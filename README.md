@@ -1,5 +1,12 @@
 # pg-datahike
 
+<p align="center">
+<a href="https://clojurians.slack.com/archives/CB7GJAN0L"><img src="https://badgen.net/badge/-/slack?icon=slack&label"/></a>
+<a href="https://clojars.org/org.replikativ/pg-datahike"><img src="https://img.shields.io/clojars/v/org.replikativ/pg-datahike.svg"/></a>
+<a href="https://circleci.com/gh/replikativ/pg-datahike"><img src="https://circleci.com/gh/replikativ/pg-datahike.svg?style=shield"/></a>
+<a href="https://github.com/replikativ/pg-datahike/tree/main"><img src="https://img.shields.io/github/last-commit/replikativ/pg-datahike/main"/></a>
+</p>
+
 **PostgreSQL access for [Datahike](https://github.com/replikativ/datahike).**
 Embeds a PG-compatible adapter — wire protocol, SQL translator, virtual
 `pg_*` / `information_schema` catalogs, constraint enforcement, schema
