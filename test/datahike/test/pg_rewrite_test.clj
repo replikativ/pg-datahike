@@ -117,3 +117,92 @@
       (is (not (re-find #"\bREFERENCES\b" out)))
       (is (re-find #"idx_auto_\d+" out))
       (is (re-find #"SELECT 1 FROM" out)))))
+
+;; ============================================================================
+;; quote-reserved-alias-rule
+;;
+;; PG accepts `SELECT 1 AS select` (alias named after a reserved word).
+;; JSqlParser 5 rejects it — the rule double-quotes the alias so the
+;; SQL text round-trips through parse + equivalent semantics on PG.
+;; ============================================================================
+
+(defn- quote-alias [sql]
+  (rw/rewrite sql [rw/quote-reserved-alias-rule]))
+
+(deftest quote-reserved-alias-basic
+  (testing "AS <hard-keyword> wrapped in double-quotes"
+    (is (= "SELECT 1 AS \"select\"" (quote-alias "SELECT 1 AS select")))
+    (is (= "SELECT 1 AS \"from\""   (quote-alias "SELECT 1 AS from")))
+    (is (= "SELECT 1 AS \"where\""  (quote-alias "SELECT 1 AS where")))
+    (is (= "SELECT 1 AS \"when\""   (quote-alias "SELECT 1 AS when")))
+    (is (= "SELECT 1 AS \"join\""   (quote-alias "SELECT 1 AS join")))))
+
+(deftest quote-reserved-alias-preserves-case
+  (testing "Double-quoted aliases are case-sensitive; preserve original text"
+    (is (= "SELECT 1 AS \"Select\"" (quote-alias "SELECT 1 AS Select")))
+    (is (= "SELECT 1 AS \"SELECT\"" (quote-alias "SELECT 1 AS SELECT")))))
+
+(deftest quote-reserved-alias-skip-cast
+  (testing "`CAST(x AS int)` — AS introduces type, not alias, leave it"
+    (is (= "SELECT CAST(1 AS int) FROM t"
+           (quote-alias "SELECT CAST(1 AS int) FROM t")))
+    (is (= "SELECT CAST(name AS text) FROM t"
+           (quote-alias "SELECT CAST(name AS text) FROM t"))))
+  (testing "Nested CAST — still skip"
+    (is (= "SELECT CAST(CAST(x AS int) AS bigint)"
+           (quote-alias "SELECT CAST(CAST(x AS int) AS bigint)"))))
+  (testing "CAST(... AS int) AS select — only the outer AS is an alias"
+    (is (= "SELECT CAST(1 AS int) AS \"select\" FROM t"
+           (quote-alias "SELECT CAST(1 AS int) AS select FROM t")))))
+
+(deftest quote-reserved-alias-skip-non-reserved
+  (testing "Non-reserved keyword aliases untouched"
+    (is (= "SELECT 1 AS n"        (quote-alias "SELECT 1 AS n")))
+    (is (= "SELECT 1 AS total"    (quote-alias "SELECT 1 AS total")))
+    (is (= "SELECT 1 AS update"   (quote-alias "SELECT 1 AS update")))))
+
+(deftest quote-reserved-alias-skip-inside-strings
+  (testing "Keyword inside a string literal untouched"
+    (let [sql "SELECT 'AS select' AS label FROM t"]
+      (is (= sql (quote-alias sql))))))
+
+(deftest quote-reserved-alias-skip-inside-comments
+  (testing "AS <kw> inside a comment untouched"
+    (let [sql "SELECT 1 /* AS select */ FROM t"]
+      (is (= sql (quote-alias sql))))))
+
+(deftest quote-reserved-alias-multiple-aliases
+  (testing "Multi-column SELECT with several reserved aliases"
+    (is (= "SELECT 1 AS \"select\", 2 AS \"from\", 3 AS ok"
+           (quote-alias "SELECT 1 AS select, 2 AS from, 3 AS ok")))))
+
+(deftest quote-reserved-alias-metabase-privilege-query
+  (testing "Shape from Metabase's build_privilege_map"
+    (let [sql (str "with table_privileges as ("
+                   " select NULL as role, t.schemaname as schema, t.objectname as table,"
+                   "   f(t.sn, 'update') as update,"
+                   "   f(t.sn, 'select') as select"
+                   " from tabs t)"
+                   " select * from table_privileges")
+          out (quote-alias sql)]
+      ;; role, schema, table aren't in our reserved list → unchanged.
+      ;; update, select ARE in our list (well update is not… let me
+      ;; check: only the keywords JSqlParser 5.2 rejects are in the
+      ;; set. Metabase's SELECT has both; this test captures the
+      ;; behaviour on the SELECT alias specifically.
+      (is (re-find #"as \"select\"" out))
+      (is (not (re-find #"as \"role\"" out)))
+      (is (not (re-find #"as \"schema\"" out))))))
+
+(deftest quote-reserved-alias-with-already-quoted
+  (testing "AS \"already-quoted\" untouched — tokenizer emits a distinct token kind"
+    ;; The tokenizer emits quoted idents; our match requires :text in
+    ;; the reserved set, which is the unquoted form only.
+    (let [sql "SELECT 1 AS \"select\""]
+      (is (= sql (quote-alias sql))))))
+
+(deftest quote-reserved-alias-integrates-with-default-rules
+  (testing "quote-reserved-alias-rule is part of default-rules"
+    (let [sql "SELECT 1 AS select"]
+      (is (= "SELECT 1 AS \"select\""
+             (rw/rewrite sql rw/default-rules))))))

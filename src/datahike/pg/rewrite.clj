@@ -218,6 +218,89 @@
                      (conj acc [insert-pos insert-pos "1 "])))
             (recur (inc i) acc)))))))
 
+;; ---------------------------------------------------------------------------
+;; AS <reserved-keyword> alias rewriter
+;; ---------------------------------------------------------------------------
+;; PostgreSQL accepts most reserved keywords as column aliases after
+;; `AS` (e.g. `SELECT 1 AS update` is valid PG — `update` becomes the
+;; column label). JSqlParser 5's grammar is stricter and errors out on
+;; many of these. ORMs that emit privilege/metadata queries frequently
+;; use reserved words as aliases (Metabase's `build_privilege_map`
+;; uses `AS select, AS update, AS insert, ...`).
+;;
+;; Rewrite: when we see `AS <reserved-kw>` where `<reserved-kw>` is an
+;; unquoted ident that JSqlParser would reject, wrap it in PG's
+;; double-quote identifier syntax (`AS "<kw>"`). PG treats both forms
+;; as the same alias so the downstream behaviour is unchanged.
+;;
+;; Must skip `CAST(<expr> AS <type>)` — the `AS` there introduces a
+;; type-name, not an alias, and some type names (`int`, `text`, …)
+;; overlap with the reserved-word set.
+
+(def ^:private alias-reserved-kws
+  "Reserved keywords that JSqlParser 5.x rejects as an unquoted alias
+   after `AS`. Empirically determined with
+   `SELECT 1 AS <kw>` against 5.2. PG accepts all of these; we just
+   need to double-quote them before JSqlParser sees them."
+  #{"select" "from" "where" "group" "order" "having"
+    "and" "or" "not" "in" "like" "between"
+    "when" "else" "join" "union" "intersect" "except"
+    "as" "with" "all" "any" "some" "exists"
+    "null" "true" "false" "is" "on"
+    "asc" "desc" "cross" "inner" "outer" "left" "right" "full"
+    "limit" "offset" "fetch" "for" "of"
+    "by" "into" "values" "returning" "using"})
+
+(defn- inside-cast-parens?
+  "True if the token at idx sits inside an unmatched paren group opened
+   by a `CAST` keyword (ignoring nested plain-paren groups). Used to
+   distinguish `CAST(x AS int)` (type context) from `SELECT x AS int`
+   (alias context)."
+  [toks ^long idx]
+  (loop [i (dec idx), depth 0]
+    (if (neg? i)
+      false
+      (let [t (nth toks i)]
+        (cond
+          (punct? t ")") (recur (dec i) (inc depth))
+          (punct? t "(")
+          (if (pos? depth)
+            (recur (dec i) (dec depth))
+            ;; Found the opening paren at our nesting level. Look at
+            ;; the previous non-comment token to decide.
+            (let [prev (non-comment-before toks i)]
+              (= "cast" (kw-text prev))))
+          :else (recur (dec i) depth))))))
+
+(defn quote-reserved-alias-rule
+  "Find `AS <reserved-kw>` outside of `CAST(... AS ...)` contexts and
+   replace `<reserved-kw>` with `\"<reserved-kw>\"` so JSqlParser
+   accepts it as an identifier. PG already treats the two forms
+   equivalently (both produce the same column label)."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (dec n))
+        acc
+        (let [t (nth toks i)]
+          (if-not (= "as" (kw-text t))
+            (recur (inc i) acc)
+            (let [next-t (nth toks (inc i) nil)
+                  nt-kw (kw-text next-t)]
+              (if (and nt-kw
+                       (contains? alias-reserved-kws nt-kw)
+                       ;; Preserve original capitalisation of the token
+                       ;; so the quoted alias still equals the user's
+                       ;; intent ("Select" vs "select" vs "SELECT").
+                       (not (inside-cast-parens? toks (inc i))))
+                (let [start (:pos next-t)
+                      end (:end next-t)
+                      original-text (:text next-t)
+                      quoted (str "\"" original-text "\"")]
+                  (recur (+ i 2)
+                         (conj acc [start end quoted])))
+                (recur (inc i) acc)))))))))
+
 ;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
@@ -231,4 +314,5 @@
    needed."
   [inline-references-rule
    create-index-anonymous-rule
-   select-from-rule])
+   select-from-rule
+   quote-reserved-alias-rule])
