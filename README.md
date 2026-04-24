@@ -71,7 +71,7 @@ and datoms. They're immediately queryable from Clojure:
 ;; => #{["A" 10] ["B" 20]}
 ```
 
-## Three integration patterns
+## Four integration patterns
 
 ### 1. Multi-database server
 
@@ -123,6 +123,53 @@ RESET datahike.as_of;
 
 Transparent to the client — every subsequent query sees the chosen
 view of the db.
+
+### 4. Git-like branching
+
+Branching is cheap in Datahike: every transaction produces a new
+immutable commit, so a "branch" is just a named pointer at a commit
+UUID. Creation is O(1) — one konserve write, no data copy, no WAL
+replay, no container provisioning. pgwire exposes the read side and
+the admin ops through standard PG session variables and a small
+`datahike.*` function namespace.
+
+```sql
+-- Introspect
+SELECT datahike.branches();            -- returns one row per branch
+SELECT datahike.current_branch();
+SELECT datahike.commit_id();           -- current session's db head
+SELECT datahike.parent_commits();      -- immediate parents (0/1/2+)
+
+-- Admin — konserve-level writes, don't go through the tx writer
+SELECT datahike.create_branch('preview', 'main');
+SELECT datahike.create_branch('from-cid', '69ea6ee1-…');  -- from commit UUID
+SELECT datahike.delete_branch('preview');
+
+-- Session view: three cuts on the same immutable log.
+-- They compose — feature branch's state as of yesterday is just two SETs.
+SET datahike.branch    = 'feature';
+SET datahike.commit_id = '69ea6ee1-2feb-5b61-be14-5590b9e01e48';
+SET datahike.as_of     = '2024-01-15T00:00:00Z';
+RESET datahike.branch;
+```
+
+Or pin a branch at connect time via the JDBC URL's database name
+(same suffix pattern as the multi-DB registry):
+
+```
+jdbc:postgresql://localhost:5432/prod:feature   → prod-conn, pinned to :feature
+jdbc:postgresql://localhost:5432/prod           → prod-conn, default branch
+```
+
+`SET datahike.commit_id = '<uuid>'` is Datahike-unique: no other
+PG-compatible database lets you query by an exact commit identifier.
+
+**Honest footnote for 0.1**: writes always land on the connection's
+default branch, even when `SET datahike.branch` is active — pgwire
+reads respect the pinned branch, but the transaction writer is
+conn-wide. Users who need to write to a specific branch open a
+second connection on `/<db>:<branch>` or use the Clojure API
+(`datahike.versioning/branch!`, `merge!`, …). Post-0.1 item.
 
 ## Embedding without TCP
 
