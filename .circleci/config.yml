@@ -203,6 +203,8 @@ jobs:
     resource_class: large
     steps:
       - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Install JDK 21 + Clojure + babashka + netcat
           command: |
@@ -227,7 +229,10 @@ jobs:
       - run:
           name: Wait for server
           command: |
-            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            # 120s — Clojure + datahike cold-start is ~15s warm, up to
+            # 90s when the .m2 cache isn't attached and every dep is a
+            # fresh Clojars fetch. Cheap wait, expensive timeout.
+            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
             echo "pgwire did not come up on :15432" >&2; exit 1
       - run:
           name: asyncpg setup
@@ -243,6 +248,8 @@ jobs:
       - image: cimg/node:20.11
     steps:
       - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Install JDK 21 + Clojure + babashka + netcat
           command: |
@@ -262,7 +269,10 @@ jobs:
       - run:
           name: Wait for server
           command: |
-            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            # 120s — Clojure + datahike cold-start is ~15s warm, up to
+            # 90s when the .m2 cache isn't attached and every dep is a
+            # fresh Clojars fetch. Cheap wait, expensive timeout.
+            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
             echo "pgwire did not come up on :15432" >&2; exit 1
       - run:
           name: node-postgres setup
@@ -282,6 +292,8 @@ jobs:
     resource_class: large
     steps:
       - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Install Clojure + babashka + Maven + netcat
           command: |
@@ -316,7 +328,10 @@ jobs:
       - run:
           name: Wait for server
           command: |
-            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            # 120s — Clojure + datahike cold-start is ~15s warm, up to
+            # 90s when the .m2 cache isn't attached and every dep is a
+            # fresh Clojars fetch. Cheap wait, expensive timeout.
+            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
             echo "pgwire did not come up on :15432" >&2; exit 1
       - run:
           name: Hibernate integration test
@@ -331,6 +346,8 @@ jobs:
       - image: cimg/python:3.11
     steps:
       - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Install JDK 21 + Clojure + babashka + netcat
           command: |
@@ -353,7 +370,10 @@ jobs:
       - run:
           name: Wait for server
           command: |
-            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            # 120s — Clojure + datahike cold-start is ~15s warm, up to
+            # 90s when the .m2 cache isn't attached and every dep is a
+            # fresh Clojars fetch. Cheap wait, expensive timeout.
+            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
             echo "pgwire did not come up on :15432" >&2; exit 1
       - run:
           name: SQLAlchemy 7-phase dialect smoke
@@ -440,7 +460,17 @@ workflows:
             branches:
               only: main
     jobs:
+      - setup:
+          context: ghcr-read-package
+      - build:
+          context: ghcr-read-package
+          requires:
+            - setup
       - asyncpg-conformance:
           context: ghcr-read-package
+          requires:
+            - build
       - node-postgres-conformance:
           context: ghcr-read-package
+          requires:
+            - build
