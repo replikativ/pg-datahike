@@ -107,6 +107,32 @@
                (mapv #(ctx/materialize-arg! ctx %) raw-args))
         result-var (ctx/fresh-var! ctx)]
     (cond
+      ;; PG privilege-check functions (has_*_privilege). We run without
+      ;; a privilege model — one user, one schema, all granted — so
+      ;; return `true` unconditionally. Metabase's describe-database
+      ;; step queries these to filter out unreadable tables. Register
+      ;; every variant so qualifier / arg-count mismatch doesn't fall
+      ;; through to the unknown-function path.
+      (contains? #{"has_table_privilege"
+                   "has_any_column_privilege"
+                   "has_column_privilege"
+                   "has_sequence_privilege"
+                   "has_database_privilege"
+                   "has_schema_privilege"
+                   "has_function_privilege"
+                   "has_language_privilege"
+                   "has_server_privilege"
+                   "has_foreign_data_wrapper_privilege"
+                   "pg_has_role"}
+                 fname)
+      (let [fn-param (symbol (str "?priv" (swap! (:var-counter ctx) inc)))
+            priv-fn (fn [& _args] true)]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj priv-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; current_database() / current_schema() used inline as a value
       ;; expression — the sole-select path is classified by
       ;; datahike.pg.classify, but column-position use lands here.
@@ -2547,6 +2573,17 @@
                                        (:col-overrides ctx))
           col-var (ctx/col-var! ctx resolved)]
       [[(list '= col-var true)]])
+
+    ;; Boolean-valued expressions used directly as predicates:
+    ;; `WHERE <bool-fn>(...)`, `WHERE CASE WHEN ... END`, etc. PG
+    ;; accepts any boolean expression. Route through translate-expr
+    ;; which binds the result to a fresh var, then assert `= true`.
+    (or (instance? Function expr)
+        (instance? CaseExpression expr)
+        (instance? Parenthesis expr))
+    (let [v (translate-expr ctx expr)
+          v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+      [[(list '= v true)]])
 
     :else
     (throw (ex-info (str "Unsupported WHERE expression: " (type expr))

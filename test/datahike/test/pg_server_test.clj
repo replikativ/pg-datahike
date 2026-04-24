@@ -719,3 +719,43 @@
   ;; Cleanup
   (testing "Cleanup"
     (.execute *handler* "DELETE FROM department WHERE name = 'Research'")))
+
+;; ============================================================================
+;; Privilege-check functions + boolean-valued WHERE
+;; ============================================================================
+;; PG has a family of `has_*_privilege(user, obj, action)` functions
+;; that ORMs query during catalog discovery. We don't implement a
+;; privilege model — one user, one schema, everything granted — so
+;; every privilege-check returns true. The functions also appear as
+;; bare boolean expressions in WHERE clauses, which our translator
+;; previously rejected; those are now routed through translate-expr.
+
+(deftest test-privilege-functions-return-true
+  (testing "has_schema_privilege(user, schema, priv)"
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT has_schema_privilege('x', 'public', 'usage')")))))
+  (testing "has_table_privilege(user, table, priv)"
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT has_table_privilege('x', 'person', 'select')")))))
+  (testing "has_any_column_privilege(user, table, priv)"
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT has_any_column_privilege('x', 'person', 'update')")))))
+  (testing "pg_catalog. qualifier accepted"
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT pg_catalog.has_schema_privilege('x', 'public', 'usage')"))))))
+
+(deftest test-bool-function-as-where-predicate
+  (testing "WHERE <bool-fn>(...) accepted (PG allows bool expr as predicate)"
+    (let [r (.execute *handler*
+                      "SELECT name FROM person WHERE has_table_privilege('x', 'person', 'select')")]
+      (is (nil? (err r)))
+      (is (= 3 (count (rows r))))))
+  (testing "WHERE <bool-fn>(...) AND <other>"
+    (let [r (.execute *handler*
+                      "SELECT name FROM person WHERE has_schema_privilege('x', 'public', 'usage') AND age > 30")]
+      (is (nil? (err r)))
+      (is (= 1 (count (rows r)))))))
