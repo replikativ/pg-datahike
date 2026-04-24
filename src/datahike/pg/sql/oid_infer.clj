@@ -138,6 +138,13 @@
    "session_user"  types/oid-name
    "user"          types/oid-name
    "system_user"   types/oid-name
+   ;; pg_get_*def synthesizers — return SQL text
+   "pg_get_indexdef"      types/oid-text
+   "pg_get_constraintdef" types/oid-text
+   "pg_get_userbyid"      types/oid-name
+   "obj_description"      types/oid-text
+   "col_description"      types/oid-text
+   "shobj_description"    types/oid-text
    ;; Array-returning functions — result OID is T[] per PG
    "current_schemas"       types/oid-name-array
    "string_to_array"       types/oid-text-array

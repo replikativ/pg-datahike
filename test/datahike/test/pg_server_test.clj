@@ -368,6 +368,60 @@
     (is (= [[nil]] (rows (.execute *handler* "SELECT obj_description(0, 'pg_class')"))))
     (is (= [[nil]] (rows (.execute *handler* "SELECT col_description(0, 1)"))))))
 
+(deftest test-pg-get-userbyid
+  (testing "pg_get_userbyid returns the static handler role for any oid"
+    (is (= [["datahike"]] (rows (.execute *handler* "SELECT pg_get_userbyid(10)"))))
+    (is (= [["datahike"]] (rows (.execute *handler* "SELECT pg_get_userbyid(0)"))))))
+
+(deftest test-pg-get-indexdef
+  (testing "pg_index.indexdef pre-baked from schema (UNIQUE / PRIMARY KEY)"
+    (let [r (rows (.execute *handler* "SELECT indexdef FROM pg_index ORDER BY indexdef"))]
+      (is (some #(re-find #"CREATE UNIQUE INDEX person_name_pkey" %) (map first r))
+          "PK index def synthesized from :db.unique/identity")
+      (is (some #(re-find #"CREATE UNIQUE INDEX department_name_pkey" %) (map first r))
+          "Department PK index def synthesized")))
+
+  (testing "pg_get_indexdef(oid) reads the pre-baked column"
+    (let [r (rows (.execute *handler* "SELECT pg_get_indexdef(indexrelid) FROM pg_index ORDER BY indexrelid"))]
+      (is (every? #(re-find #"^CREATE UNIQUE INDEX " (first %)) r)
+          "every row should be a CREATE UNIQUE INDEX statement"))))
+
+(deftest test-pg-constraint-and-getconstraintdef
+  (testing "pg_constraint synthesizes one row per PK / UNIQUE column"
+    (let [r (rows (.execute *handler* "SELECT conname, contype, condef FROM pg_constraint ORDER BY conname"))
+          named (into {} (map (fn [[n t d]] [n [t d]]) r))]
+      (is (contains? named "person_name_pkey"))
+      (is (= ["p" "PRIMARY KEY (name)"] (named "person_name_pkey")))
+      (is (contains? named "department_name_pkey"))))
+
+  (testing "pg_get_constraintdef(oid) joins pg_constraint and reads condef"
+    (let [r (rows (.execute *handler* "SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c WHERE c.contype = 'p' ORDER BY c.conname"))]
+      (is (every? #(re-find #"^PRIMARY KEY " (second %)) r)
+          "every PK constraint def should start with PRIMARY KEY"))))
+
+(deftest test-pg-constraint-check-and-fk
+  (testing "CHECK and FK constraints surface via pg_constraint after DDL"
+    ;; New connection — fixture has only person/department.
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          h (pg/make-query-handler conn)]
+      (try
+        (.execute h "CREATE TABLE dept (id BIGINT PRIMARY KEY, name TEXT NOT NULL UNIQUE, budget BIGINT CHECK (budget > 0))")
+        (.execute h "CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT NOT NULL, dept_id BIGINT, FOREIGN KEY (dept_id) REFERENCES dept (id))")
+        (let [^PgWireServer$QueryResult r (.execute h "SELECT conname, contype, condef FROM pg_constraint ORDER BY conname")
+              named (into {} (map (fn [[n t d]] [n [t d]]) (mapv vec (.rows r))))]
+          (is (contains? named "dept_budget_check"))
+          (is (= ["c" "CHECK (budget > 0)"] (named "dept_budget_check")))
+          (is (contains? named "emp_dept_id_fkey"))
+          (let [[ctype cdef] (named "emp_dept_id_fkey")]
+            (is (= "f" ctype))
+            (is (= "FOREIGN KEY (dept_id) REFERENCES dept (id)" cdef))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 ;; ============================================================================
 ;; Aggregates
 ;; ============================================================================

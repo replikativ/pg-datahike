@@ -85,23 +85,22 @@
             WHERE (c.oid, a.attnum) IN ((16384, 1), (16384, 2))"))))
 
 (deftest probe-empty-catalog
-  (testing "bare catalog-table reference"
-    (is (= :empty-catalog
-           (shape/catalog-probe
-            "SELECT n.nspname, c.conname FROM pg_constraint c
-              JOIN pg_namespace n ON c.connamespace = n.oid"))))
-  (testing "schema-qualified catalog reference"
+  (testing "schema-qualified catalog reference (pg_trigger — still unmaterialized)"
     (is (= :empty-catalog
            (shape/catalog-probe
             "SELECT * FROM pg_catalog.pg_trigger"))))
-  (testing "pg_get_indexdef still falls into empty-catalog (Phase B will lower it)"
-    (is (= :empty-catalog
-           (shape/catalog-probe
-            "SELECT pg_get_indexdef(oid) FROM pg_index WHERE indrelid = 16384"))))
-  (testing "pg_get_constraintdef still falls into empty-catalog (Phase B will lower it)"
-    (is (= :empty-catalog
-           (shape/catalog-probe
-            "SELECT pg_get_constraintdef(oid) FROM pg_constraint")))))
+  (testing "pg_depend / pg_settings still unmaterialized"
+    (is (= :empty-catalog (shape/catalog-probe "SELECT * FROM pg_depend")))
+    (is (= :empty-catalog (shape/catalog-probe "SELECT * FROM pg_settings"))))
+  (testing "pg_constraint is now materialized — no shape-level shortcut"
+    (is (nil? (shape/catalog-probe
+               "SELECT n.nspname, c.conname FROM pg_constraint c
+                 JOIN pg_namespace n ON c.connamespace = n.oid"))))
+  (testing "pg_get_indexdef / pg_get_constraintdef now lower relationally — no shortcut"
+    (is (nil? (shape/catalog-probe
+               "SELECT pg_get_indexdef(oid) FROM pg_index WHERE indrelid = 16384")))
+    (is (nil? (shape/catalog-probe
+               "SELECT pg_get_constraintdef(oid) FROM pg_constraint")))))
 
 (deftest probe-implemented-system-fns-do-not-intercept
   (testing "format_type is implemented in expr.clj — must reach the real SELECT path"

@@ -50,6 +50,10 @@
     ;; any, so rows are always empty, but the LEFT JOIN in pgjdbc's
     ;; field-metadata query still needs the table to exist.
     "pg_index" "pg_attrdef"
+    ;; pg_constraint backs `pg_get_constraintdef(oid)` — we synthesize
+    ;; one row per CHECK / FK / PK / UNIQUE constraint with a pre-baked
+    ;; condef text column.
+    "pg_constraint"
     ;; pg_extension is probed by framework feature-detection (Rails,
     ;; Hibernate probe for `pg_trgm`, `uuid-ossp`, `citext`, …). We
     ;; never install any extensions, so the table is always empty.
@@ -222,6 +226,11 @@
      ;; so we emit actual NULL via empty value + get-else pathway.
      {:db/ident :pg_index/indpred :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_index/indexprs :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; Pre-baked CREATE INDEX text — `pg_get_indexdef(oid)` lowers to
+     ;; a join that reads this column directly. PG generates the
+     ;; string at runtime from indkey + indrelid; we synthesize once
+     ;; at catalog load.
+     {:db/ident :pg_index/indexdef :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_index") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_attrdef"
@@ -231,6 +240,24 @@
      {:db/ident :pg_attrdef/adnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_attrdef/adbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attrdef") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_constraint"
+    ;; One row per CHECK / FK / PK / UNIQUE constraint. `condef` is
+    ;; the synthesized text — `pg_get_constraintdef(oid)` lowers to
+    ;; `[?c :pg_constraint/oid ?arg] [?c :pg_constraint/condef ?out]`.
+    ;; We deliberately do NOT model the int2[]/oid[] vector columns
+    ;; (conkey, confkey, conpfeqop) — clients that read them via
+    ;; `pg_get_constraintdef` get the rendered text instead.
+    [{:db/ident :pg_constraint/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/contype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/connamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/confrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/condeferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/convalidated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/condef :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_constraint") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_extension"
     ;; Always empty — we never install extensions. Clients probe
     ;; `SELECT * FROM pg_extension WHERE extname='pg_trgm'` to feature-
@@ -579,7 +606,17 @@
                                                        (Math/abs (.hashCode
                                                                   ^String (:name col)))))
                    primary? (= :db.unique/identity (:unique col))
-                   attnum (inc idx)]]
+                   attnum (inc idx)
+                   idx-name (str tname "_" (:name col)
+                                 (if primary? "_pkey" "_key"))
+                   ;; pg_get_indexdef format: "CREATE [UNIQUE] INDEX
+                   ;; <name> ON <schema>.<table> USING btree (<col>)".
+                   ;; Always UNIQUE here since we only synthesize rows
+                   ;; for unique columns; btree is PG's default access
+                   ;; method.
+                   idxdef (str "CREATE UNIQUE INDEX " idx-name
+                               " ON public." tname
+                               " USING btree (" (:name col) ")")]]
          {:pg_index/indrelid (long tbl-oid)
           :pg_index/indexrelid (long idx-oid)
           :pg_index/indkey (str attnum)
@@ -588,6 +625,7 @@
           :pg_index/indisvalid true
           :pg_index/indpred ""
           :pg_index/indexprs ""
+          :pg_index/indexdef idxdef
           (pgs/row-marker-attr "pg_index") true})))
 
     ;; pg_attrdef — empty. LEFT JOIN in pgjdbc's field-metadata query
@@ -598,6 +636,109 @@
     ;; pg_extension — always empty; we never install extensions.
     "pg_extension"
     []
+    ;; pg_constraint — one row per UNIQUE/PK column + per CHECK + per FK.
+    ;; `condef` is the rendered text that pg_get_constraintdef returns.
+    ;; Synthesised OIDs are stable hashes of (kind, name, table) so two
+    ;; runs of the same DB produce the same oids — matching how
+    ;; PG-side oids stay stable for the life of a constraint.
+    "pg_constraint"
+    (let [tables  (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          q-fn    (requiring-resolve 'datahike.api/q)
+          ;; CHECK constraints persisted via :pg/check-* attrs.
+          checks  (try
+                    (q-fn '{:find  [?n ?t ?x]
+                            :keys  [name table expr]
+                            :where [[?e :pg/check-name ?n]
+                                    [?e :pg/check-table ?t]
+                                    [?e :pg/check-expr ?x]]}
+                          cte-db)
+                    (catch Throwable _ []))
+          ;; FK constraints persisted via :pg/fk-* attrs.
+          fks (try
+                (q-fn '{:find  [?n ?ct ?cc ?pt ?pc]
+                        :keys  [name child-table child-cols parent-table parent-cols]
+                        :where [[?e :pg/fk-name ?n]
+                                [?e :pg/fk-child-table ?ct]
+                                [?e :pg/fk-child-cols ?cc]
+                                [?e :pg/fk-parent-table ?pt]
+                                [?e :pg/fk-parent-cols ?pc]]}
+                      cte-db)
+                (catch Throwable _ []))
+          ->oid (fn [kind nm tbl]
+                  ;; Tag the high bit to avoid collisions with table OIDs.
+                  (bit-or 0x50000000
+                          (Math/abs (.hashCode ^String (str kind ":" nm ":" tbl)))))]
+      (vec
+       (concat
+        ;; UNIQUE / PRIMARY KEY rows — one per unique column.
+        (for [[tname {:keys [columns]}] (sort-by key tables)
+              col columns
+              :when (:unique col)
+              :let [tbl-oid  (or (pgs/table-oid cte-db tname)
+                                 (Math/abs (.hashCode ^String tname)))
+                    primary? (= :db.unique/identity (:unique col))
+                    contype  (if primary? "p" "u")
+                    cname    (str tname "_" (:name col)
+                                  (if primary? "_pkey" "_key"))
+                    condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
+                                  (:name col) ")")]]
+          {:pg_constraint/oid           (long (->oid contype cname tname))
+           :pg_constraint/conname       cname
+           :pg_constraint/contype       contype
+           :pg_constraint/conrelid      (long tbl-oid)
+           :pg_constraint/connamespace  2200
+           :pg_constraint/confrelid     0
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred   false
+           :pg_constraint/convalidated  true
+           :pg_constraint/condef        condef
+           (pgs/row-marker-attr "pg_constraint") true})
+        ;; CHECK constraints — one row per persisted :pg/check-*.
+        (for [{cname :name tname :table cexpr :expr} checks
+              :let [tbl-oid (or (pgs/table-oid cte-db tname)
+                                (Math/abs (.hashCode ^String tname)))]]
+          {:pg_constraint/oid           (long (->oid "c" cname tname))
+           :pg_constraint/conname       cname
+           :pg_constraint/contype       "c"
+           :pg_constraint/conrelid      (long tbl-oid)
+           :pg_constraint/connamespace  2200
+           :pg_constraint/confrelid     0
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred   false
+           :pg_constraint/convalidated  true
+           :pg_constraint/condef        (str "CHECK (" cexpr ")")
+           (pgs/row-marker-attr "pg_constraint") true})
+        ;; FK constraints — child-cols / parent-cols are stored as
+        ;; JSON-serialized strings; render them as comma-joined
+        ;; identifiers in the condef (matches PG's pg_get_constraintdef).
+        (for [{cname :name child :child-table child-cols :child-cols
+               parent :parent-table parent-cols :parent-cols} fks
+              :let [tbl-oid (or (pgs/table-oid cte-db child)
+                                (Math/abs (.hashCode ^String child)))
+                    parent-oid (or (pgs/table-oid cte-db parent)
+                                   (Math/abs (.hashCode ^String parent)))
+                    parse-cols (fn [s]
+                                 (try
+                                   (let [v ((requiring-resolve 'datahike.pg.jsonb/parse-jsonb) s)]
+                                     (cond (vector? v)     v
+                                           (sequential? v) (vec v)
+                                           :else           [v]))
+                                   (catch Throwable _ [s])))
+                    cs (parse-cols child-cols)
+                    ps (parse-cols parent-cols)]]
+          {:pg_constraint/oid           (long (->oid "f" cname child))
+           :pg_constraint/conname       cname
+           :pg_constraint/contype       "f"
+           :pg_constraint/conrelid      (long tbl-oid)
+           :pg_constraint/connamespace  2200
+           :pg_constraint/confrelid     (long parent-oid)
+           :pg_constraint/condeferrable false
+           :pg_constraint/condeferred   false
+           :pg_constraint/convalidated  true
+           :pg_constraint/condef        (str "FOREIGN KEY (" (str/join ", " cs)
+                                             ") REFERENCES " parent
+                                             " (" (str/join ", " ps) ")")
+           (pgs/row-marker-attr "pg_constraint") true}))))
     "information_schema_table_constraints"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))]
       (vec

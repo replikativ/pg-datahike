@@ -132,25 +132,21 @@
 (def ^:private empty-catalog-tables
   "Catalog / introspection tables we don't materialize. A SELECT that
    references any of these gets an empty-row result matching the
-   outer SELECT's projection shape. pg_index and pg_attrdef are
-   deliberately NOT here — they flow through the real catalog path
-   since we synthesize rows for them."
-  #{"pg_constraint" "pg_depend" "pg_description"
+   outer SELECT's projection shape. pg_index, pg_attrdef and
+   pg_constraint are deliberately NOT here — they flow through the
+   real catalog path since we synthesize rows for them."
+  #{"pg_depend" "pg_description"
     "pg_inherits" "pg_rewrite" "pg_trigger"
     "pg_stat_user_tables" "pg_stat_activity"
     "pg_locks" "pg_settings"})
 
 (def ^:private empty-catalog-fns
-  "PG system functions we don't implement. A SELECT that calls any of
-   these gets an empty result — clients use them to pretty-print
-   schema metadata, and returning 0 rows (column is NULL) is the
-   least-surprising answer.
-
-   format_type, obj_description, col_description are now implemented
-   (or stubbed to NULL) in expr.clj — they go through the regular
-   function path. pg_get_indexdef / pg_get_constraintdef stay here
-   until they're lowered relationally against pg_index / pg_constraint."
-  #{"pg_get_indexdef" "pg_get_constraintdef"})
+  "PG system functions that route to the empty-catalog handler. The set
+   is empty now that pg_get_indexdef / pg_get_constraintdef lower to
+   real catalog joins (see datahike.pg.sql.expr) and the comment-lookup
+   pair stub to NULL. Kept as a hook for any future fns that need the
+   shape-level shortcut."
+  #{})
 
 (defn- fk-conname?
   "Odoo's post-add-foreign-key lookup:

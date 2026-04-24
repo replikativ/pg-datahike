@@ -240,6 +240,43 @@
                [(apply list fn-param args) result-var])
         result-var)
 
+      ;; pg_get_userbyid(oid) — single-tenant: every oid maps to the
+      ;; static handler role.
+      (= fname "pg_get_userbyid")
+      (let [fn-param (symbol (str "?get-user" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [_oid] "datahike")]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(list fn-param (or (first args) :__null__)) result-var])
+        result-var)
+
+      ;; pg_get_indexdef(oid [, column, pretty]) — relational lowering.
+      ;; The CREATE INDEX text is pre-baked into pg_index.indexdef at
+      ;; catalog-data time; here we emit the lookup-by-oid pattern so
+      ;; the surrounding SELECT composes correctly with WHERE / JOIN /
+      ;; ORDER BY. Two-arg `column` form returns a single column name;
+      ;; we don't model that yet — return the full def.
+      (= fname "pg_get_indexdef")
+      (let [arg-oid (or (first args) :__null__)
+            idx-eid (ctx/fresh-var! ctx)]
+        (swap! (:where-clauses ctx) conj
+               [idx-eid :pg_index/indexrelid arg-oid])
+        (swap! (:where-clauses ctx) conj
+               [idx-eid :pg_index/indexdef result-var])
+        result-var)
+
+      ;; pg_get_constraintdef(oid [, pretty]) — same pattern as
+      ;; pg_get_indexdef. condef is pre-rendered at catalog-data time.
+      (= fname "pg_get_constraintdef")
+      (let [arg-oid (or (first args) :__null__)
+            con-eid (ctx/fresh-var! ctx)]
+        (swap! (:where-clauses ctx) conj
+               [con-eid :pg_constraint/oid arg-oid])
+        (swap! (:where-clauses ctx) conj
+               [con-eid :pg_constraint/condef result-var])
+        result-var)
+
       ;; pg_typeof(value) — PG returns regtype (text-formatted as
       ;; the type name). We resolve it at translate time using the
       ;; expression's inferred OID so the result is a constant
