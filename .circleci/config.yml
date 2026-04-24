@@ -34,6 +34,34 @@ commands:
           name: Install babashka
           command: curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
 
+  start-pgwire-and-wait:
+    description: |
+      Start pg-datahike's pgwire server in the background and block
+      until port 15432 is reachable. On timeout, prints the tail of the
+      server's stdout/stderr so CI logs show why the server didn't boot
+      (missing dep, classpath error, port collision, …) — otherwise a
+      failed poll reads as "something broke, check elsewhere".
+    steps:
+      - run:
+          name: Start pgwire server (background)
+          command: clojure -M:server 2>&1 | tee /tmp/pgwire.log
+          background: true
+      - run:
+          name: Wait for pgwire on :15432
+          command: |
+            # Up to 180s. Clojure + datahike cold-start is ~15s on a
+            # warm .m2, up to ~90s on a cold one; 180s leaves slack
+            # for slow Clojars days without loitering forever on a
+            # genuinely-broken startup.
+            for i in $(seq 1 180); do
+              nc -z localhost 15432 && exit 0
+              sleep 1
+            done
+            echo "ERROR: pgwire did not come up on :15432 after 180s" >&2
+            echo "--- last 100 lines of /tmp/pgwire.log ---" >&2
+            tail -n 100 /tmp/pgwire.log >&2 || true
+            exit 1
+
 jobs:
   setup:
     executor: clj-jdk21
@@ -55,7 +83,11 @@ jobs:
             - deps-
       - run:
           name: Resolve Clojure deps
-          command: clojure -A:dev:test:build:format -P
+          # Include :server so nrepl lands in .m2 — downstream
+          # integration jobs run `clojure -M:server` in the background,
+          # and a cold Clojars fetch for nrepl-1.0.0 pushes their
+          # "Wait for server" poll past its deadline.
+          command: clojure -A:dev:test:build:format:server -P
       - save_cache:
           key: deps-{{ checksum "deps.edn" }}
           paths:
@@ -172,19 +204,7 @@ jobs:
       - run:
           name: Clone pgjdbc
           command: bash test/integration/pgjdbc/setup.sh
-      - run:
-          name: Start pgwire server
-          command: clojure -M:server
-          background: true
-      - run:
-          name: Wait for server
-          command: |
-            for i in $(seq 1 30); do
-              nc -z localhost 15432 && exit 0
-              sleep 1
-            done
-            echo "pgwire did not come up on :15432" >&2
-            exit 1
+      - start-pgwire-and-wait
       - run:
           name: Run ResultSetTest
           command: bash test/integration/pgjdbc/run-one.sh ResultSetTest
@@ -222,18 +242,7 @@ jobs:
       - run:
           name: Compile Java sources
           command: bb prep
-      - run:
-          name: Start pgwire server
-          command: clojure -M:server
-          background: true
-      - run:
-          name: Wait for server
-          command: |
-            # 120s — Clojure + datahike cold-start is ~15s warm, up to
-            # 90s when the .m2 cache isn't attached and every dep is a
-            # fresh Clojars fetch. Cheap wait, expensive timeout.
-            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
-            echo "pgwire did not come up on :15432" >&2; exit 1
+      - start-pgwire-and-wait
       - run:
           name: asyncpg setup
           command: bash test/integration/asyncpg/setup.sh
@@ -262,18 +271,7 @@ jobs:
       - run:
           name: Compile Java sources
           command: bb prep
-      - run:
-          name: Start pgwire server
-          command: clojure -M:server
-          background: true
-      - run:
-          name: Wait for server
-          command: |
-            # 120s — Clojure + datahike cold-start is ~15s warm, up to
-            # 90s when the .m2 cache isn't attached and every dep is a
-            # fresh Clojars fetch. Cheap wait, expensive timeout.
-            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
-            echo "pgwire did not come up on :15432" >&2; exit 1
+      - start-pgwire-and-wait
       - run:
           name: node-postgres setup
           command: bash test/integration/node-postgres/setup.sh
@@ -321,18 +319,7 @@ jobs:
       - run:
           name: Compile Java sources
           command: bb prep
-      - run:
-          name: Start pgwire server
-          command: clojure -M:server
-          background: true
-      - run:
-          name: Wait for server
-          command: |
-            # 120s — Clojure + datahike cold-start is ~15s warm, up to
-            # 90s when the .m2 cache isn't attached and every dep is a
-            # fresh Clojars fetch. Cheap wait, expensive timeout.
-            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
-            echo "pgwire did not come up on :15432" >&2; exit 1
+      - start-pgwire-and-wait
       - run:
           name: Hibernate integration test
           # Drop -q so CI logs show compile errors / maven download issues
@@ -363,18 +350,7 @@ jobs:
       - run:
           name: Compile Java sources
           command: bb prep
-      - run:
-          name: Start pgwire server
-          command: clojure -M:server
-          background: true
-      - run:
-          name: Wait for server
-          command: |
-            # 120s — Clojure + datahike cold-start is ~15s warm, up to
-            # 90s when the .m2 cache isn't attached and every dep is a
-            # fresh Clojars fetch. Cheap wait, expensive timeout.
-            for i in $(seq 1 120); do nc -z localhost 15432 && exit 0; sleep 1; done
-            echo "pgwire did not come up on :15432" >&2; exit 1
+      - start-pgwire-and-wait
       - run:
           name: SQLAlchemy 7-phase dialect smoke
           command: python3 test/integration/test_sqlalchemy.py
