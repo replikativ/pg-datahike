@@ -204,12 +204,15 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Install Clojure + babashka
+          name: Install JDK 21 + Clojure + babashka + netcat
           command: |
-            # download.clojure.org returns 403 from CI IPs — fetch the
-            # canonical installer from GitHub Releases instead. --fail
-            # aborts on any HTTP error so we don't silently write the
-            # error body to disk and try to execute it.
+            # cimg/python has no JDK; install one for `bb prep` and
+            # `clojure -M:server`. Safe here because no prior JDK is
+            # present (ca-certificates-java's post-inst doesn't hit
+            # the `cacerts` dir-vs-file conflict that cimg/openjdk
+            # images surface).
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+              openjdk-21-jdk-headless netcat-openbsd
             curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
             chmod +x linux-install.sh
             sudo ./linux-install.sh
@@ -241,13 +244,10 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Install Clojure + babashka + JDK
+          name: Install JDK 21 + Clojure + babashka + netcat
           command: |
-            sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless netcat-openbsd
-            # download.clojure.org returns 403 from CI IPs — fetch the
-            # canonical installer from GitHub Releases instead. --fail
-            # aborts on any HTTP error so we don't silently write the
-            # error body to disk and try to execute it.
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+              openjdk-21-jdk-headless netcat-openbsd
             curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
             chmod +x linux-install.sh
             sudo ./linux-install.sh
@@ -332,12 +332,10 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Install Clojure + babashka
+          name: Install JDK 21 + Clojure + babashka + netcat
           command: |
-            # download.clojure.org returns 403 from CI IPs — fetch the
-            # canonical installer from GitHub Releases instead. --fail
-            # aborts on any HTTP error so we don't silently write the
-            # error body to disk and try to execute it.
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+              openjdk-21-jdk-headless netcat-openbsd
             curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
             chmod +x linux-install.sh
             sudo ./linux-install.sh
