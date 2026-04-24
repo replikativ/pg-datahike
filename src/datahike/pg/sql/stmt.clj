@@ -530,18 +530,66 @@
            :alias   sub-name
            :aliases aliases}))
 
-      ;; (SELECT … FROM real-table …) AS t — run the inner select
-      inner-ps
-      (let [sub-parsed (translate-select ^PlainSelect inner-ps schema db)
-            sub-q (cond-> (:query sub-parsed)
-                    (:limit sub-parsed)  (assoc :limit (:limit sub-parsed))
-                    (:offset sub-parsed) (assoc :offset (:offset sub-parsed)))
+      ;; (SELECT … FROM real-table …) AS t — run the inner select.
+      ;; Inner may also be a SetOperationList (UNION/INTERSECT/EXCEPT) —
+      ;; handle that by translating each branch, executing, and combining.
+      ;; SetOperationList branches share the same column-aliases by SQL
+      ;; spec; we use the first PlainSelect's find-aliases as canonical.
+      (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
+      (let [is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
+            ;; Translate-select on each branch (or just the inner-ps).
+            branch-parsed
+            (if is-union?
+              (let [^net.sf.jsqlparser.statement.select.SetOperationList sol inner
+                    branches (.getSelects sol)
+                    ops (.getOperations sol)
+                    op-kind (when (seq ops)
+                              (let [op (first ops)]
+                                (cond
+                                  (instance? net.sf.jsqlparser.statement.select.UnionOp op)
+                                  (if (.isAll ^net.sf.jsqlparser.statement.select.UnionOp op)
+                                    :union-all :union)
+                                  (instance? net.sf.jsqlparser.statement.select.IntersectOp op)
+                                  :intersect
+                                  (instance? net.sf.jsqlparser.statement.select.ExceptOp op)
+                                  :except
+                                  :else :union)))
+                    parsed (mapv (fn [s]
+                                   (when (instance? PlainSelect s)
+                                     (translate-select ^PlainSelect s schema db)))
+                                 branches)]
+                {:op op-kind :branches parsed})
+              {:op nil :branches [(translate-select ^PlainSelect inner-ps schema db)]})
+            sub-parsed (first (:branches branch-parsed))
             sub-aliases (:find-aliases sub-parsed)
-            sub-in-args (:in-args sub-parsed)
             q-fn (requiring-resolve 'datahike.api/q)
-            sub-results (if (seq sub-in-args)
-                          (apply q-fn sub-q db sub-in-args)
-                          (q-fn sub-q db))
+            ;; Execute each branch. Apply per-branch limit/offset.
+            run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
+                         (let [q (cond-> query
+                                   (:limit p)  (assoc :limit (:limit p))
+                                   (:offset p) (assoc :offset (:offset p)))
+                               raw (if (seq in-args)
+                                     (apply q-fn q db in-args)
+                                     (q-fn q db))
+                               raw (cond->> raw
+                                     sql-offset (drop sql-offset)
+                                     sql-limit  (take sql-limit))
+                               hc (or hidden-count 0)
+                               visible (- (count (:find query)) hc)]
+                           (if (pos? hc)
+                             (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                             raw)))
+            branch-rows (mapv run-branch (:branches branch-parsed))
+            sub-results (case (:op branch-parsed)
+                          :union-all (mapcat identity branch-rows)
+                          :union     (distinct (mapcat identity branch-rows))
+                          :intersect (let [sets (map set branch-rows)]
+                                       (apply clojure.set/intersection sets))
+                          :except    (let [[a & bs] branch-rows]
+                                       (reduce (fn [acc r] (apply disj acc r))
+                                               (set a) bs))
+                          ;; nil → not a UNION, single branch
+                          (first branch-rows))
             sub-results (cond->> sub-results
                           (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
                           (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))

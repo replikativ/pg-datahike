@@ -305,3 +305,15 @@
       (is (nil? (:err r)))
       ;; pg_views + pg_matviews are empty; only the pg_tables row flows.
       (is (= 1 (count (:rows r)))))))
+
+(deftest test-derived-table-over-union-with-where-alias
+  ;; Metabase build_privilege_map shape: `FROM (UNION-of-catalogs) t
+  ;; WHERE t.schemaname …`. Inner UNION must materialise into the
+  ;; derived-table alias so the outer WHERE can resolve `t.schemaname`.
+  (testing "WHERE t.<col> binds through a UNION-rooted derived table"
+    (let [r (ex (str "SELECT * FROM ("
+                     "  SELECT schemaname, tablename FROM pg_tables "
+                     "  UNION SELECT schemaname, viewname FROM pg_views"
+                     ") t WHERE t.schemaname = 'public'"))]
+      (is (nil? (:err r)))
+      (is (= 1 (count (:rows r)))))))
