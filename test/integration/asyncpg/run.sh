@@ -64,9 +64,12 @@ echo "[run] full output -> ${LOG}"
 
 # Use pytest-style output (asyncpg uses unittest but pytest runs it fine).
 # `-p no:cacheprovider` avoids creating .pytest_cache inside the upstream tree.
+# tee so CircleCI sees progress (a plain redirect starves its
+# no_output_timeout during the 10m+ run).
+set -o pipefail
 python -m pytest -v --tb=short -p no:cacheprovider \
-  "${MODULES[@]}" > "${LOG}" 2>&1
-RC=$?
+  "${MODULES[@]}" 2>&1 | tee "${LOG}"
+RC=${PIPESTATUS[0]}
 
 # --- summarize ---------------------------------------------------------------
 #

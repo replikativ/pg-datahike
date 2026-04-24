@@ -97,9 +97,12 @@ echo "[run] ./gradlew ${GRADLE_ARGS[*]}"
 echo "[run] full output -> ${LOG}"
 
 cd "${CLONE_DIR}"
+# tee the gradle output so CI stdout sees progress during the ~6-10m
+# run — a plain redirect starves CircleCI's no_output_timeout.
+set -o pipefail
 # shellcheck disable=SC2068
-./gradlew ${GRADLE_ARGS[@]} > "${LOG}" 2>&1
-GRADLE_RC=$?
+./gradlew ${GRADLE_ARGS[@]} --console=plain 2>&1 | tee "${LOG}"
+GRADLE_RC=${PIPESTATUS[0]}
 
 # --- summarize ---------------------------------------------------------------
 #

@@ -64,15 +64,21 @@ echo "[run-one] using JDK21=${JDK21}" >&2
 cd "${CLONE_DIR}"
 GRADLE_FILTERS=(--tests "${CLASS}")
 for f in "${EXTRA_FILTERS[@]}"; do GRADLE_FILTERS+=(--tests "${f}"); done
-# Keep the daemon alive between runs — single-test iteration drops from ~30s
-# (cold JVM) to ~3-5s (warm daemon). Users of the all-class runner (run.sh)
-# still use --no-daemon so CI repeats are deterministic.
+# Keep the daemon alive between runs — single-test iteration drops from
+# ~30s (cold JVM) to ~3-5s (warm daemon). Users of the all-class runner
+# (run.sh) still use --no-daemon so CI repeats are deterministic.
+#
+# `tee` the output so the shell (and CircleCI) sees progress in real
+# time. A plain redirect to a file starves CircleCI's stdout for the
+# whole gradle run (~6-10 min) and hits its no_output_timeout before
+# the tests even finish.
+set -o pipefail
 JAVA_HOME="${JDK21}" PATH="${JDK21}/bin:${PATH}" \
   ./gradlew :postgresql:test "${GRADLE_FILTERS[@]}" \
   -PjdkBuildVersion=21 \
-  --daemon --no-scan \
-  -Dorg.gradle.java.home="${JDK21}" > "${LOG}" 2>&1
-RC=$?
+  --daemon --no-scan --console=plain \
+  -Dorg.gradle.java.home="${JDK21}" 2>&1 | tee "${LOG}"
+RC=${PIPESTATUS[0]}
 
 XML="${CLONE_DIR}/pgjdbc/build/test-results/test/TEST-${CLASS}.xml"
 if [[ -f "${XML}" ]]; then
