@@ -28,7 +28,7 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.statement.select PlainSelect SelectItem AllColumns Join ParenthesedSelect]
+           [net.sf.jsqlparser.statement.select PlainSelect SelectItem AllColumns Join ParenthesedSelect SetOperationList]
            [net.sf.jsqlparser.expression.operators.relational EqualsTo]
            [net.sf.jsqlparser.expression StringValue Alias]))
 
@@ -657,25 +657,103 @@
            (pgs/row-marker-attr "information_schema_key_column_usage") true}))))
     nil))
 
-(defn catalog-tables-used
-  "Walk a PlainSelect's FROM + JOIN items and return the set of
-   catalog table names referenced. Called with every join right-item
-   too so `SELECT … FROM pg_class c JOIN pg_attribute a ON …` sees
-   both. Mutates matching Table nodes to the normalized internal name
-   so the SQL translator sees `pg_attribute` instead of
-   `pg_catalog.pg_attribute`."
-  [^PlainSelect stmt]
+(declare collect-in-stmt! collect-in-expr!)
+
+(defn- collect-in-plain!
+  "Recurse into a PlainSelect's FROM-item and JOIN right-items. For
+   each Table that maps to a catalog, mutate it to the internal name
+   and record it in the accumulator. For ParenthesedSelect items
+   (derived tables), recurse into the inner select. Also scan WHERE
+   for embedded subqueries (EXISTS / scalar subquery references).
+   Returns the updated accumulator set.
+
+   Arg order is `[acc stmt]` consistently across the helpers so that
+   `(reduce collect-in-plain! #{} stmts)` works as a natural
+   accumulator pattern."
+  [acc ^PlainSelect stmt]
   (let [items (cons (.getFromItem stmt)
                     (map (fn [^Join j] (.getRightItem j))
                          (or (.getJoins stmt) [])))
-        result (transient #{})]
-    (doseq [item items]
-      (when (instance? Table item)
-        (when-let [tn (catalog-table-name ^Table item)]
-          (.setName ^Table item tn)
-          (.setSchemaName ^Table item nil)
-          (conj! result tn))))
-    (persistent! result)))
+        acc (reduce
+             (fn [acc item]
+               (cond
+                 (instance? Table item)
+                 (if-let [tn (catalog-table-name ^Table item)]
+                   (do (.setName ^Table item tn)
+                       (.setSchemaName ^Table item nil)
+                       (conj acc tn))
+                   acc)
+                 (instance? ParenthesedSelect item)
+                 (collect-in-stmt! acc (.getSelect ^ParenthesedSelect item))
+                 :else acc))
+             acc
+             items)
+        where-expr (.getWhere stmt)]
+    (if where-expr
+      (collect-in-expr! acc where-expr)
+      acc)))
+
+(defn- collect-in-expr!
+  "Scan an Expression tree for embedded ParenthesedSelects (subqueries
+   in WHERE / projection / EXISTS) and recurse into them."
+  [acc expr]
+  (cond
+    (nil? expr) acc
+    (instance? ParenthesedSelect expr)
+    (collect-in-stmt! acc (.getSelect ^ParenthesedSelect expr))
+    (instance? net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr)
+    (collect-in-expr!
+     acc
+     (.getRightExpression ^net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr))
+    (instance? net.sf.jsqlparser.expression.BinaryExpression expr)
+    (let [^net.sf.jsqlparser.expression.BinaryExpression be expr]
+      (-> acc
+          (collect-in-expr! (.getLeftExpression be))
+          (collect-in-expr! (.getRightExpression be))))
+    (instance? net.sf.jsqlparser.expression.Parenthesis expr)
+    (collect-in-expr! acc
+                      (.getExpression ^net.sf.jsqlparser.expression.Parenthesis expr))
+    :else acc))
+
+(defn collect-in-stmt!
+  "Walk a SELECT / ParenthesedSelect / SetOperationList statement and
+   collect the set of catalog table names it references (anywhere —
+   top-level FROM/JOINs, derived tables, UNION branches, WHERE
+   subqueries, CTE bodies). Mutates matching Table nodes to the
+   normalized internal catalog name. Returns the accumulated set."
+  ([stmt] (collect-in-stmt! #{} stmt))
+  ([acc stmt]
+   (cond
+     (nil? stmt) acc
+     (instance? PlainSelect stmt)
+     (let [^PlainSelect ps stmt
+           acc (reduce (fn [a ^net.sf.jsqlparser.statement.select.WithItem wi]
+                         (collect-in-stmt! a (.getSelect wi)))
+                       acc
+                       (or (.getWithItemsList ps) []))]
+       (collect-in-plain! acc ps))
+     (instance? ParenthesedSelect stmt)
+     (collect-in-stmt! acc (.getSelect ^ParenthesedSelect stmt))
+     (instance? SetOperationList stmt)
+     (reduce collect-in-stmt! acc (.getSelects ^SetOperationList stmt))
+     :else acc)))
+
+(defn catalog-tables-used
+  "Walk a PlainSelect's FROM + JOIN items (plus any nested derived
+   tables, UNION branches, and WHERE subqueries) and return the set of
+   catalog table names referenced. Mutates matching Table nodes to the
+   normalized internal name so the SQL translator sees `pg_attribute`
+   instead of `pg_catalog.pg_attribute`."
+  [^PlainSelect stmt]
+  (collect-in-stmt! stmt))
+
+(defn catalog-tables-in-stmt
+  "Same as catalog-tables-used but accepts any Statement (PlainSelect,
+   ParenthesedSelect, SetOperationList). Used by sql/parse-sql's
+   top-level dispatch to pick up catalog refs under UNIONs and
+   top-level ParenthesedSelects."
+  [stmt]
+  (collect-in-stmt! stmt))
 
 ;; ============================================================================
 ;; System query detection

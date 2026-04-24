@@ -273,3 +273,35 @@
       (let [cols (set (map first (:rows r)))]
         (is (contains? cols "name") "UNIQUE on :person/name should surface 'name'")
         (is (contains? cols "db_id") "implicit pkey on db_id")))))
+
+;; ============================================================================
+;; Nested catalog references — derived tables + UNIONs.
+;;
+;; Catalog materialisation previously only fired for top-level PlainSelect
+;; FROM/JOIN items, so `SELECT * FROM (SELECT … FROM pg_tables) t` and
+;; `SELECT … FROM pg_tables UNION SELECT … FROM pg_views` both returned
+;; zero rows. The recursive collector in catalog.clj plus the hoisted
+;; materialisation at the top of parse-sql fix this uniformly.
+;; ============================================================================
+
+(deftest test-catalog-under-derived-table
+  (testing "SELECT * FROM (SELECT … FROM pg_tables) t — inner catalog materialises"
+    (let [r (ex "SELECT * FROM (SELECT tablename FROM pg_tables) t")]
+      (is (nil? (:err r)))
+      (is (contains? (set (map first (:rows r))) "person")))))
+
+(deftest test-catalog-under-union
+  (testing "UNION of catalog tables — each branch sees the materialised db"
+    (let [r (ex (str "SELECT tablename FROM pg_tables "
+                     "UNION SELECT viewname FROM pg_views"))]
+      (is (nil? (:err r)))
+      (is (contains? (set (map first (:rows r))) "person")))))
+
+(deftest test-catalog-under-three-way-union
+  (testing "Triple UNION pg_tables ∪ pg_views ∪ pg_matviews"
+    (let [r (ex (str "SELECT schemaname, tablename FROM pg_tables "
+                     "UNION SELECT schemaname, viewname FROM pg_views "
+                     "UNION SELECT schemaname, matviewname FROM pg_matviews"))]
+      (is (nil? (:err r)))
+      ;; pg_views + pg_matviews are empty; only the pg_tables row flows.
+      (is (= 1 (count (:rows r)))))))

@@ -3871,7 +3871,14 @@
                               (classified-error "DROP SEQUENCE error: " e)))
 
                           :set-operation
-                          (let [{:keys [op sub-results]} parsed
+                          (let [{:keys [op sub-results enriched-db]} parsed
+                                ;; When the top-level UNION / INTERSECT
+                                ;; references catalog tables (or CTEs via
+                                ;; a parent scope), parse-sql attaches
+                                ;; :enriched-db here so each sub-query
+                                ;; runs against the enriched speculative
+                                ;; db, not the handler's raw connection db.
+                                query-db (or enriched-db db)
                   ;; Execute each sub-query and strip any hidden ORDER-BY
                   ;; columns before combining — sub-queries may add entity-id
                   ;; (or similar) to :find for server-side sort, which must
@@ -3880,8 +3887,8 @@
                                 exec-sub (fn [{:keys [query in-args find-aliases hidden-count]}]
                                            (let [q-input (assoc query :cancel (current-cancel))
                                                  raw (if (seq in-args)
-                                                       (apply d/q q-input db in-args)
-                                                       (d/q q-input db))
+                                                       (apply d/q q-input query-db in-args)
+                                                       (d/q q-input query-db))
                                                  hc (or hidden-count 0)
                                                  visible (- (count (:find query)) hc)
                                                  results (if (pos? hc)

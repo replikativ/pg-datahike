@@ -262,6 +262,40 @@
 
       ;; Parse with JSqlParser
            (let [stmt (CCJSqlParserUtil/parse ^String (preprocess-sql sql))
+            ;; Catalog materialisation: find every catalog table ref
+            ;; anywhere in the AST (top-level, derived tables, UNION
+            ;; branches, WHERE subqueries, CTE bodies) and inject a
+            ;; speculative db with their schema + rows. Each branch
+            ;; below uses `db` (now enriched) as the base so nested
+            ;; scopes see the same catalog data without re-walking.
+            ;; `orig-db` holds the un-enriched reference so the
+            ;; `(not= cte-db orig-db)` check further down tags the
+            ;; result with :enriched-db for the server's executor.
+                 orig-db db
+                 [db schema]
+                 (if db
+                   (let [used-catalogs (catalog/catalog-tables-in-stmt stmt)]
+                     (if (empty? used-catalogs)
+                       [db schema]
+                       (let [with-fn (requiring-resolve 'datahike.api/db-with)
+                             sorted-names (sort used-catalogs)
+                             combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
+                             combined-data (vec (mapcat #(catalog/catalog-data-for
+                                                          % schema db)
+                                                        sorted-names))
+                             cache *catalog-cache*
+                             cache-key [(hash (:schema db)) sorted-names]
+                             cached (cache-get cache cache-key)
+                             enriched
+                             (or cached
+                                 (cache-put!
+                                  cache cache-key
+                                  (let [spec-db (with-fn db combined-schema)]
+                                    (if (seq combined-data)
+                                      (with-fn spec-db combined-data)
+                                      spec-db))))]
+                         [enriched (:schema enriched)])))
+                   [db schema])
             ;; Count prepared-statement placeholders once at the AST
             ;; level — reused for INSERT/UPDATE/DELETE which don't
             ;; accumulate placeholders in a ctx (unlike translate-select).
@@ -418,43 +452,12 @@
                             [db schema]
                             withs)
                            [db schema])
-                ;; Materialize catalog virtual tables (pg_type, pg_attribute, etc.)
-                ;; Walks FROM + every JOIN right-item so queries like
-                ;; `pg_class c JOIN pg_attribute a ON …` get both tables
-                ;; injected into the speculative db. Each matching Table
-                ;; AST node is renamed to the internal catalog key (e.g.
-                ;; `information_schema.columns` → `information_schema_columns`).
+                ;; Catalog materialisation already happened at the outer
+                ;; parse-sql scope (see the `[db schema]` binding at the
+                ;; top of the JSqlParser branch). CTEs above use the
+                ;; enriched cte-db; nothing more to do here.
                          [cte-db cte-schema]
-                         (if (nil? cte-db)
-                           [cte-db cte-schema]
-                           (let [used-catalogs (catalog/catalog-tables-used ^PlainSelect stmt)]
-                             (if (empty? used-catalogs)
-                               [cte-db cte-schema]
-                               (let [with-fn (requiring-resolve 'datahike.api/db-with)
-                                     user-schema cte-schema
-                            ;; Build combined schema + data for every used catalog
-                                     sorted-names (sort used-catalogs)
-                                     combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
-                                     combined-data (vec (mapcat #(catalog/catalog-data-for
-                                                                  % user-schema cte-db)
-                                                                sorted-names))
-                                     cache *catalog-cache*
-                            ;; Content-hash of the user schema, not
-                            ;; identity — same shape across connections
-                            ;; hits the same entry. Sorted catalog
-                            ;; names mean FROM/JOIN order doesn't
-                            ;; create spurious misses.
-                                     cache-key [(hash (:schema cte-db)) sorted-names]
-                                     cached (cache-get cache cache-key)
-                                     enriched-db
-                                     (or cached
-                                         (cache-put!
-                                          cache cache-key
-                                          (let [spec-db (with-fn cte-db combined-schema)]
-                                            (if (seq combined-data)
-                                              (with-fn spec-db combined-data)
-                                              spec-db))))]
-                                 [enriched-db (:schema enriched-db)]))))
+                         [cte-db cte-schema]
 
 ;; Table-free SELECT (e.g. SELECT 1+2, SELECT CASE WHEN 1>2 THEN 3 END)
                 ;; Evaluate expressions directly without going through the query engine.
@@ -765,8 +768,17 @@
 
                                   :else
                                   (translate-select ^PlainSelect stmt cte-schema cte-db))
-                ;; Pass enriched db to server when CTEs/derived tables modified it
-                         result (if (not= cte-db db)
+                ;; Pass enriched db to server when the top-level catalog
+                ;; materialisation or CTE processing produced a different
+                ;; db from the user's original — but only if
+                ;; translate-select didn't already tag a tighter
+                ;; enriched-db (e.g. one containing a derived-table's
+                ;; `:<alias>/*` attrs). `identical?` (reference equality)
+                ;; is the right check against `orig-db` — Datahike's
+                ;; `=` returns true on structurally equal DB snapshots
+                ;; and would mask the distinction.
+                         result (if (and (nil? (:enriched-db result))
+                                         (not (identical? cte-db orig-db)))
                                   (assoc result :enriched-db cte-db)
                                   result)]
                      (if has-full-join?
@@ -797,7 +809,8 @@
                    (let [inner (.getSelect ^ParenthesedSelect stmt)]
                      (if (instance? PlainSelect inner)
                        (let [result (translate-select ^PlainSelect inner schema db)]
-                         (assoc result :type :select))
+                         (cond-> (assoc result :type :select)
+                           (not (identical? db orig-db)) (assoc :enriched-db db)))
                        {:type :error :message (str "Unsupported nested select: " (type inner))}))
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT
@@ -820,9 +833,14 @@
                                        (instance? IntersectOp op) :intersect
                                        (instance? ExceptOp op) :except
                                        :else :union-all)))]
-                     {:type :set-operation
-                      :op op-type
-                      :sub-results sub-results})
+                     (cond-> {:type :set-operation
+                              :op op-type
+                              :sub-results sub-results}
+                       ;; Top-level catalog materialisation propagates
+                       ;; to the server's set-operation executor via
+                       ;; :enriched-db — each sub-query runs against it.
+                       (not (identical? db orig-db))
+                       (assoc :enriched-db db)))
 
           ;; INSERT
                    (instance? Insert stmt)
