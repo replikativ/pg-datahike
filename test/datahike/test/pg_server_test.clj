@@ -282,7 +282,28 @@
 
   (testing "LIKE with % in middle"
     (let [r (.execute *handler* "SELECT name FROM person WHERE name LIKE '%li%'")]
-      (is (= 2 (count (rows r)))))))
+      (is (= 2 (count (rows r))))))
+
+  (testing "regex match (~) — anchor"
+    (let [r (.execute *handler* "SELECT name FROM person WHERE name ~ '^A'")]
+      (is (= [["Alice"]] (rows r)))))
+
+  (testing "regex match (~) — substring"
+    (let [r (.execute *handler* "SELECT name FROM person WHERE name ~ 'li'")]
+      (is (= 2 (count (rows r))))))
+
+  (testing "regex non-match (!~) — case-sensitive"
+    (let [r (.execute *handler* "SELECT name FROM person WHERE name !~ '^A'")]
+      ;; Bob, Charlie. NULLs are excluded (UNKNOWN → FALSE).
+      (is (= #{"Bob" "Charlie"} (set (map first (rows r)))))))
+
+  (testing "regex case-insensitive match (~*)"
+    (let [r (.execute *handler* "SELECT name FROM person WHERE name ~* '^a'")]
+      (is (= [["Alice"]] (rows r)))))
+
+  (testing "regex case-insensitive non-match (!~*)"
+    (let [r (.execute *handler* "SELECT name FROM person WHERE name !~* '^a'")]
+      (is (= #{"Bob" "Charlie"} (set (map first (rows r))))))))
 
 ;; ============================================================================
 ;; Aggregates

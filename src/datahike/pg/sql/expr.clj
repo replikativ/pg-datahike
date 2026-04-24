@@ -1934,15 +1934,28 @@
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           pattern (translate-expr ctx (.getRightExpression e))
-          ;; Build regex predicate using re-matches
-          match-pred (if case-insensitive?
-                       (list 're-find (list 're-pattern (list 'str "(?i)" pattern)) col)
-                       (list 're-find (list 're-pattern pattern) col))
-          ;; Null-guard: re-find on :__null__ would throw; also SQL says NULL col → UNKNOWN → FALSE.
+          pat-str (str pattern)
+          re-str (if case-insensitive? (str "(?i)" pat-str) pat-str)
+          ;; Pre-compile and inject the matcher as an in-param. Two reasons:
+          ;;  (1) Datahike does not resolve nested fn calls inside a single
+          ;;      predicate, so `[(not (re-find …))]` silently treats the
+          ;;      inner call as opaque-truthy.
+          ;;  (2) Datalog `(not […])` clauses don't compose with `or-join`
+          ;;      when sibling branches reference different vars (Metabase's
+          ;;      getSchemas idiom: `nspname !~ '^pg_temp_' OR nspname = (current_schemas(true))[1]`).
+          ;; Emitting a boolean predicate via in-param sidesteps both.
+          re-obj (re-pattern re-str)
+          matcher (if negate?
+                    (fn [s] (and (some? s) (not (.find (.matcher ^java.util.regex.Pattern re-obj (str s))))))
+                    (fn [s] (and (some? s) (boolean (.find (.matcher ^java.util.regex.Pattern re-obj (str s)))))))
+          fn-param (symbol (str "?re-match" (swap! (:var-counter ctx) inc)))
+          _ (swap! (:in-params ctx) conj fn-param)
+          _ (swap! (:in-args ctx) conj matcher)
+          ;; Null-guard: SQL says NULL col → UNKNOWN → FALSE. Matcher
+          ;; tolerates :__null__ via some? check, but the explicit guard
+          ;; keeps the predicate consistent with the LIKE / `=` shapes.
           guards (ctx/null-guard-clauses ctx [col])]
-      (if negate?
-        (conj guards [(list 'not match-pred)])
-        (conj guards [match-pred])))
+      (conj guards [(list fn-param col)]))
 
     (instance? LikeExpression expr)
     (let [^LikeExpression e expr
