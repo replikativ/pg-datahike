@@ -113,9 +113,13 @@ jobs:
       - run:
           name: Install Clojure CLI
           command: |
-            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
-            chmod +x linux-install-1.12.4.1588.sh
-            sudo ./linux-install-1.12.4.1588.sh
+            # download.clojure.org returns 403 from CI IPs — fetch the
+            # canonical installer from GitHub Releases instead. --fail
+            # aborts on any HTTP error so we don't silently write the
+            # error body to disk and try to execute it.
+            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
       - run:
           name: Install babashka
           command: |
@@ -160,9 +164,13 @@ jobs:
       - run:
           name: Install Clojure + babashka
           command: |
-            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
-            chmod +x linux-install-1.12.4.1588.sh
-            sudo ./linux-install-1.12.4.1588.sh
+            # download.clojure.org returns 403 from CI IPs — fetch the
+            # canonical installer from GitHub Releases instead. --fail
+            # aborts on any HTTP error so we don't silently write the
+            # error body to disk and try to execute it.
+            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
           name: Compile Java sources
@@ -194,9 +202,13 @@ jobs:
           name: Install Clojure + babashka + JDK
           command: |
             sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless netcat-openbsd
-            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
-            chmod +x linux-install-1.12.4.1588.sh
-            sudo ./linux-install-1.12.4.1588.sh
+            # download.clojure.org returns 403 from CI IPs — fetch the
+            # canonical installer from GitHub Releases instead. --fail
+            # aborts on any HTTP error so we don't silently write the
+            # error body to disk and try to execute it.
+            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
           name: Compile Java sources
@@ -229,12 +241,28 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Install Clojure + babashka + Maven
+          name: Install Clojure + babashka + Maven + netcat
           command: |
-            sudo apt-get update && sudo apt-get install -y maven netcat-openbsd
-            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
-            chmod +x linux-install-1.12.4.1588.sh
-            sudo ./linux-install-1.12.4.1588.sh
+            # NOTE: do NOT `apt-get install maven` on cimg/openjdk:21.
+            # Ubuntu's maven package Depends: on openjdk-11-jre-headless,
+            # which trips ca-certificates-java's post-install script
+            # (it expects /etc/ssl/certs/java/cacerts to be a file; the
+            # image has it as a directory). The install aborts with
+            # "jks-keystore exited with code 1". Fetch Maven directly
+            # from Apache instead — no JDK dep, no post-inst.
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends netcat-openbsd
+            MAVEN_VERSION=3.9.9
+            curl -sL https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz \
+              | sudo tar -xz -C /opt
+            sudo ln -sf /opt/apache-maven-${MAVEN_VERSION}/bin/mvn /usr/local/bin/mvn
+            mvn -v
+            # download.clojure.org returns 403 from CI IPs — fetch the
+            # canonical installer from GitHub Releases instead. --fail
+            # aborts on any HTTP error so we don't silently write the
+            # error body to disk and try to execute it.
+            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
           name: Compile Java sources
@@ -264,9 +292,13 @@ jobs:
       - run:
           name: Install Clojure + babashka
           command: |
-            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
-            chmod +x linux-install-1.12.4.1588.sh
-            sudo ./linux-install-1.12.4.1588.sh
+            # download.clojure.org returns 403 from CI IPs — fetch the
+            # canonical installer from GitHub Releases instead. --fail
+            # aborts on any HTTP error so we don't silently write the
+            # error body to disk and try to execute it.
+            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
           name: Install SQLAlchemy + psycopg2
