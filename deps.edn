@@ -34,7 +34,13 @@
   ;; access.
   :server {:extra-paths ["test"]
            :extra-deps  {nrepl/nrepl {:mvn/version "1.0.0"}}
-           :main-opts   ["-m" "clojure.main" "test/integration/start_pgwire.clj"]}
+           ;; clojure -M:server already goes through clojure.main; a
+           ;; bare script path as the only main-opt = "load and run".
+           ;; Adding `-m clojure.main` on top makes it try to resolve
+           ;; `clojure.main/-main` as an IFn and NPEs, because
+           ;; clojure.main is the dispatcher, not a user ns with a
+           ;; -main var.
+           :main-opts   ["test/integration/start_pgwire.clj"]}
 
   ;; tools.build-based jar / install / deploy.
   :build {:extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
