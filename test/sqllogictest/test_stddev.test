@@ -1,0 +1,73 @@
+# test_stddev.test
+# PostgreSQL-compatible STDDEV and VARIANCE aggregate function tests
+
+statement ok
+CREATE TABLE integers (i INTEGER)
+
+statement ok
+INSERT INTO integers VALUES (1), (2), (3), (4), (5)
+
+# VARIANCE (population)
+query R rowsort
+SELECT VARIANCE(i) FROM integers
+----
+2.500000
+
+# STDDEV (population)
+query R rowsort
+SELECT STDDEV(i) FROM integers
+----
+1.581139
+
+# With NULLs — NULLs are skipped
+statement ok
+CREATE TABLE nullints (i INTEGER)
+
+statement ok
+INSERT INTO nullints VALUES (2), (4), (NULL), (6), (8)
+
+query R rowsort
+SELECT VARIANCE(i) FROM nullints
+----
+6.666667
+
+query R rowsort
+SELECT STDDEV(i) FROM nullints
+----
+2.581989
+
+# With GROUP BY
+statement ok
+CREATE TABLE groups (g INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO groups VALUES (1, 10), (1, 20), (1, 30), (2, 100), (2, 200)
+
+query IR rowsort
+SELECT g, VARIANCE(v) FROM groups GROUP BY g
+----
+1	100.000000
+2	5000.000000
+
+query IR rowsort
+SELECT g, STDDEV(v) FROM groups GROUP BY g
+----
+1	10.000000
+2	70.710678
+
+# Single value — VAR_SAMP/STDDEV_SAMP return NULL (division by n-1=0)
+statement ok
+CREATE TABLE single (i INTEGER)
+
+statement ok
+INSERT INTO single VALUES (42)
+
+query R rowsort
+SELECT VARIANCE(i) FROM single
+----
+NULL
+
+query R rowsort
+SELECT STDDEV(i) FROM single
+----
+NULL

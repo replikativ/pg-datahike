@@ -1,0 +1,58 @@
+# test_subquery.test
+# Subqueries: IN (SELECT ...), NOT IN (SELECT ...)
+
+statement ok
+CREATE TABLE employees (name TEXT, salary INTEGER, dept TEXT)
+
+statement ok
+INSERT INTO employees (name, salary, dept) VALUES ('Alice', 80000, 'eng')
+
+statement ok
+INSERT INTO employees (name, salary, dept) VALUES ('Bob', 60000, 'eng')
+
+statement ok
+INSERT INTO employees (name, salary, dept) VALUES ('Charlie', 90000, 'sales')
+
+statement ok
+INSERT INTO employees (name, salary, dept) VALUES ('Diana', 70000, 'sales')
+
+statement ok
+CREATE TABLE high_earners (salary INTEGER)
+
+statement ok
+INSERT INTO high_earners (salary) VALUES (80000)
+
+statement ok
+INSERT INTO high_earners (salary) VALUES (90000)
+
+# ============================================================
+# IN (SELECT ...)
+# ============================================================
+
+query T rowsort
+SELECT name FROM employees WHERE salary IN (SELECT salary FROM high_earners)
+----
+Alice
+Charlie
+
+# ============================================================
+# NOT IN (SELECT ...)
+# ============================================================
+
+query T rowsort
+SELECT name FROM employees WHERE salary NOT IN (SELECT salary FROM high_earners)
+----
+Bob
+Diana
+
+# ============================================================
+# IN subquery with WHERE
+# ============================================================
+
+query T rowsort
+SELECT name FROM employees WHERE dept IN (SELECT dept FROM employees WHERE salary > 75000)
+----
+Alice
+Bob
+Charlie
+Diana

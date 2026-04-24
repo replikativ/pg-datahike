@@ -1,0 +1,56 @@
+# test_set_ops.test
+# Set operation tests (UNION, INTERSECT, EXCEPT)
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b TEXT)
+
+statement ok
+CREATE TABLE t2 (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+statement ok
+INSERT INTO t2 VALUES (2, 'y'), (3, 'z'), (4, 'w')
+
+# UNION ALL — preserves duplicates
+query IT rowsort
+SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2
+----
+1	x
+2	y
+2	y
+3	z
+3	z
+4	w
+
+# UNION — removes duplicates
+query IT rowsort
+SELECT a, b FROM t1 UNION SELECT a, b FROM t2
+----
+1	x
+2	y
+3	z
+4	w
+
+# INTERSECT — common rows only
+query IT rowsort
+SELECT a, b FROM t1 INTERSECT SELECT a, b FROM t2
+----
+2	y
+3	z
+
+# EXCEPT — rows in t1 but not in t2
+query IT rowsort
+SELECT a, b FROM t1 EXCEPT SELECT a, b FROM t2
+----
+1	x
+
+# UNION ALL with WHERE
+query IT rowsort
+SELECT a, b FROM t1 WHERE a > 1 UNION ALL SELECT a, b FROM t2 WHERE a < 4
+----
+2	y
+2	y
+3	z
+3	z

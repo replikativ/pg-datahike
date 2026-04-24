@@ -1,0 +1,84 @@
+# test_dml.test
+# Data manipulation: INSERT, UPDATE, DELETE
+
+statement ok
+CREATE TABLE inventory (sku TEXT, qty INTEGER, price DOUBLE PRECISION)
+
+statement ok
+INSERT INTO inventory (sku, qty, price) VALUES ('AAA', 100, 9.99)
+
+statement ok
+INSERT INTO inventory (sku, qty, price) VALUES ('BBB', 50, 19.99)
+
+statement ok
+INSERT INTO inventory (sku, qty, price) VALUES ('CCC', 200, 4.99)
+
+# Verify initial state
+query TIR nosort
+SELECT sku, qty, price FROM inventory ORDER BY sku
+----
+AAA	100	9.990000
+BBB	50	19.990000
+CCC	200	4.990000
+
+query I rowsort
+SELECT COUNT(*) FROM inventory
+----
+3
+
+# ============================================================
+# UPDATE
+# ============================================================
+
+statement ok
+UPDATE inventory SET qty = 75 WHERE sku = 'BBB'
+
+query I rowsort
+SELECT qty FROM inventory WHERE sku = 'BBB'
+----
+75
+
+statement ok
+UPDATE inventory SET price = 5.99 WHERE sku = 'CCC'
+
+query R rowsort
+SELECT price FROM inventory WHERE sku = 'CCC'
+----
+5.990000
+
+# ============================================================
+# DELETE
+# ============================================================
+
+statement ok
+DELETE FROM inventory WHERE sku = 'CCC'
+
+query I rowsort
+SELECT COUNT(*) FROM inventory
+----
+2
+
+query T rowsort
+SELECT sku FROM inventory
+----
+AAA
+BBB
+
+# ============================================================
+# INSERT after DELETE — verify IDs don't collide
+# ============================================================
+
+statement ok
+INSERT INTO inventory (sku, qty, price) VALUES ('DDD', 300, 1.99)
+
+query I rowsort
+SELECT COUNT(*) FROM inventory
+----
+3
+
+query T rowsort
+SELECT sku FROM inventory
+----
+AAA
+BBB
+DDD

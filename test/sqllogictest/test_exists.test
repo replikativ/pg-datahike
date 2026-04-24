@@ -1,0 +1,70 @@
+# test_exists.test
+# EXISTS and NOT EXISTS subqueries.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+statement ok
+CREATE TABLE t2 (x INTEGER, y TEXT)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'alpha'), (2, 'beta')
+
+statement ok
+CREATE TABLE empty_t (z INTEGER)
+
+# ============================================================
+# Uncorrelated EXISTS (subquery has rows)
+# ============================================================
+
+query IT rowsort
+SELECT a, b FROM t1 WHERE EXISTS (SELECT 1 FROM t2)
+----
+1	one
+2	two
+3	three
+
+# ============================================================
+# Uncorrelated NOT EXISTS (subquery has rows)
+# ============================================================
+
+query IT rowsort
+SELECT a, b FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2)
+----
+
+# ============================================================
+# Uncorrelated EXISTS (subquery empty)
+# ============================================================
+
+query IT rowsort
+SELECT a, b FROM t1 WHERE EXISTS (SELECT 1 FROM empty_t)
+----
+
+# ============================================================
+# Uncorrelated NOT EXISTS (subquery empty)
+# ============================================================
+
+query IT rowsort
+SELECT a, b FROM t1 WHERE NOT EXISTS (SELECT 1 FROM empty_t)
+----
+1	one
+2	two
+3	three
+
+# ============================================================
+# EXISTS with non-trivial subquery
+# ============================================================
+
+query IT rowsort
+SELECT a, b FROM t1 WHERE EXISTS (SELECT x FROM t2 WHERE x > 5)
+----
+
+query IT rowsort
+SELECT a, b FROM t1 WHERE EXISTS (SELECT x FROM t2 WHERE x > 0)
+----
+1	one
+2	two
+3	three

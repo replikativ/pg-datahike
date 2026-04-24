@@ -1,0 +1,58 @@
+# test_date.test
+# Date function tests (epoch-seconds representation)
+
+statement ok
+CREATE TABLE events (id INTEGER, ts INTEGER)
+
+# Timestamps as epoch-seconds: 2024-01-15 10:30:00 = 1705312200, etc.
+statement ok
+INSERT INTO events VALUES (1, 1705312200), (2, 1705398600), (3, 1705485000), (4, 1705571400), (5, 1705657800)
+
+# DATE_TRUNC day
+query II rowsort
+SELECT id, DATE_TRUNC('day', ts) FROM events
+----
+1	1705276800
+2	1705363200
+3	1705449600
+4	1705536000
+5	1705622400
+
+# GROUP BY DATE_TRUNC
+query IR rowsort
+SELECT DATE_TRUNC('day', ts) AS day, COUNT(*) FROM events GROUP BY DATE_TRUNC('day', ts)
+----
+1705276800	1.000000
+1705363200	1.000000
+1705449600	1.000000
+1705536000	1.000000
+1705622400	1.000000
+
+# DATE_TRUNC hour (truncates to top of the hour)
+query II rowsort
+SELECT id, DATE_TRUNC('hour', ts) FROM events
+----
+1	1705309200
+2	1705395600
+3	1705482000
+4	1705568400
+5	1705654800
+
+# DATE_ADD — add 1 day (86400 seconds)
+query II rowsort
+SELECT id, DATE_ADD('seconds', 86400, ts) AS next_day FROM events WHERE id = 1
+----
+1	1705398600
+
+# DATE_DIFF in days (end_ts - start_ts)
+statement ok
+CREATE TABLE intervals (id INTEGER, start_ts INTEGER, end_ts INTEGER)
+
+statement ok
+INSERT INTO intervals VALUES (1, 1705312200, 1705398600), (2, 1705312200, 1705485000)
+
+query II rowsort
+SELECT id, DATE_DIFF('days', end_ts, start_ts) FROM intervals
+----
+1	1
+2	2

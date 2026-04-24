@@ -1,0 +1,4 @@
+{:error nil,
+ :rows
+ [["public" "address" "BASE TABLE"]
+  ["public" "person" "BASE TABLE"]]}

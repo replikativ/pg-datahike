@@ -1,0 +1,5 @@
+# Ignore the cloned upstream source tree and virtualenv.
+asyncpg/
+.venv/
+*.log
+last-run.log

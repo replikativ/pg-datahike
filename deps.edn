@@ -1,0 +1,50 @@
+{:paths ["src" "java" "target/classes"]
+
+ :deps
+ {org.clojure/clojure               {:mvn/version "1.12.4"}
+  org.replikativ/datahike           {:mvn/version "0.8.1673"}
+  ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
+  com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}}
+
+ :aliases
+ {;; Prep task: compile Java sources before Clojure can load them.
+  ;; `clj -T:build compile-java` (or `clj -X:prep`) must run before
+  ;; any other alias that loads datahike.pg.server.
+  :prep {:exec-fn clojure.tools.build.api/javac
+         :exec-args {:src-dirs ["java"]
+                     :class-dir "target/classes"
+                     :basis-args {:aliases [:build]}
+                     :javac-opts ["-source" "17" "-target" "17"]}
+         :extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}}}
+
+  ;; Unit tests — ns-based, run against :local/root datahike.
+  :test {:extra-paths ["test"]
+         :extra-deps  {lambdaisland/kaocha  {:mvn/version "1.91.1392"}
+                       org.postgresql/postgresql {:mvn/version "42.7.3"}}
+         :main-opts   ["-m" "kaocha.runner"]}
+
+  ;; Dev REPL with test code on the classpath + nREPL for editor hook-up.
+  :dev {:extra-paths ["test"]
+        :extra-deps  {nrepl/nrepl            {:mvn/version "1.0.0"}
+                      lambdaisland/kaocha    {:mvn/version "1.91.1392"}
+                      org.postgresql/postgresql {:mvn/version "42.7.3"}}}
+
+  ;; Server launcher — pairs with test/integration/start_pgwire.clj.
+  ;; Starts pgwire on :15432 + nREPL on :15433 for dual SQL + Datalog
+  ;; access.
+  :server {:extra-paths ["test"]
+           :extra-deps  {nrepl/nrepl {:mvn/version "1.0.0"}}
+           :main-opts   ["-m" "clojure.main" "test/integration/start_pgwire.clj"]}
+
+  ;; tools.build-based jar / install / deploy.
+  :build {:extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
+                       slipset/deps-deploy          {:mvn/version "0.2.2"}}
+          :ns-default build}
+
+  ;; Format checking (cljfmt, read-only; fails the job if formatting drifts).
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts ["-m" "cljfmt.main" "check"]}
+
+  ;; Format fix (cljfmt apply).
+  :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+         :main-opts ["-m" "cljfmt.main" "fix"]}}}

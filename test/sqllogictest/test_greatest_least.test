@@ -1,0 +1,62 @@
+# test_greatest_least.test
+# GREATEST and LEAST function tests
+
+statement ok
+CREATE TABLE vals (id INTEGER, a DOUBLE, b DOUBLE, c DOUBLE)
+
+statement ok
+INSERT INTO vals VALUES (1, 10.0, 20.0, 15.0), (2, 30.0, 5.0, 25.0), (3, 1.0, 1.0, 1.0)
+
+# GREATEST of two columns
+query IR rowsort
+SELECT id, GREATEST(a, b) FROM vals
+----
+1	20.000000
+2	30.000000
+3	1.000000
+
+# LEAST of two columns
+query IR rowsort
+SELECT id, LEAST(a, b) FROM vals
+----
+1	10.000000
+2	5.000000
+3	1.000000
+
+# GREATEST of three columns
+query IR rowsort
+SELECT id, GREATEST(a, b, c) FROM vals
+----
+1	20.000000
+2	30.000000
+3	1.000000
+
+# LEAST of three columns
+query IR rowsort
+SELECT id, LEAST(a, b, c) FROM vals
+----
+1	10.000000
+2	5.000000
+3	1.000000
+
+# GREATEST with literal
+query IR rowsort
+SELECT id, GREATEST(a, 12.0) FROM vals
+----
+1	12.000000
+2	30.000000
+3	12.000000
+
+# LEAST with literal
+query IR rowsort
+SELECT id, LEAST(b, 10.0) FROM vals
+----
+1	10.000000
+2	5.000000
+3	1.000000
+
+# GREATEST in aggregation context
+query R rowsort
+SELECT SUM(GREATEST(a, b)) FROM vals
+----
+51.000000

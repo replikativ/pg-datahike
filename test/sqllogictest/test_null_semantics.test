@@ -1,0 +1,96 @@
+# test_null_semantics.test
+# Stratum-specific NULL semantics tests
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b DOUBLE)
+
+statement ok
+INSERT INTO t1 VALUES (1, 1.5), (NULL, NULL), (3, 3.5), (NULL, 2.0)
+
+# IS NULL / IS NOT NULL on integer columns
+query I rowsort
+SELECT COUNT(*) FROM t1 WHERE a IS NULL
+----
+2
+
+query I rowsort
+SELECT COUNT(*) FROM t1 WHERE a IS NOT NULL
+----
+2
+
+# IS NULL / IS NOT NULL on double columns
+query I rowsort
+SELECT COUNT(*) FROM t1 WHERE b IS NULL
+----
+1
+
+query I rowsort
+SELECT COUNT(*) FROM t1 WHERE b IS NOT NULL
+----
+3
+
+# Aggregates correctly skip NULLs
+query I rowsort
+SELECT COUNT(a) FROM t1
+----
+2
+
+query R rowsort
+SELECT SUM(a) FROM t1
+----
+4.000000
+
+query R rowsort
+SELECT AVG(a) FROM t1
+----
+2.000000
+
+query I rowsort
+SELECT MIN(a) FROM t1
+----
+1
+
+query I rowsort
+SELECT MAX(a) FROM t1
+----
+3
+
+# Double column aggregates skip NaN NULLs
+query R rowsort
+SELECT SUM(b) FROM t1
+----
+7.000000
+
+query R rowsort
+SELECT AVG(b) FROM t1
+----
+2.333333
+
+# Multiple NULLs in different columns
+statement ok
+CREATE TABLE mixed (a INTEGER, b INTEGER, c DOUBLE)
+
+statement ok
+INSERT INTO mixed VALUES (1, NULL, 1.0), (NULL, 2, 2.0), (3, 3, NULL), (NULL, NULL, NULL)
+
+query I rowsort
+SELECT COUNT(*) FROM mixed WHERE a IS NOT NULL
+----
+2
+
+query I rowsort
+SELECT COUNT(*) FROM mixed WHERE c IS NOT NULL
+----
+2
+
+# WHERE with comparison on nullable column
+# (NULL values are Long/MIN_VALUE, so comparisons naturally exclude them)
+query I rowsort
+SELECT COUNT(*) FROM mixed WHERE a > 0
+----
+2
+
+query I rowsort
+SELECT COUNT(*) FROM mixed WHERE b > 0
+----
+2

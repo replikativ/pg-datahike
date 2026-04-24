@@ -1,0 +1,106 @@
+# test_aggregate.test
+# Aggregate functions: COUNT, SUM, AVG, MIN, MAX
+
+statement ok
+CREATE TABLE numbers (val INTEGER, grp INTEGER)
+
+statement ok
+INSERT INTO numbers (val, grp) VALUES (10, 1)
+
+statement ok
+INSERT INTO numbers (val, grp) VALUES (20, 1)
+
+statement ok
+INSERT INTO numbers (val, grp) VALUES (30, 1)
+
+statement ok
+INSERT INTO numbers (val, grp) VALUES (40, 2)
+
+statement ok
+INSERT INTO numbers (val, grp) VALUES (50, 2)
+
+statement ok
+INSERT INTO numbers (val, grp) VALUES (60, 3)
+
+# ============================================================
+# Simple aggregates
+# ============================================================
+
+query I rowsort
+SELECT COUNT(*) FROM numbers
+----
+6
+
+query I rowsort
+SELECT SUM(val) FROM numbers
+----
+210
+
+query I rowsort
+SELECT MIN(val) FROM numbers
+----
+10
+
+query I rowsort
+SELECT MAX(val) FROM numbers
+----
+60
+
+# ============================================================
+# Multiple aggregates
+# ============================================================
+
+query IIII rowsort
+SELECT COUNT(*) AS cnt, SUM(val) AS total, MIN(val) AS lo, MAX(val) AS hi FROM numbers
+----
+6	210	10	60
+
+# ============================================================
+# GROUP BY
+# ============================================================
+
+query II nosort
+SELECT grp, SUM(val) FROM numbers GROUP BY grp ORDER BY grp
+----
+1	60
+2	90
+3	60
+
+query II nosort
+SELECT grp, COUNT(*) FROM numbers GROUP BY grp ORDER BY grp
+----
+1	3
+2	2
+3	1
+
+# ============================================================
+# GROUP BY with multiple aggregates
+# ============================================================
+
+query IIII nosort
+SELECT grp, SUM(val), MIN(val), MAX(val) FROM numbers GROUP BY grp ORDER BY grp
+----
+1	60	10	30
+2	90	40	50
+3	60	60	60
+
+# ============================================================
+# HAVING
+# ============================================================
+
+query II nosort
+SELECT grp, SUM(val) FROM numbers GROUP BY grp HAVING SUM(val) > 60 ORDER BY grp
+----
+2	90
+
+query II nosort
+SELECT grp, COUNT(*) FROM numbers GROUP BY grp HAVING COUNT(*) > 1 ORDER BY grp
+----
+1	3
+2	2
+
+# HAVING filters all groups — empty result
+query II rowsort
+SELECT grp, SUM(val) FROM numbers GROUP BY grp HAVING SUM(val) > 1000
+----
+

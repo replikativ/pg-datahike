@@ -1,0 +1,51 @@
+# test_distinct_expr.test
+# DISTINCT with expressions and constants — inspired by PostgreSQL
+# regression/select_distinct.sql.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES (0, 1), (0, 2), (1, 3), (1, 4), (2, 5)
+
+# ============================================================
+# Multi-column DISTINCT
+# ============================================================
+
+query II rowsort
+SELECT DISTINCT a, b FROM t1
+----
+0	1
+0	2
+1	3
+1	4
+2	5
+
+# ============================================================
+# DISTINCT on single column with duplicates
+# ============================================================
+
+query I rowsort
+SELECT DISTINCT a FROM t1
+----
+0
+1
+2
+
+# ============================================================
+# DISTINCT + ORDER BY
+# ============================================================
+
+query I nosort
+SELECT DISTINCT a FROM t1 ORDER BY a
+----
+0
+1
+2
+
+query I nosort
+SELECT DISTINCT a FROM t1 ORDER BY a DESC
+----
+2
+1
+0

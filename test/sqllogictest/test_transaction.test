@@ -1,0 +1,108 @@
+# test_transaction.test
+# BEGIN / COMMIT / ROLLBACK transaction support.
+
+statement ok
+CREATE TABLE tx_test (id INTEGER, val TEXT)
+
+statement ok
+INSERT INTO tx_test VALUES (1, 'original')
+
+# ============================================================
+# COMMIT: changes persist
+# ============================================================
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx_test VALUES (2, 'committed')
+
+statement ok
+COMMIT
+
+query IT rowsort
+SELECT id, val FROM tx_test
+----
+1	original
+2	committed
+
+# ============================================================
+# ROLLBACK: changes discarded
+# ============================================================
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx_test VALUES (3, 'rolled-back')
+
+statement ok
+ROLLBACK
+
+query IT rowsort
+SELECT id, val FROM tx_test
+----
+1	original
+2	committed
+
+# ============================================================
+# ROLLBACK after UPDATE: update discarded
+# ============================================================
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE tx_test SET val = 'changed' WHERE id = 1
+
+statement ok
+ROLLBACK
+
+query IT rowsort
+SELECT id, val FROM tx_test WHERE id = 1
+----
+1	original
+
+# ============================================================
+# ROLLBACK after DELETE: delete discarded
+# ============================================================
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM tx_test WHERE id = 2
+
+statement ok
+ROLLBACK
+
+query IT rowsort
+SELECT id, val FROM tx_test
+----
+1	original
+2	committed
+
+# ============================================================
+# Multi-statement COMMIT: all changes atomic
+# ============================================================
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx_test VALUES (10, 'batch1')
+
+statement ok
+INSERT INTO tx_test VALUES (11, 'batch2')
+
+statement ok
+UPDATE tx_test SET val = 'updated' WHERE id = 10
+
+statement ok
+COMMIT
+
+query IT rowsort
+SELECT id, val FROM tx_test WHERE id >= 10
+----
+10	updated
+11	batch2

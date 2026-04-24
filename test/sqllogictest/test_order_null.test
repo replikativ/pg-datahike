@@ -1,0 +1,37 @@
+# test_order_null.test
+# ORDER BY with NULL values — PostgreSQL default semantics:
+# ASC  → NULLs LAST
+# DESC → NULLs FIRST
+# (Per PG docs: NULLs are treated as larger than any non-NULL value.)
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (3, 'c'), (NULL, 'x'), (1, 'a'), (5, NULL), (2, 'b')
+
+# ============================================================
+# ORDER BY ASC — NULLs LAST
+# ============================================================
+
+query IT nosort
+SELECT a, b FROM t1 ORDER BY a ASC
+----
+1	a
+2	b
+3	c
+5	NULL
+NULL	x
+
+# ============================================================
+# ORDER BY DESC — NULLs FIRST
+# ============================================================
+
+query IT nosort
+SELECT a, b FROM t1 ORDER BY a DESC
+----
+NULL	x
+5	NULL
+3	c
+2	b
+1	a

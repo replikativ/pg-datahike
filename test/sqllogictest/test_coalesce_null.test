@@ -1,0 +1,42 @@
+# test_coalesce_null.test
+# COALESCE with NULL literal arguments.
+
+statement ok
+CREATE TABLE t1 (id INTEGER, v DOUBLE)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10.0), (2, 20.0)
+
+# COALESCE(NULL, literal) — first arg is bare NULL
+query IR rowsort
+SELECT id, COALESCE(NULL, 1) FROM t1
+----
+1	1.000000
+2	1.000000
+
+# COALESCE(NULL, NULL, literal) — multiple leading NULLs
+query IR rowsort
+SELECT id, COALESCE(NULL, NULL, 42) FROM t1
+----
+1	42.000000
+2	42.000000
+
+# COALESCE(column, NULL, literal) — column non-null, should use column
+query IR rowsort
+SELECT id, COALESCE(v, NULL, 99) FROM t1
+----
+1	10.000000
+2	20.000000
+
+# COALESCE with nullable column and NULL literal fallback
+statement ok
+CREATE TABLE t2 (id INTEGER, v DOUBLE)
+
+statement ok
+INSERT INTO t2 VALUES (1, NULL), (2, 5.0)
+
+query IR rowsort
+SELECT id, COALESCE(v, NULL, 0) FROM t2
+----
+1	0.000000
+2	5.000000

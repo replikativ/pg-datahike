@@ -1,0 +1,51 @@
+# test_returning.test
+# RETURNING clause on INSERT, UPDATE, DELETE.
+
+statement ok
+CREATE TABLE ret (id INTEGER, name TEXT, val DOUBLE)
+
+# ============================================================
+# INSERT RETURNING specific columns
+# ============================================================
+
+query IT rowsort
+INSERT INTO ret VALUES (1, 'Alice', 10.0) RETURNING id, name
+----
+1	Alice
+
+# ============================================================
+# INSERT RETURNING *
+# ============================================================
+
+query ITR rowsort
+INSERT INTO ret VALUES (2, 'Bob', 20.0) RETURNING *
+----
+2	Bob	20.000000
+
+# ============================================================
+# Multi-row INSERT RETURNING
+# ============================================================
+
+query I rowsort
+INSERT INTO ret VALUES (3, 'Carol', 30.0), (4, 'Dave', 40.0) RETURNING id
+----
+3
+4
+
+# ============================================================
+# UPDATE RETURNING
+# ============================================================
+
+query TR rowsort
+UPDATE ret SET val = 99.0 WHERE id = 1 RETURNING name, val
+----
+Alice	99.000000
+
+# ============================================================
+# DELETE RETURNING
+# ============================================================
+
+query IT rowsort
+DELETE FROM ret WHERE id = 2 RETURNING id, name
+----
+2	Bob

@@ -1,0 +1,109 @@
+# test_functions.test
+# SQL function tests: UPPER, LOWER, SUBSTR, ABS, ROUND, CAST, CONCAT
+
+statement ok
+CREATE TABLE words (id INTEGER, word TEXT, score DOUBLE PRECISION)
+
+statement ok
+INSERT INTO words (id, word, score) VALUES (1, 'Hello', 3.14159)
+
+statement ok
+INSERT INTO words (id, word, score) VALUES (2, 'World', -2.71828)
+
+statement ok
+INSERT INTO words (id, word, score) VALUES (3, 'Test', 1.41421)
+
+# ============================================================
+# String functions
+# ============================================================
+
+query T nosort
+SELECT UPPER(word) FROM words ORDER BY id
+----
+HELLO
+WORLD
+TEST
+
+query T nosort
+SELECT LOWER(word) FROM words ORDER BY id
+----
+hello
+world
+test
+
+query T nosort
+SELECT SUBSTR(word, 1, 3) FROM words ORDER BY id
+----
+Hel
+Wor
+Tes
+
+# ============================================================
+# Math functions
+# ============================================================
+
+query R nosort
+SELECT ABS(score) FROM words ORDER BY id
+----
+3.141590
+2.718280
+1.414210
+
+# ============================================================
+# CAST
+# ============================================================
+
+query R nosort
+SELECT CAST(id AS DOUBLE PRECISION) FROM words ORDER BY id
+----
+1.000000
+2.000000
+3.000000
+
+query T nosort
+SELECT CAST(id AS VARCHAR) FROM words ORDER BY id
+----
+1
+2
+3
+
+# ============================================================
+# Arithmetic expressions
+# ============================================================
+
+query I nosort
+SELECT id + 10 AS shifted FROM words ORDER BY id
+----
+11
+12
+13
+
+query I nosort
+SELECT id * 2 AS doubled FROM words ORDER BY id
+----
+2
+4
+6
+
+query R rowsort
+SELECT ABS(score - 3.0) FROM words WHERE id = 2
+----
+5.718280
+
+# ============================================================
+# Concat operator ||
+# ============================================================
+
+query T nosort
+SELECT word || '!' FROM words ORDER BY id
+----
+Hello!
+World!
+Test!
+
+query T nosort
+SELECT word || ' #' || CAST(id AS VARCHAR) FROM words ORDER BY id
+----
+Hello #1
+World #2
+Test #3

@@ -1,0 +1,36 @@
+# test_in_null.test
+# IN and NOT IN with NULL values in the list.
+# SQL three-valued logic: NOT IN (1, NULL) should return no rows
+# when the value might not be in the set.
+
+statement ok
+CREATE TABLE t1 (x INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES (1), (2), (3)
+
+# IN with NULL — only exact matches return true
+query I rowsort
+SELECT x FROM t1 WHERE x IN (1, NULL)
+----
+1
+
+# NOT IN with NULL — SQL says this returns UNKNOWN (not TRUE) for non-matches
+# Because x NOT IN (1, NULL) = x!=1 AND x!=NULL = ... AND UNKNOWN = UNKNOWN
+# So no rows should be returned
+query I rowsort
+SELECT x FROM t1 WHERE x NOT IN (1, NULL)
+----
+
+# IN without NULL — normal behavior
+query I rowsort
+SELECT x FROM t1 WHERE x IN (1, 3)
+----
+1
+3
+
+# NOT IN without NULL — normal behavior
+query I rowsort
+SELECT x FROM t1 WHERE x NOT IN (1, 3)
+----
+2

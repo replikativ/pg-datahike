@@ -1,0 +1,94 @@
+# test_string_extended.test
+# Extended string functions and :: cast syntax.
+
+statement ok
+CREATE TABLE t1 (id INTEGER, s TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'hello'), (2, 'world'), (3, 'abc')
+
+# ============================================================
+# LPAD / RPAD
+# ============================================================
+
+query T rowsort
+SELECT LPAD(s, 8) FROM t1
+----
+   hello
+   world
+     abc
+
+query T rowsort
+SELECT RPAD(s, 8, '.') FROM t1
+----
+hello...
+world...
+abc.....
+
+# ============================================================
+# REPEAT
+# ============================================================
+
+query T rowsort
+SELECT REPEAT(s, 2) FROM t1 WHERE id = 3
+----
+abcabc
+
+# ============================================================
+# INITCAP
+# ============================================================
+
+query T rowsort
+SELECT INITCAP(s) FROM t1
+----
+Abc
+Hello
+World
+
+# ============================================================
+# REVERSE
+# ============================================================
+
+query T rowsort
+SELECT REVERSE(s) FROM t1 WHERE id = 1
+----
+olleh
+
+# ============================================================
+# LEFT / RIGHT
+# ============================================================
+
+query T rowsort
+SELECT LEFT(s, 3) FROM t1
+----
+abc
+hel
+wor
+
+query T rowsort
+SELECT RIGHT(s, 3) FROM t1
+----
+abc
+llo
+rld
+
+# ============================================================
+# POSITION — uses special IN syntax, needs JSqlParser-specific handling
+# Skipped for now: POSITION('x' IN col) parses with nil params
+# ============================================================
+
+# ============================================================
+# PostgreSQL :: cast syntax
+# ============================================================
+
+query R rowsort
+SELECT 42::double precision
+----
+42.000000
+
+query T rowsort
+SELECT id::text FROM t1
+----
+1
+2
+3

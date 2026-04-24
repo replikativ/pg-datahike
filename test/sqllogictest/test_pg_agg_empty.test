@@ -1,0 +1,115 @@
+# test_pg_agg_empty.test
+# Aggregates over empty result sets, COUNT(*) vs COUNT(col), NULL-only columns.
+# From PostgreSQL regression/aggregates.sql patterns.
+
+statement ok
+CREATE TABLE nums (x INTEGER)
+
+statement ok
+INSERT INTO nums VALUES (1), (2), (3), (4), (5)
+
+# ============================================================
+# Aggregates on empty result set (WHERE filters all rows)
+# ============================================================
+
+# COUNT(*) over empty → 0
+query I rowsort
+SELECT COUNT(*) FROM nums WHERE x > 100
+----
+0
+
+# SUM over empty → NULL
+query R rowsort
+SELECT SUM(x) FROM nums WHERE x > 100
+----
+NULL
+
+# AVG over empty → NULL
+query R rowsort
+SELECT AVG(x) FROM nums WHERE x > 100
+----
+NULL
+
+# MIN/MAX over empty → NULL
+query I rowsort
+SELECT MIN(x) FROM nums WHERE x > 100
+----
+NULL
+
+query I rowsort
+SELECT MAX(x) FROM nums WHERE x > 100
+----
+NULL
+
+# ============================================================
+# COUNT(*) vs COUNT(col) with NULLs
+# ============================================================
+
+statement ok
+CREATE TABLE nullcol (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO nullcol VALUES (1, 10), (1, NULL), (2, 20), (2, 30), (2, NULL)
+
+# COUNT(*) counts all rows in the group (including NULL b's).
+# COUNT(b) skips NULL b's.
+# Group a=1: 2 rows total, 1 non-null b → (1, 2, 1)
+# Group a=2: 3 rows total, 2 non-null b → (2, 3, 2)
+query III rowsort
+SELECT a, COUNT(*), COUNT(b) FROM nullcol GROUP BY a
+----
+1	2	1
+2	3	2
+
+# ============================================================
+# SUM/AVG of a column containing only NULLs
+# ============================================================
+
+statement ok
+CREATE TABLE allnull (v DOUBLE)
+
+statement ok
+INSERT INTO allnull VALUES (NULL), (NULL), (NULL)
+
+query R rowsort
+SELECT SUM(v) FROM allnull
+----
+NULL
+
+query R rowsort
+SELECT AVG(v) FROM allnull
+----
+NULL
+
+query I rowsort
+SELECT COUNT(v) FROM allnull
+----
+0
+
+query I rowsort
+SELECT COUNT(*) FROM allnull
+----
+3
+
+# ============================================================
+# ORDER BY on aggregate not in SELECT list
+# ============================================================
+
+statement ok
+CREATE TABLE ordagg (grp INTEGER, val INTEGER, extra INTEGER)
+
+statement ok
+INSERT INTO ordagg VALUES (1, 10, 100), (1, 20, 200), (2, 5, 50), (2, 15, 150), (3, 30, 300)
+
+# ORDER BY on an aggregate not in SELECT is not supported
+statement error
+SELECT grp, SUM(val) FROM ordagg GROUP BY grp ORDER BY SUM(extra)
+
+# ============================================================
+# DISTINCT on a single aggregate (should be a no-op, not an error)
+# ============================================================
+
+query I rowsort
+SELECT DISTINCT COUNT(*) FROM nums
+----
+5

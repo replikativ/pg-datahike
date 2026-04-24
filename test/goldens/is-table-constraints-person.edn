@@ -1,0 +1,2 @@
+{:error nil,
+ :rows [["PRIMARY KEY" "person_pkey"] ["UNIQUE" "person_id_key"]]}

@@ -1,0 +1,62 @@
+# test_case_advanced.test
+# Advanced CASE expressions: searched CASE, CASE in GROUP BY.
+# Inspired by PostgreSQL regression/case.sql.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma'), (5, 'epsilon')
+
+# ============================================================
+# Searched CASE (CASE WHEN ... THEN ... ELSE ... END)
+# ============================================================
+
+query T rowsort
+SELECT CASE WHEN a < 2 THEN 'small' WHEN a < 4 THEN 'medium' ELSE 'large' END FROM t1
+----
+small
+medium
+medium
+large
+
+# ============================================================
+# CASE in GROUP BY
+# ============================================================
+
+statement ok
+CREATE TABLE t2 (score INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (10), (25), (35), (50), (75), (85), (95)
+
+query TR rowsort
+SELECT CASE WHEN score < 30 THEN 'low' WHEN score < 70 THEN 'mid' ELSE 'high' END AS bucket, COUNT(*) FROM t2 GROUP BY CASE WHEN score < 30 THEN 'low' WHEN score < 70 THEN 'mid' ELSE 'high' END
+----
+high	3.000000
+low	2.000000
+mid	2.000000
+
+# ============================================================
+# COALESCE — first non-NULL value (numeric)
+# ============================================================
+
+query I rowsort
+SELECT COALESCE(a, -1) FROM t1
+----
+1
+2
+3
+5
+
+# ============================================================
+# CASE with ELSE NULL
+# ============================================================
+
+query T rowsort
+SELECT CASE WHEN a > 3 THEN 'big' ELSE 'normal' END FROM t1
+----
+normal
+normal
+normal
+big

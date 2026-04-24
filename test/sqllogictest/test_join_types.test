@@ -1,0 +1,112 @@
+# test_join_types.test
+# RIGHT JOIN, FULL OUTER JOIN, self-join, multi-table join, multi-column keys.
+# Inspired by PostgreSQL regression/join.sql.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+statement ok
+CREATE TABLE t2 (a INTEGER, c TEXT)
+
+statement ok
+INSERT INTO t2 VALUES (2, 'p'), (3, 'q'), (4, 'r')
+
+# ============================================================
+# INNER JOIN (baseline)
+# ============================================================
+
+query ITT rowsort
+SELECT t1.a, t1.b, t2.c FROM t1 INNER JOIN t2 ON t1.a = t2.a
+----
+2	y	p
+3	z	q
+
+# ============================================================
+# LEFT JOIN — unmatched left rows get NULLs for right cols
+# ============================================================
+
+query ITT rowsort
+SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+----
+1	x	NULL
+2	y	p
+3	z	q
+
+# ============================================================
+# RIGHT JOIN — unmatched right rows get NULLs for left cols
+# Postgres: SELECT t1.a shows NULL for unmatched right rows
+# ============================================================
+
+query ITT rowsort
+SELECT t1.a, t1.b, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a
+----
+2	y	p
+3	z	q
+NULL	NULL	r
+
+# ============================================================
+# FULL OUTER JOIN — unmatched from both sides
+# t1.a shows the left-side value (NULL for unmatched right rows)
+# ============================================================
+
+query ITT rowsort
+SELECT t1.a, t1.b, t2.c FROM t1 FULL JOIN t2 ON t1.a = t2.a
+----
+1	x	NULL
+2	y	p
+3	z	q
+NULL	NULL	r
+
+# ============================================================
+# Multi-column join key
+# ============================================================
+
+statement ok
+CREATE TABLE m1 (a INTEGER, b INTEGER, v TEXT)
+
+statement ok
+INSERT INTO m1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma')
+
+statement ok
+CREATE TABLE m2 (a INTEGER, b INTEGER, w TEXT)
+
+statement ok
+INSERT INTO m2 VALUES (1, 10, 'one'), (2, 99, 'miss'), (3, 30, 'three')
+
+query IITT rowsort
+SELECT m1.a, m1.b, m1.v, m2.w FROM m1 INNER JOIN m2 ON m1.a = m2.a AND m1.b = m2.b
+----
+1	10	alpha	one
+3	30	gamma	three
+
+# ============================================================
+# 3-table join chain
+# ============================================================
+
+statement ok
+CREATE TABLE orders (id INTEGER, cust_id INTEGER, amount DOUBLE)
+
+statement ok
+INSERT INTO orders VALUES (1, 10, 100.0), (2, 20, 200.0), (3, 10, 300.0)
+
+statement ok
+CREATE TABLE customers (id INTEGER, region_id INTEGER, name TEXT)
+
+statement ok
+INSERT INTO customers VALUES (10, 1, 'Alice'), (20, 2, 'Bob')
+
+statement ok
+CREATE TABLE regions (id INTEGER, rname TEXT)
+
+statement ok
+INSERT INTO regions VALUES (1, 'East'), (2, 'West')
+
+query TTIR rowsort
+SELECT r.rname, c.name, o.id, o.amount FROM orders o INNER JOIN customers c ON o.cust_id = c.id INNER JOIN regions r ON c.region_id = r.id
+----
+East	Alice	1	100.000000
+East	Alice	3	300.000000
+West	Bob	2	200.000000

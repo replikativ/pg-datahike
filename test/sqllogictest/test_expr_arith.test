@@ -1,0 +1,128 @@
+# test_expr_arith.test
+# Arithmetic expressions, operator precedence, division-by-zero, modulo.
+# Inspired by PostgreSQL regression/expressions.sql and select.sql.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b INTEGER, c DOUBLE)
+
+statement ok
+INSERT INTO t1 VALUES (10, 3, 2.5), (20, 4, 0.0), (7, 0, 1.5), (0, 5, 3.0), (-3, 2, -1.0)
+
+# ============================================================
+# Basic arithmetic in SELECT
+# ============================================================
+
+query III rowsort
+SELECT a + b, a - b, a * b FROM t1
+----
+13	7	30
+24	16	80
+7	7	0
+5	-5	0
+-1	-5	-6
+
+# ============================================================
+# Expression precedence: a + b * c (multiply before add)
+# ============================================================
+
+query R rowsort
+SELECT a + b * c FROM t1
+----
+17.500000
+20.000000
+7.000000
+15.000000
+-5.000000
+
+# ============================================================
+# Parenthesized expression
+# ============================================================
+
+query R rowsort
+SELECT (a + b) * c FROM t1
+----
+32.500000
+0.000000
+10.500000
+15.000000
+1.000000
+
+# ============================================================
+# Negative literals
+# ============================================================
+
+query I rowsort
+SELECT -a FROM t1
+----
+-10
+-20
+-7
+0
+3
+
+query R rowsort
+SELECT -1 * c FROM t1
+----
+-2.500000
+0.000000
+-1.500000
+-3.000000
+1.000000
+
+# ============================================================
+# Modulo operator
+# ============================================================
+
+query IIR rowsort
+SELECT a, b, a % b FROM t1 WHERE b != 0
+----
+10	3	1.000000
+20	4	0.000000
+0	5	0.000000
+-3	2	-1.000000
+
+# ============================================================
+# Arithmetic in WHERE
+# ============================================================
+
+query I rowsort
+SELECT a FROM t1 WHERE a * 2 > 15
+----
+10
+20
+
+query I rowsort
+SELECT a FROM t1 WHERE a + b > 10
+----
+10
+20
+
+# ============================================================
+# Expressions in ORDER BY
+# ============================================================
+
+# Add `a ASC` as a secondary sort so rows with an identical product tie
+# in a well-defined order — SQL does not require a stable tie order, and
+# Datahike's engine does not currently stabilize ORDER BY by inserting
+# a hidden entity-id tiebreaker.
+query IR nosort
+SELECT a, a * c AS product FROM t1 ORDER BY a * c DESC, a ASC
+----
+10	25.000000
+7	10.500000
+-3	3.000000
+0	0.000000
+20	0.000000
+
+# ============================================================
+# Mixed int/double arithmetic
+# ============================================================
+
+query R rowsort
+SELECT a + c FROM t1
+----
+12.500000
+20.000000
+8.500000
+3.000000
+-4.000000

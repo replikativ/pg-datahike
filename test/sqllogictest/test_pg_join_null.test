@@ -1,0 +1,121 @@
+# test_pg_join_null.test
+# JOIN edge cases from PostgreSQL regression/join.sql
+# NULL keys, WHERE on nullable side, LEFT → INNER reduction, COALESCE in WHERE.
+
+statement ok
+CREATE TABLE j1 (i INTEGER, j INTEGER, t TEXT)
+
+statement ok
+INSERT INTO j1 VALUES (1, 4, 'one'), (2, 3, 'two'), (3, 2, 'three'), (4, 1, 'four'), (5, 0, 'five'), (NULL, NULL, 'null1'), (0, NULL, 'zero')
+
+statement ok
+CREATE TABLE j2 (i INTEGER, k INTEGER)
+
+statement ok
+INSERT INTO j2 VALUES (1, -1), (2, 2), (3, -3), (2, 4), (5, -5), (5, -5), (0, NULL), (NULL, NULL)
+
+# ============================================================
+# INNER JOIN — NULL keys must NOT match
+# ============================================================
+
+query IIT rowsort
+SELECT j1.i, j2.k, j1.t FROM j1 INNER JOIN j2 ON j1.i = j2.i
+----
+0	NULL	zero
+1	-1	one
+2	2	two
+2	4	two
+3	-3	three
+5	-5	five
+5	-5	five
+
+# ============================================================
+# LEFT JOIN — unmatched left rows + NULL keys don't match
+# ============================================================
+
+query IIT rowsort
+SELECT j1.i, j2.k, j1.t FROM j1 LEFT JOIN j2 ON j1.i = j2.i
+----
+0	NULL	zero
+1	-1	one
+2	2	two
+2	4	two
+3	-3	three
+4	NULL	four
+5	-5	five
+5	-5	five
+NULL	NULL	null1
+
+# ============================================================
+# LEFT JOIN + WHERE on nullable right side (reduces to INNER)
+# ============================================================
+
+query IIT rowsort
+SELECT j1.i, j2.k, j1.t FROM j1 LEFT JOIN j2 ON j1.i = j2.i WHERE j2.k = 2
+----
+2	2	two
+
+# ============================================================
+# LEFT JOIN + WHERE on left side only (preserves LEFT semantics)
+# ============================================================
+
+query IIT rowsort
+SELECT j1.i, j2.k, j1.t FROM j1 LEFT JOIN j2 ON j1.i = j2.i WHERE j1.i = 4
+----
+4	NULL	four
+
+# ============================================================
+# LEFT JOIN with aggregate on nullable right column
+# Per SQL: COUNT(col) skips NULL. Unmatched left rows (j1.i ∈ {4, NULL})
+# contribute j2.k = NULL → COUNT = 0. Row with j1.i = 0 joins j2's
+# (0, NULL) row, whose k is explicitly NULL → also COUNT = 0.
+# ============================================================
+
+query II rowsort
+SELECT j1.i, COUNT(j2.k) FROM j1 LEFT JOIN j2 ON j1.i = j2.i GROUP BY j1.i
+----
+0	0
+1	1
+2	2
+3	1
+4	0
+5	2
+NULL	0
+
+# ============================================================
+# FULL JOIN basics with NULLs
+# ============================================================
+
+statement ok
+CREATE TABLE x (x1 INTEGER, x2 INTEGER)
+
+statement ok
+INSERT INTO x VALUES (1, 11), (2, 22), (3, NULL), (4, 44)
+
+statement ok
+CREATE TABLE y (y1 INTEGER, y2 INTEGER)
+
+statement ok
+INSERT INTO y VALUES (1, 111), (2, 222), (5, NULL), (6, 666)
+
+query II rowsort
+SELECT x.x1, y.y1 FROM x FULL JOIN y ON x.x1 = y.y1
+----
+1	1
+2	2
+3	NULL
+4	NULL
+NULL	5
+NULL	6
+
+# ============================================================
+# LEFT JOIN with COALESCE on right side
+# ============================================================
+
+query II rowsort
+SELECT x.x1, COALESCE(y.y2, -1) FROM x LEFT JOIN y ON x.x1 = y.y1
+----
+1	111
+2	222
+3	-1
+4	-1

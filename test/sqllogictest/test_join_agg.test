@@ -1,0 +1,60 @@
+# test_join_agg.test
+# JOIN with aggregation tests
+
+statement ok
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DOUBLE)
+
+statement ok
+CREATE TABLE customers (id INTEGER, name TEXT, region TEXT)
+
+statement ok
+INSERT INTO customers VALUES (1, 'Alice', 'East'), (2, 'Bob', 'West'), (3, 'Carol', 'East')
+
+statement ok
+INSERT INTO orders VALUES (1, 1, 100.0), (2, 1, 200.0), (3, 2, 150.0), (4, 2, 250.0), (5, 3, 300.0), (6, 1, 50.0)
+
+# INNER JOIN with GROUP BY
+query TR rowsort
+SELECT c.name, SUM(o.amount) FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name
+----
+Alice	350.000000
+Bob	400.000000
+Carol	300.000000
+
+# INNER JOIN with GROUP BY and ORDER BY
+query TR nosort
+SELECT c.name, SUM(o.amount) AS total FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name ORDER BY total DESC
+----
+Bob	400.000000
+Alice	350.000000
+Carol	300.000000
+
+# JOIN with GROUP BY on dimension column
+query TR rowsort
+SELECT c.region, SUM(o.amount) FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.region
+----
+East	650.000000
+West	400.000000
+
+# JOIN with COUNT
+query TI rowsort
+SELECT c.name, COUNT(*) FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name
+----
+Alice	3
+Bob	2
+Carol	1
+
+# JOIN with WHERE filter
+query TR rowsort
+SELECT c.name, SUM(o.amount) FROM orders o INNER JOIN customers c ON o.customer_id = c.id WHERE o.amount > 100 GROUP BY c.name
+----
+Alice	200.000000
+Bob	400.000000
+Carol	300.000000
+
+# JOIN with HAVING >= (inclusive)
+query TR nosort
+SELECT c.name, SUM(o.amount) AS total FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name HAVING total >= 350 ORDER BY total DESC
+----
+Bob	400.000000
+Alice	350.000000

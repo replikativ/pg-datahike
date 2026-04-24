@@ -1,0 +1,53 @@
+{:min-bb-version "0.8.0"
+ :pods {clj-kondo/clj-kondo {:version "2026.01.19"}}
+ :tasks
+ {:requires ([babashka.process :refer [shell]]
+             [clojure.string :as str]
+             [pod.borkdude.clj-kondo :as clj-kondo])
+
+  prep {:doc "Compile Java sources to target/classes (prerequisite for loading pgwire ns)."
+        :task (shell "clojure -T:build compile-java")}
+
+  test {:doc "Run unit test suite via kaocha."
+        :depends [prep]
+        :task (apply shell "clojure -M:test" *command-line-args*)}
+
+  sqllogictest {:doc "Run SQL-level sqllogictest suite against the pgwire handler."
+                :depends [prep]
+                :task (shell "clojure -M:dev"
+                             "-e" (str "(require 'datahike.test.sqllogictest-runner)"
+                                       " (require 'clojure.test)"
+                                       " (let [r (clojure.test/run-tests 'datahike.test.sqllogictest-runner)]"
+                                       "   (when (pos? (+ (:fail r) (:error r)))"
+                                       "     (System/exit 1)))"))}
+
+  pgjdbc {:doc "Run pgjdbc ResultSetTest (requires JDK 21; server must be running on :15432)."
+          :task (shell "bash test/integration/pgjdbc/run-one.sh ResultSetTest")}
+
+  cross-engine {:doc "Diff pgwire vs. real Postgres on a .test file. Requires REFERENCE_URL + TARGET_URL env."
+                :task (apply shell "clojure -M:dev -m datahike.test.cross-engine"
+                             *command-line-args*)}
+
+  format {:doc "Check Clojure source formatting with cljfmt."
+          :task (shell "clojure -M:format")}
+
+  ffix {:doc "Fix Clojure source formatting with cljfmt."
+        :task (shell "clojure -M:ffix")}
+
+  lint {:doc "Run clj-kondo on src/ + test/."
+        :task (do (clj-kondo/print!
+                   (clj-kondo/run! {:lint ["src" "test"]
+                                    :config {:output {:exclude-files ["test/integration/"]}}}))
+                  nil)}
+
+  clean {:doc "Remove build artifacts."
+         :task (shell "clojure -T:build clean")}
+
+  jar {:doc "Build deployable jar."
+       :task (shell "clojure -T:build jar")}
+
+  install {:doc "Install jar to local ~/.m2."
+           :task (shell "clojure -T:build install")}
+
+  clojars {:doc "Deploy jar to Clojars (requires CLOJARS_USERNAME + CLOJARS_PASSWORD)."
+           :task (shell "clojure -T:build deploy")}}}

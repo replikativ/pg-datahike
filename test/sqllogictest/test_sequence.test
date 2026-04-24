@@ -1,0 +1,63 @@
+# test_sequence.test
+# SQL SEQUENCE support (CREATE SEQUENCE, nextval, currval, DROP SEQUENCE)
+
+# ============================================================
+# CREATE SEQUENCE with defaults
+# ============================================================
+
+statement ok
+CREATE SEQUENCE test_seq START WITH 1 INCREMENT BY 1
+
+# ============================================================
+# nextval increments and returns
+# ============================================================
+
+query I rowsort
+SELECT nextval('test_seq')
+----
+2
+
+query I rowsort
+SELECT nextval('test_seq')
+----
+3
+
+# ============================================================
+# currval returns last value
+# ============================================================
+
+query I rowsort
+SELECT currval('test_seq')
+----
+3
+
+# ============================================================
+# Sequence with custom increment (Hibernate pattern)
+# ============================================================
+
+statement ok
+CREATE SEQUENCE hibernate_seq START WITH 1 INCREMENT BY 50
+
+query I rowsort
+SELECT nextval('hibernate_seq')
+----
+51
+
+query I rowsort
+SELECT nextval('hibernate_seq')
+----
+101
+
+# ============================================================
+# DROP SEQUENCE
+# ============================================================
+
+statement ok
+DROP SEQUENCE IF EXISTS test_seq
+
+statement ok
+DROP SEQUENCE IF EXISTS hibernate_seq
+
+# Dropping non-existent sequence with IF EXISTS should succeed
+statement ok
+DROP SEQUENCE IF EXISTS nonexistent_seq

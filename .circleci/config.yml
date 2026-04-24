@@ -1,0 +1,372 @@
+version: 2.1
+
+orbs:
+  tools: replikativ/clj-tools@0
+
+jobs:
+  setup:
+    executor: tools/clojurecli
+    steps:
+      - restore_cache:
+          keys:
+            - source-{{ .Branch }}-{{ .Revision }}
+            - source-{{ .Branch }}
+            - source-
+      - checkout
+      - save_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - .git
+      - restore_cache:
+          keys:
+            - deps-{{ checksum "deps.edn" }}
+            - deps-
+      - run:
+          name: Resolve Clojure deps
+          command: clojure -A:dev:test:build:format -P
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+      - persist_to_workspace:
+          root: /home/circleci/
+          paths:
+            - .m2
+            - replikativ
+
+  build:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Build jar
+          command: bb jar
+      - run:
+          name: Install jar to local Maven repository
+          command: bb install
+      - persist_to_workspace:
+          root: /home/circleci/
+          paths:
+            - .m2
+
+  format:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Check formatting
+          command: bb format
+          no_output_timeout: 5m
+
+  lint:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: clj-kondo lint
+          command: bb lint
+          no_output_timeout: 5m
+
+  unittest:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Run unit tests
+          command: bb test
+          no_output_timeout: 10m
+
+  sqllogictest:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Run sqllogictest suite
+          command: bb sqllogictest
+          no_output_timeout: 10m
+
+  pgjdbc-conformance:
+    # pgjdbc tests require JDK 21. Use the standard CircleCI Java image
+    # and install Clojure/bb on top — pgjdbc's gradle build hard-codes
+    # its own JDK requirements so a matching image is cheapest.
+    docker:
+      - image: cimg/openjdk:21.0
+    resource_class: large
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Install Clojure CLI
+          command: |
+            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
+            chmod +x linux-install-1.12.4.1588.sh
+            sudo ./linux-install-1.12.4.1588.sh
+      - run:
+          name: Install babashka
+          command: |
+            curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Clone pgjdbc
+          command: bash test/integration/pgjdbc/setup.sh
+      - run:
+          name: Start pgwire server
+          command: clojure -M:server
+          background: true
+      - run:
+          name: Wait for server
+          command: |
+            for i in $(seq 1 30); do
+              nc -z localhost 15432 && exit 0
+              sleep 1
+            done
+            echo "pgwire did not come up on :15432" >&2
+            exit 1
+      - run:
+          name: Run ResultSetTest
+          command: bash test/integration/pgjdbc/run-one.sh ResultSetTest
+          no_output_timeout: 10m
+
+  # --- Nightly integration jobs ---------------------------------------------
+  # Each job provisions the client toolchain (Python venv, Node npm, Maven)
+  # on top of the matching cimg/* base image, installs Clojure + babashka,
+  # starts the pgwire server in the background, waits on :15432, then runs
+  # the harness's own setup.sh + run.sh. See `doc/integration-testing.md`
+  # for the cross-engine testing model.
+
+  asyncpg-conformance:
+    docker:
+      - image: cimg/python:3.11
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install Clojure + babashka
+          command: |
+            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
+            chmod +x linux-install-1.12.4.1588.sh
+            sudo ./linux-install-1.12.4.1588.sh
+            curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Start pgwire server
+          command: clojure -M:server
+          background: true
+      - run:
+          name: Wait for server
+          command: |
+            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            echo "pgwire did not come up on :15432" >&2; exit 1
+      - run:
+          name: asyncpg setup
+          command: bash test/integration/asyncpg/setup.sh
+          no_output_timeout: 15m
+      - run:
+          name: asyncpg run
+          command: bash test/integration/asyncpg/run.sh
+          no_output_timeout: 20m
+
+  node-postgres-conformance:
+    docker:
+      - image: cimg/node:20.11
+    steps:
+      - checkout
+      - run:
+          name: Install Clojure + babashka + JDK
+          command: |
+            sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless netcat-openbsd
+            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
+            chmod +x linux-install-1.12.4.1588.sh
+            sudo ./linux-install-1.12.4.1588.sh
+            curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Start pgwire server
+          command: clojure -M:server
+          background: true
+      - run:
+          name: Wait for server
+          command: |
+            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            echo "pgwire did not come up on :15432" >&2; exit 1
+      - run:
+          name: node-postgres setup
+          command: bash test/integration/node-postgres/setup.sh
+          no_output_timeout: 10m
+      - run:
+          name: node-postgres run
+          command: bash test/integration/node-postgres/run.sh
+          no_output_timeout: 15m
+
+  hibernate-app-conformance:
+    # JDK 21 required — the Hibernate test pom.xml declares
+    # maven.compiler.{source,target}=21. An openjdk:17.0 image can't
+    # compile it.
+    docker:
+      - image: cimg/openjdk:21.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install Clojure + babashka + Maven
+          command: |
+            sudo apt-get update && sudo apt-get install -y maven netcat-openbsd
+            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
+            chmod +x linux-install-1.12.4.1588.sh
+            sudo ./linux-install-1.12.4.1588.sh
+            curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Start pgwire server
+          command: clojure -M:server
+          background: true
+      - run:
+          name: Wait for server
+          command: |
+            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            echo "pgwire did not come up on :15432" >&2; exit 1
+      - run:
+          name: Hibernate integration test
+          # Drop -q so CI logs show compile errors / maven download issues
+          # on failure. Keeps the quiet-default habit local but doesn't
+          # hide diagnostics in CI.
+          command: cd test/integration/hibernate-app && mvn test -B --no-transfer-progress
+          no_output_timeout: 15m
+
+  sqlalchemy-conformance:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - run:
+          name: Install Clojure + babashka
+          command: |
+            curl -sLO https://download.clojure.org/install/linux-install-1.12.4.1588.sh
+            chmod +x linux-install-1.12.4.1588.sh
+            sudo ./linux-install-1.12.4.1588.sh
+            curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+      - run:
+          name: Install SQLAlchemy + psycopg2
+          command: pip install --quiet sqlalchemy psycopg2-binary
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Start pgwire server
+          command: clojure -M:server
+          background: true
+      - run:
+          name: Wait for server
+          command: |
+            for i in $(seq 1 30); do nc -z localhost 15432 && exit 0; sleep 1; done
+            echo "pgwire did not come up on :15432" >&2; exit 1
+      - run:
+          name: SQLAlchemy 7-phase dialect smoke
+          command: python3 test/integration/test_sqlalchemy.py
+          no_output_timeout: 10m
+
+  deploy:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Deploy to Clojars
+          command: bb clojars
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - setup:
+          context: ghcr-read-package
+      - build:
+          context: ghcr-read-package
+          requires:
+            - setup
+      - format:
+          context: ghcr-read-package
+          requires:
+            - setup
+      - lint:
+          context: ghcr-read-package
+          requires:
+            - setup
+      - unittest:
+          context: ghcr-read-package
+          requires:
+            - build
+      - sqllogictest:
+          context: ghcr-read-package
+          requires:
+            - build
+      - pgjdbc-conformance:
+          context: ghcr-read-package
+          requires:
+            - build
+      - hibernate-app-conformance:
+          context: ghcr-read-package
+          requires:
+            - build
+      - sqlalchemy-conformance:
+          context: ghcr-read-package
+          requires:
+            - build
+      - deploy:
+          context:
+            - ghcr-read-package
+            - clojars-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - format
+            - lint
+            - unittest
+            - sqllogictest
+            - pgjdbc-conformance
+            - hibernate-app-conformance
+            - sqlalchemy-conformance
+
+  # Nightly: wire-protocol regression targets that aren't release-ready
+  # yet. The harness scripts work cleanly; the SUT doesn't cover enough of
+  # what these clients probe (asyncpg: prepared-statement internals,
+  # node-postgres: COLLATE + extended-query metadata). Keeping them in
+  # nightly so a fix in core immediately lights them up, without blocking
+  # per-commit PRs on known gaps. Hibernate + SQLAlchemy moved to
+  # per-commit once they hit 100% on their curated suites.
+  nightly-integration:
+    triggers:
+      - schedule:
+          # 04:00 UTC daily
+          cron: "0 4 * * *"
+          filters:
+            branches:
+              only: main
+    jobs:
+      - asyncpg-conformance:
+          context: ghcr-read-package
+      - node-postgres-conformance:
+          context: ghcr-read-package

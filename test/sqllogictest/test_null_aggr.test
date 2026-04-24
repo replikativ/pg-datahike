@@ -1,0 +1,73 @@
+# test_null_aggr.test
+# PostgreSQL-compatible NULL handling in aggregate functions
+
+# NULLs in aggregates — NULLs should be skipped
+statement ok
+CREATE TABLE nullints (i INTEGER)
+
+statement ok
+INSERT INTO nullints VALUES (1), (2), (NULL)
+
+query I rowsort
+SELECT COUNT(*) FROM nullints
+----
+3
+
+query I rowsort
+SELECT COUNT(i) FROM nullints
+----
+2
+
+query R rowsort
+SELECT SUM(i) FROM nullints
+----
+3.000000
+
+query R rowsort
+SELECT AVG(i) FROM nullints
+----
+1.500000
+
+query I rowsort
+SELECT MIN(i) FROM nullints
+----
+1
+
+query I rowsort
+SELECT MAX(i) FROM nullints
+----
+2
+
+# Empty table aggregates
+statement ok
+CREATE TABLE empty_t (i INTEGER)
+
+query I rowsort
+SELECT COUNT(*) FROM empty_t
+----
+0
+
+query I rowsort
+SELECT COUNT(i) FROM empty_t
+----
+0
+
+query R rowsort
+SELECT SUM(i) FROM empty_t
+----
+NULL
+
+query R rowsort
+SELECT AVG(i) FROM empty_t
+----
+NULL
+
+query R rowsort
+SELECT MIN(i) FROM empty_t
+----
+NULL
+
+query R rowsort
+SELECT MAX(i) FROM empty_t
+----
+NULL

@@ -1,0 +1,66 @@
+# test_case_coalesce.test
+# CASE expression and COALESCE/NULLIF tests
+
+statement ok
+CREATE TABLE products (id INTEGER, name TEXT, price DOUBLE, category INTEGER)
+
+statement ok
+INSERT INTO products VALUES (1, 'Widget', 10.0, 1), (2, 'Gadget', 25.0, 2), (3, 'Gizmo', 5.0, 1), (4, 'Doohickey', 50.0, 3), (5, 'Thingamajig', 15.0, 2)
+
+# Searched CASE with numeric result
+query TR rowsort
+SELECT name, CASE WHEN price < 10 THEN 0.0 WHEN price < 30 THEN 1.0 ELSE 2.0 END AS tier FROM products
+----
+Doohickey	2.000000
+Gadget	1.000000
+Gizmo	0.000000
+Thingamajig	1.000000
+Widget	1.000000
+
+# CASE in aggregation
+query IR rowsort
+SELECT category, SUM(CASE WHEN price > 10 THEN price ELSE 0 END) AS high_total FROM products GROUP BY category
+----
+1	0.000000
+2	40.000000
+3	50.000000
+
+# COALESCE with NULLs — use DOUBLE to see NULL as NaN
+statement ok
+CREATE TABLE nullable (id INTEGER, a DOUBLE, b DOUBLE)
+
+statement ok
+INSERT INTO nullable VALUES (1, 10.0, 20.0), (2, NULL, 30.0), (3, 40.0, NULL), (4, NULL, NULL)
+
+query IR rowsort
+SELECT id, COALESCE(a, b) FROM nullable
+----
+1	10.000000
+2	30.000000
+3	40.000000
+4	NULL
+
+# COALESCE with default literal (2-arg)
+query IR rowsort
+SELECT id, COALESCE(a, 0) FROM nullable
+----
+1	10.000000
+2	0.000000
+3	40.000000
+4	0.000000
+
+# NULLIF — returns NULL when values match
+query IR rowsort
+SELECT id, NULLIF(a, 10) FROM nullable
+----
+1	NULL
+2	NULL
+3	40.000000
+4	NULL
+
+# CASE with COUNT
+query RI rowsort
+SELECT CASE WHEN price > 20 THEN 1.0 ELSE 0.0 END AS expensive, COUNT(*) FROM products GROUP BY CASE WHEN price > 20 THEN 1.0 ELSE 0.0 END
+----
+0.000000	3
+1.000000	2

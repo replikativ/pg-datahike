@@ -1,0 +1,59 @@
+# test_case.test
+# CASE WHEN expressions — both searched and simple forms.
+
+statement ok
+CREATE TABLE students (name TEXT, grade INTEGER, subject TEXT)
+
+statement ok
+INSERT INTO students (name, grade, subject) VALUES ('Alice', 95, 'Math')
+
+statement ok
+INSERT INTO students (name, grade, subject) VALUES ('Bob', 72, 'Math')
+
+statement ok
+INSERT INTO students (name, grade, subject) VALUES ('Charlie', 85, 'Science')
+
+statement ok
+INSERT INTO students (name, grade, subject) VALUES ('Diana', 60, 'Science')
+
+statement ok
+INSERT INTO students (name, grade, subject) VALUES ('Eve', 45, 'Art')
+
+# ============================================================
+# Searched CASE WHEN
+# ============================================================
+
+query TT nosort
+SELECT name, CASE WHEN grade >= 90 THEN 'A' WHEN grade >= 80 THEN 'B' WHEN grade >= 70 THEN 'C' ELSE 'F' END AS letter FROM students ORDER BY name
+----
+Alice	A
+Bob	C
+Charlie	B
+Diana	F
+Eve	F
+
+# ============================================================
+# Simple CASE form
+# ============================================================
+
+query TT nosort
+SELECT name, CASE subject WHEN 'Math' THEN 'STEM' WHEN 'Science' THEN 'STEM' ELSE 'Humanities' END AS dept FROM students ORDER BY name
+----
+Alice	STEM
+Bob	STEM
+Charlie	STEM
+Diana	STEM
+Eve	Humanities
+
+# ============================================================
+# CASE in WHERE (via subexpression)
+# ============================================================
+
+query TT nosort
+SELECT name, CASE WHEN grade >= 70 THEN 'pass' ELSE 'fail' END AS result FROM students ORDER BY name
+----
+Alice	pass
+Bob	pass
+Charlie	pass
+Diana	fail
+Eve	fail

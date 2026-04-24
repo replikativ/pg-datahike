@@ -1,0 +1,80 @@
+# test_order_limit.test
+# ORDER BY and LIMIT/OFFSET tests
+
+statement ok
+CREATE TABLE items (id INTEGER, name TEXT, price DOUBLE, qty INTEGER)
+
+statement ok
+INSERT INTO items VALUES (1, 'Apple', 1.50, 100), (2, 'Banana', 0.75, 200), (3, 'Cherry', 3.00, 50), (4, 'Date', 5.00, 30), (5, 'Elderberry', 8.00, 10)
+
+# ORDER BY single column ASC
+query IT nosort
+SELECT id, name FROM items ORDER BY name ASC
+----
+1	Apple
+2	Banana
+3	Cherry
+4	Date
+5	Elderberry
+
+# ORDER BY single column DESC
+query IR nosort
+SELECT id, price FROM items ORDER BY price DESC
+----
+5	8.000000
+4	5.000000
+3	3.000000
+1	1.500000
+2	0.750000
+
+# ORDER BY with LIMIT
+query IT nosort
+SELECT id, name FROM items ORDER BY id ASC LIMIT 3
+----
+1	Apple
+2	Banana
+3	Cherry
+
+# ORDER BY with LIMIT and OFFSET
+query IT nosort
+SELECT id, name FROM items ORDER BY id ASC LIMIT 2 OFFSET 1
+----
+2	Banana
+3	Cherry
+
+# LIMIT only (restrict row count)
+query I rowsort
+SELECT COUNT(*) FROM (SELECT id FROM items LIMIT 3)
+----
+3
+
+# OFFSET only (skip first rows)
+query IT nosort
+SELECT id, name FROM items ORDER BY id OFFSET 3
+----
+4	Date
+5	Elderberry
+
+# ORDER BY with GROUP BY
+query TR nosort
+SELECT name, SUM(qty) AS total_qty FROM items GROUP BY name ORDER BY total_qty DESC LIMIT 3
+----
+Banana	200.000000
+Apple	100.000000
+Cherry	50.000000
+
+# ORDER BY multiple columns
+statement ok
+CREATE TABLE multi (a INTEGER, b INTEGER, c INTEGER)
+
+statement ok
+INSERT INTO multi VALUES (1, 2, 30), (1, 1, 20), (2, 1, 10), (1, 2, 40), (2, 2, 50)
+
+query III nosort
+SELECT a, b, c FROM multi ORDER BY a ASC, b ASC, c ASC
+----
+1	1	20
+1	2	30
+1	2	40
+2	1	10
+2	2	50

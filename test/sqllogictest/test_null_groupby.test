@@ -1,0 +1,68 @@
+# test_null_groupby.test
+# NULL handling in GROUP BY, JOIN keys, HAVING, and ORDER BY.
+# Inspired by PostgreSQL regression/aggregates.sql and select.sql.
+
+statement ok
+CREATE TABLE t1 (grp INTEGER, val INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (1, 20), (2, 30), (NULL, 40), (NULL, 50), (2, NULL)
+
+# ============================================================
+# NULL as a GROUP BY key — forms its own group
+# ============================================================
+
+query RR rowsort
+SELECT grp, SUM(val) FROM t1 GROUP BY grp
+----
+1.000000	30.000000
+2.000000	30.000000
+NULL	90.000000
+
+query RR rowsort
+SELECT grp, COUNT(*) FROM t1 GROUP BY grp
+----
+1.000000	2.000000
+2.000000	2.000000
+NULL	2.000000
+
+# ============================================================
+# NULL in HAVING — NULL group can be filtered
+# ============================================================
+
+query RR rowsort
+SELECT grp, SUM(val) FROM t1 GROUP BY grp HAVING grp IS NOT NULL
+----
+1.000000	30.000000
+2.000000	30.000000
+
+# ============================================================
+# NULL in aggregate column — skipped by SUM/AVG
+# ============================================================
+
+query RR rowsort
+SELECT grp, AVG(val) FROM t1 GROUP BY grp
+----
+1.000000	15.000000
+2.000000	30.000000
+NULL	45.000000
+
+# ============================================================
+# NULL in JOIN keys — should not match
+# ============================================================
+
+statement ok
+CREATE TABLE t2 (k INTEGER, label TEXT)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'one'), (2, 'two'), (NULL, 'none')
+
+query IT rowsort
+SELECT t1.grp, t2.label FROM t1 INNER JOIN t2 ON t1.grp = t2.k
+----
+1	one
+1	one
+2	two
+2	two
+
+# NULL keys don't match in INNER JOIN — the NULL rows from t1 and t2 are excluded

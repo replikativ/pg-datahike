@@ -1,0 +1,25 @@
+# test_having_degenerate.test
+# HAVING without GROUP BY — inspired by PostgreSQL regression/select_having.sql
+# lines 33-48 (degenerate cases).
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b DOUBLE)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)
+
+# ============================================================
+# HAVING with GROUP BY — standard case
+# ============================================================
+
+statement ok
+CREATE TABLE t2 (grp INTEGER, val INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (1, 20), (2, 30), (2, 40), (2, 50), (3, 60)
+
+query RR rowsort
+SELECT grp, COUNT(*) FROM t2 GROUP BY grp HAVING COUNT(*) > 1
+----
+1.000000	2.000000
+2.000000	3.000000

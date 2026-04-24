@@ -1,0 +1,124 @@
+# test_update.test
+# SQL UPDATE statement tests
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b INTEGER, c DOUBLE)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10, 1.5), (2, 20, 2.5), (3, 30, 3.5), (4, 40, 4.5), (5, 50, 5.5)
+
+# Basic UPDATE with WHERE
+statement ok
+UPDATE t1 SET b = 99 WHERE a = 3
+
+query IIR rowsort
+SELECT a, b, c FROM t1
+----
+1	10	1.500000
+2	20	2.500000
+3	99	3.500000
+4	40	4.500000
+5	50	5.500000
+
+# UPDATE with expression in SET
+statement ok
+UPDATE t1 SET b = b * 2 WHERE a > 3
+
+query IIR rowsort
+SELECT a, b, c FROM t1
+----
+1	10	1.500000
+2	20	2.500000
+3	99	3.500000
+4	80	4.500000
+5	100	5.500000
+
+# UPDATE without WHERE (all rows)
+statement ok
+UPDATE t1 SET c = 0.0
+
+query IIR rowsort
+SELECT a, b, c FROM t1
+----
+1	10	0.000000
+2	20	0.000000
+3	99	0.000000
+4	80	0.000000
+5	100	0.000000
+
+# Multiple column UPDATE
+statement ok
+UPDATE t1 SET b = 1, c = 9.9 WHERE a = 1
+
+query IIR rowsort
+SELECT a, b, c FROM t1 WHERE a = 1
+----
+1	1	9.900000
+
+# UPDATE with NULL
+statement ok
+CREATE TABLE t2 (x INTEGER, y INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+UPDATE t2 SET y = NULL WHERE x = 2
+
+query II rowsort
+SELECT x, y FROM t2
+----
+1	10
+2	NULL
+3	30
+
+# Verify SUM skips the NULL
+query R rowsort
+SELECT SUM(y) FROM t2
+----
+40.000000
+
+# UPDATE with arithmetic expression
+statement ok
+CREATE TABLE t3 (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO t3 VALUES (10, 5), (20, 10), (30, 15)
+
+statement ok
+UPDATE t3 SET a = a + b WHERE b > 5
+
+query II rowsort
+SELECT a, b FROM t3
+----
+10	5
+30	10
+45	15
+
+# UPDATE with no matching rows (no-op)
+statement ok
+UPDATE t3 SET a = 0 WHERE b > 100
+
+query II rowsort
+SELECT a, b FROM t3
+----
+10	5
+30	10
+45	15
+
+# UPDATE on IS NULL predicate
+statement ok
+CREATE TABLE t4 (v INTEGER, w INTEGER)
+
+statement ok
+INSERT INTO t4 VALUES (1, NULL), (2, 20), (3, NULL)
+
+statement ok
+UPDATE t4 SET w = 0 WHERE w IS NULL
+
+query II rowsort
+SELECT v, w FROM t4
+----
+1	0
+2	20
+3	0

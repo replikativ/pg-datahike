@@ -1,0 +1,63 @@
+# test_like.test
+# LIKE pattern matching tests
+
+statement ok
+CREATE TABLE words (id INTEGER, word TEXT)
+
+statement ok
+INSERT INTO words VALUES (1, 'apple'), (2, 'application'), (3, 'banana'), (4, 'band'), (5, 'candy'), (6, 'can'), (7, 'pineapple')
+
+# LIKE with prefix match
+query IT rowsort
+SELECT id, word FROM words WHERE word LIKE 'app%'
+----
+1	apple
+2	application
+
+# LIKE with suffix match
+query IT rowsort
+SELECT id, word FROM words WHERE word LIKE '%le'
+----
+1	apple
+7	pineapple
+
+# LIKE with contains match
+query IT rowsort
+SELECT id, word FROM words WHERE word LIKE '%an%'
+----
+3	banana
+4	band
+5	candy
+6	can
+
+# LIKE exact match (no wildcards)
+query IT rowsort
+SELECT id, word FROM words WHERE word LIKE 'banana'
+----
+3	banana
+
+# NOT LIKE
+query IT rowsort
+SELECT id, word FROM words WHERE word NOT LIKE '%an%'
+----
+1	apple
+2	application
+7	pineapple
+
+# LIKE with no matches
+query I rowsort
+SELECT COUNT(*) FROM words WHERE word LIKE 'xyz%'
+----
+0
+
+# LIKE in GROUP BY context
+statement ok
+CREATE TABLE logs (id INTEGER, msg TEXT, level TEXT)
+
+statement ok
+INSERT INTO logs VALUES (1, 'User login', 'INFO'), (2, 'User logout', 'INFO'), (3, 'Error occurred', 'ERROR'), (4, 'User signup', 'INFO'), (5, 'Error timeout', 'ERROR')
+
+query TI rowsort
+SELECT level, COUNT(*) FROM logs WHERE msg LIKE 'User%' GROUP BY level
+----
+INFO	3

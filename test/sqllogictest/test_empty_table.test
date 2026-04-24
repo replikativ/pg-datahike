@@ -1,0 +1,70 @@
+# test_empty_table.test
+# Empty table edge cases — inspired by PostgreSQL behavior.
+
+statement ok
+CREATE TABLE empty_t (a INTEGER, b DOUBLE, c TEXT)
+
+# ============================================================
+# SELECT * from empty table — 0 rows
+# ============================================================
+
+query IRt rowsort
+SELECT * FROM empty_t
+----
+
+# ============================================================
+# SELECT column from empty table — 0 rows
+# ============================================================
+
+query I rowsort
+SELECT a FROM empty_t
+----
+
+# ============================================================
+# SELECT with WHERE on empty table — 0 rows
+# ============================================================
+
+query I rowsort
+SELECT a FROM empty_t WHERE a > 0
+----
+
+# ============================================================
+# COUNT(*) on empty table — 1 row with 0
+# ============================================================
+
+query I rowsort
+SELECT COUNT(*) FROM empty_t
+----
+0
+
+# ============================================================
+# SUM on empty table — 1 row with NULL
+# ============================================================
+
+query R rowsort
+SELECT SUM(a) FROM empty_t
+----
+NULL
+
+# ============================================================
+# AVG on empty table — 1 row with NULL
+# ============================================================
+
+query R rowsort
+SELECT AVG(b) FROM empty_t
+----
+NULL
+
+# ============================================================
+# MIN/MAX on empty table — 1 row with NULL
+# ============================================================
+
+query R rowsort
+SELECT MIN(a) FROM empty_t
+----
+NULL
+
+query R rowsort
+SELECT MAX(b) FROM empty_t
+----
+NULL

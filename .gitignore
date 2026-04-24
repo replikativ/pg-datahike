@@ -1,0 +1,40 @@
+# Build outputs
+/target/
+/classes/
+*.class
+*.jar
+
+# tools.deps cache
+.cpcache/
+
+# Editor / IDE
+.idea/
+*.iml
+.vscode/
+.calva/
+.lsp/
+;; Keep .clj-kondo/config.edn tracked; ignore the auto-generated cache.
+.clj-kondo/.cache/
+.nrepl-port
+.portal/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Integration tests: each harness clones its upstream driver repo under
+# its own subdir for running a conformance suite; not checked in.
+/test/integration/pgjdbc/pgjdbc/
+/test/integration/asyncpg/asyncpg/
+/test/integration/asyncpg/.venv/
+/test/integration/node-postgres/node-postgres/
+/test/integration/node-postgres/node_modules/
+/test/integration/**/*.log
+# Maven build output for the Hibernate integration app.
+/test/integration/hibernate-app/target/
+# SQLAlchemy dialect bytecode cache.
+/test/integration/__pycache__/
+
+# Runtime logs
+*.log
+/tmp/

@@ -1,0 +1,45 @@
+# test_having.test
+# PostgreSQL-compatible HAVING clause tests
+
+statement ok
+CREATE TABLE integers (i INTEGER, g INTEGER)
+
+statement ok
+INSERT INTO integers VALUES (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 3)
+
+# Basic HAVING
+query IR rowsort
+SELECT g, SUM(i) FROM integers GROUP BY g HAVING SUM(i) > 5
+----
+1	6.000000
+2	9.000000
+3	6.000000
+
+query IR rowsort
+SELECT g, SUM(i) FROM integers GROUP BY g HAVING SUM(i) >= 9
+----
+2	9.000000
+
+# HAVING with COUNT
+query II rowsort
+SELECT g, COUNT(*) FROM integers GROUP BY g HAVING COUNT(*) > 1
+----
+1	3
+2	2
+
+query II rowsort
+SELECT g, COUNT(*) FROM integers GROUP BY g HAVING COUNT(*) = 1
+----
+3	1
+
+# HAVING with AVG
+query IR rowsort
+SELECT g, AVG(i) FROM integers GROUP BY g HAVING AVG(i) > 3
+----
+2	4.500000
+3	6.000000
+
+# HAVING filters all groups — empty result
+query IR rowsort
+SELECT g, SUM(i) FROM integers GROUP BY g HAVING SUM(i) > 100
+----

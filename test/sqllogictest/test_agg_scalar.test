@@ -1,0 +1,56 @@
+# test_agg_scalar.test
+# CORR (Pearson correlation) scalar aggregate — no GROUP BY.
+
+statement ok
+CREATE TABLE pairs (x DOUBLE, y DOUBLE)
+
+statement ok
+INSERT INTO pairs VALUES (1, 2), (2, 4), (3, 6), (4, 8), (5, 10)
+
+# Perfect positive correlation
+query R rowsort
+SELECT CORR(x, y) FROM pairs
+----
+1.000000
+
+# Perfect correlation with self
+query R rowsort
+SELECT CORR(x, x) FROM pairs
+----
+1.000000
+
+# Negative correlation
+statement ok
+CREATE TABLE neg (x DOUBLE, y DOUBLE)
+
+statement ok
+INSERT INTO neg VALUES (1, 5), (2, 3), (3, 1)
+
+query R rowsort
+SELECT CORR(x, y) FROM neg
+----
+-1.000000
+
+# With NULLs — skip rows where either is NULL
+statement ok
+CREATE TABLE nullpairs (x DOUBLE, y DOUBLE)
+
+statement ok
+INSERT INTO nullpairs VALUES (1, 10), (2, NULL), (3, 30), (NULL, 40), (5, 50)
+
+query R rowsort
+SELECT CORR(x, y) FROM nullpairs
+----
+1.000000
+
+# Single row — returns NULL (need >=2 pairs)
+statement ok
+CREATE TABLE single (x DOUBLE, y DOUBLE)
+
+statement ok
+INSERT INTO single VALUES (1, 2)
+
+query R rowsort
+SELECT CORR(x, y) FROM single
+----
+NULL

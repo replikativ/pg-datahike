@@ -1,0 +1,45 @@
+# test_subquery_cte.test
+# Subquery and CTE (Common Table Expression) tests
+
+statement ok
+CREATE TABLE employees (id INTEGER, name TEXT, dept TEXT, salary DOUBLE)
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 'Eng', 90000.0), (2, 'Bob', 'Eng', 85000.0), (3, 'Carol', 'Sales', 70000.0), (4, 'Dave', 'Sales', 75000.0), (5, 'Eve', 'Eng', 95000.0)
+
+# Simple CTE
+query TR nosort
+WITH eng AS (SELECT name, salary FROM employees WHERE dept = 'Eng') SELECT name, salary FROM eng ORDER BY salary DESC
+----
+Eve	95000.000000
+Alice	90000.000000
+Bob	85000.000000
+
+# CTE with aggregation
+query TR rowsort
+WITH dept_avg AS (SELECT dept, AVG(salary) AS avg_sal FROM employees GROUP BY dept) SELECT dept, avg_sal FROM dept_avg
+----
+Eng	90000.000000
+Sales	72500.000000
+
+# IN subquery
+query T rowsort
+SELECT name FROM employees WHERE dept IN (SELECT dept FROM employees WHERE salary > 90000)
+----
+Alice
+Bob
+Eve
+
+# FROM subquery
+query TR nosort
+SELECT name, salary FROM (SELECT name, salary FROM employees WHERE salary > 80000) ORDER BY salary DESC
+----
+Eve	95000.000000
+Alice	90000.000000
+Bob	85000.000000
+
+# CTE filtering already-aggregated data
+query TR nosort
+WITH totals AS (SELECT dept, SUM(salary) AS total FROM employees GROUP BY dept) SELECT dept, total FROM totals WHERE total > 200000 ORDER BY total DESC
+----
+Eng	270000.000000

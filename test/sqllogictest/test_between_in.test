@@ -1,0 +1,107 @@
+# test_between_in.test
+# BETWEEN, NOT BETWEEN, IN list, NOT IN list, multi-predicate WHERE.
+# Inspired by PostgreSQL regression/select.sql.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b DOUBLE, c TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10.0, 'alpha'), (2, 20.0, 'beta'), (3, 30.0, 'gamma'), (4, 40.0, 'delta'), (5, 50.0, 'epsilon')
+
+# ============================================================
+# BETWEEN
+# ============================================================
+
+query I rowsort
+SELECT a FROM t1 WHERE a BETWEEN 2 AND 4
+----
+2
+3
+4
+
+query R rowsort
+SELECT b FROM t1 WHERE b BETWEEN 15.0 AND 35.0
+----
+20.000000
+30.000000
+
+# ============================================================
+# NOT BETWEEN
+# ============================================================
+
+query I rowsort
+SELECT a FROM t1 WHERE a NOT BETWEEN 2 AND 4
+----
+1
+5
+
+# ============================================================
+# IN list (values)
+# ============================================================
+
+query IT rowsort
+SELECT a, c FROM t1 WHERE a IN (1, 3, 5)
+----
+1	alpha
+3	gamma
+5	epsilon
+
+query IT rowsort
+SELECT a, c FROM t1 WHERE c IN ('alpha', 'delta')
+----
+1	alpha
+4	delta
+
+# ============================================================
+# NOT IN list
+# ============================================================
+
+query I rowsort
+SELECT a FROM t1 WHERE a NOT IN (1, 3, 5)
+----
+2
+4
+
+# ============================================================
+# Multi-predicate WHERE with AND
+# ============================================================
+
+query IR rowsort
+SELECT a, b FROM t1 WHERE a > 1 AND b < 40.0
+----
+2	20.000000
+3	30.000000
+
+# ============================================================
+# Multi-predicate WHERE with OR
+# ============================================================
+
+query I rowsort
+SELECT a FROM t1 WHERE a = 1 OR a = 5
+----
+1
+5
+
+# ============================================================
+# Combined BETWEEN + AND
+# ============================================================
+
+query IT rowsort
+SELECT a, c FROM t1 WHERE a BETWEEN 2 AND 4 AND c != 'gamma'
+----
+2	beta
+4	delta
+
+# ============================================================
+# IN + aggregation
+# ============================================================
+
+query I rowsort
+SELECT COUNT(*) FROM t1 WHERE a IN (1, 2, 3)
+----
+3
+
+query R rowsort
+SELECT SUM(b) FROM t1 WHERE a NOT IN (1, 5)
+----
+90.000000

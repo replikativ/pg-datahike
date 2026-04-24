@@ -1,0 +1,56 @@
+# test_sum.test
+# PostgreSQL-compatible SUM aggregate function tests
+
+statement ok
+CREATE TABLE integers (i INTEGER)
+
+statement ok
+INSERT INTO integers VALUES (1), (2), (3), (4), (5)
+
+query R rowsort
+SELECT SUM(i) FROM integers
+----
+15.000000
+
+query R rowsort
+SELECT SUM(i) FROM integers WHERE i > 3
+----
+9.000000
+
+# SUM with NULL values — NULLs are skipped
+statement ok
+CREATE TABLE nullints (i INTEGER)
+
+statement ok
+INSERT INTO nullints VALUES (10), (NULL), (20), (NULL), (30)
+
+query R rowsort
+SELECT SUM(i) FROM nullints
+----
+60.000000
+
+# SUM with GROUP BY
+statement ok
+CREATE TABLE groups (g INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO groups VALUES (1, 10), (1, 20), (2, 30), (2, 40), (3, 50)
+
+query IR rowsort
+SELECT g, SUM(v) FROM groups GROUP BY g
+----
+1	30.000000
+2	70.000000
+3	50.000000
+
+# SUM of doubles
+statement ok
+CREATE TABLE doubles (d DOUBLE)
+
+statement ok
+INSERT INTO doubles VALUES (1.5), (2.5), (3.0)
+
+query R rowsort
+SELECT SUM(d) FROM doubles
+----
+7.000000

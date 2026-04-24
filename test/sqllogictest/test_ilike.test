@@ -1,0 +1,54 @@
+# test_ilike.test
+# Case-insensitive ILIKE pattern matching tests
+
+statement ok
+CREATE TABLE names (id INTEGER, name TEXT)
+
+statement ok
+INSERT INTO names VALUES (1, 'Alice'), (2, 'BOB'), (3, 'carol'), (4, 'DaVe'), (5, 'Eve')
+
+# ILIKE prefix match (case-insensitive)
+query IT rowsort
+SELECT id, name FROM names WHERE name ILIKE 'a%'
+----
+1	Alice
+
+# ILIKE contains match (case-insensitive)
+query IT rowsort
+SELECT id, name FROM names WHERE name ILIKE '%o%'
+----
+2	BOB
+3	carol
+
+# ILIKE suffix match (case-insensitive)
+query IT rowsort
+SELECT id, name FROM names WHERE name ILIKE '%e'
+----
+1	Alice
+4	DaVe
+5	Eve
+
+# ILIKE exact match (case-insensitive)
+query IT rowsort
+SELECT id, name FROM names WHERE name ILIKE 'bob'
+----
+2	BOB
+
+# NOT ILIKE
+query IT rowsort
+SELECT id, name FROM names WHERE name NOT ILIKE '%e%'
+----
+2	BOB
+3	carol
+
+# ILIKE with mixed case pattern
+query IT rowsort
+SELECT id, name FROM names WHERE name ILIKE '%OL'
+----
+3	carol
+
+# ILIKE with no matches
+query I rowsort
+SELECT COUNT(*) FROM names WHERE name ILIKE 'xyz%'
+----
+0

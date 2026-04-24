@@ -1,0 +1,87 @@
+# test_string_funcs.test
+# String functions: UPPER, LOWER, SUBSTR, LENGTH.
+# Inspired by PostgreSQL regression/strings.sql.
+
+statement ok
+CREATE TABLE t1 (name TEXT, city TEXT)
+
+statement ok
+INSERT INTO t1 VALUES ('Alice', 'New York'), ('bob', 'LONDON'), ('Charlie', 'paris'), ('DIANA', 'Tokyo')
+
+# ============================================================
+# UPPER / LOWER
+# ============================================================
+
+query TT rowsort
+SELECT UPPER(name), LOWER(city) FROM t1
+----
+ALICE	new york
+BOB	london
+CHARLIE	paris
+DIANA	tokyo
+
+# ============================================================
+# UPPER/LOWER in WHERE
+# ============================================================
+
+query T rowsort
+SELECT name FROM t1 WHERE LOWER(name) = 'bob'
+----
+bob
+
+query T rowsort
+SELECT name FROM t1 WHERE UPPER(city) = 'LONDON'
+----
+bob
+
+# ============================================================
+# UPPER/LOWER in GROUP BY
+# ============================================================
+
+statement ok
+CREATE TABLE t2 (category TEXT, val INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES ('Fruit', 1), ('fruit', 2), ('FRUIT', 3), ('Veggie', 4), ('veggie', 5)
+
+query TR rowsort
+SELECT LOWER(category), SUM(val) FROM t2 GROUP BY LOWER(category)
+----
+fruit	6.000000
+veggie	9.000000
+
+# ============================================================
+# SUBSTR / SUBSTRING
+# ============================================================
+
+query T rowsort
+SELECT SUBSTR(name, 1, 3) FROM t1
+----
+Ali
+bob
+Cha
+DIA
+
+# ============================================================
+# LENGTH
+# ============================================================
+
+query TI rowsort
+SELECT name, LENGTH(name) FROM t1
+----
+Alice	5
+bob	3
+Charlie	7
+DIANA	5
+
+# ============================================================
+# UPPER/LOWER in ORDER BY
+# ============================================================
+
+query T nosort
+SELECT name FROM t1 ORDER BY LOWER(name)
+----
+Alice
+bob
+Charlie
+DIANA

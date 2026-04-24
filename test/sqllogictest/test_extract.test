@@ -1,0 +1,61 @@
+# test_extract.test
+# EXTRACT function for date/time components, DATE_TRUNC with various units.
+# Inspired by PostgreSQL regression/date.sql and timestamp.sql.
+
+statement ok
+CREATE TABLE events (ts INTEGER, label TEXT)
+
+# Timestamps as epoch seconds:
+# 2024-01-15 10:30:45 = 1705311045
+# 2024-01-15 14:15:00 = 1705324500
+# 2024-02-20 08:00:00 = 1708416000
+# 2024-03-01 23:59:59 = 1709337599
+
+statement ok
+INSERT INTO events VALUES (1705311045, 'a'), (1705324500, 'b'), (1708416000, 'c'), (1709337599, 'd')
+
+# ============================================================
+# DATE_TRUNC with day — floor to start of day
+# ============================================================
+
+query II rowsort
+SELECT DATE_TRUNC('day', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('day', ts)
+----
+1705276800	2
+1708387200	1
+1709251200	1
+
+# ============================================================
+# DATE_TRUNC with hour
+# ============================================================
+
+query II rowsort
+SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('hour', ts)
+----
+1705309200	1
+1705323600	1
+1708416000	1
+1709334000	1
+
+# ============================================================
+# DATE_TRUNC with minute
+# ============================================================
+
+query I rowsort
+SELECT DATE_TRUNC('minute', ts) FROM events
+----
+1705311000
+1705324500
+1708416000
+1709337540
+
+# ============================================================
+# DATE_TRUNC with month
+# ============================================================
+
+query II rowsort
+SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('month', ts)
+----
+1704067200	2
+1706745600	1
+1709251200	1

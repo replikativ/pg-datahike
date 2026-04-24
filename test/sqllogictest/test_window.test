@@ -1,0 +1,78 @@
+# test_window.test
+# Window functions: ROW_NUMBER, RANK, DENSE_RANK, running SUM/AVG, LAG/LEAD.
+
+statement ok
+CREATE TABLE emp (id INTEGER, name TEXT, dept TEXT, salary DOUBLE)
+
+statement ok
+INSERT INTO emp VALUES (1, 'Alice', 'Eng', 90000.0), (2, 'Bob', 'Eng', 80000.0), (3, 'Carol', 'Sales', 70000.0), (4, 'Dave', 'Sales', 75000.0), (5, 'Eve', 'Eng', 95000.0)
+
+# ============================================================
+# ROW_NUMBER() OVER (ORDER BY salary DESC)
+# ============================================================
+
+query ITR rowsort
+SELECT name, dept, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn FROM emp
+----
+Eve	Eng	1.000000
+Alice	Eng	2.000000
+Bob	Eng	3.000000
+Dave	Sales	4.000000
+Carol	Sales	5.000000
+
+# ============================================================
+# RANK() OVER (PARTITION BY dept ORDER BY salary DESC)
+# ============================================================
+
+query ITR rowsort
+SELECT name, dept, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rnk FROM emp
+----
+Eve	Eng	1.000000
+Alice	Eng	2.000000
+Bob	Eng	3.000000
+Dave	Sales	1.000000
+Carol	Sales	2.000000
+
+# ============================================================
+# Running SUM OVER (ORDER BY id)
+# ============================================================
+
+query IR rowsort
+SELECT id, SUM(salary) OVER (ORDER BY id) AS running_sum FROM emp
+----
+1	90000.000000
+2	170000.000000
+3	240000.000000
+4	315000.000000
+5	410000.000000
+
+# ============================================================
+# SUM OVER entire partition (no ORDER BY)
+# ============================================================
+
+query TR rowsort
+SELECT dept, SUM(salary) OVER (PARTITION BY dept) AS dept_total FROM emp
+----
+Eng	265000.000000
+Eng	265000.000000
+Eng	265000.000000
+Sales	145000.000000
+Sales	145000.000000
+
+# ============================================================
+# DENSE_RANK
+# ============================================================
+
+statement ok
+CREATE TABLE scores (name TEXT, score INTEGER)
+
+statement ok
+INSERT INTO scores VALUES ('A', 100), ('B', 90), ('C', 90), ('D', 80)
+
+query TR rowsort
+SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores
+----
+A	1.000000
+B	2.000000
+C	2.000000
+D	3.000000

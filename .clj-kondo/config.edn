@@ -1,0 +1,9 @@
+;; Test-macro bindings clj-kondo can't infer on its own.
+{:lint-as
+ {datahike.test.pg-wire-jdbc-test/with-conn clojure.core/let
+  datahike.test.pg-constraints-test/with-test-db clojure.core/with-open}
+
+ :config-in-ns
+ {;; Integration-test fixtures intentionally use `defn ^:private` + unused
+  ;; vars for ergonomics; suppress inline.
+  datahike.test.sqllogictest-runner {:linters {:unused-private-var {:level :off}}}}}

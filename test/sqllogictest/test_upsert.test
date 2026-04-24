@@ -1,0 +1,73 @@
+# test_upsert.test
+# INSERT ON CONFLICT (UPSERT) tests
+
+statement ok
+CREATE TABLE kv (k INTEGER, v DOUBLE, label TEXT)
+
+statement ok
+INSERT INTO kv VALUES (1, 10.0, 'one'), (2, 20.0, 'two'), (3, 30.0, 'three')
+
+# DO NOTHING — conflicting row unchanged
+statement ok
+INSERT INTO kv VALUES (1, 99.0, 'changed') ON CONFLICT (k) DO NOTHING
+
+query IRT rowsort
+SELECT k, v, label FROM kv
+----
+1	10.000000	one
+2	20.000000	two
+3	30.000000	three
+
+# DO UPDATE SET — replace value on conflict
+statement ok
+INSERT INTO kv VALUES (2, 200.0, 'TWO') ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, label = EXCLUDED.label
+
+query IRT rowsort
+SELECT k, v, label FROM kv
+----
+1	10.000000	one
+2	200.000000	TWO
+3	30.000000	three
+
+# Insert new row (no conflict)
+statement ok
+INSERT INTO kv VALUES (4, 40.0, 'four') ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v
+
+query IRT rowsort
+SELECT k, v, label FROM kv
+----
+1	10.000000	one
+2	200.000000	TWO
+3	30.000000	three
+4	40.000000	four
+
+# DO UPDATE with expression using existing value
+statement ok
+INSERT INTO kv VALUES (3, 5.0, 'three_new') ON CONFLICT (k) DO UPDATE SET v = v + EXCLUDED.v
+
+query IRT rowsort
+SELECT k, v, label FROM kv
+----
+1	10.000000	one
+2	200.000000	TWO
+3	35.000000	three
+4	40.000000	four
+
+# Multiple row upsert: one conflict, one new
+statement ok
+INSERT INTO kv VALUES (1, 100.0, 'ONE'), (5, 50.0, 'five') ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, label = EXCLUDED.label
+
+query IRT rowsort
+SELECT k, v, label FROM kv
+----
+1	100.000000	ONE
+2	200.000000	TWO
+3	35.000000	three
+4	40.000000	four
+5	50.000000	five
+
+# Aggregation after upserts
+query R rowsort
+SELECT SUM(v) FROM kv
+----
+425.000000

@@ -1,0 +1,51 @@
+# test_filter.test
+# Aggregate FILTER clause tests
+
+statement ok
+CREATE TABLE sales (id INTEGER, region TEXT, amount DOUBLE, status INTEGER)
+
+statement ok
+INSERT INTO sales VALUES (1, 'East', 100.0, 1), (2, 'West', 200.0, 1), (3, 'East', 150.0, 0), (4, 'West', 300.0, 1), (5, 'East', 50.0, 0)
+
+# SUM with FILTER
+query R rowsort
+SELECT SUM(amount) FILTER (WHERE status = 1) FROM sales
+----
+600.000000
+
+# COUNT with FILTER (rewritten as SUM internally, returns double)
+query R rowsort
+SELECT COUNT(*) FILTER (WHERE status = 1) FROM sales
+----
+3.000000
+
+# AVG with FILTER
+query R rowsort
+SELECT AVG(amount) FILTER (WHERE status = 1) FROM sales
+----
+200.000000
+
+# Multiple FILTER aggregates
+query RRR rowsort
+SELECT SUM(amount) FILTER (WHERE status = 1), SUM(amount) FILTER (WHERE status = 0), COUNT(*) FILTER (WHERE status = 1) FROM sales
+----
+600.000000	200.000000	3.000000
+
+# FILTER with GROUP BY
+query TRR rowsort
+SELECT region, SUM(amount) FILTER (WHERE status = 1), COUNT(*) FILTER (WHERE status = 1) FROM sales GROUP BY region
+----
+East	100.000000	1.000000
+West	500.000000	2.000000
+
+# FILTER with no matching rows — SUM returns NULL per SQL standard
+query R rowsort
+SELECT SUM(amount) FILTER (WHERE status > 5) FROM sales
+----
+NULL
+
+# MIN/MAX with FILTER
+query RR rowsort
+SELECT MIN(amount) FILTER (WHERE status = 1), MAX(amount) FILTER (WHERE status = 1) FROM sales
+----
+100.000000	300.000000

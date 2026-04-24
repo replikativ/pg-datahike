@@ -1,0 +1,43 @@
+# test_timestamp.test
+# Timestamp types, NOW(), CURRENT_TIMESTAMP, CURRENT_DATE.
+
+statement ok
+CREATE TABLE events (id INTEGER, name TEXT, ts TIMESTAMP)
+
+# ============================================================
+# INSERT with timestamp string
+# ============================================================
+
+statement ok
+INSERT INTO events VALUES (1, 'launch', '2024-01-15T10:30:00Z')
+
+statement ok
+INSERT INTO events VALUES (2, 'update', '2024-06-01T00:00:00Z')
+
+# ============================================================
+# SELECT timestamp column (ISO format)
+# ============================================================
+
+query IT rowsort
+SELECT id, name FROM events
+----
+1	launch
+2	update
+
+# ============================================================
+# NOW() returns a timestamp (not null)
+# ============================================================
+
+query I rowsort
+SELECT CASE WHEN NOW() IS NOT NULL THEN 1 ELSE 0 END
+----
+1
+
+# ============================================================
+# CURRENT_TIMESTAMP returns a timestamp
+# ============================================================
+
+query I rowsort
+SELECT CASE WHEN CURRENT_TIMESTAMP IS NOT NULL THEN 1 ELSE 0 END
+----
+1

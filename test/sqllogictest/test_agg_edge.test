@@ -1,0 +1,89 @@
+# test_agg_edge.test
+# Aggregate edge cases: multiple COUNT DISTINCT, compound agg expressions,
+# single-row aggregates.
+# Inspired by PostgreSQL regression/aggregates.sql.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b INTEGER, c TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10, 'x'), (2, 10, 'y'), (1, 20, 'x'), (3, 30, 'z'), (2, 10, 'y')
+
+# ============================================================
+# COUNT vs COUNT DISTINCT
+# ============================================================
+
+query II rowsort
+SELECT COUNT(a), COUNT(DISTINCT a) FROM t1
+----
+5	3
+
+query II rowsort
+SELECT COUNT(c), COUNT(DISTINCT c) FROM t1
+----
+5	3
+
+# ============================================================
+# Compound agg expressions: MAX(a) - MIN(a)
+# ============================================================
+
+query R rowsort
+SELECT MAX(a) - MIN(a) AS range_a FROM t1
+----
+2.000000
+
+# ============================================================
+# Single-row input
+# ============================================================
+
+statement ok
+CREATE TABLE single_row (x INTEGER)
+
+statement ok
+INSERT INTO single_row VALUES (42)
+
+query IRRR rowsort
+SELECT COUNT(*), SUM(x), AVG(x), MIN(x) FROM single_row
+----
+1	42.000000	42.000000	42.000000
+
+# COUNT(*) counts rows regardless of NULLs
+statement ok
+CREATE TABLE all_null (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO all_null VALUES (NULL, 1), (NULL, 2), (NULL, 3)
+
+query I rowsort
+SELECT COUNT(*) FROM all_null
+----
+3
+
+# ============================================================
+# Aggregate with DISTINCT in GROUP BY
+# ============================================================
+
+query RR rowsort
+SELECT b, COUNT(DISTINCT a) FROM t1 GROUP BY b
+----
+10.000000	2.000000
+20.000000	1.000000
+30.000000	1.000000
+
+# ============================================================
+# Multiple aggregates with different columns
+# ============================================================
+
+query RRRR rowsort
+SELECT SUM(a), SUM(b), AVG(a), AVG(b) FROM t1
+----
+9.000000	80.000000	1.800000	16.000000
+
+# ============================================================
+# SUM with expression
+# ============================================================
+
+query R rowsort
+SELECT SUM(a * b) FROM t1
+----
+160.000000

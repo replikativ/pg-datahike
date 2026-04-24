@@ -1,0 +1,55 @@
+# test_avg.test
+# PostgreSQL-compatible AVG aggregate function tests
+
+statement ok
+CREATE TABLE integers (i INTEGER)
+
+statement ok
+INSERT INTO integers VALUES (1), (2), (3), (4), (5)
+
+query R rowsort
+SELECT AVG(i) FROM integers
+----
+3.000000
+
+query R rowsort
+SELECT AVG(i) FROM integers WHERE i > 3
+----
+4.500000
+
+# AVG with NULLs — NULLs are skipped
+statement ok
+CREATE TABLE nullints (i INTEGER)
+
+statement ok
+INSERT INTO nullints VALUES (10), (NULL), (20), (NULL), (30)
+
+query R rowsort
+SELECT AVG(i) FROM nullints
+----
+20.000000
+
+# AVG with GROUP BY
+statement ok
+CREATE TABLE groups (g INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO groups VALUES (1, 10), (1, 20), (2, 30), (2, 40)
+
+query IR rowsort
+SELECT g, AVG(v) FROM groups GROUP BY g
+----
+1	15.000000
+2	35.000000
+
+# AVG of doubles
+statement ok
+CREATE TABLE doubles (d DOUBLE)
+
+statement ok
+INSERT INTO doubles VALUES (1.0), (2.0), (3.0)
+
+query R rowsort
+SELECT AVG(d) FROM doubles
+----
+2.000000

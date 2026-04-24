@@ -1,0 +1,106 @@
+# test_select_agg.test
+# SELECT + aggregate combinations — inspired by PostgreSQL regression/aggregates.sql
+# and select_implicit.sql. Tests mixing literals, column refs, and aggregates.
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b DOUBLE)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)
+
+# ============================================================
+# Literal + aggregate (the core bug: SELECT 1, COUNT(*))
+# ============================================================
+
+query II rowsort
+SELECT 1, COUNT(*) FROM t1
+----
+1	5
+
+query IR rowsort
+SELECT 1 AS one, SUM(a) AS total FROM t1
+----
+1	15.000000
+
+query IR rowsort
+SELECT 1 AS one, AVG(b) AS avg_b FROM t1
+----
+1	30.000000
+
+# ============================================================
+# Multiple aggregates (no literal — regression check)
+# ============================================================
+
+query RR rowsort
+SELECT SUM(a), AVG(b) FROM t1
+----
+15.000000	30.000000
+
+query IR rowsort
+SELECT COUNT(*), SUM(b) FROM t1
+----
+5	150.000000
+
+# ============================================================
+# Column + aggregate + GROUP BY
+# ============================================================
+
+statement ok
+CREATE TABLE t2 (grp INTEGER, val DOUBLE)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10.0), (1, 20.0), (2, 30.0), (2, 40.0), (2, 50.0)
+
+query RR rowsort
+SELECT grp, COUNT(*) FROM t2 GROUP BY grp
+----
+1.000000	2.000000
+2.000000	3.000000
+
+query RR rowsort
+SELECT grp, SUM(val) FROM t2 GROUP BY grp
+----
+1.000000	30.000000
+2.000000	120.000000
+
+# ============================================================
+# Literal + column + aggregate + GROUP BY
+# ============================================================
+
+query IRR rowsort
+SELECT 1 AS one, grp, SUM(val) AS total FROM t2 GROUP BY grp
+----
+1	1.000000	30.000000
+1	2.000000	120.000000
+
+# ============================================================
+# Aliased aggregate without literal (regression check)
+# ============================================================
+
+query R rowsort
+SELECT SUM(val) AS total FROM t2
+----
+150.000000
+
+query I rowsort
+SELECT COUNT(*) AS n FROM t2
+----
+5
+
+# ============================================================
+# Empty table aggregates
+# ============================================================
+
+statement ok
+CREATE TABLE empty_t (a INTEGER, b DOUBLE)
+
+query I rowsort
+SELECT COUNT(*) FROM empty_t
+----
+0
+
+# SUM of empty table returns NULL
+query R rowsort
+SELECT SUM(a) FROM empty_t
+----
+NULL

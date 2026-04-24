@@ -1,0 +1,116 @@
+# test_delete.test
+# SQL DELETE statement tests
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+# DELETE with WHERE
+statement ok
+DELETE FROM t1 WHERE a = 3
+
+query II rowsort
+SELECT a, b FROM t1
+----
+1	10
+2	20
+4	40
+5	50
+
+# DELETE with comparison predicate
+statement ok
+DELETE FROM t1 WHERE b >= 40
+
+query II rowsort
+SELECT a, b FROM t1
+----
+1	10
+2	20
+
+# Verify count after delete
+query I rowsort
+SELECT COUNT(*) FROM t1
+----
+2
+
+# DELETE with no matching rows (no-op)
+statement ok
+DELETE FROM t1 WHERE a > 100
+
+query II rowsort
+SELECT a, b FROM t1
+----
+1	10
+2	20
+
+# DELETE all rows
+statement ok
+DELETE FROM t1
+
+query I rowsort
+SELECT COUNT(*) FROM t1
+----
+0
+
+# Rebuild table and test more predicates
+statement ok
+INSERT INTO t1 VALUES (10, 100), (20, 200), (30, 300)
+
+statement ok
+DELETE FROM t1 WHERE a < 20
+
+query II rowsort
+SELECT a, b FROM t1 WHERE a = 10
+----
+
+query II rowsort
+SELECT a, b FROM t1
+----
+20	200
+30	300
+
+# DELETE with IS NULL
+statement ok
+CREATE TABLE t2 (x INTEGER, y INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)
+
+statement ok
+DELETE FROM t2 WHERE y IS NULL
+
+query II rowsort
+SELECT x, y FROM t2
+----
+1	10
+3	30
+
+# DELETE from empty table (no-op)
+statement ok
+CREATE TABLE t3 (v INTEGER)
+
+statement ok
+DELETE FROM t3
+
+query I rowsort
+SELECT COUNT(*) FROM t3
+----
+0
+
+# DELETE with <> predicate
+statement ok
+CREATE TABLE t4 (a INTEGER)
+
+statement ok
+INSERT INTO t4 VALUES (1), (2), (3), (2), (1)
+
+statement ok
+DELETE FROM t4 WHERE a <> 2
+
+query I rowsort
+SELECT a FROM t4
+----
+2
+2
