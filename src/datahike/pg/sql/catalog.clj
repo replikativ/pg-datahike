@@ -41,7 +41,7 @@
 (def ^:private built-in-catalog-tables
   "Virtual catalog tables this layer materializes on demand. Extension
    tables are added via register-catalog-table! and don't appear here."
-  #{"pg_type" "pg_class" "pg_tables" "pg_attribute"
+  #{"pg_type" "pg_class" "pg_tables" "pg_views" "pg_matviews" "pg_attribute"
     "pg_namespace" "pg_database" "pg_proc"
     "pg_indexes"
     ;; pg_index is PG's internal index catalog (distinct from the
@@ -252,6 +252,22 @@
      {:db/ident :pg_tables/hastriggers :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_tables/rowsecurity :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_tables") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    ;; pg_views — list of all user-defined views. We don't store views
+    ;; so this is always empty, but ORMs (Metabase, pgAdmin) union it
+    ;; with pg_tables during table discovery; not having it raises.
+    "pg_views"
+    [{:db/ident :pg_views/schemaname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_views/viewname   :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_views/viewowner  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_views/definition :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_views") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_matviews"
+    [{:db/ident :pg_matviews/schemaname  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_matviews/matviewname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_matviews/matviewowner :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_matviews/definition  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_matviews/ispopulated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_matviews") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "information_schema_columns"
     [{:db/ident :information_schema_columns/table_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/table_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
