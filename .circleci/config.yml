@@ -3,9 +3,40 @@ version: 2.1
 orbs:
   tools: replikativ/clj-tools@0
 
+# ---------------------------------------------------------------------------
+# Executors
+# ---------------------------------------------------------------------------
+#
+# The orb's `tools/clojurecli` image stopped shipping with Java at some
+# point — `clojure -T:build compile-java` bombs with "Couldn't find 'java'.
+# Please set JAVA_HOME." To keep CI predictable across orb refreshes we pin
+# our own `cimg/openjdk:21.0`-based executor and install Clojure CLI + bb
+# on top via the `install-clj-tools` command. JDK 21 matches both the
+# pgjdbc toolchain and the Hibernate pom target.
+
+executors:
+  clj-jdk21:
+    docker:
+      - image: cimg/openjdk:21.0
+    resource_class: medium
+
+commands:
+  install-clj-tools:
+    description: "Install Clojure CLI + babashka on a bare JDK image."
+    steps:
+      - run:
+          name: Install Clojure CLI
+          command: |
+            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
+      - run:
+          name: Install babashka
+          command: curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+
 jobs:
   setup:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
       - restore_cache:
           keys:
@@ -17,6 +48,7 @@ jobs:
           key: source-{{ .Branch }}-{{ .Revision }}
           paths:
             - .git
+      - install-clj-tools
       - restore_cache:
           keys:
             - deps-{{ checksum "deps.edn" }}
@@ -35,10 +67,12 @@ jobs:
             - replikativ
 
   build:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
+      - checkout
       - attach_workspace:
           at: /home/circleci
+      - install-clj-tools
       - run:
           name: Compile Java sources
           command: bb prep
@@ -54,30 +88,36 @@ jobs:
             - .m2
 
   format:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
+      - checkout
       - attach_workspace:
           at: /home/circleci
+      - install-clj-tools
       - run:
           name: Check formatting
           command: bb format
           no_output_timeout: 5m
 
   lint:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
+      - checkout
       - attach_workspace:
           at: /home/circleci
+      - install-clj-tools
       - run:
           name: clj-kondo lint
           command: bb lint
           no_output_timeout: 5m
 
   unittest:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
+      - checkout
       - attach_workspace:
           at: /home/circleci
+      - install-clj-tools
       - run:
           name: Compile Java sources
           command: bb prep
@@ -87,10 +127,12 @@ jobs:
           no_output_timeout: 10m
 
   sqllogictest:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
+      - checkout
       - attach_workspace:
           at: /home/circleci
+      - install-clj-tools
       - run:
           name: Compile Java sources
           command: bb prep
@@ -321,10 +363,12 @@ jobs:
           no_output_timeout: 10m
 
   deploy:
-    executor: tools/clojurecli
+    executor: clj-jdk21
     steps:
+      - checkout
       - attach_workspace:
           at: /home/circleci
+      - install-clj-tools
       - run:
           name: Deploy to Clojars
           command: bb clojars

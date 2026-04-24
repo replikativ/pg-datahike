@@ -32,14 +32,34 @@ if ! (exec 3<>/dev/tcp/localhost/15432) 2>/dev/null; then
 fi
 exec 3<&-; exec 3>&-
 
-# Gradle's toolchain auto-detection requires an EXACT languageVersion match
-# and pgjdbc hard-codes 17/21 elsewhere, so pin to JDK 21 to avoid the
-# GraalVM-25 mismatch ("What went wrong: 25.0.1").
-JDK21="${JDK21:-/usr/lib/jvm/java-21-openjdk-amd64}"
-if [[ ! -x "${JDK21}/bin/java" ]]; then
-  echo "ERROR: JDK 21 not found at ${JDK21}; set JDK21=<path>" >&2
+# Gradle's toolchain auto-detection requires an EXACT languageVersion
+# match and pgjdbc hard-codes 17/21 elsewhere, so we run under JDK 21.
+#
+# Resolution order:
+#   1. $JDK21 env (explicit override for odd installs)
+#   2. $JAVA_HOME if its `java` reports version 21
+#      (CircleCI cimg/openjdk:21.0 sets this for free)
+#   3. `java` on PATH if it reports version 21
+#   4. /usr/lib/jvm/java-21-openjdk-amd64 (apt-default on Debian/Ubuntu)
+java_major() {
+  "$1" -version 2>&1 | awk -F '[".]' '/version/ {v=$2; if (v=="1") v=$3; print v; exit}'
+}
+if [[ -z "${JDK21:-}" && -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]] \
+   && [[ "$(java_major "${JAVA_HOME}/bin/java")" == "21" ]]; then
+  JDK21="${JAVA_HOME}"
+fi
+if [[ -z "${JDK21:-}" ]] && command -v java >/dev/null 2>&1 \
+   && [[ "$(java_major java)" == "21" ]]; then
+  JDK21="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+fi
+if [[ -z "${JDK21:-}" && -x "/usr/lib/jvm/java-21-openjdk-amd64/bin/java" ]]; then
+  JDK21="/usr/lib/jvm/java-21-openjdk-amd64"
+fi
+if [[ -z "${JDK21:-}" || ! -x "${JDK21}/bin/java" ]]; then
+  echo "ERROR: JDK 21 not found — set JDK21=<path> or put a JDK 21 java on PATH" >&2
   exit 2
 fi
+echo "[run-one] using JDK21=${JDK21}" >&2
 
 cd "${CLONE_DIR}"
 GRADLE_FILTERS=(--tests "${CLASS}")
