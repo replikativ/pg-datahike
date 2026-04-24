@@ -163,6 +163,111 @@
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
         result-var)
 
+      ;; current_user() / session_user() / user() / system_user() —
+      ;; PG canonicalises all four to the role of the current
+      ;; connection. We're single-tenant so they all return the
+      ;; static handler name. The bare-identifier forms (no parens)
+      ;; are handled in `translate-expr`.
+      (contains? #{"current_user" "session_user" "user" "system_user"} fname)
+      (let [fn-param (symbol (str "?cur-user" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [] "datahike")]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+        result-var)
+
+      ;; current_setting(name [, missing_ok]) — return a GUC
+      ;; parameter as text. We expose the static set of settings
+      ;; that JDBC / psycopg2 / asyncpg / Metabase actually probe on
+      ;; connect; everything else throws (PG: error 42704) unless
+      ;; the caller passes missing_ok=true, in which case we return
+      ;; NULL. Values are 0.1-stable; revisit if any client gates a
+      ;; feature on the reported version.
+      (= fname "current_setting")
+      (let [fn-param (symbol (str "?cur-setting" (swap! (:var-counter ctx) inc)))
+            settings {"server_version"             "15.0"
+                      "server_version_num"         "150000"
+                      "client_encoding"            "UTF8"
+                      "server_encoding"            "UTF8"
+                      "TimeZone"                   "UTC"
+                      "DateStyle"                  "ISO, MDY"
+                      "IntervalStyle"              "postgres"
+                      "search_path"                "\"$user\", public"
+                      "standard_conforming_strings" "on"
+                      "lc_messages"                "C"
+                      "lc_collate"                 "C"
+                      "lc_ctype"                   "C"
+                      "is_superuser"               "off"
+                      "session_authorization"      "datahike"
+                      "application_name"           "datahike"
+                      "transaction_isolation"      "read committed"
+                      "transaction_read_only"      "off"
+                      "default_transaction_isolation" "read committed"}
+            impl-fn (fn [name & [missing-ok]]
+                      (or (get settings (str name))
+                          (when missing-ok :__null__)
+                          (throw (ex-info (str "unrecognized configuration parameter \"" name "\"")
+                                          {:sqlstate "42704"}))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; format_type(oid, typmod) — return canonical type name.
+      ;; typmod is currently ignored (we don't track VARCHAR(N) etc.;
+      ;; that lands when :pg/atttypmod is plumbed through DDL).
+      (= fname "format_type")
+      (let [fn-param (symbol (str "?fmt-type" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn ([oid] (types/format-type oid -1))
+                      ([oid typmod] (types/format-type oid typmod)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; obj_description(oid, catalog) / col_description(oid, attnum)
+      ;; — PG returns the COMMENT ON text. We don't track comments;
+      ;; returning NULL (instead of 0 rows) lets Metabase render an
+      ;; empty description column rather than dropping the row.
+      (contains? #{"obj_description" "col_description" "shobj_description"} fname)
+      (let [fn-param (symbol (str "?desc" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [& _args] :__null__)]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; pg_typeof(value) — PG returns regtype (text-formatted as
+      ;; the type name). We resolve it at translate time using the
+      ;; expression's inferred OID so the result is a constant
+      ;; string the planner can fold; falls back to "text" when the
+      ;; argument is a derived expression we can't statically type.
+      (= fname "pg_typeof")
+      (let [arg-expr (first params)
+            oid-env {:db            (:db ctx)
+                     :schema        (:schema ctx)
+                     :table-aliases (:table-aliases ctx)
+                     :default-table (:default-table ctx)
+                     :hints         (:hints ctx)}
+            ;; Use a runtime require to avoid a load cycle (oid-infer
+            ;; depends on types only; pulling it from expr is fine but
+            ;; the namespace isn't aliased at the top of this file).
+            arg-oid (try
+                      ((requiring-resolve 'datahike.pg.sql.oid-infer/expr-oid)
+                       arg-expr oid-env)
+                      (catch Throwable _ nil))
+            type-name (or (get types/oid->pg-name arg-oid) "text")
+            fn-param (symbol (str "?pg-typeof" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [_v] type-name)]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(list fn-param (or (first args) :__null__)) result-var])
+        result-var)
+
       ;; --- Array-returning functions -------------------------------------
       ;; current_schemas(bool) → name[]. We run with a single public
       ;; schema; include_implicit differs conceptually in PG (true ⇒
@@ -1208,6 +1313,15 @@
          (= "current_schema" (.getColumnName ^Column expr))
          (nil? (.getTable ^Column expr)))
     "public"
+
+    ;; current_user / session_user / user / system_user as bare
+    ;; identifiers (PG keywords; JSqlParser surfaces them as Column).
+    ;; All collapse to the static handler role.
+    (and (instance? Column expr)
+         (nil? (.getTable ^Column expr))
+         (contains? #{"current_user" "session_user" "user" "system_user"}
+                    (str/lower-case (.getColumnName ^Column expr))))
+    "datahike"
 
     (instance? Column expr)
     (let [^Column col-expr expr

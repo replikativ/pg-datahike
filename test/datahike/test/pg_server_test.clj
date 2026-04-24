@@ -306,6 +306,69 @@
       (is (= #{"Bob" "Charlie"} (set (map first (rows r))))))))
 
 ;; ============================================================================
+;; PG session / introspection functions (Metabase / pgjdbc / psycopg2 connect probes)
+;; ============================================================================
+
+(deftest test-pg-current-user-functions
+  (testing "current_user / session_user / user / system_user as bare identifiers"
+    (doseq [ident ["current_user" "CURRENT_USER" "session_user" "SESSION_USER"
+                   "user" "USER" "system_user"]]
+      (is (= [["datahike"]] (rows (.execute *handler* (str "SELECT " ident))))
+          (str ident " should resolve to 'datahike'"))))
+
+  (testing "current_user() / session_user() with parens"
+    (doseq [fname ["current_user()" "session_user()" "user()" "system_user()"]]
+      (is (= [["datahike"]] (rows (.execute *handler* (str "SELECT " fname))))
+          (str fname " should resolve to 'datahike'")))))
+
+(deftest test-pg-current-setting
+  (testing "known GUC parameters return expected values"
+    (is (= [["UTC"]]    (rows (.execute *handler* "SELECT current_setting('TimeZone')"))))
+    (is (= [["15.0"]]   (rows (.execute *handler* "SELECT current_setting('server_version')"))))
+    (is (= [["UTF8"]]   (rows (.execute *handler* "SELECT current_setting('client_encoding')"))))
+    (is (= [["UTF8"]]   (rows (.execute *handler* "SELECT current_setting('server_encoding')"))))
+    (is (= [["on"]]     (rows (.execute *handler* "SELECT current_setting('standard_conforming_strings')")))))
+
+  (testing "missing_ok=true returns NULL for unknown parameters"
+    (let [r (.execute *handler* "SELECT current_setting('does_not_exist', true)")]
+      (is (nil? (err r)))
+      (is (= [[nil]] (rows r)))))
+
+  (testing "missing_ok=false (default) raises 42704 for unknown parameters"
+    (let [r (.execute *handler* "SELECT current_setting('does_not_exist')")]
+      (is (some? (err r))
+          "unknown setting without missing_ok must error"))))
+
+(deftest test-pg-format-type
+  (testing "format_type maps OIDs to canonical type names"
+    (is (= [["integer"]]            (rows (.execute *handler* "SELECT format_type(23, -1)"))))
+    (is (= [["bigint"]]              (rows (.execute *handler* "SELECT format_type(20, -1)"))))
+    (is (= [["text"]]                (rows (.execute *handler* "SELECT format_type(25, -1)"))))
+    (is (= [["character varying"]]   (rows (.execute *handler* "SELECT format_type(1043, -1)"))))
+    (is (= [["boolean"]]             (rows (.execute *handler* "SELECT format_type(16, -1)")))))
+
+  (testing "format_type composes inside SELECT against pg_type"
+    (let [r (.execute *handler* "SELECT typname, format_type(oid, -1) FROM pg_type WHERE oid IN (16, 23, 25) ORDER BY oid")]
+      (is (= [["bool" "boolean"] ["int4" "integer"] ["text" "text"]]
+             (rows r))))))
+
+(deftest test-pg-typeof
+  (testing "pg_typeof returns the type name of a literal expression"
+    (is (= [["bigint"]]          (rows (.execute *handler* "SELECT pg_typeof(1)"))))
+    (is (= [["text"]]            (rows (.execute *handler* "SELECT pg_typeof('hello')"))))
+    (is (= [["double precision"]] (rows (.execute *handler* "SELECT pg_typeof(1.5)"))))
+    (is (= [["boolean"]]         (rows (.execute *handler* "SELECT pg_typeof(true)")))))
+
+  (testing "pg_typeof on a column resolves to the column's declared type"
+    (is (= [["text"]] (rows (.execute *handler* "SELECT DISTINCT pg_typeof(name) FROM person"))))
+    (is (= [["bigint"]] (rows (.execute *handler* "SELECT DISTINCT pg_typeof(age) FROM person"))))))
+
+(deftest test-pg-comment-stubs
+  (testing "obj_description / col_description return NULL (no comments tracked)"
+    (is (= [[nil]] (rows (.execute *handler* "SELECT obj_description(0, 'pg_class')"))))
+    (is (= [[nil]] (rows (.execute *handler* "SELECT col_description(0, 1)"))))))
+
+;; ============================================================================
 ;; Aggregates
 ;; ============================================================================
 

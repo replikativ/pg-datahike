@@ -130,6 +130,14 @@
    ;; Type checks / introspection
    "pg_typeof"     types/oid-text
    "version"       types/oid-text
+   "format_type"   types/oid-text
+   "current_setting" types/oid-text
+   "current_database" types/oid-name
+   "current_schema"   types/oid-name
+   "current_user"  types/oid-name
+   "session_user"  types/oid-name
+   "user"          types/oid-name
+   "system_user"   types/oid-name
    ;; Array-returning functions — result OID is T[] per PG
    "current_schemas"       types/oid-name-array
    "string_to_array"       types/oid-text-array

@@ -94,15 +94,25 @@
     (is (= :empty-catalog
            (shape/catalog-probe
             "SELECT * FROM pg_catalog.pg_trigger"))))
-  (testing "system-function call"
+  (testing "pg_get_indexdef still falls into empty-catalog (Phase B will lower it)"
     (is (= :empty-catalog
            (shape/catalog-probe
-            "SELECT format_type(atttypid, atttypmod) AS t
-               FROM pg_attribute WHERE attrelid = 16384"))))
-  (testing "obj_description lookup"
+            "SELECT pg_get_indexdef(oid) FROM pg_index WHERE indrelid = 16384"))))
+  (testing "pg_get_constraintdef still falls into empty-catalog (Phase B will lower it)"
     (is (= :empty-catalog
            (shape/catalog-probe
-            "SELECT obj_description(oid, 'pg_class') FROM pg_class")))))
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint")))))
+
+(deftest probe-implemented-system-fns-do-not-intercept
+  (testing "format_type is implemented in expr.clj — must reach the real SELECT path"
+    (is (nil? (shape/catalog-probe
+               "SELECT format_type(atttypid, atttypmod) AS t
+                  FROM pg_attribute WHERE attrelid = 16384"))))
+  (testing "obj_description / col_description are stubbed in expr.clj — same"
+    (is (nil? (shape/catalog-probe
+               "SELECT obj_description(oid, 'pg_class') FROM pg_class")))
+    (is (nil? (shape/catalog-probe
+               "SELECT col_description(attrelid, attnum) FROM pg_attribute")))))
 
 (deftest probe-non-catalog-select-returns-nil
   (is (nil? (shape/catalog-probe "SELECT 1")))

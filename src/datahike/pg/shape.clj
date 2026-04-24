@@ -144,9 +144,13 @@
   "PG system functions we don't implement. A SELECT that calls any of
    these gets an empty result — clients use them to pretty-print
    schema metadata, and returning 0 rows (column is NULL) is the
-   least-surprising answer."
-  #{"format_type" "pg_get_constraintdef" "pg_get_indexdef"
-    "obj_description" "col_description"})
+   least-surprising answer.
+
+   format_type, obj_description, col_description are now implemented
+   (or stubbed to NULL) in expr.clj — they go through the regular
+   function path. pg_get_indexdef / pg_get_constraintdef stay here
+   until they're lowered relationally against pg_index / pg_constraint."
+  #{"pg_get_indexdef" "pg_get_constraintdef"})
 
 (defn- fk-conname?
   "Odoo's post-add-foreign-key lookup:
