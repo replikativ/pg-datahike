@@ -1,1 +1,1 @@
-{:error nil, :rows [["current_schemas(false)"]]}
+{:error nil, :rows [["{public}"]]}

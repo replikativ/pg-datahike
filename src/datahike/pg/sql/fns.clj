@@ -75,6 +75,35 @@
   [coll]
   (count (remove #(or (nil? %) (= :__null__ %)) coll)))
 
+(defn filter-array-agg
+  "SQL array_agg(col) — collect all non-NULL values into a PgArray.
+   Element-type inferred from the first non-nil element; falls back
+   to :text when the input is empty (PG would return NULL; we follow
+   that by returning `:__null__`).
+
+   Requires datahike.pg.arrays which lives below this ns on the load
+   order — use requiring-resolve at call time to avoid a cycle."
+  [coll]
+  (let [arr-ns (some-> 'datahike.pg.arrays find-ns)
+        _ (when-not arr-ns (require 'datahike.pg.arrays))
+        vs (into []
+                 (map #(if (= :__null__ %) nil %))
+                 coll)
+        arr-fn (resolve 'datahike.pg.arrays/array)
+        pick-type (fn [v]
+                    (cond
+                      (instance? Long v)    :int8
+                      (instance? Integer v) :int4
+                      (integer? v)          :int8
+                      (instance? Double v)  :float8
+                      (float? v)            :float8
+                      (boolean? v)          :bool
+                      (inst? v)             :timestamptz
+                      :else                 :text))
+        first-v (some identity vs)
+        elem-type (if (some? first-v) (pick-type first-v) :text)]
+    (arr-fn elem-type vs)))
+
 (defn filter-count-distinct
   "SQL COUNT(DISTINCT col) — counts distinct non-NULL values."
   [coll]
@@ -258,7 +287,8 @@
    "var_samp"       'datahike.pg.sql/filter-variance-samp
    "var_pop"        'variance
    "median"         'median
-   "corr"           'datahike.pg.sql/filter-corr})
+   "corr"           'datahike.pg.sql/filter-corr
+   "array_agg"      'datahike.pg.sql/filter-array-agg})
 
 (defn aggregate-function? [^String fname]
   (contains? sql-aggregate->datalog (str/lower-case fname)))

@@ -21,6 +21,7 @@
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.types :as types])
@@ -31,7 +32,7 @@
             UnionOp IntersectOp ExceptOp]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            Function LongValue DoubleValue StringValue NullValue
+            BooleanValue Function LongValue DoubleValue StringValue NullValue
             CaseExpression CastExpression ArrayConstructor JdbcParameter]
            [net.sf.jsqlparser.statement.create.table CreateTable ColumnDefinition]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
@@ -71,6 +72,7 @@
 (def filter-variance-samp  fns/filter-variance-samp)
 (def filter-stddev-samp    fns/filter-stddev-samp)
 (def filter-corr           fns/filter-corr)
+(def filter-array-agg      fns/filter-array-agg)
 (def sql-+   fns/sql-+)
 (def sql--   fns/sql--)
 (def sql-*   fns/sql-*)
@@ -458,16 +460,59 @@
                 ;; Evaluate expressions directly without going through the query engine.
                 ;; BUT only if there's no WHERE clause — a WHERE gate (e.g.
                 ;; SELECT 'x' WHERE EXISTS (...)) needs the full translator.
+                         trivial-table-free-item?
+                         (fn [^SelectItem item]
+                           ;; Plain literal / NULL / CASE / simple CAST of
+                           ;; literal / ParenthesedSelect are handled by
+                           ;; the direct-evaluation branch below. Anything
+                           ;; more (Function, ArrayExpression, nested
+                           ;; ArrayConstructor-in-CAST) must flow through
+                           ;; translate-select.
+                           (let [e (.getExpression item)
+                                 simple-cast? (fn [^CastExpression c]
+                                                (let [inner (.getLeftExpression c)]
+                                                  (or (instance? LongValue inner)
+                                                      (instance? DoubleValue inner)
+                                                      (instance? StringValue inner)
+                                                      (instance? NullValue inner)
+                                                      (instance? net.sf.jsqlparser.expression.BooleanValue inner))))
+                                 _ nil]
+                             (or (instance? LongValue e)
+                                 (instance? DoubleValue e)
+                                 (instance? StringValue e)
+                                 (instance? NullValue e)
+                                 (instance? CaseExpression e)
+                                 (and (instance? CastExpression e) (simple-cast? e))
+                                 (instance? net.sf.jsqlparser.statement.select.ParenthesedSelect e)
+                                 (and (instance? net.sf.jsqlparser.schema.Column e)
+                                      (nil? (.getTable ^net.sf.jsqlparser.schema.Column e))
+                                      (contains? #{"true" "false"}
+                                                 (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column e)
+                                                         clojure.string/lower-case)))
+                                 (instance? net.sf.jsqlparser.expression.BooleanValue e))))
+                         unnest-single-item?
+                         (fn [^SelectItem item]
+                           ;; SELECT unnest(...) is a set-returning function
+                           ;; that the narrow table-free pattern below
+                           ;; expands into literal-rows — must take the
+                           ;; direct-eval branch even though Function isn't
+                           ;; in the trivial set.
+                           (let [e (.getExpression item)]
+                             (and (instance? Function e)
+                                  (= "unnest" (str/lower-case (.getName ^Function e))))))
                          table-free? (and (nil? (.getFromItem ^PlainSelect stmt))
-                                          (nil? (.getWhere ^PlainSelect stmt)))
+                                          (nil? (.getWhere ^PlainSelect stmt))
+                                          (let [items (.getSelectItems ^PlainSelect stmt)]
+                                            (or (every? trivial-table-free-item? items)
+                                                (and (= 1 (count items))
+                                                     (unnest-single-item? (first items))))))
                 ;; Narrow support for PG's set-returning-function idiom
-                ;;   SELECT unnest(array_fill(expr, ARRAY[count]))
-                ;; which produces `count` rows of `expr`. We match it
-                ;; only in its fully-constant form (no FROM, no params);
-                ;; the general array-type implementation is a separate
-                ;; piece of work. Motivation: pgjdbc's concurrency tests
-                ;; use this purely as a row-multiplier.
-                         [unnest-val unnest-count unnest-alias]
+                ;;   SELECT unnest(array_fill(expr, ARRAY[count]))  — N rows of expr
+                ;;   SELECT unnest(ARRAY[e1,e2,e3])                 — N distinct rows
+                ;; both produce `count` literal rows. Matches only fully-
+                ;; constant forms (no FROM, no params); the general
+                ;; table-function path is a follow-up.
+                         [unnest-val unnest-count unnest-alias unnest-elts?]
                          (when (and table-free? (nil? (seq withs)))
                            (let [items (.getSelectItems ^PlainSelect stmt)]
                              (when (= 1 (count items))
@@ -478,8 +523,10 @@
                                             (= "unnest" (str/lower-case (.getName ^Function expr))))
                                    (let [params (some-> (.getParameters ^Function expr) .getExpressions)
                                          arg (when (= 1 (count params)) (first params))]
-                                     (when (and (instance? Function arg)
-                                                (= "array_fill" (str/lower-case (.getName ^Function arg))))
+                                     (cond
+                                       ;; unnest(array_fill(v, ARRAY[n])) — one distinct value repeated N times
+                                       (and (instance? Function arg)
+                                            (= "array_fill" (str/lower-case (.getName ^Function arg))))
                                        (let [args (some-> (.getParameters ^Function arg) .getExpressions)]
                                          (when (= 2 (count args))
                                            (let [val-expr (first args)
@@ -490,8 +537,34 @@
                                                             (instance? LongValue (first dims)))
                                                    [val-expr
                                                     (.getValue ^LongValue (first dims))
-                                                    (or alias-str "unnest")])))))))))))))
+                                                    (or alias-str "unnest")
+                                                    false]))))))
+                                       ;; unnest(ARRAY[e1,e2,...]) — emit each element as its own row
+                                       (instance? ArrayConstructor arg)
+                                       [(vec (.getExpressions ^ArrayConstructor arg))
+                                        nil
+                                        (or alias-str "unnest")
+                                        true])))))))
+                         literal-eval (fn [e]
+                                        (cond
+                                          (instance? LongValue e)    (.getValue ^LongValue e)
+                                          (instance? DoubleValue e)  (.getValue ^DoubleValue e)
+                                          (instance? StringValue e)  (.getNotExcapedValue ^StringValue e)
+                                          (instance? NullValue e)    :__null__
+                                          :else (str e)))
                          result (cond
+                                  ;; unnest(ARRAY[e1,e2,e3]) — N rows, one per element
+                                  (and unnest-val unnest-elts?)
+                                  (let [vs (mapv literal-eval unnest-val)]
+                                    {:type :select
+                                     :query {:find [] :where []}
+                                     :find-aliases [unnest-alias]
+                                     :has-aggregates? false
+                                     :has-distinct? false
+                                     :in-args []
+                                     :hidden-count 0
+                                     :literal-rows (mapv vector vs)})
+
                                   unnest-val
                                   (let [fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})
                                ;; Evaluate the fill expression once. CAST
@@ -543,6 +616,22 @@
                                                             (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
                                                             (instance? StringValue expr) (.getNotExcapedValue ^StringValue expr)
                                                             (instance? NullValue expr) :__null__
+                                                            ;; Bare TRUE/FALSE — JSqlParser 5.x emits a
+                                                            ;; BooleanValue. Older versions emitted a
+                                                            ;; Column with name "true"/"false". Return an
+                                                            ;; actual Boolean so value inference reports
+                                                            ;; BOOL (16), not TEXT, and value->string
+                                                            ;; renders the PG text form 't'/'f'.
+                                                            (instance? BooleanValue expr)
+                                                            (.getValue ^BooleanValue expr)
+                                                            (and (instance? net.sf.jsqlparser.schema.Column expr)
+                                                                 (nil? (.getTable ^net.sf.jsqlparser.schema.Column expr))
+                                                                 (#{"true" "false"}
+                                                                  (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column expr)
+                                                                          str/lower-case)))
+                                                            (Boolean/parseBoolean
+                                                             (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column expr)
+                                                                     str/lower-case))
                                                             (instance? CaseExpression expr)
                                                             (let [case-fn (expr/translate-case-expr fake-ctx ^CaseExpression expr)
                                                                   in-args @(:in-args fake-ctx)
@@ -558,8 +647,15 @@
                                                                         (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
                                                                         :else (str inner))]
                                                               (case (types/cast-category type-str)
-                                                                :integer (long raw)
-                                                                :float (double raw)
+                                                                ;; CAST('1' AS BIGINT): inner was a
+                                                                ;; StringValue, so raw is a String —
+                                                                ;; (long "1") throws. Parse numerically.
+                                                                :integer (if (number? raw)
+                                                                           (long raw)
+                                                                           (Long/parseLong (str/trim (str raw))))
+                                                                :float   (if (number? raw)
+                                                                           (double raw)
+                                                                           (Double/parseDouble (str/trim (str raw))))
                                                                 :text (str raw)
                                                                 :boolean (Boolean/parseBoolean (str raw))
                                                                 :date (let [s (str/trim (str raw))]
@@ -652,6 +748,15 @@
                                     {:type :select
                                      :query {:find [] :where []}
                                      :find-aliases (mapv second vals-aliases)
+                                     ;; Parse-time OID inference for the
+                                     ;; Extended Query Describe path — see
+                                     ;; datahike.pg.sql.oid-infer.
+                                     :select-item-oids
+                                     (mapv (fn [^SelectItem item]
+                                             (oid/expr-oid (.getExpression item)
+                                                           {:db cte-db
+                                                            :schema cte-schema}))
+                                           select-items)
                                      :has-aggregates? false
                                      :has-distinct? false
                                      :in-args []

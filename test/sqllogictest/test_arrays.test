@@ -1,0 +1,270 @@
+# test_arrays.test
+#
+# First-class array value coverage — construction, subscripting,
+# slicing, operators, and the full PG text codec. Complements the
+# unit tests in pg_arrays_test.clj (pure value semantics) and
+# pg_array_sql_test.clj (SQL protocol) by driving the shapes through
+# the simple-query execute pipeline.
+
+# ---------------------------------------------------------------------------
+# Constructor output — PG canonical text {a,b,c}
+# ---------------------------------------------------------------------------
+
+query T rowsort
+SELECT ARRAY[1,2,3]
+----
+{1,2,3}
+
+query T rowsort
+SELECT ARRAY['alice','bob','charlie']
+----
+{alice,bob,charlie}
+
+query T rowsort
+SELECT ARRAY['a,b','c']
+----
+{"a,b",c}
+
+query T rowsort
+SELECT ARRAY[]::int[]
+----
+{}
+
+# ---------------------------------------------------------------------------
+# Subscripting — 1-indexed, out-of-range → NULL
+# ---------------------------------------------------------------------------
+
+query I rowsort
+SELECT ARRAY[10,20,30][1]
+----
+10
+
+query I rowsort
+SELECT ARRAY[10,20,30][2]
+----
+20
+
+query I rowsort
+SELECT ARRAY[10,20,30][3]
+----
+30
+
+query T rowsort
+SELECT ARRAY[10,20,30][0]
+----
+NULL
+
+query T rowsort
+SELECT ARRAY[10,20,30][99]
+----
+NULL
+
+query T rowsort
+SELECT ARRAY['a','b','c'][2]
+----
+b
+
+# ---------------------------------------------------------------------------
+# Array-returning scalar functions
+# ---------------------------------------------------------------------------
+
+query T rowsort
+SELECT current_schemas(true)
+----
+{public}
+
+query T rowsort
+SELECT (current_schemas(true))[1]
+----
+public
+
+query T rowsort
+SELECT (pg_catalog.current_schemas(true))[1]
+----
+public
+
+query T rowsort
+SELECT string_to_array('a,b,c', ',')
+----
+{a,b,c}
+
+query T rowsort
+SELECT (string_to_array('a,b,c', ','))[2]
+----
+b
+
+query T rowsort
+SELECT regexp_split_to_array('one-two-three', '-')
+----
+{one,two,three}
+
+# ---------------------------------------------------------------------------
+# Array meta-functions
+# ---------------------------------------------------------------------------
+
+query I rowsort
+SELECT array_length(ARRAY[1,2,3,4], 1)
+----
+4
+
+query T rowsort
+SELECT array_length(ARRAY[]::int[], 1)
+----
+NULL
+
+query I rowsort
+SELECT array_upper(ARRAY[10,20,30], 1)
+----
+3
+
+query I rowsort
+SELECT array_lower(ARRAY[10,20,30], 1)
+----
+1
+
+query I rowsort
+SELECT cardinality(ARRAY[10,20,30])
+----
+3
+
+query I rowsort
+SELECT cardinality(ARRAY[]::int[])
+----
+0
+
+query T rowsort
+SELECT array_to_string(ARRAY['a','b','c'], ',')
+----
+a,b,c
+
+query T rowsort
+SELECT array_to_string(ARRAY['a',NULL,'c'], ',', '?')
+----
+a,?,c
+
+# ---------------------------------------------------------------------------
+# Array operators: @>, <@, &&, ||
+# ---------------------------------------------------------------------------
+
+query T rowsort
+SELECT ARRAY[1,2,3,4] @> ARRAY[2,3]
+----
+t
+
+query T rowsort
+SELECT ARRAY[1,2] @> ARRAY[2,3]
+----
+f
+
+query T rowsort
+SELECT ARRAY[2,3] <@ ARRAY[1,2,3,4]
+----
+t
+
+query T rowsort
+SELECT ARRAY[1,2,3] && ARRAY[3,4,5]
+----
+t
+
+query T rowsort
+SELECT ARRAY[1,2,3] && ARRAY[7,8,9]
+----
+f
+
+query T rowsort
+SELECT ARRAY[1,2] || ARRAY[3,4]
+----
+{1,2,3,4}
+
+query T rowsort
+SELECT ARRAY['a','b'] || 'c'
+----
+{a,b,c}
+
+# ---------------------------------------------------------------------------
+# Array transforms
+# ---------------------------------------------------------------------------
+
+query T rowsort
+SELECT array_append(ARRAY[1,2], 3)
+----
+{1,2,3}
+
+query T rowsort
+SELECT array_prepend(0, ARRAY[1,2])
+----
+{0,1,2}
+
+query T rowsort
+SELECT array_cat(ARRAY[1,2], ARRAY[3,4])
+----
+{1,2,3,4}
+
+query I rowsort
+SELECT array_position(ARRAY['a','b','c'], 'b')
+----
+2
+
+query T rowsort
+SELECT array_remove(ARRAY[1,2,3,2,1], 2)
+----
+{1,3,1}
+
+query T rowsort
+SELECT array_replace(ARRAY[1,2,3,2,1], 2, 99)
+----
+{1,99,3,99,1}
+
+# ---------------------------------------------------------------------------
+# ANY / ALL over arrays
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE nums (n INT PRIMARY KEY)
+
+statement ok
+INSERT INTO nums VALUES (1), (2), (3), (4), (5)
+
+query I rowsort
+SELECT n FROM nums WHERE n = ANY(ARRAY[2,4])
+----
+2
+4
+
+query I rowsort
+SELECT n FROM nums WHERE n <= ALL(ARRAY[3,4,5])
+----
+1
+2
+3
+
+# Runtime array from fn result
+query I rowsort
+SELECT 1 WHERE 'public' = ANY(current_schemas(true))
+----
+1
+
+# ---------------------------------------------------------------------------
+# unnest
+# ---------------------------------------------------------------------------
+
+query I rowsort
+SELECT unnest(ARRAY[10,20,30])
+----
+10
+20
+30
+
+# ---------------------------------------------------------------------------
+# Slicing — arr[lo:hi], 1-indexed inclusive, clamped
+# ---------------------------------------------------------------------------
+
+query T rowsort
+SELECT (ARRAY[10,20,30,40,50])[2:4]
+----
+{20,30,40}
+
+query T rowsort
+SELECT (ARRAY[10,20,30])[2:10]
+----
+{20,30}

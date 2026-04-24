@@ -39,6 +39,84 @@
 (def oid-uuid     2950)
 (def oid-jsonb    3802)
 
+;; Array OIDs — every scalar type has a paired `T[]` OID. PG catalog
+;; rows: `SELECT typname, oid, typelem FROM pg_type WHERE typelem <> 0`.
+;; We only materialise the types we actually emit; others can follow.
+(def oid-bool-array        1000)
+(def oid-bytea-array       1001)
+(def oid-name-array        1003)
+(def oid-int2-array        1005)
+(def oid-int4-array        1007)
+(def oid-text-array        1009)
+(def oid-int8-array        1016)
+(def oid-float4-array      1021)
+(def oid-float8-array      1022)
+(def oid-oid-array         1028)
+(def oid-varchar-array     1015)
+(def oid-bpchar-array      1014)
+(def oid-date-array        1182)
+(def oid-time-array        1183)
+(def oid-timestamp-array   1115)
+(def oid-timestamptz-array 1185)
+(def oid-numeric-array     1231)
+(def oid-uuid-array        2951)
+(def oid-json-array        199)
+(def oid-jsonb-array       3807)
+
+(def element-oid->array-oid
+  "Scalar element OID → corresponding T[] OID."
+  {oid-bool        oid-bool-array
+   oid-bytea       oid-bytea-array
+   oid-name        oid-name-array
+   oid-int2        oid-int2-array
+   oid-int4        oid-int4-array
+   oid-text        oid-text-array
+   oid-int8        oid-int8-array
+   oid-float4      oid-float4-array
+   oid-float8      oid-float8-array
+   oid-oid         oid-oid-array
+   oid-varchar     oid-varchar-array
+   oid-bpchar      oid-bpchar-array
+   oid-date        oid-date-array
+   oid-time        oid-time-array
+   oid-timestamp   oid-timestamp-array
+   oid-timestamptz oid-timestamptz-array
+   oid-numeric     oid-numeric-array
+   oid-uuid        oid-uuid-array
+   oid-json        oid-json-array
+   oid-jsonb       oid-jsonb-array})
+
+(def array-oid->element-oid
+  "Inverse of element-oid->array-oid: T[] OID → T OID."
+  (into {} (map (fn [[e a]] [a e])) element-oid->array-oid))
+
+(def elem-kw->oid
+  "Element-type keyword (as stored on PgArray :elem-type) → OID."
+  {:bool        oid-bool
+   :bytea       oid-bytea
+   :name        oid-name
+   :int2        oid-int2
+   :int4        oid-int4
+   :text        oid-text
+   :int8        oid-int8
+   :float4      oid-float4
+   :float8      oid-float8
+   :oid         oid-oid
+   :varchar     oid-varchar
+   :bpchar      oid-bpchar
+   :date        oid-date
+   :time        oid-time
+   :timestamp   oid-timestamp
+   :timestamptz oid-timestamptz
+   :numeric     oid-numeric
+   :uuid        oid-uuid
+   :json        oid-json
+   :jsonb       oid-jsonb})
+
+(def oid->elem-kw
+  "Inverse of elem-kw->oid."
+  (into {} (map (fn [[k v]] [v k])) elem-kw->oid))
+
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
 ;; ============================================================================
@@ -282,7 +360,30 @@
    [oid-interval  "interval"  16  "b"]
    [oid-numeric   "numeric"   -1  "b"]
    [oid-uuid      "uuid"      16  "b"]
-   [oid-jsonb     "jsonb"     -1  "b"]])
+   [oid-jsonb     "jsonb"     -1  "b"]
+   ;; Array types — one per scalar with a paired T[] OID. typtype="b"
+   ;; like scalars; the typelem linkage is exposed via element-oid
+   ;; lookups at query time (see datahike.pg.sql.catalog).
+   [oid-bool-array        "_bool"        -1 "b"]
+   [oid-bytea-array       "_bytea"       -1 "b"]
+   [oid-name-array        "_name"        -1 "b"]
+   [oid-int2-array        "_int2"        -1 "b"]
+   [oid-int4-array        "_int4"        -1 "b"]
+   [oid-text-array        "_text"        -1 "b"]
+   [oid-int8-array        "_int8"        -1 "b"]
+   [oid-float4-array      "_float4"      -1 "b"]
+   [oid-float8-array      "_float8"      -1 "b"]
+   [oid-oid-array         "_oid"         -1 "b"]
+   [oid-varchar-array     "_varchar"     -1 "b"]
+   [oid-bpchar-array      "_bpchar"      -1 "b"]
+   [oid-date-array        "_date"        -1 "b"]
+   [oid-time-array        "_time"        -1 "b"]
+   [oid-timestamp-array   "_timestamp"   -1 "b"]
+   [oid-timestamptz-array "_timestamptz" -1 "b"]
+   [oid-numeric-array     "_numeric"     -1 "b"]
+   [oid-uuid-array        "_uuid"        -1 "b"]
+   [oid-json-array        "_json"        -1 "b"]
+   [oid-jsonb-array       "_jsonb"       -1 "b"]])
 
 ;; ============================================================================
 ;; Type size for wire protocol RowDescription
@@ -311,7 +412,28 @@
    oid-uuid      16
    oid-json      -1
    oid-jsonb     -1
-   oid-oid        4})
+   oid-oid        4
+   ;; Array types are always variable-length on the wire.
+   oid-bool-array        -1
+   oid-bytea-array       -1
+   oid-name-array        -1
+   oid-int2-array        -1
+   oid-int4-array        -1
+   oid-text-array        -1
+   oid-int8-array        -1
+   oid-float4-array      -1
+   oid-float8-array      -1
+   oid-oid-array         -1
+   oid-varchar-array     -1
+   oid-bpchar-array      -1
+   oid-date-array        -1
+   oid-time-array        -1
+   oid-timestamp-array   -1
+   oid-timestamptz-array -1
+   oid-numeric-array     -1
+   oid-uuid-array        -1
+   oid-json-array        -1
+   oid-jsonb-array       -1})
 
 ;; ============================================================================
 ;; Convenience functions
@@ -345,14 +467,17 @@
 (defn cast-category
   "Classify a SQL type name for CAST handling.
    Returns :integer, :float, :text, :boolean, :date, :time,
-   :timestamp, :uuid, :bytes, or nil. :date and :time are checked
-   before :timestamp so callers can emit the display-appropriate Java
-   type (LocalDate / LocalTime vs Instant)."
+   :timestamp, :uuid, :bytes, :array, or nil. :date and :time are
+   checked before :timestamp so callers can emit the
+   display-appropriate Java type (LocalDate / LocalTime vs Instant).
+   Any type-name ending in `[]` classifies as :array; the element
+   category can be resolved by recursing on the prefix."
   [sql-type-name]
   (when sql-type-name
     (let [;; Strip type arguments: "timestamp(6)" → "timestamp"
           base (clojure.string/replace sql-type-name #"\s*\([^)]*\)" "")]
       (cond
+        (clojure.string/ends-with? base "[]") :array
         (contains? cast-integer-types base)   :integer
         (contains? cast-float-types base)     :float
         (contains? cast-text-types base)      :text
@@ -365,10 +490,40 @@
         (contains? cast-bit-types base)       :bit
         :else nil))))
 
+(defn cast-array-elem-kw
+  "For a SQL type name like `int[]`, return the element-type keyword
+   used by PgArray :elem-type (:int8, :text, :bool, etc.). Returns
+   nil for non-array target types."
+  [sql-type-name]
+  (when sql-type-name
+    (let [base (clojure.string/replace sql-type-name #"\s*\([^)]*\)" "")]
+      (when (clojure.string/ends-with? base "[]")
+        (let [elem (clojure.string/trim (subs base 0 (- (count base) 2)))
+              cat (cast-category elem)]
+          (case cat
+            :integer :int8
+            :float   :float8
+            :text    :text
+            :boolean :bool
+            :date    :date
+            :time    :time
+            :timestamp :timestamp
+            :uuid    :uuid
+            :text))))))
+
 (defn infer-oid-from-value
   "Infer a PostgreSQL type OID from a Clojure runtime value."
   [v]
   (cond
+    ;; PgArray → the T[] OID corresponding to its element type.
+    ;; Kept as a record-instance check (via class name) to avoid
+    ;; a require-loop; callers have the concrete record. A miss
+    ;; falls back to text[] (1009).
+    (and (some? v)
+         (= "datahike.pg.arrays.PgArray" (.getName (class v))))
+    (get element-oid->array-oid
+         (get elem-kw->oid (:elem-type v))
+         oid-text-array)
     (instance? clojure.lang.Ratio v) oid-float8
     (instance? Long v)    oid-int8
     (instance? Integer v) oid-int4

@@ -45,6 +45,7 @@
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [datahike.datom Datom]
@@ -946,6 +947,42 @@
                                                      (subs (str v) 1))
                                                    (str v)))))))))
 
+        ;; Parse-time OID inference for each select-item expression.
+        ;; Walks the JSqlParser AST to produce a result OID per element
+        ;; of :find-aliases, mirroring PG's exprType (see
+        ;; datahike.pg.sql.oid-infer). Consumed by describeResult so
+        ;; Extended Query's RowDescription has correct types before
+        ;; Execute runs. Window-function / compound-aggregate columns
+        ;; don't line up with a simple select-item index, so we bail
+        ;; to nil for any index we can't resolve — caller falls back
+        ;; to the value-based inference used by the Simple Query path.
+        oid-env {:db db :schema schema
+                 :table-aliases table-aliases
+                 :default-table default-table
+                 :hints (pgs/schema-hints db)}
+        select-item-oids
+        (when (and (empty? @window-specs) (empty? @compound-exprs))
+          (let [acc (reduce
+                     (fn [v ^SelectItem item]
+                       (let [expr (.getExpression item)]
+                         (cond
+                           (instance? AllColumns expr)
+                           (let [cols (pgs/column-info schema default-table db)]
+                             (into v (keep (fn [col]
+                                             (when (not= "db_id" (:name col))
+                                               (:oid col)))
+                                           cols)))
+                           :else
+                           (conj v (oid/expr-oid expr oid-env)))))
+                     []
+                     select-items)
+                ;; find-aliases may be longer than acc when SELECT
+                ;; contains JOIN-driven entity vars added to :find
+                ;; for :with semantics. Pad with nil so the vector
+                ;; lines up index-for-index with find-aliases.
+                n (count @find-aliases)]
+            (vec (take n (concat acc (repeat nil))))))
+
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
         ;; from different entity combinations that produce identical values.
         ;; For LEFT JOINs, only add the left table's entity var (not the
@@ -1515,6 +1552,10 @@
              :limit           (when-not sql-order-by limit-val)
              :offset          (when-not sql-order-by offset-val)
              :find-aliases    @find-aliases
+             ;; OID per find-alias for Extended Query Describe. nil slots
+             ;; fall back to value-based inference at Execute time (via
+             ;; compute-schema-oids) or TEXT when neither path resolves.
+             :select-item-oids select-item-oids
              :has-aggregates? @has-aggregates?
              :has-distinct?   has-distinct?
              :in-args         in-args

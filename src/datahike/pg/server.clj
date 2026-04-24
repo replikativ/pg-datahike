@@ -18,6 +18,7 @@
             [datahike.api :as d]
             [datahike.core :as dc]
             [datahike.versioning :as versioning]
+            [datahike.pg.arrays :as pg-arr]
             [datahike.pg.classify :as cls]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -233,6 +234,10 @@
   (cond
     (nil? v)           nil
     (= :__null__ v)    nil  ;; LEFT JOIN sentinel → SQL NULL
+    ;; PgArray → PG canonical array text format `{…}` (see
+    ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
+    ;; PgArray is a defrecord and vectors would otherwise intercept.
+    (pg-arr/array? v) (pg-arr/to-pg-text v)
     (string? v)  v
     (keyword? v) (if-let [ns (namespace v)]
                    (str ns "/" (name v))
@@ -3144,10 +3149,22 @@
           (let [aliases (:find-aliases parsed)
                 db (d/db conn)
                 resolved (compute-schema-oids parsed db)
+                ;; Parse-time OIDs from oid-infer (one per find-alias,
+                ;; nil for entries we can't statically type). Prefer
+                ;; these over compute-schema-oids' -1 sentinel since
+                ;; they cover literals, aggregates, CAST, function
+                ;; calls, and arithmetic — shapes that have no schema
+                ;; attribute. See datahike.pg.sql.oid-infer.
+                item-oids (:select-item-oids parsed)
                 oids (int-array
                       (for [i (range (count aliases))]
-                        (let [o (aget ^ints resolved i)]
-                          (if (= o -1) PgWireServer/OID_TEXT o))))
+                        (let [schema-oid (aget ^ints resolved i)
+                              item-oid (when item-oids
+                                         (nth item-oids i nil))]
+                          (cond
+                            (not= schema-oid -1) schema-oid
+                            (some? item-oid)     item-oid
+                            :else                PgWireServer/OID_TEXT))))
                 sources (compute-column-sources parsed db)
                 qr (PgWireServer$QueryResult.
                     (into-array String aliases)
@@ -3348,8 +3365,17 @@
                 ;; Table-free SELECT: return literal row(s) directly.
                 ;; :literal-rows is used by table-function expansions
                 ;; (unnest(array_fill(...))) that produce N rows from
-                ;; compile-time-known arguments.
-                              (format-query-result (or literal-rows [literal-row]) find-aliases)
+                ;; compile-time-known arguments. Pass :select-item-oids
+                ;; (via a synthetic schema-oids array keyed by
+                ;; -1 sentinel) so SELECT TRUE reports BOOL even when
+                ;; value inference would look at a String.
+                              (let [item-oids (:select-item-oids parsed)
+                                    schema-oids (when item-oids
+                                                  (int-array
+                                                   (map #(int (or % -1)) item-oids)))]
+                                (format-query-result (or literal-rows [literal-row])
+                                                     find-aliases
+                                                     schema-oids))
                               (let [;; Use enriched db when CTEs/derived tables created speculative data
                                     query-db (or enriched-db db)
                                     hidden-count (or hidden-count 0)
@@ -3559,6 +3585,24 @@
               ;; Shared with describeResult; see compute-schema-oids.
                                 (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
                                       schema-oids (compute-schema-oids parsed-with-shape db)
+                                      ;; Blend parse-time OIDs (oid-infer)
+                                      ;; over the -1 sentinel so empty
+                                      ;; result sets and aggregate /
+                                      ;; CAST / literal columns keep the
+                                      ;; correct type when value inference
+                                      ;; would otherwise fall back to TEXT.
+                                      item-oids (:select-item-oids parsed)
+                                      schema-oids (if (and item-oids (seq find-aliases))
+                                                    (let [n (count find-aliases)
+                                                          out (int-array n)]
+                                                      (dotimes [i n]
+                                                        (let [so (aget ^ints schema-oids i)
+                                                              io (when (< i (count item-oids))
+                                                                   (nth item-oids i))]
+                                                          (aset out i
+                                                                (int (if (and (= so -1) io) io so)))))
+                                                      out)
+                                                    schema-oids)
                                       sources (compute-column-sources parsed-with-shape db)
                                       result (format-query-result results find-aliases schema-oids)]
                                   (if sources
