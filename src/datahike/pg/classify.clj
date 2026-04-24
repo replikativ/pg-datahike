@@ -444,13 +444,32 @@
    JSqlParser. Called with the tokens AFTER the leading SELECT."
   [toks]
   (let [[t1 _t2 & _] (skip-leading-paren toks)
-        ;; When SELECT is followed by `pg_catalog.` prefix, skip it.
-        [t1 rest-args] (if (and (kw=? t1 "pg_catalog")
-                                (= "." (:text (second toks))))
-                         [(nth toks 2 nil) (drop 3 toks)]
-                         [t1 (rest toks)])]
+        ;; When SELECT is followed by `pg_catalog.` prefix, skip it so
+        ;; `pg_catalog.current_database()` classifies the same as the
+        ;; bare form. Same treatment for the `datahike.` prefix, which
+        ;; namespaces our branching / versioning functions; below the
+        ;; cond we route datahike.X specifically (so a bare `branches()`
+        ;; or `current_branch()` without the prefix stays generic-SQL).
+        [t1 rest-args dh?] (cond
+                             (and (kw=? t1 "pg_catalog")
+                                  (= "." (:text (second toks))))
+                             [(nth toks 2 nil) (drop 3 toks) false]
+                             (and (kw=? t1 "datahike")
+                                  (= "." (:text (second toks))))
+                             [(nth toks 2 nil) (drop 3 toks) true]
+                             :else
+                             [t1 (rest toks) false])]
     (cond
       (nil? t1) {:kind :generic-sql}
+      ;; datahike.* branching / versioning functions
+      (and dh? (kw=? t1 "branches"))       {:kind :dh-branches}
+      (and dh? (kw=? t1 "current_branch")) {:kind :dh-current-branch}
+      (and dh? (kw=? t1 "commit_id"))      {:kind :dh-commit-id}
+      (and dh? (kw=? t1 "parent_commits")) {:kind :dh-parent-commits}
+      (and dh? (kw=? t1 "create_branch"))
+      {:kind :dh-create-branch :args (extract-fn-string-args rest-args)}
+      (and dh? (kw=? t1 "delete_branch"))
+      {:kind :dh-delete-branch :args (extract-fn-string-args rest-args)}
       (kw=? t1 "version")       {:kind :version}
       (kw=? t1 "now")           {:kind :now}
       (kw=? t1 "current_schema") {:kind :current-schema}

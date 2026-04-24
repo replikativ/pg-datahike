@@ -729,7 +729,10 @@
     :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
     :pg-backend-pid :txid-current :pg-sleep
     :comment-on :lock-table :create-view :create-index
-    :maintenance-noop :schema-noop})
+    :maintenance-noop :schema-noop
+    ;; datahike.* branching / versioning functions
+    :dh-branches :dh-current-branch :dh-commit-id :dh-parent-commits
+    :dh-create-branch :dh-delete-branch})
 
 (defn system-query?*
   "Inner implementation — takes an already-computed classify result so

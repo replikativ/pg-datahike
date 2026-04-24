@@ -17,6 +17,7 @@
             [clojure.set]
             [datahike.api :as d]
             [datahike.core :as dc]
+            [datahike.versioning :as versioning]
             [datahike.pg.classify :as cls]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -2010,10 +2011,10 @@
 ;; ============================================================================
 
 (defn- parse-temporal-set
-  "Parse `SET datahike.as_of / .since / .history = '…'` and their
-   RESET forms. Returns [key value] where key is :as-of | :since |
-   :history and value is the string (or nil for reset/clear), or nil
-   if the SQL isn't a recognized temporal session-var op.
+  "Parse `SET datahike.{as_of,since,history,branch,commit_id} = '…'` and
+   their RESET forms. Returns [key value] where key is :as-of | :since |
+   :history | :branch | :commit-id and value is the string (or nil for
+   reset/clear), or nil if the SQL isn't a recognized session-var op.
 
    Implemented on top of datahike.pg.classify — the classifier gives
    us {:kind :set :var \"…\" :value \"…\"} or {:kind :reset :var \"…\"}
@@ -2021,9 +2022,11 @@
   [^String sql]
   (let [{:keys [kind var value]} (cls/classify sql)
         key (case var
-              "datahike.as_of"   :as-of
-              "datahike.since"   :since
-              "datahike.history" :history
+              "datahike.as_of"     :as-of
+              "datahike.since"     :since
+              "datahike.history"   :history
+              "datahike.branch"    :branch
+              "datahike.commit_id" :commit-id
               nil)]
     (cond
       (nil? key) nil
@@ -2066,10 +2069,27 @@
           :else nil)))))
 
 (defn- apply-temporal
-  "Apply temporal wrappers to a database based on session state."
+  "Apply temporal + branch wrappers to a database based on session state.
+
+   Precedence: commit-id wins over branch (pinning to a specific commit
+   is a stronger assertion than \"head of some branch\"). Both are
+   applied before the time-slice wrappers (as-of / since / history) so
+   a client can, e.g., `SET datahike.branch = 'feature'` and then
+   `SET datahike.as_of = '…'` to view that branch at a past point.
+
+   `branch` / `commit-id` are looked up via datahike.versioning's
+   branch-as-db / commit-as-db. The input `db` param is the caller's
+   starting point (usually `(d/db conn)`); when branch or commit-id is
+   bound, we ignore that and read from the store instead."
   [db session-state]
-  (let [{:keys [as-of since history]} @session-state]
-    (cond-> db
+  (let [{:keys [as-of since history branch commit-id]} @session-state
+        ;; branch / commit-id: route via datahike.versioning at the store
+        ;; level. The conn's current :db is replaced if either is set.
+        base (cond
+               commit-id (versioning/commit-as-db (:store db) commit-id)
+               branch    (versioning/branch-as-db (:store db) branch)
+               :else     db)]
+    (cond-> base
       history (d/history)
       as-of   (d/as-of as-of)
       since   (d/since since))))
@@ -2244,6 +2264,15 @@
     :try-advisory-xact-lock {:names ["pg_try_advisory_xact_lock"]  :oids [PgWireServer/OID_BOOL]}
     :advisory-unlock        {:names ["pg_advisory_unlock"]         :oids [PgWireServer/OID_BOOL]}
     :get-fk-conname         {:names ["name"]                       :oids [PgWireServer/OID_TEXT]}
+    ;; datahike.* branching / versioning functions. Multi-row results
+    ;; (branches, parent_commits) still advertise a single-column row;
+    ;; PG's protocol doesn't need per-row metadata, only per-column.
+    :dh-branches            {:names ["branches"]                    :oids [PgWireServer/OID_TEXT]}
+    :dh-current-branch      {:names ["current_branch"]              :oids [PgWireServer/OID_TEXT]}
+    :dh-commit-id           {:names ["commit_id"]                   :oids [PgWireServer/OID_TEXT]}
+    :dh-parent-commits      {:names ["parent_commits"]              :oids [PgWireServer/OID_TEXT]}
+    :dh-create-branch       {:names ["create_branch"]               :oids [PgWireServer/OID_TEXT]}
+    :dh-delete-branch       {:names ["delete_branch"]               :oids [PgWireServer/OID_TEXT]}
     :show                   (show-metadata parsed)
     :empty-catalog          (let [{:keys [names oids]
                                    :or {names ["id"] oids [PgWireServer/OID_INT8]}}
@@ -2688,6 +2717,87 @@
 (defn- handle-pg-keywords [_ctx _parsed]
   (single-row-result "string_agg" PgWireServer/OID_TEXT ""))
 
+;; --- Datahike versioning / branching ---------------------------------------
+
+(defn- text-result
+  "Multi-row single-column result with values rendered as plain text
+   (OID_TEXT). tag is the CommandComplete label — e.g. \"SELECT 3\".
+   Used by the datahike.* branching handlers whose natural output is
+   a list of strings (branch names, parent commit UUIDs, …)."
+  [^String col-name ^String tag values]
+  (let [rows (into-array
+              (Class/forName "[Ljava.lang.String;")
+              (mapv (fn [v] (into-array String [(str v)])) values))]
+    (PgWireServer$QueryResult.
+     (into-array String [col-name])
+     (int-array [PgWireServer/OID_TEXT])
+     rows
+     tag)))
+
+(defn- handle-dh-branches
+  "SELECT datahike.branches() → one row per registered branch name."
+  [conn _ctx _parsed]
+  (let [names (some->> (versioning/branches conn)
+                       (map name)
+                       sort
+                       vec)]
+    (text-result "branches" (str "SELECT " (count names)) names)))
+
+(defn- handle-dh-current-branch
+  "SELECT datahike.current_branch() → the session's pinned branch, or
+   the conn's default branch when none is pinned."
+  [conn session-state]
+  (let [b (or (:branch @session-state)
+              (get-in @conn [:config :branch])
+              :db)]
+    (single-row-result "current_branch" PgWireServer/OID_TEXT (name b))))
+
+(defn- handle-dh-commit-id
+  "SELECT datahike.commit_id() → UUID of the current session's db head
+   (after any branch / commit-id / temporal SETs are applied)."
+  [conn session-state]
+  (let [db (apply-temporal (d/db conn) session-state)]
+    (single-row-result "commit_id" PgWireServer/OID_TEXT
+                       (str (versioning/commit-id db)))))
+
+(defn- handle-dh-parent-commits
+  "SELECT datahike.parent_commits() → UUIDs of the current db's
+   immediate parent commits (zero rows at genesis; one row in the
+   common case; two+ rows on a merge commit)."
+  [conn session-state]
+  (let [db (apply-temporal (d/db conn) session-state)
+        parents (or (versioning/parent-commit-ids db) [])]
+    (text-result "parent_commits"
+                 (str "SELECT " (count parents))
+                 (map str parents))))
+
+(defn- handle-dh-create-branch
+  "SELECT datahike.create_branch('new', 'from') → creates `:new` from
+   the branch-keyword `:from` (or a commit UUID string). O(1) konserve
+   write; does not go through the transaction writer."
+  [conn parsed]
+  (let [[new-name from] (:args parsed)]
+    (when-not (and new-name from)
+      (throw (ex-info "datahike.create_branch requires (new-name, from-branch-or-commit)"
+                      {:sqlstate "42601" :args (:args parsed)})))
+    (let [from-ref (if (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                                   from)
+                     (java.util.UUID/fromString from)
+                     (keyword from))]
+      (versioning/branch! conn from-ref (keyword new-name))
+      (single-row-result "create_branch" PgWireServer/OID_TEXT new-name))))
+
+(defn- handle-dh-delete-branch
+  "SELECT datahike.delete_branch('name') → marks the branch unreachable;
+   GC reclaims the underlying commits on the next sweep."
+  [conn parsed]
+  (let [[bname] (:args parsed)]
+    (when-not bname
+      (throw (ex-info "datahike.delete_branch requires (branch-name)"
+                      {:sqlstate "42601" :args (:args parsed)})))
+    (versioning/delete-branch! conn (keyword bname))
+    (single-row-result "delete_branch" PgWireServer/OID_TEXT bname)))
+
 ;; --- Catalog probes ---------------------------------------------------------
 
 (defn- handle-empty-catalog
@@ -2924,10 +3034,16 @@
      SET datahike.since = '2024-01-01T00:00:00Z'
      SET datahike.history = 'true'
      RESET datahike.as_of"
-  ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases] :as opts}]]
+  ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch] :as opts}]]
   (ensure-pg-schema! conn)
   (let [silently-accept (resolve-silently-accept opts)
-        session-state (atom {:db-name (or db-name "datahike")})
+        session-state (atom (cond-> {:db-name (or db-name "datahike")}
+                              ;; When the factory saw `database=X:feature`
+                              ;; in the StartupMessage, pin the branch so
+                              ;; every query on this session reads/writes-
+                              ;; read-path against it without needing an
+                              ;; explicit SET.
+                              initial-branch (assoc :branch initial-branch)))
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
@@ -3098,7 +3214,16 @@
                     temporal-set
                     (let [[k v] temporal-set]
                       (if v
-                        (swap! session-state assoc k (if (= k :history) true (parse-instant v)))
+                        (swap! session-state assoc k
+                               (case k
+                                 :history   true
+                                 :branch    (keyword v)
+                                 :commit-id (try (java.util.UUID/fromString v)
+                                                 (catch Exception _
+                                                   (throw (ex-info
+                                                           (str "Not a valid commit UUID: " v)
+                                                           {:value v :sqlstate "22P02"}))))
+                                 (parse-instant v)))
                         (swap! session-state dissoc k))
                       (empty-result "SET"))
                     timeout-ms
@@ -3203,6 +3328,14 @@
                             :nextval           (handle-nextval ctx parsed)
                             :currval           (handle-currval ctx parsed)
                             :setval            (handle-setval ctx parsed)
+
+              ;; datahike.* branching / versioning
+                            :dh-branches       (handle-dh-branches conn ctx parsed)
+                            :dh-current-branch (handle-dh-current-branch conn session-state)
+                            :dh-commit-id      (handle-dh-commit-id conn session-state)
+                            :dh-parent-commits (handle-dh-parent-commits conn session-state)
+                            :dh-create-branch  (handle-dh-create-branch conn parsed)
+                            :dh-delete-branch  (handle-dh-delete-branch conn parsed)
                             (empty-result "OK"))
 
                           :select
@@ -3819,6 +3952,21 @@
     conn-or-registry
     {default-name conn-or-registry}))
 
+(defn- parse-db-name
+  "Split a StartupMessage `database` value into [base-name branch].
+   Accepts `base[:branch]` — `:branch` is optional and, when present,
+   seeds the handler's session-state so every query against the
+   connection reads/writes-read-path against that branch.
+
+   Returns [base-name branch-keyword-or-nil]."
+  [^String database]
+  (if-let [idx (and database (.indexOf database ":"))]
+    (if (neg? idx)
+      [database nil]
+      [(.substring database 0 idx)
+       (keyword (.substring database (inc idx)))])
+    [database nil]))
+
 (defn make-query-handler-factory
   "Build a QueryHandlerFactory that routes on the StartupMessage's
    `database` parameter.
@@ -3826,8 +3974,13 @@
    registry: {name → conn} map of database name to Datahike conn.
    opts:     forwarded to make-query-handler (e.g. :on-query, :compat).
 
-   Clients that pass `database=X` land on `(registry \"X\")`. Unknown
-   names get a handler that errors every query with 3D000
+   Clients that pass `database=X` land on `(registry \"X\")`. An optional
+   `:branch` suffix — `database=X:feature` — pins the connection's
+   session-state to the `:feature` branch from the first query. Both
+   the `current_database()` reply and the `pg_database` catalog still
+   report the base name; the branch is a session-state detail.
+
+   Unknown base-names get a handler that errors every query with 3D000
    invalid_catalog_name — matching PG's behaviour on a non-existent db.
 
    Intended for callers who want to wrap their own PgWireServer (e.g.
@@ -3842,12 +3995,14 @@
                             (assoc opts :db-name (first names)
                                    :registered-databases names)))
       (create [_ startup-params]
-        (let [requested (or (.get ^java.util.Map startup-params "database")
-                            (first names))]
+        (let [raw (or (.get ^java.util.Map startup-params "database")
+                      (first names))
+              [requested branch] (parse-db-name raw)]
           (if-let [conn (get registry requested)]
             (make-query-handler conn
-                                (assoc opts :db-name requested
-                                       :registered-databases names))
+                                (cond-> (assoc opts :db-name requested
+                                               :registered-databases names)
+                                  branch (assoc :initial-branch branch)))
             (reject-unknown-db-handler requested)))))))
 
 (defn start-server
