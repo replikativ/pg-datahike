@@ -4,15 +4,17 @@
 ;; the catalog shapes Metabase probes during sync (PK / UNIQUE / FK /
 ;; CHECK + scalar / string / instant column types). Logs every SQL
 ;; statement Metabase sends to stdout so the inspector run.sh / dev
-;; REPL can tail it.
+;; REPL can tail it. Also starts an nREPL on :15433 so a side-by-side
+;; Datalog session can inspect the live conn while Metabase queries it.
 ;;
 ;; Usage:
-;;   clojure -M:server test/integration/metabase/seed.clj
+;;   clojure -M:dev test/integration/metabase/seed.clj
 ;;
 ;; Stops on SIGINT.
 
 (require '[datahike.api :as d]
-         '[datahike.pg :as pg])
+         '[datahike.pg :as pg]
+         '[nrepl.server :as nrepl])
 
 (def cfg {:store              {:backend :memory :id (java.util.UUID/randomUUID)}
           :schema-flexibility :write
@@ -79,6 +81,15 @@
                                               (str (subs snippet 0 240) "…")
                                               snippet)]
                                     (println (format "[q%04d] %s" n cap)))))}))
+
+;; Expose conn + server as user-ns vars so the nREPL session can poke
+;; at them without re-establishing.
+(intern 'user 'conn conn)
+(intern 'user 'server server)
+
+(def nrepl-port (Integer/parseInt (or (System/getenv "DATAHIKE_NREPL_PORT") "15433")))
+(def nrepl-server (nrepl/start-server :port nrepl-port :bind "0.0.0.0"))
+(println (format "[seed] nREPL listening on :%d  (clj-nrepl-eval -p %d \"…\")" nrepl-port nrepl-port))
 
 (println "[seed] ready — Metabase can now connect to localhost:15432")
 ;; Block until interrupted.

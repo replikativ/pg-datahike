@@ -70,6 +70,7 @@
     "pg_stat_user_tables"
     "pg_depend"
     "pg_inherits"
+    "pg_enum"
     "information_schema_columns" "information_schema_tables"
     "information_schema_sequences"
     "information_schema_table_constraints"
@@ -287,6 +288,16 @@
      {:db/ident :pg_inherits/inhparent :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_inherits/inhseqno :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_inherits") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_enum"
+    ;; Always empty — we don't model PG enum types. Metabase's
+    ;; describe-database probes `SELECT enumtypid FROM pg_enum`
+    ;; before sync-fields; without this catalog, the query errors
+    ;; out and sync-fields aborts.
+    [{:db/ident :pg_enum/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_enum/enumtypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_enum/enumlabel :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_enum") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_constraint"
     ;; One row per CHECK / FK / PK / UNIQUE constraint. `condef` is
     ;; the synthesized text — `pg_get_constraintdef(oid)` lowers to
@@ -694,6 +705,8 @@
     "pg_depend"
     []
     "pg_inherits"
+    []
+    "pg_enum"
     []
     ;; pg_constraint — one row per UNIQUE/PK column + per CHECK + per FK.
     ;; `condef` is the rendered text that pg_get_constraintdef returns.

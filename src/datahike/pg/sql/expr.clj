@@ -2237,9 +2237,14 @@
                  :else
                  (throw (ex-info (str "Unsupported IN expression: " (type right))
                                  {:expr (str right) :sqlstate "0A000"})))
-          ;; Build or-join with equality tests, handling NULLs per SQL standard
-          shared-vars (vec (sort-by str (ctx/collect-vars col)))
           non-null-vals (filterv some? vals)
+          ;; Detect parameterised values — JdbcParameter substitution
+          ;; emits `?pN` symbols. A `(contains? #{?p1} ?col)` clause
+          ;; would compare ?col against the literal var, never matching.
+          ;; For these, fall back to per-value equality which Datahike
+          ;; resolves param vars correctly. Pure-literal lists keep
+          ;; using the O(1) hash-set predicate.
+          has-param? (some symbol? non-null-vals)
           guards (ctx/null-guard-clauses ctx [col])]
       (cond
         ;; NOT IN with NULL in the list → always empty (SQL standard)
@@ -2250,10 +2255,18 @@
         (and not-in? (empty? non-null-vals))
         []
 
-        ;; NOT IN → set-based predicate wrapped in `not`. Using `(or-join ...)`
-        ;; with many branches explodes Datahike's planner (OOM on large lists).
-        ;; A single `(contains? #{...} ?col)` predicate is O(1) per row.
-        ;; NULL col must be filtered via null-guard (SQL: NULL NOT IN (…) → UNKNOWN → FALSE).
+        ;; NOT IN with parameterised values — emit per-value not= guards
+        ;; (one parameter per row of the list). Datahike conjoins them:
+        ;; col matches NOT IN iff every (not= col p_i) holds.
+        (and not-in? has-param?)
+        (into guards
+              (mapv (fn [v] [(list 'not= col v)]) non-null-vals))
+
+        ;; NOT IN literal list — set-based predicate wrapped in `not`.
+        ;; Using `(or-join ...)` with many branches explodes Datahike's
+        ;; planner (OOM on large lists). A single `(contains? #{...} ?col)`
+        ;; predicate is O(1) per row. NULL col must be filtered via
+        ;; null-guard (SQL: NULL NOT IN (…) → UNKNOWN → FALSE).
         not-in?
         (let [val-set (set non-null-vals)]
           (conj guards (list 'not [(list 'contains? val-set col)])))
@@ -2261,6 +2274,19 @@
         ;; IN with empty or NULL-only list → nothing matches
         (empty? non-null-vals)
         [[(list 'not= col col)]]
+
+        ;; IN with parameterised values — or-join across per-value
+        ;; equality. Each branch binds the param var to col via `=`.
+        ;; `[(= ?col ?p1)]` works because Datahike resolves both vars
+        ;; from :in / :where bindings; `(contains? #{?p1} ?col)` does
+        ;; NOT (the set member is the var symbol, not its value).
+        has-param?
+        (let [shared-vars (vec (distinct (concat (ctx/collect-vars col)
+                                                 (filter symbol? non-null-vals))))
+              branches (mapv (fn [v]
+                               (list 'and [(list '= col v)]))
+                             non-null-vals)]
+          (conj guards (apply list 'or-join shared-vars branches)))
 
         ;; IN — set-based predicate (O(1) per row)
         ;; `(contains? #{...} :__null__)` returns false, so positive IN is already null-safe.
