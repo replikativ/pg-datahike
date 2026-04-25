@@ -331,10 +331,22 @@
                       (ctx/add-clause! ctx [(list 'not= r-var :__null__)])
                       (ctx/add-clause! ctx [(list 'not= r-var nil)]))))))
 
-          ;; Fall back to regular predicate translation
+          ;; Fall back to regular predicate translation. For OUTER joins
+          ;; (LEFT/RIGHT/FULL), capture the predicate clauses for the
+          ;; or-join post-processor — applying them globally would
+          ;; convert the LEFT JOIN into an INNER JOIN by filtering out
+          ;; rows whose right side has no match (NULL filter rejects).
+          ;; The translate-predicate call still side-effects col-var
+          ;; data patterns into where-clauses for any right-side
+          ;; columns the predicate references; only the predicate
+          ;; itself is deferred.
             :else
-            (let [preds (expr/translate-predicate ctx expr)]
-              (swap! (:where-clauses ctx) into preds))))))
+            (if (#{:left :right :full} jtype)
+              (let [preds (expr/translate-predicate ctx expr)]
+                (swap! ref-info update :matched-only-preds (fnil into [])
+                       (vec preds)))
+              (let [preds (expr/translate-predicate ctx expr)]
+                (swap! (:where-clauses ctx) into preds)))))))
     {:name name :alias right-alias :join-type jtype :ref-info @ref-info}))
 
 (defn select-item-alias [^SelectItem item]
@@ -1272,7 +1284,8 @@
               (if (:value-join? ref-info)
                 ;; VALUE-EQUALITY LEFT JOIN: ON t1.a = t2.x
                 ;; (RIGHT JOINs are rewritten to LEFT at AST level)
-                (let [{:keys [left-key-var right-key-attr right-alias left-evar]} ref-info
+                (let [{:keys [left-key-var right-key-attr right-alias left-evar
+                              matched-only-preds]} ref-info
                       right-evar (ctx/entity-var! ctx right-alias)
                       ;; Convert left join key to get-else so NULL-key entities are included.
                       ;; They'll go to the unmatched branch via not-join.
@@ -1333,8 +1346,15 @@
                       ;; If right key var was in SELECT and differs from left key, bind it
                       matched-key-bind (when (and right-key-var (not= right-key-var left-key-var))
                                          [[(list 'identity left-key-var) right-key-var]])
+                      ;; Right-side filter predicates from the ON clause
+                      ;; (e.g. `… AND d.objsubid = 0`) — applied inside
+                      ;; the matched branch only. Without this they'd
+                      ;; act as global filters and convert the LEFT JOIN
+                      ;; into an INNER JOIN.
                       matched-parts (into [matched-key]
-                                          (concat matched-non-key matched-key-bind))
+                                          (concat matched-non-key
+                                                  matched-key-bind
+                                                  matched-only-preds))
                       matched (apply list 'and matched-parts)
                       ;; Branch 2: unmatched — no right entity with this key
                       null-bindings (into [[(list 'ground :__null__) right-evar]]

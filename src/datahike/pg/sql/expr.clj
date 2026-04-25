@@ -2084,29 +2084,62 @@
                                 (= op-type "NOT_MATCH_CASEINSENSITIVE"))
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
-          pattern (translate-expr ctx (.getRightExpression e))
-          pat-str (str pattern)
-          re-str (if case-insensitive? (str "(?i)" pat-str) pat-str)
-          ;; Pre-compile and inject the matcher as an in-param. Two reasons:
-          ;;  (1) Datahike does not resolve nested fn calls inside a single
-          ;;      predicate, so `[(not (re-find …))]` silently treats the
-          ;;      inner call as opaque-truthy.
+          right (.getRightExpression e)
+          pattern (translate-expr ctx right)
+          ;; Distinguish a parse-time-known regex literal from a
+          ;; parameter placeholder. JdbcParameter / JdbcNamedParameter
+          ;; turn into ParamRef records that cannot be `re-pattern`-ed
+          ;; until Bind. For literals we compile once; for params we
+          ;; defer compilation into the matcher closure.
+          literal? (or (instance? StringValue right)
+                       (string? pattern))
+          ;; Two reasons we go through an in-param matcher rather than
+          ;; emitting `[(re-find #"…" col)]` directly:
+          ;;  (1) Datahike does not resolve nested fn calls inside a
+          ;;      single predicate, so `[(not (re-find …))]` silently
+          ;;      treats the inner call as opaque-truthy.
           ;;  (2) Datalog `(not […])` clauses don't compose with `or-join`
-          ;;      when sibling branches reference different vars (Metabase's
-          ;;      getSchemas idiom: `nspname !~ '^pg_temp_' OR nspname = (current_schemas(true))[1]`).
-          ;; Emitting a boolean predicate via in-param sidesteps both.
-          re-obj (re-pattern re-str)
-          matcher (if negate?
-                    (fn [s] (and (some? s) (not (.find (.matcher ^java.util.regex.Pattern re-obj (str s))))))
-                    (fn [s] (and (some? s) (boolean (.find (.matcher ^java.util.regex.Pattern re-obj (str s)))))))
+          ;;      when sibling branches reference different vars
+          ;;      (Metabase's getSchemas idiom).
+          matcher
+          (if literal?
+            (let [pat-str (str pattern)
+                  re-str  (if case-insensitive? (str "(?i)" pat-str) pat-str)
+                  re-obj  (re-pattern re-str)]
+              (if negate?
+                (fn [s] (and (some? s) (not (.find (.matcher ^java.util.regex.Pattern re-obj (str s))))))
+                (fn [s] (and (some? s) (boolean (.find (.matcher ^java.util.regex.Pattern re-obj (str s))))))))
+            ;; Parameter pattern: compile per-row (cheap; pgjdbc only
+            ;; sends a regex param across a connection a handful of
+            ;; times during sync). Cache the most recent (str pat) so
+            ;; subsequent rows reuse the compiled Pattern.
+            (let [cache (volatile! [nil nil])]
+              (fn [pat-arg s]
+                (and (some? s)
+                     (some? pat-arg)
+                     (not= :__null__ pat-arg)
+                     (let [pat-str (str pat-arg)
+                           re-str  (if case-insensitive? (str "(?i)" pat-str) pat-str)
+                           [last-str ^java.util.regex.Pattern last-pat] @cache
+                           p (if (= last-str re-str)
+                               last-pat
+                               (let [np (try (re-pattern re-str)
+                                             (catch Throwable _ nil))]
+                                 (vreset! cache [re-str np])
+                                 np))
+                           hit? (and p (.find (.matcher ^java.util.regex.Pattern p (str s))))]
+                       (if negate? (not hit?) (boolean hit?)))))))
           fn-param (symbol (str "?re-match" (swap! (:var-counter ctx) inc)))
           _ (swap! (:in-params ctx) conj fn-param)
           _ (swap! (:in-args ctx) conj matcher)
           ;; Null-guard: SQL says NULL col → UNKNOWN → FALSE. Matcher
           ;; tolerates :__null__ via some? check, but the explicit guard
           ;; keeps the predicate consistent with the LIKE / `=` shapes.
-          guards (ctx/null-guard-clauses ctx [col])]
-      (conj guards [(list fn-param col)]))
+          guards (ctx/null-guard-clauses ctx [col])
+          pred-form (if literal?
+                      (list fn-param col)
+                      (list fn-param pattern col))]
+      (conj guards [pred-form]))
 
     (instance? LikeExpression expr)
     (let [^LikeExpression e expr
