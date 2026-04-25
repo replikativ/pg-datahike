@@ -591,35 +591,55 @@
                       result-var])
               result-var)))
 
-      ;; DATE_TRUNC(precision, epoch-seconds) → floor to precision boundary
+      ;; DATE_TRUNC(precision, ts) → floor to precision boundary.
+      ;; Accepts ts as either:
+      ;;   - java.util.Date  (the type Datahike returns for :db.type/instant
+      ;;     attrs — Metabase's Question Builder breakouts go through this
+      ;;     branch with `temporal-unit "month"`)
+      ;;   - Long/epoch-seconds (some legacy callers / synthetic values)
+      ;; and returns the same shape it received, so downstream
+      ;; aggregations / projections see a value of the original type.
+      ;; PG's DATE_TRUNC also returns a TIMESTAMP, so Date in / Date out
+      ;; is the right wire-side default.
       (= fname "date_trunc")
       (let [[precision ts] args
             fn-param (symbol (str "?date-trunc" (swap! (:var-counter ctx) inc)))
+            trunc-zdt (fn [unit ^java.time.ZonedDateTime zdt]
+                        (case unit
+                          "second"  (.truncatedTo zdt java.time.temporal.ChronoUnit/SECONDS)
+                          "minute"  (.truncatedTo zdt java.time.temporal.ChronoUnit/MINUTES)
+                          "hour"    (.truncatedTo zdt java.time.temporal.ChronoUnit/HOURS)
+                          "day"     (.truncatedTo zdt java.time.temporal.ChronoUnit/DAYS)
+                          "week"    (let [dow (.getValue (.getDayOfWeek zdt))
+                                          start (.minusDays zdt (dec dow))]
+                                      (.truncatedTo start java.time.temporal.ChronoUnit/DAYS))
+                          "month"   (.truncatedTo (.withDayOfMonth zdt 1)
+                                                  java.time.temporal.ChronoUnit/DAYS)
+                          "quarter" (let [m (.getMonthValue zdt)
+                                          qstart (- m (mod (dec m) 3))]
+                                      (.truncatedTo (.withDayOfMonth (.withMonth zdt qstart) 1)
+                                                    java.time.temporal.ChronoUnit/DAYS))
+                          "year"    (.truncatedTo (.withDayOfYear zdt 1)
+                                                  java.time.temporal.ChronoUnit/DAYS)
+                          zdt))
             trunc-fn (fn [prec ts]
-                       (when (and prec ts (number? ts))
-                         (let [ts (long ts)
-                               ;; Normalize: accept both singular and plural
-                               unit (let [u (if (keyword? prec) (name prec) (str prec))]
-                                      (str/replace u #"s$" ""))
-                               inst (java.time.Instant/ofEpochSecond ts)
-                               zdt (.atZone inst java.time.ZoneOffset/UTC)]
-                           (case unit
-                             "second" (.getEpochSecond (.toInstant (.truncatedTo zdt java.time.temporal.ChronoUnit/SECONDS)))
-                             "minute" (.getEpochSecond (.toInstant (.truncatedTo zdt java.time.temporal.ChronoUnit/MINUTES)))
-                             "hour"   (.getEpochSecond (.toInstant (.truncatedTo zdt java.time.temporal.ChronoUnit/HOURS)))
-                             "day"    (.getEpochSecond (.toInstant (.truncatedTo zdt java.time.temporal.ChronoUnit/DAYS)))
-                             "week"   (let [dow (.getValue (.getDayOfWeek zdt))
-                                            start-of-week (.minusDays zdt (dec dow))]
-                                        (.getEpochSecond (.toInstant (.truncatedTo start-of-week java.time.temporal.ChronoUnit/DAYS))))
-                             "month"  (let [first-of-month (.withDayOfMonth zdt 1)]
-                                        (.getEpochSecond (.toInstant (.truncatedTo first-of-month java.time.temporal.ChronoUnit/DAYS))))
-                             "quarter" (let [month (.getMonthValue zdt)
-                                             quarter-start (- month (mod (dec month) 3))
-                                             first-of-quarter (.withDayOfMonth (.withMonth zdt quarter-start) 1)]
-                                         (.getEpochSecond (.toInstant (.truncatedTo first-of-quarter java.time.temporal.ChronoUnit/DAYS))))
-                             "year"   (let [first-of-year (.withDayOfYear zdt 1)]
-                                        (.getEpochSecond (.toInstant (.truncatedTo first-of-year java.time.temporal.ChronoUnit/DAYS))))
-                             ts))))]
+                       (when (and prec ts (not= :__null__ ts))
+                         (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
+                                      (str/replace u #"s$" ""))]
+                           (cond
+                             (instance? java.util.Date ts)
+                             (let [zdt (.atZone (.toInstant ^java.util.Date ts)
+                                                java.time.ZoneOffset/UTC)
+                                   trunc (trunc-zdt unit zdt)]
+                               (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+
+                             (number? ts)
+                             (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
+                                                java.time.ZoneOffset/UTC)
+                                   trunc (trunc-zdt unit zdt)]
+                               (.getEpochSecond (.toInstant ^java.time.ZonedDateTime trunc)))
+
+                             :else ts))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj trunc-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param precision ts) result-var])
