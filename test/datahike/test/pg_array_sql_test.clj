@@ -22,7 +22,7 @@
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]
            [java.sql Connection DriverManager PreparedStatement ResultSet
-                     ResultSetMetaData Types]))
+            ResultSetMetaData Types]))
 
 (def oid-int4 23)
 (def oid-int8 20)

@@ -47,19 +47,19 @@
                    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
 
 (d/transact conn
-  (let [now #(java.util.Date.)]
-    [{:customer/id 1 :customer/email "alice@example.com" :customer/name "Alice"
-      :customer/age 30 :customer/created_at (now)}
-     {:customer/id 2 :customer/email "bob@example.com" :customer/name "Bob"
-      :customer/age 28 :customer/created_at (now)}
-     {:customer/id 3 :customer/email "carol@example.com" :customer/name "Carol"
-      :customer/age 41 :customer/created_at (now)}]))
+            (let [now #(java.util.Date.)]
+              [{:customer/id 1 :customer/email "alice@example.com" :customer/name "Alice"
+                :customer/age 30 :customer/created_at (now)}
+               {:customer/id 2 :customer/email "bob@example.com" :customer/name "Bob"
+                :customer/age 28 :customer/created_at (now)}
+               {:customer/id 3 :customer/email "carol@example.com" :customer/name "Carol"
+                :customer/age 41 :customer/created_at (now)}]))
 
 (d/transact conn
-  [{:order/id 100 :order/customer [:customer/id 1] :order/total_cents 4500 :order/status "paid"}
-   {:order/id 101 :order/customer [:customer/id 1] :order/total_cents 1200 :order/status "paid"}
-   {:order/id 102 :order/customer [:customer/id 2] :order/total_cents 9999 :order/status "pending"}
-   {:order/id 103 :order/customer [:customer/id 3] :order/total_cents  500 :order/status "paid"}])
+            [{:order/id 100 :order/customer [:customer/id 1] :order/total_cents 4500 :order/status "paid"}
+             {:order/id 101 :order/customer [:customer/id 1] :order/total_cents 1200 :order/status "paid"}
+             {:order/id 102 :order/customer [:customer/id 2] :order/total_cents 9999 :order/status "pending"}
+             {:order/id 103 :order/customer [:customer/id 3] :order/total_cents  500 :order/status "paid"}])
 
 ;; on-query hook — dump every SQL Metabase sends with a query counter.
 ;; Toggle with DATAHIKE_PG_TRACE=0 to silence; default is on for

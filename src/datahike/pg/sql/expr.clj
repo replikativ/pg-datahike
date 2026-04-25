@@ -1282,122 +1282,122 @@
       :else
       (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
       ;; Constant value — cast at translation time
-      (cond
-        is-int?  (Long/parseLong (str inner-raw))
-        is-float? (Double/parseDouble (str inner-raw))
-        is-text? (str inner-raw)
-        is-bool? (Boolean/parseBoolean (str inner-raw))
+        (cond
+          is-int?  (Long/parseLong (str inner-raw))
+          is-float? (Double/parseDouble (str inner-raw))
+          is-text? (str inner-raw)
+          is-bool? (Boolean/parseBoolean (str inner-raw))
         ;; ::date — extract the LocalDate so serialization can omit the
         ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
-        is-date? (try
-                   (java.time.LocalDate/parse
-                    (str/trim (str inner-raw))
-                    (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                   (catch Exception _
-                     (let [d (parse-timestamp-string (str inner-raw))]
-                       (when (instance? java.util.Date d)
-                         (-> ^java.util.Date d .toInstant
-                             (.atZone java.time.ZoneOffset/UTC)
-                             .toLocalDate)))))
+          is-date? (try
+                     (java.time.LocalDate/parse
+                      (str/trim (str inner-raw))
+                      (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                     (catch Exception _
+                       (let [d (parse-timestamp-string (str inner-raw))]
+                         (when (instance? java.util.Date d)
+                           (-> ^java.util.Date d .toInstant
+                               (.atZone java.time.ZoneOffset/UTC)
+                               .toLocalDate)))))
         ;; ::time — extract the LocalTime so serialization emits only
         ;; "HH:MM:SS[.fff]" and drops any date component the input had.
-        is-time? (let [s (str/trim (str inner-raw))
+          is-time? (let [s (str/trim (str inner-raw))
                        ;; Accept "HH:MM:SS[.f]", "YYYY-MM-DD HH:MM:SS[.f]",
                        ;; and ISO-8601 with T separator.
-                       time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                   (try (java.time.LocalTime/parse time-only)
-                        (catch Exception _ s)))
-        is-ts?   (parse-timestamp-string (str inner-raw))
-        is-uuid? (java.util.UUID/fromString (str inner-raw))
+                         time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
+                     (try (java.time.LocalTime/parse time-only)
+                          (catch Exception _ s)))
+          is-ts?   (parse-timestamp-string (str inner-raw))
+          is-uuid? (java.util.UUID/fromString (str inner-raw))
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
-        (= type-str "regnamespace") 2200
+          (= type-str "regnamespace") 2200
         ;; ::regclass — resolve the literal name to the table OID. Prefer
         ;; the stable :pg/table-oid from CREATE TABLE; for legacy tables
         ;; without one, match the hashCode fallback that pg_class and
         ;; pg_attribute synthesize so WHERE attrelid = 'x'::regclass
         ;; actually joins. 0 for unknown names.
-        (= type-str "regclass")
-        (let [n (str inner-raw)]
-          (or (when params/*parse-db* (pgs/table-oid params/*parse-db* n))
-              (when (seq n) (Math/abs (.hashCode ^String n)))
-              0))
-        :else    inner-raw)
+          (= type-str "regclass")
+          (let [n (str inner-raw)]
+            (or (when params/*parse-db* (pgs/table-oid params/*parse-db* n))
+                (when (seq n) (Math/abs (.hashCode ^String n)))
+                0))
+          :else    inner-raw)
       ;; Variable/expression — add runtime cast binding
-      (let [inner-val (ctx/materialize-arg! ctx inner-raw)
-            result-var (ctx/fresh-var! ctx)]
-        (cond
-          is-date?
-          (let [fn-param (symbol (str "?cast-date" (swap! (:var-counter ctx) inc)))
-                date-fn (fn [v]
-                          (when v
-                            (let [s (str/trim (str v))]
-                              (or (try (java.time.LocalDate/parse
-                                        s
-                                        (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                                       (catch Exception _ nil))
-                                  (when-let [d (parse-timestamp-string s)]
-                                    (when (instance? java.util.Date d)
-                                      (-> ^java.util.Date d .toInstant
-                                          (.atZone java.time.ZoneOffset/UTC)
-                                          .toLocalDate)))))))]
-            (swap! (:in-params ctx) conj fn-param)
-            (swap! (:in-args ctx) conj date-fn)
-            (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
+        (let [inner-val (ctx/materialize-arg! ctx inner-raw)
+              result-var (ctx/fresh-var! ctx)]
+          (cond
+            is-date?
+            (let [fn-param (symbol (str "?cast-date" (swap! (:var-counter ctx) inc)))
+                  date-fn (fn [v]
+                            (when v
+                              (let [s (str/trim (str v))]
+                                (or (try (java.time.LocalDate/parse
+                                          s
+                                          (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                                         (catch Exception _ nil))
+                                    (when-let [d (parse-timestamp-string s)]
+                                      (when (instance? java.util.Date d)
+                                        (-> ^java.util.Date d .toInstant
+                                            (.atZone java.time.ZoneOffset/UTC)
+                                            .toLocalDate)))))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj date-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
-          is-time?
-          (let [fn-param (symbol (str "?cast-time" (swap! (:var-counter ctx) inc)))
-                time-fn (fn [v]
-                          (when v
-                            (let [s (str/trim (str v))
-                                  time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                              (try (java.time.LocalTime/parse time-only)
-                                   (catch Exception _ s)))))]
-            (swap! (:in-params ctx) conj fn-param)
-            (swap! (:in-args ctx) conj time-fn)
-            (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
+            is-time?
+            (let [fn-param (symbol (str "?cast-time" (swap! (:var-counter ctx) inc)))
+                  time-fn (fn [v]
+                            (when v
+                              (let [s (str/trim (str v))
+                                    time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
+                                (try (java.time.LocalTime/parse time-only)
+                                     (catch Exception _ s)))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj time-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
-          is-ts?
+            is-ts?
           ;; Timestamp cast: use an in-param function for runtime parsing
-          (let [ts-fn-param (symbol (str "?cast-ts" (swap! (:var-counter ctx) inc)))
-                ts-fn (fn [v] (when v (parse-timestamp-string (str v))))]
-            (swap! (:in-params ctx) conj ts-fn-param)
-            (swap! (:in-args ctx) conj ts-fn)
-            (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
+            (let [ts-fn-param (symbol (str "?cast-ts" (swap! (:var-counter ctx) inc)))
+                  ts-fn (fn [v] (when v (parse-timestamp-string (str v))))]
+              (swap! (:in-params ctx) conj ts-fn-param)
+              (swap! (:in-args ctx) conj ts-fn)
+              (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
 
-          is-uuid?
-          (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))
-                uuid-fn (fn [v] (when v (java.util.UUID/fromString (str v))))]
-            (swap! (:in-params ctx) conj uuid-fn-param)
-            (swap! (:in-args ctx) conj uuid-fn)
-            (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
+            is-uuid?
+            (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))
+                  uuid-fn (fn [v] (when v (java.util.UUID/fromString (str v))))]
+              (swap! (:in-params ctx) conj uuid-fn-param)
+              (swap! (:in-args ctx) conj uuid-fn)
+              (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
 
           ;; ::regnamespace — always resolve to OID 2200 (single namespace)
-          (= type-str "regnamespace")
-          (do (swap! (:where-clauses ctx) conj [(list 'identity 2200) result-var])
-              result-var)
+            (= type-str "regnamespace")
+            (do (swap! (:where-clauses ctx) conj [(list 'identity 2200) result-var])
+                result-var)
 
           ;; ::regclass — resolve table name to relation OID. Same
           ;; precedence as the literal branch: :pg/table-oid, then
           ;; hashCode fallback, then 0.
-          (= type-str "regclass")
-          (let [fn-param (symbol (str "?regclass" (swap! (:var-counter ctx) inc)))
-                db params/*parse-db*
-                lookup (fn [v]
-                         (when (some? v)
-                           (let [n (str v)]
-                             (or (when db (pgs/table-oid db n))
-                                 (when (seq n) (Math/abs (.hashCode ^String n)))
-                                 0))))]
-            (swap! (:in-params ctx) conj fn-param)
-            (swap! (:in-args ctx) conj lookup)
-            (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
-            result-var)
+            (= type-str "regclass")
+            (let [fn-param (symbol (str "?regclass" (swap! (:var-counter ctx) inc)))
+                  db params/*parse-db*
+                  lookup (fn [v]
+                           (when (some? v)
+                             (let [n (str v)]
+                               (or (when db (pgs/table-oid db n))
+                                   (when (seq n) (Math/abs (.hashCode ^String n)))
+                                   0))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj lookup)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+              result-var)
 
-          :else
-          (let [cast-fn (cond is-int? 'long is-float? 'double is-text? 'str is-bool? 'boolean :else 'str)]
-            (swap! (:where-clauses ctx) conj [(list cast-fn inner-val) result-var])))
-        result-var)))))
+            :else
+            (let [cast-fn (cond is-int? 'long is-float? 'double is-text? 'str is-bool? 'boolean :else 'str)]
+              (swap! (:where-clauses ctx) conj [(list cast-fn inner-val) result-var])))
+          result-var)))))
 
 (def ^:private arith-op->null-safe
   "Map Clojure arithmetic op-sym to the fully-qualified fns/null-safe variant
