@@ -188,8 +188,8 @@
             (let [^EqualsTo eq expr
                   left (.getLeftExpression eq)
                   right (.getRightExpression eq)
-                  left-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx))
-                  right-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx))
+                  left-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
+                  right-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
                   schema (:schema ctx)
                   hints  (:hints ctx)
                   ;; Pull target-unique fact for an attr: true when the
@@ -243,11 +243,25 @@
                      :ref-attr     r-bare}
 
                     :else nil)
+                  derived-aliases (:derived-aliases ctx)
+                  ;; Skip ref/db_id unification when the db-id side is
+                  ;; a derived alias — `derived.db_id` is a projected
+                  ;; value column in the speculative db, NOT a real
+                  ;; entity-id we can unify with the ref attr's value.
+                  ;; Falls through to value-equality JOIN, which
+                  ;; correctly looks up `[?d :derived/db_id ?val]` and
+                  ;; matches against the outer ref's value.
+                  derived? (fn [resolved]
+                             (and (vector? resolved)
+                                  (= :db-id (first resolved))
+                                  (contains? derived-aliases (second resolved))))
                   [ref-side db-id-side]
                   (cond
-                    (and (vector? left-resolved) (= :db-id (first left-resolved)))
+                    (and (vector? left-resolved) (= :db-id (first left-resolved))
+                         (not (derived? left-resolved)))
                     [right-resolved left-resolved]
-                    (and (vector? right-resolved) (= :db-id (first right-resolved)))
+                    (and (vector? right-resolved) (= :db-id (first right-resolved))
+                         (not (derived? right-resolved)))
                     [left-resolved right-resolved]
                     :else nil)]
               (cond
@@ -298,8 +312,8 @@
                   (let [l-var (expr/translate-expr ctx left)
                       ;; Determine which side is left vs right table
                         left-alias (:default-table ctx)
-                        l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx))
-                        r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx))
+                        l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
+                        r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
                       ;; Right-side attr is the one from the right table
                         [left-key-var right-key-attr]
                         (let [l-ns (if (vector? l-resolved) (second l-resolved) (namespace l-resolved))
@@ -767,11 +781,20 @@
          joins)
         table-aliases (merge table-aliases join-aliases)
 
+        ;; Aliases of derived tables in JOIN positions. translate-join
+        ;; consults this to skip the ref/db_id unification path, which
+        ;; assumes the right-side alias names a real entity in the live
+        ;; db. Derived rows live in their own entity-id space in the
+        ;; speculative db; we have to JOIN them by value, not by
+        ;; entity-id unification.
+        derived-alias-set (into #{} (map :alias) derived-joins)
+
         ;; Create context
         ctx (ctx/make-ctx schema table-aliases default-table
                           {:db db
                            :parse-sql params/*parse-sql*
-                           :hints (pgs/schema-hints db)})
+                           :hints (pgs/schema-hints db)
+                           :derived-aliases derived-alias-set})
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins

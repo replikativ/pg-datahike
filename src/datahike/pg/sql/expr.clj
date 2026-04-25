@@ -1582,7 +1582,8 @@
         (let [resolved (ctx/resolve-column expr
                                            (:table-aliases ctx)
                                            (:default-table ctx)
-                                           (:col-overrides ctx))]
+                                           (:col-overrides ctx)
+                                           (:derived-aliases ctx))]
           (ctx/col-var! ctx resolved))))
 
     (instance? AllColumns expr)
@@ -2134,7 +2135,8 @@
           (let [resolved (ctx/resolve-column left
                                              (:table-aliases ctx)
                                              (:default-table ctx)
-                                             (:col-overrides ctx))
+                                             (:col-overrides ctx)
+                                             (:derived-aliases ctx))
                 val (translate-expr ctx right)]
             (if (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
@@ -2225,7 +2227,8 @@
               resolved (ctx/resolve-column col
                                            (:table-aliases ctx)
                                            (:default-table ctx)
-                                           (:col-overrides ctx))]
+                                           (:col-overrides ctx)
+                                           (:derived-aliases ctx))]
           (cond
             ;; db_id IS NULL doesn't make sense
             (and (vector? resolved) (= :db-id (first resolved)))
@@ -3005,7 +3008,8 @@
     (let [resolved (ctx/resolve-column ^Column expr
                                        (:table-aliases ctx)
                                        (:default-table ctx)
-                                       (:col-overrides ctx))
+                                       (:col-overrides ctx)
+                                       (:derived-aliases ctx))
           col-var (ctx/col-var! ctx resolved)]
       [[(list '= col-var true)]])
 

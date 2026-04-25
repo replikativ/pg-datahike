@@ -53,15 +53,25 @@
      [:aliased alias-key kw]  — for aliased column references (self-joins)
      :ns/col                  — for regular column references"
   ([^Column col table-aliases default-table]
-   (resolve-column col table-aliases default-table {}))
+   (resolve-column col table-aliases default-table {} nil))
   ([^Column col table-aliases default-table col-overrides]
+   (resolve-column col table-aliases default-table col-overrides nil))
+  ([^Column col table-aliases default-table col-overrides derived-aliases]
    (let [table-ref (.getTable col)
          table-alias (when table-ref (params/unquote-ident (.getName ^Table table-ref)))
          alias-key (or table-alias default-table)
          table-name (get table-aliases alias-key alias-key)
-         col-name (params/unquote-ident (.getColumnName col))]
-     (if (= col-name "db_id")
+         col-name (params/unquote-ident (.getColumnName col))
+         derived? (contains? (or derived-aliases #{}) alias-key)]
+     (cond
+       ;; db_id on a real-table alias is the entity-id (special-cased
+       ;; everywhere as the [:db-id alias] vector). On a derived alias,
+       ;; db_id is just a projected value column on the speculative
+       ;; entity — resolve to the regular `:<alias>/db_id` keyword.
+       (and (= col-name "db_id") (not derived?))
        [:db-id alias-key]
+
+       :else
        (let [kw (or (get-in col-overrides [table-name col-name])
                     (keyword table-name col-name))]
          (if (not= alias-key table-name)
@@ -117,13 +127,24 @@
                   Drives the `:col-overrides` lookup used by `resolve-column`
                   so `WHERE <renamed-col>` and `JOIN … ON …` resolve hint-
                   mapped columns to their real attribute keywords."
-  [schema table-aliases default-table & [{:keys [db parse-sql hints]}]]
+  [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases]}]]
   {:schema        schema
    :table-aliases table-aliases
    :default-table default-table
    :db            db
    :parse-sql     parse-sql
    :hints         (or hints {})
+   ;; Aliases of FROM/JOIN-position derived tables — `(SELECT … FROM …) AS x`
+   ;; whose rows have been materialised into the speculative db with their
+   ;; own entity-id space. translate-join uses this to suppress the ref/db_id
+   ;; unification it would otherwise apply, because a derived alias's `db_id`
+   ;; column is just the projected source-entity-id value, not a real
+   ;; entity-id in the speculative db. Without this, JOIN ON outer.ref =
+   ;; derived.db_id rebinds the derived alias's entity-var to the source
+   ;; entity-id, then `derived.col` resolves through the wrong attribute
+   ;; namespace (source's :customer/name instead of the speculative
+   ;; :c/name) and matches nothing.
+   :derived-aliases (or derived-aliases #{})
    ;; Precomputed {table-name → {hinted-col-name → attr-ident}} so
    ;; resolve-column maps user-facing column names back to the storage-
    ;; level attribute in O(1). Only entries for columns with a
