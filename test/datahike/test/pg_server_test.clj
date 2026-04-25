@@ -363,6 +363,39 @@
     (is (= [["text"]] (rows (.execute *handler* "SELECT DISTINCT pg_typeof(name) FROM person"))))
     (is (= [["bigint"]] (rows (.execute *handler* "SELECT DISTINCT pg_typeof(age) FROM person"))))))
 
+(deftest test-predicate-in-case-when
+  ;; CASE WHEN <pred> THEN x ELSE y END inside a SELECT projection
+  ;; goes through translate-predicate-expr (boolean form) rather than
+  ;; translate-predicate (where-clause vector). Several predicate
+  ;; types had no inline branch and silently fell back to translate-expr,
+  ;; which routed them back — infinite recursion → StackOverflow.
+  ;; These regressions cover IN / NOT IN, LIKE / NOT LIKE, BETWEEN /
+  ;; NOT BETWEEN, regex ~ / !~ used as the WHEN predicate.
+  (testing "CASE WHEN col IN (lit, lit) THEN ..."
+    (let [r (.execute *handler* "SELECT name, CASE WHEN age IN (25, 35) THEN 'edge' ELSE 'mid' END AS bucket FROM person ORDER BY age")]
+      (is (= [["Bob" "edge"] ["Alice" "mid"] ["Charlie" "edge"]] (rows r)))))
+
+  (testing "CASE WHEN col NOT IN (lit) THEN ..."
+    (let [r (.execute *handler* "SELECT name, CASE WHEN age NOT IN (30) THEN 'other' ELSE 'thirty' END AS bucket FROM person ORDER BY age")]
+      (is (= [["Bob" "other"] ["Alice" "thirty"] ["Charlie" "other"]] (rows r)))))
+
+  (testing "CASE WHEN col LIKE 'pat' THEN ..."
+    (let [r (.execute *handler* "SELECT name, CASE WHEN name LIKE 'A%' THEN 'A' ELSE 'X' END AS bucket FROM person ORDER BY name")]
+      (is (= [["Alice" "A"] ["Bob" "X"] ["Charlie" "X"]] (rows r)))))
+
+  (testing "CASE WHEN col BETWEEN lo AND hi"
+    ;; Bob=25, Alice=30, Charlie=35; BETWEEN 28 AND 32 only matches Alice.
+    (let [r (.execute *handler* "SELECT name, CASE WHEN age BETWEEN 28 AND 32 THEN 'mid' ELSE 'far' END AS bucket FROM person ORDER BY age")]
+      (is (= [["Bob" "far"] ["Alice" "mid"] ["Charlie" "far"]] (rows r)))))
+
+  (testing "CASE WHEN col ~ 'regex' THEN ..."
+    (let [r (.execute *handler* "SELECT name, CASE WHEN name ~ '^A' THEN 'A' ELSE 'X' END AS bucket FROM person ORDER BY name")]
+      (is (= [["Alice" "A"] ["Bob" "X"] ["Charlie" "X"]] (rows r)))))
+
+  (testing "CASE WHEN col !~ 'regex' THEN ..."
+    (let [r (.execute *handler* "SELECT name, CASE WHEN name !~ '^A' THEN 'X' ELSE 'A' END AS bucket FROM person ORDER BY name")]
+      (is (= [["Alice" "A"] ["Bob" "X"] ["Charlie" "X"]] (rows r))))))
+
 (deftest test-pg-comment-stubs
   (testing "obj_description / col_description return NULL (no comments tracked)"
     (is (= [[nil]] (rows (.execute *handler* "SELECT obj_description(0, 'pg_class')"))))

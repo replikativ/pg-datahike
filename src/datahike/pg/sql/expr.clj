@@ -1038,9 +1038,133 @@
                    (ctx/materialize-arg! ctx inner)
                    inner)))
 
+    ;; col [NOT] IN (literal-list-or-subquery) used inside CASE WHEN /
+    ;; nested AND-OR. Lower to a single contains?/or-join form rather
+    ;; than the WHERE-clause vector form translate-predicate emits.
+    (instance? InExpression expr)
+    (let [^InExpression e expr
+          not-in? (.isNot e)
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)
+          right (.getRightExpression e)
+          vals (cond
+                 (instance? ParenthesedExpressionList right)
+                 (mapv #(translate-expr ctx %) ^ParenthesedExpressionList right)
+                 (instance? ExpressionList right)
+                 (mapv #(translate-expr ctx %) ^ExpressionList right)
+                 :else
+                 (throw (ex-info (str "IN expression form unsupported in predicate-expr context: "
+                                      (type right))
+                                 {:expr (str right) :sqlstate "0A000"})))
+          non-null-vals (filterv some? vals)
+          has-param? (some symbol? non-null-vals)
+          set-form (if has-param?
+                     ;; Parameter-laden lists — runtime set construction
+                     ;; via in-param fn so each Bind sees the current
+                     ;; values. (Same trick we use for IN in WHERE.)
+                     (let [fn-param (symbol (str "?in-set" (swap! (:var-counter ctx) inc)))
+                           build (fn [& xs] (set xs))]
+                       (swap! (:in-params ctx) conj fn-param)
+                       (swap! (:in-args ctx) conj build)
+                       (let [out-var (ctx/fresh-var! ctx)]
+                         (swap! (:where-clauses ctx) conj
+                                [(apply list fn-param non-null-vals) out-var])
+                         out-var))
+                     (set non-null-vals))
+          base (list 'contains? set-form col)]
+      (if not-in? (list 'not base) base))
+
+    ;; col [NOT] LIKE 'pat' inside CASE WHEN. Reuse the LIKE→regex
+    ;; compile from translate-predicate (precomputed Pattern literal).
+    (instance? LikeExpression expr)
+    (let [^LikeExpression e expr
+          not-like? (.isNot e)
+          case-insensitive? (.isCaseInsensitive e)
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)
+          pattern (translate-expr ctx (.getRightExpression e))
+          pat-str (str pattern)
+          ^Character esc (or (when-let [c (.getEscape e)]
+                               (when-not (str/blank? (str c)) (Character/valueOf (char (first (str c))))))
+                             (Character/valueOf \\))
+          re-sb (StringBuilder. "^")
+          _ (loop [i 0]
+              (when (< i (count pat-str))
+                (let [c (.charAt ^String pat-str i)]
+                  (if (= c (.charValue esc))
+                    (if (< (inc i) (count pat-str))
+                      (let [next-c (.charAt ^String pat-str (inc i))]
+                        (.append re-sb (java.util.regex.Pattern/quote (str next-c)))
+                        (recur (+ i 2)))
+                      (recur (inc i)))
+                    (case c
+                      \% (do (.append re-sb ".*") (recur (inc i)))
+                      \_ (do (.append re-sb ".") (recur (inc i)))
+                      (do (.append re-sb (java.util.regex.Pattern/quote (str c)))
+                          (recur (inc i))))))))
+          _ (.append re-sb "$")
+          re-str (str re-sb)
+          re-str (if case-insensitive? (str "(?i)" re-str) re-str)
+          re-obj (re-pattern re-str)
+          base (list 'boolean (list 're-find re-obj col))]
+      (if not-like? (list 'not base) base))
+
+    ;; col [NOT] BETWEEN lo AND hi inside CASE WHEN.
+    (instance? Between expr)
+    (let [^Between e expr
+          not-between? (.isNot e)
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)
+          lo  (translate-expr ctx (.getBetweenExpressionStart e))
+          hi  (translate-expr ctx (.getBetweenExpressionEnd e))
+          base (list 'and (list '<= lo col) (list '<= col hi))]
+      (if not-between? (list 'not base) base))
+
+    ;; col IS [NOT] {TRUE|FALSE|UNKNOWN} inside CASE WHEN.
+    (instance? IsBooleanExpression expr)
+    (let [^IsBooleanExpression e expr
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)
+          ;; JSqlParser exposes both isTrue/isNot — combine.
+          true? (.isTrue e)
+          not? (.isNot e)
+          target true?  ;; whether comparing to TRUE
+          base (list '= col target)]
+      (if not? (list 'not base) base))
+
+    ;; col ~ 'pat' / col !~ 'pat' inside CASE WHEN. Same pre-compile
+    ;; trick as the WHERE form.
+    (instance? RegExpMatchOperator expr)
+    (let [^RegExpMatchOperator e expr
+          op-type (str (.getOperatorType e))
+          negate? (or (= op-type "NOT_MATCH_CASESENSITIVE")
+                      (= op-type "NOT_MATCH_CASEINSENSITIVE"))
+          ci? (or (= op-type "MATCH_CASEINSENSITIVE")
+                  (= op-type "NOT_MATCH_CASEINSENSITIVE"))
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)
+          pattern (translate-expr ctx (.getRightExpression e))
+          re-str (let [s (str pattern)] (if ci? (str "(?i)" s) s))
+          re-obj (re-pattern re-str)
+          base (list 'boolean (list 're-find re-obj col))]
+      (if negate? (list 'not base) base))
+
+    ;; A bare value/column expression used as a boolean: must be a
+    ;; non-predicate type (literal, Column, Function, etc.). Routing
+    ;; through translate-expr on a recognised predicate type would
+    ;; ping-pong, so guard explicitly.
     :else
-    ;; Fallback: translate as a value (e.g. column ref → var)
-    (translate-expr ctx expr)))
+    (cond
+      ;; Predicate types that translate-predicate-expr should handle —
+      ;; if we reach here it's a gap, fail loudly rather than recurse.
+      (or (instance? ExistsExpression expr)
+          (instance? JsonOperator expr)
+          (instance? DoubleAnd expr))
+      (throw (ex-info (str "Predicate expression not supported in inline boolean context: "
+                           (type expr))
+                      {:expr (str expr) :sqlstate "0A000"}))
+      :else
+      (translate-expr ctx expr))))
 
 (defn parse-timestamp-string
   "Parse a timestamp string in various formats to java.util.Date.
