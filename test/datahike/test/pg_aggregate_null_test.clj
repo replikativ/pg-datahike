@@ -87,9 +87,13 @@
   (is (= "60" (cell "SELECT SUM(val) FROM t"))))
 
 (deftest test-avg-skips-nulls
-  ;; avg of [10 20 30] = 20
+  ;; avg of [10 20 30] = 20. PG promotes AVG(int*) → numeric, so the
+  ;; rendered value is `20.0000000000000000` (BigDecimal at the scale
+  ;; our filter-avg-numeric uses). Accept any representation that
+  ;; parses to 20 to stay tolerant if we tune the scale later.
   (let [r (cell "SELECT AVG(val) FROM t")]
-    (is (or (= "20.0" r) (= "20" r))
+    (is (and (string? r)
+             (= 20.0 (Double/parseDouble r)))
         (str "got: " r))))
 
 (deftest test-min-max-skip-nulls

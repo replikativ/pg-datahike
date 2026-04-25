@@ -274,6 +274,35 @@
             (swap! (:nullable-vars ctx) conj v)
             v)))))
 
+(defn- check-agg-alias-collision!
+  "Targeted PG-compat sniff: real PG raises 42703 on any unresolved
+   column reference. pgwire-datahike treats missing attrs as NULL by
+   design (EAV semantics — see datahike.test.pg-server-test/test-
+   semantic-errors), but that silence is harmful when the column name
+   matches a SELECT-list aggregation alias: the user almost certainly
+   meant HAVING (or a nested sub-query) and would otherwise see a
+   silent zero-rows result.
+
+   Triggered only for that exact pattern. Genuinely-missing columns
+   continue to bind to the :__null__ sentinel."
+  [ctx attr]
+  (let [agg-set (:agg-aliases-warning-set ctx)
+        col-name (cond
+                   (and (vector? attr) (= :aliased (first attr))) (name (nth attr 2))
+                   (keyword? attr) (name attr)
+                   :else nil)]
+    (when (and col-name agg-set
+               (contains? agg-set (str/lower-case col-name))
+               (not (get (:schema ctx) (if (vector? attr) (nth attr 2) attr))))
+      (throw (ex-info (str "column \"" col-name "\" does not exist")
+                      {:sqlstate "42703"
+                       :error    :sql/undefined-column
+                       :column   col-name
+                       :hint     (str "\"" col-name "\" is a SELECT-list "
+                                      "aggregation alias and cannot be "
+                                      "referenced in WHERE; use HAVING or "
+                                      "wrap the query in a subquery")})))))
+
 (defn col-var!
   "Get or create the logic variable for an attribute.
 
@@ -316,20 +345,22 @@
           cvars (:col->var ctx)
           ref-target (get (:ref-targets ctx) kw)]
       (or (get @cvars cache-key)
-          (let [v (symbol (str "?" alias-key "_" (name kw)))
-                evar (entity-var! ctx alias-key)
-                lj? (contains? @(:left-join-evars ctx) evar)]
-            (if lj?
-              (add-clause! ctx [evar kw v])
-              (add-clause! ctx [(list 'get-else '$ evar kw :__null__) v]))
-            (swap! (:nullable-vars ctx) conj v)
-            (if ref-target
-              (let [pk-v (symbol (str "?" alias-key "_" (name kw) "_pk"))]
-                (emit-ref-deref! ctx v pk-v ref-target)
-                (swap! (:nullable-vars ctx) conj pk-v)
-                (swap! cvars assoc cache-key pk-v)
-                pk-v)
-              (do (swap! cvars assoc cache-key v) v)))))
+          (do
+            (check-agg-alias-collision! ctx attr)
+            (let [v (symbol (str "?" alias-key "_" (name kw)))
+                  evar (entity-var! ctx alias-key)
+                  lj? (contains? @(:left-join-evars ctx) evar)]
+              (if lj?
+                (add-clause! ctx [evar kw v])
+                (add-clause! ctx [(list 'get-else '$ evar kw :__null__) v]))
+              (swap! (:nullable-vars ctx) conj v)
+              (if ref-target
+                (let [pk-v (symbol (str "?" alias-key "_" (name kw) "_pk"))]
+                  (emit-ref-deref! ctx v pk-v ref-target)
+                  (swap! (:nullable-vars ctx) conj pk-v)
+                  (swap! cvars assoc cache-key pk-v)
+                  pk-v)
+                (do (swap! cvars assoc cache-key v) v))))))
 
     ;; Regular keyword :ns/col
     :else
@@ -343,20 +374,22 @@
           cvars (:col->var ctx)
           ref-target (get (:ref-targets ctx) resolved-attr)]
       (or (get @cvars cache-key)
-          (let [v (symbol (str "?" alias-key "_" (name resolved-attr)))
-                evar (entity-var! ctx alias-key)
-                lj? (contains? @(:left-join-evars ctx) evar)]
-            (if lj?
-              (add-clause! ctx [evar resolved-attr v])
-              (add-clause! ctx [(list 'get-else '$ evar resolved-attr :__null__) v]))
-            (swap! (:nullable-vars ctx) conj v)
-            (if ref-target
-              (let [pk-v (symbol (str "?" alias-key "_" (name resolved-attr) "_pk"))]
-                (emit-ref-deref! ctx v pk-v ref-target)
-                (swap! (:nullable-vars ctx) conj pk-v)
-                (swap! cvars assoc cache-key pk-v)
-                pk-v)
-              (do (swap! cvars assoc cache-key v) v)))))))
+          (do
+            (check-agg-alias-collision! ctx resolved-attr)
+            (let [v (symbol (str "?" alias-key "_" (name resolved-attr)))
+                  evar (entity-var! ctx alias-key)
+                  lj? (contains? @(:left-join-evars ctx) evar)]
+              (if lj?
+                (add-clause! ctx [evar resolved-attr v])
+                (add-clause! ctx [(list 'get-else '$ evar resolved-attr :__null__) v]))
+              (swap! (:nullable-vars ctx) conj v)
+              (if ref-target
+                (let [pk-v (symbol (str "?" alias-key "_" (name resolved-attr) "_pk"))]
+                  (emit-ref-deref! ctx v pk-v ref-target)
+                  (swap! (:nullable-vars ctx) conj pk-v)
+                  (swap! cvars assoc cache-key pk-v)
+                  pk-v)
+                (do (swap! cvars assoc cache-key v) v))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Expression helpers

@@ -8,10 +8,13 @@ MB=http://localhost:3000
 PROBE_LOG=/tmp/mbql-probes.log
 : > "$PROBE_LOG"
 
-# ---- session: try login first (admin may already exist) ----
-SESSION=$(curl -fsS -X POST -H "Content-Type: application/json" \
-  --data '{"username":"probe@datahike.local","password":"datahike-test-1!"}' \
-  "$MB/api/session" 2>/dev/null | jq -r '.id // empty')
+# ---- session: try common admin emails first; fall back to setup ----
+for em in "probe@datahike.local" "test@datahike.local"; do
+  SESSION=$(curl -fsS -X POST -H "Content-Type: application/json" \
+    --data "$(jq -n --arg e "$em" '{username:$e, password:"datahike-test-1!"}')" \
+    "$MB/api/session" 2>/dev/null | jq -r '.id // empty')
+  [[ -n "$SESSION" ]] && break
+done
 if [[ -z "$SESSION" ]]; then
   TOK=$(curl -fsS "$MB/api/session/properties" | jq -r '."setup-token"')
   SESSION=$(curl -fsS -X POST -H "Content-Type: application/json" \
@@ -110,9 +113,15 @@ probe "04-distinct-where-emails-age-gt-25" "$(jq -n --argjson t "$cust_table_id"
 probe "05-multi-breakout-status-customer" "$(jq -n --argjson t "$ord_table_id" --argjson s "$ord_status" --argjson c "$ord_cust" \
   '{"source-table":$t,"aggregation":[["count"]],"breakout":[["field",$s,null],["field",$c,null]]}')"
 
-# 6. HAVING — count by status, having count > 1
+# 6. HAVING — count by status, having count > 1.
+# MBQL idiom: nested :source-query (top-level :filter [:aggregation N] is
+# a known Metabase compilation quirk that emits invalid PG SQL —
+# `WHERE <agg-alias> > N`. pgwire-datahike now raises 42703 with a
+# helpful hint for that form; the probe uses the canonical idiom that
+# Metabase's QP correctly compiles to a valid sub-query + outer WHERE.
 probe "06-having-count-gt-1" "$(jq -n --argjson t "$ord_table_id" --argjson s "$ord_status" \
-  '{"source-table":$t,"aggregation":[["count"]],"breakout":[["field",$s,null]],"filter":[">",["aggregation",0],1]}')"
+  '{"source-query":{"source-table":$t,"aggregation":[["count"]],"breakout":[["field",$s,null]]},
+    "filter":[">",["field","count",{"base-type":"type/Integer"}],1]}')"
 
 # 7. CASE expression — sum(total_cents) where status='paid' else 0
 probe "07-case-sum-paid" "$(jq -n --argjson t "$ord_table_id" --argjson s "$ord_status" --argjson tc "$ord_total" \

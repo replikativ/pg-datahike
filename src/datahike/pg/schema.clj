@@ -121,6 +121,45 @@
                          hint))]
     (transact-fn conn [entity])))
 
+(defn ref-attrs-from-schema
+  "Return the seq of `:db.type/ref :db.cardinality/one` attribute idents
+   in `schema`. Excludes internal namespaces."
+  [schema]
+  (keep (fn [[k v]]
+          (when (and (keyword? k)
+                     (namespace k)
+                     (not (contains? internal-ns-prefixes (namespace k)))
+                     (= :db.type/ref (:db/valueType v))
+                     (= :db.cardinality/one (:db/cardinality v)))
+            k))
+        schema))
+
+(def ^:private ref-target-warned
+  "Per-process atom of `[warning-kind ref-attr]` keys we've already
+   logged so the same warning doesn't spam every translate. Cleared
+   only on JVM restart — schemas are usually stable within a session."
+  (atom #{}))
+
+(defn- warn-once!
+  "Print a one-shot warning to *err*, keyed so repeated calls with the
+   same key are no-ops. Plain println — pgwire-datahike doesn't
+   currently depend on a logging library, and stdout is reserved for
+   the seed harness's query trace."
+  [k msg]
+  (when-not (contains? @ref-target-warned k)
+    (swap! ref-target-warned conj k)
+    (binding [*out* *err*]
+      (println (str "[pgwire-datahike] WARN: " msg)))))
+
+(def ^:private ref-targets-cache
+  "Memoization for `derive-ref-targets`. Outer key is the schema map
+   itself (WeakHashMap — releases when the conn's schema is GC'd);
+   inner value is a HashMap of `hints → result` so a single schema
+   shared by multiple conn-with-different-hints scenarios doesn't
+   thrash. Schemas are value-typed and typically stable across queries,
+   so the cache hit rate is near-100%."
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
 (defn derive-ref-targets
   "For each `:db.type/ref` attribute, determine the *target PK attribute*
    that SQL projection should dereference to. `SELECT order.customer FROM
@@ -141,32 +180,143 @@
       This matches the seed style most projects use, where ref attrs
       are named after the table they point to.
 
-   Only `:db.cardinality/one` refs are derefed — many-cardinality refs
-   would yield multiple PK rows per source row, which has no clean SQL
-   projection equivalent."
+   Only `:db.cardinality/one` refs are derefed. `:db.cardinality/many`
+   refs are deliberately omitted: the natural PG-side projection is
+   `int8[]` (an array of target PKs), but emitting that requires
+   caller-aware logic (only valid in SELECT-list position, with a
+   GROUP BY by the source entity, and an `array_agg` aggregate over
+   each target's PK). The current behavior — Datalog's natural
+   multi-row expansion — is at least well-defined; users that need
+   PG-array projection should pre-aggregate with an explicit
+   `(SELECT array_agg(t.pk) FROM …)` subquery until cardinality/many
+   ref-deref lands.
+
+   Pure schema-side derivation; for runtime data validation against the
+   actual entities a ref points to (polymorphism detection,
+   namespace-mismatch detection), see `validate-ref-targets!`.
+
+   Memoized — schema is value-typed and typically stable per conn, so
+   recomputing per query is wasted work."
   [schema hints]
-  (let [;; Build {namespace → unique-identity-attr} index once.
-        ns->unique-id (reduce-kv
-                       (fn [m k v]
-                         (if (and (keyword? k)
-                                  (= :db.unique/identity (:db/unique v))
-                                  (namespace k))
-                           (assoc m (namespace k) k)
-                           m))
-                       {}
-                       schema)]
+  (let [hint-key (or hints {})
+        ;; Two-level cache: outer is WeakHashMap by schema (releases
+        ;; with conn); inner is HashMap by hints. Prevents the
+        ;; cache-key vector from being GC'd-before-use that would
+        ;; happen with a single-level WeakHashMap[[schema hints]].
+        inner (or (.get ^java.util.Map ref-targets-cache schema)
+                  (let [m (java.util.Collections/synchronizedMap
+                           (java.util.HashMap.))]
+                    (.put ^java.util.Map ref-targets-cache schema m)
+                    m))]
+    (or (.get ^java.util.Map inner hint-key)
+        (let [ns->unique-id (reduce-kv
+                             (fn [m k v]
+                               (if (and (keyword? k)
+                                        (= :db.unique/identity (:db/unique v))
+                                        (namespace k))
+                                 (assoc m (namespace k) k)
+                                 m))
+                             {}
+                             schema)
+              result (reduce-kv
+                      (fn [m attr-ident props]
+                        (if (and (keyword? attr-ident)
+                                 (= :db.type/ref (:db/valueType props))
+                                 (= :db.cardinality/one (:db/cardinality props)))
+                          (let [hint (get hints attr-ident)
+                                target (or (:references hint)
+                                           (get ns->unique-id (name attr-ident)))]
+                            (if target (assoc m attr-ident target) m))
+                          m))
+                      {}
+                      schema)]
+          (.put ^java.util.Map inner hint-key result)
+          result))))
+
+(defn- ref-target-namespaces
+  "Query the live db for the distinct namespaces of entities a given
+   ref attr points to. An entity's namespace is taken from any one of
+   its attrs (`:db/*` and `:datahike.pg/*` excluded — those don't
+   characterise the entity).
+
+   Returns a set of strings (the namespace names). Empty set when no
+   entity uses the attr yet."
+  [db ref-attr]
+  (let [q-fn (requiring-resolve 'datahike.api/q)]
+    (->> (q-fn '{:find  [?attr]
+                 :in    [$ ?ref]
+                 :where [[_ ?ref ?target]
+                         [?target ?attr _]]}
+               db ref-attr)
+         (keep (fn [[attr]]
+                 (when (keyword? attr)
+                   (let [ns (namespace attr)]
+                     (when (and ns
+                                (not (contains? internal-ns-prefixes ns)))
+                       ns)))))
+         set)))
+
+(defn validate-ref-targets!
+  "Cross-check `ref-targets` (from `derive-ref-targets`) against the
+   actual data in `db`. Drops:
+   - polymorphic refs — entities span multiple namespaces; convention
+     can't pick a single target safely. User must add an explicit
+     `:datahike.pg/references` hint per polymorphic ref.
+   - namespace-mismatched refs — convention picked target X but the
+     data points to namespace Y. Often means the user intended `:X` but
+     named the ref attr after a different concept (`:order/buyer` ref
+     to `customer`). Hint should override.
+
+   Each drop emits a one-shot stderr warning. Returns the validated
+   subset of `ref-targets`. Refs with no current data (empty set)
+   pass through unchanged — the convention is the best guess until
+   data appears.
+
+   Also warns about ref attrs that have NO ref-targets entry at all
+   (no hint, no namespace match) so the user knows to set a hint
+   if they want SQL-FK projection on that column."
+  [db schema ref-targets]
+  (when (and db schema)
+    (doseq [ref-attr (ref-attrs-from-schema schema)
+            :when (not (contains? ref-targets ref-attr))]
+      (warn-once! [::no-target ref-attr]
+                  (str "ref attr " ref-attr " has no SQL FK target — "
+                       "set :datahike.pg/references hint to enable "
+                       "FK-style projection (otherwise it projects as "
+                       "the raw entity-id)."))))
+  (if-not (and db (seq ref-targets))
+    ref-targets
     (reduce-kv
-     (fn [m attr-ident props]
-       (if (and (keyword? attr-ident)
-                (= :db.type/ref (:db/valueType props))
-                (= :db.cardinality/one (:db/cardinality props)))
-         (let [hint (get hints attr-ident)
-               target (or (:references hint)
-                          (get ns->unique-id (name attr-ident)))]
-           (if target (assoc m attr-ident target) m))
-         m))
+     (fn [acc ref-attr target-pk]
+       (let [actual-ns (ref-target-namespaces db ref-attr)
+             expected-ns (namespace target-pk)]
+         (cond
+           ;; No data yet — trust the convention/hint.
+           (zero? (count actual-ns)) (assoc acc ref-attr target-pk)
+
+           (= 1 (count actual-ns))
+           (if (= (first actual-ns) expected-ns)
+             (assoc acc ref-attr target-pk)
+             (do (warn-once! [::namespace-mismatch ref-attr]
+                             (str "ref attr " ref-attr " resolves to target "
+                                  target-pk " (namespace " expected-ns ")"
+                                  " but data points to namespace "
+                                  (first actual-ns)
+                                  ". SQL projection will fall back to the "
+                                  "raw entity-id; set :datahike.pg/references "
+                                  "to override."))
+                 acc))
+
+           :else
+           (do (warn-once! [::polymorphic-ref ref-attr]
+                           (str "ref attr " ref-attr " is polymorphic — "
+                                "entities span namespaces " (sort actual-ns)
+                                ". SQL projection falls back to the raw "
+                                "entity-id; set :datahike.pg/references to "
+                                "force a single target."))
+               acc))))
      {}
-     schema)))
+     ref-targets)))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`

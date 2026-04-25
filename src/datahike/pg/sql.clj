@@ -64,7 +64,9 @@
 ;; `datahike.pg.sql/...` names so the qualified symbols emitted by the
 ;; translator (and cached in client prepared statements) keep resolving.
 (def filter-sum            fns/filter-sum)
+(def filter-sum-numeric    fns/filter-sum-numeric)
 (def filter-avg            fns/filter-avg)
+(def filter-avg-numeric    fns/filter-avg-numeric)
 (def filter-min            fns/filter-min)
 (def filter-max            fns/filter-max)
 (def filter-count          fns/filter-count)

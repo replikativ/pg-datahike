@@ -444,6 +444,36 @@
   [vtype]
   (get dh-type->oid vtype oid-text))
 
+(def ^:private oid->dh-type-map
+  "Inverse of dh-type->oid for the OIDs that materialize-set-op!'s
+   schema inference cares about. Several Datahike types collapse to
+   the same OID (string/keyword/symbol/bytes/number/tuple → text or
+   float8), so this is biased toward the most useful inverse
+   (text → :db.type/string, float8 → :db.type/double, int8 → long)."
+  {oid-bool        :db.type/boolean
+   oid-int2        :db.type/long
+   oid-int4        :db.type/long
+   oid-int8        :db.type/long
+   oid-float4      :db.type/double
+   oid-float8      :db.type/double
+   oid-numeric     :db.type/bigdec
+   oid-text        :db.type/string
+   oid-varchar     :db.type/string
+   oid-bpchar      :db.type/string
+   oid-name        :db.type/string
+   oid-date        :db.type/instant
+   oid-time        :db.type/instant
+   oid-timestamp   :db.type/instant
+   oid-timestamptz :db.type/instant
+   oid-uuid        :db.type/uuid
+   oid-bytea       :db.type/bytes})
+
+(defn dh-type-for-oid
+  "Inverse lookup: PG OID → Datahike valueType. Returns nil for
+   unknown OIDs (caller decides fallback)."
+  [oid]
+  (when oid (get oid->dh-type-map (long oid))))
+
 (defn pg-name-for-dh-type
   "Return the PostgreSQL type name string for a Datahike valueType keyword."
   [vtype]

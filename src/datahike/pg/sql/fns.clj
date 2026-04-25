@@ -45,16 +45,70 @@
 ;; `'datahike.pg.sql/filter-*` symbols in the map resolve once re-exported.
 
 (defn filter-sum
-  "SUM that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
+  "SUM that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
+   Uses Clojure's auto-promoting `+` so int8 inputs that overflow
+   silently become BigInt — `filter-sum-numeric` is the variant the
+   translator picks for SUM(int8) / SUM(numeric) where the result OID
+   is NUMERIC; this one stays for SUM(int4) / SUM(float*)."
   [coll]
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (reduce + 0 vs))))
 
+(defn filter-sum-numeric
+  "SUM with explicit BigDecimal accumulation. PG returns NUMERIC for
+   SUM(int8) and SUM(numeric) to avoid overflow; this variant matches
+   that. Coerces inputs to BigDecimal once at the boundary so
+   `+` stays primitive across the reduce. Skips nil and `:__null__`
+   sentinels."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs)
+      :__null__
+      (reduce (fn [^java.math.BigDecimal acc v]
+                (.add acc (cond
+                            (instance? java.math.BigDecimal v) v
+                            (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                            (integer? v) (java.math.BigDecimal/valueOf (long v))
+                            (float? v)   (java.math.BigDecimal/valueOf (double v))
+                            :else        (java.math.BigDecimal. (str v)))))
+              java.math.BigDecimal/ZERO
+              vs))))
+
 (defn filter-avg
-  "AVG that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
+  "AVG that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
+   Returns Double — used for AVG(float4) / AVG(float8). For AVG(int*)
+   / AVG(numeric) the translator picks `filter-avg-numeric` which
+   preserves precision via BigDecimal."
   [coll]
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (/ (double (reduce + 0 vs)) (count vs)))))
+
+(defn filter-avg-numeric
+  "AVG with BigDecimal precision. Matches PG's AVG(int*) → numeric and
+   AVG(numeric) → numeric, where the runtime divides a BigDecimal sum
+   by the count. Scale 16 with HALF_UP — PG defaults to scale of the
+   input plus a small buffer; 16 is enough for the typical money /
+   integer-aggregate use case without runaway expansion. Callers that
+   need different precision can wrap the column in a CAST. Skips nil
+   and `:__null__` sentinels."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs)
+      :__null__
+      (let [sum (reduce (fn [^java.math.BigDecimal acc v]
+                          (.add acc (cond
+                                      (instance? java.math.BigDecimal v) v
+                                      (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                      (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                      (float? v)   (java.math.BigDecimal/valueOf (double v))
+                                      :else        (java.math.BigDecimal. (str v)))))
+                        java.math.BigDecimal/ZERO
+                        vs)
+            n   (java.math.BigDecimal/valueOf (long (count vs)))]
+        (.divide ^java.math.BigDecimal sum
+                 ^java.math.BigDecimal n
+                 16
+                 java.math.RoundingMode/HALF_UP)))))
 
 (defn filter-min
   "MIN that ignores :__null__ sentinel values. Returns :__null__ if all filtered."

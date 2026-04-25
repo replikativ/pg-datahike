@@ -165,21 +165,47 @@
    "array_fill"    :arg-type})
 
 (def sql-aggregate->return-oid
-  "Aggregate function → return OID. SUM/MIN/MAX propagate the argument
-   type; COUNT is always INT8.
+  "Aggregate function → return-OID rule. Three rule shapes:
 
-   AVG is always FLOAT8 because `filter-avg` divides by `(count vs)` and
-   wraps the sum in `double` — the runtime result is always a Double
-   even for integer inputs. PG's own `AVG(int)` returns NUMERIC; mapping
-   to FLOAT8 here keeps us aligned with the actual runtime type so
-   clients (Metabase, pgjdbc) don't truncate the fractional part on the
-   way back. Integer inputs were previously inferred as INT8 via
-   `:arg-type`, which made Metabase render `AVG(total_cents) = 4049.75`
-   as `4049`."
+   - integer (an OID): always returns this OID, regardless of input.
+     Used for COUNT (always INT8) and the variance/correlation family
+     (always FLOAT8).
+
+   - `:arg-type`: returns the OID of the first argument. Used for
+     MIN/MAX where the result-type tracks the input.
+
+   - map `{<input-oid> <output-oid> … :default <fallback>}`:
+     resolved by looking up the first argument's OID. Used for SUM/AVG
+     to match PG's `pg_proc.dat` per-input-type return rules:
+
+       AVG(int2|int4|int8|numeric) → numeric   (PG)
+       AVG(float4|float8)          → float8
+       SUM(int2|int4)              → int8
+       SUM(int8|numeric)           → numeric  (overflow-safe)
+       SUM(float4)                 → float4
+       SUM(float8)                 → float8
+
+     PG promotes integer SUMs to int8/numeric to prevent overflow,
+     and AVG(int) to numeric to preserve fractional precision. Without
+     these per-input rules, AVG(total_cents) renders as a truncated
+     INT8 in Metabase even though the runtime returns a Double, and
+     SUM(int8) silently overflows when the sum exceeds Long/MAX_VALUE."
   {"count"          types/oid-int8
    "count_distinct" types/oid-int8
-   "sum"            :arg-type
-   "avg"            types/oid-float8
+   "sum"            {types/oid-int2    types/oid-int8
+                     types/oid-int4    types/oid-int8
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float4
+                     types/oid-float8  types/oid-float8
+                     :default          :arg-type}
+   "avg"            {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
    "min"            :arg-type
    "max"            :arg-type
    "stddev"         types/oid-float8
@@ -293,6 +319,16 @@
                            ;; defensive: fall back if we see it.
                            (nil? first-arg) types/oid-int8
                            :else (expr-oid first-arg env))
+      ;; Per-input-type map (SUM/AVG): look up by first-arg's OID,
+      ;; fall back to :default. The :default may itself be :arg-type
+      ;; (used by SUM for unknown inputs that aren't in the rule map).
+      (map? rule) (let [arg-oid (when first-arg (expr-oid first-arg env))
+                        result (or (get rule arg-oid)
+                                   (get rule :default))]
+                    (cond
+                      (integer? result) result
+                      (= result :arg-type) arg-oid
+                      :else nil))
       :else nil)))
 
 (defn- cast-oid
@@ -459,11 +495,18 @@
                            (when (seq obs)
                              (.getExpression
                               ^net.sf.jsqlparser.statement.select.OrderByElement
-                              (first obs)))))]
+                              (first obs)))))
+            arg-oid (when arg-expr (expr-oid arg-expr env))]
         (cond
-          (integer? rule)        rule
-          (= rule :arg-type)     (when arg-expr (expr-oid arg-expr env))
-          :else                  nil))
+          (integer? rule)    rule
+          (= rule :arg-type) arg-oid
+          (map? rule)        (let [r (or (get rule arg-oid)
+                                         (get rule :default))]
+                               (cond
+                                 (integer? r) r
+                                 (= r :arg-type) arg-oid
+                                 :else nil))
+          :else              nil))
 
       ;; --- EXTRACT() --- always returns float8 in PG --------------------
       (instance? ExtractExpression expr) types/oid-float8

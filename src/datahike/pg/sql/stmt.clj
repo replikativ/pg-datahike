@@ -621,6 +621,12 @@
           {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
         sub-parsed (first (:branches branch-parsed))
         sub-aliases (:find-aliases sub-parsed)
+        ;; Per-column expected OID from the inner translate-select's
+        ;; oid-infer pass. Used as a default when the materialised
+        ;; rows are empty or numerically-mixed (samples alone can't
+        ;; pick a type then). Aligns the speculative-db's
+        ;; :db/valueType with what describeResult will tell clients.
+        sub-oids (:select-item-oids sub-parsed)
         q-fn (requiring-resolve 'datahike.api/q)
         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
                      (let [q (cond-> query
@@ -680,36 +686,83 @@
                                     v  (nth vs col-idx nil)]
                                 (when (and (some? v) (not= :__null__ v)) v)))
                             sub-results))
+        ;; PG-style numeric LUB for mixed integer/float/numeric
+        ;; samples. Mirrors a small slice of select_common_type_from_oids
+        ;; in PG's parser/parse_coerce.c — wider/more-precise wins.
+        numeric-lub (fn [vs]
+                      (let [has-bigdec? (some #(instance? java.math.BigDecimal %) vs)
+                            has-float?  (some #(or (instance? Double %)
+                                                   (instance? Float %)) vs)
+                            has-bigint? (some #(and (instance? java.math.BigInteger %)
+                                                    (not (fits-long? %)))
+                                              vs)]
+                        (cond
+                          has-bigdec? :db.type/bigdec
+                          has-bigint? :db.type/bigdec  ; promote to numeric to keep precision
+                          has-float?  :db.type/double
+                          :else       :db.type/long)))
         col-vtype (fn [col-idx]
-                    (let [samples (sample-rows col-idx)]
+                    (let [samples (sample-rows col-idx)
+                          ;; OID-hint default — used when samples are
+                          ;; empty, or to disambiguate between equally
+                          ;; plausible types (a single Long sample for
+                          ;; a column declared NUMERIC by oid-infer
+                          ;; should pick :db.type/bigdec, not :long).
+                          hint-vtype (some-> (nth sub-oids col-idx nil)
+                                             types/dh-type-for-oid)]
                       (cond
+                        ;; No samples — trust the OID hint, else string.
+                        (empty? samples)
+                        (or hint-vtype :db.type/string)
+
                         ;; Order matters: Boolean must come before
                         ;; integer? (false/true don't satisfy
                         ;; integer? but Booleans aren't numbers).
                         (every? boolean? samples)               :db.type/boolean
                         (every? #(instance? java.util.Date %)   samples) :db.type/instant
                         (every? #(instance? java.util.UUID %)   samples) :db.type/uuid
-                        (every? #(instance? java.math.BigDecimal %) samples) :db.type/bigdec
-                        (and (every? integer? samples)
-                             (every? #(or (instance? Long %)
-                                          (instance? Integer %)
-                                          (instance? Short %)
-                                          (instance? Byte %)
-                                          (and (instance? java.math.BigInteger %)
-                                               (fits-long? %)))
-                                     samples))
-                        :db.type/long
-                        (every? #(instance? java.math.BigInteger %) samples) :db.type/bigint
-                        (every? float? samples)                 :db.type/double
-                        :else :db.type/string)))
+
+                        ;; Numeric LUB — covers homogeneous bigdec /
+                        ;; long / double, AND mixed numeric (e.g. a
+                        ;; column with both Long 100 and Double 99.5
+                        ;; that previously fell through to :string).
+                        ;; The hint nudges toward bigdec when the
+                        ;; declared column was numeric but samples are
+                        ;; all Long.
+                        (every? number? samples)
+                        (let [lub (numeric-lub samples)]
+                          (cond
+                            (and (= lub :db.type/long)
+                                 (= hint-vtype :db.type/bigdec)) :db.type/bigdec
+                            (and (= lub :db.type/long)
+                                 (= hint-vtype :db.type/double)) :db.type/double
+                            :else lub))
+
+                        :else (or hint-vtype :db.type/string))))
         ;; Coercion to the runtime class Datahike's schema spec
         ;; demands. Without this, Integer values (e.g. COUNT result)
         ;; pass type inference but are rejected by `db-with` because
         ;; the spec is `(= (class %) java.lang.Long)`.
+        ;; Coerce a sample value to the runtime class Datahike's
+        ;; schema spec demands for the inferred vtype. Numeric LUB
+        ;; can promote samples (e.g. Long → BigDecimal when another
+        ;; row's value was BigDecimal); the coercer makes that
+        ;; promotion concrete at the data-tx step.
         col-coerce (fn [vtype]
                      (case vtype
-                       :db.type/long    long
-                       :db.type/double  double
+                       :db.type/long    (fn [v]
+                                          (cond
+                                            (instance? Long v) v
+                                            (instance? java.math.BigInteger v) (.longValueExact ^java.math.BigInteger v)
+                                            :else (long v)))
+                       :db.type/double  (fn [v] (if (instance? Double v) v (double v)))
+                       :db.type/bigdec  (fn [v]
+                                          (cond
+                                            (instance? java.math.BigDecimal v) v
+                                            (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                            (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                            (float? v)   (java.math.BigDecimal/valueOf (double v))
+                                            :else        (java.math.BigDecimal. (str v))))
                        :db.type/string  str
                        identity))
         ;; Always emit a row-existence marker so `t.*` expansion in
@@ -828,7 +881,9 @@
                            :parse-sql params/*parse-sql*
                            :hints hints
                            :derived-aliases derived-alias-set
-                           :ref-targets (pgs/derive-ref-targets schema hints)})
+                           :ref-targets (pgs/validate-ref-targets!
+                                         db schema
+                                         (pgs/derive-ref-targets schema hints))})
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
@@ -845,13 +900,36 @@
         _ (doseq [{:keys [alias]} join-infos]
             (when alias (ctx/entity-var! ctx alias)))
 
+        ;; Extract SELECT items NOW (before WHERE) so we can pre-scan
+        ;; aggregation aliases — needed for the WHERE-references-an-
+        ;; aggregation-alias detector. Real PG raises 42703 for any
+        ;; unresolved column in WHERE, but pgwire-datahike treats
+        ;; missing attrs as NULL by design (EAV semantics, see
+        ;; datahike.test.pg-server-test/test-semantic-errors). The
+        ;; targeted exception: when the unresolved column NAME matches
+        ;; a SELECT-list aggregation alias, the user almost certainly
+        ;; meant HAVING — emit a helpful 42703 with a hint instead of
+        ;; silently filtering all rows.
+        select-items (.getSelectItems select)
+        agg-aliases-warning-set
+        (into #{}
+              (keep (fn [^SelectItem item]
+                      (when-let [a (.getAlias item)]
+                        (let [expr (.getExpression item)]
+                          (when (or (and (instance? Function expr)
+                                         (fns/aggregate-function?
+                                          (str/lower-case (.getName ^Function expr))))
+                                    (instance? net.sf.jsqlparser.expression.AnalyticExpression expr))
+                            (str/lower-case
+                             (unquote-ident (.getName ^Alias a))))))))
+              select-items)
+        ctx (assoc ctx :agg-aliases-warning-set agg-aliases-warning-set)
+
         where-expr (.getWhere select)
         _ (when where-expr
             (let [preds (expr/translate-predicate ctx where-expr)]
               (swap! (:where-clauses ctx) into preds)))
 
-        ;; SELECT items
-        select-items (.getSelectItems select)
         has-distinct? (some? (.getDistinct select))
 
         ;; GROUP BY
@@ -870,6 +948,38 @@
         has-aggregates? (atom false)
         compound-exprs (atom [])  ;; [{:alias str :op sym :l-idx int :r-idx int}]
         window-specs (atom [])    ;; [{:op kw :partition-by [idx] :order-by [[idx dir]] :frame {...}}]
+
+        ;; Lightweight oid-env — built before aggregate dispatch so the
+        ;; SUM/AVG branches can pick the numeric-precision runtime
+        ;; variant (filter-sum-numeric / filter-avg-numeric) when the
+        ;; input column's OID is INT8 / NUMERIC. Mirrors the fuller
+        ;; oid-env constructed below for select-item OID inference;
+        ;; both pull from the same fields.
+        agg-oid-env {:db db :schema schema
+                     :table-aliases table-aliases
+                     :default-table default-table
+                     :hints (pgs/schema-hints db)}
+        ;; Map first-arg OID + agg name → runtime fn variant override.
+        ;; Mirrors PG's per-input-type aggregate dispatch (see
+        ;; `sql-aggregate->return-oid` in oid-infer): SUM(int8) and
+        ;; SUM(numeric) need BigDecimal-precision runtime to avoid
+        ;; overflow + match the NUMERIC return OID. AVG(int*) /
+        ;; AVG(numeric) need BigDecimal so `cents → dollars` doesn't
+        ;; lose precision via `(double sum)`. Returns nil when the
+        ;; default (non-numeric) variant is the right one — caller
+        ;; falls back to fns/sql-aggregate->datalog as before.
+        pick-precision-variant
+        (fn [agg-name input-oid]
+          (case agg-name
+            "sum" (when (or (= input-oid types/oid-int8)
+                            (= input-oid types/oid-numeric))
+                    'datahike.pg.sql/filter-sum-numeric)
+            "avg" (when (or (= input-oid types/oid-int2)
+                            (= input-oid types/oid-int4)
+                            (= input-oid types/oid-int8)
+                            (= input-oid types/oid-numeric))
+                    'datahike.pg.sql/filter-avg-numeric)
+            nil))
 
         _ (doseq [^SelectItem item select-items]
             (let [expr (.getExpression item)
@@ -1087,9 +1197,18 @@
                                                   (if cnt? 1 (expr/interpret-form iv bindings))
                                                   (if cnt? 0 :__null__)))))
                               fn-param (symbol (str "?filter-fn" (swap! (:var-counter ctx) inc)))
+                          ;; Per-input-type variant — same numeric-promotion
+                          ;; rule as the non-FILTER aggregate path.
+                              filter-precision-variant
+                              (when inner-expr
+                                (pick-precision-variant
+                                 fname
+                                 (oid/expr-oid inner-expr agg-oid-env)))
                           ;; Choose aggregate: COUNT→sum, others→filter-aware variant
-                              filter-agg (if is-count?
-                                           'sum
+                              filter-agg (cond
+                                           is-count? 'sum
+                                           filter-precision-variant filter-precision-variant
+                                           :else
                                            (case fname
                                              "sum" 'datahike.pg.sql/filter-sum
                                              "avg" 'datahike.pg.sql/filter-avg
@@ -1153,11 +1272,22 @@
                               v (expr/translate-expr ctx inner-expr)
                               ;; Materialize expression args (e.g. SUM(a * b) → SUM(?v))
                               v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                              ;; Per-input-type variant for SUM/AVG. Compute
+                              ;; OID against the original AST expression
+                              ;; (post-ref-deref `v` is a logic var with no
+                              ;; OID rule). Falls back silently to default
+                              ;; agg-sym when input type doesn't match the
+                              ;; precision-sensitive set.
+                              precision-variant (when inner-expr
+                                                  (pick-precision-variant
+                                                   fname
+                                                   (oid/expr-oid inner-expr agg-oid-env)))
                               agg-sym (cond
                                         (and is-count-col? is-distinct?)
                                         'datahike.pg.sql/filter-count-distinct
                                         is-count-col?
                                         'datahike.pg.sql/filter-count
+                                        precision-variant precision-variant
                                         :else agg-sym)
                               ;; Distinct aggregates (e.g. SUM(DISTINCT x)) deduplicate
                               ;; their input collection rather than doing a set scan.
