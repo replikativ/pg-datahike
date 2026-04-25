@@ -96,6 +96,7 @@
          extract-returning
          materialize-table-function
          materialize-derived-select!
+         materialize-set-op!
          match-aggregate-index
          select-item-alias
          eval-values-literal
@@ -533,93 +534,133 @@
       ;; (SELECT … FROM real-table …) AS t — run the inner select.
       ;; Inner may also be a SetOperationList (UNION/INTERSECT/EXCEPT) —
       ;; handle that by translating each branch, executing, and combining.
-      ;; SetOperationList branches share the same column-aliases by SQL
-      ;; spec; we use the first PlainSelect's find-aliases as canonical.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
-      (let [is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
-            ;; Translate-select on each branch (or just the inner-ps).
-            branch-parsed
-            (if is-union?
-              (let [^net.sf.jsqlparser.statement.select.SetOperationList sol inner
-                    branches (.getSelects sol)
-                    ops (.getOperations sol)
-                    op-kind (when (seq ops)
-                              (let [op (first ops)]
-                                (cond
-                                  (instance? net.sf.jsqlparser.statement.select.UnionOp op)
-                                  (if (.isAll ^net.sf.jsqlparser.statement.select.UnionOp op)
-                                    :union-all :union)
-                                  (instance? net.sf.jsqlparser.statement.select.IntersectOp op)
-                                  :intersect
-                                  (instance? net.sf.jsqlparser.statement.select.ExceptOp op)
-                                  :except
-                                  :else :union)))
-                    parsed (mapv (fn [s]
-                                   (when (instance? PlainSelect s)
-                                     (translate-select ^PlainSelect s schema db)))
-                                 branches)]
-                {:op op-kind :branches parsed})
-              {:op nil :branches [(translate-select ^PlainSelect inner-ps schema db)]})
-            sub-parsed (first (:branches branch-parsed))
-            sub-aliases (:find-aliases sub-parsed)
-            q-fn (requiring-resolve 'datahike.api/q)
-            ;; Execute each branch. Apply per-branch limit/offset.
-            run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
-                         (let [q (cond-> query
-                                   (:limit p)  (assoc :limit (:limit p))
-                                   (:offset p) (assoc :offset (:offset p)))
-                               raw (if (seq in-args)
-                                     (apply q-fn q db in-args)
-                                     (q-fn q db))
-                               raw (cond->> raw
-                                     sql-offset (drop sql-offset)
-                                     sql-limit  (take sql-limit))
-                               hc (or hidden-count 0)
-                               visible (- (count (:find query)) hc)]
-                           (if (pos? hc)
-                             (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
-                             raw)))
-            branch-rows (mapv run-branch (:branches branch-parsed))
-            sub-results (case (:op branch-parsed)
-                          :union-all (mapcat identity branch-rows)
-                          :union     (distinct (mapcat identity branch-rows))
-                          :intersect (let [sets (map set branch-rows)]
-                                       (apply clojure.set/intersection sets))
-                          :except    (let [[a & bs] branch-rows]
-                                       (reduce (fn [acc r] (apply disj acc r))
-                                               (set a) bs))
-                          ;; nil → not a UNION, single branch
-                          (first branch-rows))
-            sub-results (cond->> sub-results
-                          (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
-                          (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
-            first-sub (first sub-results)
-            first-vals (if (sequential? first-sub) (vec first-sub) [first-sub])
-            schema-tx (vec (for [[i a] (map-indexed vector sub-aliases)
-                                 :let [sample (nth first-vals i nil)
-                                       vtype (cond
-                                               (instance? Long sample)    :db.type/long
-                                               (instance? Double sample)  :db.type/double
-                                               (instance? Boolean sample) :db.type/boolean
-                                               :else :db.type/string)]]
-                             {:db/ident (keyword sub-name a)
-                              :db/valueType vtype
-                              :db/cardinality :db.cardinality/one}))
-            spec-db (with-fn db schema-tx)
-            data-tx (vec (for [row sub-results]
-                           (let [vals (if (sequential? row) (vec row) [row])]
-                             (into {} (keep-indexed
-                                       (fn [i a]
-                                         (let [v (nth vals i nil)]
-                                           (when (and (some? v) (not= :__null__ v))
-                                             [(keyword sub-name a) v])))
-                                       sub-aliases)))))
-            spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
-        {:db      spec-db2
-         :schema  (:schema spec-db2)
-         :name    sub-name
-         :alias   sub-name
-         :aliases sub-aliases}))))
+      (materialize-set-op! inner sub-name db schema)
+
+      :else nil)))
+
+(defn materialize-set-op!
+  "Run a SELECT (PlainSelect or SetOperationList) and persist its rows
+   under `target-name/<col>` in a speculative db. Returns the same
+   `{:db :schema :name :alias :aliases}` map shape as
+   `materialize-derived-select!` so callers can swap them.
+
+   Used by both the derived-table path (FROM (...) AS t) and the CTE
+   path (WITH t AS (...)), since SQL set operations over heterogeneous
+   tables can't be expressed natively in Datalog — we have to flatten
+   them into a single virtual table."
+  [inner target-name db schema]
+  (let [with-fn (requiring-resolve 'datahike.api/db-with)
+        is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
+        branch-parsed
+        (if is-union?
+          (let [^net.sf.jsqlparser.statement.select.SetOperationList sol inner
+                branches (.getSelects sol)
+                ops (.getOperations sol)
+                op-kind (when (seq ops)
+                          (let [op (first ops)]
+                            (cond
+                              (instance? net.sf.jsqlparser.statement.select.UnionOp op)
+                              (if (.isAll ^net.sf.jsqlparser.statement.select.UnionOp op)
+                                :union-all :union)
+                              (instance? net.sf.jsqlparser.statement.select.IntersectOp op)
+                              :intersect
+                              (instance? net.sf.jsqlparser.statement.select.ExceptOp op)
+                              :except
+                              :else :union)))
+                parsed (mapv (fn [s]
+                               (when (instance? PlainSelect s)
+                                 (translate-select ^PlainSelect s schema db)))
+                             branches)]
+            {:op op-kind :branches parsed})
+          {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
+        sub-parsed (first (:branches branch-parsed))
+        sub-aliases (:find-aliases sub-parsed)
+        q-fn (requiring-resolve 'datahike.api/q)
+        run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
+                     (let [q (cond-> query
+                               (:limit p)  (assoc :limit (:limit p))
+                               (:offset p) (assoc :offset (:offset p)))
+                           ;; If translate-select materialized derived
+                           ;; tables (FROM (…) AS sub) or catalog refs
+                           ;; under it, the resulting query references
+                           ;; speculative attrs (`:sub/*`) only present
+                           ;; in :enriched-db. Run against that, falling
+                           ;; back to the outer db when the branch was
+                           ;; a plain table reference.
+                           exec-db (or (:enriched-db p) db)
+                           raw (if (seq in-args)
+                                 (apply q-fn q exec-db in-args)
+                                 (q-fn q exec-db))
+                           raw (cond->> raw
+                                 sql-offset (drop sql-offset)
+                                 sql-limit  (take sql-limit))
+                           hc (or hidden-count 0)
+                           visible (- (count (:find query)) hc)]
+                       (if (pos? hc)
+                         (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                         raw)))
+        branch-rows (mapv run-branch (:branches branch-parsed))
+        sub-results (case (:op branch-parsed)
+                      :union-all (mapcat identity branch-rows)
+                      :union     (distinct (mapcat identity branch-rows))
+                      :intersect (let [sets (map set branch-rows)]
+                                   (apply clojure.set/intersection sets))
+                      :except    (let [[a & bs] branch-rows]
+                                   (reduce (fn [acc r] (apply disj acc r))
+                                           (set a) bs))
+                      ;; nil → not a UNION, single branch
+                      (first branch-rows))
+        sub-results (cond->> sub-results
+                      (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
+                      (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
+        ;; Walk every row rather than just the first — UNION across
+        ;; tables of different shapes (or first-row-all-NULL cases) can
+        ;; otherwise mis-type a column as :string when later rows have
+        ;; longs.
+        col-vtype (fn [col-idx]
+                    (let [samples (keep (fn [row]
+                                          (let [vs (if (sequential? row) (vec row) [row])
+                                                v  (nth vs col-idx nil)]
+                                            (when (and (some? v) (not= :__null__ v)) v)))
+                                        sub-results)]
+                      (cond
+                        (every? #(instance? Long %)    samples) :db.type/long
+                        (every? #(instance? Double %)  samples) :db.type/double
+                        (every? #(instance? Boolean %) samples) :db.type/boolean
+                        :else :db.type/string)))
+        ;; Always emit a row-existence marker so `t.*` expansion in
+        ;; the OUTER select has an entity anchor even when every
+        ;; non-marker column is NULL on a given row (e.g. Metabase's
+        ;; `NULL as role` projection in build_privilege_map).
+        row-marker (pgs/row-marker-attr target-name)
+        schema-tx (conj
+                   (vec (for [[i a] (map-indexed vector sub-aliases)]
+                          {:db/ident (keyword target-name a)
+                           :db/valueType (col-vtype i)
+                           :db/cardinality :db.cardinality/one}))
+                   {:db/ident       row-marker
+                    :db/valueType   :db.type/boolean
+                    :db/cardinality :db.cardinality/one})
+        spec-db (with-fn db schema-tx)
+        data-tx (vec (for [row sub-results]
+                       (let [vals (if (sequential? row) (vec row) [row])
+                             cols (into {} (keep-indexed
+                                            (fn [i a]
+                                              (let [v (nth vals i nil)]
+                                                (when (and (some? v) (not= :__null__ v))
+                                                  [(keyword target-name a) v])))
+                                            sub-aliases))]
+                         ;; Always include the row marker so the
+                         ;; entity exists even if every projected
+                         ;; column was NULL.
+                         (assoc cols row-marker true))))
+        spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
+    {:db      spec-db2
+     :schema  (:schema spec-db2)
+     :name    target-name
+     :alias   target-name
+     :aliases sub-aliases}))
 
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
@@ -736,6 +777,40 @@
             (let [expr (.getExpression item)
                   alias-str (select-item-alias item)]
               (cond
+                ;; SELECT t.* — table-qualified wildcard. JSqlParser
+                ;; surfaces this as AllTableColumns (which extends
+                ;; AllColumns, so the AllTableColumns check MUST come
+                ;; first). Resolve the alias → real table name, then
+                ;; expand to that table's columns. Critical for CTE
+                ;; projections (`select t.* from cte t`) and derived
+                ;; tables — Metabase's build_privilege_map and pgjdbc's
+                ;; getSchemas idiom both rely on it.
+                (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
+                (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
+                      ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
+                      raw-name (when tbl
+                                 (str/lower-case
+                                  (or (when-let [a (.getAlias tbl)]
+                                        (.getName ^Alias a))
+                                      (.getName tbl))))
+                      ;; Resolve alias → real table via table-aliases.
+                      real (or (get table-aliases raw-name) raw-name)
+                      cols (pgs/column-info schema real db)]
+                  (doseq [col cols
+                          :when (not= "db_id" (:name col))]
+                    ;; Route through the [:aliased <alias> :real/col]
+                    ;; form so the resulting var uses the FROM alias's
+                    ;; entity-var (`?<alias>_eid`) rather than the
+                    ;; canonical table's. Without this, `select t.*
+                    ;; from t1 t` would emit anchor patterns under
+                    ;; both `?t_eid` and `?t1_eid` and the planner
+                    ;; sees them as independent — driving cartesian
+                    ;; products at best, zero rows when the duplicate
+                    ;; clause confuses constraint propagation.
+                    (let [v (ctx/col-var! ctx [:aliased raw-name (:attr col)])]
+                      (swap! find-elements conj v)
+                      (swap! find-aliases conj (:name col)))))
+
                 ;; SELECT * — expand to all user columns (exclude db_id)
                 (instance? AllColumns expr)
                 (let [cols (pgs/column-info schema default-table db)]
@@ -982,8 +1057,14 @@
                     ;; Regular non-aggregate expression
                     (let [v (cond
                               (seq? v)            (ctx/materialize-arg! ctx v)
-                              (not (symbol? v))   (let [var (ctx/fresh-var! ctx)]
-                                                    (ctx/add-clause! ctx [(list 'identity v) var])
+                              (not (symbol? v))   (let [var (ctx/fresh-var! ctx)
+                                                        ;; Datahike drops rows when a fn-binding
+                                                        ;; produces nil; use the :__null__ sentinel
+                                                        ;; for SQL NULL projections so the row
+                                                        ;; survives. The wire layer maps the
+                                                        ;; sentinel back to NULL on output.
+                                                        bind-v (if (nil? v) :__null__ v)]
+                                                    (ctx/add-clause! ctx [(list 'identity bind-v) var])
                                                     var)
                               :else               v)
                           col-alias (when (and (nil? alias-str) (instance? Column expr))
@@ -1014,6 +1095,22 @@
                      (fn [v ^SelectItem item]
                        (let [expr (.getExpression item)]
                          (cond
+                           ;; AllTableColumns must come BEFORE AllColumns
+                           ;; (it's a subclass).
+                           (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
+                           (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
+                                 ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
+                                 raw-name (when tbl
+                                            (str/lower-case
+                                             (or (when-let [a (.getAlias tbl)]
+                                                   (.getName ^Alias a))
+                                                 (.getName tbl))))
+                                 real (or (get table-aliases raw-name) raw-name)
+                                 cols (pgs/column-info schema real db)]
+                             (into v (keep (fn [col]
+                                             (when (not= "db_id" (:name col))
+                                               (:oid col)))
+                                           cols)))
                            (instance? AllColumns expr)
                            (let [cols (pgs/column-info schema default-table db)]
                              (into v (keep (fn [col]

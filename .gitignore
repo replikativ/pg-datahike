@@ -30,6 +30,9 @@ Thumbs.db
 /test/integration/node-postgres/node-postgres/
 /test/integration/node-postgres/node_modules/
 /test/integration/**/*.log
+# Metabase: JAR (downloaded by setup.sh) and its private H2 metadata DB.
+/test/integration/metabase/metabase.jar
+/test/integration/metabase/data/
 # Maven build output for the Hibernate integration app.
 /test/integration/hibernate-app/target/
 # SQLAlchemy dialect bytecode cache.

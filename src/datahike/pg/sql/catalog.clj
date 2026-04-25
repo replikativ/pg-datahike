@@ -58,6 +58,18 @@
     ;; Hibernate probe for `pg_trgm`, `uuid-ossp`, `citext`, …). We
     ;; never install any extensions, so the table is always empty.
     "pg_extension"
+    ;; The next four are always-empty virtual tables — modelling them
+    ;; as a real (empty) catalog rather than going through shape.clj's
+    ;; empty-catalog short-circuit lets LEFT JOINs against them produce
+    ;; NULL-filled rows instead of dropping the entire result set.
+    ;; Metabase's get-tables query LEFT JOINs both pg_description and
+    ;; pg_stat_user_tables; without rows for the table itself, the
+    ;; LEFT JOIN must still match — same shape pgjdbc field-metadata
+    ;; uses for pg_attrdef.
+    "pg_description"
+    "pg_stat_user_tables"
+    "pg_depend"
+    "pg_inherits"
     "information_schema_columns" "information_schema_tables"
     "information_schema_sequences"
     "information_schema_table_constraints"
@@ -240,6 +252,41 @@
      {:db/ident :pg_attrdef/adnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_attrdef/adbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attrdef") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_description"
+    ;; Always empty — we don't track COMMENT ON anything. Metabase's
+    ;; get-tables query LEFT JOINs against this; an empty real table
+    ;; produces NULL-filled left-side rows.
+    [{:db/ident :pg_description/objoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_description/classoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_description/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_description/description :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_description") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_stat_user_tables"
+    ;; Always empty — we don't track row-count statistics. Metabase
+    ;; LEFT JOINs against this for an `estimated_row_count` field.
+    [{:db/ident :pg_stat_user_tables/relid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_user_tables/schemaname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_user_tables/relname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_user_tables/n_live_tup :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_user_tables/n_dead_tup :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_stat_user_tables") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_depend"
+    ;; Always empty — no dependency tracking. Some pgjdbc / pg_dump
+    ;; queries reference it; an empty table is the right shape.
+    [{:db/ident :pg_depend/classid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_depend/objid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_depend/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_depend/refclassid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_depend/refobjid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_depend/refobjsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_depend/deptype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_depend") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_inherits"
+    ;; Always empty — we don't model table inheritance.
+    [{:db/ident :pg_inherits/inhrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_inherits/inhparent :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_inherits/inhseqno :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_inherits") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_constraint"
     ;; One row per CHECK / FK / PK / UNIQUE constraint. `condef` is
     ;; the synthesized text — `pg_get_constraintdef(oid)` lowers to
@@ -635,6 +682,18 @@
     []
     ;; pg_extension — always empty; we never install extensions.
     "pg_extension"
+    []
+    ;; Always-empty tables. Modelling them as real (empty) catalog
+    ;; tables so LEFT JOINs against them produce NULL fills rather
+    ;; than dropping the entire row set (the empty-catalog short-
+    ;; circuit doesn't differentiate INNER from LEFT).
+    "pg_description"
+    []
+    "pg_stat_user_tables"
+    []
+    "pg_depend"
+    []
+    "pg_inherits"
     []
     ;; pg_constraint — one row per UNIQUE/PK column + per CHECK + per FK.
     ;; `condef` is the rendered text that pg_get_constraintdef returns.

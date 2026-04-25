@@ -394,7 +394,13 @@
                                                   (.setLeft j true)
                                                   (.setFull j false))))
                                             has-full?))
-                ;; Handle CTEs: execute each, transact into speculative db
+                ;; Handle CTEs: execute each, transact into speculative db.
+                ;; Both PlainSelect and SetOperationList (UNION/INTERSECT/
+                ;; EXCEPT) inner shapes go through the shared
+                ;; `materialize-set-op!` helper so a CTE built from a UNION
+                ;; over heterogeneous tables (e.g. Metabase's
+                ;; build_privilege_map across pg_tables / pg_views /
+                ;; pg_matviews) materialises into one virtual relation.
                          withs (.getWithItemsList ^PlainSelect stmt)
                          [cte-db cte-schema]
                          (if (and db (seq withs))
@@ -404,50 +410,13 @@
                                     cte-select (.getSelect wi)
                                     inner (if (instance? ParenthesedSelect cte-select)
                                             (.getSelect ^ParenthesedSelect cte-select)
-                                            cte-select)]
-                                (if (instance? PlainSelect inner)
-                                  (let [cte-parsed (translate-select ^PlainSelect inner curr-schema curr-db)
-                                        cte-query (:query cte-parsed)
-                                        cte-aliases (:find-aliases cte-parsed)
-                                        cte-in-args (:in-args cte-parsed)
-                               ;; Execute CTE query
-                                        cte-results (if (seq cte-in-args)
-                                                      (apply (requiring-resolve 'datahike.api/q)
-                                                             cte-query curr-db cte-in-args)
-                                                      ((requiring-resolve 'datahike.api/q)
-                                                       cte-query curr-db))
-                               ;; Derive schema attrs for CTE table
-                               ;; Infer types from first result row
-                                        first-row (first cte-results)
-                                        first-vals (if (sequential? first-row) (vec first-row) [first-row])
-                                        cte-schema-tx (vec (for [[i alias] (map-indexed vector cte-aliases)
-                                                                 :let [sample (nth first-vals i nil)
-                                                                       vtype (cond
-                                                                               (instance? Long sample)    :db.type/long
-                                                                               (instance? Double sample)  :db.type/double
-                                                                               (instance? Boolean sample) :db.type/boolean
-                                                                               (instance? Float sample)   :db.type/float
-                                                                               :else :db.type/string)]]
-                                                             {:db/ident (keyword cte-name alias)
-                                                              :db/valueType vtype
-                                                              :db/cardinality :db.cardinality/one}))
-                               ;; Transact CTE schema + data into speculative db
-                                        with-fn (requiring-resolve 'datahike.api/db-with)
-                                        spec-db (with-fn curr-db cte-schema-tx)
-                               ;; Build data transactions from results
-                                        cte-data (vec (for [row cte-results]
-                                                        (let [vals (if (sequential? row) (vec row) [row])]
-                                                          (into {}
-                                                                (keep-indexed
-                                                                 (fn [i alias]
-                                                                   (let [v (nth vals i nil)]
-                                                                     (when (and (some? v) (not= :__null__ v))
-                                                                       [(keyword cte-name alias) v])))
-                                                                 cte-aliases)))))
-                                        spec-db2 (if (seq cte-data)
-                                                   (with-fn spec-db cte-data)
-                                                   spec-db)]
-                                    [spec-db2 (:schema spec-db2)])
+                                            cte-select)
+                                    materialised
+                                    (when (or (instance? PlainSelect inner)
+                                              (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
+                                      (stmt/materialize-set-op! inner cte-name curr-db curr-schema))]
+                                (if materialised
+                                  [(:db materialised) (:schema materialised)]
                                   [curr-db curr-schema])))
                             [db schema]
                             withs)

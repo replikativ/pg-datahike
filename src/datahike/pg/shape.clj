@@ -132,12 +132,13 @@
 (def ^:private empty-catalog-tables
   "Catalog / introspection tables we don't materialize. A SELECT that
    references any of these gets an empty-row result matching the
-   outer SELECT's projection shape. pg_index, pg_attrdef and
-   pg_constraint are deliberately NOT here — they flow through the
-   real catalog path since we synthesize rows for them."
-  #{"pg_depend" "pg_description"
-    "pg_inherits" "pg_rewrite" "pg_trigger"
-    "pg_stat_user_tables" "pg_stat_activity"
+   outer SELECT's projection shape. pg_index, pg_attrdef,
+   pg_constraint, pg_description, pg_stat_user_tables, pg_depend,
+   pg_inherits are deliberately NOT here — they flow through the
+   real catalog path since we synthesize rows (or empty-but-real
+   tables for the LEFT-JOIN-able ones) for them."
+  #{"pg_rewrite" "pg_trigger"
+    "pg_stat_activity"
     "pg_locks" "pg_settings"})
 
 (def ^:private empty-catalog-fns
