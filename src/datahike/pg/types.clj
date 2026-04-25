@@ -2,6 +2,8 @@
   "PostgreSQL type system registry for the PgWire compatibility layer.
 
    Centralizes all type mappings between PostgreSQL OIDs, SQL type names,
+
+   Centralizes all type mappings between PostgreSQL OIDs, SQL type names,
    Datahike value types, and wire protocol format codes.
 
    Authoritative source: PostgreSQL 19devel src/include/catalog/pg_type.dat
@@ -11,6 +13,7 @@
    2. Datahike type → PG OID (for wire protocol RowDescription)
    3. PG OID → SQL name (for format_type() and information_schema)
    4. SQL name → category (for CAST type classification)"
+  (:require [clojure.string :as str])
   (:import [datahike.pg PgWireServer]))
 
 ;; ============================================================================
@@ -473,6 +476,52 @@
    unknown OIDs (caller decides fallback)."
   [oid]
   (when oid (get oid->dh-type-map (long oid))))
+
+;; ============================================================================
+;; NUMERIC typmod — encodes precision and scale per PG's atttypmod scheme
+
+;; PG encodes NUMERIC's typmod as:
+;;   typmod = ((precision << 16) | scale) + VARHDRSZ
+;;   VARHDRSZ = 4
+;; A typmod of -1 means "no precision specified" (PG default for plain
+;; NUMERIC). Decoding: subtract 4, scale = low 16 bits, precision =
+;; upper 16 bits. We mirror PG exactly so clients (pgjdbc, psycopg2,
+;; Metabase) see the same value they'd see on a real PG.
+(def ^:const var-hdr-sz 4)
+
+(defn encode-numeric-typmod
+  "Encode PG NUMERIC(precision, scale) → atttypmod integer.
+   Returns -1 when both precision and scale are nil (unconstrained)."
+  [precision scale]
+  (if (and (nil? precision) (nil? scale))
+    -1
+    (let [p (or precision 0)
+          s (or scale 0)]
+      (+ (bit-or (bit-shift-left p 16) s)
+         var-hdr-sz))))
+
+(defn decode-numeric-typmod
+  "Inverse of `encode-numeric-typmod`. Returns `[precision scale]` or
+   `[nil nil]` for typmod -1 (unconstrained NUMERIC)."
+  [typmod]
+  (if (or (nil? typmod) (neg? typmod))
+    [nil nil]
+    (let [adjusted (- typmod var-hdr-sz)]
+      [(bit-shift-right adjusted 16)
+       (bit-and adjusted 0xFFFF)])))
+
+(defn parse-numeric-args
+  "Parse the JSqlParser ColDataType string `\"NUMERIC (10, 2)\"` (or
+   `\"DECIMAL(10,2)\"` etc.) into `[precision scale]`. Returns
+   `[nil nil]` when no parens present (plain `NUMERIC`)."
+  [type-str]
+  (when type-str
+    (if-let [[_ args-str] (re-find #"(?i)^\s*(?:numeric|decimal)\s*\(([^)]*)\)" type-str)]
+      (let [parts (mapv str/trim (str/split args-str #","))
+            p (try (Long/parseLong (nth parts 0 "")) (catch Exception _ nil))
+            s (try (Long/parseLong (nth parts 1 "0")) (catch Exception _ nil))]
+        [p (or s 0)])
+      [nil nil])))
 
 (defn pg-name-for-dh-type
   "Return the PostgreSQL type name string for a Datahike valueType keyword."

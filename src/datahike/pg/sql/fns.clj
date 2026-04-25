@@ -158,6 +158,52 @@
         elem-type (if (some? first-v) (pick-type first-v) :text)]
     (arr-fn elem-type vs)))
 
+(defn pg-many-ref-array
+  "Per-row Datalog fn for `:db.cardinality/many :db.type/ref` SQL
+   projection: given the source entity-id, fetch all values of
+   `ref-attr` (each is a target entity-id), look up `target-pk-attr`
+   on each, and return a PgArray of the resulting PK values.
+
+   Empty for source entities with no ref values — matches what a
+   real PG `int[]` column would render for a row that has no
+   elements. Avoids the Datalog `array_agg` + or-join dance because
+   it runs per-row in pure Clojure: the source entity is already
+   bound, so we just do two lookups and box.
+
+   Used as `[(?pg-many-ref-array $ ?source-eid :order/tags :tag/id) ?out]`
+   in the translator-emitted Datalog query."
+  [db source-eid ref-attr target-pk-attr]
+  (let [arr-ns (some-> 'datahike.pg.arrays find-ns)
+        _ (when-not arr-ns (require 'datahike.pg.arrays))
+        arr-fn (resolve 'datahike.pg.arrays/array)
+        ;; eavt scan: all `[source-eid ref-attr v]` datoms.
+        datoms-fn (requiring-resolve 'datahike.api/datoms)
+        target-eids (mapv :v (datoms-fn db {:index :eavt
+                                            :components [source-eid ref-attr]}))
+        ;; Per-target lookup of the PK value. Nil targets (deleted
+        ;; or schema-attr eids) drop out; real-target-with-no-PK
+        ;; passes through nil, matching PG's NULL element.
+        pks (vec
+             (for [eid target-eids
+                   :let [pk-datoms (datoms-fn db {:index :eavt
+                                                  :components [eid target-pk-attr]})
+                         v (some-> ^datahike.datom.Datom (first pk-datoms) .-v)]
+                   :when (some? v)]
+               v))
+        ;; Element type from the target PK attr's :db/valueType, NOT
+        ;; from the first sample value (which would mistype an empty
+        ;; array as :text). Defaults to :int8 — most FK PKs are bigint.
+        schema (:schema db)
+        target-vtype (get-in schema [target-pk-attr :db/valueType])
+        elem-type (case target-vtype
+                    :db.type/long    :int8
+                    :db.type/string  :text
+                    :db.type/uuid    :uuid
+                    :db.type/bigdec  :numeric
+                    :db.type/instant :timestamptz
+                    :int8)]
+    (arr-fn elem-type pks)))
+
 (defn filter-count-distinct
   "SQL COUNT(DISTINCT col) — counts distinct non-NULL values."
   [coll]

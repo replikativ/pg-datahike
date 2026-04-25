@@ -247,7 +247,14 @@
    caller falls back to TEXT.
 
    `table-aliases` maps SQL aliases → real table names; we synthesise
-   the attribute keyword as `:<table>/<col>` and probe `db`'s schema."
+   the attribute keyword as `:<table>/<col>` and probe `db`'s schema.
+
+   `:db.cardinality/many` columns project as PG arrays (`int8[]`,
+   `text[]`, etc.) — see `col-var!`'s emit-many-ref-array branch. The
+   OID returned here drives both describeResult and Metabase's column-
+   type rendering, so we must promote to the array OID at this layer
+   (not the underlying scalar) for the wire-level array literal to be
+   parsed as an array on the client side."
   [^Column col {:keys [db schema table-aliases default-table hints]}]
   (when schema
     (let [col-name   (unquote-ident (.getColumnName col))
@@ -256,8 +263,6 @@
                            (unquote-ident (.getAlias t))))
           table-real (or (get table-aliases col-table col-table)
                          default-table)
-          ;; Schema hints may rename the SQL column to a different
-          ;; Datahike attribute local-name.
           hint-attr (when (and hints col-table)
                       (some (fn [[attr h]]
                               (when (and (= (:column h) col-name)
@@ -268,9 +273,19 @@
                    (when table-real
                      (keyword table-real col-name)))
           props (when attr (get schema attr))
-          valuetype (:db/valueType props)]
-      (when valuetype
-        (pgs/oid-for-valuetype valuetype)))))
+          valuetype (:db/valueType props)
+          cardinality (:db/cardinality props)
+          base-oid (when valuetype (pgs/oid-for-valuetype valuetype))]
+      (cond
+        (nil? base-oid) nil
+        ;; Cardinality-many → array OID. For ref attrs we project the
+        ;; deref'd target PK (typically int8); for non-ref many attrs
+        ;; (e.g. `:tag/aliases :db.type/string :many`) we project a
+        ;; text array. The element type comes from the array OID
+        ;; registry so this stays correct as new types are added.
+        (= cardinality :db.cardinality/many)
+        (get types/element-oid->array-oid base-oid types/oid-text-array)
+        :else base-oid))))
 
 (defn- promoted-numeric
   "Numeric promotion for binary arithmetic, matching PG's simplified
@@ -293,6 +308,27 @@
   (promoted-numeric (expr-oid (.getLeftExpression e) env)
                     (expr-oid (.getRightExpression e) env)))
 
+(defn resolve-aggregate-result-oid
+  "Given an aggregate name and the OID of its first argument, return
+   the result OID per `sql-aggregate->return-oid`. Returns nil for
+   unknown aggregates or unresolvable rules (caller falls back).
+
+   Public so the translator can derive the runtime fn variant from
+   the same rule the OID inference uses — avoids drift between
+   describeResult's reported type and the actual runtime."
+  [agg-name input-oid]
+  (let [rule (get sql-aggregate->return-oid (str/lower-case agg-name))]
+    (cond
+      (integer? rule)    rule
+      (= rule :arg-type) input-oid
+      (map? rule)        (let [r (or (get rule input-oid)
+                                     (get rule :default))]
+                           (cond
+                             (integer? r) r
+                             (= r :arg-type) input-oid
+                             :else nil))
+      :else              nil)))
+
 (defn- function-oid
   "Resolve a scalar or aggregate function reference. `:arg-type`
    sentinel in the registry means 'propagate the first argument's type'.
@@ -313,22 +349,16 @@
         rule (or (get sql-aggregate->return-oid fname)
                  (get sql-fn->return-oid fname))]
     (cond
+      ;; Aggregate rule (registered in sql-aggregate->return-oid) —
+      ;; delegate to the shared resolver so runtime variant selection
+      ;; (in stmt.clj) doesn't have to recompute the same logic.
+      (contains? sql-aggregate->return-oid fname)
+      (let [input-oid (cond
+                        (nil? first-arg) types/oid-int8 ; COUNT(*) defensive
+                        :else (expr-oid first-arg env))]
+        (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
-      (= rule :arg-type) (cond
-                           ;; COUNT(*) has no arg; handled above via :int8 but
-                           ;; defensive: fall back if we see it.
-                           (nil? first-arg) types/oid-int8
-                           :else (expr-oid first-arg env))
-      ;; Per-input-type map (SUM/AVG): look up by first-arg's OID,
-      ;; fall back to :default. The :default may itself be :arg-type
-      ;; (used by SUM for unknown inputs that aren't in the rule map).
-      (map? rule) (let [arg-oid (when first-arg (expr-oid first-arg env))
-                        result (or (get rule arg-oid)
-                                   (get rule :default))]
-                    (cond
-                      (integer? result) result
-                      (= result :arg-type) arg-oid
-                      :else nil))
+      (= rule :arg-type) (when first-arg (expr-oid first-arg env))
       :else nil)))
 
 (defn- cast-oid
@@ -488,8 +518,6 @@
       (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
       (let [^net.sf.jsqlparser.expression.AnalyticExpression ae expr
             fname (str/lower-case (.getName ae))
-            rule (or (get sql-aggregate->return-oid fname)
-                     (get sql-fn->return-oid fname))
             arg-expr (or (.getExpression ae)
                          (when-let [obs (.getOrderByElements ae)]
                            (when (seq obs)
@@ -497,16 +525,12 @@
                               ^net.sf.jsqlparser.statement.select.OrderByElement
                               (first obs)))))
             arg-oid (when arg-expr (expr-oid arg-expr env))]
-        (cond
-          (integer? rule)    rule
-          (= rule :arg-type) arg-oid
-          (map? rule)        (let [r (or (get rule arg-oid)
-                                         (get rule :default))]
-                               (cond
-                                 (integer? r) r
-                                 (= r :arg-type) arg-oid
-                                 :else nil))
-          :else              nil))
+        (or (resolve-aggregate-result-oid fname arg-oid)
+            (let [rule (get sql-fn->return-oid fname)]
+              (cond
+                (integer? rule)    rule
+                (= rule :arg-type) arg-oid
+                :else              nil))))
 
       ;; --- EXTRACT() --- always returns float8 in PG --------------------
       (instance? ExtractExpression expr) types/oid-float8

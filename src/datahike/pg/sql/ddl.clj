@@ -434,6 +434,18 @@
                                dh-type (or (get pg-type->dh-type raw-type)
                                            (get pg-type->dh-type base-type)
                                            :db.type/string)
+                               ;; NUMERIC(p, s): preserve precision +
+                               ;; scale via PG's atttypmod encoding so
+                               ;; clients see the declared type. Real
+                               ;; PG keeps these in pg_attribute; we
+                               ;; tag the schema attr's ident entity
+                               ;; with `:pg/typmod` and surface it in
+                               ;; the catalog + describeResult.
+                               numeric-typmod
+                               (when (= dh-type :db.type/bigdec)
+                                 (let [[p s] (types/parse-numeric-args raw-type)]
+                                   (when (or p s)
+                                     (types/encode-numeric-typmod p s))))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; NOT NULL inline; PK is implicitly NOT NULL
@@ -457,6 +469,7 @@
                      (cond-> {:db/ident       (keyword ns col-name)
                               :db/valueType   dh-type
                               :db/cardinality :db.cardinality/one}
+                       numeric-typmod (assoc :pg/typmod numeric-typmod)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec
                             (not= :unsupported (:kind default-spec)))

@@ -959,27 +959,21 @@
                      :table-aliases table-aliases
                      :default-table default-table
                      :hints (pgs/schema-hints db)}
-        ;; Map first-arg OID + agg name → runtime fn variant override.
-        ;; Mirrors PG's per-input-type aggregate dispatch (see
-        ;; `sql-aggregate->return-oid` in oid-infer): SUM(int8) and
-        ;; SUM(numeric) need BigDecimal-precision runtime to avoid
-        ;; overflow + match the NUMERIC return OID. AVG(int*) /
-        ;; AVG(numeric) need BigDecimal so `cents → dollars` doesn't
-        ;; lose precision via `(double sum)`. Returns nil when the
-        ;; default (non-numeric) variant is the right one — caller
-        ;; falls back to fns/sql-aggregate->datalog as before.
+        ;; Per-input-type runtime variant for precision-sensitive
+        ;; aggregates. Single source of truth: oid-infer's
+        ;; `sql-aggregate->return-oid` says e.g. AVG(int8) → numeric;
+        ;; if the inferred result OID is NUMERIC and we have a
+        ;; BigDecimal runtime variant, use it. Avoids the previous
+        ;; duplication where stmt.clj redundantly enumerated which
+        ;; (agg, input-oid) pairs need numeric runtimes.
         pick-precision-variant
         (fn [agg-name input-oid]
-          (case agg-name
-            "sum" (when (or (= input-oid types/oid-int8)
-                            (= input-oid types/oid-numeric))
-                    'datahike.pg.sql/filter-sum-numeric)
-            "avg" (when (or (= input-oid types/oid-int2)
-                            (= input-oid types/oid-int4)
-                            (= input-oid types/oid-int8)
-                            (= input-oid types/oid-numeric))
-                    'datahike.pg.sql/filter-avg-numeric)
-            nil))
+          (let [result-oid (oid/resolve-aggregate-result-oid agg-name input-oid)]
+            (when (= result-oid types/oid-numeric)
+              (case agg-name
+                "sum" 'datahike.pg.sql/filter-sum-numeric
+                "avg" 'datahike.pg.sql/filter-avg-numeric
+                nil))))
 
         _ (doseq [^SelectItem item select-items]
             (let [expr (.getExpression item)
@@ -2163,7 +2157,17 @@
      :else (str e))))
 
 (defn coerce-insert-value
-  "Coerce a value to match the schema type for an attribute."
+  "Coerce a value to match the schema type for an attribute.
+
+   `:db.type/ref` columns: SQL FK semantics says `INSERT/UPDATE … SET
+   col = N` writes the target's PK value (matching what the
+   read-side ref-deref returns). Datahike's transact requires either
+   an entity-id or a lookup-ref. We convert the user-supplied PK
+   value to a lookup-ref `[target-pk-attr val]` using the same
+   convention `derive-ref-targets` uses on the read side, keeping
+   read and write FK semantics symmetric. Falls through to the raw
+   value when no target is resolvable (hint-only refs without a
+   threaded db, or genuinely-unmapped refs)."
   [val attr schema]
   (when (some? val)
     (let [vtype (get-in schema [attr :db/valueType])]
@@ -2177,6 +2181,17 @@
         ;; it with the decoded wire value, which already has the right
         ;; type from Bind.
         (params/param-ref? val) val
+        ;; :db.type/ref column with a numeric/string PK value →
+        ;; lookup-ref. Already-vector values (explicit `[:k v]`) pass
+        ;; through unchanged. Convention-based target resolution
+        ;; (hints aren't visible here without db access — see
+        ;; coerce-insert-value-with-hints for the hint-aware path).
+        (and (= vtype :db.type/ref)
+             (not (vector? val))
+             (some? val))
+        (if-let [target-pk-attr (get (pgs/derive-ref-targets schema {}) attr)]
+          [target-pk-attr val]
+          val)
         ;; BigInteger or clojure.lang.BigInt lands here when a SQL
         ;; literal overflows Long — `(- (BigInteger. "...N"))` returns
         ;; BigInt (not BigInteger), so checking both types is required.

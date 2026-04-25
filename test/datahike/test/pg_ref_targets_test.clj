@@ -64,16 +64,32 @@
       (is (empty? (pgs/derive-ref-targets schema {}))
           "no `buyer` namespace exists, no hint, so no FK projection target"))))
 
-(deftest cardinality-many-omitted
-  (testing ":db.cardinality/many refs are deliberately not in ref-targets"
+(deftest cardinality-many-shape
+  (testing ":db.cardinality/many refs return [target :many] vector shape"
+    ;; Use convention-matching name: :order/tag matches :tag/* namespace.
+    ;; (Plural :order/tags would need an explicit hint, since "tags"
+    ;; doesn't equal "tag".)
     (let [schema-tx [{:db/ident :tag/id  :db/valueType :db.type/long
+                      :db/cardinality :db.cardinality/one
+                      :db/unique :db.unique/identity}
+                     {:db/ident :order/tag :db/valueType :db.type/ref
+                      :db/cardinality :db.cardinality/many}]
+          schema (:schema (make-db schema-tx))]
+      (is (= {:order/tag [:tag/id :many]}
+             (pgs/derive-ref-targets schema {}))
+          "many refs project as PgArray of target PKs (vs single PK for one)")))
+
+  (testing "explicit hint on plural-name many-ref"
+    (let [schema-tx [{:db/ident :tag/id :db/valueType :db.type/long
                       :db/cardinality :db.cardinality/one
                       :db/unique :db.unique/identity}
                      {:db/ident :order/tags :db/valueType :db.type/ref
                       :db/cardinality :db.cardinality/many}]
           schema (:schema (make-db schema-tx))]
-      (is (empty? (pgs/derive-ref-targets schema {}))
-          "many-cardinality refs need PG-array projection — not yet supported"))))
+      (is (= {:order/tags [:tag/id :many]}
+             (pgs/derive-ref-targets schema
+                                     {:order/tags {:references :tag/id}}))
+          ":datahike.pg/references hint resolves the convention mismatch"))))
 
 (deftest cached-result-stable
   (testing "same schema + hints → same result instance (memoization)"

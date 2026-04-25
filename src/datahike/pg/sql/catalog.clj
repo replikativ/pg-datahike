@@ -202,6 +202,11 @@
      ;; PG identity-column kind: '' = not identity, 'a' = always,
      ;; 'd' = by default. We never emit identity columns.
      {:db/ident :pg_attribute/attidentity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; atttypmod: encodes NUMERIC(p, s) precision/scale (and varchar(n)
+     ;; length when we add it). -1 = unconstrained — what real PG
+     ;; reports for plain `NUMERIC` or `TEXT` columns. Drives
+     ;; information_schema.columns.numeric_precision / numeric_scale.
+     {:db/ident :pg_attribute/atttypmod :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attribute") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_namespace"
     [{:db/ident :pg_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -459,7 +464,16 @@
            ["1043" "varchar" "-1" "b"] ["1082" "date" "4" "b"]
            ["1114" "timestamp" "8" "b"] ["2950" "uuid" "16" "b"]])
     "pg_attribute"
-    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))]
+    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
+          ;; column. Returns {attr-ident → typmod-int}.
+          q-fn (requiring-resolve 'datahike.api/q)
+          typmods (when cte-db
+                    (into {}
+                          (q-fn '{:find [?ident ?typmod]
+                                  :where [[?e :db/ident ?ident]
+                                          [?e :pg/typmod ?typmod]]}
+                                cte-db)))]
       (vec (for [[tname {:keys [columns]}] (sort-by key tables)
                  [idx col] (map-indexed vector columns)
                  :let [tbl-oid (or (pgs/table-oid cte-db tname)
@@ -469,13 +483,27 @@
                                    ;; key convention (name → hash) so stale
                                    ;; data still has a stable attrelid.
                                    (Math/abs (.hashCode ^String tname)))
-                       pk? (= :db.unique/identity (:unique col))]]
+                       pk? (= :db.unique/identity (:unique col))
+                       ;; -1 = unconstrained (real PG's default for
+                       ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
+                       ;; columns get a positive value via DDL.
+                       typmod (long (or (get typmods (:attr col)) -1))]]
              {:pg_attribute/attname (:name col)
-              :pg_attribute/atttypid (long (pgs/oid-for-valuetype (:valuetype col)))
+              ;; Cardinality-many columns project as PG arrays, so
+              ;; their atttypid must be the array OID — pgjdbc reads
+              ;; this for ResultSetMetaData and the field-metadata
+              ;; cache key. Mirrors the OID inference in
+              ;; oid-infer/column-oid.
+              :pg_attribute/atttypid
+              (long (let [base (pgs/oid-for-valuetype (:valuetype col))]
+                      (if (= :db.cardinality/many (:cardinality col))
+                        (get types/element-oid->array-oid base types/oid-text-array)
+                        base)))
               :pg_attribute/attnum (long (inc idx))
               :pg_attribute/attrelid (long tbl-oid)
               :pg_attribute/attnotnull pk?
               :pg_attribute/attidentity ""
+              :pg_attribute/atttypmod typmod
               (pgs/row-marker-attr "pg_attribute") true})))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
@@ -630,16 +658,27 @@
           ;; PG's information_schema fills numeric_precision / _scale only
           ;; for numeric-categoried types and leaves the rest NULL. We do
           ;; the same — Metabase reads these to infer fixed-point vs
-          ;; floating-point columns.
-          numeric-precision (fn [vtype]
-                              (case vtype
-                                :db.type/long    64
-                                :db.type/ref     64
-                                :db.type/float   24
-                                :db.type/double  53
-                                :db.type/bigdec  nil
-                                :db.type/bigint  64
-                                nil))
+          ;; floating-point columns. For NUMERIC(p, s) columns we
+          ;; decode the per-attr typmod (set at DDL time) so users see
+          ;; their declared (10, 2) etc., not unconstrained NULL.
+          q-fn (requiring-resolve 'datahike.api/q)
+          typmods (when cte-db
+                    (into {}
+                          (q-fn '{:find [?ident ?tm]
+                                  :where [[?e :db/ident ?ident]
+                                          [?e :pg/typmod ?tm]]}
+                                cte-db)))
+          numeric-precision (fn [vtype attr]
+                              (let [[p _] (when-let [tm (get typmods attr)]
+                                            (types/decode-numeric-typmod tm))]
+                                (case vtype
+                                  :db.type/long    64
+                                  :db.type/ref     64
+                                  :db.type/float   24
+                                  :db.type/double  53
+                                  :db.type/bigdec  p
+                                  :db.type/bigint  64
+                                  nil)))
           numeric-radix     (fn [vtype]
                               (case vtype
                                 :db.type/long    2
@@ -649,12 +688,15 @@
                                 :db.type/bigdec  10
                                 :db.type/bigint  2
                                 nil))
-          numeric-scale     (fn [vtype]
-                              (case vtype
-                                :db.type/long    0
-                                :db.type/ref     0
-                                :db.type/bigint  0
-                                nil))
+          numeric-scale     (fn [vtype attr]
+                              (let [[_ s] (when-let [tm (get typmods attr)]
+                                            (types/decode-numeric-typmod tm))]
+                                (case vtype
+                                  :db.type/long    0
+                                  :db.type/ref     0
+                                  :db.type/bigdec  s
+                                  :db.type/bigint  0
+                                  nil)))
           datetime-precision (fn [vtype]
                                (case vtype
                                  :db.type/instant 6
@@ -680,9 +722,9 @@
                :information_schema_columns/data_type              (pgs/pg-type-name vtype)
                :information_schema_columns/character_maximum_length nil
                :information_schema_columns/character_octet_length nil
-               :information_schema_columns/numeric_precision      (numeric-precision vtype)
+               :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))
                :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
-               :information_schema_columns/numeric_scale          (numeric-scale vtype)
+               :information_schema_columns/numeric_scale          (numeric-scale vtype (:attr col))
                :information_schema_columns/datetime_precision     (datetime-precision vtype)
                :information_schema_columns/udt_catalog            "datahike"
                :information_schema_columns/udt_schema             "pg_catalog"

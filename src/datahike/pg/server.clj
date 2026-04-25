@@ -389,25 +389,40 @@
           where-clauses)))
 
 (defn- compute-column-sources
-  "Per-column [tableOid attnum] pairs for the RowDescription. Returns
-   [int[] short[]] when at least one column has a known source table;
-   otherwise nil (caller omits the fields — pgjdbc sees zeros and
-   short-circuits getBaseColumnName to \"\", which is the existing
-   behavior for non-table expressions).
+  "Per-column [tableOid attnum typmod] arrays for the RowDescription.
+   Returns [int[] short[] int[]] when at least one column has a known
+   source table; otherwise nil (caller omits the fields — pgjdbc sees
+   zeros and short-circuits getBaseColumnName to \"\", which is the
+   existing behavior for non-table expressions).
 
-   pgjdbc uses (tableOid, attnum) as the cache key for its field-metadata
-   query, so these values MUST agree with the rows we emit in pg_class
-   and pg_attribute — that's why both sides route through schema.clj
-   helpers (table-oid, column-attnum)."
+   typmod (PG's per-column type modifier, e.g. NUMERIC(10, 2)
+   precision+scale encoded per types/encode-numeric-typmod) is read
+   from the attribute's `:pg/typmod` ident-attached marker via the
+   live db. Defaults to -1 (unspecified) when no marker is set —
+   matches PG's RowDescription default for unconstrained columns.
+
+   pgjdbc uses (tableOid, attnum) as the cache key for its field-
+   metadata query, so these values MUST agree with the rows we emit
+   in pg_class and pg_attribute — that's why both sides route through
+   schema.clj helpers (table-oid, column-attnum)."
   [parsed db]
   (when (and db (:find-aliases parsed) (:query parsed))
     (let [aliases (:find-aliases parsed)
           find-vars (:find (:query parsed))
           var->attr (find-var->attr parsed)
           schema (:schema db)
+          ;; Bulk-fetch typmods for the schema attrs we'll need; falls
+          ;; back to -1 per column when the attr has none. One Datalog
+          ;; query per RowDescription emission instead of N point lookups.
+          typmod-map (when db
+                       (into {} (d/q '{:find [?ident ?tm]
+                                       :where [[?e :db/ident ?ident]
+                                               [?e :pg/typmod ?tm]]}
+                                     db)))
           n (count aliases)
           toids (int-array n)
           attnums (short-array n)
+          typmods (int-array n -1)
           any? (atom false)]
       (dotimes [i n]
         (let [fvar (when (< i (count find-vars)) (nth find-vars i))
@@ -416,12 +431,16 @@
               cname (when attr (name attr))
               toid (when tname (pgs/table-oid db tname))
               anum (when (and tname cname)
-                     (pgs/column-attnum schema tname cname))]
+                     (pgs/column-attnum schema tname cname))
+              tm (when attr (get typmod-map attr))]
           (when (and toid anum)
             (reset! any? true)
             (aset-int toids i (int toid))
-            (aset-short attnums i (short anum)))))
-      (when @any? [toids attnums]))))
+            (aset-short attnums i (short anum)))
+          (when tm
+            (reset! any? true)
+            (aset-int typmods i (int tm)))))
+      (when @any? [toids attnums typmods]))))
 
 (defn- compute-schema-oids
   "Resolve the PG OID for each :find element of a parsed SELECT.
@@ -460,27 +479,39 @@
                                   :where [[?e :db/ident ?ident]
                                           [?e :pg/type ?pt]]}
                                 db)))]
-    (int-array
-     (map-indexed
-      (fn [i alias]
-        (let [fvar (when (< i (count find-vars)) (nth find-vars i))
-              attr (when (symbol? fvar) (get var->attr fvar))
-              props (when attr (get schema attr))]
-          (if props
-            (if-let [pgtype (and pgtype-map (get pgtype-map attr))]
-              (case pgtype
-                "jsonb" types/oid-jsonb
-                "json"  types/oid-jsonb
-                (pgs/oid-for-valuetype (:db/valueType props)))
-              (pgs/oid-for-valuetype (:db/valueType props)))
-            (or (some (fn [[attr-kw p]]
-                        (when (and (keyword? attr-kw)
-                                   (= (name attr-kw) alias)
-                                   (not (str/starts-with? (str (namespace attr-kw)) "__")))
-                          (pgs/oid-for-valuetype (:db/valueType p))))
-                      schema)
-                -1))))
-      find-aliases))))
+    (let [;; Promote cardinality-many props to array OIDs — matches what
+          ;; col-var! emits for `:db.cardinality/many :db.type/ref`
+          ;; columns (PgArray of target PKs). Without this, describe-
+          ;; Result reports int8 for what's actually int8[], and pgjdbc
+          ;; calls .toLong on the PgArray.
+          oid-for-props (fn [props]
+                          (let [base (pgs/oid-for-valuetype (:db/valueType props))]
+                            (if (= :db.cardinality/many (:db/cardinality props))
+                              (get types/element-oid->array-oid
+                                   base
+                                   types/oid-text-array)
+                              base)))]
+      (int-array
+       (map-indexed
+        (fn [i alias]
+          (let [fvar (when (< i (count find-vars)) (nth find-vars i))
+                attr (when (symbol? fvar) (get var->attr fvar))
+                props (when attr (get schema attr))]
+            (if props
+              (if-let [pgtype (and pgtype-map (get pgtype-map attr))]
+                (case pgtype
+                  "jsonb" types/oid-jsonb
+                  "json"  types/oid-jsonb
+                  (oid-for-props props))
+                (oid-for-props props))
+              (or (some (fn [[attr-kw p]]
+                          (when (and (keyword? attr-kw)
+                                     (= (name attr-kw) alias)
+                                     (not (str/starts-with? (str (namespace attr-kw)) "__")))
+                            (oid-for-props p)))
+                        schema)
+                  -1))))
+        find-aliases)))))
 
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
@@ -1931,6 +1962,10 @@
         spec [[:pg/type str1]
               [:pg/table-oid long1]
               [:pg/not-null bool1]
+              ;; PG-style atttypmod — encodes NUMERIC(p, s) precision +
+              ;; scale, plus length for VARCHAR(n) etc. Stored as a long;
+              ;; -1 means unconstrained (PG default).
+              [:pg/typmod long1]
               [:pg/default-kind kw1]
               [:pg/default-value str1]
               [:pg/default-arg str1]
@@ -3202,7 +3237,9 @@
                                 (make-array String 0 0))
                     "SELECT 0")]
             (if sources
-              (.withColumnSources qr (first sources) (second sources))
+              (-> qr
+                  (.withColumnSources (first sources) (second sources))
+                  (.withColumnTypmods (nth sources 2)))
               qr))
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT — the executor
@@ -3678,8 +3715,9 @@
                                       sources (compute-column-sources parsed-with-shape db)
                                       result (format-query-result results find-aliases schema-oids)]
                                   (if sources
-                                    (.withColumnSources ^PgWireServer$QueryResult result
-                                                        (first sources) (second sources))
+                                    (-> ^PgWireServer$QueryResult result
+                                        (.withColumnSources (first sources) (second sources))
+                                        (.withColumnTypmods (nth sources 2)))
                                     result)))))
 
                           :insert

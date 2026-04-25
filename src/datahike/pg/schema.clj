@@ -180,16 +180,15 @@
       This matches the seed style most projects use, where ref attrs
       are named after the table they point to.
 
-   Only `:db.cardinality/one` refs are derefed. `:db.cardinality/many`
-   refs are deliberately omitted: the natural PG-side projection is
-   `int8[]` (an array of target PKs), but emitting that requires
-   caller-aware logic (only valid in SELECT-list position, with a
-   GROUP BY by the source entity, and an `array_agg` aggregate over
-   each target's PK). The current behavior — Datalog's natural
-   multi-row expansion — is at least well-defined; users that need
-   PG-array projection should pre-aggregate with an explicit
-   `(SELECT array_agg(t.pk) FROM …)` subquery until cardinality/many
-   ref-deref lands.
+   Both `:db.cardinality/one` AND `:db.cardinality/many` refs are
+   included. The result map's value is a `target-pk-attr` for the
+   one-cardinality case, OR a vector `[target-pk-attr :many]` for
+   many-cardinality refs — the translator branches on the shape:
+     - one  → emit a chained `get-else` that derefs to a single
+              target-PK value (matching real PG INT FK columns)
+     - many → emit a per-row Clojure fn (`fns/pg-many-ref-array`)
+              that boxes all target PKs into a PgArray (matching
+              `int8[]` columns)
 
    Pure schema-side derivation; for runtime data validation against the
    actual entities a ref points to (polymorphism detection,
@@ -221,12 +220,17 @@
               result (reduce-kv
                       (fn [m attr-ident props]
                         (if (and (keyword? attr-ident)
-                                 (= :db.type/ref (:db/valueType props))
-                                 (= :db.cardinality/one (:db/cardinality props)))
+                                 (= :db.type/ref (:db/valueType props)))
                           (let [hint (get hints attr-ident)
                                 target (or (:references hint)
-                                           (get ns->unique-id (name attr-ident)))]
-                            (if target (assoc m attr-ident target) m))
+                                           (get ns->unique-id (name attr-ident)))
+                                cardinality (:db/cardinality props)]
+                            (cond
+                              (and target (= :db.cardinality/one cardinality))
+                              (assoc m attr-ident target)
+                              (and target (= :db.cardinality/many cardinality))
+                              (assoc m attr-ident [target :many])
+                              :else m))
                           m))
                       {}
                       schema)]
@@ -287,16 +291,19 @@
   (if-not (and db (seq ref-targets))
     ref-targets
     (reduce-kv
-     (fn [acc ref-attr target-pk]
-       (let [actual-ns (ref-target-namespaces db ref-attr)
+     (fn [acc ref-attr target-entry]
+       (let [;; target-entry is either `target-attr` (one) or
+             ;; `[target-attr :many]` (many) — see derive-ref-targets.
+             target-pk (if (vector? target-entry) (first target-entry) target-entry)
+             actual-ns (ref-target-namespaces db ref-attr)
              expected-ns (namespace target-pk)]
          (cond
            ;; No data yet — trust the convention/hint.
-           (zero? (count actual-ns)) (assoc acc ref-attr target-pk)
+           (zero? (count actual-ns)) (assoc acc ref-attr target-entry)
 
            (= 1 (count actual-ns))
            (if (= (first actual-ns) expected-ns)
-             (assoc acc ref-attr target-pk)
+             (assoc acc ref-attr target-entry)
              (do (warn-once! [::namespace-mismatch ref-attr]
                              (str "ref attr " ref-attr " resolves to target "
                                   target-pk " (namespace " expected-ns ")"
