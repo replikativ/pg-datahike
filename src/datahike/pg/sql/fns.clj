@@ -112,6 +112,63 @@
 (defn- drop-nulls [coll]
   (remove #(or (nil? %) (= :__null__ %)) coll))
 
+(defn- drop-pair-nulls
+  "For pair-aggregate inputs `[[p v] …]`, drop pairs whose value is
+   nil/sentinel. Used by percentile / mode aggregates that receive the
+   ordered-set parameter alongside the per-row value."
+  [coll]
+  (remove (fn [[_ v]] (or (nil? v) (= :__null__ v))) coll))
+
+(defn filter-percentile-cont
+  "PG `PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY x)` — linearly-
+   interpolated continuous percentile. Receives a coll of `[p x]` pairs
+   (every `p` is the same constant, threaded per-row by the translator
+   so the aggregate fn can stay single-arg per Datahike's aggregate
+   contract). Returns the interpolated p-th percentile of the x values,
+   `:__null__` for an empty input."
+  [coll]
+  (let [pairs (drop-pair-nulls coll)
+        vs    (sort (map second pairs))
+        n     (count vs)]
+    (cond
+      (zero? n) :__null__
+      (== 1 n)  (first vs)
+      :else
+      (let [p (double (first (first pairs)))
+            idx (* p (dec n))
+            lo (long (Math/floor idx))
+            hi (long (Math/ceil idx))
+            frac (- idx lo)]
+        (+ (* (nth vs lo) (- 1.0 frac))
+           (* (nth vs hi) frac))))))
+
+(defn filter-percentile-disc
+  "PG `PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY x)` — discrete
+   percentile, no interpolation. Returns the value at position
+   `ceil(p * n)` (1-based) in the sorted non-null x values."
+  [coll]
+  (let [pairs (drop-pair-nulls coll)
+        vs    (sort (map second pairs))
+        n     (count vs)]
+    (if (zero? n)
+      :__null__
+      (let [p (double (first (first pairs)))
+            idx (max 0 (min (dec n) (dec (long (Math/ceil (* p n))))))]
+        (nth vs idx)))))
+
+(defn filter-mode
+  "PG `MODE() WITHIN GROUP (ORDER BY x)` — most frequent value.
+   Receives raw x values (no percentile parameter). Tie-broken by
+   ORDER BY ascending, matching PG's stable-sort tiebreak."
+  [coll]
+  (let [vs (drop-nulls coll)]
+    (if (empty? vs)
+      :__null__
+      (let [freq (frequencies vs)
+            max-cnt (apply max (vals freq))
+            winners (filter #(= max-cnt (val %)) freq)]
+        (first (sort (map key winners)))))))
+
 (defn filter-variance-samp
   "SQL VAR_SAMP(x) — sample variance, ignores :__null__/nil. Returns
    :__null__ when fewer than 2 non-null values remain (matches PG)."
@@ -288,7 +345,14 @@
    "var_pop"        'variance
    "median"         'median
    "corr"           'datahike.pg.sql/filter-corr
-   "array_agg"      'datahike.pg.sql/filter-array-agg})
+   "array_agg"      'datahike.pg.sql/filter-array-agg
+   ;; Ordered-set aggregates — `WITHIN GROUP (ORDER BY x)` syntax.
+   ;; Translator routes them through the pair-aggregate path (like
+   ;; corr) since the percentile fraction is a constant alongside
+   ;; the per-row value, and Datalog aggregates take a single coll.
+   "percentile_cont" 'datahike.pg.sql/filter-percentile-cont
+   "percentile_disc" 'datahike.pg.sql/filter-percentile-disc
+   "mode"            'datahike.pg.sql/filter-mode})
 
 (defn aggregate-function? [^String fname]
   (contains? sql-aggregate->datalog (str/lower-case fname)))

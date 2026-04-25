@@ -127,13 +127,21 @@
                   Drives the `:col-overrides` lookup used by `resolve-column`
                   so `WHERE <renamed-col>` and `JOIN … ON …` resolve hint-
                   mapped columns to their real attribute keywords."
-  [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases]}]]
+  [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases ref-targets]}]]
   {:schema        schema
    :table-aliases table-aliases
    :default-table default-table
    :db            db
    :parse-sql     parse-sql
    :hints         (or hints {})
+   ;; {ref-attr-ident → target-pk-attr-ident} — drives SQL FK
+   ;; semantics: projecting a `:db.type/ref` column yields the
+   ;; target's PK value (matching a real-PG INT FK column), not the
+   ;; raw Datahike entity-id. Computed once at the handler entry
+   ;; point (datahike.pg.schema/derive-ref-targets) and threaded
+   ;; through every translation. Empty-map default keeps
+   ;; refs-as-eids behavior for callers that don't supply this.
+   :ref-targets   (or ref-targets {})
    ;; Aliases of FROM/JOIN-position derived tables — `(SELECT … FROM …) AS x`
    ;; whose rows have been materialised into the speculative db with their
    ;; own entity-id space. translate-join uses this to suppress the ref/db_id
@@ -197,6 +205,75 @@
   [ctx clause]
   (swap! (:where-clauses ctx) conj clause))
 
+(defn- emit-ref-deref!
+  "Emit a Datalog or-join that binds `pk-var` to the target-PK value of
+   the ref entity-id `ref-eid-var`, handling the null-ref case.
+
+   Pattern:
+     (or-join [?ref-eid ?pk]
+       (and [(= ?ref-eid :__null__)] [(ground :__null__) ?pk])
+       (and [(not= ?ref-eid :__null__)]
+            [(get-else $ ?ref-eid target-pk :__null__) ?pk]))
+
+   The wrapper is necessary because get-else's entity arg must be a
+   number / nil / lookup-ref — passing the `:__null__` sentinel keyword
+   (which `col-var!` emits when the source row lacks the ref attr)
+   would throw at search time."
+  [ctx ref-eid-var pk-var target-pk-attr]
+  (add-clause! ctx
+               (list 'or-join [ref-eid-var pk-var]
+                     (list 'and
+                           [(list '= ref-eid-var :__null__)]
+                           [(list 'ground :__null__) pk-var])
+                     (list 'and
+                           [(list 'not= ref-eid-var :__null__)]
+                           [(list 'get-else '$ ref-eid-var target-pk-attr :__null__) pk-var]))))
+
+(defn ref-eid-var!
+  "Get/create the logic variable bound to the *raw entity-id* a
+   `:db.type/ref` attribute holds, bypassing the SQL-projection
+   dereference that `col-var!` applies for ref columns.
+
+   Used only by the JOIN-condition rewriter in `translate-join`, which
+   unifies the right alias's entity-var with the ref's value (the
+   target entity-id) — an optimization that turns `JOIN c ON p.fk =
+   c.pk` into a single direct entity binding instead of two passes
+   (deref + value equality).
+
+   Forms accepted: same as `col-var!`. For non-ref attrs this returns
+   the same var that `col-var!` does — there's nothing to dereference.
+
+   Cached separately from `col-var!` (key `[alias-key attr :__eid__]`)
+   so projection sites and JOIN sites can both fetch their respective
+   binding without invalidating each other."
+  [ctx attr]
+  (cond
+    (and (vector? attr) (= :db-id (first attr)))
+    (entity-var! ctx (second attr))
+
+    :else
+    (let [[alias-key resolved-attr]
+          (cond
+            (and (vector? attr) (= :aliased (first attr)))
+            [(nth attr 1) (nth attr 2)]
+            :else
+            [(namespace attr)
+             (if-let [db (:db ctx)]
+               (resolve-inherited-attr attr (:schema ctx) db)
+               attr)])
+          cache-key [alias-key resolved-attr :__eid__]
+          cvars (:col->var ctx)]
+      (or (get @cvars cache-key)
+          (let [v (symbol (str "?" alias-key "_" (name resolved-attr) "_eid"))
+                evar (entity-var! ctx alias-key)
+                lj? (contains? @(:left-join-evars ctx) evar)]
+            (swap! cvars assoc cache-key v)
+            (if lj?
+              (add-clause! ctx [evar resolved-attr v])
+              (add-clause! ctx [(list 'get-else '$ evar resolved-attr :__null__) v]))
+            (swap! (:nullable-vars ctx) conj v)
+            v)))))
+
 (defn col-var!
   "Get or create the logic variable for an attribute.
 
@@ -214,6 +291,13 @@
    get-else with the LEFT JOIN sentinel entity-id would otherwise throw.
    These vars are still added to `:nullable-vars` so null-guards apply.
 
+   `:db.type/ref` columns: when `ctx`'s `:ref-targets` map has an entry
+   for the resolved attr, the returned var is the *target-PK value*
+   (e.g. for `:order/customer` → the referenced customer's
+   `:customer/id`), matching how a real PG FK column projects. Callers
+   that need the raw entity-id (only the JOIN-condition rewriter) use
+   `ref-eid-var!` instead.
+
    Handles three forms of attr:
      [:db-id alias-key]        → return entity var for the alias
      [:aliased alias-key kw]   → aliased column (self-joins)
@@ -229,17 +313,23 @@
     (let [alias-key (nth attr 1)
           kw (nth attr 2)
           cache-key [alias-key kw]
-          cvars (:col->var ctx)]
+          cvars (:col->var ctx)
+          ref-target (get (:ref-targets ctx) kw)]
       (or (get @cvars cache-key)
           (let [v (symbol (str "?" alias-key "_" (name kw)))
                 evar (entity-var! ctx alias-key)
                 lj? (contains? @(:left-join-evars ctx) evar)]
-            (swap! cvars assoc cache-key v)
             (if lj?
               (add-clause! ctx [evar kw v])
               (add-clause! ctx [(list 'get-else '$ evar kw :__null__) v]))
             (swap! (:nullable-vars ctx) conj v)
-            v)))
+            (if ref-target
+              (let [pk-v (symbol (str "?" alias-key "_" (name kw) "_pk"))]
+                (emit-ref-deref! ctx v pk-v ref-target)
+                (swap! (:nullable-vars ctx) conj pk-v)
+                (swap! cvars assoc cache-key pk-v)
+                pk-v)
+              (do (swap! cvars assoc cache-key v) v)))))
 
     ;; Regular keyword :ns/col
     :else
@@ -250,17 +340,23 @@
                           (resolve-inherited-attr attr (:schema ctx) db)
                           attr)
           cache-key [alias-key resolved-attr]
-          cvars (:col->var ctx)]
+          cvars (:col->var ctx)
+          ref-target (get (:ref-targets ctx) resolved-attr)]
       (or (get @cvars cache-key)
           (let [v (symbol (str "?" alias-key "_" (name resolved-attr)))
                 evar (entity-var! ctx alias-key)
                 lj? (contains? @(:left-join-evars ctx) evar)]
-            (swap! cvars assoc cache-key v)
             (if lj?
               (add-clause! ctx [evar resolved-attr v])
               (add-clause! ctx [(list 'get-else '$ evar resolved-attr :__null__) v]))
             (swap! (:nullable-vars ctx) conj v)
-            v)))))
+            (if ref-target
+              (let [pk-v (symbol (str "?" alias-key "_" (name resolved-attr) "_pk"))]
+                (emit-ref-deref! ctx v pk-v ref-target)
+                (swap! (:nullable-vars ctx) conj pk-v)
+                (swap! cvars assoc cache-key pk-v)
+                pk-v)
+              (do (swap! cvars assoc cache-key v) v)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Expression helpers

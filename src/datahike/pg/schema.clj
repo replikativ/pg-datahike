@@ -121,6 +121,53 @@
                          hint))]
     (transact-fn conn [entity])))
 
+(defn derive-ref-targets
+  "For each `:db.type/ref` attribute, determine the *target PK attribute*
+   that SQL projection should dereference to. `SELECT order.customer FROM
+   order` should return the customer's PK value (1, 2, 3) — what a real
+   PostgreSQL FK column stores — not the Datahike entity-id (10, 11, 12)
+   that the ref attribute physically holds.
+
+   Returns `{ref-attr-ident → target-pk-attr-ident}` (a subset of the
+   ref attrs in the schema; refs with no resolvable target are omitted
+   and fall back to projecting the raw entity-id).
+
+   Resolution order:
+   1. Explicit `:datahike.pg/references K` hint (authoritative).
+   2. Convention: `(name ref-attr)` names a namespace, and the
+      `:db.unique/identity` attr in that namespace is the target.
+      Example: `:order/customer` (ref) → namespace `customer` →
+      `:customer/id` (the only `:db.unique/identity` in `customer`).
+      This matches the seed style most projects use, where ref attrs
+      are named after the table they point to.
+
+   Only `:db.cardinality/one` refs are derefed — many-cardinality refs
+   would yield multiple PK rows per source row, which has no clean SQL
+   projection equivalent."
+  [schema hints]
+  (let [;; Build {namespace → unique-identity-attr} index once.
+        ns->unique-id (reduce-kv
+                       (fn [m k v]
+                         (if (and (keyword? k)
+                                  (= :db.unique/identity (:db/unique v))
+                                  (namespace k))
+                           (assoc m (namespace k) k)
+                           m))
+                       {}
+                       schema)]
+    (reduce-kv
+     (fn [m attr-ident props]
+       (if (and (keyword? attr-ident)
+                (= :db.type/ref (:db/valueType props))
+                (= :db.cardinality/one (:db/cardinality props)))
+         (let [hint (get hints attr-ident)
+               target (or (:references hint)
+                          (get ns->unique-id (name attr-ident)))]
+           (if target (assoc m attr-ident target) m))
+         m))
+     {}
+     schema)))
+
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
    by scanning the db for :datahike.pg/for-ident-rooted hint entities.

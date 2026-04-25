@@ -3518,19 +3518,31 @@
                                                     results-vec)))))))
                                       results)
                   ;; SQL requires: aggregate on empty result → one row with defaults
-                  ;; COUNT(*) → 0, SUM/AVG/MIN/MAX → NULL
-                                    results (if (and has-aggregates? (empty? (seq results)))
-                                              (let [find-elems (:find query)
-                                                    default-row (mapv (fn [elem]
-                                                                        (if (and (seq? elem) (symbol? (first elem)))
-                                                                          (let [agg-name (name (first elem))]
-                                                                            (if (or (= agg-name "count")
-                                                                                    (= agg-name "count-distinct")
-                                                                                    (= agg-name "filter-count")
-                                                                                    (= agg-name "filter-count-distinct"))
-                                                                              0
-                                                                              nil))
-                                                                          nil))
+                  ;; COUNT(*) → 0, SUM/AVG/MIN/MAX → NULL.
+                  ;; This applies ONLY when there is no GROUP BY — i.e.
+                  ;; every :find element is an aggregate form. With a
+                  ;; group-by column in :find (a plain `?var` element),
+                  ;; an empty result means zero matching groups, so PG
+                  ;; returns zero rows. The earlier always-on default
+                  ;; synthesis turned `WHERE …→ 0 rows GROUP BY status`
+                  ;; into a single bogus `[null, 0]` row.
+                                    find-elems (:find query)
+                                    all-aggregates? (and (seq find-elems)
+                                                         (every? (fn [elem]
+                                                                   (and (seq? elem)
+                                                                        (symbol? (first elem))))
+                                                                 find-elems))
+                                    results (if (and has-aggregates?
+                                                     all-aggregates?
+                                                     (empty? (seq results)))
+                                              (let [default-row (mapv (fn [elem]
+                                                                        (let [agg-name (name (first elem))]
+                                                                          (if (or (= agg-name "count")
+                                                                                  (= agg-name "count-distinct")
+                                                                                  (= agg-name "filter-count")
+                                                                                  (= agg-name "filter-count-distinct"))
+                                                                            0
+                                                                            nil)))
                                                                       find-elems)]
                                                 [default-row])
                                               results)

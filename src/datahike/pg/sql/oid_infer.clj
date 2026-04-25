@@ -165,12 +165,21 @@
    "array_fill"    :arg-type})
 
 (def sql-aggregate->return-oid
-  "Aggregate function → return OID. SUM/AVG/MIN/MAX propagate the
-   argument type; COUNT is always INT8."
+  "Aggregate function → return OID. SUM/MIN/MAX propagate the argument
+   type; COUNT is always INT8.
+
+   AVG is always FLOAT8 because `filter-avg` divides by `(count vs)` and
+   wraps the sum in `double` — the runtime result is always a Double
+   even for integer inputs. PG's own `AVG(int)` returns NUMERIC; mapping
+   to FLOAT8 here keeps us aligned with the actual runtime type so
+   clients (Metabase, pgjdbc) don't truncate the fractional part on the
+   way back. Integer inputs were previously inferred as INT8 via
+   `:arg-type`, which made Metabase render `AVG(total_cents) = 4049.75`
+   as `4049`."
   {"count"          types/oid-int8
    "count_distinct" types/oid-int8
    "sum"            :arg-type
-   "avg"            :arg-type
+   "avg"            types/oid-float8
    "min"            :arg-type
    "max"            :arg-type
    "stddev"         types/oid-float8
@@ -180,7 +189,14 @@
    "var_samp"       types/oid-float8
    "var_pop"        types/oid-float8
    "median"         :arg-type
-   "corr"           types/oid-float8})
+   "corr"           types/oid-float8
+   ;; Ordered-set aggregates (WITHIN GROUP). PG: percentile_cont
+   ;; returns FLOAT8 for numeric/float input, INTERVAL for interval;
+   ;; we only support numeric here so FLOAT8 covers it. percentile_disc
+   ;; returns the input type. mode also returns the input type.
+   "percentile_cont" types/oid-float8
+   "percentile_disc" :arg-type
+   "mode"            :arg-type})
 
 ;; ---------------------------------------------------------------------------
 ;; Inference
@@ -427,6 +443,27 @@
 
       ;; --- Function / aggregate ----------------------------------------
       (instance? Function expr) (function-oid expr env)
+
+      ;; --- AnalyticExpression — window fns (OVER) and ordered-set
+      ;; aggregates (WITHIN GROUP). Aggregate name lives on getName();
+      ;; the value-bearing argument is either getExpression() (window
+      ;; / FILTER aggregates) or the first ORDER BY element (WITHIN
+      ;; GROUP ordered-set aggregates like PERCENTILE_DISC, MODE).
+      (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
+      (let [^net.sf.jsqlparser.expression.AnalyticExpression ae expr
+            fname (str/lower-case (.getName ae))
+            rule (or (get sql-aggregate->return-oid fname)
+                     (get sql-fn->return-oid fname))
+            arg-expr (or (.getExpression ae)
+                         (when-let [obs (.getOrderByElements ae)]
+                           (when (seq obs)
+                             (.getExpression
+                              ^net.sf.jsqlparser.statement.select.OrderByElement
+                              (first obs)))))]
+        (cond
+          (integer? rule)        rule
+          (= rule :arg-type)     (when arg-expr (expr-oid arg-expr env))
+          :else                  nil))
 
       ;; --- EXTRACT() --- always returns float8 in PG --------------------
       (instance? ExtractExpression expr) types/oid-float8

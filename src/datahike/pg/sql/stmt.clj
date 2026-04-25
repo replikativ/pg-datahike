@@ -270,12 +270,13 @@
                 ;; :db.unique/identity (or explicitly named by
                 ;; :datahike.pg/references). Same mechanic as db_id
                 ;; unification: the ref attr's value IS the target
-                ;; entity-id, so we col-var! the ref to get ?ref-var and
-                ;; rebind the target alias's entity-var to it. The
+                ;; entity-id, so we get the raw ref-eid var (not the
+                ;; deref'd target-PK that ref-targeted col-var! returns)
+                ;; and rebind the target alias's entity-var to it. The
                 ;; target's unique column then resolves via the bound
                 ;; entity.
                 (let [{:keys [ref-resolved ref-attr target-alias]} fk-via-ref
-                      ref-var (ctx/col-var! ctx ref-resolved)]
+                      ref-var (ctx/ref-eid-var! ctx ref-resolved)]
                   (swap! (:entity-vars ctx) assoc target-alias ref-var)
                   (when (#{:left :right :full} jtype)
                     (reset! ref-info {:ref-var ref-var
@@ -287,7 +288,11 @@
                 ref-side
                 (do
                 ;; Always create the ref pattern [?left-eid :ref-attr ?ref-var]
-                  (let [ref-var (ctx/col-var! ctx ref-side)
+                  ;; Use ref-eid-var! to get the raw ref entity-id var —
+                  ;; col-var! would return the SQL-projection deref'd PK
+                  ;; for ref-targeted attrs, which is the wrong thing to
+                  ;; rebind a target alias's entity-var to.
+                  (let [ref-var (ctx/ref-eid-var! ctx ref-side)
                         db-id-alias (second db-id-side)]
                   ;; Always unify entity vars (the right-table entity IS the ref value)
                     (swap! (:entity-vars ctx) assoc db-id-alias ref-var)
@@ -658,41 +663,67 @@
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have
         ;; longs.
+        ;;
+        ;; Predicate-based: Datahike's :db.type/long requires *exactly*
+        ;; Long (the schema spec is `(= (class %) java.lang.Long)`),
+        ;; so an Integer-returning aggregate like COUNT — or any Java
+        ;; int promoted by JDBC unwrapping — would otherwise fall to
+        ;; the :else string branch and reject the row at transact
+        ;; time. The data-tx step coerces each value to the inferred
+        ;; type's expected class (see col-coerce).
+        fits-long? (fn [^Number n]
+                     (and (<= Long/MIN_VALUE (.longValue n))
+                          (<= (.longValue n) Long/MAX_VALUE)))
+        sample-rows (fn [col-idx]
+                      (keep (fn [row]
+                              (let [vs (if (sequential? row) (vec row) [row])
+                                    v  (nth vs col-idx nil)]
+                                (when (and (some? v) (not= :__null__ v)) v)))
+                            sub-results))
         col-vtype (fn [col-idx]
-                    (let [samples (keep (fn [row]
-                                          (let [vs (if (sequential? row) (vec row) [row])
-                                                v  (nth vs col-idx nil)]
-                                            (when (and (some? v) (not= :__null__ v)) v)))
-                                        sub-results)]
-                      ;; Match the speculative-db's :db/valueType to the
-                      ;; runtime types Datahike actually accepts. Hitting
-                      ;; the :else string branch when samples include a
-                      ;; Date / UUID / etc. makes the subsequent transact
-                      ;; reject the row with a schema-mismatch error
-                      ;; (datahike.db.transaction "Bad entity value …
-                      ;; Must be conform to: string?"). Test trigger:
-                      ;; LEFT JOIN to a derived table that projects
-                      ;; `customer.created_at` (DateTime) — Metabase
-                      ;; emits this from the Question Builder whenever a
-                      ;; user joins through a temporal column.
+                    (let [samples (sample-rows col-idx)]
                       (cond
-                        (every? #(instance? Long %)             samples) :db.type/long
-                        (every? #(instance? Double %)           samples) :db.type/double
-                        (every? #(instance? Boolean %)          samples) :db.type/boolean
+                        ;; Order matters: Boolean must come before
+                        ;; integer? (false/true don't satisfy
+                        ;; integer? but Booleans aren't numbers).
+                        (every? boolean? samples)               :db.type/boolean
                         (every? #(instance? java.util.Date %)   samples) :db.type/instant
                         (every? #(instance? java.util.UUID %)   samples) :db.type/uuid
                         (every? #(instance? java.math.BigDecimal %) samples) :db.type/bigdec
+                        (and (every? integer? samples)
+                             (every? #(or (instance? Long %)
+                                          (instance? Integer %)
+                                          (instance? Short %)
+                                          (instance? Byte %)
+                                          (and (instance? java.math.BigInteger %)
+                                               (fits-long? %)))
+                                     samples))
+                        :db.type/long
                         (every? #(instance? java.math.BigInteger %) samples) :db.type/bigint
+                        (every? float? samples)                 :db.type/double
                         :else :db.type/string)))
+        ;; Coercion to the runtime class Datahike's schema spec
+        ;; demands. Without this, Integer values (e.g. COUNT result)
+        ;; pass type inference but are rejected by `db-with` because
+        ;; the spec is `(= (class %) java.lang.Long)`.
+        col-coerce (fn [vtype]
+                     (case vtype
+                       :db.type/long    long
+                       :db.type/double  double
+                       :db.type/string  str
+                       identity))
         ;; Always emit a row-existence marker so `t.*` expansion in
         ;; the OUTER select has an entity anchor even when every
         ;; non-marker column is NULL on a given row (e.g. Metabase's
         ;; `NULL as role` projection in build_privilege_map).
         row-marker (pgs/row-marker-attr target-name)
+        ;; Per-column inferred type + coercion fn, computed once.
+        col-types (mapv (fn [i] (col-vtype i)) (range (count sub-aliases)))
+        col-coercions (mapv col-coerce col-types)
         schema-tx (conj
                    (vec (for [[i a] (map-indexed vector sub-aliases)]
                           {:db/ident (keyword target-name a)
-                           :db/valueType (col-vtype i)
+                           :db/valueType (nth col-types i)
                            :db/cardinality :db.cardinality/one}))
                    {:db/ident       row-marker
                     :db/valueType   :db.type/boolean
@@ -704,7 +735,8 @@
                                             (fn [i a]
                                               (let [v (nth vals i nil)]
                                                 (when (and (some? v) (not= :__null__ v))
-                                                  [(keyword target-name a) v])))
+                                                  [(keyword target-name a)
+                                                   ((nth col-coercions i) v)])))
                                             sub-aliases))]
                          ;; Always include the row marker so the
                          ;; entity exists even if every projected
@@ -790,11 +822,13 @@
         derived-alias-set (into #{} (map :alias) derived-joins)
 
         ;; Create context
+        hints (pgs/schema-hints db)
         ctx (ctx/make-ctx schema table-aliases default-table
                           {:db db
                            :parse-sql params/*parse-sql*
-                           :hints (pgs/schema-hints db)
-                           :derived-aliases derived-alias-set})
+                           :hints hints
+                           :derived-aliases derived-alias-set
+                           :ref-targets (pgs/derive-ref-targets schema hints)})
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
@@ -896,11 +930,56 @@
                       partition-list (.getPartitionExpressionList ae)
                       order-by-list (.getOrderByElements ae)
                       window-elem (.getWindowElement ae)
+                      ;; AnalyticType.WITHIN_GROUP is the ordered-set
+                      ;; aggregate flavor (PERCENTILE_CONT / _DISC, MODE).
+                      ;; It carries an ORDER BY clause but is NOT a
+                      ;; window function — we must NOT route it through
+                      ;; the partition+frame post-processing path.
+                      analytic-type (str (.getType ae))
+                      within-group? (= "WITHIN_GROUP" analytic-type)
+                      ordered-set-fn? (contains? #{"percentile_cont"
+                                                   "percentile_disc"
+                                                   "mode"} fname)
                       ranking-fns #{"row_number" "rank" "dense_rank" "ntile"
                                     "percent_rank" "cume_dist" "lag" "lead"}
-                      is-window? (or (seq partition-list) (seq order-by-list)
-                                     window-elem (contains? ranking-fns fname))]
-                  (if is-window?
+                      is-window? (and (not within-group?)
+                                      (or (seq partition-list) (seq order-by-list)
+                                          window-elem (contains? ranking-fns fname)))]
+                  (cond
+                    ;; Ordered-set aggregate via WITHIN GROUP — translate
+                    ;; with the same pair-aggregate pattern filter-corr
+                    ;; uses: the percentile fraction (constant per query)
+                    ;; rides alongside each per-row x value as a
+                    ;; `[p x]` vector, and the aggregate fn unpacks p
+                    ;; from the first pair. MODE has no parameter and
+                    ;; receives raw x values.
+                    (and within-group? ordered-set-fn?)
+                    (do
+                      (reset! has-aggregates? true)
+                      (when (empty? order-by-list)
+                        (throw (ex-info (str fname " requires WITHIN GROUP (ORDER BY ...)")
+                                        {:fname fname})))
+                      (let [first-ob ^net.sf.jsqlparser.statement.select.OrderByElement
+                            (first order-by-list)
+                            x-expr (.getExpression first-ob)
+                            x-var (expr/translate-expr ctx x-expr)
+                            x-var (if (seq? x-var) (ctx/materialize-arg! ctx x-var) x-var)
+                            agg-fn-sym (get fns/sql-aggregate->datalog fname)]
+                        (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+                        (cond
+                          ;; MODE — no parameter, aggregate raw values
+                          (= fname "mode")
+                          (swap! find-elements conj (list agg-fn-sym x-var))
+                          ;; PERCENTILE_CONT/_DISC — pair `p` with each x
+                          :else
+                          (let [p-val (expr/translate-expr ctx inner-expr)
+                                p-val (if (seq? p-val) (ctx/materialize-arg! ctx p-val) p-val)
+                                pair-var (ctx/fresh-var! ctx)]
+                            (ctx/add-clause! ctx [(list 'vector p-val x-var) pair-var])
+                            (swap! find-elements conj (list agg-fn-sym pair-var))))
+                        (swap! find-aliases conj (or alias-str fname))))
+
+                    is-window?
                     ;; Window function: collect spec for server-side post-processing.
                     ;; All base columns must be in :find so the post-processor can
                     ;; partition, sort, and compute values from the result tuples.
@@ -983,6 +1062,7 @@
                       (swap! window-specs conj (assoc win-spec :alias (or alias-str fname))))
 
                     ;; Not a window — handle as FILTER aggregate or plain aggregate
+                    :else
                     (do
                       (reset! has-aggregates? true)
                       (if (and filter-expr agg-sym)
