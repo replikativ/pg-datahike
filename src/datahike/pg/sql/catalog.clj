@@ -96,7 +96,14 @@
   [^Table t]
   (when t
     (let [raw (str/lower-case (unquote-ident (.getName t)))
-          schema (when-let [s (.getSchemaName t)] (str/lower-case s))
+          ;; JSqlParser returns getSchemaName verbatim — including any
+          ;; surrounding double-quotes — so a `"information_schema"."x"`
+          ;; reference would compare as the literal string
+          ;; `"information_schema"` (quotes included) and miss every
+          ;; cond branch below. Strip them the same way we do for the
+          ;; table name itself.
+          schema (when-let [s (.getSchemaName t)]
+                   (str/lower-case (unquote-ident s)))
           normalized (cond
                        (= schema "information_schema") (str "information_schema_" raw)
                        (= schema "pg_catalog")          raw

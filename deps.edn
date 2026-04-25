@@ -24,10 +24,13 @@
          :main-opts   ["-m" "kaocha.runner"]}
 
   ;; Dev REPL with test code on the classpath + nREPL for editor hook-up.
+  ;; Uses local datahike checkout so engine-side fixes (e.g. planner
+  ;; resolve-pred-fn :consts lookup) are picked up without a release.
   :dev {:extra-paths ["test"]
         :extra-deps  {nrepl/nrepl            {:mvn/version "1.0.0"}
                       lambdaisland/kaocha    {:mvn/version "1.91.1392"}
-                      org.postgresql/postgresql {:mvn/version "42.7.3"}}}
+                      org.postgresql/postgresql {:mvn/version "42.7.3"}
+                      org.replikativ/datahike {:local/root "/home/christian-weilbach/Development/datahike"}}}
 
   ;; Server launcher — pairs with test/integration/start_pgwire.clj.
   ;; Starts pgwire on :15432 + nREPL on :15433 for dual SQL + Datalog

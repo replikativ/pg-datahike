@@ -953,9 +953,15 @@
                 (some? v))
         identity (interpret-form (first args) bindings)
         str   (apply str (mapv #(interpret-form % bindings) args))
-        ;; Fallback: try to resolve and call
-        (let [f (resolve op)
-              evaluated-args (mapv #(interpret-form % bindings) args)]
+        ;; Fallback: a generated fn-param symbol bound by the Datalog
+        ;; runtime to a user-registered fn (e.g. `?pg-format6` for
+        ;; format(), `?case-fn7`, `?in-set8`) — call it on the
+        ;; interpreted args. Falls back to clojure.core resolve for
+        ;; literal symbols like `count`, `min`.
+        (let [evaluated-args (mapv #(interpret-form % bindings) args)
+              f-from-bindings (when (symbol? op) (get bindings op))
+              f (or (when (fn? f-from-bindings) f-from-bindings)
+                    (resolve op))]
           (when f (apply f evaluated-args)))))
 
     :else form))

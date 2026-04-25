@@ -2166,12 +2166,25 @@
    Applied at Execute time for prepared statements:
    - `:in-args` vector may contain ParamRef sentinels (one per `$N`
      the SELECT translator encountered).
-   - `:tx-data` for INSERT may contain ParamRef at any depth."
+   - `:tx-data` for INSERT may contain ParamRef at any depth.
+   - `:sub-results` (UNION / INTERSECT / EXCEPT branches) are parsed
+     independently, so ParamRefs live inside each branch's :in-args.
+     Recurse so the set-op executor sees real values, not sentinels."
   [parsed bound]
   (let [fetch (fn [idx] (nth bound idx))]
     (cond-> parsed
-      (contains? parsed :in-args) (update :in-args sql/substitute-params fetch)
-      (contains? parsed :tx-data) (update :tx-data sql/substitute-params fetch))))
+      (contains? parsed :in-args)
+      (update :in-args sql/substitute-params fetch)
+      (contains? parsed :tx-data)
+      (update :tx-data sql/substitute-params fetch)
+      (contains? parsed :sub-results)
+      (update :sub-results
+              (fn [subs]
+                (mapv (fn [sub]
+                        (cond-> sub
+                          (contains? sub :in-args)
+                          (update :in-args sql/substitute-params fetch)))
+                      subs))))))
 
 (def ^:private compat-presets
   "Named bundles for :compat. Each maps to a :silently-accept set
@@ -3191,6 +3204,37 @@
             (if sources
               (.withColumnSources qr (first sources) (second sources))
               qr))
+
+          ;; UNION / UNION ALL / INTERSECT / EXCEPT — the executor
+          ;; runs each branch separately and combines, but pgjdbc on
+          ;; Extended Query needs RowDescription before the first
+          ;; DataRow at Execute time. Without a Describe response
+          ;; here, the client falls through to "Received resultset
+          ;; tuples, but no field structure for them" the moment
+          ;; Execute writes its DataRows. Use the first sub-result's
+          ;; metadata: SQL set ops require all branches to agree on
+          ;; arity + column types, so the first branch is canonical.
+          (= :set-operation (:type parsed))
+          (when-let [sub (first (:sub-results parsed))]
+            (let [aliases (:find-aliases sub)
+                  db (d/db conn)
+                  resolved (compute-schema-oids sub db)
+                  item-oids (:select-item-oids sub)
+                  oids (int-array
+                        (for [i (range (count aliases))]
+                          (let [schema-oid (aget ^ints resolved i)
+                                item-oid (when item-oids
+                                           (nth item-oids i nil))]
+                            (cond
+                              (not= schema-oid -1) schema-oid
+                              (some? item-oid)     item-oid
+                              :else                PgWireServer/OID_TEXT))))]
+              (PgWireServer$QueryResult.
+               (into-array String aliases)
+               oids
+               (into-array (Class/forName "[Ljava.lang.String;")
+                           (make-array String 0 0))
+               "SELECT 0")))
 
           ;; Any system query whose parse attached :metadata (via
           ;; system-result-metadata) — covers :current-database, :now,
