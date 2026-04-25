@@ -208,8 +208,13 @@
              :value (-> base (subs 1 (dec (count base)))
                         (str/replace "''" "'"))}
             ;; Known zero-arg functions. Match either form: `now`,
-            ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`.
-            (re-matches #"(?i)(?:now|current_timestamp|statement_timestamp|transaction_timestamp|clock_timestamp)(?:\(\))?"
+            ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`. Also
+            ;; accept the AT TIME ZONE wrapper Odoo uses
+            ;; (`now() AT TIME ZONE 'UTC'`) — for our `:db.type/instant`
+            ;; columns the timezone wrapper is a no-op since we don't
+            ;; track per-column timezone offsets, so it folds into
+            ;; plain `now`.
+            (re-matches #"(?i)(?:now|current_timestamp|statement_timestamp|transaction_timestamp|clock_timestamp)(?:\(\))?(?:\s+at\s+time\s+zone\s+'[^']+')?"
                         base)
             {:kind :fn :value "now"}
             (re-matches #"(?i)current_date(?:\(\))?" base)

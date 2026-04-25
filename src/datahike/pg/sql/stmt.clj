@@ -701,6 +701,20 @@
                           has-bigint? :db.type/bigdec  ; promote to numeric to keep precision
                           has-float?  :db.type/double
                           :else       :db.type/long)))
+        ;; PG-style type categorisation per `select_common_type_from_oids`
+        ;; (src/backend/parser/parse_coerce.c). Mixed values within a
+        ;; category promote per category rules; cross-category falls to
+        ;; :db.type/string with a warning (PG would error 42804 — we
+        ;; soft-fail for compatibility with the existing EAV-as-NULL
+        ;; design where ad-hoc UNIONs across types are tolerated).
+        value-category (fn [v]
+                         (cond
+                           (boolean? v)                              :boolean
+                           (instance? java.util.Date v)              :datetime
+                           (instance? java.util.UUID v)              :uuid
+                           (number? v)                               :numeric
+                           (or (string? v) (keyword? v) (symbol? v)) :string
+                           :else                                     :unknown))
         col-vtype (fn [col-idx]
                     (let [samples (sample-rows col-idx)
                           ;; OID-hint default — used when samples are
@@ -715,30 +729,34 @@
                         (empty? samples)
                         (or hint-vtype :db.type/string)
 
-                        ;; Order matters: Boolean must come before
-                        ;; integer? (false/true don't satisfy
-                        ;; integer? but Booleans aren't numbers).
-                        (every? boolean? samples)               :db.type/boolean
-                        (every? #(instance? java.util.Date %)   samples) :db.type/instant
-                        (every? #(instance? java.util.UUID %)   samples) :db.type/uuid
-
-                        ;; Numeric LUB — covers homogeneous bigdec /
-                        ;; long / double, AND mixed numeric (e.g. a
-                        ;; column with both Long 100 and Double 99.5
-                        ;; that previously fell through to :string).
-                        ;; The hint nudges toward bigdec when the
-                        ;; declared column was numeric but samples are
-                        ;; all Long.
-                        (every? number? samples)
-                        (let [lub (numeric-lub samples)]
+                        :else
+                        (let [cats (into #{} (map value-category) samples)]
                           (cond
-                            (and (= lub :db.type/long)
-                                 (= hint-vtype :db.type/bigdec)) :db.type/bigdec
-                            (and (= lub :db.type/long)
-                                 (= hint-vtype :db.type/double)) :db.type/double
-                            :else lub))
+                            ;; Single-category — straightforward mapping.
+                            (= cats #{:boolean})  :db.type/boolean
+                            (= cats #{:datetime}) :db.type/instant
+                            (= cats #{:uuid})     :db.type/uuid
+                            (= cats #{:string})   :db.type/string
 
-                        :else (or hint-vtype :db.type/string))))
+                            (= cats #{:numeric})
+                            (let [lub (numeric-lub samples)]
+                              (cond
+                                (and (= lub :db.type/long)
+                                     (= hint-vtype :db.type/bigdec)) :db.type/bigdec
+                                (and (= lub :db.type/long)
+                                     (= hint-vtype :db.type/double)) :db.type/double
+                                :else lub))
+
+                            ;; Cross-category. PG would raise
+                            ;; ERRCODE_DATATYPE_MISMATCH (42804). We
+                            ;; coerce to :db.type/string and stringify
+                            ;; values at the boundary — matches the
+                            ;; existing EAV-as-NULL leniency. Exception:
+                            ;; if the OID hint is set, trust it (callers
+                            ;; that ran oid-infer have a more
+                            ;; authoritative answer than sampled rows).
+                            :else
+                            (or hint-vtype :db.type/string))))))
         ;; Coercion to the runtime class Datahike's schema spec
         ;; demands. Without this, Integer values (e.g. COUNT result)
         ;; pass type inference but are rejected by `db-with` because
@@ -1357,9 +1375,14 @@
                  :table-aliases table-aliases
                  :default-table default-table
                  :hints (pgs/schema-hints db)}
+        ;; OID inference per select-item. The expr-oid walker handles
+        ;; AnalyticExpression (windows, WITHIN GROUP) and arithmetic
+        ;; combinations of aggregates, so we don't gate on window/
+        ;; compound — both inferences are sound. Padding to
+        ;; find-aliases length absorbs extra entries those features
+        ;; add to :find that don't map 1:1 to a select-item.
         select-item-oids
-        (when (and (empty? @window-specs) (empty? @compound-exprs))
-          (let [acc (reduce
+        (let [acc (reduce
                      (fn [v ^SelectItem item]
                        (let [expr (.getExpression item)]
                          (cond
@@ -1394,7 +1417,7 @@
                 ;; for :with semantics. Pad with nil so the vector
                 ;; lines up index-for-index with find-aliases.
                 n (count @find-aliases)]
-            (vec (take n (concat acc (repeat nil))))))
+            (vec (take n (concat acc (repeat nil)))))
 
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
         ;; from different entity combinations that produce identical values.

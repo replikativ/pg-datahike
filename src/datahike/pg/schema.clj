@@ -134,22 +134,40 @@
             k))
         schema))
 
-(def ^:private ref-target-warned
-  "Per-process atom of `[warning-kind ref-attr]` keys we've already
-   logged so the same warning doesn't spam every translate. Cleared
-   only on JVM restart — schemas are usually stable within a session."
-  (atom #{}))
+;; Per-(schema, hints) warn dedup: the warning set is keyed on the
+;; schema map's identity so two different schemas (e.g. across tests)
+;; warn independently, and the same schema doesn't re-warn every
+;; translate. Schema is the natural scope because the warnings here
+;; are about schema-level facts (ref-target convention misses).
+;;
+;; WeakHashMap means GC reclaims warning state when a schema goes
+;; away (test conn closed, server shut down) — a long-running server
+;; that re-creates schemas during its lifetime gets fresh state per
+;; schema instance without manual cleanup.
+(def ^:private schema-warn-sets
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- schema-warn-set
+  "Get-or-create the warned-key set for a given schema map."
+  [schema]
+  (or (.get ^java.util.Map schema-warn-sets schema)
+      (let [a (atom #{})]
+        (.put ^java.util.Map schema-warn-sets schema a)
+        a)))
 
 (defn- warn-once!
-  "Print a one-shot warning to *err*, keyed so repeated calls with the
-   same key are no-ops. Plain println — pgwire-datahike doesn't
-   currently depend on a logging library, and stdout is reserved for
-   the seed harness's query trace."
-  [k msg]
-  (when-not (contains? @ref-target-warned k)
-    (swap! ref-target-warned conj k)
-    (binding [*out* *err*]
-      (println (str "[pgwire-datahike] WARN: " msg)))))
+  "Print a one-shot warning to *err*, keyed so repeated calls for the
+   same `(schema, k)` are no-ops. The dedup is scoped to the schema
+   value — distinct schemas (e.g. across test runs that build fresh
+   conns) warn independently, and a long-running server that
+   re-creates a schema after a fix gets a fresh warning emit. Plain
+   println; pgwire-datahike doesn't depend on a logging library yet."
+  [schema k msg]
+  (let [warned (schema-warn-set schema)]
+    (when-not (contains? @warned k)
+      (swap! warned conj k)
+      (binding [*out* *err*]
+        (println (str "[pgwire-datahike] WARN: " msg))))))
 
 (def ^:private ref-targets-cache
   "Memoization for `derive-ref-targets`. Outer key is the schema map
@@ -237,28 +255,37 @@
           (.put ^java.util.Map inner hint-key result)
           result))))
 
-(defn- ref-target-namespaces
-  "Query the live db for the distinct namespaces of entities a given
-   ref attr points to. An entity's namespace is taken from any one of
-   its attrs (`:db/*` and `:datahike.pg/*` excluded — those don't
-   characterise the entity).
+(defn- bulk-ref-target-namespaces
+  "Single Datalog query that returns `{ref-attr → #{target-namespace}}`
+   for every ref attr in `ref-attrs` at once. Avoids N+1 round-trips
+   when `validate-ref-targets!` cross-checks the schema against live
+   data — which it does on every translate-select.
 
-   Returns a set of strings (the namespace names). Empty set when no
-   entity uses the attr yet."
-  [db ref-attr]
-  (let [q-fn (requiring-resolve 'datahike.api/q)]
-    (->> (q-fn '{:find  [?attr]
-                 :in    [$ ?ref]
-                 :where [[_ ?ref ?target]
-                         [?target ?attr _]]}
-               db ref-attr)
-         (keep (fn [[attr]]
-                 (when (keyword? attr)
-                   (let [ns (namespace attr)]
-                     (when (and ns
-                                (not (contains? internal-ns-prefixes ns)))
-                       ns)))))
-         set)))
+   Empty namespace sets for refs with no current entities pass through
+   unchanged so the caller can trust the convention until data
+   appears."
+  [db ref-attrs]
+  (when (and db (seq ref-attrs))
+    (let [q-fn (requiring-resolve 'datahike.api/q)
+          ;; One query: walk every datom whose attr is in the
+          ;; ref-attrs set, follow the ref, then take any attr on the
+          ;; target as a namespace witness. Filtering internal attrs
+          ;; here keeps the post-processing simple.
+          rows (q-fn '{:find  [?ref ?attr]
+                       :in    [$ [?ref ...]]
+                       :where [[_ ?ref ?target]
+                               [?target ?attr _]]}
+                     db (vec ref-attrs))]
+      (reduce (fn [acc [ref-attr attr]]
+                (if (and (keyword? attr)
+                         (some? (namespace attr))
+                         (not (contains? internal-ns-prefixes (namespace attr))))
+                  (update acc ref-attr (fnil conj #{}) (namespace attr))
+                  acc))
+              ;; Initialise every ref to empty set so the caller can
+              ;; tell "no data yet" from "missing entry".
+              (zipmap ref-attrs (repeat #{}))
+              rows))))
 
 (defn validate-ref-targets!
   "Cross-check `ref-targets` (from `derive-ref-targets`) against the
@@ -283,47 +310,50 @@
   (when (and db schema)
     (doseq [ref-attr (ref-attrs-from-schema schema)
             :when (not (contains? ref-targets ref-attr))]
-      (warn-once! [::no-target ref-attr]
+      (warn-once! schema [::no-target ref-attr]
                   (str "ref attr " ref-attr " has no SQL FK target — "
                        "set :datahike.pg/references hint to enable "
                        "FK-style projection (otherwise it projects as "
                        "the raw entity-id)."))))
   (if-not (and db (seq ref-targets))
     ref-targets
-    (reduce-kv
-     (fn [acc ref-attr target-entry]
-       (let [;; target-entry is either `target-attr` (one) or
-             ;; `[target-attr :many]` (many) — see derive-ref-targets.
-             target-pk (if (vector? target-entry) (first target-entry) target-entry)
-             actual-ns (ref-target-namespaces db ref-attr)
-             expected-ns (namespace target-pk)]
-         (cond
-           ;; No data yet — trust the convention/hint.
-           (zero? (count actual-ns)) (assoc acc ref-attr target-entry)
+    (let [;; One bulk query for every ref attr in ref-targets. Replaces
+          ;; the old per-attr Datalog round-trip — for a schema with
+          ;; N ref attrs, drops translate-time cost from O(N) round-
+          ;; trips to 1.
+          ns-by-ref (bulk-ref-target-namespaces db (keys ref-targets))]
+      (reduce-kv
+       (fn [acc ref-attr target-entry]
+         (let [target-pk (if (vector? target-entry) (first target-entry) target-entry)
+               actual-ns (get ns-by-ref ref-attr #{})
+               expected-ns (namespace target-pk)]
+           (cond
+             ;; No data yet — trust the convention/hint.
+             (zero? (count actual-ns)) (assoc acc ref-attr target-entry)
 
-           (= 1 (count actual-ns))
-           (if (= (first actual-ns) expected-ns)
-             (assoc acc ref-attr target-entry)
-             (do (warn-once! [::namespace-mismatch ref-attr]
-                             (str "ref attr " ref-attr " resolves to target "
-                                  target-pk " (namespace " expected-ns ")"
-                                  " but data points to namespace "
-                                  (first actual-ns)
-                                  ". SQL projection will fall back to the "
-                                  "raw entity-id; set :datahike.pg/references "
-                                  "to override."))
-                 acc))
+             (= 1 (count actual-ns))
+             (if (= (first actual-ns) expected-ns)
+               (assoc acc ref-attr target-entry)
+               (do (warn-once! schema [::namespace-mismatch ref-attr]
+                               (str "ref attr " ref-attr " resolves to target "
+                                    target-pk " (namespace " expected-ns ")"
+                                    " but data points to namespace "
+                                    (first actual-ns)
+                                    ". SQL projection will fall back to the "
+                                    "raw entity-id; set :datahike.pg/references "
+                                    "to override."))
+                   acc))
 
-           :else
-           (do (warn-once! [::polymorphic-ref ref-attr]
-                           (str "ref attr " ref-attr " is polymorphic — "
-                                "entities span namespaces " (sort actual-ns)
-                                ". SQL projection falls back to the raw "
-                                "entity-id; set :datahike.pg/references to "
-                                "force a single target."))
-               acc))))
-     {}
-     ref-targets)))
+             :else
+             (do (warn-once! schema [::polymorphic-ref ref-attr]
+                             (str "ref attr " ref-attr " is polymorphic — "
+                                  "entities span namespaces " (sort actual-ns)
+                                  ". SQL projection falls back to the raw "
+                                  "entity-id; set :datahike.pg/references to "
+                                  "force a single target."))
+                 acc))))
+       {}
+       ref-targets))))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`

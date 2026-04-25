@@ -210,10 +210,13 @@
       (str/replace #"(?i)\b(index|key)\s+varchar" "\"$1\" varchar")
       ;; Standalone PRIMARY KEY(col) in an INHERITS table body.
       (str/replace #"(?i)\(\s*primary\s+key\s*\([^)]*\)\s*\)" "(id serial)")
-      ;; Peel outer parens from DEFAULT (now() AT TIME ZONE 'x') so
-      ;; JSqlParser's column-spec model parses it.
-      (str/replace #"(?i)\bDEFAULT\s+\((now\s*\(\s*\)\s+at\s+time\s+zone\s+'[^']+')\)"
-                   "DEFAULT $1")
+      ;; (Removed: DEFAULT (now() AT TIME ZONE 'X') paren-peel.
+      ;;  JSqlParser 5.2 parses the parenthesised form natively. The
+      ;;  old regex stripped the parens, which then broke the AT TIME
+      ;;  ZONE expression because the column-spec parser doesn't
+      ;;  accept it without parens — exactly the opposite of what
+      ;;  the regex was trying to achieve. Caught by Odoo's
+      ;;  base_data.sql which uses this exact pattern.)
       ;; ALTER TABLE … TYPE … USING expr — strip the USING half.
       (str/replace #"(?i)(\bTYPE\s+\w+(?:\s+\w+)*)\s+USING\s+.+$" "$1")
       ;; ALTER COLUMN … DROP DEFAULT — no-op in our schema.
