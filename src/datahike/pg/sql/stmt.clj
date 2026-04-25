@@ -138,7 +138,21 @@
                     (unquote-ident (str/trim (.getName ^Alias al))))]
             {:name a :alias a}))
         right-alias (or alias name)
-        on-exprs (some-> (.getOnExpressions join) seq)
+        ;; Multi-condition ON (A AND B AND ...) lands as a single
+        ;; AndExpression, not split per `getOnExpressions`. Flatten so
+        ;; each conjunct is recognised as its own EqualsTo and the
+        ;; LEFT-JOIN branch records ref-info for every join key.
+        ;; Without this, a multi-cond ON falls through to the generic
+        ;; predicate path and emits INNER-style equality predicates,
+        ;; which break LEFT JOIN semantics on empty right tables.
+        flatten-and (fn flatten-and [e]
+                      (if (instance? net.sf.jsqlparser.expression.operators.conditional.AndExpression e)
+                        (let [^net.sf.jsqlparser.expression.operators.conditional.AndExpression ae e]
+                          (concat (flatten-and (.getLeftExpression ae))
+                                  (flatten-and (.getRightExpression ae))))
+                        [e]))
+        on-exprs (some-> (.getOnExpressions join) seq
+                         (->> (mapcat flatten-and)))
         ;; Track ref-attr info for outer join post-processing
         ref-info (atom nil)]
     ;; For LEFT/RIGHT/FULL joins, pre-register the right-alias entity var in
