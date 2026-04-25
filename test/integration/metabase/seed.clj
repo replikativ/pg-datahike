@@ -76,11 +76,8 @@
                                   (let [n (swap! query-counter inc)
                                         snippet (-> (str sql)
                                                     (clojure.string/replace #"\s+" " ")
-                                                    clojure.string/trim)
-                                        cap (if (> (count snippet) 240)
-                                              (str (subs snippet 0 240) "…")
-                                              snippet)]
-                                    (println (format "[q%04d] %s" n cap)))))}))
+                                                    clojure.string/trim)]
+                                    (println (format "[q%04d] %s" n snippet)))))}))
 
 ;; Expose conn + server as user-ns vars so the nREPL session can poke
 ;; at them without re-establishing.

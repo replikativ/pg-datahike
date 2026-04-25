@@ -2381,42 +2381,87 @@
           not-like? (.isNot e)
           case-insensitive? (.isCaseInsensitive e)
           col (translate-expr ctx (.getLeftExpression e))
-          pattern (translate-expr ctx (.getRightExpression e))
-          ;; Get ESCAPE character (default: backslash per PostgreSQL convention)
+          right-expr (.getRightExpression e)
+          pattern (translate-expr ctx right-expr)
+          ;; ESCAPE character (default: backslash per PostgreSQL).
           ^Character escape-char (let [esc (.getEscape e)]
                                    (if (and esc (not (str/blank? (str esc))))
                                      (Character/valueOf (char (first (str esc))))
                                      (Character/valueOf \\)))
-          ;; Convert SQL LIKE to Java regex:
-          ;; 1. Process character-by-character to respect escape sequences
-          ;; 2. Escaped % or _ become literal matches
-          pat-str (str pattern)
-          regex-sb (StringBuilder. "^")
-          _ (loop [i 0]
-              (when (< i (count pat-str))
-                (let [c (.charAt ^String pat-str i)]
-                  (if (= c (.charValue escape-char))
-                    ;; Escape char: next character is literal
-                    (if (< (inc i) (count pat-str))
-                      (let [next-c (.charAt ^String pat-str (inc i))]
-                        (.append regex-sb (java.util.regex.Pattern/quote (str next-c)))
-                        (recur (+ i 2)))
-                      (recur (inc i)))
-                    (case c
-                      \% (do (.append regex-sb ".*") (recur (inc i)))
-                      \_ (do (.append regex-sb ".") (recur (inc i)))
-                      ;; Escape regex metacharacters
-                      (do (.append regex-sb (java.util.regex.Pattern/quote (str c)))
-                          (recur (inc i))))))))
-          _ (.append regex-sb "$")
-          regex-str (str regex-sb)
-          regex-str (if case-insensitive? (str "(?i)" regex-str) regex-str)
-          pred [(list 're-find (re-pattern regex-str) col)]
-          ;; Null-guard: re-find on :__null__ would throw; also SQL says NULL col → UNKNOWN → FALSE.
+          ;; Compile the SQL LIKE pattern → Java regex source. Same
+          ;; rules whether the pattern is known at parse time or not:
+          ;;   %  → .*       _  → .       <esc>X → literal X
+          ;;   anything else → Pattern/quote
+          like->regex (fn [^String pat-str]
+                        (let [sb (StringBuilder. "^")]
+                          (loop [i 0]
+                            (when (< i (count pat-str))
+                              (let [c (.charAt pat-str i)]
+                                (if (= c (.charValue escape-char))
+                                  (if (< (inc i) (count pat-str))
+                                    (do (.append sb (java.util.regex.Pattern/quote
+                                                     (str (.charAt pat-str (inc i)))))
+                                        (recur (+ i 2)))
+                                    (recur (inc i)))
+                                  (case c
+                                    \% (do (.append sb ".*") (recur (inc i)))
+                                    \_ (do (.append sb ".") (recur (inc i)))
+                                    (do (.append sb (java.util.regex.Pattern/quote (str c)))
+                                        (recur (inc i))))))))
+                          (.append sb "$")
+                          (str sb)))
+          ;; Same gate as RegExpMatchOperator: pre-compile only when the
+          ;; right side is an actual literal. With Extended Query, pgjdbc
+          ;; rewrites every LIKE-pattern literal to a JdbcParameter so
+          ;; the SQL reaches us as `LIKE $1 ESCAPE '\'` — `pattern` is a
+          ;; logic-var symbol then, and (str pattern) yields `?p1`,
+          ;; which compiled as a regex never matches anything. Defer
+          ;; compilation to per-row when the pattern isn't a literal.
+          literal? (or (instance? StringValue right-expr)
+                       (string? pattern))
+          ;; Null-guard: re-find on :__null__ would throw; SQL says
+          ;; NULL col → UNKNOWN → FALSE.
           guards (ctx/null-guard-clauses ctx [col])]
-      (if not-like?
-        (conj guards (list 'not pred))
-        (conj guards pred)))
+      (if literal?
+        (let [regex-str (cond-> (like->regex (str pattern))
+                          case-insensitive? (->> (str "(?i)")))
+              re-obj (re-pattern regex-str)
+              pred [(list 're-find re-obj col)]]
+          (if not-like?
+            (conj guards (list 'not pred))
+            (conj guards pred)))
+        ;; Parameter pattern → register an in-param matcher fn.
+        ;; Cache the last (str pat) so re-Bind/re-Execute on the same
+        ;; portal reuses the compiled Pattern.
+        (let [cache (volatile! [nil nil])
+              matcher (fn [pat-arg s]
+                        (and (some? s)
+                             (not= :__null__ s)
+                             (some? pat-arg)
+                             (not= :__null__ pat-arg)
+                             (let [pat-str (str pat-arg)
+                                   re-str (cond-> (like->regex pat-str)
+                                            case-insensitive? (->> (str "(?i)")))
+                                   [last-str ^java.util.regex.Pattern last-pat] @cache
+                                   p (if (= last-str re-str)
+                                       last-pat
+                                       (let [np (try (re-pattern re-str)
+                                                     (catch Throwable _ nil))]
+                                         (vreset! cache [re-str np])
+                                         np))]
+                               (and p (boolean (.find (.matcher ^java.util.regex.Pattern p
+                                                                (str s))))))))
+              fn-param (symbol (str "?like" (swap! (:var-counter ctx) inc)))
+              result-var (ctx/fresh-var! ctx)
+              col' (if (seq? col) (ctx/materialize-arg! ctx col) col)
+              pat' (if (seq? pattern) (ctx/materialize-arg! ctx pattern) pattern)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj matcher)
+          (swap! (:where-clauses ctx) conj
+                 [(list fn-param pat' col') result-var])
+          (if not-like?
+            (conj guards [(list 'not result-var)])
+            (conj guards [(list 'identity result-var)])))))
 
     (instance? NotExpression expr)
     (let [^NotExpression e expr
