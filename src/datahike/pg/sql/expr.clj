@@ -89,6 +89,33 @@
          interpret-form
          parse-timestamp-string)
 
+(defn- coerce-pg-array
+  "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
+   ops can index into it uniformly. Inputs come from three places:
+
+     - an ArrayConstructor literal that already produced a pg-arr;
+     - a catalog column (e.g. pg_constraint.conkey) stored as the PG
+       array text form `\"{1,2,3}\"`;
+     - a Clojure collection from a function call.
+
+   Returns a `pg-arr/array` or nil if the value isn't array-shaped.
+   Best-effort: a parse failure means the value wasn't an array, so
+   the calling op can return false / true per ANY/ALL semantics.
+
+   We default the element-type to `:int8` for catalog-text arrays —
+   pg_constraint.conkey is the only catalog column that flows through
+   this path, and its element type matches attnums (which we encode
+   as int8). Datahike doesn't preserve a type tag on the stored
+   string, so guessing wider than int2 keeps `(member? arr c)` from
+   failing on long-vs-short equality."
+  [v]
+  (cond
+    (pg-arr/array? v)   v
+    (string? v)         (try (pg-arr/from-pg-text v :int8)
+                             (catch Throwable _ nil))
+    (sequential? v)     (pg-arr/array :unknown (vec v))
+    :else               nil))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -1001,11 +1028,11 @@
               fn-param (symbol (str "?pg-" kind (swap! (:var-counter ctx) inc)))
               op-fn (case kind
                       "any" (fn [c a]
-                              (if (pg-arr/array? a)
-                                (boolean (pg-arr/member? a c)) false))
+                              (if-let [arr (coerce-pg-array a)]
+                                (boolean (pg-arr/member? arr c)) false))
                       "all" (fn [c a]
-                              (if (pg-arr/array? a)
-                                (pg-arr/all-match? a #(= % c)) true)))
+                              (if-let [arr (coerce-pg-array a)]
+                                (pg-arr/all-match? arr #(= % c)) true)))
               result-var (ctx/fresh-var! ctx)]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj op-fn)
@@ -1896,12 +1923,12 @@
             cmp-fn (requiring-resolve (symbol "clojure.core" (name op)))
             op-fn (case kind
                     "any" (fn [c a]
-                            (if (pg-arr/array? a)
-                              (boolean (pg-arr/any-match? a #(cmp-fn c %)))
+                            (if-let [arr (coerce-pg-array a)]
+                              (boolean (pg-arr/any-match? arr #(cmp-fn c %)))
                               false))
                     "all" (fn [c a]
-                            (if (pg-arr/array? a)
-                              (pg-arr/all-match? a #(cmp-fn c %))
+                            (if-let [arr (coerce-pg-array a)]
+                              (pg-arr/all-match? arr #(cmp-fn c %))
                               true)))
             result-var (ctx/fresh-var! ctx)]
         (swap! (:in-params ctx) conj fn-param)
@@ -2027,11 +2054,11 @@
                   fn-param (symbol (str "?pg-" kind "-pred" (swap! (:var-counter ctx) inc)))
                   op-fn (case kind
                           "any" (fn [c a]
-                                  (if (pg-arr/array? a)
-                                    (boolean (pg-arr/member? a c)) false))
+                                  (if-let [arr (coerce-pg-array a)]
+                                    (boolean (pg-arr/member? arr c)) false))
                           "all" (fn [c a]
-                                  (if (pg-arr/array? a)
-                                    (pg-arr/all-match? a #(= % c)) true)))
+                                  (if-let [arr (coerce-pg-array a)]
+                                    (pg-arr/all-match? arr #(= % c)) true)))
                   result-var (ctx/fresh-var! ctx)]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj op-fn)

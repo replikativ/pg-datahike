@@ -302,9 +302,13 @@
     ;; One row per CHECK / FK / PK / UNIQUE constraint. `condef` is
     ;; the synthesized text — `pg_get_constraintdef(oid)` lowers to
     ;; `[?c :pg_constraint/oid ?arg] [?c :pg_constraint/condef ?out]`.
-    ;; We deliberately do NOT model the int2[]/oid[] vector columns
-    ;; (conkey, confkey, conpfeqop) — clients that read them via
-    ;; `pg_get_constraintdef` get the rendered text instead.
+    ;;
+    ;; conkey / confkey are int2[] in PG. We store them as the PG
+    ;; array text form ("{1,2,3}") so the wire layer renders them
+    ;; correctly and the runtime ANY/ALL path can parse them back
+    ;; into a pg-arr on demand. Metabase's FK introspection joins
+    ;; pg_attribute to pg_constraint via `attnum = ANY(c.conkey)`,
+    ;; so populating these isn't optional.
     [{:db/ident :pg_constraint/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/conname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/contype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -314,6 +318,8 @@
      {:db/ident :pg_constraint/condeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condeferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/convalidated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/conkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_constraint/confkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_constraint/condef :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_constraint") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_extension"
@@ -819,7 +825,20 @@
           ->oid (fn [kind nm tbl]
                   ;; Tag the high bit to avoid collisions with table OIDs.
                   (bit-or 0x50000000
-                          (Math/abs (.hashCode ^String (str kind ":" nm ":" tbl)))))]
+                          (Math/abs (.hashCode ^String (str kind ":" nm ":" tbl)))))
+          ;; pg_attribute attnums are 1-based positions in the column
+          ;; list as derive-virtual-tables emits it. Mirror that order
+          ;; here so conkey values reference the same slots.
+          attnum-for (fn [tname col-name]
+                       (some (fn [[idx col]]
+                               (when (= col-name (:name col))
+                                 (long (inc idx))))
+                             (map-indexed vector
+                                          (get-in tables [tname :columns]))))
+          ->conkey   (fn [attnums]
+                       ;; PG int2[] text form: "{1,2}" — already PG's
+                       ;; canonical wire encoding for an int2[] column.
+                       (str "{" (str/join "," attnums) "}"))]
       (vec
        (concat
         ;; UNIQUE / PRIMARY KEY rows — one per unique column.
@@ -833,7 +852,8 @@
                     cname    (str tname "_" (:name col)
                                   (if primary? "_pkey" "_key"))
                     condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
-                                  (:name col) ")")]]
+                                  (:name col) ")")
+                    attnum   (attnum-for tname (:name col))]]
           {:pg_constraint/oid           (long (->oid contype cname tname))
            :pg_constraint/conname       cname
            :pg_constraint/contype       contype
@@ -843,6 +863,8 @@
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
            :pg_constraint/convalidated  true
+           :pg_constraint/conkey        (->conkey (if attnum [attnum] []))
+           :pg_constraint/confkey       "{}"
            :pg_constraint/condef        condef
            (pgs/row-marker-attr "pg_constraint") true})
         ;; CHECK constraints — one row per persisted :pg/check-*.
@@ -858,6 +880,12 @@
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
            :pg_constraint/convalidated  true
+           ;; CHECK constraints don't have a column-attnum vector at
+           ;; the catalog level — PG synthesises conkey only when the
+           ;; CHECK references a single column. We don't parse the
+           ;; expression that deeply, so leave both keys empty.
+           :pg_constraint/conkey        "{}"
+           :pg_constraint/confkey       "{}"
            :pg_constraint/condef        (str "CHECK (" cexpr ")")
            (pgs/row-marker-attr "pg_constraint") true})
         ;; FK constraints — child-cols / parent-cols are stored as
@@ -877,7 +905,9 @@
                                            :else           [v]))
                                    (catch Throwable _ [s])))
                     cs (parse-cols child-cols)
-                    ps (parse-cols parent-cols)]]
+                    ps (parse-cols parent-cols)
+                    child-attnums  (vec (keep #(attnum-for child %) cs))
+                    parent-attnums (vec (keep #(attnum-for parent %) ps))]]
           {:pg_constraint/oid           (long (->oid "f" cname child))
            :pg_constraint/conname       cname
            :pg_constraint/contype       "f"
@@ -887,6 +917,8 @@
            :pg_constraint/condeferrable false
            :pg_constraint/condeferred   false
            :pg_constraint/convalidated  true
+           :pg_constraint/conkey        (->conkey child-attnums)
+           :pg_constraint/confkey       (->conkey parent-attnums)
            :pg_constraint/condef        (str "FOREIGN KEY (" (str/join ", " cs)
                                              ") REFERENCES " parent
                                              " (" (str/join ", " ps) ")")

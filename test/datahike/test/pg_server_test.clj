@@ -430,7 +430,23 @@
   (testing "pg_get_constraintdef(oid) joins pg_constraint and reads condef"
     (let [r (rows (.execute *handler* "SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c WHERE c.contype = 'p' ORDER BY c.conname"))]
       (is (every? #(re-find #"^PRIMARY KEY " (second %)) r)
-          "every PK constraint def should start with PRIMARY KEY"))))
+          "every PK constraint def should start with PRIMARY KEY")))
+
+  (testing "pg_constraint.conkey is a real int2[] — Metabase joins on attnum = ANY(conkey)"
+    ;; Track 5 / Blocker 4. Metabase's FK-introspection query joins
+    ;; pg_attribute → pg_constraint via `a.attnum = ANY(c.conkey)`.
+    ;; Before Track 5, conkey didn't exist; the join silently
+    ;; yielded zero rows and Metabase reported the table as having
+    ;; no PKs/FKs.
+    (let [r (rows (.execute *handler*
+                            "SELECT a.attname
+                               FROM pg_attribute a
+                               JOIN pg_class cl ON cl.oid = a.attrelid
+                               JOIN pg_constraint c ON c.conrelid = cl.oid
+                                                  AND a.attnum = ANY(c.conkey)
+                              WHERE cl.relname = 'person' AND c.contype = 'p'"))]
+      (is (= 1 (count r)) "person has exactly one PK column")
+      (is (= "name" (ffirst r))))))
 
 (deftest test-pg-constraint-check-and-fk
   (testing "CHECK and FK constraints surface via pg_constraint after DDL"
