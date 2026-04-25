@@ -650,10 +650,25 @@
                                                 v  (nth vs col-idx nil)]
                                             (when (and (some? v) (not= :__null__ v)) v)))
                                         sub-results)]
+                      ;; Match the speculative-db's :db/valueType to the
+                      ;; runtime types Datahike actually accepts. Hitting
+                      ;; the :else string branch when samples include a
+                      ;; Date / UUID / etc. makes the subsequent transact
+                      ;; reject the row with a schema-mismatch error
+                      ;; (datahike.db.transaction "Bad entity value …
+                      ;; Must be conform to: string?"). Test trigger:
+                      ;; LEFT JOIN to a derived table that projects
+                      ;; `customer.created_at` (DateTime) — Metabase
+                      ;; emits this from the Question Builder whenever a
+                      ;; user joins through a temporal column.
                       (cond
-                        (every? #(instance? Long %)    samples) :db.type/long
-                        (every? #(instance? Double %)  samples) :db.type/double
-                        (every? #(instance? Boolean %) samples) :db.type/boolean
+                        (every? #(instance? Long %)             samples) :db.type/long
+                        (every? #(instance? Double %)           samples) :db.type/double
+                        (every? #(instance? Boolean %)          samples) :db.type/boolean
+                        (every? #(instance? java.util.Date %)   samples) :db.type/instant
+                        (every? #(instance? java.util.UUID %)   samples) :db.type/uuid
+                        (every? #(instance? java.math.BigDecimal %) samples) :db.type/bigdec
+                        (every? #(instance? java.math.BigInteger %) samples) :db.type/bigint
                         :else :db.type/string)))
         ;; Always emit a row-existence marker so `t.*` expansion in
         ;; the OUTER select has an entity anchor even when every
