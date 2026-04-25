@@ -838,6 +838,61 @@
         (swap! (:where-clauses ctx) conj [(list fn-param target) result-var])
         result-var)
 
+      ;; PG's format() function — text formatting with %I (quoted
+      ;; identifier), %L (quoted literal), %s (raw string), %%
+      ;; (escape). Java's String.format chokes on %I/%L, so we
+      ;; can't just delegate. Metabase's describe-fields query uses
+      ;; FORMAT('%I.%I', schema, table) to build qualified names —
+      ;; not optional.
+      (= fname "format")
+      (let [tmpl-arg (first args)
+            value-args (vec (rest args))
+            ;; Quote-an-identifier per PG: wrap in "..", escape internal "
+            quote-id  (fn [^Object v]
+                        (let [s (cond (nil? v) ""
+                                      (string? v) v
+                                      :else (str v))]
+                          (str \" (str/replace s "\"" "\"\"") \")))
+            ;; Quote-a-literal per PG: wrap in '..', escape '
+            quote-lit (fn [^Object v]
+                        (if (nil? v)
+                          "NULL"
+                          (str \' (str/replace (str v) "'" "''") \')))
+            apply-fmt (fn [tmpl values]
+                        (let [n (count tmpl)
+                              sb (StringBuilder.)]
+                          (loop [i 0
+                                 vs values]
+                            (if (>= i n)
+                              (.toString sb)
+                              (let [c (.charAt ^String tmpl i)]
+                                (if (and (= c \%) (< (inc i) n))
+                                  (let [spec (.charAt ^String tmpl (inc i))]
+                                    (case spec
+                                      \%  (do (.append sb \%)
+                                              (recur (+ i 2) vs))
+                                      \s  (do (.append sb (str (first vs)))
+                                              (recur (+ i 2) (rest vs)))
+                                      \I  (do (.append sb ^String (quote-id (first vs)))
+                                              (recur (+ i 2) (rest vs)))
+                                      \L  (do (.append sb ^String (quote-lit (first vs)))
+                                              (recur (+ i 2) (rest vs)))
+                                      ;; Unknown spec — keep literal so we don't
+                                      ;; silently corrupt user-format strings.
+                                      (do (.append sb \%)
+                                          (.append sb spec)
+                                          (recur (+ i 2) vs))))
+                                  (do (.append sb c)
+                                      (recur (inc i) vs))))))))
+            fmt-fn (fn [tmpl & vs]
+                     (apply-fmt (str tmpl) vs))
+            fn-param (symbol (str "?pg-format" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj fmt-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param tmpl-arg value-args) result-var])
+        result-var)
+
       ;; Unknown function — pass through as symbol
       :else
       (do (swap! (:where-clauses ctx) conj

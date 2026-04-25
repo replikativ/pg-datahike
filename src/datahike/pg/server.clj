@@ -593,7 +593,11 @@
      ?        → next positional arg
      $1..$N   → 1-indexed arg
 
-   Placeholders inside single-quoted strings are left alone.
+   Placeholders inside single-quoted string literals OR double-quoted
+   SQL identifiers are left alone — Metabase's describe-fields query
+   uses `\"pk?\"` as a column alias, and substituting that `?` would
+   silently turn the alias into the first parameter value.
+
    Positional (`?`) and numbered (`$N`) placeholders can be mixed;
    `?` consumes from a separate cursor so they don't fight over
    indices with `$N`. When a mix is present, most clients pick one
@@ -602,7 +606,8 @@
   (let [len (count template)
         sb (StringBuilder.)]
     (loop [i 0
-           in-str? false
+           in-str?   false   ; inside '…'
+           in-ident? false   ; inside "…"
            pos-idx 0]
       (if (>= i len)
         (.toString sb)
@@ -613,16 +618,27 @@
                 (cond
                   (and (= c \') (< (inc i) len) (= \' (.charAt template (inc i))))
                   (do (.append sb \')
-                      (recur (+ i 2) true pos-idx))
-                  (= c \') (recur (inc i) false pos-idx)
-                  :else    (recur (inc i) true pos-idx)))
+                      (recur (+ i 2) true false pos-idx))
+                  (= c \') (recur (inc i) false false pos-idx)
+                  :else    (recur (inc i) true false pos-idx)))
+            in-ident?
+            (do (.append sb c)
+                (cond
+                  ;; "" inside an identifier is the literal " escape.
+                  (and (= c \") (< (inc i) len) (= \" (.charAt template (inc i))))
+                  (do (.append sb \")
+                      (recur (+ i 2) false true pos-idx))
+                  (= c \") (recur (inc i) false false pos-idx)
+                  :else    (recur (inc i) false true pos-idx)))
             (= c \')
-            (do (.append sb c) (recur (inc i) true pos-idx))
+            (do (.append sb c) (recur (inc i) true false pos-idx))
+            (= c \")
+            (do (.append sb c) (recur (inc i) false true pos-idx))
             (= c \?)
             (do (.append sb (if (< pos-idx (count args))
                               (nth args pos-idx)
                               "NULL"))
-                (recur (inc i) false (inc pos-idx)))
+                (recur (inc i) false false (inc pos-idx)))
             (= c \$)
             ;; $N — consume digits
             (let [j (loop [k (inc i)]
@@ -633,9 +649,9 @@
                       ;; $1 → args[0]
                       arg (nth args (dec n) "NULL")]
                   (.append sb arg)
-                  (recur j false pos-idx))
-                (do (.append sb c) (recur (inc i) false pos-idx))))
-            :else (do (.append sb c) (recur (inc i) false pos-idx))))))))
+                  (recur j false false pos-idx))
+                (do (.append sb c) (recur (inc i) false false pos-idx))))
+            :else (do (.append sb c) (recur (inc i) false false pos-idx))))))))
 
 (defmacro ^:private with-stmt-timeout
   "Schedule a cancel-flag flip after `timeout-ms` (nil or 0 disables);

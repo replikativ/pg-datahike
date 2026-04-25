@@ -66,7 +66,11 @@ mkdir -p "${DATA_DIR}"
 
 echo "[run] starting seeded pgwire on :${PGWIRE_PORT}"
 pushd "${REPO_ROOT}" >/dev/null
-clojure -M:server "${HERE}/seed.clj" >>"${LOG}" 2>&1 &
+# Use :dev (not :server) — :server has a hardcoded :main-opts pointing
+# at the unfixtured start_pgwire.clj, so a trailing seed.clj would land
+# as an unread positional arg and Metabase would sync against an empty
+# DB (zero tables). :dev passes the script through cleanly.
+clojure -M:dev "${HERE}/seed.clj" >>"${LOG}" 2>&1 &
 PGWIRE_PID=$!
 popd >/dev/null
 
@@ -177,8 +181,8 @@ DB_BODY=$(jq -n --arg port "${PGWIRE_PORT}" '
   name:      "pg-datahike",
   details:   { host: "localhost", port: ($port|tonumber),
                db: "datahike", user: "datahike", password: "datahike",
-               ssl: false, tunnel-enabled: false,
-               advanced-options: false } }')
+               ssl: false, "tunnel-enabled": false,
+               "advanced-options": false } }')
 DB_ID="$(mb -X POST --data "${DB_BODY}" \
   "http://localhost:${MB_PORT}/api/database" | jq -r '.id')"
 if [[ -z "${DB_ID}" || "${DB_ID}" == "null" ]]; then
