@@ -353,16 +353,36 @@
      {:db/ident :pg_matviews/definition  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_matviews/ispopulated :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_matviews") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    ;; information_schema.columns — mirror PG's information_schema.sql
+    ;; columns view. Domain-to-Datahike-type mapping:
+    ;;   cardinal_number  → :db.type/long  (ordinal_position, *_precision, *_scale)
+    ;;   sql_identifier   → :db.type/string (table/schema/column names, udt_*)
+    ;;   character_data   → :db.type/string (data_type, defaults, identity_generation)
+    ;;   yes_or_no        → :db.type/string ("YES" / "NO" — 3-char varchar in PG)
     "information_schema_columns"
     [{:db/ident :information_schema_columns/table_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/table_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/table_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/column_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/ordinal_position :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/data_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/udt_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_columns/character_maximum_length :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/ordinal_position :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/column_default :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_columns/is_nullable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/data_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/character_maximum_length :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/character_octet_length :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/numeric_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/numeric_precision_radix :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/numeric_scale :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/datetime_precision :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/udt_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/udt_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/udt_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/dtd_identifier :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/is_self_referencing :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/is_identity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/identity_generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/is_generated :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_columns/is_updatable :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "information_schema_columns") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "information_schema_tables"
     [{:db/ident :information_schema_tables/table_catalog :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -406,8 +426,8 @@
      {:db/ident :information_schema_key_column_usage/table_schema :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_key_column_usage/table_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :information_schema_key_column_usage/column_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_key_column_usage/ordinal_position :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :information_schema_key_column_usage/position_in_unique_constraint :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_key_column_usage/ordinal_position :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :information_schema_key_column_usage/position_in_unique_constraint :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "information_schema_key_column_usage") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     nil))
 
@@ -575,6 +595,11 @@
           (pgs/table-names user-schema))
     "information_schema_columns"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          ;; udt_name in PG follows the underlying base-type convention from
+          ;; pg_type — `int4` / `int8` / `varchar` / `timestamp`, NOT the
+          ;; SQL-spelled `data_type` ("integer" / "bigint" / …). Metabase
+          ;; routes its column-type inference off `udt_name`, so getting
+          ;; this right matters more than data_type spelling.
           udt-name (fn [vtype]
                      (case vtype
                        :db.type/string  "text"
@@ -588,19 +613,74 @@
                        :db.type/keyword "text"
                        :db.type/bigdec  "numeric"
                        :db.type/bytes   "bytea"
-                       "text"))]
+                       "text"))
+          ;; PG's information_schema fills numeric_precision / _scale only
+          ;; for numeric-categoried types and leaves the rest NULL. We do
+          ;; the same — Metabase reads these to infer fixed-point vs
+          ;; floating-point columns.
+          numeric-precision (fn [vtype]
+                              (case vtype
+                                :db.type/long    64
+                                :db.type/ref     64
+                                :db.type/float   24
+                                :db.type/double  53
+                                :db.type/bigdec  nil
+                                :db.type/bigint  64
+                                nil))
+          numeric-radix     (fn [vtype]
+                              (case vtype
+                                :db.type/long    2
+                                :db.type/ref     2
+                                :db.type/float   2
+                                :db.type/double  2
+                                :db.type/bigdec  10
+                                :db.type/bigint  2
+                                nil))
+          numeric-scale     (fn [vtype]
+                              (case vtype
+                                :db.type/long    0
+                                :db.type/ref     0
+                                :db.type/bigint  0
+                                nil))
+          datetime-precision (fn [vtype]
+                               (case vtype
+                                 :db.type/instant 6
+                                 nil))
+          ;; Drop nil-valued keys per PG's information_schema convention —
+          ;; columns that don't apply to the type are simply absent (the
+          ;; wire layer surfaces them as SQL NULL).
+          drop-nils (fn [m] (into {} (remove (comp nil? val)) m))]
       (vec (for [[tname {:keys [columns]}] (sort-by key tables)
                  [idx col] (map-indexed vector
-                                        (cons {:name "db_id" :valuetype :db.type/long} columns))]
-             {:information_schema_columns/table_catalog "datahike"
-              :information_schema_columns/table_schema "public"
-              :information_schema_columns/table_name tname
-              :information_schema_columns/column_name (:name col)
-              :information_schema_columns/ordinal_position (str (inc idx))
-              :information_schema_columns/data_type (pgs/pg-type-name (:valuetype col))
-              :information_schema_columns/udt_name (udt-name (:valuetype col))
-              :information_schema_columns/is_nullable "YES"
-              (pgs/row-marker-attr "information_schema_columns") true})))
+                                        (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
+                 :let [vtype     (:valuetype col)
+                       pos       (long (inc idx))
+                       identity? (and (= "db_id" (:name col)) (zero? idx))]]
+             (drop-nils
+              {:information_schema_columns/table_catalog          "datahike"
+               :information_schema_columns/table_schema           "public"
+               :information_schema_columns/table_name             tname
+               :information_schema_columns/column_name            (:name col)
+               :information_schema_columns/ordinal_position       pos
+               :information_schema_columns/column_default         nil
+               :information_schema_columns/is_nullable            (if identity? "NO" "YES")
+               :information_schema_columns/data_type              (pgs/pg-type-name vtype)
+               :information_schema_columns/character_maximum_length nil
+               :information_schema_columns/character_octet_length nil
+               :information_schema_columns/numeric_precision      (numeric-precision vtype)
+               :information_schema_columns/numeric_precision_radix (numeric-radix vtype)
+               :information_schema_columns/numeric_scale          (numeric-scale vtype)
+               :information_schema_columns/datetime_precision     (datetime-precision vtype)
+               :information_schema_columns/udt_catalog            "datahike"
+               :information_schema_columns/udt_schema             "pg_catalog"
+               :information_schema_columns/udt_name               (udt-name vtype)
+               :information_schema_columns/dtd_identifier         (str pos)
+               :information_schema_columns/is_self_referencing    "NO"
+               :information_schema_columns/is_identity            (if identity? "YES" "NO")
+               :information_schema_columns/identity_generation    (if identity? "BY DEFAULT" nil)
+               :information_schema_columns/is_generated           "NEVER"
+               :information_schema_columns/is_updatable           "YES"
+               (pgs/row-marker-attr "information_schema_columns") true}))))
     "information_schema_tables"
     (mapv (fn [t]
             {:information_schema_tables/table_catalog "datahike"
@@ -853,7 +933,7 @@
            :information_schema_key_column_usage/table_schema "public"
            :information_schema_key_column_usage/table_name tname
            :information_schema_key_column_usage/column_name "db_id"
-           :information_schema_key_column_usage/ordinal_position "1"
+           :information_schema_key_column_usage/ordinal_position 1
            (pgs/row-marker-attr "information_schema_key_column_usage") true})
         (for [[tname {:keys [columns]}] (sort-by key tables)
               col columns
@@ -865,8 +945,8 @@
            :information_schema_key_column_usage/table_schema "public"
            :information_schema_key_column_usage/table_name tname
            :information_schema_key_column_usage/column_name (:name col)
-           :information_schema_key_column_usage/ordinal_position "1"
-           :information_schema_key_column_usage/position_in_unique_constraint "1"
+           :information_schema_key_column_usage/ordinal_position 1
+           :information_schema_key_column_usage/position_in_unique_constraint 1
            (pgs/row-marker-attr "information_schema_key_column_usage") true}))))
     nil))
 

@@ -771,19 +771,52 @@
     (let [r (.execute *handler* "SELECT * FROM information_schema.columns")]
       (is (nil? (err r)))
       (let [rs (rows r)
-            ;; Each row: [catalog schema table_name column_name ordinal data_type nullable default]
             person-cols (set (map #(nth % 3) (filter #(= "person" (nth % 2)) rs)))]
         (is (contains? person-cols "name"))
-        (is (contains? person-cols "age"))
-        ;; Check data types
-        (let [age-row (first (filter #(and (= "person" (nth % 2))
-                                           (= "age" (nth % 3))) rs))]
-          (is (= "bigint" (nth age-row 5)))))))
+        (is (contains? person-cols "age"))))
+    ;; data_type lookup deserves an explicit projection — `SELECT *`
+    ;; column ordering is determined by pg_attribute and not part of
+    ;; the SQL contract.
+    (let [r (.execute *handler*
+                      "SELECT data_type FROM information_schema.columns
+                        WHERE table_name = 'person' AND column_name = 'age'")]
+      (is (nil? (err r)))
+      (is (= "bigint" (ffirst (rows r))))))
 
   (testing "information_schema.tables"
     (let [r (.execute *handler* "SELECT * FROM information_schema.tables")]
       (is (nil? (err r)))
       (is (some #(= "person" (nth % 2)) (rows r)))))
+
+  (testing "information_schema.columns ordinal_position is integer (Metabase Blocker 1)"
+    ;; Metabase emits `ordinal_position - 1` arithmetic to derive a 0-based
+    ;; column index. With ordinal_position stored as :db.type/string this
+    ;; raised a runtime type error — fixed by mirroring PG's cardinal_number
+    ;; domain (= integer). Regression test: subtract a literal and verify
+    ;; the simple-query text-encoded result is "1" (computed numerically),
+    ;; not "21" (string concat) or a type-error.
+    (let [r (.execute *handler*
+                      "SELECT ordinal_position - 1 AS idx
+                         FROM information_schema.columns
+                        WHERE table_name = 'person' AND column_name = 'age'")]
+      (is (nil? (err r)))
+      (is (= [["1"]] (rows r)) "age is the 2nd person column → ordinal_position-1 = 1")))
+
+  (testing "information_schema.columns udt_schema = pg_catalog (Metabase type inference)"
+    (let [r (.execute *handler*
+                      "SELECT udt_schema, udt_name
+                         FROM information_schema.columns
+                        WHERE table_name = 'person' AND column_name = 'age'")]
+      (is (nil? (err r)))
+      (is (= [["pg_catalog" "int8"]] (rows r)))))
+
+  (testing "information_schema.columns is_identity = YES on the implicit db_id PK"
+    (let [r (.execute *handler*
+                      "SELECT is_identity, identity_generation, is_nullable
+                         FROM information_schema.columns
+                        WHERE table_name = 'person' AND column_name = 'db_id'")]
+      (is (nil? (err r)))
+      (is (= [["YES" "BY DEFAULT" "NO"]] (rows r)))))
 
   (testing "pg_namespace"
     (let [r (.execute *handler* "SELECT * FROM pg_namespace")]
