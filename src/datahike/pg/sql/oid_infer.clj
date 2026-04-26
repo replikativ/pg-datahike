@@ -20,6 +20,7 @@
   (:require [clojure.string :as str]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column]
            [net.sf.jsqlparser.expression
@@ -275,8 +276,16 @@
           props (when attr (get schema attr))
           valuetype (:db/valueType props)
           cardinality (:db/cardinality props)
-          base-oid (when valuetype (pgs/oid-for-valuetype valuetype))]
+          base-oid (when valuetype (pgs/oid-for-valuetype valuetype))
+          ;; Native PG array column (Option C): the schema records
+          ;; `:pg/type "_T"` on the ident entity. Look it up so the
+          ;; column reports its declared array OID even though the
+          ;; storage type is `:db.type/string`.
+          pg-type-name (when (and db attr) (#'params/pg-type-of-attr db attr))
+          pg-name-oid  (when pg-type-name (get types/pg-name->oid pg-type-name))]
       (cond
+        ;; Native PG array column wins over the storage-type fallback.
+        pg-name-oid pg-name-oid
         (nil? base-oid) nil
         ;; Cardinality-many → array OID. For ref attrs we project the
         ;; deref'd target PK (typically int8); for non-ref many attrs

@@ -502,7 +502,12 @@
                 (case pgtype
                   "jsonb" types/oid-jsonb
                   "json"  types/oid-jsonb
-                  (oid-for-props props))
+                  ;; Native PG array column: `:pg/type "_T"` resolves
+                  ;; via pg-name->oid to the corresponding array OID
+                  ;; (`_int4` → 1007 etc.). Fall back to the storage
+                  ;; type's OID when not in the array registry.
+                  (or (get types/pg-name->oid pgtype)
+                      (oid-for-props props)))
                 (oid-for-props props))
               (or (some (fn [[attr-kw p]]
                           (when (and (keyword? attr-kw)
@@ -2044,6 +2049,13 @@
               ;; scale, plus length for VARCHAR(n) etc. Stored as a long;
               ;; -1 means unconstrained (PG default).
               [:pg/typmod long1]
+              ;; Native PG array column metadata (Option C storage):
+              ;; element-keyword (:int4 / :text / …) drives from-pg-text
+              ;; reconstruction; ndim records dimensionality so the
+              ;; codec can validate shape and the OID inferer reports
+              ;; the correct array OID (`pg/type "_T"` resolves it).
+              [:pg/array-elem kw1]
+              [:pg/array-ndim long1]
               [:pg/default-kind kw1]
               [:pg/default-value str1]
               [:pg/default-arg str1]

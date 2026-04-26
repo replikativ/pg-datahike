@@ -47,7 +47,8 @@
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.pg.arrays :as pg-arr])
   (:import [datahike.datom Datom]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -2072,8 +2073,24 @@
     (let [col-data-type (.getColDataType ce)
           type-str (when col-data-type
                      (str/lower-case (str (.getDataType col-data-type))))
-          cast-cat (types/cast-category type-str)]
+          cast-cat (types/cast-category type-str)
+          ;; CAST(<x> AS T[]): JSqlParser exposes the array dim via
+          ;; getArrayData (a list, size = ndim) rather than embedding
+          ;; `[]` in the type string. We retype an empty / untyped
+          ;; PgArray to match the target element-keyword and pass
+          ;; non-array inputs through `pg-arr/array` for consistency.
+          array-data (try (.getArrayData col-data-type) (catch Throwable _ nil))
+          array-target? (and (some? type-str) (seq array-data))]
       (cond
+        array-target?
+        (let [elem-kw (or (get types/sql-name->elem-kw type-str) :text)]
+          (cond
+            (pg-arr/array? inner) (pg-arr/array elem-kw (:elements inner)
+                                                (:dims inner) (:lbounds inner))
+            (sequential? inner)   (pg-arr/array elem-kw (vec inner))
+            (string? inner)       (pg-arr/from-pg-text inner elem-kw)
+            :else                 (pg-arr/array elem-kw [inner])))
+
         (= cast-cat :integer)   (if (integer? inner) inner (Long/parseLong (str inner)))
         (= cast-cat :float)     (if (float? inner) inner (Double/parseDouble (str inner)))
         (= cast-cat :text)      (if (string? inner) inner (str inner))
@@ -2177,6 +2194,39 @@
                 (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))
          (java.util.Date.)
          (java.util.Date.)))  ;; any timezone expression defaults to current time
+
+    ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
+    ;; Build a typed PgArray; coerce-insert-value will serialize it
+    ;; for storage on an array column. Recurses on nested
+    ;; ArrayConstructors so multi-dim literals build the right shape.
+    ;; Element-type detection mirrors expr.clj's recursive walker so
+    ;; INSERT and SELECT translation produce the same elem-type for
+    ;; equivalent literals.
+    ;;
+    ;; Nested ArrayConstructors materialize as PgArray instances at
+    ;; the inner level — but PgArray is a defrecord (map-like), which
+    ;; the outer ctor's `compute-dims` treats as a scalar. Unwrap any
+    ;; PgArray children's `:elements` so the outer build sees a
+    ;; uniform nested-vector structure and computes dims correctly.
+     (instance? ArrayConstructor e)
+     (let [exprs (.getExpressions ^ArrayConstructor e)
+           detect (fn detect [es]
+                    (or (some (fn [x]
+                                (cond
+                                  (instance? LongValue x)        :int8
+                                  (instance? DoubleValue x)      :float8
+                                  (instance? StringValue x)      :text
+                                  (instance? BooleanValue x)     :bool
+                                  (instance? ArrayConstructor x)
+                                  (detect (.getExpressions ^ArrayConstructor x))
+                                  :else nil))
+                              es)
+                        :text))
+           elem-type (detect exprs)
+           unwrap   (fn [v] (if (pg-arr/array? v) (:elements v) v))
+           elements (mapv #(unwrap (extract-value % schema db)) exprs)]
+       (pg-arr/array elem-type elements))
+
      :else (str e))))
 
 (defn coerce-insert-value
@@ -2193,7 +2243,8 @@
    threaded db, or genuinely-unmapped refs)."
   [val attr schema]
   (when (some? val)
-    (let [vtype (get-in schema [attr :db/valueType])]
+    (let [vtype     (get-in schema [attr :db/valueType])
+          elem-kw   (get-in schema [attr :pg/array-elem])]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
@@ -2204,6 +2255,27 @@
         ;; it with the decoded wire value, which already has the right
         ;; type from Bind.
         (params/param-ref? val) val
+
+        ;; Native PG array column (`:pg/array-elem` recorded by DDL)
+        ;; — Option C storage: serialize a PgArray (or coerce a
+        ;; sequential value into one) to canonical PG text. Strings
+        ;; that already look like array text pass through unchanged.
+        (some? elem-kw)
+        (cond
+          (pg-arr/array? val)
+          (pg-arr/to-pg-text val)
+          (and (string? val)
+               (clojure.string/starts-with? (clojure.string/triml val) "{"))
+          val
+          (sequential? val)
+          (pg-arr/to-pg-text (pg-arr/array elem-kw (vec val)))
+          :else
+          ;; Last-ditch: string-coerce. Lets clients send a single
+          ;; element to an array column and have it stored as a
+          ;; 1-element array (PG would reject this; we tolerate to
+          ;; mirror the permissive behaviour of `:db.type/string`
+          ;; coercion above).
+          (pg-arr/to-pg-text (pg-arr/array elem-kw [val])))
         ;; :db.type/ref column with a numeric/string PK value →
         ;; lookup-ref. Already-vector values (explicit `[:k v]`) pass
         ;; through unchanged. Convention-based target resolution
@@ -2528,12 +2600,41 @@
         :*
         (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
 
+(defn- enrich-schema-with-pg-array-meta
+  "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
+   metadata like `:pg/array-elem` lives as ident-entity facts. For
+   array column INSERTs we need that metadata available via
+   `(get-in schema [attr :pg/array-elem])`, so this helper queries
+   db for every ident's array-elem/ndim and merges the results into
+   the schema map. Called once per INSERT/UPDATE translation; the
+   query is small (one row per array column in the entire DB)."
+  [schema db]
+  (if (nil? db)
+    schema
+    (let [pg-meta (try
+                    (into {}
+                          (map (fn [[ident elem ndim]]
+                                 [ident (cond-> {}
+                                          elem (assoc :pg/array-elem elem)
+                                          ndim (assoc :pg/array-ndim ndim))]))
+                          ((requiring-resolve 'datahike.api/q)
+                           '{:find  [?ident ?elem ?ndim]
+                             :where [[?e :db/ident ?ident]
+                                     [?e :pg/array-elem ?elem]
+                                     [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
+                           db))
+                    (catch Throwable _ {}))]
+      (reduce-kv (fn [s ident more]
+                   (update s ident merge more))
+                 schema pg-meta))))
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
    Handles ON CONFLICT (UPSERT) via :db.fn/call for atomic execution."
   [^Insert insert schema db]
-  (let [table (.getTable insert)
+  (let [schema (enrich-schema-with-pg-array-meta schema db)
+        table (.getTable insert)
         table-name (unquote-ident (.getName ^Table table))
         ns table-name
         columns (.getColumns insert)

@@ -436,18 +436,43 @@
                                ^ColDataType cdt (.getColDataType col)
                                raw-type (str/lower-case (str (.getDataType cdt)))
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
-                               dh-type (or (get pg-type->dh-type raw-type)
-                                           (get pg-type->dh-type base-type)
-                                           :db.type/string)
+                               ;; Detect array column. JSqlParser exposes
+                               ;; the array dimensions via getArrayData()
+                               ;; — a list whose size = ndim (entries are
+                               ;; null for unsized `[]`, integers for
+                               ;; sized `[3]` which PG ignores anyway).
+                               ;; We look up the element-keyword from
+                               ;; `base-type` (typmod stripped) — which
+                               ;; for `numeric(10,2)[]` resolves to
+                               ;; `:numeric`, matching PG's array OIDs.
+                               array-data (try (.getArrayData cdt)
+                                               (catch Throwable _ nil))
+                               ndim       (when (seq array-data) (count array-data))
+                               array-spec (when ndim
+                                            (when-let [elem (get types/sql-name->elem-kw base-type)]
+                                              {:elem    elem
+                                               :pg-name (str "_" (name elem))
+                                               :ndim    ndim}))
+                               ;; Array columns: store as serialized
+                               ;; canonical text in :db.type/string.
+                               ;; Round-trip via to-pg-text/from-pg-text.
+                               dh-type (cond
+                                         array-spec :db.type/string
+                                         :else (or (get pg-type->dh-type raw-type)
+                                                   (get pg-type->dh-type base-type)
+                                                   :db.type/string))
                                ;; NUMERIC(p, s): preserve precision +
                                ;; scale via PG's atttypmod encoding so
                                ;; clients see the declared type. Real
                                ;; PG keeps these in pg_attribute; we
                                ;; tag the schema attr's ident entity
                                ;; with `:pg/typmod` and surface it in
-                               ;; the catalog + describeResult.
+                               ;; the catalog + describeResult. Skipped
+                               ;; for array columns — we don't currently
+                               ;; preserve element typmod through the
+                               ;; serialized array codec.
                                numeric-typmod
-                               (when (= dh-type :db.type/bigdec)
+                               (when (and (= dh-type :db.type/bigdec) (not array-spec))
                                  (let [[p s] (types/parse-numeric-args raw-type)]
                                    (when (or p s)
                                      (types/encode-numeric-typmod p s))))
@@ -474,6 +499,18 @@
                      (cond-> {:db/ident       (keyword ns col-name)
                               :db/valueType   dh-type
                               :db/cardinality :db.cardinality/one}
+                       ;; Array column: tag with element-keyword and ndim
+                       ;; so coerce-insert-value / value->string /
+                       ;; coerce-pg-array can reconstruct the typed
+                       ;; PgArray from the stored canonical text. The
+                       ;; `:pg/type "_T"` slot drives column-OID
+                       ;; resolution via pg-name->oid in oid_infer.
+                       array-spec (assoc :pg/type        (:pg-name array-spec)
+                                         :pg/array-elem  (:elem array-spec)
+                                         ;; Long-cast for Datahike's
+                                         ;; :db.type/long validation
+                                         ;; (count returns int).
+                                         :pg/array-ndim  (long (:ndim array-spec)))
                        numeric-typmod (assoc :pg/typmod numeric-typmod)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec

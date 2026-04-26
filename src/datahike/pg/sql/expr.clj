@@ -91,30 +91,42 @@
 
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
-   ops can index into it uniformly. Inputs come from three places:
+   ops can index into it uniformly. Inputs come from four places:
 
      - an ArrayConstructor literal that already produced a pg-arr;
-     - a catalog column (e.g. pg_constraint.conkey) stored as the PG
-       array text form `\"{1,2,3}\"`;
+     - a native PG array column stored as canonical PG text
+       (`\"{1,2,3}\"`), reconstructed via `from-pg-text`;
+     - a catalog column (e.g. pg_constraint.conkey) stored the same
+       way (no schema-side `:pg/array-elem`);
      - a Clojure collection from a function call.
+
+   Two-arity form `(coerce-pg-array v elem-type)` is preferred when
+   the call site knows the element keyword from schema metadata
+   (translate-time capture from `:pg/array-elem`). The single-arity
+   form auto-detects: tries `:int8` first (catches int catalogs and
+   any int-typed user array), then `:float8`, then falls back to
+   `:text` (which always succeeds because tokens parse as raw strings).
 
    Returns a `pg-arr/array` or nil if the value isn't array-shaped.
    Best-effort: a parse failure means the value wasn't an array, so
-   the calling op can return false / true per ANY/ALL semantics.
+   the calling op can return false / true per ANY/ALL semantics."
+  ([v] (coerce-pg-array v nil))
+  ([v elem-type]
+   (cond
+     (pg-arr/array? v)
+     v
 
-   We default the element-type to `:int8` for catalog-text arrays —
-   pg_constraint.conkey is the only catalog column that flows through
-   this path, and its element type matches attnums (which we encode
-   as int8). Datahike doesn't preserve a type tag on the stored
-   string, so guessing wider than int2 keeps `(member? arr c)` from
-   failing on long-vs-short equality."
-  [v]
-  (cond
-    (pg-arr/array? v)   v
-    (string? v)         (try (pg-arr/from-pg-text v :int8)
-                             (catch Throwable _ nil))
-    (sequential? v)     (pg-arr/array :unknown (vec v))
-    :else               nil))
+     (and (string? v) (clojure.string/starts-with? (clojure.string/triml v) "{"))
+     (let [trial (fn [t] (try (pg-arr/from-pg-text v t) (catch Throwable _ nil)))]
+       (or (when elem-type (trial elem-type))
+           (trial :int8)
+           (trial :float8)
+           (trial :text)))
+
+     (sequential? v)
+     (pg-arr/array (or elem-type :unknown) (vec v))
+
+     :else nil)))
 
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
@@ -388,11 +400,13 @@
       ;; array_length(arr, dim) — NULL for empty or out-of-range dim,
       ;; per-dim count otherwise. Note PG returns NULL for length-0
       ;; even when dim is in range, so we check positivity.
+      ;; `coerce-pg-array` reconstructs the PgArray when arr is a
+      ;; stored canonical-text string from a native array column.
       (= fname "array_length")
       (let [fn-param (symbol (str "?arr-len" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (pg-arr/array? arr)
-                        (let [n (pg-arr/length-d arr (long dim))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (let [n (pg-arr/length-d a (long dim))]
                           (if (and n (pos? (long n))) n :__null__))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
@@ -404,10 +418,10 @@
       (= fname "array_upper")
       (let [fn-param (symbol (str "?arr-upper" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (pg-arr/array? arr)
-                        (let [n (pg-arr/length-d arr (long dim))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (let [n (pg-arr/length-d a (long dim))]
                           (if (and n (pos? (long n)))
-                            (pg-arr/ubound arr (long dim))
+                            (pg-arr/ubound a (long dim))
                             :__null__))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
@@ -419,9 +433,11 @@
       (= fname "array_lower")
       (let [fn-param (symbol (str "?arr-lower" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (pos? (pg-arr/length arr))
-                               (<= (long dim) (pg-arr/ndim arr)))
-                        (pg-arr/lbound arr (long dim))
+                      (if-let [a (coerce-pg-array arr)]
+                        (if (and (pos? (pg-arr/length a))
+                                 (<= (long dim) (pg-arr/ndim a)))
+                          (pg-arr/lbound a (long dim))
+                          :__null__)
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -435,8 +451,8 @@
       (= fname "cardinality")
       (let [fn-param (symbol (str "?card" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr]
-                      (if (pg-arr/array? arr)
-                        (count (pg-arr/flat-elements arr))
+                      (if-let [a (coerce-pg-array arr)]
+                        (count (pg-arr/flat-elements a))
                         0))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -1733,8 +1749,8 @@
               hi (if (seq? hi) (ctx/materialize-arg! ctx hi) hi)
               fn-param (symbol (str "?pg-arr-slice" (swap! (:var-counter ctx) inc)))
               slice-fn (fn [arr lo hi]
-                         (if (pg-arr/array? arr)
-                           (pg-arr/slice arr lo hi)
+                         (if-let [a (coerce-pg-array arr)]
+                           (pg-arr/slice a lo hi)
                            :__null__))]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj slice-fn)
@@ -1750,8 +1766,8 @@
               idx (if (seq? idx) (ctx/materialize-arg! ctx idx) idx)
               fn-param (symbol (str "?pg-arr-sub" (swap! (:var-counter ctx) inc)))
               sub-fn (fn [arr i]
-                       (if (pg-arr/array? arr)
-                         (let [v (pg-arr/subscript arr i)]
+                       (if-let [a (coerce-pg-array arr)]
+                         (let [v (pg-arr/subscript a i)]
                            (if (nil? v) :__null__ v))
                          :__null__))]
           (swap! (:in-params ctx) conj fn-param)
