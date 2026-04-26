@@ -2068,16 +2068,74 @@
     (let [^OrExpression e expr
           left-clauses (translate-predicate ctx (.getLeftExpression e))
           right-clauses (translate-predicate ctx (.getRightExpression e))
-          ;; Collect all variables referenced by both branches for or-join
-          all-vars (into (ctx/collect-vars left-clauses) (ctx/collect-vars right-clauses))
-          shared-vars (vec (sort-by str all-vars))]
-      [(concat ['or-join shared-vars]
-               [(if (= 1 (count left-clauses))
-                  (first left-clauses)
-                  (concat ['and] left-clauses))]
-               [(if (= 1 (count right-clauses))
-                  (first right-clauses)
-                  (concat ['and] right-clauses))])])
+          ;; The canonical "always false" sentinel produced by EXISTS /
+          ;; IN-subquery handlers when the inner evaluates to no rows.
+          ;; A branch carrying this sentinel (alone or under an `and`)
+          ;; is constant-false — it cannot match any outer row.
+          ;; `(and false …)` short-circuits to false, so any AND containing
+          ;; the sentinel is also constant-false.
+          false-sentinel? (fn false-sentinel? [form]
+                            (cond
+                              (and (vector? form)
+                                   (= 1 (count form))
+                                   (= '(not= 1 1) (first form)))
+                              true
+                              (and (seq? form) (= 'and (first form)))
+                              (some false-sentinel? (rest form))
+                              :else false))
+          ;; Build the per-branch form. translate-predicate returns a
+          ;; *vector of clauses* implicitly ANDed; wrap it back into a
+          ;; single form for OR composition. Empty vector = "no
+          ;; constraint" = always-true; in OR that subsumes the other
+          ;; branch (true OR x = true), so handled in the outer cond.
+          mk-branch    (fn [cs]
+                         (cond
+                           (empty? cs)      ::always-true
+                           (= 1 (count cs)) (first cs)
+                           :else            (concat ['and] cs)))
+          all-branches (mapv mk-branch [left-clauses right-clauses])]
+      (cond
+        ;; Any branch is always-true → OR(true, x) = true → no constraint.
+        ;; Returning [] means translate-predicate's caller (the AND in
+        ;; the surrounding WHERE) just skips this clause.
+        (some #(= ::always-true %) all-branches)
+        []
+
+        ;; Drop constant-false branches. OR(false, x) = x; OR(false, false) = false.
+        :else
+        (let [live-branches (vec (remove false-sentinel? all-branches))]
+          (cond
+            ;; All branches false → OR is false. Emit one canonical
+            ;; false-sentinel as a top-level clause; the surrounding AND
+            ;; short-circuits to false, the query returns no rows.
+            (empty? live-branches)
+            [[(list 'not= 1 1)]]
+
+            ;; Single live branch → unwrap to flat clauses so the outer
+            ;; translate-predicate keeps its vec-of-clauses shape.
+            (= 1 (count live-branches))
+            (let [b (first live-branches)]
+              (cond
+                (and (seq? b) (= 'and (first b))) (vec (rest b))
+                (vector? b)                       [b]
+                :else                             [b]))
+
+            ;; Two live branches → emit OR. shared-vars =
+            ;; (branch-vars ∩ outer-bound-vars). Datomic / legacy-engine
+            ;; semantics: shared-vars are the bridge between branches and
+            ;; the outer query (limit-context projects each branch's
+            ;; result to these). Branch-locals (e.g. the ?c1 introduced
+            ;; inside a correlated EXISTS subquery) must stay out of
+            ;; shared-vars or the post-projection `limit-rel`
+            ;; mismatches across branches. Empty intersection → use
+            ;; plain `or`.
+            :else
+            (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                  outer-vars  (ctx/collect-vars @(:where-clauses ctx))
+                  shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
+              [(if (seq shared-vars)
+                 (concat ['or-join shared-vars] live-branches)
+                 (concat ['or] live-branches))])))))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
