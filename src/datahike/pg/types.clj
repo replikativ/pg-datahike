@@ -184,6 +184,93 @@
    "regtype"           :db.type/long})
 
 ;; ============================================================================
+;; SQL name → element keyword (for array column types)
+;; ============================================================================
+
+(def sql-name->elem-kw
+  "SQL type name (lowercased, no `(p,s)` parens) → the array-element
+   keyword used on `PgArray :elem-type`. More specific than
+   `sql-name->dh-type` because integer width matters at the wire
+   layer (`int4[]` → `_int4`, OID 1007; `int8[]` → `_int8`, OID 1016)
+   even though both reduce to `:db.type/long` in Datahike storage."
+  {"text"              :text
+   "varchar"           :varchar
+   "character varying" :varchar
+   "char"              :bpchar
+   "character"         :bpchar
+   "bpchar"            :bpchar
+   "name"              :name
+   "citext"            :text
+   "integer"           :int4
+   "int"               :int4
+   "int4"              :int4
+   "int2"              :int2
+   "smallint"          :int2
+   "int8"              :int8
+   "bigint"            :int8
+   "double precision"  :float8
+   "double"            :float8
+   "float"             :float8
+   "float8"            :float8
+   "float4"            :float4
+   "real"              :float4
+   "numeric"           :numeric
+   "decimal"           :numeric
+   "boolean"           :bool
+   "bool"              :bool
+   "timestamp"                       :timestamp
+   "timestamp without time zone"     :timestamp
+   "timestamp with time zone"        :timestamptz
+   "timestamptz"                     :timestamptz
+   "date"              :date
+   "time"              :time
+   "time without time zone"          :time
+   "time with time zone"             :time
+   "uuid"              :uuid
+   "json"              :json
+   "jsonb"             :jsonb
+   "bytea"             :bytea
+   "oid"               :oid})
+
+(defn parse-array-type-name
+  "Parse a SQL type string for arrays. Returns
+   `{:elem <kw> :pg-name \"_T\" :ndim N}` or `nil` if not an array.
+
+   Strips `(p,s)` typmod, tolerates `int ARRAY` / `int ARRAY[3]`
+   (PG's alternative array syntax — the size is informational,
+   PG doesn't enforce it). Element-name is matched against
+   `sql-name->elem-kw` so we cover every scalar in our registry.
+
+   Multi-dim is reflected by `:ndim`; we accept arbitrary N at parse
+   time (DDL can choose to reject N>1 if it isn't ready to handle
+   them, but the parser doesn't lose information).
+
+       \"int[]\"        → {:elem :int4, :pg-name \"_int4\", :ndim 1}
+       \"text[][]\"     → {:elem :text, :pg-name \"_text\", :ndim 2}
+       \"int ARRAY\"    → {:elem :int4, :pg-name \"_int4\", :ndim 1}
+       \"int ARRAY[3]\" → {:elem :int4, :pg-name \"_int4\", :ndim 1}
+       \"numeric(p,s)[]\" → {:elem :numeric, :pg-name \"_numeric\", :ndim 1}"
+  [^String s]
+  (let [norm (-> s
+                 str/lower-case
+                 str/trim
+                 (str/replace #"\s*\([^)]*\)" "")  ;; strip typmod (p,s)
+                 ;; "int ARRAY" / "int ARRAY[3]" → "int[]" (size ignored)
+                 (str/replace #"\s+array\s*\[\s*\d*\s*\]" "[]")
+                 (str/replace #"\s+array$" "[]")
+                 str/trim)
+        m (re-matches #"^([a-z][a-z0-9 ]*?)\s*((?:\[\s*\d*\s*\])+)\s*$" norm)]
+    (when m
+      (let [elem-name (str/trim (nth m 1))
+            brackets  (nth m 2)
+            ndim      (count (re-seq #"\[" brackets))
+            elem-kw   (get sql-name->elem-kw elem-name)]
+        (when elem-kw
+          {:elem elem-kw
+           :pg-name (str "_" (name elem-kw))
+           :ndim ndim})))))
+
+;; ============================================================================
 ;; Datahike value type → PostgreSQL OID (for wire protocol)
 ;; ============================================================================
 
@@ -193,24 +280,38 @@
    valueType 1:1 — e.g. `date` vs `timestamp` both collapse to
    :db.type/instant) back to its wire OID. Used by
    infer-param-oid-for-column so pgjdbc's ParameterDescription sees
-   the SQL-declared type, not our internal reduction."
-  {"bool"        oid-bool
-   "int2"        oid-int2
-   "int4"        oid-int4
-   "int8"        oid-int8
-   "text"        oid-text
-   "varchar"     oid-varchar
-   "float4"      oid-float4
-   "float8"      oid-float8
-   "numeric"     oid-numeric
-   "date"        oid-date
-   "time"        oid-time
-   "timestamp"   oid-timestamp
-   "timestamptz" oid-timestamptz
-   "uuid"        oid-uuid
-   "json"        oid-json
-   "jsonb"       oid-jsonb
-   "bytea"       oid-bytea})
+   the SQL-declared type, not our internal reduction.
+
+   Includes paired `_T` entries for every scalar — `_int4` →
+   oid-int4-array, etc. — so an array column's `:pg/type` (set
+   to `_int4` etc. by translate-create-table for `int[]` columns)
+   resolves directly to its array OID."
+  (merge
+   {"bool"        oid-bool
+    "int2"        oid-int2
+    "int4"        oid-int4
+    "int8"        oid-int8
+    "text"        oid-text
+    "varchar"     oid-varchar
+    "float4"      oid-float4
+    "float8"      oid-float8
+    "numeric"     oid-numeric
+    "date"        oid-date
+    "time"        oid-time
+    "timestamp"   oid-timestamp
+    "timestamptz" oid-timestamptz
+    "uuid"        oid-uuid
+    "json"        oid-json
+    "jsonb"       oid-jsonb
+    "bytea"       oid-bytea}
+   ;; Array entries: "_T" → array OID. Generated from elem-kw->oid
+   ;; so adding a new scalar type only needs three rows
+   ;; (elem-kw->oid, element-oid->array-oid, sql-name->elem-kw).
+   (into {}
+         (keep (fn [[kw oid]]
+                 (when-let [arr-oid (element-oid->array-oid oid)]
+                   [(str "_" (name kw)) arr-oid])))
+         elem-kw->oid)))
 
 (def dh-type->oid
   "Map Datahike :db/valueType to PostgreSQL type OID for wire protocol."

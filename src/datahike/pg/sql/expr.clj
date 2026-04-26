@@ -385,14 +385,15 @@
         result-var)
 
       ;; --- Array meta functions -----------------------------------------
-      ;; array_length(arr, dim) — NULL for empty, count otherwise.
-      ;; PG supports multi-dim; we only honour dim=1.
+      ;; array_length(arr, dim) — NULL for empty or out-of-range dim,
+      ;; per-dim count otherwise. Note PG returns NULL for length-0
+      ;; even when dim is in range, so we check positivity.
       (= fname "array_length")
       (let [fn-param (symbol (str "?arr-len" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (= 1 (long dim))
-                               (pos? (pg-arr/length arr)))
-                        (pg-arr/length arr)
+                      (if (pg-arr/array? arr)
+                        (let [n (pg-arr/length-d arr (long dim))]
+                          (if (and n (pos? (long n))) n :__null__))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -403,9 +404,11 @@
       (= fname "array_upper")
       (let [fn-param (symbol (str "?arr-upper" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (= 1 (long dim))
-                               (pos? (pg-arr/length arr)))
-                        (pg-arr/length arr)
+                      (if (pg-arr/array? arr)
+                        (let [n (pg-arr/length-d arr (long dim))]
+                          (if (and n (pos? (long n)))
+                            (pg-arr/ubound arr (long dim))
+                            :__null__))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -416,9 +419,9 @@
       (= fname "array_lower")
       (let [fn-param (symbol (str "?arr-lower" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (= 1 (long dim))
-                               (pos? (pg-arr/length arr)))
-                        (:lbound arr)
+                      (if (and (pg-arr/array? arr) (pos? (pg-arr/length arr))
+                               (<= (long dim) (pg-arr/ndim arr)))
+                        (pg-arr/lbound arr (long dim))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -426,11 +429,15 @@
                [(list fn-param (first args) (or (second args) 1)) result-var])
         result-var)
 
-      ;; cardinality(arr) — 0 for empty (differs from array_length NULL)
+      ;; cardinality(arr) — total leaf count across all dimensions
+      ;; (PG: differs from array_length, which is per-dim and NULL for
+      ;; empty). 0 for empty array; sum across all dims for multi-dim.
       (= fname "cardinality")
       (let [fn-param (symbol (str "?card" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr]
-                      (if (pg-arr/array? arr) (pg-arr/length arr) 0))]
+                      (if (pg-arr/array? arr)
+                        (count (pg-arr/flat-elements arr))
+                        0))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -1632,15 +1639,33 @@
     ;; jsonb_build_array branch below.
     (instance? ArrayConstructor expr)
     (let [exprs (.getExpressions ^ArrayConstructor expr)
-          elem-type (let [first-typed
-                          (some (fn [e]
-                                  (cond
-                                    (instance? LongValue e)    :int8
-                                    (instance? DoubleValue e)  :float8
-                                    (instance? StringValue e)  :text
-                                    (instance? BooleanValue e) :bool))
-                                exprs)]
-                      (or first-typed :text))
+          ;; Detect the leaf element type by walking through nested
+          ;; ArrayConstructors. Without this, `ARRAY[ARRAY[1,2],
+          ;; ARRAY[3,4]]` gets an outer `:elem-type :text` (no
+          ;; LongValue at the top level) — wrong for OID inference
+          ;; and for any operator that reads `:elem-type` directly.
+          ;; Falls back to :text when no typed literal is found
+          ;; (matches PG's empty-array-untyped behaviour).
+          detect-elem (fn detect-elem [es]
+                        (or (some (fn [e]
+                                    (cond
+                                      (instance? LongValue e)        :int8
+                                      (instance? DoubleValue e)      :float8
+                                      (instance? StringValue e)      :text
+                                      (instance? BooleanValue e)     :bool
+                                      (instance? ArrayConstructor e)
+                                      (detect-elem (.getExpressions ^ArrayConstructor e))
+                                      (instance? CastExpression e)
+                                      (let [t (-> (str (.getColDataType ^CastExpression e))
+                                                  clojure.string/lower-case
+                                                  clojure.string/trim
+                                                  ;; strip (p,s) typmod
+                                                  (clojure.string/replace #"\s*\([^)]*\)" ""))]
+                                        (get types/sql-name->elem-kw t))
+                                      :else nil))
+                                  es)
+                            :text))
+          elem-type (detect-elem exprs)
           args (mapv #(translate-expr ctx %) exprs)
           arg-vars (mapv #(if (seq? %) (ctx/materialize-arg! ctx %) %) args)
           fn-param (symbol (str "?pg-arr-ctor" (swap! (:var-counter ctx) inc)))
