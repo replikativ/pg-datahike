@@ -146,19 +146,27 @@
   [^String s]
   (str/replace s #"[\\\"]" "\\\\$0"))
 
+(declare to-pg-text)
+
 (defn- element->text
   "Format a single element for array text output. Booleans → t/f,
    numbers → Java toString, strings → quoted+escaped as needed, nil →
-   unquoted NULL."
+   unquoted NULL. Nested PgArrays and sequential collections recurse
+   into PG's `{…}` format so multi-dim ARRAY[[1,0],[0,1]] renders
+   as `{{1,0},{0,1}}` (matching PG's `array_out`)."
   [v]
   (cond
-    (nil? v)       "NULL"
-    (boolean? v)   (if v "t" "f")
-    (number? v)    (str v)
-    :else          (let [s (str v)]
-                     (if (needs-quote? s)
-                       (str "\"" (escape-for-array-text s) "\"")
-                       s))))
+    (nil? v)        "NULL"
+    (boolean? v)    (if v "t" "f")
+    (number? v)     (str v)
+    (array? v)      (to-pg-text v)
+    (sequential? v) (if (empty? v)
+                      "{}"
+                      (str "{" (str/join "," (map element->text v)) "}"))
+    :else           (let [s (str v)]
+                      (if (needs-quote? s)
+                        (str "\"" (escape-for-array-text s) "\"")
+                        s))))
 
 (defn to-pg-text
   "Render a PgArray to PG's canonical text format: `{e1,e2,...}`.

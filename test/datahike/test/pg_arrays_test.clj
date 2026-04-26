@@ -180,6 +180,18 @@
 (deftest text-format-float
   (is (= "{1.5,2.5}" (arr/to-pg-text (arr/array :float8 [1.5 2.5])))))
 
+(deftest text-format-nested-pg-array
+  (testing "Multi-dim ARRAY[[1,0],[0,1]] renders as PG canonical {{1,0},{0,1}}"
+    (let [inner1 (arr/array :int8 [1 0])
+          inner2 (arr/array :int8 [0 1])
+          outer  (arr/array :int8 [inner1 inner2])]
+      (is (= "{{1,0},{0,1}}" (arr/to-pg-text outer)))))
+  (testing "Nested clojure vector — same canonical form"
+    (is (= "{{1,0},{0,1}}" (arr/to-pg-text (arr/array :int8 [[1 0] [0 1]])))))
+  (testing "3D arrays compose"
+    (is (= "{{{1,2},{3,4}},{{5,6},{7,8}}}"
+           (arr/to-pg-text (arr/array :int8 [[[1 2] [3 4]] [[5 6] [7 8]]]))))))
+
 (deftest text-parse-empty
   (is (= [] (:elements (arr/from-pg-text "{}" :int4)))))
 
