@@ -134,10 +134,26 @@
   (testing "key UPDATE on unreferenced row ok"
     (is (ok? (run "UPDATE p3 SET id = 20 WHERE id = 2")))))
 
-(deftest fk-cascade-rejected-at-ddl
-  (testing "ON DELETE CASCADE is not supported — DDL itself rejected"
+(deftest fk-cascade-on-delete
+  (testing "ON DELETE CASCADE — inline form is lifted to a table-level
+            FK by the rewrite layer; DELETE on the parent retracts the
+            child rows in the same transaction."
+    (is (ok? (run "CREATE TABLE pcas (id INT PRIMARY KEY)")))
+    (is (ok? (run "CREATE TABLE ccas (id INT PRIMARY KEY, pid INT REFERENCES pcas(id) ON DELETE CASCADE)")))
+    (is (ok? (run "INSERT INTO pcas VALUES (1),(2),(3)")))
+    (is (ok? (run "INSERT INTO ccas VALUES (10, 1),(11, 1),(12, 2)")))
+    (testing "DELETE parent → cascade-delete dependent children"
+      (is (ok? (run "DELETE FROM pcas WHERE id = 1")))
+      ;; Children of pid=1 should be gone; pid=2's child remains.
+      ;; COUNT(*) returns rows as strings via the wire format here.
+      (is (= "1" (-> (rows (run "SELECT COUNT(*) FROM ccas")) ffirst str))))
+    (testing "DELETE unreferenced parent unaffected"
+      (is (ok? (run "DELETE FROM pcas WHERE id = 3"))))))
+
+(deftest fk-set-null-rejected-at-ddl
+  (testing "ON DELETE SET NULL — not yet implemented; DDL rejected"
     (is (err-contains?
-         (run "CREATE TABLE cc (id INT PRIMARY KEY, pid INT REFERENCES p2(id) ON DELETE CASCADE)")
+         (run "CREATE TABLE csn (id INT PRIMARY KEY, pid INT REFERENCES p2(id) ON DELETE SET NULL)")
          "not supported"))))
 
 ;; ============================================================================

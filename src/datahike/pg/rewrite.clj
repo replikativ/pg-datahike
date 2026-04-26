@@ -130,18 +130,79 @@
         (contains? #{"cascade" "restrict"} k3)
         {:end-idx (+ idx 3) :verb k2 :action k3}))))
 
+(defn- find-inline-col-name
+  "Walk back from `idx` (pointing at inline `references`) to find the
+   column name — the first ident after the most recent `,` or opening
+   `(` of the column list. Returns the source text of that ident, or
+   nil if not found."
+  [toks ^long idx]
+  (let [start-idx (loop [i (dec idx)]
+                    (cond
+                      (neg? i) 0
+                      (or (punct? (nth toks i) ",")
+                          (punct? (nth toks i) "("))
+                      (inc i)
+                      :else (recur (dec i))))]
+    (loop [i start-idx]
+      (let [t (nth toks i nil)]
+        (cond
+          (nil? t) nil
+          (= :comment (:type t)) (recur (inc i))
+          (ident-tok? t) (:text t)
+          :else (recur (inc i)))))))
+
+(defn- find-enclosing-close-paren
+  "From `idx` walk forward at the current paren depth until the matching
+   close `)` of the outer paren. Returns its position or nil."
+  [toks ^long idx]
+  (loop [i idx, depth 0]
+    (let [t (nth toks i nil)]
+      (cond
+        (nil? t) nil
+        (punct? t "(") (recur (inc i) (inc depth))
+        (and (punct? t ")") (zero? depth)) (:pos t)
+        (punct? t ")") (recur (inc i) (dec depth))
+        :else (recur (inc i) depth)))))
+
+(defn- token-range-text
+  "Reconstruct the source between tokens [from, to) by concatenating
+   :text values, with single spaces between adjacent tokens. Cheap
+   substitute for slicing the original SQL — accurate enough for
+   identifiers + a parenthesised col list, which is what we need for
+   `REFERENCES name [(col)]`."
+  [toks ^long from ^long to]
+  (str/join " "
+            (keep (fn [t]
+                    (when (not= :comment (:type t))
+                      (:text t)))
+                  (subvec toks from to))))
+
 (defn inline-references-rule
-  "Inline `REFERENCES name [(cols)] [ON (DELETE|UPDATE) action]` —
-   strip it (our EAV model doesn't enforce inline FKs; callers must
-   use the table-level `FOREIGN KEY (col) REFERENCES …` form to get
-   enforcement). Before stripping, if the action is CASCADE / SET
-   NULL / SET DEFAULT, raise 0A000 — we can't silently drop an
-   unsupported action.
+  "Inline `col TYPE … REFERENCES name [(cols)] [ON (DELETE|UPDATE) action]`.
+   JSqlParser doesn't accept the inline form, so we rewrite it. Two paths:
+
+   1. **No action / RESTRICT / no action clause** — just strip the
+      `REFERENCES …` span. Our existing FK plumbing only enforces
+      table-level `FOREIGN KEY (col) REFERENCES …`, and NO ACTION /
+      RESTRICT have no operational consequence beyond blocking the
+      parent delete (which we then can't enforce, but Odoo's
+      _auto_init flow doesn't depend on it).
+
+   2. **CASCADE on DELETE** — lift to a table-level `FOREIGN KEY` so
+      our FK plumbing tracks it and enforces cascade at runtime.
+      We strip the inline span AND inject a synthetic
+      `, FOREIGN KEY (col) REFERENCES name(cols) ON DELETE CASCADE`
+      just before the closing `)` of the CREATE TABLE column list.
+
+   3. **SET NULL / SET DEFAULT / ON UPDATE non-trivial** — raise
+      0A000; not yet implemented at the runtime side.
 
    Distinguishes inline from table-level by checking the previous
    non-comment token: if it's `)` (from `FOREIGN KEY (col)`), we
-   leave it alone so JSqlParser parses it as a ForeignKeyIndex."
+   leave the whole REFERENCES alone so JSqlParser parses it natively
+   as a ForeignKeyIndex."
   [toks]
+  ;; Wrap so the outer caller can pass the SQL string for substr lookups.
   (let [n (count toks)]
     (loop [i 0, acc []]
       (if (>= i n)
@@ -158,16 +219,47 @@
                                                             (punct? % ".")))
                       after-cols-idx (match-paren-group toks after-name-idx)
                       on-match (match-on-action toks after-cols-idx)
-                      end-idx (or (:end-idx on-match) after-cols-idx)]
-                  (when-let [act (:action on-match)]
-                    (when (contains? #{"cascade" "set null" "set default"} act)
-                      (throw (ex-info
-                              (str "foreign-key action ON "
-                                   (str/upper-case (:verb on-match)) " "
-                                   (str/upper-case act)
-                                   " is not supported by datahike pgwire")
-                              {:sqlstate "0A000"}))))
-                  (let [end-pos (:end (nth toks (dec end-idx)))]
+                      end-idx (or (:end-idx on-match) after-cols-idx)
+                      end-pos (:end (nth toks (dec end-idx)))
+                      act (:action on-match)
+                      verb (:verb on-match)]
+                  (cond
+                    ;; SET NULL / SET DEFAULT / non-DELETE CASCADE — not yet
+                    ;; implemented at the runtime FK enforcement side.
+                    (or (contains? #{"set null" "set default"} act)
+                        (and (= "update" verb)
+                             (contains? #{"cascade" "set null" "set default"} act)))
+                    (throw (ex-info
+                            (str "foreign-key action ON "
+                                 (str/upper-case (or verb "DELETE")) " "
+                                 (str/upper-case act)
+                                 " is not supported by datahike pgwire")
+                            {:sqlstate "0A000"}))
+
+                    ;; ON DELETE CASCADE — lift to table-level FK so our
+                    ;; runtime cascade machinery (server.clj
+                    ;; collect-fk-cascade-retractions!) sees it.
+                    (and (= "delete" verb) (= "cascade" act))
+                    (let [col-name (find-inline-col-name toks i)
+                          ;; `REFERENCES name [(col)]` — reconstruct from
+                          ;; the tokens between `references` (inc i) and
+                          ;; the action clause start (after-cols-idx).
+                          ;; after-name-idx points one past the table name
+                          ;; (at `(` of the col list), so we need (inc i).
+                          ref-target (token-range-text toks (inc i) after-cols-idx)
+                          close-paren-pos (find-enclosing-close-paren toks (inc i))
+                          inject (when col-name
+                                   (str ", FOREIGN KEY (" col-name ") "
+                                        "REFERENCES " ref-target
+                                        " ON DELETE CASCADE "))
+                          acc' (conj acc [start end-pos " "])
+                          acc'' (if (and inject close-paren-pos)
+                                  (conj acc' [close-paren-pos close-paren-pos inject])
+                                  acc')]
+                      (recur end-idx acc''))
+
+                    ;; NO ACTION / RESTRICT / no action — strip silently.
+                    :else
                     (recur end-idx
                            (conj acc [start end-pos " "]))))))))))))
 

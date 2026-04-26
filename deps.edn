@@ -2,7 +2,7 @@
 
  :deps
  {org.clojure/clojure               {:mvn/version "1.12.4"}
-  org.replikativ/datahike           {:mvn/version "0.8.1675"}
+  org.replikativ/datahike           {:local/root "/home/christian-weilbach/Development/datahike"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
   com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}}
 

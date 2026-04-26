@@ -487,27 +487,47 @@
                                             (internal-attr? k)
                                             (nil? (namespace k))
                                             (:hidden (get hints k))))
-                            schema)]
-     (reduce
-      (fn [tables [ident props]]
-        (let [[table-name local-col] (attr->table-col ident)
-              h (get hints ident)
-              col-name (or (:column h) local-col)
-              vtype (:db/valueType props)
-              col {:name        col-name
-                   :attr        ident
-                   :oid         (oid-for-valuetype vtype)
-                   :valuetype   vtype
-                   :cardinality (:db/cardinality props)
-                   :unique      (:db/unique props)
-                   :ref?        (= vtype :db.type/ref)
-                   :references  (:references h)
-                   :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
-          (-> tables
-              (update-in [table-name :columns] (fnil conj []) col)
-              (assoc-in [table-name :attrs col-name] ident))))
-      {}
-      user-attrs))))
+                            schema)
+         tables-from-attrs (reduce
+                            (fn [tables [ident props]]
+                              (let [[table-name local-col] (attr->table-col ident)
+                                    h (get hints ident)
+                                    col-name (or (:column h) local-col)
+                                    vtype (:db/valueType props)
+                                    col {:name        col-name
+                                         :attr        ident
+                                         :oid         (oid-for-valuetype vtype)
+                                         :valuetype   vtype
+                                         :cardinality (:db/cardinality props)
+                                         :unique      (:db/unique props)
+                                         :ref?        (= vtype :db.type/ref)
+                                         :references  (:references h)
+                                         :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
+                                (-> tables
+                                    (update-in [table-name :columns] (fnil conj []) col)
+                                    (assoc-in [table-name :attrs col-name] ident))))
+                            {}
+                            user-attrs)
+         ;; Also surface tables that exist in the schema but have NO own
+         ;; user columns — typically INHERITS children whose columns all
+         ;; live in the parent's namespace. Without this, pg_class doesn't
+         ;; list them, Odoo's `table_exists()` returns false, and Odoo
+         ;; issues a redundant CREATE TABLE that we then reject as 42P07.
+         ;; Detect via the row-marker attr (`<table>/db-row-exists`) which
+         ;; every pgwire CREATE TABLE installs.
+         marker-tables (into #{}
+                             (keep (fn [[k _]]
+                                     (when (and (keyword? k)
+                                                (= (name k) row-marker-col)
+                                                (namespace k))
+                                       (namespace k))))
+                             schema)]
+     (reduce (fn [tables tname]
+               (cond-> tables
+                 (not (contains? tables tname))
+                 (assoc tname {:columns [] :attrs {}})))
+             tables-from-attrs
+             marker-tables))))
 
 (defn table-names
   "Return sorted list of virtual table names for a schema."

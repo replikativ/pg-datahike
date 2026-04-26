@@ -1187,20 +1187,23 @@
   "All FK constraints where the given table is the PARENT side — i.e.
    the FKs that must be checked when a row in `table-name` is deleted
    (or its PK is updated). Used by DELETE / UPDATE to enforce
-   parent-side RESTRICT."
+   parent-side RESTRICT and CASCADE actions."
   [db table-name]
   (let [q-fn (requiring-resolve 'datahike.api/q)]
-    (map (fn [[n ct cc pc]]
+    (map (fn [[n ct cc pc od]]
            {:name n :child-table ct
             :child-cols (vec (jb/parse-jsonb cc))
-            :parent-cols (vec (jb/parse-jsonb pc))})
-         (q-fn '{:find [?n ?ct ?cc ?pc]
+            :parent-cols (vec (jb/parse-jsonb pc))
+            ;; PG default for missing ON DELETE is NO ACTION.
+            :on-delete (or od :no-action)})
+         (q-fn '{:find [?n ?ct ?cc ?pc ?od]
                  :in [$ ?pt]
                  :where [[?e :pg/fk-name ?n]
                          [?e :pg/fk-parent-table ?pt]
                          [?e :pg/fk-child-table ?ct]
                          [?e :pg/fk-child-cols ?cc]
-                         [?e :pg/fk-parent-cols ?pc]]}
+                         [?e :pg/fk-parent-cols ?pc]
+                         [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
                db table-name))))
 
 (defn- enforce-fk-on-insert!
@@ -1240,45 +1243,115 @@
                        :table table-name
                        :constraint name})))))))))
 
-(defn- enforce-fk-restrict-on-delete!
-  "Before DELETE retracts `eids` from `table-name`, verify no FK
-   references them (the parent-side RESTRICT behavior). Raises 23503
-   if any child row would become an orphan. Called from execute-delete
-   with the CURRENT db (pre-transact) — restrict is a prohibition,
-   not a cascade, so we only need to see committed child rows."
+(defn- find-fk-children
+  "Find child eids that reference any of the parent eids via the given FK.
+   Returns the eids as a set, or empty set if none."
+  [db table-name fk eids]
+  (let [q-fn (requiring-resolve 'datahike.api/q)
+        {:keys [child-table child-cols parent-cols]} fk
+        parent-attrs (mapv #(keyword table-name %) parent-cols)
+        child-attrs (mapv #(keyword child-table %) child-cols)]
+    (into #{}
+          (mapcat (fn [eid]
+                    (let [parent-vals (mapv (fn [a]
+                                              (ffirst (q-fn {:find '[?v]
+                                                             :in '[$ ?e]
+                                                             :where [['?e a '?v]]}
+                                                            db eid)))
+                                            parent-attrs)]
+                      (when (every? some? parent-vals)
+                        (let [patterns (mapv (fn [attr v] ['?c attr v])
+                                             child-attrs parent-vals)
+                              q {:find '[?c] :where patterns}]
+                          (mapv first (q-fn q db)))))))
+          eids)))
+
+(defn- collect-fk-cascade-retractions!
+  "Walk all FKs with this table as parent. For RESTRICT/NO ACTION, raise
+   23503 if any child references the deleted eids. For CASCADE, recurse:
+   collect the child eids and ALSO walk THEIR children. Returns a set of
+   cascade-eids (across all child tables) to retract in the same tx.
+   PG-equivalent (commands/trigger.c::RI_FKey_cascade_del). Walks
+   iteratively against `db` (pre-transact); since retractEntity is
+   atomic, the same tx removes parent + transitively-cascading children."
   [db table-name eids]
   (when (seq eids)
-    (let [fks (seq (read-fks-referring-to db table-name))]
-      (when fks
-        (let [q-fn (requiring-resolve 'datahike.api/q)]
-          (doseq [eid eids
-                  {:keys [name child-table child-cols parent-cols]} fks
-                  :let [parent-attrs (mapv #(keyword table-name %) parent-cols)
+    (loop [pending [[table-name eids]]
+           visited #{}                  ;; [table-name eid] pairs already cascaded
+           cascade-eids #{}]
+      (if (empty? pending)
+        cascade-eids
+        (let [[t es] (first pending)
+              fks (read-fks-referring-to db t)
+              ;; Bucket FKs by action.
+              by-action (group-by :on-delete fks)
+              ;; RESTRICT / NO ACTION: any child = abort.
+              restrict-fks (concat (get by-action :no-action)
+                                   (get by-action :restrict))]
+          ;; Raise on first restrict violation.
+          (doseq [{:keys [name parent-cols] :as fk} restrict-fks
+                  :let [hits (find-fk-children db t fk es)]
+                  :when (seq hits)
+                  :let [parent-attrs (mapv #(keyword t %) parent-cols)
+                        eid (first es)
                         parent-vals (mapv (fn [a]
-                                            (ffirst (q-fn {:find '[?v]
-                                                           :in '[$ ?e]
-                                                           :where [['?e a '?v]]}
-                                                          db eid)))
-                                          parent-attrs)]
-                  :when (every? some? parent-vals)
-                  :let [child-attrs (mapv #(keyword child-table %) child-cols)
-                        patterns (mapv (fn [attr v] ['?c attr v])
-                                       child-attrs parent-vals)
-                        q {:find '[?c] :where patterns}
-                        child-hits (q-fn q db)]
-                  :when (seq child-hits)]
+                                            (ffirst ((requiring-resolve 'datahike.api/q)
+                                                     {:find '[?v]
+                                                      :in '[$ ?e]
+                                                      :where [['?e a '?v]]}
+                                                     db eid)))
+                                          parent-attrs)]]
             (throw (ex-info
-                    (str "update or delete on table \"" table-name
+                    (str "update or delete on table \"" t
                          "\" violates foreign key constraint \""
                          name "\" on table \""
-                         child-table "\": Key ("
+                         (:child-table fk) "\": Key ("
                          (str/join ", " parent-cols) ")=("
                          (str/join ", " (map pr-str parent-vals))
                          ") is still referenced from table \""
-                         child-table "\"")
+                         (:child-table fk) "\"")
                     {:sqlstate "23503"
-                     :table child-table
-                     :constraint name}))))))))
+                     :table (:child-table fk)
+                     :constraint name})))
+          ;; CASCADE: collect new child eids, recurse on those.
+          (let [cascades (get by-action :cascade)
+                new-by-table
+                (reduce (fn [acc fk]
+                          (let [hits (find-fk-children db t fk es)
+                                fresh (remove (fn [c]
+                                                (contains? visited [(:child-table fk) c]))
+                                              hits)]
+                            (if (seq fresh)
+                              (update acc (:child-table fk) (fnil into #{}) fresh)
+                              acc)))
+                        {} cascades)
+                next-pending (concat (rest pending)
+                                     (for [[t' es'] new-by-table] [t' es']))
+                next-visited (into visited
+                                   (mapcat (fn [[t' es']]
+                                             (map vector (repeat t') es')))
+                                   new-by-table)
+                next-cascade (into cascade-eids
+                                   (mapcat val) new-by-table)]
+            ;; SET NULL / SET DEFAULT not yet supported — surface clearly.
+            (when-let [unsupported (seq (concat (get by-action :set-null)
+                                                (get by-action :set-default)))]
+              (throw (ex-info
+                      (str "ON DELETE " (name (:on-delete (first unsupported)))
+                           " is not yet implemented for FK \""
+                           (:name (first unsupported)) "\"")
+                      {:sqlstate "0A000"
+                       :constraint (:name (first unsupported))})))
+            (recur next-pending next-visited next-cascade)))))))
+
+(defn- enforce-fk-restrict-on-delete!
+  "Compatibility shim — older sites call this. Walks the FK graph and
+   either raises 23503 (RESTRICT/NO ACTION) or returns nil (we don't
+   add cascade retractions through this path; new callers should use
+   collect-fk-cascade-retractions! and append to tx-data)."
+  [db table-name eids]
+  (collect-fk-cascade-retractions! db table-name eids)
+  nil)
 
 (defn- enforce-fk-restrict-on-update!
   "Mirror of enforce-fk-restrict-on-delete!, but for UPDATE: when an
@@ -1598,10 +1671,15 @@
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
-                             (build-returning-result returning db eids table schema))]
-      (enforce-fk-restrict-on-delete! db table eids)
-      (when (seq tx-data)
-        (d/transact conn tx-data))
+                             (build-returning-result returning db eids table schema))
+          ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
+          ;; to retract atomically alongside the parent deletion.
+          cascade-eids (collect-fk-cascade-retractions! db table eids)
+          cascade-tx (when (seq cascade-eids)
+                       (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
+          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))]
+      (when (seq full-tx)
+        (d/transact conn full-tx))
       (or returning-result
           (empty-result (str "DELETE " (count eids)))))
     (catch Exception e

@@ -563,14 +563,17 @@
                  ou (assoc :pg/fk-on-update ou))))
         schema-tx (into schema-tx (into check-entities fk-entities))
         ;; Loud error at DDL for FK actions we don't yet implement.
+        ;; ON DELETE CASCADE *is* implemented (server.clj
+        ;; collect-fk-cascade-retractions!) so we accept it here.
+        ;; ON DELETE SET NULL / SET DEFAULT and ON UPDATE * still raise.
         _ (doseq [fk fk-entities]
-            (when (contains? #{:cascade :set-null :set-default}
+            (when (contains? #{:set-null :set-default}
                              (:pg/fk-on-delete fk))
               (throw (ex-info
                       (str "FOREIGN KEY ON DELETE "
                            (name (:pg/fk-on-delete fk))
                            " is not yet supported for " (:pg/fk-name fk)
-                           " — only NO ACTION / RESTRICT are enforced")
+                           " — only NO ACTION / RESTRICT / CASCADE are enforced")
                       {:sqlstate "0A000"
                        :fk (:pg/fk-name fk)
                        :action (:pg/fk-on-delete fk)})))

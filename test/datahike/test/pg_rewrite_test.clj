@@ -27,10 +27,28 @@
   (is (= "CREATE TABLE c (pid INT  )"
          (strip-refs "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE NO ACTION)"))))
 
-(deftest inline-references-with-cascade-raises-0a000
-  (doseq [action ["CASCADE" "SET NULL" "SET DEFAULT"]
-          verb ["DELETE" "UPDATE"]]
-    (testing (str "ON " verb " " action " rejected")
+(deftest inline-references-on-delete-cascade-lifts-to-table-fk
+  (testing "ON DELETE CASCADE — inline form is lifted to a table-level
+            FOREIGN KEY clause appended before the closing `)`. The
+            inline REFERENCES is stripped (so JSqlParser parses the
+            column normally) and the runtime FK plumbing then tracks
+            cascade behavior."
+    (let [out (strip-refs
+               "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE CASCADE)")]
+      (is (re-find #"FOREIGN KEY\s*\(\s*pid\s*\)\s+REFERENCES" out))
+      (is (re-find #"ON DELETE CASCADE" out))
+      ;; The original inline `REFERENCES p(id) ON DELETE CASCADE` is gone
+      ;; from the column position — only the appended table-level FK
+      ;; carries it.
+      (is (not (re-find #"INT\s+REFERENCES" out))))))
+
+(deftest inline-references-with-unsupported-action-raises-0a000
+  (doseq [[action verb] [["SET NULL" "DELETE"]
+                         ["SET DEFAULT" "DELETE"]
+                         ["CASCADE" "UPDATE"]
+                         ["SET NULL" "UPDATE"]
+                         ["SET DEFAULT" "UPDATE"]]]
+    (testing (str "ON " verb " " action " rejected (not yet implemented)")
       (let [ex (try (strip-refs
                      (str "CREATE TABLE c (pid INT REFERENCES p(id) ON "
                           verb " " action ")"))
