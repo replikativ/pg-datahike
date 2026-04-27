@@ -29,7 +29,7 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            JdbcParameter Parenthesis NotExpression]
+            CastExpression JdbcParameter Parenthesis NotExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between InExpression ExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
@@ -344,6 +344,42 @@
                            (let [[tns cn] (col-ns-name c)]
                              (when-let [oid (infer-param-oid-for-column schema tns cn)]
                                (.put result (.getIndex p) oid))))
+           ;; Strip CAST/Parenthesis wrappers so we can see the
+           ;; Column / JdbcParameter inside. Returns the inner node.
+           unwrap (fn unwrap [n]
+                    (cond
+                      (instance? CastExpression n)
+                      (recur (.getLeftExpression ^CastExpression n))
+                      (instance? Parenthesis n)
+                      (recur (.getExpression ^Parenthesis n))
+                      :else n))
+           ;; If `n` (or any Parenthesis-wrapped descendant) is a
+           ;; `CAST(? AS T)`, return the cast target's OID so callers
+           ;; can record an explicit param→OID mapping. PG semantics:
+           ;; the cast target overrides the comparand column's type
+           ;; for ParameterDescription. Resolves both canonical names
+           ;; (`int4`, `text`) and SQL aliases (`int`, `integer`,
+           ;; `bigint`, …) via sql-name→elem-kw.
+           cast-target-oid
+           (fn cast-target-oid [n]
+             (cond
+               (instance? Parenthesis n)
+               (recur (.getExpression ^Parenthesis n))
+               (instance? CastExpression n)
+               (let [ce ^CastExpression n
+                     dt (.getColDataType ce)
+                     type-str (when dt
+                                (str/lower-case (str (.getDataType dt))))]
+                 (or (get types/pg-name->oid type-str)
+                     (when-let [kw (get types/sql-name->elem-kw type-str)]
+                       (get types/elem-kw->oid kw))))))
+           ;; Bind a param against (a) an explicit cast target on its
+           ;; own side, or (b) the comparand column on the other side.
+           bind-param! (fn [^JdbcParameter p side-with-cast comparand-col]
+                         (if-let [oid (cast-target-oid side-with-cast)]
+                           (.put result (.getIndex p) oid)
+                           (when (instance? Column comparand-col)
+                             (record-param! p ^Column comparand-col))))
            walk (fn walk [n]
                   (cond
                     (nil? n) nil
@@ -352,38 +388,44 @@
                     :else
                     (do (.put seen n true)
                         (cond
-                         ;; col OP ?  or  ? OP col
+                         ;; col OP ?  or  ? OP col — also accept either
+                         ;; side wrapped in CAST(... AS T) or parens.
                           (instance? net.sf.jsqlparser.expression.operators.relational.ComparisonOperator n)
                           (let [l (.getLeftExpression
                                    ^net.sf.jsqlparser.expression.operators.relational.ComparisonOperator n)
                                 r (.getRightExpression
-                                   ^net.sf.jsqlparser.expression.operators.relational.ComparisonOperator n)]
+                                   ^net.sf.jsqlparser.expression.operators.relational.ComparisonOperator n)
+                                lb (unwrap l) rb (unwrap r)]
                             (cond
-                              (and (instance? Column l) (instance? JdbcParameter r))
-                              (record-param! r l)
-                              (and (instance? Column r) (instance? JdbcParameter l))
-                              (record-param! l r))
+                              (and (instance? Column lb) (instance? JdbcParameter rb))
+                              (bind-param! rb r lb)
+                              (and (instance? Column rb) (instance? JdbcParameter lb))
+                              (bind-param! lb l rb))
                             (walk l) (walk r))
 
-                         ;; col IN (?, ?, ...)
+                         ;; col IN (?, ?, ...) — RHS items may also be
+                         ;; CAST-wrapped (`IN (CAST(? AS INT), ?)`).
                           (instance? InExpression n)
                           (let [l (.getLeftExpression ^InExpression n)
-                                rhs (.getRightExpression ^InExpression n)]
-                            (when (instance? Column l)
+                                rhs (.getRightExpression ^InExpression n)
+                                lb (unwrap l)]
+                            (when (instance? Column lb)
                               (when (instance? ExpressionList rhs)
                                 (doseq [e rhs]
-                                  (when (instance? JdbcParameter e)
-                                    (record-param! e l)))))
+                                  (let [eb (unwrap e)]
+                                    (when (instance? JdbcParameter eb)
+                                      (bind-param! eb e lb))))))
                             (walk l) (walk rhs))
 
                          ;; col BETWEEN ? AND ?
                           (instance? Between n)
                           (let [l (.getLeftExpression ^Between n)
                                 s (.getBetweenExpressionStart ^Between n)
-                                e (.getBetweenExpressionEnd ^Between n)]
-                            (when (instance? Column l)
-                              (when (instance? JdbcParameter s) (record-param! s l))
-                              (when (instance? JdbcParameter e) (record-param! e l)))
+                                e (.getBetweenExpressionEnd ^Between n)
+                                lb (unwrap l) sb (unwrap s) eb (unwrap e)]
+                            (when (instance? Column lb)
+                              (when (instance? JdbcParameter sb) (bind-param! sb s lb))
+                              (when (instance? JdbcParameter eb) (bind-param! eb e lb)))
                             (walk l) (walk s) (walk e))
 
                           (instance? AndExpression n)
@@ -395,7 +437,9 @@
                           (instance? Parenthesis n)
                           (walk (.getExpression ^Parenthesis n))
                           (instance? NotExpression n)
-                          (walk (.getExpression ^NotExpression n))))))]
+                          (walk (.getExpression ^NotExpression n))
+                          (instance? CastExpression n)
+                          (walk (.getLeftExpression ^CastExpression n))))))]
        (walk expr)
        (when (pos? (.size result)) (into {} result)))
      (catch Throwable _ nil))))
