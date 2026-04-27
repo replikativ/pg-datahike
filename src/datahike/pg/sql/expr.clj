@@ -2010,12 +2010,58 @@
     ;; Functions — aggregate or scalar
     (instance? Function expr)
     (let [^Function f expr
-          fname (str/lower-case (.getName f))]
-      (if (fns/aggregate-function? fname)
+          fname (str/lower-case (.getName f))
+          params (when-let [pl (.getParameters f)]
+                   (.getExpressions ^ExpressionList pl))]
+      (cond
+        ;; ARRAY(SELECT col FROM …) — PG's "construct array from
+        ;; subquery". JSqlParser parses it as Function name="array"
+        ;; with the inner SELECT as the sole argument. Pre-evaluate
+        ;; the inner SELECT (catalog-enriched db is in scope) and
+        ;; wrap all returned rows in a PgArray. Single-column inner
+        ;; → flat 1-D array (matches PG); multi-column inner is rare
+        ;; in PG idiom and would need a row-typed array, so we take
+        ;; the first column only and document it.
+        ;;
+        ;; psql's `\d <table>` uses this:
+        ;;   array_to_string(array(SELECT rolname FROM pg_roles
+        ;;                          WHERE oid = ANY(pol.polroles)), ',')
+        ;; Correlated against the outer pol row. With our virtual
+        ;; pg_policy empty, the outer never iterates and the array()
+        ;; never executes — but we still need a valid translation.
+        (and (= fname "array")
+             (= 1 (count params))
+             (or (instance? PlainSelect (first params))
+                 (instance? ParenthesedSelect (first params))))
+        (let [arg (first params)
+              inner (if (instance? ParenthesedSelect arg)
+                      (.getSelect ^ParenthesedSelect arg)
+                      arg)
+              db (:db ctx)]
+          (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
+            (try
+              (let [parse-fn (:parse-sql ctx)
+                    parsed   (parse-fn (str inner) (:schema ctx) db)
+                    q        (:query parsed)
+                    in-args  (:in-args parsed)
+                    query-db (or (:enriched-db parsed) db)
+                    q-fn     (requiring-resolve 'datahike.api/q)
+                    results  (if (seq in-args)
+                               (apply q-fn q query-db in-args)
+                               (q-fn q query-db))
+                    flat     (vec (map (fn [row]
+                                         (if (sequential? row) (first row) row))
+                                       results))]
+                (pg-arr/array :text flat))
+              (catch Throwable _ (pg-arr/array :text [])))
+            (pg-arr/array :text [])))
+
+        (fns/aggregate-function? fname)
         ;; handled at select-item level — return marker
         {:aggregate true :fn fname :params (.getParameters f)}
+
         ;; Non-aggregate function → Datalog function binding
-        (translate-function-call ctx f)))
+        :else (translate-function-call ctx f)))
 
     ;; CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME
     (instance? TimeKeyExpression expr)
@@ -2088,6 +2134,51 @@
         (instance? Between expr)
         (instance? InExpression expr))
     (translate-predicate-expr ctx expr)
+
+    ;; Scalar subquery in projection / expression position — `(SELECT
+    ;; col FROM t WHERE …)`. PG semantics: returns one value per outer
+    ;; row, NULL if the inner produces no rows.
+    ;;
+    ;; psql's `\d <table>` projects two such subqueries:
+    ;;   (SELECT pg_get_expr(d.adbin, d.adrelid, true) FROM pg_attrdef d
+    ;;    WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef)
+    ;;   (SELECT c.collname FROM pg_collation c, pg_type t WHERE …)
+    ;; Both reference catalog tables that are empty in our virtual
+    ;; catalog (we don't track column defaults or collations as rows),
+    ;; so the inner produces no rows for any outer row → NULL.
+    ;;
+    ;; Strategy: attempt to evaluate the inner SELECT once at
+    ;; translate time against the (catalog-enriched) db. Three cases:
+    ;;   1. Non-correlated, returns rows → use first row's first col.
+    ;;   2. Non-correlated, returns 0 rows → :__null__.
+    ;;   3. Correlated (references outer aliases the inner translator
+    ;;      can't resolve) → translate-select throws → :__null__.
+    ;; Case 3 is a planned conservative fallback: we don't yet have a
+    ;; per-row scalar-subquery executor, but the catalog tables that
+    ;; drive correlated psql probes (pg_attrdef, pg_collation) are
+    ;; empty in our impl, so the correct PG result IS NULL.
+    (or (instance? ParenthesedSelect expr) (instance? PlainSelect expr))
+    (let [inner (if (instance? ParenthesedSelect expr)
+                  (.getSelect ^ParenthesedSelect expr)
+                  expr)
+          db    (:db ctx)]
+      (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
+        (try
+          (let [parse-fn   (:parse-sql ctx)
+                inner-sql  (str inner)
+                parsed     (parse-fn inner-sql (:schema ctx) db)
+                q          (:query parsed)
+                in-args    (:in-args parsed)
+                query-db   (or (:enriched-db parsed) db)
+                q-fn       (requiring-resolve 'datahike.api/q)
+                results    (if (seq in-args)
+                             (apply q-fn q query-db in-args)
+                             (q-fn q query-db))
+                first-row  (first results)
+                v          (if (sequential? first-row) (first first-row) first-row)]
+            (if (some? v) v :__null__))
+          (catch Throwable _ :__null__))
+        :__null__))
 
     :else
     (throw (ex-info (str "Unsupported SQL expression: " (type expr) " — " (str expr))
@@ -2162,6 +2253,54 @@
                [(list fn-param col' arr') result-var])
         [[(list 'identity result-var)]]))))
 
+(defn- column-vtype
+  "Return the Datahike `:db/valueType` of the schema attribute that
+   `col` resolves to in the current ctx; nil when resolution fails or
+   the attr isn't in the schema. Used for PG-style typinput dispatch
+   on unknown-string operands of comparisons / IN / BETWEEN."
+  [ctx ^Column col]
+  (when-let [resolved (try (ctx/resolve-column col
+                                               (:table-aliases ctx)
+                                               (:default-table ctx)
+                                               (:col-overrides ctx)
+                                               (:derived-aliases ctx))
+                           (catch Throwable _ nil))]
+    (let [attr (cond (keyword? resolved) resolved
+                     (and (vector? resolved) (= 3 (count resolved))) (nth resolved 2)
+                     :else nil)]
+      (when attr (get-in (:schema ctx) [attr :db/valueType])))))
+
+(defn- coerce-unknown-literal
+  "If `lit` is a `StringValue` and `col` resolves to a Datahike-typed
+   schema attribute, return the typinput-coerced value (long, double,
+   bigdec, bool, uuid, instant) per PG's unknown-literal resolution.
+   Otherwise return nil so the caller falls through to translate-expr.
+
+   Mirrors `parse_coerce.c:coerce_type` line 233 — when an `unknown`
+   literal lands as the operand of an operator whose other side has a
+   determined type, PG calls that type's typinput function to produce
+   a typed Const. Without this, `WHERE c.oid = '16384'` compares long
+   to string and matches nothing — real PG resolves the literal via
+   `oidin('16384')`."
+  [ctx ^Column col lit]
+  (when (and (instance? StringValue lit)
+             (instance? Column col))
+    (when-let [vt (column-vtype ctx col)]
+      (let [s (.getNotExcapedValue ^StringValue lit)
+            v (coerce/coerce-unknown s vt parse-timestamp-string)]
+        (when (not (identical? v s))   ; only signal coercion when it produced a typed value
+          v)))))
+
+(defn- coerce-comparison-operands
+  "Apply PG-style unknown-literal coercion to a `[left right]` pair of
+   AST nodes for a binary comparison. Returns `[left' right']` where
+   each side is either the original AST node or a pre-resolved
+   typed Clojure value (Long/Double/Boolean/UUID/Date/...). The
+   caller's translate-expr branch handles both."
+  [ctx left right]
+  [(or (coerce-unknown-literal ctx right left) left)
+   (or (coerce-unknown-literal ctx left right) right)])
+
 (defn translate-comparison
   "Translate a binary comparison to Datalog predicate clauses.
 
@@ -2180,7 +2319,11 @@
 
    Special-cased: `col <op> ANY/ALL(arr)` on the RHS dispatches through
    `translate-quantified-cmp` so we don't try to bind an array against
-   a scalar."
+   a scalar.
+
+   Implicit text-to-int coercion: `<long-col> = '<digits>'` (and the
+   reverse) coerces the digit literal to a long. Matches PG's implicit
+   `oidin('16384')` resolution that powers psql's `\\d <table>` queries."
   [ctx op left right]
   (if (and (instance? Function right)
            (#{"any" "all"}
@@ -2190,8 +2333,13 @@
           params (.getParameters fn-expr)
           arr-expr (when params (first params))]
       (translate-quantified-cmp ctx op left arr-expr kind))
-    (let [l (translate-expr ctx left)
-          r (translate-expr ctx right)
+    (let [[left right] (coerce-comparison-operands ctx left right)
+          ;; Each side is either an AST node (translate-expr-bound) or
+          ;; a pre-resolved typed Clojure value from coerce-unknown.
+          l (if (instance? net.sf.jsqlparser.expression.Expression left)
+              (translate-expr ctx left) left)
+          r (if (instance? net.sf.jsqlparser.expression.Expression right)
+              (translate-expr ctx right) right)
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
           guards (ctx/null-guard-clauses ctx [l r])]
@@ -2363,7 +2511,12 @@
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx))
-                val (translate-expr ctx right)]
+                ;; PG-style unknown-literal coercion: `<typed-col> = '<lit>'`
+                ;; routes the literal through the column's typinput when
+                ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
+                ;; See coerce/coerce-unknown for the dispatch.
+                coerced (coerce-unknown-literal ctx left right)
+                val (or coerced (translate-expr ctx right))]
             (if (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
               (let [evar (ctx/entity-var! ctx (second resolved))]
@@ -2430,9 +2583,16 @@
     (instance? Between expr)
     (let [^Between e expr
           not-between? (.isNot e)
-          col (translate-expr ctx (.getLeftExpression e))
-          lo (translate-expr ctx (.getBetweenExpressionStart e))
-          hi (translate-expr ctx (.getBetweenExpressionEnd e))
+          left-ast (.getLeftExpression e)
+          col (translate-expr ctx left-ast)
+          ;; PG-style typinput on each bound when LHS is a typed Column
+          ;; — `oid BETWEEN '16000' AND '17000'` and similar.
+          coerce-bound (fn [bound-ast]
+                         (or (when (instance? Column left-ast)
+                               (coerce-unknown-literal ctx left-ast bound-ast))
+                             (translate-expr ctx bound-ast)))
+          lo (coerce-bound (.getBetweenExpressionStart e))
+          hi (coerce-bound (.getBetweenExpressionEnd e))
           guards (ctx/null-guard-clauses ctx [col lo hi])]
       (if not-between?
         ;; NOT BETWEEN → val < lo OR val > hi. Guard against NULL col
@@ -2690,14 +2850,23 @@
     (instance? InExpression expr)
     (let [^InExpression e expr
           not-in? (.isNot e)
-          col (translate-expr ctx (.getLeftExpression e))
+          left-ast (.getLeftExpression e)
+          col (translate-expr ctx left-ast)
           right (.getRightExpression e)
+          ;; PG-style typinput: when the LHS is a typed Column, route
+          ;; each unknown StringValue in the IN-list through the
+          ;; column's typinput. Mirrors `c.oid IN ('16384','16385')`
+          ;; from pgjdbc's getColumns probe.
+          translate-in-elem (fn [el]
+                              (or (when (instance? Column left-ast)
+                                    (coerce-unknown-literal ctx left-ast el))
+                                  (translate-expr ctx el)))
           vals (cond
                  (instance? ParenthesedExpressionList right)
-                 (mapv #(translate-expr ctx %) ^ParenthesedExpressionList right)
+                 (mapv translate-in-elem ^ParenthesedExpressionList right)
 
                  (instance? ExpressionList right)
-                 (mapv #(translate-expr ctx %) ^ExpressionList right)
+                 (mapv translate-in-elem ^ExpressionList right)
 
                  ;; Subquery: execute it and extract single-column values
                  (instance? ParenthesedSelect right)
@@ -3283,6 +3452,35 @@
                                        (:derived-aliases ctx))
           col-var (ctx/col-var! ctx resolved)]
       [[(list '= col-var true)]])
+
+    ;; Boolean literals — `WHERE true` adds no constraint, `WHERE false`
+    ;; emits the canonical false-sentinel so the surrounding AND
+    ;; short-circuits to no rows. psql's `\dC` (list casts) emits
+    ;; `WHERE ((true AND fn1(...)) OR (true AND fn2(...)))` with
+    ;; literal trues; this branch + the existing OrExpression false-
+    ;; sentinel handling collapse it to the live-fn predicates.
+    (instance? BooleanValue expr)
+    (if (.getValue ^BooleanValue expr)
+      []                              ; WHERE true → no constraint
+      [[(list 'not= 1 1)]])           ; WHERE false → constant-false sentinel
+
+    ;; Scalar (boolean) subquery in WHERE. psql's `\dT` emits
+    ;;   WHERE (t.typrelid = 0 OR
+    ;;          (SELECT c.relkind = 'c' FROM pg_class c WHERE c.oid = t.typrelid))
+    ;; Try to evaluate the inner SELECT once at translate time; treat
+    ;; the result as boolean. Correlated subqueries fail to translate
+    ;; against the outer-bare ctx → fall back to constant-false (no
+    ;; match) so the surrounding OR/AND short-circuits correctly. The
+    ;; catalog tables driving these psql probes are empty in our
+    ;; impl, so the correct PG result IS no match.
+    (instance? ParenthesedSelect expr)
+    (let [v (translate-expr ctx expr)]
+      (cond
+        (true? v)  []                       ; always-true → no constraint
+        (false? v) [[(list 'not= 1 1)]]     ; always-false → drop branch
+        (= :__null__ v) [[(list 'not= 1 1)]] ; NULL in bool position → false (PG 3VL)
+        :else (let [v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+                [[(list '= v true)]])))
 
     ;; Boolean-valued expressions used directly as predicates:
     ;; `WHERE <bool-fn>(...)`, `WHERE CASE WHEN ... END`, etc. PG

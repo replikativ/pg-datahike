@@ -222,7 +222,24 @@
       ;; ALTER TABLE … TYPE … USING expr — strip the USING half.
       (str/replace #"(?i)(\bTYPE\s+\w+(?:\s+\w+)*)\s+USING\s+.+$" "$1")
       ;; ALTER COLUMN … DROP DEFAULT — no-op in our schema.
-      (str/replace #"(?i)ALTER\s+COLUMN\s+\"?\w+\"?\s+DROP\s+DEFAULT\s*,?\s*" "")))
+      (str/replace #"(?i)ALTER\s+COLUMN\s+\"?\w+\"?\s+DROP\s+DEFAULT\s*,?\s*" "")
+      ;; OPERATOR(qual.op) — explicit operator-schema qualification,
+      ;; emitted by psql's \d <table> / \dt+ <table> / \dS family
+      ;; (`relname OPERATOR(pg_catalog.~) '^x$'`). JSqlParser doesn't
+      ;; accept the `OPERATOR(...)` wrapper. We don't honour
+      ;; cross-schema operator scoping (everything's in `public`), so
+      ;; collapse `OPERATOR(qualifier.OP)` to bare `OP`. The captured
+      ;; group is the operator symbol — kept intact so `~`, `!~`, `=`,
+      ;; `<>`, `||`, etc. all flow through.
+      (str/replace #"(?i)OPERATOR\s*\(\s*\w+\s*\.\s*([!~=<>@?#&|+/*-]+)\s*\)" "$1")
+      ;; COLLATE qual.X — collation specifier emitted by the same psql
+      ;; `\d` queries (`'^x$' COLLATE pg_catalog.default`). We don't
+      ;; track collations; strip the whole clause so the surrounding
+      ;; expression reads as a plain string compare. Two forms:
+      ;; qualified (`COLLATE pg_catalog.default`) and bare
+      ;; (`COLLATE \"C\"`).
+      (str/replace #"(?i)\s+COLLATE\s+\w+\s*\.\s*\w+" "")
+      (str/replace #"(?i)\s+COLLATE\s+\"?\w+\"?" "")))
 
 (defn parse-sql
   "Parse a SQL statement and return a translation result.

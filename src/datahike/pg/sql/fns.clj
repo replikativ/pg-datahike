@@ -483,6 +483,75 @@
   "Stub: always returns true (all tables are visible in the default schema)."
   [_oid] true)
 
+;; The other `pg_*_is_visible` predicates: psql's `\df`, `\da`, `\dT`,
+;; `\dF`, `\dD` all gate their list queries on these. We don't model
+;; per-namespace visibility (everything lives in `public`), so they
+;; mirror pg_table_is_visible's stub.
+(def pg-function-is-visible (constantly true))
+(def pg-type-is-visible (constantly true))
+(def pg-namespace-is-visible (constantly true))
+(def pg-ts-config-is-visible (constantly true))
+(def pg-operator-is-visible (constantly true))
+(def pg-conversion-is-visible (constantly true))
+
+;; Function-introspection stubs. psql `\df` / `\sf` / `\df+` issue
+;; these against pg_proc. We don't surface user-defined fns yet, so
+;; they return empty strings — psql renders an empty cell rather than
+;; failing.
+(def pg-get-function-arguments (constantly ""))
+(def pg-get-function-result    (constantly ""))
+(def pg-get-functiondef        (constantly ""))
+(def pg-get-function-identity-arguments (constantly ""))
+
+;; Size functions. psql `\d+` / `\dt+` show "Size" via
+;; `pg_size_pretty(pg_table_size(c.oid))`. We don't track on-disk
+;; size for Datahike-backed tables; report 0 with a human-formatted
+;; pretty-print so the cell isn't blank.
+(def pg-table-size      (constantly 0))
+(def pg-relation-size   (constantly 0))
+(def pg-indexes-size    (constantly 0))
+(def pg-database-size   (constantly 0))
+(def pg-total-relation-size (constantly 0))
+
+(defn pg-size-pretty
+  "Format a byte count as PG's pretty string ('1024 bytes', '12 kB',
+   '5 MB'). Mirrors `pg_size_pretty` in src/backend/utils/adt/dbsize.c."
+  [bytes]
+  (let [n (long (or bytes 0))]
+    (cond
+      (< n 10240)              (str n " bytes")
+      (< n (* 10240 1024))     (str (long (/ (+ n 512) 1024)) " kB")
+      (< n (* 10240 1024 1024)) (str (long (/ (+ n (* 512 1024)) (* 1024 1024))) " MB")
+      :else                    (str (long (/ (+ n (* 512 1024 1024)) (* 1024 1024 1024))) " GB"))))
+
+;; Encoding/locale stubs. psql `\l` shows server encoding via
+;; `pg_encoding_to_char(d.encoding)`. We're always UTF8 — no other
+;; encoding is meaningful for in-memory Datahike.
+(def pg-encoding-to-char (constantly "UTF8"))
+
+;; Object-definition reconstructors. psql `\d <table>`, `\d+`, `\dY`
+;; query these against pg_statistic_ext, pg_partitioned_table,
+;; pg_view, pg_trigger, pg_rewrite. We don't track any of these
+;; entities, so reconstruct returns nil — psql renders no row /
+;; "(none)" / blank.
+(def pg-get-statisticsobjdef        (constantly :__null__))
+(def pg-get-statisticsobjdef-columns (constantly :__null__))
+(def pg-get-statisticsobjdef-expressions (constantly :__null__))
+(def pg-get-partkeydef              (constantly :__null__))
+(def pg-get-viewdef                 (constantly :__null__))
+(def pg-get-triggerdef              (constantly :__null__))
+(def pg-get-ruledef                 (constantly :__null__))
+(def pg-get-publication-tables      (constantly :__null__))
+(def pg-tablespace-location         (constantly :__null__))
+
+;; Publication / replication stubs. psql `\d <table>` (12+) probes
+;; pg_relation_is_publishable to render the "Publications" footer.
+;; We don't model logical replication; everything is publishable but
+;; nothing is published.
+(def pg-relation-is-publishable     (constantly true))
+(def pg-get-replica-identity-index  (constantly :__null__))
+(def pg-get-replica-identity        (constantly "d"))
+
 (defn pg-format-type
   "Convert a type OID + type modifier to a type name string.
    Delegates to the centralized type registry."
@@ -576,6 +645,35 @@
    "octet_length" count
    "position"     sql-position
    "strpos"       sql-position
-   "pg_table_is_visible"  pg-table-is-visible
+   "pg_table_is_visible"      pg-table-is-visible
+   "pg_function_is_visible"   pg-function-is-visible
+   "pg_type_is_visible"       pg-type-is-visible
+   "pg_namespace_is_visible"  pg-namespace-is-visible
+   "pg_ts_config_is_visible"  pg-ts-config-is-visible
+   "pg_operator_is_visible"   pg-operator-is-visible
+   "pg_conversion_is_visible" pg-conversion-is-visible
+   "pg_get_function_arguments" pg-get-function-arguments
+   "pg_get_function_result"    pg-get-function-result
+   "pg_get_functiondef"        pg-get-functiondef
+   "pg_get_function_identity_arguments" pg-get-function-identity-arguments
+   "pg_table_size"          pg-table-size
+   "pg_relation_size"       pg-relation-size
+   "pg_indexes_size"        pg-indexes-size
+   "pg_database_size"       pg-database-size
+   "pg_total_relation_size" pg-total-relation-size
+   "pg_size_pretty"         pg-size-pretty
+   "pg_encoding_to_char"    pg-encoding-to-char
+   "pg_get_statisticsobjdef"            pg-get-statisticsobjdef
+   "pg_get_statisticsobjdef_columns"    pg-get-statisticsobjdef-columns
+   "pg_get_statisticsobjdef_expressions" pg-get-statisticsobjdef-expressions
+   "pg_get_partkeydef"      pg-get-partkeydef
+   "pg_get_viewdef"         pg-get-viewdef
+   "pg_get_triggerdef"      pg-get-triggerdef
+   "pg_get_ruledef"         pg-get-ruledef
+   "pg_get_publication_tables" pg-get-publication-tables
+   "pg_tablespace_location" pg-tablespace-location
+   "pg_relation_is_publishable"   pg-relation-is-publishable
+   "pg_get_replica_identity_index" pg-get-replica-identity-index
+   "pg_get_replica_identity"       pg-get-replica-identity
    "format_type"          pg-format-type
    "pg_get_expr"          pg-get-expr})

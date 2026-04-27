@@ -166,3 +166,85 @@
         :else (throw (pg-error "22P02"
                                (str "cannot coerce " (class v) " to float")
                                {:value v}))))))
+
+;; ============================================================================
+;; PG-style typinput dispatch for unknown string literals
+;; ============================================================================
+;;
+;; PG's parser tags single-quoted literals as `unknown` until the
+;; surrounding operator/function call resolves their target type, then
+;; calls the type's `typinput` function (oidin, int4in, int8in,
+;; float8in, numericin, boolin, …) to produce a typed Const. See
+;; src/backend/parser/parse_coerce.c:233 (`if (inputTypeId == UNKNOWNOID
+;; && IsA(node, Const)) ... apply target type's typinput`).
+;;
+;; Concrete user-visible effect: `WHERE c.oid = '16384'` works because
+;; PG resolves `=(oid, unknown)` → `=(oid, oid)`, then runs
+;; `oidin('16384')` to get the long. Without this, comparing an
+;; oid-column to a quoted-digit literal returns 0 rows (long ≠ string).
+;; psql's `\d <table>` family relies on it; pgjdbc's
+;; `getColumns(oid='16384', ...)` etc. use the same idiom.
+;;
+;; We don't have a full operator-resolution pass. The translator
+;; instead detects the shape `Column <op> StringValue` (and reverse,
+;; and IN/BETWEEN) at translation time and dispatches the unknown
+;; literal through this table when the column resolves to a Datahike
+;; valueType we recognise.
+
+(defn- parse-bool-token
+  "Mirror PG's `boolin`: accept t/true/y/yes/on/1 and f/false/n/no/off/0
+   (case-insensitive, leading/trailing whitespace ignored). Returns
+   nil for unrecognised input."
+  [^String s]
+  (case (clojure.string/lower-case (.trim s))
+    ("t" "true" "y" "yes" "on" "1") true
+    ("f" "false" "n" "no" "off" "0") false
+    nil))
+
+(defn- safe [f]
+  (fn [s] (try (f s) (catch Throwable _ nil))))
+
+(def vtype->typinput
+  "`{:db/valueType → (fn [^String s] typed-value-or-nil)}`. Each fn is
+   the Datahike-side analogue of PG's typinput for the corresponding
+   target type — `oidin`/`int8in` → `Long/parseLong`, `numericin` →
+   `BigDecimal.`, etc. A nil return means the literal is unparseable
+   for that type; the caller decides how to handle (typically: keep
+   the original string so the comparison falls through to text
+   equality, never matches, returns 0 rows — exactly what PG would do
+   if the surrounding operator-resolution failed).
+
+   Restricted to pure / immutable conversions; mutable typinputs
+   (e.g. timestamptz with the session's TimeZone GUC) need ctx
+   threaded through and aren't covered."
+  {:db.type/long    (safe #(Long/parseLong (.trim ^String %)))
+   :db.type/double  (safe #(Double/parseDouble (.trim ^String %)))
+   :db.type/float   (safe #(.floatValue ^Number (Double/parseDouble (.trim ^String %))))
+   :db.type/bigdec  (safe #(BigDecimal. (.trim ^String %)))
+   :db.type/boolean parse-bool-token
+   :db.type/uuid    (safe #(java.util.UUID/fromString (.trim ^String %)))
+   :db.type/string  identity})
+
+(defn coerce-unknown
+  "PG-style typinput dispatch: coerce an unknown-type string literal to
+   `vtype` using the type's typinput equivalent. Returns the typed
+   value on success, the original string on failure (so the
+   surrounding comparison falls through to text equality and matches
+   nothing — PG's outcome when an unknown literal can't resolve to
+   the operator's expected type).
+
+   The `:db.type/instant` typinput needs a parse-timestamp helper
+   that lives in expr.clj; instant coercion is wired separately via
+   `coerce-comparison-operands` taking an explicit timestamp parser."
+  ([^String s vtype] (coerce-unknown s vtype nil))
+  ([^String s vtype timestamp-parser]
+   (cond
+     (nil? s) nil
+     (= vtype :db.type/instant)
+     (or (when timestamp-parser
+           (try (timestamp-parser s) (catch Throwable _ nil)))
+         s)
+     :else
+     (if-let [f (vtype->typinput vtype)]
+       (or (f s) s)
+       s))))
