@@ -178,6 +178,47 @@
    so the cache hit rate is near-100%."
   (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
 
+;; Per-query memoisation for `schema-hints` and `derive-virtual-tables`.
+;;
+;; In a single parse-sql call, `catalog-data-for*` (catalog.clj) is
+;; invoked once per catalog table referenced — pg_class, pg_attribute,
+;; pg_index, … — and each invocation calls
+;; `(derive-virtual-tables user-schema (schema-hints cte-db))`. Both
+;; inputs are stable across the whole query, so we walk the user
+;; schema and re-run the hint Datalog query N times where 1 would
+;; suffice. On a 600-table Odoo schema with 5 catalog tables in one
+;; query, that's ~5 schema walks instead of 1.
+;;
+;; Why IdentityHashMap rather than WeakHashMap:
+;;   - WeakHashMap uses `.equals` for hash-collision resolution.
+;;   - `datahike.db.DB.equals` (db.cljc:302) throws ClassCastException
+;;     on two distinct DB records (it iterates an internal map but
+;;     treats Datoms as Map.Entry). Any second `.get` for a different
+;;     DB on the same hash bucket would crash, surfacing as
+;;     "SQL parse error: class datahike.datom.Datom cannot be cast to
+;;      class java.util.Map$Entry".
+;;   - IdentityHashMap uses `==` (System.identityHashCode), never
+;;     touches `.equals`, so the broken DB equality doesn't matter.
+;;
+;; Lifetime: bound to a fresh map per parse-sql call (sql.clj
+;; catalog-enrichment block), so the map is GC'd with the query — no
+;; leak even though IdentityHashMap doesn't have weak references.
+
+(def ^:dynamic *catalog-tx-cache*
+  "When non-nil, a map `{:hints ihm :tables ihm}` of two
+   IdentityHashMaps used to memoise `schema-hints` (keyed by db) and
+   `derive-virtual-tables` (keyed by schema, with inner keyed by
+   hints). Bound at the top of parse-sql's catalog enrichment block
+   so all `catalog-data-for*` calls in one query share the cache."
+  nil)
+
+(defn make-catalog-tx-cache
+  "Construct a fresh per-query cache. Caller `binding`s
+   *catalog-tx-cache* to the result around their unit of work."
+  []
+  {:hints  (java.util.IdentityHashMap.)
+   :tables (java.util.IdentityHashMap.)})
+
 (defn derive-ref-targets
   "For each `:db.type/ref` attribute, determine the *target PK attribute*
    that SQL projection should dereference to. `SELECT order.customer FROM
@@ -355,37 +396,50 @@
        {}
        ref-targets))))
 
+(defn- schema-hints*
+  [db]
+  (let [q-fn (requiring-resolve 'datahike.api/q)
+        ;; The :datahike.pg/* attrs may not yet be in the schema (bare
+        ;; conn without ensure-pg-schema!) — keep the query resilient
+        ;; to each attr being absent by using per-attr lookups instead
+        ;; of a single join.
+        rows (q-fn '{:find [?for-ident ?e]
+                     :where [[?e :datahike.pg/for-ident ?for-ident]]}
+                   db)
+        pull-fn (requiring-resolve 'datahike.api/pull)]
+    (into {}
+          (keep (fn [[for-ident e]]
+                  (let [p (pull-fn db
+                                   '[:datahike.pg/column
+                                     :datahike.pg/hidden
+                                     :datahike.pg/references
+                                     :datahike.pg/table]
+                                   e)
+                        h (cond-> {}
+                            (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
+                            (:datahike.pg/hidden p)     (assoc :hidden true)
+                            (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
+                            (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
+                    (when (seq h) [for-ident h]))))
+          rows)))
+
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
    by scanning the db for :datahike.pg/for-ident-rooted hint entities.
-   Nil-safe: returns an empty map when `db` is nil (pure-schema call sites)."
+   Nil-safe: returns an empty map when `db` is nil (pure-schema call sites).
+   When `*catalog-tx-cache*` is bound (within parse-sql's catalog
+   enrichment), reuses the result across all `catalog-data-for*` calls
+   in the current query."
   [db]
-  (if db
-    (let [q-fn (requiring-resolve 'datahike.api/q)
-          ;; The :datahike.pg/* attrs may not yet be in the schema (bare
-          ;; conn without ensure-pg-schema!) — keep the query resilient
-          ;; to each attr being absent by using per-attr lookups instead
-          ;; of a single join.
-          rows (q-fn '{:find [?for-ident ?e]
-                       :where [[?e :datahike.pg/for-ident ?for-ident]]}
-                     db)
-          pull-fn (requiring-resolve 'datahike.api/pull)]
-      (into {}
-            (keep (fn [[for-ident e]]
-                    (let [p (pull-fn db
-                                     '[:datahike.pg/column
-                                       :datahike.pg/hidden
-                                       :datahike.pg/references
-                                       :datahike.pg/table]
-                                     e)
-                          h (cond-> {}
-                              (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
-                              (:datahike.pg/hidden p)     (assoc :hidden true)
-                              (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
-                              (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
-                      (when (seq h) [for-ident h]))))
-            rows))
-    {}))
+  (cond
+    (nil? db) {}
+    (some? *catalog-tx-cache*)
+    (let [^java.util.IdentityHashMap m (:hints *catalog-tx-cache*)]
+      (or (.get m db)
+          (let [v (schema-hints* db)]
+            (.put m db v)
+            v)))
+    :else (schema-hints* db)))
 
 (def ^:const row-marker-col "db-row-exists")
 
@@ -464,6 +518,54 @@
   (when-let [ns (namespace ident)]
     [ns (name ident)]))
 
+(defn- derive-virtual-tables*
+  [schema hints]
+  (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
+                                           (internal-attr? k)
+                                           (nil? (namespace k))
+                                           (:hidden (get hints k))))
+                           schema)
+        tables-from-attrs (reduce
+                           (fn [tables [ident props]]
+                             (let [[table-name local-col] (attr->table-col ident)
+                                   h (get hints ident)
+                                   col-name (or (:column h) local-col)
+                                   vtype (:db/valueType props)
+                                   col {:name        col-name
+                                        :attr        ident
+                                        :oid         (oid-for-valuetype vtype)
+                                        :valuetype   vtype
+                                        :cardinality (:db/cardinality props)
+                                        :unique      (:db/unique props)
+                                        :ref?        (= vtype :db.type/ref)
+                                        :references  (:references h)
+                                        :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
+                               (-> tables
+                                   (update-in [table-name :columns] (fnil conj []) col)
+                                   (assoc-in [table-name :attrs col-name] ident))))
+                           {}
+                           user-attrs)
+         ;; Also surface tables that exist in the schema but have NO own
+         ;; user columns — typically INHERITS children whose columns all
+         ;; live in the parent's namespace. Without this, pg_class doesn't
+         ;; list them, Odoo's `table_exists()` returns false, and Odoo
+         ;; issues a redundant CREATE TABLE that we then reject as 42P07.
+         ;; Detect via the row-marker attr (`<table>/db-row-exists`) which
+         ;; every pgwire CREATE TABLE installs.
+        marker-tables (into #{}
+                            (keep (fn [[k _]]
+                                    (when (and (keyword? k)
+                                               (= (name k) row-marker-col)
+                                               (namespace k))
+                                      (namespace k))))
+                            schema)]
+    (reduce (fn [tables tname]
+              (cond-> tables
+                (not (contains? tables tname))
+                (assoc tname {:columns [] :attrs {}})))
+            tables-from-attrs
+            marker-tables)))
+
 (defn derive-virtual-tables
   "Derive virtual table definitions from a Datahike schema map.
 
@@ -480,54 +582,25 @@
    - `:datahike.pg/hidden true`  → attribute excluded entirely
    - `:datahike.pg/column \"x\"` → column renamed to \"x\"
    - `:datahike.pg/references K`→ carried through on the col as `:references`
-     for the translator's FK-via-ref JOIN rewrite."
+     for the translator's FK-via-ref JOIN rewrite.
+
+   Each catalog table referenced in a query calls this with the same
+   schema/hints. When `*catalog-tx-cache*` is bound, the result is
+   memoised across all calls in the current parse-sql so the schema
+   walk happens once per query (not once per catalog table)."
   ([schema] (derive-virtual-tables schema {}))
   ([schema hints]
-   (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
-                                            (internal-attr? k)
-                                            (nil? (namespace k))
-                                            (:hidden (get hints k))))
-                            schema)
-         tables-from-attrs (reduce
-                            (fn [tables [ident props]]
-                              (let [[table-name local-col] (attr->table-col ident)
-                                    h (get hints ident)
-                                    col-name (or (:column h) local-col)
-                                    vtype (:db/valueType props)
-                                    col {:name        col-name
-                                         :attr        ident
-                                         :oid         (oid-for-valuetype vtype)
-                                         :valuetype   vtype
-                                         :cardinality (:db/cardinality props)
-                                         :unique      (:db/unique props)
-                                         :ref?        (= vtype :db.type/ref)
-                                         :references  (:references h)
-                                         :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
-                                (-> tables
-                                    (update-in [table-name :columns] (fnil conj []) col)
-                                    (assoc-in [table-name :attrs col-name] ident))))
-                            {}
-                            user-attrs)
-         ;; Also surface tables that exist in the schema but have NO own
-         ;; user columns — typically INHERITS children whose columns all
-         ;; live in the parent's namespace. Without this, pg_class doesn't
-         ;; list them, Odoo's `table_exists()` returns false, and Odoo
-         ;; issues a redundant CREATE TABLE that we then reject as 42P07.
-         ;; Detect via the row-marker attr (`<table>/db-row-exists`) which
-         ;; every pgwire CREATE TABLE installs.
-         marker-tables (into #{}
-                             (keep (fn [[k _]]
-                                     (when (and (keyword? k)
-                                                (= (name k) row-marker-col)
-                                                (namespace k))
-                                       (namespace k))))
-                             schema)]
-     (reduce (fn [tables tname]
-               (cond-> tables
-                 (not (contains? tables tname))
-                 (assoc tname {:columns [] :attrs {}})))
-             tables-from-attrs
-             marker-tables))))
+   (if-let [c *catalog-tx-cache*]
+     (let [^java.util.IdentityHashMap outer (:tables c)
+           inner (or (.get outer schema)
+                     (let [m (java.util.IdentityHashMap.)]
+                       (.put outer schema m)
+                       m))]
+       (or (.get ^java.util.IdentityHashMap inner hints)
+           (let [v (derive-virtual-tables* schema hints)]
+             (.put ^java.util.IdentityHashMap inner hints v)
+             v)))
+     (derive-virtual-tables* schema hints))))
 
 (defn table-names
   "Return sorted list of virtual table names for a schema."
