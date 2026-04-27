@@ -1618,10 +1618,52 @@
     (instance? Column expr)
     (let [^Column col-expr expr
           tbl (.getTable col-expr)
-          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))]
-      (if (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
+          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
+          ;; JSqlParser parses `xs[2]` as a Column with a side-channel
+          ;; `ArrayConstructor` carrying the indices: `(.getColumnName)`
+          ;; returns the bare name `xs`; `(.getArrayConstructor)` is the
+          ;; `[2]` part. For deeper chains like `xs[2][3]`, JSqlParser
+          ;; emits `ArrayExpression(Column[xs[2]], 3)` — handled by the
+          ;; ArrayExpression branch above. We only need to recognise
+          ;; the single-bracket Column-with-ArrayConstructor case here
+          ;; so users can write `WHERE xs[2] = 20` or `SELECT xs[2]`.
+          ac (.getArrayConstructor col-expr)]
+      (cond
+        (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
         ;; Bound by UPDATE ... FROM (VALUES ...) AS alias(cols)
         (get-in params/*from-bindings* [tbl-name (unquote-ident (.getColumnName col-expr))])
+
+        (some? ac)
+        ;; Walk the bracket-expressions left-to-right, applying
+        ;; pg-arr/subscript once per `[expr]`. Each step routes the
+        ;; input through coerce-pg-array so a stored canonical-text
+        ;; array column is reconstructed transparently.
+        (let [bare-col (let [c (Column.)]
+                         (.setColumnName c (.getColumnName col-expr))
+                         (when tbl (.setTable c ^Table tbl))
+                         c)
+              base-var (translate-expr ctx bare-col)
+              base-var (if (seq? base-var) (ctx/materialize-arg! ctx base-var) base-var)
+              idx-exprs (.getExpressions ^ArrayConstructor ac)]
+          (reduce (fn [container idx-expr]
+                    (let [idx-val   (translate-expr ctx idx-expr)
+                          idx-val   (if (seq? idx-val) (ctx/materialize-arg! ctx idx-val) idx-val)
+                          fn-param  (symbol (str "?col-sub" (swap! (:var-counter ctx) inc)))
+                          sub-fn    (fn [arr i]
+                                      (if-let [a (coerce-pg-array arr)]
+                                        (let [v (pg-arr/subscript a i)]
+                                          (if (nil? v) :__null__ v))
+                                        :__null__))
+                          result-var (ctx/fresh-var! ctx)]
+                      (swap! (:in-params ctx) conj fn-param)
+                      (swap! (:in-args ctx) conj sub-fn)
+                      (swap! (:where-clauses ctx) conj
+                             [(list fn-param container idx-val) result-var])
+                      result-var))
+                  base-var
+                  idx-exprs))
+
+        :else
         (let [resolved (ctx/resolve-column expr
                                            (:table-aliases ctx)
                                            (:default-table ctx)
@@ -2246,8 +2288,13 @@
               (swap! (:where-clauses ctx) conj
                      [(list fn-param col arr-val) result-var])
               [[(list 'identity result-var)]])))
-        ;; Special case: column = value can be a ground filter
+        ;; Special case: column = value can be a ground filter. Skip
+        ;; the fast-path when the Column carries an ArrayConstructor
+        ;; (e.g. `xs[2]`) — that needs translate-expr's subscript
+        ;; rewrite, which the fast-path bypasses by routing straight
+        ;; through resolve-column / col-var!.
         (if (and (instance? Column left)
+                 (nil? (.getArrayConstructor ^Column left))
                  (or (instance? LongValue right)
                      (instance? DoubleValue right)
                      (instance? StringValue right)))

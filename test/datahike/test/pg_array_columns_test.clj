@@ -196,15 +196,25 @@
         (is (= [["3"]] (query-rows c "SELECT cardinality(xs) FROM ac WHERE id=1")))
         (is (= [["0"]] (query-rows c "SELECT cardinality(xs) FROM ac WHERE id=2")))))))
 
-;; NOTE: Subscripting a *stored* array column (`SELECT xs[2] FROM t` or
-;; `WHERE xs[2] = N`) is currently a JSqlParser gap — JSqlParser parses
-;; `xs[2]` as a Column literal of name "xs[2]" rather than an
-;; ArrayExpression of (Column xs, index 2). The same syntax against a
-;; literal works (`SELECT (ARRAY[10,20,30])[2]`) because the
-;; ArrayConstructor at the head triggers JSqlParser's ArrayExpression
-;; recognition. Tracked as a separate parser-rewrite task; subscripting
-;; on column references will need either a pre-parse SQL rewrite or
-;; Column-name detection in translate-expr.
+(deftest ops-subscript-on-column
+  (testing "WHERE xs[2] = N matches when stored array's 2nd elem = N"
+    (with-conn
+      (fn [c]
+        (exec! c "CREATE TABLE asub (id int PRIMARY KEY, xs int[])")
+        (exec! c "INSERT INTO asub (id, xs) VALUES (1, ARRAY[10,20,30])")
+        (exec! c "INSERT INTO asub (id, xs) VALUES (2, ARRAY[40,50,60])")
+        (is (= [["1"]]
+               (query-rows c "SELECT id FROM asub WHERE xs[2] = 20")))
+        (is (= [["2"]]
+               (query-rows c "SELECT id FROM asub WHERE xs[2] = 50")))))))
+
+(deftest ops-subscript-projection
+  (testing "SELECT xs[2] FROM t projects the 2nd element"
+    (with-conn
+      (fn [c]
+        (exec! c "CREATE TABLE asubp (id int PRIMARY KEY, xs int[])")
+        (exec! c "INSERT INTO asubp (id, xs) VALUES (1, ARRAY[10,20,30])")
+        (is (= [["20"]] (query-rows c "SELECT xs[2] FROM asubp WHERE id=1")))))))
 
 (deftest ops-any-on-column
   (testing "WHERE n = ANY(arr_col) works against stored arrays"
