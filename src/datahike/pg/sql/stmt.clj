@@ -1394,41 +1394,41 @@
         ;; add to :find that don't map 1:1 to a select-item.
         select-item-oids
         (let [acc (reduce
-                     (fn [v ^SelectItem item]
-                       (let [expr (.getExpression item)]
-                         (cond
+                   (fn [v ^SelectItem item]
+                     (let [expr (.getExpression item)]
+                       (cond
                            ;; AllTableColumns must come BEFORE AllColumns
                            ;; (it's a subclass).
-                           (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                           (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                                 ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                                 raw-name (when tbl
-                                            (str/lower-case
-                                             (or (when-let [a (.getAlias tbl)]
-                                                   (.getName ^Alias a))
-                                                 (.getName tbl))))
-                                 real (or (get table-aliases raw-name) raw-name)
-                                 cols (pgs/column-info schema real db)]
-                             (into v (keep (fn [col]
-                                             (when (not= "db_id" (:name col))
-                                               (:oid col)))
-                                           cols)))
-                           (instance? AllColumns expr)
-                           (let [cols (pgs/column-info schema default-table db)]
-                             (into v (keep (fn [col]
-                                             (when (not= "db_id" (:name col))
-                                               (:oid col)))
-                                           cols)))
-                           :else
-                           (conj v (oid/expr-oid expr oid-env)))))
-                     []
-                     select-items)
+                         (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
+                         (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
+                               ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
+                               raw-name (when tbl
+                                          (str/lower-case
+                                           (or (when-let [a (.getAlias tbl)]
+                                                 (.getName ^Alias a))
+                                               (.getName tbl))))
+                               real (or (get table-aliases raw-name) raw-name)
+                               cols (pgs/column-info schema real db)]
+                           (into v (keep (fn [col]
+                                           (when (not= "db_id" (:name col))
+                                             (:oid col)))
+                                         cols)))
+                         (instance? AllColumns expr)
+                         (let [cols (pgs/column-info schema default-table db)]
+                           (into v (keep (fn [col]
+                                           (when (not= "db_id" (:name col))
+                                             (:oid col)))
+                                         cols)))
+                         :else
+                         (conj v (oid/expr-oid expr oid-env)))))
+                   []
+                   select-items)
                 ;; find-aliases may be longer than acc when SELECT
                 ;; contains JOIN-driven entity vars added to :find
                 ;; for :with semantics. Pad with nil so the vector
                 ;; lines up index-for-index with find-aliases.
-                n (count @find-aliases)]
-            (vec (take n (concat acc (repeat nil)))))
+              n (count @find-aliases)]
+          (vec (take n (concat acc (repeat nil)))))
 
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
         ;; from different entity combinations that produce identical values.
@@ -1503,7 +1503,17 @@
                                         ;; datahike.* calls (sql-+, sql-*, null-safe scalar ops)
                                         ;; SHOULD be materialized so the resulting bind var can
                                         ;; be referenced by :order-by.
-                                        agg-syms (set (vals fns/sql-aggregate->datalog))
+                                        ;;
+                                        ;; Includes the precision-variant aggregate fns
+                                        ;; (filter-sum-numeric / filter-avg-numeric) emitted
+                                        ;; for INT8/NUMERIC inputs by pick-precision-variant —
+                                        ;; without these, ORDER BY <agg-alias> against a
+                                        ;; numeric column re-materialised the agg-form as a
+                                        ;; where-clause function call and failed at execute
+                                        ;; time with "Unknown function filter-sum-numeric".
+                                        agg-syms (into (set (vals fns/sql-aggregate->datalog))
+                                                       '#{datahike.pg.sql/filter-sum-numeric
+                                                          datahike.pg.sql/filter-avg-numeric})
                                         v (if (and (seq? v)
                                                    (not (contains? agg-syms (first v))))
                                             (ctx/materialize-arg! ctx v)

@@ -109,9 +109,9 @@
     (let [m Long/MAX_VALUE
           result (fns/filter-sum-numeric [m m m])]
       (is (= 0 (.compareTo ^java.math.BigDecimal result
-                            (.multiply
-                             (java.math.BigDecimal/valueOf m)
-                             (java.math.BigDecimal/valueOf 3))))))))
+                           (.multiply
+                            (java.math.BigDecimal/valueOf m)
+                            (java.math.BigDecimal/valueOf 3))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; AVG-NUMERIC — BigDecimal-precision AVG(int*) / AVG(numeric)
@@ -121,7 +121,7 @@
     (let [r (fns/filter-avg-numeric [10 20 30])]
       (is (instance? java.math.BigDecimal r))
       (is (zero? (.compareTo ^java.math.BigDecimal r
-                              (java.math.BigDecimal/valueOf 20))))))
+                             (java.math.BigDecimal/valueOf 20))))))
 
   (testing "AVG of cents preserves fractional part (no float rounding)"
     ;; Sum 100 + 200 + 250 = 550. AVG = 183.3333...
@@ -136,7 +136,7 @@
   (testing "skips :__null__"
     (let [r (fns/filter-avg-numeric [10 :__null__ 30])]
       (is (zero? (.compareTo ^java.math.BigDecimal r
-                              (java.math.BigDecimal/valueOf 20))))))
+                             (java.math.BigDecimal/valueOf 20))))))
 
   (testing "empty → :__null__"
     (is (= :__null__ (fns/filter-avg-numeric [])))))
