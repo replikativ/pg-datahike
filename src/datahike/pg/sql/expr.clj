@@ -461,16 +461,21 @@
         result-var)
 
       ;; array_to_string(arr, sep [, null_replace])
+      ;; array_to_string(arr, sep [, null_str]) — flattens ALL
+      ;; dimensions to leaves and joins with sep. PG: per-leaf
+      ;; iteration via ArrayGetNItems regardless of ndim
+      ;; (varlena.c:3888). NULL elements are silently skipped when
+      ;; null_str is absent; rendered as null_str when provided.
       (= fname "array_to_string")
       (let [fn-param (symbol (str "?arr-to-str" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr sep & [null-replace]]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (let [elts (:elements arr)
+                      (if-let [a (coerce-pg-array arr)]
+                        (let [leaves (pg-arr/flat-elements a)
                               mapped (if null-replace
-                                       (mapv #(if (nil? %) (str null-replace) (str %)) elts)
-                                       (keep (fn [e] (when (some? e) (str e))) elts))]
-                          (str/join (str sep) mapped))))]
+                                       (mapv #(if (nil? %) (str null-replace) (str %)) leaves)
+                                       (keep (fn [e] (when (some? e) (str e))) leaves))]
+                          (str/join (str sep) mapped))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -478,11 +483,23 @@
         result-var)
 
       ;; --- Array operator-style functions -------------------------------
+      ;; array_append(arr, x) — PG rejects multi-dim
+      ;; (`array_userfuncs.c:172-174`); only 1-D supported. NULL arr →
+      ;; NULL; NULL x → appended as a NULL leaf. Empty arr starts
+      ;; index at 1 (we keep lbound=1 for the result).
       (= fname "array_append")
       (let [fn-param (symbol (str "?arr-app" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr v]
-                      (if (pg-arr/array? arr)
-                        (pg-arr/array (:elem-type arr) (conj (:elements arr) v))
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_append: argument must be empty or one-dimensional array"
+                                            {:sqlstate "2202E"
+                                             :ndim (pg-arr/ndim a)})))
+                          (pg-arr/array (:elem-type a)
+                                        (conj (:elements a) v)
+                                        nil
+                                        (:lbounds a)))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -490,11 +507,23 @@
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_prepend(x, arr) — PG rejects multi-dim
+      ;; (`array_userfuncs.c:257-259`). 1-D only. PG inserts at
+      ;; lbound-1 then restores lbound (line 268-274), so the result
+      ;; lbound is unchanged from the input.
       (= fname "array_prepend")
       (let [fn-param (symbol (str "?arr-prep" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [v arr]
-                      (if (pg-arr/array? arr)
-                        (pg-arr/array (:elem-type arr) (into [v] (:elements arr)))
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_prepend: argument must be empty or one-dimensional array"
+                                            {:sqlstate "2202E"
+                                             :ndim (pg-arr/ndim a)})))
+                          (pg-arr/array (:elem-type a)
+                                        (into [v] (:elements a))
+                                        nil
+                                        (:lbounds a)))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -502,54 +531,84 @@
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_cat(a, b) and `||` — PG handles 3 cases via
+      ;; cat-rejecting-mismatch in arrays.clj (line 316-548 of
+      ;; array_userfuncs.c). NULL handling: a||NULL=a, NULL||b=b
+      ;; (line 348-359). Both NULL → NULL.
       (= fname "array_cat")
       (let [fn-param (symbol (str "?arr-cat" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [a b]
-                      (cond
-                        (and (pg-arr/array? a) (pg-arr/array? b)) (pg-arr/concat-arrs a b)
-                        (pg-arr/array? a) a
-                        (pg-arr/array? b) b
-                        :else :__null__))]
+                      (let [pa (coerce-pg-array a)
+                            pb (coerce-pg-array b)]
+                        (cond
+                          (and pa pb) (pg-arr/concat-arrs pa pb)
+                          pa pa
+                          pb pb
+                          :else :__null__)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_position(arr, v [, start]) — PG rejects multi-dim
+      ;; (`array_userfuncs.c:1345`). Returns position relative to
+      ;; lbound. NULL arr → NULL; not-found → NULL; matches IS NOT
+      ;; DISTINCT FROM (so NULL element matches NULL search target).
       (= fname "array_position")
       (let [fn-param (symbol (str "?arr-pos" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [arr v]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (let [idx (first (keep-indexed (fn [i e] (when (= e v) (inc i)))
-                                                       (:elements arr)))]
-                          (or idx :__null__))))]
+            impl-fn (fn [arr v & [start]]
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_position: searching for elements in multidimensional arrays is not supported"
+                                            {:sqlstate "0A000"
+                                             :ndim (pg-arr/ndim a)})))
+                          (let [lb (pg-arr/lbound a 1)
+                                start-off (max 0 (- (long (or start lb)) (long lb)))
+                                elts (subvec (:elements a) start-off)
+                                idx (first (keep-indexed
+                                            (fn [i e] (when (= e v) (+ i start-off (long lb))))
+                                            elts))]
+                            (or idx :__null__)))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
-               [(list fn-param (first args) (second args)) result-var])
+               [(apply list fn-param (first args) (second args) (drop 2 args)) result-var])
         result-var)
 
+      ;; array_remove(arr, v) — PG rejects multi-dim
+      ;; (`arrayfuncs.c:6423-6426`). 1-D only. Removes ALL elements
+      ;; matching v (IS NOT DISTINCT FROM). Result lbound preserved.
       (= fname "array_remove")
       (let [fn-param (symbol (str "?arr-rem" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr v]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (pg-arr/array (:elem-type arr)
-                                      (vec (remove #(= % v) (:elements arr))))))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_remove: removing elements from multidimensional arrays is not supported"
+                                            {:sqlstate "0A000"
+                                             :ndim (pg-arr/ndim a)})))
+                          (pg-arr/array (:elem-type a)
+                                        (vec (remove #(= % v) (:elements a)))
+                                        nil
+                                        (:lbounds a)))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_replace(arr, from, to) — replaces ALL leaf occurrences
+      ;; regardless of dim (`arrayfuncs.c:6662`). Shape preserved.
       (= fname "array_replace")
       (let [fn-param (symbol (str "?arr-rep" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr from to]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (pg-arr/array (:elem-type arr)
-                                      (mapv #(if (= % from) to %) (:elements arr)))))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (pg-arr/replace-leaves a #(if (= % from) to %))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj

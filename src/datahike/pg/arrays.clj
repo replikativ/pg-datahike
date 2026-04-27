@@ -48,24 +48,41 @@
 
 (defrecord PgArray [elem-type elements dims lbounds])
 
+(defn- inner-seq
+  "Treat both Clojure sequentials and nested `PgArray` records as
+   sub-arrays. PgArrays that arrive as elements of a parent vector
+   (from expr.clj's ArrayConstructor build-fn at runtime, where each
+   inner ArrayConstructor binds its result-var to a PgArray) need to
+   be unwrapped so dim/leaf walking sees the underlying nested
+   structure rather than treating the whole record as an opaque
+   leaf."
+  [v]
+  (cond
+    (instance? PgArray v) (:elements v)
+    (sequential? v)       v
+    :else                 nil))
+
 (defn- compute-dims
   "Walk `elements` to derive per-dimension sizes. Returns nil for an
    empty top-level (PG treats `{}` as zero-element 1-D). Raises on
    ragged shape — PG rejects them and so do we."
   [elements]
   (letfn [(walk [v]
-            (cond
-              (and (sequential? v) (every? sequential? v))
-              (let [child-shapes (mapv walk v)]
-                (when (seq (rest child-shapes))
-                  (when-not (apply = child-shapes)
-                    (throw (ex-info "ragged array — all sub-arrays must have same shape"
-                                    {:input elements}))))
-                (into [(count v)] (or (first child-shapes) [])))
-              (sequential? v)
-              [(count v)]
-              :else
-              []))]
+            (let [vs (inner-seq v)]
+              (cond
+                ;; All children are themselves sub-arrays — recurse.
+                (and vs (seq vs) (every? #(some? (inner-seq %)) vs))
+                (let [child-shapes (mapv walk vs)]
+                  (when (seq (rest child-shapes))
+                    (when-not (apply = child-shapes)
+                      (throw (ex-info "ragged array — all sub-arrays must have same shape"
+                                      {:input elements}))))
+                  (into [(count vs)] (or (first child-shapes) [])))
+                ;; Leaf-level vector / PgArray
+                vs
+                [(count vs)]
+                :else
+                [])))]
     (walk elements)))
 
 (defn array
@@ -192,13 +209,107 @@
   "Walk a (possibly nested) elements vector to a flat seq of leaves —
    used by member? / contains-arr? / overlap? and the binary codec
    which encode element-by-element regardless of shape. Preserves nil
-   leaves so 3-valued logic works through them."
+   leaves so 3-valued logic works through them. Descends into nested
+   PgArray records as well as Clojure sequentials so an outer
+   PgArray whose `:elements` happen to hold inner PgArrays (the
+   common shape produced by expr.clj's ArrayConstructor build-fn for
+   `ARRAY[ARRAY[…],…]`) is walked correctly."
   [^PgArray a]
   (let [walk (fn walk [v]
-               (if (sequential? v)
-                 (mapcat walk v)
+               (if-let [vs (inner-seq v)]
+                 (mapcat walk vs)
                  [v]))]
     (walk (:elements a))))
+
+(defn multidim?
+  "True if the array has more than one dimension. Several PG functions
+   (array_append, array_prepend, array_position, array_remove)
+   explicitly reject multi-dim arrays; callers raise the matching
+   feature_not_supported error in that case."
+  [^PgArray a]
+  (> (ndim a) 1))
+
+(defn replace-leaves
+  "Walk every leaf of `a`'s nested elements, applying `f` to each
+   leaf value. Returns a new PgArray with the same shape, dims, and
+   lbounds. Used by `array_replace`, which PG applies to all leaves
+   regardless of dimensionality (`arrayfuncs.c:6662`). Descends into
+   nested PgArrays as well as Clojure sequentials."
+  [^PgArray a f]
+  (let [walk (fn walk [v]
+               (if-let [vs (inner-seq v)]
+                 (mapv walk vs)
+                 (f v)))]
+    (->PgArray (:elem-type a)
+               (mapv walk (:elements a))
+               (:dims a)
+               (:lbounds a))))
+
+(defn match-shape
+  "Predicate: does `b` have a shape that's compatible with being a
+   sub-element of `a`? PG accepts this when `(rest dims-a)` matches
+   `dims-b` exactly. Used by array_cat for the asymmetric N-D || (N-1)-D
+   and (N-1)-D || N-D cases (`array_userfuncs.c:471–479`)."
+  [^PgArray a ^PgArray b]
+  (= (vec (rest (:dims a))) (:dims b)))
+
+(defn cat-rejecting-mismatch
+  "PG `||` with full multi-dim semantics. Three cases:
+     1. ndim-a == ndim-b: concat along outer dim. Inner dims must
+        match (line 442–453).
+     2. ndim-a == ndim-b + 1: append b as a new sub-element of a.
+        b's dims must match a's `(rest dims)` (line 471–479).
+     3. ndim-b == ndim-a + 1: prepend a as a new sub-element of b.
+        a's dims must match b's `(rest dims)` (line 499–507).
+   Result lbound comes from the first arg. NULL handling at the wire
+   layer above this — pass non-NULL PgArrays."
+  [^PgArray a ^PgArray b]
+  (let [na (ndim a) nb (ndim b)
+        aelts (:elements a) belts (:elements b)
+        adims (:dims a)     bdims (:dims b)
+        albs  (:lbounds a)]
+    (cond
+      ;; Case 1: same ndim, concat along outer
+      (= na nb)
+      (do
+        (when (and (> na 1) (not= (vec (rest adims)) (vec (rest bdims))))
+          (throw (ex-info "cannot concatenate incompatible arrays — inner dims must match"
+                          {:sqlstate "2202E"
+                           :a-dims adims :b-dims bdims})))
+        (->PgArray (:elem-type a)
+                   (into aelts belts)
+                   (into [(+ (long (first adims)) (long (first bdims)))]
+                         (rest adims))
+                   albs))
+
+      ;; Case 2: a is N-D, b is (N-1)-D — append b as outer-dim element
+      (= na (inc nb))
+      (do
+        (when (not (match-shape a b))
+          (throw (ex-info "cannot concatenate incompatible arrays — sub-array shape mismatch"
+                          {:sqlstate "2202E"
+                           :a-dims adims :b-dims bdims})))
+        (->PgArray (:elem-type a)
+                   (conj aelts belts)
+                   (into [(inc (long (first adims)))] (rest adims))
+                   albs))
+
+      ;; Case 3: b is N-D, a is (N-1)-D — prepend a as outer-dim element
+      (= nb (inc na))
+      (do
+        (when (not (match-shape b a))
+          (throw (ex-info "cannot concatenate incompatible arrays — sub-array shape mismatch"
+                          {:sqlstate "2202E"
+                           :a-dims adims :b-dims bdims})))
+        (->PgArray (:elem-type b)
+                   (into [aelts] belts)
+                   (into [(inc (long (first bdims)))] (rest bdims))
+                   (:lbounds b)))
+
+      :else
+      (throw (ex-info "cannot concatenate arrays of different dimensionality"
+                      {:sqlstate "2202E"
+                       :a-ndim na :b-ndim nb})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Operators (predicates + value-producing)
@@ -246,23 +357,14 @@
   (let [bs (set (remove nil? (flat-elements b)))]
     (boolean (some #(contains? bs %) (flat-elements a)))))
 
+(declare cat-rejecting-mismatch)
+
 (defn concat-arrs
-  "PG `a || b`. For 1-D arrays, concatenate elements. For multi-dim,
-   shapes must match in all-but-the-first dim; we concatenate along
-   dim 1. Element-types must match; we leave compatibility checks to
-   the call-site (PG coerces via least common supertype)."
+  "PG `a || b` — full multi-dim semantics via `cat-rejecting-mismatch`.
+   Element-types must match; we leave compatibility checks to the
+   call-site (PG coerces via least common supertype)."
   [^PgArray a ^PgArray b]
-  (let [a-rest (rest (:dims a))
-        b-rest (rest (:dims b))]
-    (when (and (seq a-rest) (seq b-rest) (not= a-rest b-rest))
-      (throw (ex-info "concat: inner-dim shapes must match"
-                      {:a-dims (:dims a) :b-dims (:dims b)})))
-    (let [merged (into (:elements a) (:elements b))
-          new-dim1 (+ (long (or (first (:dims a)) (count (:elements a))))
-                      (long (or (first (:dims b)) (count (:elements b)))))
-          new-dims (when (or (seq a-rest) (seq b-rest))
-                     (vec (cons new-dim1 (or a-rest b-rest))))]
-      (->PgArray (:elem-type a) merged new-dims (:lbounds a)))))
+  (cat-rejecting-mismatch a b))
 
 ;; ---------------------------------------------------------------------------
 ;; Text codec

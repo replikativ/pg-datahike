@@ -251,3 +251,101 @@
         (exec! c "INSERT INTO oid_txt (id, tags) VALUES (1, ARRAY['a','b'])")
         (let [meta (describe-column-types c "SELECT tags FROM oid_txt")]
           (is (#{"_text" "text[]"} (-> meta first (nth 2)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Phase B: full PG multi-dim semantics — array_cat, array_replace,
+;; array_append/prepend/position/remove (multi-dim rejected with PG error),
+;; unnest, array_to_string
+;; ---------------------------------------------------------------------------
+
+(deftest cat-1d-1d
+  (testing "1-D || 1-D concatenates"
+    (with-conn
+      (fn [c]
+        (is (= [["{1,2,3,4}"]]
+               (query-rows c "SELECT ARRAY[1,2] || ARRAY[3,4]")))))))
+
+(deftest cat-2d-2d-matching
+  (testing "2-D || 2-D with matching inner dim concatenates outer"
+    (with-conn
+      (fn [c]
+        (is (= [["{{1,2},{3,4},{5,6}}"]]
+               (query-rows c "SELECT ARRAY[[1,2],[3,4]] || ARRAY[[5,6]]")))))))
+
+(deftest cat-2d-1d-prepends-as-row
+  (testing "2-D || 1-D appends 1-D as new outer-dim element"
+    (with-conn
+      (fn [c]
+        (is (= [["{{1,2},{3,4},{5,6}}"]]
+               (query-rows c "SELECT ARRAY[[1,2],[3,4]] || ARRAY[5,6]")))))))
+
+(deftest cat-1d-2d-appends-as-row
+  (testing "1-D || 2-D prepends 1-D as new outer-dim element"
+    (with-conn
+      (fn [c]
+        (is (= [["{{1,2},{3,4},{5,6}}"]]
+               (query-rows c "SELECT ARRAY[1,2] || ARRAY[[3,4],[5,6]]")))))))
+
+(deftest array-replace-multidim
+  (testing "array_replace walks all leaves regardless of dim"
+    (with-conn
+      (fn [c]
+        (is (= [["{{0,2},{3,0}}"]]
+               (query-rows c "SELECT array_replace(ARRAY[[1,2],[3,1]], 1, 0)")))))))
+
+(deftest array-append-rejects-multidim
+  (testing "array_append on multi-dim raises PG-style error"
+    (with-conn
+      (fn [c]
+        (let [resp (try (query-rows c "SELECT array_append(ARRAY[[1,2],[3,4]], 5)")
+                        (catch Exception e (.getMessage e)))]
+          (is (and (string? resp)
+                   (clojure.string/includes? resp "one-dimensional"))))))))
+
+(deftest array-prepend-rejects-multidim
+  (testing "array_prepend on multi-dim raises PG-style error"
+    (with-conn
+      (fn [c]
+        (let [resp (try (query-rows c "SELECT array_prepend(0, ARRAY[[1,2],[3,4]])")
+                        (catch Exception e (.getMessage e)))]
+          (is (and (string? resp)
+                   (clojure.string/includes? resp "one-dimensional"))))))))
+
+(deftest array-position-rejects-multidim
+  (testing "array_position on multi-dim raises PG-style error"
+    (with-conn
+      (fn [c]
+        (let [resp (try (query-rows c "SELECT array_position(ARRAY[[1,2],[3,4]], 3)")
+                        (catch Exception e (.getMessage e)))]
+          (is (and (string? resp)
+                   (clojure.string/includes? resp "multidimensional"))))))))
+
+(deftest array-remove-rejects-multidim
+  (testing "array_remove on multi-dim raises PG-style error"
+    (with-conn
+      (fn [c]
+        (let [resp (try (query-rows c "SELECT array_remove(ARRAY[[1,2],[3,4]], 1)")
+                        (catch Exception e (.getMessage e)))]
+          (is (and (string? resp)
+                   (clojure.string/includes? resp "multidimensional"))))))))
+
+(deftest unnest-flattens-multidim
+  (testing "unnest flattens all dimensions to one row per leaf"
+    (with-conn
+      (fn [c]
+        (is (= [["1"] ["2"] ["3"] ["4"]]
+               (query-rows c "SELECT unnest(ARRAY[[1,2],[3,4]])")))))))
+
+(deftest array-to-string-flattens-multidim
+  (testing "array_to_string joins all leaves regardless of dim"
+    (with-conn
+      (fn [c]
+        (is (= [["1,2,3,4"]]
+               (query-rows c "SELECT array_to_string(ARRAY[[1,2],[3,4]], ',')")))))))
+
+(deftest array-position-1d-respects-lbound
+  (testing "array_position returns position relative to lbound"
+    (with-conn
+      (fn [c]
+        (is (= [["2"]]
+               (query-rows c "SELECT array_position(ARRAY[10,20,30], 20)")))))))

@@ -14,6 +14,7 @@
                               | {:type :system :result QueryResult}
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
+            [datahike.pg.arrays :as pg-arr]
             [datahike.pg.classify :as cls]
             [datahike.pg.rewrite :as rw]
             [datahike.pg.sql.catalog :as catalog]
@@ -533,9 +534,28 @@
                                           (instance? NullValue e)    :__null__
                                           :else (str e)))
                          result (cond
-                                  ;; unnest(ARRAY[e1,e2,e3]) — N rows, one per element
+                                  ;; unnest(ARRAY[e1,e2,e3]) — N rows, one per element.
+                                  ;; PG flattens ALL dimensions, so for multi-dim
+                                  ;; literals we route through stmt/extract-value
+                                  ;; (which builds a typed PgArray, recursing on
+                                  ;; nested ArrayConstructors) and read leaves via
+                                  ;; pg-arr/flat-elements. literal-eval still
+                                  ;; handles the scalar-only cases for the common
+                                  ;; 1-D path.
                                   (and unnest-val unnest-elts?)
-                                  (let [vs (mapv literal-eval unnest-val)]
+                                  ;; Multi-dim flatten: PG `unnest` walks
+                                  ;; ALL leaves (`arrayfuncs.c:6255`).
+                                  ;; Recurse into nested ArrayConstructor
+                                  ;; children before evaluating each leaf
+                                  ;; literal.
+                                  (let [extract-leaves
+                                        (fn extract-leaves [exprs]
+                                          (mapcat (fn [e]
+                                                    (if (instance? ArrayConstructor e)
+                                                      (extract-leaves (.getExpressions ^ArrayConstructor e))
+                                                      [(literal-eval e)]))
+                                                  exprs))
+                                        vs (vec (extract-leaves unnest-val))]
                                     {:type :select
                                      :query {:find [] :where []}
                                      :find-aliases [unnest-alias]

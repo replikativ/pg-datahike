@@ -518,8 +518,17 @@
             first-p (when (and params (pos? (count params)))
                       (.get params 0))]
         (when (instance? ArrayConstructor first-p)
-          (let [vals (mapv #(extract-value %)
-                           (.getExpressions ^ArrayConstructor first-p))]
+          ;; PG `unnest` flattens ALL dimensions into one row per leaf
+          ;; (`arrayfuncs.c:6255`, uses ArrayGetNItems(ndim, dims) to
+          ;; iterate every leaf). For multi-dim literals like
+          ;; `ARRAY[[1,2],[3,4]]` we must produce 4 rows (1, 2, 3, 4),
+          ;; not 2 rows of sub-arrays. Build the typed PgArray via
+          ;; extract-value (which recurses through nested
+          ;; ArrayConstructors), then flatten to leaves.
+          (let [pa (extract-value ^ArrayConstructor first-p)
+                vals (if (pg-arr/array? pa)
+                       (vec (pg-arr/flat-elements pa))
+                       (vec pa))]
             (if with-ord?
               {:aliases ["unnest" "ordinality"]
                :rows    (vec (map-indexed (fn [i v] [v (long (inc i))]) vals))
