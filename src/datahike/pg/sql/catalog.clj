@@ -133,7 +133,19 @@
   "Register an additional virtual catalog table. `entry` must supply
    :schema (a seq of Datahike schema entry maps — include a row-marker
    attr) and :data-fn (a fn of [user-schema cte-db] returning a seq of
-   row entity-maps)."
+   row entity-maps).
+
+   **Init-time only.** The registry is a process-local atom — it is
+   not persisted to Datahike and does not survive a server restart.
+   Call this from your application's startup code, before
+   `start-server`, not lazily on first query. If your host process
+   restarts (deploy, crash), each registration must be re-applied
+   before the first connection lands; otherwise clients hitting an
+   un-re-registered table see \"relation does not exist\".
+
+   Built-in catalogs (pg_class, pg_attribute, …) are unaffected by
+   restart — they're derived from the user schema in Datahike, which
+   is durable on file/kv backends."
   [table-name entry]
   (assert (string? table-name))
   (assert (:schema entry) "register-catalog-table! entry needs :schema")
