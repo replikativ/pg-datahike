@@ -42,6 +42,7 @@
             [datahike.datom]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
@@ -2100,8 +2101,8 @@
             (string? inner)       (pg-arr/from-pg-text inner elem-kw)
             :else                 (pg-arr/array elem-kw [inner])))
 
-        (= cast-cat :integer)   (if (integer? inner) inner (Long/parseLong (str inner)))
-        (= cast-cat :float)     (if (float? inner) inner (Double/parseDouble (str inner)))
+        (= cast-cat :integer)   (coerce/coerce-numeric inner :long)
+        (= cast-cat :float)     (coerce/coerce-numeric inner :double)
         (= cast-cat :text)      (if (string? inner) inner (str inner))
         (= cast-cat :boolean)   (if (boolean? inner) inner (Boolean/parseBoolean (str inner)))
         (= cast-cat :timestamp) (if (instance? java.util.Date inner)
@@ -2296,35 +2297,29 @@
         (if-let [target-pk-attr (get (pgs/derive-ref-targets schema {}) attr)]
           [target-pk-attr val]
           val)
-        ;; BigInteger or clojure.lang.BigInt lands here when a SQL
-        ;; literal overflows Long — `(- (BigInteger. "...N"))` returns
-        ;; BigInt (not BigInteger), so checking both types is required.
-        ;; Down-convert to the column type: float/double lose precision
-        ;; but become finite (or ±Infinity) matching PG; bigdec is
-        ;; exact; long truncates via Number.longValue (matching PG's
-        ;; implicit overflow behaviour for bigint, though a strict
-        ;; 22003 raise would be more correct).
+        ;; BigInteger / BigInt lands here when a SQL literal overflows
+        ;; Long; routed through `coerce/coerce-numeric` so :db.type/long
+        ;; raises 22003 instead of silently wrapping via .longValue,
+        ;; while float/double/bigdec land at finite/±Infinity/exact as
+        ;; PG does.
         (or (instance? java.math.BigInteger val)
             (instance? clojure.lang.BigInt val))
         (case vtype
-          :db.type/float  (float  (.doubleValue ^Number val))
-          :db.type/double (double (.doubleValue ^Number val))
-          :db.type/bigdec (bigdec val)
-          :db.type/long   (.longValue ^Number val)
+          :db.type/float  (coerce/coerce-numeric val :float)
+          :db.type/double (coerce/coerce-numeric val :double)
+          :db.type/bigdec (coerce/coerce-numeric val :bigdec)
+          :db.type/long   (coerce/coerce-numeric val :long)
           val)
-        (and (= vtype :db.type/double) (integer? val)) (double val)
-        (and (= vtype :db.type/float) (integer? val)) (float val)
-        (and (= vtype :db.type/long) (instance? Double val)) (long val)
-        (and (= vtype :db.type/long) (string? val))
-        (try (Long/parseLong val) (catch NumberFormatException _ val))
-        (and (= vtype :db.type/double) (string? val))
-        (try (Double/parseDouble val) (catch NumberFormatException _ val))
-        ;; PG allows 'N'::real and 'N'::float4 — both land here as a
-        ;; string value against a :db.type/float column. Parse via
-        ;; Double/parseDouble then narrow to float; on overflow the
-        ;; narrowing produces ±Infinity which matches PG's behavior.
-        (and (= vtype :db.type/float) (string? val))
-        (try (float (Double/parseDouble val)) (catch NumberFormatException _ val))
+        ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
+        ;; — handles both the string→number and number→number paths.
+        ;; `coerce-numeric` raises 22003/22P02 with the right SQLSTATE.
+        (and (= vtype :db.type/long)
+             (or (string? val) (instance? Double val)))
+        (coerce/coerce-numeric val :long)
+        (and (= vtype :db.type/double) (or (string? val) (integer? val)))
+        (coerce/coerce-numeric val :double)
+        (and (= vtype :db.type/float) (or (string? val) (integer? val)))
+        (coerce/coerce-numeric val :float)
         (and (= vtype :db.type/boolean) (string? val))
         (Boolean/parseBoolean val)
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
@@ -2336,12 +2331,10 @@
         (and (= vtype :db.type/bytes) (string? val))
         (or (parse-bytea-hex val) (.getBytes ^String val "UTF-8"))
         (and (= vtype :db.type/bytes) (bytes? val)) val
-        ;; Timestamp coercion: parse various timestamp formats to java.util.Date
-        ;; BigDecimal coercion: numeric/decimal columns
-        (and (= vtype :db.type/bigdec) (string? val))
-        (try (BigDecimal. ^String val) (catch NumberFormatException _ val))
-        (and (= vtype :db.type/bigdec) (number? val))
-        (bigdec val)
+        ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
+        ;; bad-syntax strings instead of silently keeping the original.
+        (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
+        (coerce/coerce-numeric val :bigdec)
         (and (= vtype :db.type/instant) (string? val))
         (expr/parse-timestamp-string val)
         (and (= vtype :db.type/instant) (instance? java.util.Date val)) val

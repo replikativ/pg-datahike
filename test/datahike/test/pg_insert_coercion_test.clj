@@ -108,6 +108,39 @@
 ;; have the nil-valued key dropped so Datahike doesn't reject
 ;; [:db/add eid attr nil] with :transact/syntax.
 
+(deftest bigint-overflow-into-long-column-raises-22003
+  ;; A19 audit fix: a BigInteger value that overflows Long range must
+  ;; raise SQLSTATE 22003 (numeric_value_out_of_range). The old code
+  ;; silently truncated via `.longValue` which produced a wrong value
+  ;; with no error.
+  (with-open [c (open)]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE big (id INT PRIMARY KEY, n BIGINT)")
+      ;; 2^64 — outside Long range but a valid PG bigint literal that
+      ;; overflows; previously stored as `Long/MIN_VALUE` silently.
+      (let [raised (try (.executeUpdate st "INSERT INTO big VALUES (1, 18446744073709551616)")
+                        nil
+                        (catch SQLException e e))]
+        (is (some? raised) "expected an exception for overflow")
+        (when raised
+          (is (= "22003" (.getSQLState raised))
+              (str "got " (.getSQLState raised) ": " (.getMessage raised))))))))
+
+(deftest bad-numeric-string-into-numeric-column-raises-22P02
+  ;; A21 audit fix: previously, an unparseable string lifted into a
+  ;; :db.type/bigdec column was returned unchanged, then surfaced as a
+  ;; generic Datahike schema error. Now we raise 22P02 directly.
+  (with-open [c (open)]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE n (id INT, v NUMERIC)")
+      (let [raised (try (.executeUpdate st "INSERT INTO n VALUES (1, 'not a number')")
+                        nil
+                        (catch SQLException e e))]
+        (is (some? raised))
+        (when raised
+          (is (= "22P02" (.getSQLState raised))
+              (str "got " (.getSQLState raised) ": " (.getMessage raised))))))))
+
 (deftest prepared-insert-with-null-parameter
   (with-open [c (open)]
     (with-open [st (.createStatement c)]

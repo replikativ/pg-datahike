@@ -45,6 +45,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -1473,8 +1474,8 @@
       (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
       ;; Constant value — cast at translation time
         (cond
-          is-int?  (Long/parseLong (str inner-raw))
-          is-float? (Double/parseDouble (str inner-raw))
+          is-int?  (coerce/coerce-numeric inner-raw :long)
+          is-float? (coerce/coerce-numeric inner-raw :double)
           is-text? (str inner-raw)
           is-bool? (Boolean/parseBoolean (str inner-raw))
         ;; ::date — extract the LocalDate so serialization can omit the

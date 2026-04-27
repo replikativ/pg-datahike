@@ -4163,6 +4163,13 @@
                               (let [code (or (:sqlstate parsed)
                                              (errors/classify-message msg)
                                              "XX000")]
+                                ;; Parse-time errors abort the surrounding
+                                ;; tx the same way execute-time errors do —
+                                ;; otherwise the next stmt sees a "live" tx
+                                ;; instead of the canonical 25P02
+                                ;; in_failed_sql_transaction state.
+                                (when (:in-tx? @tx-state)
+                                  (swap! tx-state assoc :aborted? true))
                                 (error-result msg code))))
 
             ;; fallback
