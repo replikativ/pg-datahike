@@ -76,6 +76,29 @@ public final class PgWireServer {
     public static final int OID_UUID        = 2950;
     public static final int OID_JSONB       = 3802;
 
+    // Array OIDs — exposed so PgParamCodec can dispatch binary
+    // encode/decode through the scalar element codec without
+    // duplicating the registry.
+    public static final int OID_BOOL_ARRAY        = 1000;
+    public static final int OID_BYTEA_ARRAY       = 1001;
+    public static final int OID_NAME_ARRAY        = 1003;
+    public static final int OID_INT2_ARRAY        = 1005;
+    public static final int OID_INT4_ARRAY        = 1007;
+    public static final int OID_TEXT_ARRAY        = 1009;
+    public static final int OID_INT8_ARRAY        = 1016;
+    public static final int OID_FLOAT4_ARRAY      = 1021;
+    public static final int OID_FLOAT8_ARRAY      = 1022;
+    public static final int OID_OID_ARRAY         = 1028;
+    public static final int OID_VARCHAR_ARRAY     = 1015;
+    public static final int OID_DATE_ARRAY        = 1182;
+    public static final int OID_TIME_ARRAY        = 1183;
+    public static final int OID_TIMESTAMP_ARRAY   = 1115;
+    public static final int OID_TIMESTAMPTZ_ARRAY = 1185;
+    public static final int OID_NUMERIC_ARRAY     = 1231;
+    public static final int OID_UUID_ARRAY        = 2951;
+    public static final int OID_JSON_ARRAY        = 199;
+    public static final int OID_JSONB_ARRAY       = 3807;
+
     /**
      * Callback interface for query execution.
      * Implementations may hold per-connection state (transaction state,

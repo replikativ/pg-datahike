@@ -421,3 +421,58 @@
     (is (= 1016 (get datahike.pg.types/pg-name->oid "_int8")))
     (is (= 1231 (get datahike.pg.types/pg-name->oid "_numeric")))
     (is (= 1000 (get datahike.pg.types/pg-name->oid "_bool")))))
+
+;; ---------------------------------------------------------------------------
+;; Phase C: PG-format binary array codec — direct Java codec round-trip.
+;; Exercises encodeArrayBinary / decodeArrayBinary without pgjdbc so the
+;; bytes themselves are verified.
+;; ---------------------------------------------------------------------------
+
+(defn- encode-arr [oid text]
+  (datahike.pg.PgParamCodec/encodeArrayBinary (int oid) text))
+
+(defn- decode-arr [oid bytes]
+  (datahike.pg.PgParamCodec/decodeArrayBinary (int oid) bytes))
+
+(deftest binary-1d-int-roundtrip
+  (let [oid 1007  ;; _int4
+        bytes (encode-arr oid "{10,20,30}")]
+    (is (some? bytes))
+    (is (= "{10,20,30}" (decode-arr oid bytes)))))
+
+(deftest binary-empty-roundtrip
+  (let [oid 1007]
+    (is (= "{}" (decode-arr oid (encode-arr oid "{}"))))))
+
+(deftest binary-1d-with-nulls
+  (let [oid 1007]
+    (is (= "{1,NULL,3}" (decode-arr oid (encode-arr oid "{1,NULL,3}"))))))
+
+(deftest binary-text-roundtrip
+  (let [oid 1009]  ;; _text
+    (is (= "{alice,bob}" (decode-arr oid (encode-arr oid "{alice,bob}"))))))
+
+(deftest binary-2d-int-roundtrip
+  (let [oid 1007
+        bytes (encode-arr oid "{{1,2},{3,4}}")
+        decoded (decode-arr oid bytes)]
+    (is (some? bytes))
+    (is (= "{{1,2},{3,4}}" decoded))))
+
+(deftest binary-text-with-special-chars
+  (let [oid 1009
+        ;; PG quotes elements containing comma; round-trip preserves the
+        ;; quote semantics — value comes back equivalent in text form.
+        original "{\"has,comma\",plain}"]
+    (is (= original (decode-arr oid (encode-arr oid original))))))
+
+(deftest binary-bool-roundtrip
+  (let [oid 1000  ;; _bool
+        bytes (encode-arr oid "{t,f,t}")]
+    (is (= "{t,f,t}" (decode-arr oid bytes)))))
+
+(deftest binary-non-default-lbound
+  (testing "Non-default lbound prefix round-trips through binary"
+    (let [oid 1007
+          original "[2:4]={1,2,3}"]
+      (is (= original (decode-arr oid (encode-arr oid original)))))))

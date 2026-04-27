@@ -349,3 +349,59 @@
       (fn [c]
         (is (= [["2"]]
                (query-rows c "SELECT array_position(ARRAY[10,20,30], 20)")))))))
+
+;; ---------------------------------------------------------------------------
+;; Phase C: binary wire format round-trip
+;; ---------------------------------------------------------------------------
+
+(deftest binary-array-roundtrip-int
+  (testing "int[] column round-trips via pgjdbc binary transfer"
+    (with-conn
+      (fn [c]
+        (exec! c "CREATE TABLE bint (id int PRIMARY KEY, xs int[])")
+        (exec! c "INSERT INTO bint VALUES (1, ARRAY[10,20,30])")
+        ;; Force binary transfer on this connection by reopening with
+        ;; the right URL params.
+        (let [url (str *conn-url* "&binaryTransferEnable=1007&prepareThreshold=1")]
+          (with-open [^Connection bc (DriverManager/getConnection url)
+                      ^Statement s  (.createStatement bc)
+                      ^ResultSet rs (.executeQuery s "SELECT xs FROM bint WHERE id=1")]
+            (.next rs)
+            (let [arr (.getArray rs 1)
+                  vs (.getArray arr)]
+              ;; pgjdbc reconstructs the array; we just assert leaf
+              ;; values arrive intact regardless of wire format.
+              (is (= [10 20 30] (map long (vec vs)))))))))))
+
+(deftest binary-array-roundtrip-text
+  (testing "text[] column round-trips via pgjdbc binary transfer"
+    (with-conn
+      (fn [c]
+        (exec! c "CREATE TABLE btxt (id int PRIMARY KEY, tags text[])")
+        (exec! c "INSERT INTO btxt VALUES (1, ARRAY['alice','bob','carol'])")
+        (let [url (str *conn-url* "&binaryTransferEnable=1009&prepareThreshold=1")]
+          (with-open [^Connection bc (DriverManager/getConnection url)
+                      ^Statement s  (.createStatement bc)
+                      ^ResultSet rs (.executeQuery s "SELECT tags FROM btxt WHERE id=1")]
+            (.next rs)
+            (let [arr (.getArray rs 1)
+                  vs (.getArray arr)]
+              (is (= ["alice" "bob" "carol"] (vec vs))))))))))
+
+(deftest binary-array-roundtrip-with-null
+  (testing "Binary transfer preserves NULL elements"
+    (with-conn
+      (fn [c]
+        (exec! c "CREATE TABLE bnull (id int PRIMARY KEY, xs int[])")
+        (exec! c "INSERT INTO bnull VALUES (1, ARRAY[1,NULL,3])")
+        (let [url (str *conn-url* "&binaryTransferEnable=1007&prepareThreshold=1")]
+          (with-open [^Connection bc (DriverManager/getConnection url)
+                      ^Statement s  (.createStatement bc)
+                      ^ResultSet rs (.executeQuery s "SELECT xs FROM bnull WHERE id=1")]
+            (.next rs)
+            (let [arr (.getArray rs 1)
+                  vs (vec (.getArray arr))]
+              (is (= 3 (count vs)))
+              (is (= 1 (long (nth vs 0))))
+              (is (nil? (nth vs 1)))
+              (is (= 3 (long (nth vs 2)))))))))))
