@@ -3079,39 +3079,106 @@
 
 ;; --- Sequence handlers ------------------------------------------------------
 
+(def ^:private nextval-max-retries
+  "Bound on the optimistic-retry loop in handle-nextval. Real
+   contention on a single sequence shouldn't push past a handful of
+   retries even at thousands of qps; 100 is generous."
+  100)
+
 (defn- handle-nextval
-  "SELECT nextval('seq_name') — read-modify-write the sequence entity."
-  [{:keys [conn tx-state]} parsed]
+  "SELECT nextval('seq_name') — atomically advance the sequence entity
+   and return the new value.
+
+   PG semantics: a `nextval` advance is never rolled back, even by
+   ROLLBACK on the surrounding transaction. We match that by always
+   committing to the live conn, regardless of the session's `:in-tx?`
+   state.
+
+   Atomicity: optimistic CAS-retry. Each iteration reads the current
+   :__seq__/value, computes the new value, and submits
+
+       [[:db/cas seq-eid :__seq__/value curr new]]
+
+   to `d/transact`. Datahike's transactor serialises tx applications
+   per conn, so two concurrent CAS submissions see each other: the
+   first wins, the second's old-val no longer matches the
+   transactor's current value and the CAS raises `:transact/cas`. We
+   re-read and retry. The loser thread will see the winner's new
+   value, compute the next slot, and commit cleanly.
+
+   Why CAS instead of the simpler `:db.fn/call` pattern: Datahike's
+   writer batches multiple in-flight transactions for a single
+   commit, then writes the SAME `:db-after` (the batch's final db)
+   into every tx-report in the batch. So reading `(:db-after report)`
+   to recover the value this call assigned doesn't work — it returns
+   the LAST tx in the batch. CAS sidesteps that: the value we
+   intended is the literal `new` slot of the op-vec, available
+   without reading `:db-after`."
+  [{:keys [conn]} parsed]
   (try
     (let [seq-name (:seq-name parsed)
-          in-tx? (:in-tx? @tx-state)
-          lookup-db (if in-tx? (:speculative-db @tx-state) (d/db conn))
-          seq-eid (ffirst (d/q '{:find [?e]
-                                 :where [[?e :__seq__/name ?n]]
-                                 :in [$ ?n]}
-                               lookup-db seq-name))]
-      (if-not seq-eid
-        (error-result (str "Sequence '" seq-name "' does not exist"))
-        (let [curr-val (or (ffirst (d/q '{:find [?v]
-                                          :where [[?e :__seq__/value ?v]]
-                                          :in [$ ?e]}
-                                        lookup-db seq-eid))
-                           0)
-              increment (or (ffirst (d/q '{:find [?i]
-                                           :where [[?e :__seq__/increment ?i]]
-                                           :in [$ ?e]}
-                                         lookup-db seq-eid))
-                            1)
-              new-val (+ curr-val increment)
-              seq-tx [[:db/add seq-eid :__seq__/value new-val]]]
-          (if in-tx?
-            (let [spec-report (dc/with lookup-db seq-tx)]
-              (swap! tx-state (fn [st]
-                                (-> st
-                                    (assoc :speculative-db (:db-after spec-report))
-                                    (update :tx-buffer into seq-tx)))))
-            (d/transact conn seq-tx))
-          (single-row-result "nextval" PgWireServer/OID_INT8 (str new-val)))))
+          q-fn (requiring-resolve 'datahike.api/q)
+          ;; Look up seq-eid + increment ONCE (they don't change after
+          ;; CREATE SEQUENCE). Only the running value moves under
+          ;; contention.
+          db0 (d/db conn)
+          eid (ffirst (q-fn '{:find [?e]
+                              :where [[?e :__seq__/name ?n]]
+                              :in [$ ?n]}
+                            db0 seq-name))
+          _ (when-not eid
+              (throw (ex-info (str "Sequence '" seq-name "' does not exist")
+                              {:sqlstate "42P01" :seq-name seq-name})))
+          incr (or (ffirst (q-fn '{:find [?i]
+                                   :where [[?e :__seq__/increment ?i]]
+                                   :in [$ ?e]}
+                                 db0 eid))
+                   1)
+          read-curr (fn [^long _attempt]
+                      (ffirst (q-fn '{:find [?v]
+                                      :where [[?e :__seq__/value ?v]]
+                                      :in [$ ?e]}
+                                    (d/db conn) eid)))
+          ;; CAS failure detection: Datahike's transactor raises an
+          ;; ex-info with `{:error :transact/cas}`, but the writer's
+          ;; throwable-promise + CompletableFuture wrapping strips
+          ;; the structured ex-data by the time we see the throw on
+          ;; the caller thread. The original message is preserved
+          ;; (verbatim "_db.fn/cas failed_" substring), so we match
+          ;; on that.
+          cas-failure? (fn [^Throwable e]
+                         (when-let [m (.getMessage e)]
+                           (.contains m ":db.fn/cas failed")))
+          new-val
+          ;; Exponential backoff between retries: 1ms, 2ms, 4ms, …
+          ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
+          ;; (commit-wait-time) between batches before flushing, so
+          ;; without a sleep the retrying caller spins on a still-
+          ;; stale conn-atom and burns through its retry budget before
+          ;; the winner's commit lands. With backoff we yield long
+          ;; enough for the writer to publish, then re-read the now-
+          ;; advanced value and try again.
+          (loop [attempt 0]
+            (let [curr (or (read-curr attempt) 0)
+                  next (+ curr incr)
+                  cas-ok?
+                  (try
+                    (d/transact conn [[:db/cas eid :__seq__/value curr next]])
+                    true
+                    (catch Throwable e
+                      (if (cas-failure? e)
+                        false
+                        (throw e))))]
+              (cond
+                cas-ok? next
+                (>= attempt nextval-max-retries)
+                (throw (ex-info (str "nextval('" seq-name "') gave up after "
+                                     nextval-max-retries " contention retries")
+                                {:sqlstate "40001" :seq-name seq-name}))
+                :else
+                (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
+                    (recur (inc attempt))))))]
+      (single-row-result "nextval" PgWireServer/OID_INT8 (str new-val)))
     (catch Exception e
       (classified-error "nextval error: " e))))
 

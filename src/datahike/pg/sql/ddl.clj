@@ -674,7 +674,15 @@
        :db/cardinality :db.cardinality/one}
       {:db/ident :__seq__/increment :db/valueType :db.type/long
        :db/cardinality :db.cardinality/one}
-      ;; The sequence entity itself
+      ;; The sequence entity itself.
+      ;; PG semantics: `CREATE SEQUENCE s START WITH N` means the
+      ;; first `nextval('s')` returns N. handle-nextval is
+      ;; advance-then-return (reads :__seq__/value, writes value+inc,
+      ;; returns value+inc), so we initialise the stored value to
+      ;; `start-val - increment` — the first advance lands on
+      ;; start-val. The IDENTITY-column path (translate-create-table
+      ;; line ~635) follows the same convention with `:__seq__/value
+      ;; 0` for `START WITH 1, INCREMENT BY 1`.
       {:__seq__/name seq-name
-       :__seq__/value start-val
+       :__seq__/value (- start-val increment)
        :__seq__/increment increment}]}))
