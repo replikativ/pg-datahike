@@ -20,6 +20,7 @@
   (:require [clojure.string :as str]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
+            [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column]
            [net.sf.jsqlparser.expression
@@ -165,12 +166,47 @@
    "array_fill"    :arg-type})
 
 (def sql-aggregate->return-oid
-  "Aggregate function → return OID. SUM/AVG/MIN/MAX propagate the
-   argument type; COUNT is always INT8."
+  "Aggregate function → return-OID rule. Three rule shapes:
+
+   - integer (an OID): always returns this OID, regardless of input.
+     Used for COUNT (always INT8) and the variance/correlation family
+     (always FLOAT8).
+
+   - `:arg-type`: returns the OID of the first argument. Used for
+     MIN/MAX where the result-type tracks the input.
+
+   - map `{<input-oid> <output-oid> … :default <fallback>}`:
+     resolved by looking up the first argument's OID. Used for SUM/AVG
+     to match PG's `pg_proc.dat` per-input-type return rules:
+
+       AVG(int2|int4|int8|numeric) → numeric   (PG)
+       AVG(float4|float8)          → float8
+       SUM(int2|int4)              → int8
+       SUM(int8|numeric)           → numeric  (overflow-safe)
+       SUM(float4)                 → float4
+       SUM(float8)                 → float8
+
+     PG promotes integer SUMs to int8/numeric to prevent overflow,
+     and AVG(int) to numeric to preserve fractional precision. Without
+     these per-input rules, AVG(total_cents) renders as a truncated
+     INT8 in Metabase even though the runtime returns a Double, and
+     SUM(int8) silently overflows when the sum exceeds Long/MAX_VALUE."
   {"count"          types/oid-int8
    "count_distinct" types/oid-int8
-   "sum"            :arg-type
-   "avg"            :arg-type
+   "sum"            {types/oid-int2    types/oid-int8
+                     types/oid-int4    types/oid-int8
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float4
+                     types/oid-float8  types/oid-float8
+                     :default          :arg-type}
+   "avg"            {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
    "min"            :arg-type
    "max"            :arg-type
    "stddev"         types/oid-float8
@@ -180,7 +216,14 @@
    "var_samp"       types/oid-float8
    "var_pop"        types/oid-float8
    "median"         :arg-type
-   "corr"           types/oid-float8})
+   "corr"           types/oid-float8
+   ;; Ordered-set aggregates (WITHIN GROUP). PG: percentile_cont
+   ;; returns FLOAT8 for numeric/float input, INTERVAL for interval;
+   ;; we only support numeric here so FLOAT8 covers it. percentile_disc
+   ;; returns the input type. mode also returns the input type.
+   "percentile_cont" types/oid-float8
+   "percentile_disc" :arg-type
+   "mode"            :arg-type})
 
 ;; ---------------------------------------------------------------------------
 ;; Inference
@@ -205,7 +248,14 @@
    caller falls back to TEXT.
 
    `table-aliases` maps SQL aliases → real table names; we synthesise
-   the attribute keyword as `:<table>/<col>` and probe `db`'s schema."
+   the attribute keyword as `:<table>/<col>` and probe `db`'s schema.
+
+   `:db.cardinality/many` columns project as PG arrays (`int8[]`,
+   `text[]`, etc.) — see `col-var!`'s emit-many-ref-array branch. The
+   OID returned here drives both describeResult and Metabase's column-
+   type rendering, so we must promote to the array OID at this layer
+   (not the underlying scalar) for the wire-level array literal to be
+   parsed as an array on the client side."
   [^Column col {:keys [db schema table-aliases default-table hints]}]
   (when schema
     (let [col-name   (unquote-ident (.getColumnName col))
@@ -214,8 +264,6 @@
                            (unquote-ident (.getAlias t))))
           table-real (or (get table-aliases col-table col-table)
                          default-table)
-          ;; Schema hints may rename the SQL column to a different
-          ;; Datahike attribute local-name.
           hint-attr (when (and hints col-table)
                       (some (fn [[attr h]]
                               (when (and (= (:column h) col-name)
@@ -226,9 +274,27 @@
                    (when table-real
                      (keyword table-real col-name)))
           props (when attr (get schema attr))
-          valuetype (:db/valueType props)]
-      (when valuetype
-        (pgs/oid-for-valuetype valuetype)))))
+          valuetype (:db/valueType props)
+          cardinality (:db/cardinality props)
+          base-oid (when valuetype (pgs/oid-for-valuetype valuetype))
+          ;; Native PG array column (Option C): the schema records
+          ;; `:pg/type "_T"` on the ident entity. Look it up so the
+          ;; column reports its declared array OID even though the
+          ;; storage type is `:db.type/string`.
+          pg-type-name (when (and db attr) (#'params/pg-type-of-attr db attr))
+          pg-name-oid  (when pg-type-name (get types/pg-name->oid pg-type-name))]
+      (cond
+        ;; Native PG array column wins over the storage-type fallback.
+        pg-name-oid pg-name-oid
+        (nil? base-oid) nil
+        ;; Cardinality-many → array OID. For ref attrs we project the
+        ;; deref'd target PK (typically int8); for non-ref many attrs
+        ;; (e.g. `:tag/aliases :db.type/string :many`) we project a
+        ;; text array. The element type comes from the array OID
+        ;; registry so this stays correct as new types are added.
+        (= cardinality :db.cardinality/many)
+        (get types/element-oid->array-oid base-oid types/oid-text-array)
+        :else base-oid))))
 
 (defn- promoted-numeric
   "Numeric promotion for binary arithmetic, matching PG's simplified
@@ -251,6 +317,27 @@
   (promoted-numeric (expr-oid (.getLeftExpression e) env)
                     (expr-oid (.getRightExpression e) env)))
 
+(defn resolve-aggregate-result-oid
+  "Given an aggregate name and the OID of its first argument, return
+   the result OID per `sql-aggregate->return-oid`. Returns nil for
+   unknown aggregates or unresolvable rules (caller falls back).
+
+   Public so the translator can derive the runtime fn variant from
+   the same rule the OID inference uses — avoids drift between
+   describeResult's reported type and the actual runtime."
+  [agg-name input-oid]
+  (let [rule (get sql-aggregate->return-oid (str/lower-case agg-name))]
+    (cond
+      (integer? rule)    rule
+      (= rule :arg-type) input-oid
+      (map? rule)        (let [r (or (get rule input-oid)
+                                     (get rule :default))]
+                           (cond
+                             (integer? r) r
+                             (= r :arg-type) input-oid
+                             :else nil))
+      :else              nil)))
+
 (defn- function-oid
   "Resolve a scalar or aggregate function reference. `:arg-type`
    sentinel in the registry means 'propagate the first argument's type'.
@@ -271,12 +358,16 @@
         rule (or (get sql-aggregate->return-oid fname)
                  (get sql-fn->return-oid fname))]
     (cond
+      ;; Aggregate rule (registered in sql-aggregate->return-oid) —
+      ;; delegate to the shared resolver so runtime variant selection
+      ;; (in stmt.clj) doesn't have to recompute the same logic.
+      (contains? sql-aggregate->return-oid fname)
+      (let [input-oid (cond
+                        (nil? first-arg) types/oid-int8 ; COUNT(*) defensive
+                        :else (expr-oid first-arg env))]
+        (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
-      (= rule :arg-type) (cond
-                           ;; COUNT(*) has no arg; handled above via :int8 but
-                           ;; defensive: fall back if we see it.
-                           (nil? first-arg) types/oid-int8
-                           :else (expr-oid first-arg env))
+      (= rule :arg-type) (when first-arg (expr-oid first-arg env))
       :else nil)))
 
 (defn- cast-oid
@@ -427,6 +518,28 @@
 
       ;; --- Function / aggregate ----------------------------------------
       (instance? Function expr) (function-oid expr env)
+
+      ;; --- AnalyticExpression — window fns (OVER) and ordered-set
+      ;; aggregates (WITHIN GROUP). Aggregate name lives on getName();
+      ;; the value-bearing argument is either getExpression() (window
+      ;; / FILTER aggregates) or the first ORDER BY element (WITHIN
+      ;; GROUP ordered-set aggregates like PERCENTILE_DISC, MODE).
+      (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
+      (let [^net.sf.jsqlparser.expression.AnalyticExpression ae expr
+            fname (str/lower-case (.getName ae))
+            arg-expr (or (.getExpression ae)
+                         (when-let [obs (.getOrderByElements ae)]
+                           (when (seq obs)
+                             (.getExpression
+                              ^net.sf.jsqlparser.statement.select.OrderByElement
+                              (first obs)))))
+            arg-oid (when arg-expr (expr-oid arg-expr env))]
+        (or (resolve-aggregate-result-oid fname arg-oid)
+            (let [rule (get sql-fn->return-oid fname)]
+              (cond
+                (integer? rule)    rule
+                (= rule :arg-type) arg-oid
+                :else              nil))))
 
       ;; --- EXTRACT() --- always returns float8 in PG --------------------
       (instance? ExtractExpression expr) types/oid-float8

@@ -42,12 +42,14 @@
             [datahike.datom]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.pg.arrays :as pg-arr])
   (:import [datahike.datom Datom]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -270,12 +272,13 @@
                 ;; :db.unique/identity (or explicitly named by
                 ;; :datahike.pg/references). Same mechanic as db_id
                 ;; unification: the ref attr's value IS the target
-                ;; entity-id, so we col-var! the ref to get ?ref-var and
-                ;; rebind the target alias's entity-var to it. The
+                ;; entity-id, so we get the raw ref-eid var (not the
+                ;; deref'd target-PK that ref-targeted col-var! returns)
+                ;; and rebind the target alias's entity-var to it. The
                 ;; target's unique column then resolves via the bound
                 ;; entity.
                 (let [{:keys [ref-resolved ref-attr target-alias]} fk-via-ref
-                      ref-var (ctx/col-var! ctx ref-resolved)]
+                      ref-var (ctx/ref-eid-var! ctx ref-resolved)]
                   (swap! (:entity-vars ctx) assoc target-alias ref-var)
                   (when (#{:left :right :full} jtype)
                     (reset! ref-info {:ref-var ref-var
@@ -287,7 +290,11 @@
                 ref-side
                 (do
                 ;; Always create the ref pattern [?left-eid :ref-attr ?ref-var]
-                  (let [ref-var (ctx/col-var! ctx ref-side)
+                  ;; Use ref-eid-var! to get the raw ref entity-id var —
+                  ;; col-var! would return the SQL-projection deref'd PK
+                  ;; for ref-targeted attrs, which is the wrong thing to
+                  ;; rebind a target alias's entity-var to.
+                  (let [ref-var (ctx/ref-eid-var! ctx ref-side)
                         db-id-alias (second db-id-side)]
                   ;; Always unify entity vars (the right-table entity IS the ref value)
                     (swap! (:entity-vars ctx) assoc db-id-alias ref-var)
@@ -512,8 +519,17 @@
             first-p (when (and params (pos? (count params)))
                       (.get params 0))]
         (when (instance? ArrayConstructor first-p)
-          (let [vals (mapv #(extract-value %)
-                           (.getExpressions ^ArrayConstructor first-p))]
+          ;; PG `unnest` flattens ALL dimensions into one row per leaf
+          ;; (`arrayfuncs.c:6255`, uses ArrayGetNItems(ndim, dims) to
+          ;; iterate every leaf). For multi-dim literals like
+          ;; `ARRAY[[1,2],[3,4]]` we must produce 4 rows (1, 2, 3, 4),
+          ;; not 2 rows of sub-arrays. Build the typed PgArray via
+          ;; extract-value (which recurses through nested
+          ;; ArrayConstructors), then flatten to leaves.
+          (let [pa (extract-value ^ArrayConstructor first-p)
+                vals (if (pg-arr/array? pa)
+                       (vec (pg-arr/flat-elements pa))
+                       (vec pa))]
             (if with-ord?
               {:aliases ["unnest" "ordinality"]
                :rows    (vec (map-indexed (fn [i v] [v (long (inc i))]) vals))
@@ -616,6 +632,12 @@
           {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
         sub-parsed (first (:branches branch-parsed))
         sub-aliases (:find-aliases sub-parsed)
+        ;; Per-column expected OID from the inner translate-select's
+        ;; oid-infer pass. Used as a default when the materialised
+        ;; rows are empty or numerically-mixed (samples alone can't
+        ;; pick a type then). Aligns the speculative-db's
+        ;; :db/valueType with what describeResult will tell clients.
+        sub-oids (:select-item-oids sub-parsed)
         q-fn (requiring-resolve 'datahike.api/q)
         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
                      (let [q (cond-> query
@@ -658,41 +680,132 @@
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have
         ;; longs.
+        ;;
+        ;; Predicate-based: Datahike's :db.type/long requires *exactly*
+        ;; Long (the schema spec is `(= (class %) java.lang.Long)`),
+        ;; so an Integer-returning aggregate like COUNT — or any Java
+        ;; int promoted by JDBC unwrapping — would otherwise fall to
+        ;; the :else string branch and reject the row at transact
+        ;; time. The data-tx step coerces each value to the inferred
+        ;; type's expected class (see col-coerce).
+        fits-long? (fn [^Number n]
+                     (and (<= Long/MIN_VALUE (.longValue n))
+                          (<= (.longValue n) Long/MAX_VALUE)))
+        sample-rows (fn [col-idx]
+                      (keep (fn [row]
+                              (let [vs (if (sequential? row) (vec row) [row])
+                                    v  (nth vs col-idx nil)]
+                                (when (and (some? v) (not= :__null__ v)) v)))
+                            sub-results))
+        ;; PG-style numeric LUB for mixed integer/float/numeric
+        ;; samples. Mirrors a small slice of select_common_type_from_oids
+        ;; in PG's parser/parse_coerce.c — wider/more-precise wins.
+        numeric-lub (fn [vs]
+                      (let [has-bigdec? (some #(instance? java.math.BigDecimal %) vs)
+                            has-float?  (some #(or (instance? Double %)
+                                                   (instance? Float %)) vs)
+                            has-bigint? (some #(and (instance? java.math.BigInteger %)
+                                                    (not (fits-long? %)))
+                                              vs)]
+                        (cond
+                          has-bigdec? :db.type/bigdec
+                          has-bigint? :db.type/bigdec  ; promote to numeric to keep precision
+                          has-float?  :db.type/double
+                          :else       :db.type/long)))
+        ;; PG-style type categorisation per `select_common_type_from_oids`
+        ;; (src/backend/parser/parse_coerce.c). Mixed values within a
+        ;; category promote per category rules; cross-category falls to
+        ;; :db.type/string with a warning (PG would error 42804 — we
+        ;; soft-fail for compatibility with the existing EAV-as-NULL
+        ;; design where ad-hoc UNIONs across types are tolerated).
+        value-category (fn [v]
+                         (cond
+                           (boolean? v)                              :boolean
+                           (instance? java.util.Date v)              :datetime
+                           (instance? java.util.UUID v)              :uuid
+                           (number? v)                               :numeric
+                           (or (string? v) (keyword? v) (symbol? v)) :string
+                           :else                                     :unknown))
         col-vtype (fn [col-idx]
-                    (let [samples (keep (fn [row]
-                                          (let [vs (if (sequential? row) (vec row) [row])
-                                                v  (nth vs col-idx nil)]
-                                            (when (and (some? v) (not= :__null__ v)) v)))
-                                        sub-results)]
-                      ;; Match the speculative-db's :db/valueType to the
-                      ;; runtime types Datahike actually accepts. Hitting
-                      ;; the :else string branch when samples include a
-                      ;; Date / UUID / etc. makes the subsequent transact
-                      ;; reject the row with a schema-mismatch error
-                      ;; (datahike.db.transaction "Bad entity value …
-                      ;; Must be conform to: string?"). Test trigger:
-                      ;; LEFT JOIN to a derived table that projects
-                      ;; `customer.created_at` (DateTime) — Metabase
-                      ;; emits this from the Question Builder whenever a
-                      ;; user joins through a temporal column.
+                    (let [samples (sample-rows col-idx)
+                          ;; OID-hint default — used when samples are
+                          ;; empty, or to disambiguate between equally
+                          ;; plausible types (a single Long sample for
+                          ;; a column declared NUMERIC by oid-infer
+                          ;; should pick :db.type/bigdec, not :long).
+                          hint-vtype (some-> (nth sub-oids col-idx nil)
+                                             types/dh-type-for-oid)]
                       (cond
-                        (every? #(instance? Long %)             samples) :db.type/long
-                        (every? #(instance? Double %)           samples) :db.type/double
-                        (every? #(instance? Boolean %)          samples) :db.type/boolean
-                        (every? #(instance? java.util.Date %)   samples) :db.type/instant
-                        (every? #(instance? java.util.UUID %)   samples) :db.type/uuid
-                        (every? #(instance? java.math.BigDecimal %) samples) :db.type/bigdec
-                        (every? #(instance? java.math.BigInteger %) samples) :db.type/bigint
-                        :else :db.type/string)))
+                        ;; No samples — trust the OID hint, else string.
+                        (empty? samples)
+                        (or hint-vtype :db.type/string)
+
+                        :else
+                        (let [cats (into #{} (map value-category) samples)]
+                          (cond
+                            ;; Single-category — straightforward mapping.
+                            (= cats #{:boolean})  :db.type/boolean
+                            (= cats #{:datetime}) :db.type/instant
+                            (= cats #{:uuid})     :db.type/uuid
+                            (= cats #{:string})   :db.type/string
+
+                            (= cats #{:numeric})
+                            (let [lub (numeric-lub samples)]
+                              (cond
+                                (and (= lub :db.type/long)
+                                     (= hint-vtype :db.type/bigdec)) :db.type/bigdec
+                                (and (= lub :db.type/long)
+                                     (= hint-vtype :db.type/double)) :db.type/double
+                                :else lub))
+
+                            ;; Cross-category. PG would raise
+                            ;; ERRCODE_DATATYPE_MISMATCH (42804). We
+                            ;; coerce to :db.type/string and stringify
+                            ;; values at the boundary — matches the
+                            ;; existing EAV-as-NULL leniency. Exception:
+                            ;; if the OID hint is set, trust it (callers
+                            ;; that ran oid-infer have a more
+                            ;; authoritative answer than sampled rows).
+                            :else
+                            (or hint-vtype :db.type/string))))))
+        ;; Coercion to the runtime class Datahike's schema spec
+        ;; demands. Without this, Integer values (e.g. COUNT result)
+        ;; pass type inference but are rejected by `db-with` because
+        ;; the spec is `(= (class %) java.lang.Long)`.
+        ;; Coerce a sample value to the runtime class Datahike's
+        ;; schema spec demands for the inferred vtype. Numeric LUB
+        ;; can promote samples (e.g. Long → BigDecimal when another
+        ;; row's value was BigDecimal); the coercer makes that
+        ;; promotion concrete at the data-tx step.
+        col-coerce (fn [vtype]
+                     (case vtype
+                       :db.type/long    (fn [v]
+                                          (cond
+                                            (instance? Long v) v
+                                            (instance? java.math.BigInteger v) (.longValueExact ^java.math.BigInteger v)
+                                            :else (long v)))
+                       :db.type/double  (fn [v] (if (instance? Double v) v (double v)))
+                       :db.type/bigdec  (fn [v]
+                                          (cond
+                                            (instance? java.math.BigDecimal v) v
+                                            (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                            (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                            (float? v)   (java.math.BigDecimal/valueOf (double v))
+                                            :else        (java.math.BigDecimal. (str v))))
+                       :db.type/string  str
+                       identity))
         ;; Always emit a row-existence marker so `t.*` expansion in
         ;; the OUTER select has an entity anchor even when every
         ;; non-marker column is NULL on a given row (e.g. Metabase's
         ;; `NULL as role` projection in build_privilege_map).
         row-marker (pgs/row-marker-attr target-name)
+        ;; Per-column inferred type + coercion fn, computed once.
+        col-types (mapv (fn [i] (col-vtype i)) (range (count sub-aliases)))
+        col-coercions (mapv col-coerce col-types)
         schema-tx (conj
                    (vec (for [[i a] (map-indexed vector sub-aliases)]
                           {:db/ident (keyword target-name a)
-                           :db/valueType (col-vtype i)
+                           :db/valueType (nth col-types i)
                            :db/cardinality :db.cardinality/one}))
                    {:db/ident       row-marker
                     :db/valueType   :db.type/boolean
@@ -704,7 +817,8 @@
                                             (fn [i a]
                                               (let [v (nth vals i nil)]
                                                 (when (and (some? v) (not= :__null__ v))
-                                                  [(keyword target-name a) v])))
+                                                  [(keyword target-name a)
+                                                   ((nth col-coercions i) v)])))
                                             sub-aliases))]
                          ;; Always include the row marker so the
                          ;; entity exists even if every projected
@@ -790,11 +904,15 @@
         derived-alias-set (into #{} (map :alias) derived-joins)
 
         ;; Create context
+        hints (pgs/schema-hints db)
         ctx (ctx/make-ctx schema table-aliases default-table
                           {:db db
                            :parse-sql params/*parse-sql*
-                           :hints (pgs/schema-hints db)
-                           :derived-aliases derived-alias-set})
+                           :hints hints
+                           :derived-aliases derived-alias-set
+                           :ref-targets (pgs/validate-ref-targets!
+                                         db schema
+                                         (pgs/derive-ref-targets schema hints))})
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
@@ -811,13 +929,36 @@
         _ (doseq [{:keys [alias]} join-infos]
             (when alias (ctx/entity-var! ctx alias)))
 
+        ;; Extract SELECT items NOW (before WHERE) so we can pre-scan
+        ;; aggregation aliases — needed for the WHERE-references-an-
+        ;; aggregation-alias detector. Real PG raises 42703 for any
+        ;; unresolved column in WHERE, but pgwire-datahike treats
+        ;; missing attrs as NULL by design (EAV semantics, see
+        ;; datahike.test.pg-server-test/test-semantic-errors). The
+        ;; targeted exception: when the unresolved column NAME matches
+        ;; a SELECT-list aggregation alias, the user almost certainly
+        ;; meant HAVING — emit a helpful 42703 with a hint instead of
+        ;; silently filtering all rows.
+        select-items (.getSelectItems select)
+        agg-aliases-warning-set
+        (into #{}
+              (keep (fn [^SelectItem item]
+                      (when-let [a (.getAlias item)]
+                        (let [expr (.getExpression item)]
+                          (when (or (and (instance? Function expr)
+                                         (fns/aggregate-function?
+                                          (str/lower-case (.getName ^Function expr))))
+                                    (instance? net.sf.jsqlparser.expression.AnalyticExpression expr))
+                            (str/lower-case
+                             (unquote-ident (.getName ^Alias a))))))))
+              select-items)
+        ctx (assoc ctx :agg-aliases-warning-set agg-aliases-warning-set)
+
         where-expr (.getWhere select)
         _ (when where-expr
             (let [preds (expr/translate-predicate ctx where-expr)]
               (swap! (:where-clauses ctx) into preds)))
 
-        ;; SELECT items
-        select-items (.getSelectItems select)
         has-distinct? (some? (.getDistinct select))
 
         ;; GROUP BY
@@ -836,6 +977,32 @@
         has-aggregates? (atom false)
         compound-exprs (atom [])  ;; [{:alias str :op sym :l-idx int :r-idx int}]
         window-specs (atom [])    ;; [{:op kw :partition-by [idx] :order-by [[idx dir]] :frame {...}}]
+
+        ;; Lightweight oid-env — built before aggregate dispatch so the
+        ;; SUM/AVG branches can pick the numeric-precision runtime
+        ;; variant (filter-sum-numeric / filter-avg-numeric) when the
+        ;; input column's OID is INT8 / NUMERIC. Mirrors the fuller
+        ;; oid-env constructed below for select-item OID inference;
+        ;; both pull from the same fields.
+        agg-oid-env {:db db :schema schema
+                     :table-aliases table-aliases
+                     :default-table default-table
+                     :hints (pgs/schema-hints db)}
+        ;; Per-input-type runtime variant for precision-sensitive
+        ;; aggregates. Single source of truth: oid-infer's
+        ;; `sql-aggregate->return-oid` says e.g. AVG(int8) → numeric;
+        ;; if the inferred result OID is NUMERIC and we have a
+        ;; BigDecimal runtime variant, use it. Avoids the previous
+        ;; duplication where stmt.clj redundantly enumerated which
+        ;; (agg, input-oid) pairs need numeric runtimes.
+        pick-precision-variant
+        (fn [agg-name input-oid]
+          (let [result-oid (oid/resolve-aggregate-result-oid agg-name input-oid)]
+            (when (= result-oid types/oid-numeric)
+              (case agg-name
+                "sum" 'datahike.pg.sql/filter-sum-numeric
+                "avg" 'datahike.pg.sql/filter-avg-numeric
+                nil))))
 
         _ (doseq [^SelectItem item select-items]
             (let [expr (.getExpression item)
@@ -896,11 +1063,56 @@
                       partition-list (.getPartitionExpressionList ae)
                       order-by-list (.getOrderByElements ae)
                       window-elem (.getWindowElement ae)
+                      ;; AnalyticType.WITHIN_GROUP is the ordered-set
+                      ;; aggregate flavor (PERCENTILE_CONT / _DISC, MODE).
+                      ;; It carries an ORDER BY clause but is NOT a
+                      ;; window function — we must NOT route it through
+                      ;; the partition+frame post-processing path.
+                      analytic-type (str (.getType ae))
+                      within-group? (= "WITHIN_GROUP" analytic-type)
+                      ordered-set-fn? (contains? #{"percentile_cont"
+                                                   "percentile_disc"
+                                                   "mode"} fname)
                       ranking-fns #{"row_number" "rank" "dense_rank" "ntile"
                                     "percent_rank" "cume_dist" "lag" "lead"}
-                      is-window? (or (seq partition-list) (seq order-by-list)
-                                     window-elem (contains? ranking-fns fname))]
-                  (if is-window?
+                      is-window? (and (not within-group?)
+                                      (or (seq partition-list) (seq order-by-list)
+                                          window-elem (contains? ranking-fns fname)))]
+                  (cond
+                    ;; Ordered-set aggregate via WITHIN GROUP — translate
+                    ;; with the same pair-aggregate pattern filter-corr
+                    ;; uses: the percentile fraction (constant per query)
+                    ;; rides alongside each per-row x value as a
+                    ;; `[p x]` vector, and the aggregate fn unpacks p
+                    ;; from the first pair. MODE has no parameter and
+                    ;; receives raw x values.
+                    (and within-group? ordered-set-fn?)
+                    (do
+                      (reset! has-aggregates? true)
+                      (when (empty? order-by-list)
+                        (throw (ex-info (str fname " requires WITHIN GROUP (ORDER BY ...)")
+                                        {:fname fname})))
+                      (let [first-ob ^net.sf.jsqlparser.statement.select.OrderByElement
+                            (first order-by-list)
+                            x-expr (.getExpression first-ob)
+                            x-var (expr/translate-expr ctx x-expr)
+                            x-var (if (seq? x-var) (ctx/materialize-arg! ctx x-var) x-var)
+                            agg-fn-sym (get fns/sql-aggregate->datalog fname)]
+                        (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+                        (cond
+                          ;; MODE — no parameter, aggregate raw values
+                          (= fname "mode")
+                          (swap! find-elements conj (list agg-fn-sym x-var))
+                          ;; PERCENTILE_CONT/_DISC — pair `p` with each x
+                          :else
+                          (let [p-val (expr/translate-expr ctx inner-expr)
+                                p-val (if (seq? p-val) (ctx/materialize-arg! ctx p-val) p-val)
+                                pair-var (ctx/fresh-var! ctx)]
+                            (ctx/add-clause! ctx [(list 'vector p-val x-var) pair-var])
+                            (swap! find-elements conj (list agg-fn-sym pair-var))))
+                        (swap! find-aliases conj (or alias-str fname))))
+
+                    is-window?
                     ;; Window function: collect spec for server-side post-processing.
                     ;; All base columns must be in :find so the post-processor can
                     ;; partition, sort, and compute values from the result tuples.
@@ -983,6 +1195,7 @@
                       (swap! window-specs conj (assoc win-spec :alias (or alias-str fname))))
 
                     ;; Not a window — handle as FILTER aggregate or plain aggregate
+                    :else
                     (do
                       (reset! has-aggregates? true)
                       (if (and filter-expr agg-sym)
@@ -1007,9 +1220,18 @@
                                                   (if cnt? 1 (expr/interpret-form iv bindings))
                                                   (if cnt? 0 :__null__)))))
                               fn-param (symbol (str "?filter-fn" (swap! (:var-counter ctx) inc)))
+                          ;; Per-input-type variant — same numeric-promotion
+                          ;; rule as the non-FILTER aggregate path.
+                              filter-precision-variant
+                              (when inner-expr
+                                (pick-precision-variant
+                                 fname
+                                 (oid/expr-oid inner-expr agg-oid-env)))
                           ;; Choose aggregate: COUNT→sum, others→filter-aware variant
-                              filter-agg (if is-count?
-                                           'sum
+                              filter-agg (cond
+                                           is-count? 'sum
+                                           filter-precision-variant filter-precision-variant
+                                           :else
                                            (case fname
                                              "sum" 'datahike.pg.sql/filter-sum
                                              "avg" 'datahike.pg.sql/filter-avg
@@ -1073,11 +1295,22 @@
                               v (expr/translate-expr ctx inner-expr)
                               ;; Materialize expression args (e.g. SUM(a * b) → SUM(?v))
                               v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                              ;; Per-input-type variant for SUM/AVG. Compute
+                              ;; OID against the original AST expression
+                              ;; (post-ref-deref `v` is a logic var with no
+                              ;; OID rule). Falls back silently to default
+                              ;; agg-sym when input type doesn't match the
+                              ;; precision-sensitive set.
+                              precision-variant (when inner-expr
+                                                  (pick-precision-variant
+                                                   fname
+                                                   (oid/expr-oid inner-expr agg-oid-env)))
                               agg-sym (cond
                                         (and is-count-col? is-distinct?)
                                         'datahike.pg.sql/filter-count-distinct
                                         is-count-col?
                                         'datahike.pg.sql/filter-count
+                                        precision-variant precision-variant
                                         :else agg-sym)
                               ;; Distinct aggregates (e.g. SUM(DISTINCT x)) deduplicate
                               ;; their input collection rather than doing a set scan.
@@ -1153,44 +1386,49 @@
                  :table-aliases table-aliases
                  :default-table default-table
                  :hints (pgs/schema-hints db)}
+        ;; OID inference per select-item. The expr-oid walker handles
+        ;; AnalyticExpression (windows, WITHIN GROUP) and arithmetic
+        ;; combinations of aggregates, so we don't gate on window/
+        ;; compound — both inferences are sound. Padding to
+        ;; find-aliases length absorbs extra entries those features
+        ;; add to :find that don't map 1:1 to a select-item.
         select-item-oids
-        (when (and (empty? @window-specs) (empty? @compound-exprs))
-          (let [acc (reduce
-                     (fn [v ^SelectItem item]
-                       (let [expr (.getExpression item)]
-                         (cond
+        (let [acc (reduce
+                   (fn [v ^SelectItem item]
+                     (let [expr (.getExpression item)]
+                       (cond
                            ;; AllTableColumns must come BEFORE AllColumns
                            ;; (it's a subclass).
-                           (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                           (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                                 ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                                 raw-name (when tbl
-                                            (str/lower-case
-                                             (or (when-let [a (.getAlias tbl)]
-                                                   (.getName ^Alias a))
-                                                 (.getName tbl))))
-                                 real (or (get table-aliases raw-name) raw-name)
-                                 cols (pgs/column-info schema real db)]
-                             (into v (keep (fn [col]
-                                             (when (not= "db_id" (:name col))
-                                               (:oid col)))
-                                           cols)))
-                           (instance? AllColumns expr)
-                           (let [cols (pgs/column-info schema default-table db)]
-                             (into v (keep (fn [col]
-                                             (when (not= "db_id" (:name col))
-                                               (:oid col)))
-                                           cols)))
-                           :else
-                           (conj v (oid/expr-oid expr oid-env)))))
-                     []
-                     select-items)
+                         (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
+                         (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
+                               ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
+                               raw-name (when tbl
+                                          (str/lower-case
+                                           (or (when-let [a (.getAlias tbl)]
+                                                 (.getName ^Alias a))
+                                               (.getName tbl))))
+                               real (or (get table-aliases raw-name) raw-name)
+                               cols (pgs/column-info schema real db)]
+                           (into v (keep (fn [col]
+                                           (when (not= "db_id" (:name col))
+                                             (:oid col)))
+                                         cols)))
+                         (instance? AllColumns expr)
+                         (let [cols (pgs/column-info schema default-table db)]
+                           (into v (keep (fn [col]
+                                           (when (not= "db_id" (:name col))
+                                             (:oid col)))
+                                         cols)))
+                         :else
+                         (conj v (oid/expr-oid expr oid-env)))))
+                   []
+                   select-items)
                 ;; find-aliases may be longer than acc when SELECT
                 ;; contains JOIN-driven entity vars added to :find
                 ;; for :with semantics. Pad with nil so the vector
                 ;; lines up index-for-index with find-aliases.
-                n (count @find-aliases)]
-            (vec (take n (concat acc (repeat nil))))))
+              n (count @find-aliases)]
+          (vec (take n (concat acc (repeat nil)))))
 
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
         ;; from different entity combinations that produce identical values.
@@ -1265,7 +1503,17 @@
                                         ;; datahike.* calls (sql-+, sql-*, null-safe scalar ops)
                                         ;; SHOULD be materialized so the resulting bind var can
                                         ;; be referenced by :order-by.
-                                        agg-syms (set (vals fns/sql-aggregate->datalog))
+                                        ;;
+                                        ;; Includes the precision-variant aggregate fns
+                                        ;; (filter-sum-numeric / filter-avg-numeric) emitted
+                                        ;; for INT8/NUMERIC inputs by pick-precision-variant —
+                                        ;; without these, ORDER BY <agg-alias> against a
+                                        ;; numeric column re-materialised the agg-form as a
+                                        ;; where-clause function call and failed at execute
+                                        ;; time with "Unknown function filter-sum-numeric".
+                                        agg-syms (into (set (vals fns/sql-aggregate->datalog))
+                                                       '#{datahike.pg.sql/filter-sum-numeric
+                                                          datahike.pg.sql/filter-avg-numeric})
                                         v (if (and (seq? v)
                                                    (not (contains? agg-syms (first v))))
                                             (ctx/materialize-arg! ctx v)
@@ -1845,10 +2093,26 @@
     (let [col-data-type (.getColDataType ce)
           type-str (when col-data-type
                      (str/lower-case (str (.getDataType col-data-type))))
-          cast-cat (types/cast-category type-str)]
+          cast-cat (types/cast-category type-str)
+          ;; CAST(<x> AS T[]): JSqlParser exposes the array dim via
+          ;; getArrayData (a list, size = ndim) rather than embedding
+          ;; `[]` in the type string. We retype an empty / untyped
+          ;; PgArray to match the target element-keyword and pass
+          ;; non-array inputs through `pg-arr/array` for consistency.
+          array-data (try (.getArrayData col-data-type) (catch Throwable _ nil))
+          array-target? (and (some? type-str) (seq array-data))]
       (cond
-        (= cast-cat :integer)   (if (integer? inner) inner (Long/parseLong (str inner)))
-        (= cast-cat :float)     (if (float? inner) inner (Double/parseDouble (str inner)))
+        array-target?
+        (let [elem-kw (or (get types/sql-name->elem-kw type-str) :text)]
+          (cond
+            (pg-arr/array? inner) (pg-arr/array elem-kw (:elements inner)
+                                                (:dims inner) (:lbounds inner))
+            (sequential? inner)   (pg-arr/array elem-kw (vec inner))
+            (string? inner)       (pg-arr/from-pg-text inner elem-kw)
+            :else                 (pg-arr/array elem-kw [inner])))
+
+        (= cast-cat :integer)   (coerce/coerce-numeric inner :long)
+        (= cast-cat :float)     (coerce/coerce-numeric inner :double)
         (= cast-cat :text)      (if (string? inner) inner (str inner))
         (= cast-cat :boolean)   (if (boolean? inner) inner (Boolean/parseBoolean (str inner)))
         (= cast-cat :timestamp) (if (instance? java.util.Date inner)
@@ -1950,13 +2214,57 @@
                 (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))
          (java.util.Date.)
          (java.util.Date.)))  ;; any timezone expression defaults to current time
+
+    ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
+    ;; Build a typed PgArray; coerce-insert-value will serialize it
+    ;; for storage on an array column. Recurses on nested
+    ;; ArrayConstructors so multi-dim literals build the right shape.
+    ;; Element-type detection mirrors expr.clj's recursive walker so
+    ;; INSERT and SELECT translation produce the same elem-type for
+    ;; equivalent literals.
+    ;;
+    ;; Nested ArrayConstructors materialize as PgArray instances at
+    ;; the inner level — but PgArray is a defrecord (map-like), which
+    ;; the outer ctor's `compute-dims` treats as a scalar. Unwrap any
+    ;; PgArray children's `:elements` so the outer build sees a
+    ;; uniform nested-vector structure and computes dims correctly.
+     (instance? ArrayConstructor e)
+     (let [exprs (.getExpressions ^ArrayConstructor e)
+           detect (fn detect [es]
+                    (or (some (fn [x]
+                                (cond
+                                  (instance? LongValue x)        :int8
+                                  (instance? DoubleValue x)      :float8
+                                  (instance? StringValue x)      :text
+                                  (instance? BooleanValue x)     :bool
+                                  (instance? ArrayConstructor x)
+                                  (detect (.getExpressions ^ArrayConstructor x))
+                                  :else nil))
+                              es)
+                        :text))
+           elem-type (detect exprs)
+           unwrap   (fn [v] (if (pg-arr/array? v) (:elements v) v))
+           elements (mapv #(unwrap (extract-value % schema db)) exprs)]
+       (pg-arr/array elem-type elements))
+
      :else (str e))))
 
 (defn coerce-insert-value
-  "Coerce a value to match the schema type for an attribute."
+  "Coerce a value to match the schema type for an attribute.
+
+   `:db.type/ref` columns: SQL FK semantics says `INSERT/UPDATE … SET
+   col = N` writes the target's PK value (matching what the
+   read-side ref-deref returns). Datahike's transact requires either
+   an entity-id or a lookup-ref. We convert the user-supplied PK
+   value to a lookup-ref `[target-pk-attr val]` using the same
+   convention `derive-ref-targets` uses on the read side, keeping
+   read and write FK semantics symmetric. Falls through to the raw
+   value when no target is resolvable (hint-only refs without a
+   threaded db, or genuinely-unmapped refs)."
   [val attr schema]
   (when (some? val)
-    (let [vtype (get-in schema [attr :db/valueType])]
+    (let [vtype     (get-in schema [attr :db/valueType])
+          elem-kw   (get-in schema [attr :pg/array-elem])]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
@@ -1967,35 +2275,61 @@
         ;; it with the decoded wire value, which already has the right
         ;; type from Bind.
         (params/param-ref? val) val
-        ;; BigInteger or clojure.lang.BigInt lands here when a SQL
-        ;; literal overflows Long — `(- (BigInteger. "...N"))` returns
-        ;; BigInt (not BigInteger), so checking both types is required.
-        ;; Down-convert to the column type: float/double lose precision
-        ;; but become finite (or ±Infinity) matching PG; bigdec is
-        ;; exact; long truncates via Number.longValue (matching PG's
-        ;; implicit overflow behaviour for bigint, though a strict
-        ;; 22003 raise would be more correct).
+
+        ;; Native PG array column (`:pg/array-elem` recorded by DDL)
+        ;; — Option C storage: serialize a PgArray (or coerce a
+        ;; sequential value into one) to canonical PG text. Strings
+        ;; that already look like array text pass through unchanged.
+        (some? elem-kw)
+        (cond
+          (pg-arr/array? val)
+          (pg-arr/to-pg-text val)
+          (and (string? val)
+               (clojure.string/starts-with? (clojure.string/triml val) "{"))
+          val
+          (sequential? val)
+          (pg-arr/to-pg-text (pg-arr/array elem-kw (vec val)))
+          :else
+          ;; Last-ditch: string-coerce. Lets clients send a single
+          ;; element to an array column and have it stored as a
+          ;; 1-element array (PG would reject this; we tolerate to
+          ;; mirror the permissive behaviour of `:db.type/string`
+          ;; coercion above).
+          (pg-arr/to-pg-text (pg-arr/array elem-kw [val])))
+        ;; :db.type/ref column with a numeric/string PK value →
+        ;; lookup-ref. Already-vector values (explicit `[:k v]`) pass
+        ;; through unchanged. Convention-based target resolution
+        ;; (hints aren't visible here without db access — see
+        ;; coerce-insert-value-with-hints for the hint-aware path).
+        (and (= vtype :db.type/ref)
+             (not (vector? val))
+             (some? val))
+        (if-let [target-pk-attr (get (pgs/derive-ref-targets schema {}) attr)]
+          [target-pk-attr val]
+          val)
+        ;; BigInteger / BigInt lands here when a SQL literal overflows
+        ;; Long; routed through `coerce/coerce-numeric` so :db.type/long
+        ;; raises 22003 instead of silently wrapping via .longValue,
+        ;; while float/double/bigdec land at finite/±Infinity/exact as
+        ;; PG does.
         (or (instance? java.math.BigInteger val)
             (instance? clojure.lang.BigInt val))
         (case vtype
-          :db.type/float  (float  (.doubleValue ^Number val))
-          :db.type/double (double (.doubleValue ^Number val))
-          :db.type/bigdec (bigdec val)
-          :db.type/long   (.longValue ^Number val)
+          :db.type/float  (coerce/coerce-numeric val :float)
+          :db.type/double (coerce/coerce-numeric val :double)
+          :db.type/bigdec (coerce/coerce-numeric val :bigdec)
+          :db.type/long   (coerce/coerce-numeric val :long)
           val)
-        (and (= vtype :db.type/double) (integer? val)) (double val)
-        (and (= vtype :db.type/float) (integer? val)) (float val)
-        (and (= vtype :db.type/long) (instance? Double val)) (long val)
-        (and (= vtype :db.type/long) (string? val))
-        (try (Long/parseLong val) (catch NumberFormatException _ val))
-        (and (= vtype :db.type/double) (string? val))
-        (try (Double/parseDouble val) (catch NumberFormatException _ val))
-        ;; PG allows 'N'::real and 'N'::float4 — both land here as a
-        ;; string value against a :db.type/float column. Parse via
-        ;; Double/parseDouble then narrow to float; on overflow the
-        ;; narrowing produces ±Infinity which matches PG's behavior.
-        (and (= vtype :db.type/float) (string? val))
-        (try (float (Double/parseDouble val)) (catch NumberFormatException _ val))
+        ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
+        ;; — handles both the string→number and number→number paths.
+        ;; `coerce-numeric` raises 22003/22P02 with the right SQLSTATE.
+        (and (= vtype :db.type/long)
+             (or (string? val) (instance? Double val)))
+        (coerce/coerce-numeric val :long)
+        (and (= vtype :db.type/double) (or (string? val) (integer? val)))
+        (coerce/coerce-numeric val :double)
+        (and (= vtype :db.type/float) (or (string? val) (integer? val)))
+        (coerce/coerce-numeric val :float)
         (and (= vtype :db.type/boolean) (string? val))
         (Boolean/parseBoolean val)
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
@@ -2007,12 +2341,10 @@
         (and (= vtype :db.type/bytes) (string? val))
         (or (parse-bytea-hex val) (.getBytes ^String val "UTF-8"))
         (and (= vtype :db.type/bytes) (bytes? val)) val
-        ;; Timestamp coercion: parse various timestamp formats to java.util.Date
-        ;; BigDecimal coercion: numeric/decimal columns
-        (and (= vtype :db.type/bigdec) (string? val))
-        (try (BigDecimal. ^String val) (catch NumberFormatException _ val))
-        (and (= vtype :db.type/bigdec) (number? val))
-        (bigdec val)
+        ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
+        ;; bad-syntax strings instead of silently keeping the original.
+        (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
+        (coerce/coerce-numeric val :bigdec)
         (and (= vtype :db.type/instant) (string? val))
         (expr/parse-timestamp-string val)
         (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
@@ -2280,12 +2612,41 @@
         :*
         (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
 
+(defn- enrich-schema-with-pg-array-meta
+  "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
+   metadata like `:pg/array-elem` lives as ident-entity facts. For
+   array column INSERTs we need that metadata available via
+   `(get-in schema [attr :pg/array-elem])`, so this helper queries
+   db for every ident's array-elem/ndim and merges the results into
+   the schema map. Called once per INSERT/UPDATE translation; the
+   query is small (one row per array column in the entire DB)."
+  [schema db]
+  (if (nil? db)
+    schema
+    (let [pg-meta (try
+                    (into {}
+                          (map (fn [[ident elem ndim]]
+                                 [ident (cond-> {}
+                                          elem (assoc :pg/array-elem elem)
+                                          ndim (assoc :pg/array-ndim ndim))]))
+                          ((requiring-resolve 'datahike.api/q)
+                           '{:find  [?ident ?elem ?ndim]
+                             :where [[?e :db/ident ?ident]
+                                     [?e :pg/array-elem ?elem]
+                                     [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
+                           db))
+                    (catch Throwable _ {}))]
+      (reduce-kv (fn [s ident more]
+                   (update s ident merge more))
+                 schema pg-meta))))
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
    Handles ON CONFLICT (UPSERT) via :db.fn/call for atomic execution."
   [^Insert insert schema db]
-  (let [table (.getTable insert)
+  (let [schema (enrich-schema-with-pg-array-meta schema db)
+        table (.getTable insert)
         table-name (unquote-ident (.getName ^Table table))
         ns table-name
         columns (.getColumns insert)

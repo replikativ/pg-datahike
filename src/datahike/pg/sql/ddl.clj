@@ -208,8 +208,13 @@
              :value (-> base (subs 1 (dec (count base)))
                         (str/replace "''" "'"))}
             ;; Known zero-arg functions. Match either form: `now`,
-            ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`.
-            (re-matches #"(?i)(?:now|current_timestamp|statement_timestamp|transaction_timestamp|clock_timestamp)(?:\(\))?"
+            ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`. Also
+            ;; accept the AT TIME ZONE wrapper Odoo uses
+            ;; (`now() AT TIME ZONE 'UTC'`) — for our `:db.type/instant`
+            ;; columns the timezone wrapper is a no-op since we don't
+            ;; track per-column timezone offsets, so it folds into
+            ;; plain `now`.
+            (re-matches #"(?i)(?:now|current_timestamp|statement_timestamp|transaction_timestamp|clock_timestamp)(?:\(\))?(?:\s+at\s+time\s+zone\s+'[^']+')?"
                         base)
             {:kind :fn :value "now"}
             (re-matches #"(?i)current_date(?:\(\))?" base)
@@ -431,9 +436,46 @@
                                ^ColDataType cdt (.getColDataType col)
                                raw-type (str/lower-case (str (.getDataType cdt)))
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
-                               dh-type (or (get pg-type->dh-type raw-type)
-                                           (get pg-type->dh-type base-type)
-                                           :db.type/string)
+                               ;; Detect array column. JSqlParser exposes
+                               ;; the array dimensions via getArrayData()
+                               ;; — a list whose size = ndim (entries are
+                               ;; null for unsized `[]`, integers for
+                               ;; sized `[3]` which PG ignores anyway).
+                               ;; We look up the element-keyword from
+                               ;; `base-type` (typmod stripped) — which
+                               ;; for `numeric(10,2)[]` resolves to
+                               ;; `:numeric`, matching PG's array OIDs.
+                               array-data (try (.getArrayData cdt)
+                                               (catch Throwable _ nil))
+                               ndim       (when (seq array-data) (count array-data))
+                               array-spec (when ndim
+                                            (when-let [elem (get types/sql-name->elem-kw base-type)]
+                                              {:elem    elem
+                                               :pg-name (str "_" (name elem))
+                                               :ndim    ndim}))
+                               ;; Array columns: store as serialized
+                               ;; canonical text in :db.type/string.
+                               ;; Round-trip via to-pg-text/from-pg-text.
+                               dh-type (cond
+                                         array-spec :db.type/string
+                                         :else (or (get pg-type->dh-type raw-type)
+                                                   (get pg-type->dh-type base-type)
+                                                   :db.type/string))
+                               ;; NUMERIC(p, s): preserve precision +
+                               ;; scale via PG's atttypmod encoding so
+                               ;; clients see the declared type. Real
+                               ;; PG keeps these in pg_attribute; we
+                               ;; tag the schema attr's ident entity
+                               ;; with `:pg/typmod` and surface it in
+                               ;; the catalog + describeResult. Skipped
+                               ;; for array columns — we don't currently
+                               ;; preserve element typmod through the
+                               ;; serialized array codec.
+                               numeric-typmod
+                               (when (and (= dh-type :db.type/bigdec) (not array-spec))
+                                 (let [[p s] (types/parse-numeric-args raw-type)]
+                                   (when (or p s)
+                                     (types/encode-numeric-typmod p s))))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; NOT NULL inline; PK is implicitly NOT NULL
@@ -457,6 +499,19 @@
                      (cond-> {:db/ident       (keyword ns col-name)
                               :db/valueType   dh-type
                               :db/cardinality :db.cardinality/one}
+                       ;; Array column: tag with element-keyword and ndim
+                       ;; so coerce-insert-value / value->string /
+                       ;; coerce-pg-array can reconstruct the typed
+                       ;; PgArray from the stored canonical text. The
+                       ;; `:pg/type "_T"` slot drives column-OID
+                       ;; resolution via pg-name->oid in oid_infer.
+                       array-spec (assoc :pg/type        (:pg-name array-spec)
+                                         :pg/array-elem  (:elem array-spec)
+                                         ;; Long-cast for Datahike's
+                                         ;; :db.type/long validation
+                                         ;; (count returns int).
+                                         :pg/array-ndim  (long (:ndim array-spec)))
+                       numeric-typmod (assoc :pg/typmod numeric-typmod)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec
                             (not= :unsupported (:kind default-spec)))
@@ -545,14 +600,17 @@
                  ou (assoc :pg/fk-on-update ou))))
         schema-tx (into schema-tx (into check-entities fk-entities))
         ;; Loud error at DDL for FK actions we don't yet implement.
+        ;; ON DELETE CASCADE *is* implemented (server.clj
+        ;; collect-fk-cascade-retractions!) so we accept it here.
+        ;; ON DELETE SET NULL / SET DEFAULT and ON UPDATE * still raise.
         _ (doseq [fk fk-entities]
-            (when (contains? #{:cascade :set-null :set-default}
+            (when (contains? #{:set-null :set-default}
                              (:pg/fk-on-delete fk))
               (throw (ex-info
                       (str "FOREIGN KEY ON DELETE "
                            (name (:pg/fk-on-delete fk))
                            " is not yet supported for " (:pg/fk-name fk)
-                           " — only NO ACTION / RESTRICT are enforced")
+                           " — only NO ACTION / RESTRICT / CASCADE are enforced")
                       {:sqlstate "0A000"
                        :fk (:pg/fk-name fk)
                        :action (:pg/fk-on-delete fk)})))
@@ -616,7 +674,15 @@
        :db/cardinality :db.cardinality/one}
       {:db/ident :__seq__/increment :db/valueType :db.type/long
        :db/cardinality :db.cardinality/one}
-      ;; The sequence entity itself
+      ;; The sequence entity itself.
+      ;; PG semantics: `CREATE SEQUENCE s START WITH N` means the
+      ;; first `nextval('s')` returns N. handle-nextval is
+      ;; advance-then-return (reads :__seq__/value, writes value+inc,
+      ;; returns value+inc), so we initialise the stored value to
+      ;; `start-val - increment` — the first advance lands on
+      ;; start-val. The IDENTITY-column path (translate-create-table
+      ;; line ~635) follows the same convention with `:__seq__/value
+      ;; 0` for `START WITH 1, INCREMENT BY 1`.
       {:__seq__/name seq-name
-       :__seq__/value start-val
+       :__seq__/value (- start-val increment)
        :__seq__/increment increment}]}))

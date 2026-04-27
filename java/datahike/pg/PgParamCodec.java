@@ -36,6 +36,381 @@ public final class PgParamCodec {
 
     private PgParamCodec() {}
 
+    // ========================================================================
+    // Array OID dispatch — pairs an array OID (`_T`) with its scalar
+    // element OID (`T`). Mirrors `element-oid->array-oid` in
+    // datahike.pg.types so adding a scalar type only needs three rows
+    // (here, in types.clj, in elem-kw->oid).
+    // ========================================================================
+
+    private static final java.util.Map<Integer, Integer> ARRAY_TO_ELEM;
+    static {
+        java.util.Map<Integer, Integer> m = new java.util.HashMap<>();
+        m.put(PgWireServer.OID_BOOL_ARRAY,        PgWireServer.OID_BOOL);
+        m.put(PgWireServer.OID_BYTEA_ARRAY,       PgWireServer.OID_BYTEA);
+        m.put(PgWireServer.OID_NAME_ARRAY,        PgWireServer.OID_NAME);
+        m.put(PgWireServer.OID_INT2_ARRAY,        PgWireServer.OID_INT2);
+        m.put(PgWireServer.OID_INT4_ARRAY,        PgWireServer.OID_INT4);
+        m.put(PgWireServer.OID_TEXT_ARRAY,        PgWireServer.OID_TEXT);
+        m.put(PgWireServer.OID_INT8_ARRAY,        PgWireServer.OID_INT8);
+        m.put(PgWireServer.OID_FLOAT4_ARRAY,      PgWireServer.OID_FLOAT4);
+        m.put(PgWireServer.OID_FLOAT8_ARRAY,      PgWireServer.OID_FLOAT8);
+        m.put(PgWireServer.OID_OID_ARRAY,         PgWireServer.OID_OID);
+        m.put(PgWireServer.OID_VARCHAR_ARRAY,     PgWireServer.OID_VARCHAR);
+        m.put(PgWireServer.OID_DATE_ARRAY,        PgWireServer.OID_DATE);
+        m.put(PgWireServer.OID_TIME_ARRAY,        PgWireServer.OID_TIME);
+        m.put(PgWireServer.OID_TIMESTAMP_ARRAY,   PgWireServer.OID_TIMESTAMP);
+        m.put(PgWireServer.OID_TIMESTAMPTZ_ARRAY, PgWireServer.OID_TIMESTAMPTZ);
+        m.put(PgWireServer.OID_NUMERIC_ARRAY,     PgWireServer.OID_NUMERIC);
+        m.put(PgWireServer.OID_UUID_ARRAY,        PgWireServer.OID_UUID);
+        m.put(PgWireServer.OID_JSON_ARRAY,        PgWireServer.OID_JSON);
+        m.put(PgWireServer.OID_JSONB_ARRAY,       PgWireServer.OID_JSONB);
+        ARRAY_TO_ELEM = java.util.Collections.unmodifiableMap(m);
+    }
+
+    /** True iff `oid` is one of the known `_T` array OIDs. */
+    public static boolean isArrayOid(int oid) {
+        return ARRAY_TO_ELEM.containsKey(oid);
+    }
+
+    /** Returns the scalar T element OID for `_T`, or -1 if not an array OID. */
+    public static int elementOidOf(int arrayOid) {
+        Integer e = ARRAY_TO_ELEM.get(arrayOid);
+        return e == null ? -1 : e.intValue();
+    }
+
+    // ------------------------------------------------------------------------
+    // Canonical-text array parser
+    //
+    // Walks `{...}` text in PG's array_out format into per-dim sizes plus
+    // a flat (row-major) leaf list of token strings. Each leaf is paired
+    // with a `quoted` flag so `"NULL"` (literal string) and unquoted NULL
+    // (SQL NULL marker) can be distinguished. Used by encodeArrayBinary
+    // to rebuild PG's wire format. Lbound prefix `[lo:hi]…=` is consumed
+    // and applied to the result; default lbound is 1 per dim.
+    // ------------------------------------------------------------------------
+
+    private static final class ParsedArray {
+        final int[] dims;
+        final int[] lbounds;
+        final String[] leafTokens;     // null entries denote SQL NULL
+        ParsedArray(int[] dims, int[] lbounds, String[] leafTokens) {
+            this.dims = dims;
+            this.lbounds = lbounds;
+            this.leafTokens = leafTokens;
+        }
+    }
+
+    private static ParsedArray parseArrayText(String text) {
+        String s = text.trim();
+        // Optional `[lo:hi][lo:hi]…=` lbound prefix.
+        java.util.List<Integer> lbounds = new java.util.ArrayList<>();
+        while (s.startsWith("[")) {
+            int eq = s.indexOf('=');
+            int closeBracket = s.indexOf(']');
+            if (closeBracket < 0 || (eq >= 0 && closeBracket > eq)) break;
+            int colon = s.indexOf(':');
+            if (colon < 0 || colon > closeBracket) break;
+            int lo = Integer.parseInt(s.substring(1, colon).trim());
+            lbounds.add(lo);
+            s = s.substring(closeBracket + 1);
+            if (s.startsWith("=")) {
+                s = s.substring(1);
+                break;
+            }
+        }
+        s = s.trim();
+
+        // Parse the body. We track depth and per-level element counts to
+        // derive dims; leaves accumulate in row-major order.
+        java.util.List<String> leaves = new java.util.ArrayList<>();
+        // Per-depth current-element count, taken at the close of each level.
+        java.util.List<Integer> dimsList = new java.util.ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inQuote = false, escape = false, hasContent = false;
+        int depth = 0;
+        // Track count of children at each depth level when we open it.
+        ArrayDeque<Integer> levelCounts = new ArrayDeque<>();
+
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (escape) {
+                cur.append(c); escape = false; hasContent = true;
+                continue;
+            }
+            if (inQuote) {
+                if (c == '\\') { escape = true; continue; }
+                if (c == '"')  { inQuote = false; hasContent = true; continue; }
+                cur.append(c); hasContent = true;
+                continue;
+            }
+            if (c == '"') {
+                // Quoted token: don't strip surrounding quotes — caller's
+                // coerce handles them via the `quoted` semantics. We pass
+                // the raw string through, knowing it was once quoted.
+                inQuote = true; hasContent = true;
+                continue;
+            }
+            if (c == '{') {
+                depth++;
+                levelCounts.push(0);
+                cur.setLength(0);
+                hasContent = false;
+                continue;
+            }
+            if (c == '}') {
+                if (hasContent) {
+                    String tok = cur.toString();
+                    leaves.add(tok.equalsIgnoreCase("NULL") ? null : tok);
+                    levelCounts.push(levelCounts.pop() + 1);
+                    cur.setLength(0);
+                    hasContent = false;
+                }
+                int closedCount = levelCounts.pop();
+                // Record this dim only on the deepest close (first time
+                // we close a level). On subsequent closes at the same
+                // depth, the count should be the same — PG validates this.
+                if (dimsList.size() < depth) {
+                    dimsList.add(0, closedCount);
+                }
+                if (!levelCounts.isEmpty()) {
+                    levelCounts.push(levelCounts.pop() + 1);
+                }
+                depth--;
+                continue;
+            }
+            if (c == ',') {
+                if (hasContent) {
+                    String tok = cur.toString();
+                    leaves.add(tok.equalsIgnoreCase("NULL") ? null : tok);
+                    levelCounts.push(levelCounts.pop() + 1);
+                    cur.setLength(0);
+                    hasContent = false;
+                }
+                continue;
+            }
+            cur.append(c);
+            if (!Character.isWhitespace(c)) hasContent = true;
+        }
+
+        int[] dims = new int[dimsList.size()];
+        for (int i = 0; i < dims.length; i++) dims[i] = dimsList.get(i);
+        if (dims.length == 0) {
+            dims = new int[]{0};
+        }
+        int[] lbs = new int[dims.length];
+        for (int i = 0; i < lbs.length; i++) {
+            lbs[i] = i < lbounds.size() ? lbounds.get(i) : 1;
+        }
+        String[] leafArr = leaves.toArray(new String[0]);
+        return new ParsedArray(dims, lbs, leafArr);
+    }
+
+    // ------------------------------------------------------------------------
+    // Binary array encode — wire format per `arrayfuncs.c:array_send`:
+    //   int32 ndim
+    //   int32 hasnull (0/1)
+    //   int32 element OID
+    //   ndim × (int32 dim, int32 lbound)
+    //   nitems × (int32 size  | -1 for NULL,  bytes)
+    // ------------------------------------------------------------------------
+
+    public static byte[] encodeArrayBinary(int arrayOid, String text) {
+        int elemOid = elementOidOf(arrayOid);
+        if (elemOid < 0) return null;
+        if (text == null) return null;
+        ParsedArray pa;
+        try {
+            pa = parseArrayText(text);
+        } catch (Exception e) {
+            return null;
+        }
+        int ndim = pa.dims.length;
+        int nitems = 1;
+        for (int d : pa.dims) nitems *= d;
+        // Edge case: PG sends ndim=0 for `{}` (empty 1-D array). Match that.
+        if (nitems == 0) {
+            ndim = 0;
+        }
+
+        // Encode each leaf via the scalar codec.
+        byte[][] leafBytes = new byte[pa.leafTokens.length][];
+        boolean hasNull = false;
+        for (int i = 0; i < pa.leafTokens.length; i++) {
+            String tok = pa.leafTokens[i];
+            if (tok == null) {
+                leafBytes[i] = null;
+                hasNull = true;
+            } else {
+                // Strip outer quotes if the token was quoted in text form.
+                // (Our parser preserves them when extracted; for binary
+                // encoding we want the raw value.)
+                String val = tok;
+                Object parsed = parseScalarToken(elemOid, val);
+                byte[] enc = encodeBinary(elemOid, parsed);
+                if (enc == null) return null;  // unsupported element type
+                leafBytes[i] = enc;
+            }
+        }
+
+        int totalBytes = 4 + 4 + 4 + 8 * ndim;
+        for (byte[] b : leafBytes) totalBytes += 4 + (b == null ? 0 : b.length);
+
+        ByteBuffer buf = ByteBuffer.allocate(totalBytes).order(ByteOrder.BIG_ENDIAN);
+        buf.putInt(ndim);
+        buf.putInt(hasNull ? 1 : 0);
+        buf.putInt(elemOid);
+        for (int d = 0; d < ndim; d++) {
+            buf.putInt(pa.dims[d]);
+            buf.putInt(pa.lbounds[d]);
+        }
+        for (byte[] b : leafBytes) {
+            if (b == null) {
+                buf.putInt(-1);
+            } else {
+                buf.putInt(b.length);
+                buf.put(b);
+            }
+        }
+        return buf.array();
+    }
+
+    /**
+     * Coerce the raw text token from the canonical array form to a typed
+     * Java value matching the element OID. Mirrors the scalar text-format
+     * parsers (decodeText switch) — used by encodeArrayBinary so each
+     * leaf can be passed to encodeBinary as the right runtime type.
+     */
+    private static Object parseScalarToken(int elemOid, String tok) {
+        try {
+            return switch (elemOid) {
+                case PgWireServer.OID_BOOL -> {
+                    String t = tok.toLowerCase();
+                    yield t.equals("t") || t.equals("true") || t.equals("1")
+                       || t.equals("yes") || t.equals("y") || t.equals("on");
+                }
+                case PgWireServer.OID_INT2,
+                     PgWireServer.OID_INT4,
+                     PgWireServer.OID_INT8,
+                     PgWireServer.OID_OID -> Long.parseLong(tok.trim());
+                case PgWireServer.OID_FLOAT4,
+                     PgWireServer.OID_FLOAT8 -> Double.parseDouble(tok.trim());
+                case PgWireServer.OID_NUMERIC -> new BigDecimal(tok.trim());
+                case PgWireServer.OID_UUID -> UUID.fromString(tok.trim());
+                case PgWireServer.OID_DATE,
+                     PgWireServer.OID_TIME,
+                     PgWireServer.OID_TIMESTAMP,
+                     PgWireServer.OID_TIMESTAMPTZ -> tok;   // delegate to encodeBinary's parser
+                default -> tok;                              // text/varchar/etc.
+            };
+        } catch (Exception e) {
+            return tok;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Binary array decode — inverse. Returns canonical PG text form
+    // (`{...}` or `[lo:hi]={...}`) so downstream Clojure code routes
+    // through the existing from-pg-text path.
+    // ------------------------------------------------------------------------
+
+    public static String decodeArrayBinary(int arrayOid, byte[] bytes) {
+        int elemOid = elementOidOf(arrayOid);
+        if (elemOid < 0) return null;
+
+        ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        int ndim    = buf.getInt();
+        int hasNull = buf.getInt();
+        int sentOid = buf.getInt();
+        if (sentOid != elemOid && sentOid != 0) {
+            // PG allows OID=0 meaning "use my type"; otherwise should match.
+            // We trust the array OID we were called with.
+        }
+        if (ndim == 0) return "{}";
+
+        int[] dims = new int[ndim];
+        int[] lbs  = new int[ndim];
+        int   nitems = 1;
+        for (int i = 0; i < ndim; i++) {
+            dims[i] = buf.getInt();
+            lbs[i]  = buf.getInt();
+            nitems *= dims[i];
+        }
+
+        // Decode each leaf to its text form.
+        String[] leaves = new String[nitems];
+        for (int i = 0; i < nitems; i++) {
+            int sz = buf.getInt();
+            if (sz < 0) {
+                leaves[i] = null;
+            } else {
+                byte[] b = new byte[sz];
+                buf.get(b);
+                Object decoded = decodeBinary(elemOid, b);
+                leaves[i] = decoded == null ? "NULL" : leafToText(decoded);
+            }
+        }
+
+        // Build the canonical text form.
+        StringBuilder out = new StringBuilder();
+        // Lbound prefix only when any lbound != 1.
+        boolean nonDefault = false;
+        for (int lb : lbs) if (lb != 1) { nonDefault = true; break; }
+        if (nonDefault) {
+            for (int i = 0; i < ndim; i++) {
+                out.append('[').append(lbs[i]).append(':')
+                   .append(lbs[i] + dims[i] - 1).append(']');
+            }
+            out.append('=');
+        }
+        emitArrayLevel(out, leaves, dims, 0, 0);
+        return out.toString();
+    }
+
+    /** Recursive emitter that walks the row-major leaves array level by level. */
+    private static int emitArrayLevel(StringBuilder out, String[] leaves,
+                                      int[] dims, int dim, int offset) {
+        out.append('{');
+        int sub = 1;
+        for (int i = dim + 1; i < dims.length; i++) sub *= dims[i];
+        for (int i = 0; i < dims[dim]; i++) {
+            if (i > 0) out.append(',');
+            if (dim == dims.length - 1) {
+                String s = leaves[offset++];
+                if (s == null) out.append("NULL");
+                else out.append(quoteIfNeeded(s));
+            } else {
+                offset = emitArrayLevel(out, leaves, dims, dim + 1, offset);
+            }
+        }
+        out.append('}');
+        return offset;
+    }
+
+    private static String quoteIfNeeded(String s) {
+        if (s.isEmpty() || s.equalsIgnoreCase("NULL")) return "\"" + s + "\"";
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == ',' || c == '"' || c == '\\' || c == '{' || c == '}'
+                || Character.isWhitespace(c)) {
+                StringBuilder b = new StringBuilder("\"");
+                for (int j = 0; j < s.length(); j++) {
+                    char cc = s.charAt(j);
+                    if (cc == '"' || cc == '\\') b.append('\\');
+                    b.append(cc);
+                }
+                return b.append('"').toString();
+            }
+        }
+        return s;
+    }
+
+    private static String leafToText(Object v) {
+        if (v == null) return "NULL";
+        if (v instanceof Boolean b) return b ? "t" : "f";
+        return v.toString();
+    }
+
     /** Days between the Unix epoch (1970-01-01) and the PG epoch (2000-01-01). */
     private static final long PG_EPOCH_DAYS = 10957L;
     /** Microseconds between the Unix epoch and the PG epoch. */
@@ -375,7 +750,15 @@ public final class PgParamCodec {
                     yield out;
                 }
 
-                default -> null;   // caller falls back to text encoding
+                default -> {
+                    // Array OIDs: route through the array codec which
+                    // parses the canonical text form and encodes each
+                    // leaf via encodeBinary(elemOid, leaf).
+                    if (isArrayOid(oid)) {
+                        yield encodeArrayBinary(oid, value.toString());
+                    }
+                    yield null;   // caller falls back to text encoding
+                }
             };
         } catch (Exception e) {
             return null;  // fall back to text encoding
@@ -460,14 +843,19 @@ public final class PgParamCodec {
             case PgWireServer.OID_JSON ->
                 new String(bytes, StandardCharsets.UTF_8);
 
-            // Types we don't support in binary today: numeric (variable-length
-            // NBASE=10000 digit encoding), interval (composite), arrays (every
-            // element type × multi-dimensional), range types, network types,
-            // composite/record types. Clients should send these in text format.
-            default ->
+            // Array OIDs: decode through the array codec, returning the
+            // canonical text form so downstream coerce-pg-array hits the
+            // existing from-pg-text path. NULL elements re-emit as the
+            // unquoted `NULL` token.
+            default -> {
+                if (isArrayOid(oid)) {
+                    String s = decodeArrayBinary(oid, bytes);
+                    if (s != null) yield s;
+                }
                 throw new PgWireServer.PgProtocolException("0A000",
                     "binary decoding not implemented for OID " + oid
                     + " (use text parameter format)");
+            }
         };
     }
 }

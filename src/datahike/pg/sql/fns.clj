@@ -45,16 +45,152 @@
 ;; `'datahike.pg.sql/filter-*` symbols in the map resolve once re-exported.
 
 (defn filter-sum
-  "SUM that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
+  "SUM that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
+   Uses Clojure's auto-promoting `+` so int8 inputs that overflow
+   silently become BigInt — `filter-sum-numeric` is the variant the
+   translator picks for SUM(int8) / SUM(numeric) where the result OID
+   is NUMERIC; this one stays for SUM(int4) / SUM(float*)."
   [coll]
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (reduce + 0 vs))))
 
+(defn filter-sum-numeric
+  "SUM with explicit BigDecimal accumulation. PG returns NUMERIC for
+   SUM(int8) and SUM(numeric) to avoid overflow; this variant matches
+   that. Coerces inputs to BigDecimal once at the boundary so
+   `+` stays primitive across the reduce. Skips nil and `:__null__`
+   sentinels."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs)
+      :__null__
+      (reduce (fn [^java.math.BigDecimal acc v]
+                (.add acc (cond
+                            (instance? java.math.BigDecimal v) v
+                            (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                            (integer? v) (java.math.BigDecimal/valueOf (long v))
+                            (float? v)   (java.math.BigDecimal/valueOf (double v))
+                            :else        (java.math.BigDecimal. (str v)))))
+              java.math.BigDecimal/ZERO
+              vs))))
+
 (defn filter-avg
-  "AVG that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
+  "AVG that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
+   Returns Double — used for AVG(float4) / AVG(float8). For AVG(int*)
+   / AVG(numeric) the translator picks `filter-avg-numeric` which
+   preserves precision via BigDecimal."
   [coll]
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (/ (double (reduce + 0 vs)) (count vs)))))
+
+(def ^:private ^:const numeric-min-sig-digits
+  "Mirrors PG's `NUMERIC_MIN_SIG_DIGITS` (16). AVG / division aim for
+   at least this many significant digits so numeric is no less
+   accurate than float8."
+  16)
+
+(def ^:private ^:const numeric-max-display-scale
+  "PG's NUMERIC_MAX_DISPLAY_SCALE upper bound. PG itself defaults to a
+   high cap; 1000 is enough headroom for any realistic AVG and well
+   below BigDecimal's intrinsic limits."
+  1000)
+
+(defn- decimal-weight
+  "Approximate PG `NumericVar.weight` for a BigDecimal: index in
+   DEC_DIGITS=4 base of the leading non-zero digit. Zero for
+   `|value| < 10000`, 1 for 10000..99999999, etc. Negative for pure
+   fractions (`0.0001..0.9999` is weight -1).
+
+   Matches the integer-part-weight half of PG's weight formula. For
+   AVG, where we only care about the magnitude relationship, this is
+   sufficient."
+  [^java.math.BigDecimal v]
+  (if (zero? (.signum v))
+    0
+    (let [int-digits (- (.precision v) (.scale v))]
+      ;; int-digits 1..4 → weight 0
+      ;; int-digits 5..8 → weight 1
+      ;; int-digits ≤ 0  → weight ≈ -ceil((-int-digits + 1) / 4) (fractional)
+      (if (pos? int-digits)
+        (long (Math/floor (/ (double (dec int-digits)) 4.0)))
+        (long (Math/floor (/ (double (dec int-digits)) 4.0)))))))
+
+(defn- leading-dec-digit-chunk
+  "PG's NumericDigit base-10000 leading chunk: the value of the first
+   DEC_DIGITS=4 group of decimal digits, or 0 for zero. Used by PG's
+   select_div_scale to decide whether to subtract 1 from qweight when
+   the dividend's leading digit ≤ the divisor's."
+  [^java.math.BigDecimal v]
+  (if (zero? (.signum v))
+    0
+    (let [unscaled (.unscaledValue (.abs v))
+          s (.toString unscaled)
+          ;; Take leading 1..4 digits, padded to 4 with trailing zeros
+          ;; so 550 → 5500 (one DEC_DIGITS chunk), comparable across
+          ;; magnitudes the way PG's first-digit comparison is.
+          digits-needed 4
+          chunk (if (>= (count s) digits-needed)
+                  (subs s 0 digits-needed)
+                  (str s (apply str (repeat (- digits-needed (count s)) \0))))]
+      (Long/parseLong chunk))))
+
+(defn- select-div-scale
+  "PG-faithful scale selection for division (matches `select_div_scale`
+   in src/backend/utils/adt/numeric.c).
+
+   `rscale = NUMERIC_MIN_SIG_DIGITS - qweight * DEC_DIGITS`
+     where qweight ≈ weight(sum) - weight(count) (- 1 when the
+     leading DEC_DIGITS chunk of the sum is ≤ the count's chunk —
+     the quotient might land one digit below the naive estimate).
+   Then floor by max of input dscales, by 0, ceiling by
+   NUMERIC_MAX_DISPLAY_SCALE."
+  [^java.math.BigDecimal sum-bd n-count]
+  (let [sum-scale (.scale sum-bd)
+        sum-w (decimal-weight sum-bd)
+        n-bd (java.math.BigDecimal/valueOf (long n-count))
+        n-w (decimal-weight n-bd)
+        sum-chunk (leading-dec-digit-chunk sum-bd)
+        n-chunk (leading-dec-digit-chunk n-bd)
+        qweight (cond-> (- sum-w n-w)
+                  (<= sum-chunk n-chunk) dec)
+        rscale (max (- numeric-min-sig-digits (* qweight 4))
+                    sum-scale
+                    0)]
+    (min rscale numeric-max-display-scale)))
+
+(defn filter-avg-numeric
+  "AVG with BigDecimal precision. Matches PG's AVG(int*)→numeric and
+   AVG(numeric)→numeric. Scale tracks PG's `select_div_scale`: at
+   least 16 significant digits, no less than the input column's
+   scale, and adjusted down for sums whose magnitude already takes
+   most of the available digits.
+
+   Concretely: AVG(int) on small values → 16 fractional digits (same
+   as PG); AVG(NUMERIC(p, 2)) → max(16, 2) = 16 digits; AVG of a sum
+   with weight 4+ digits in the integer part → fewer fractional
+   digits, mirroring PG's precision-economy rule.
+
+   Skips nil and `:__null__` sentinels."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs)
+      :__null__
+      (let [sum (reduce (fn [^java.math.BigDecimal acc v]
+                          (.add acc (cond
+                                      (instance? java.math.BigDecimal v) v
+                                      (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                      (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                      (float? v)   (java.math.BigDecimal/valueOf (double v))
+                                      :else        (java.math.BigDecimal. (str v)))))
+                        java.math.BigDecimal/ZERO
+                        vs)
+            n-count (count vs)
+            n-bd (java.math.BigDecimal/valueOf (long n-count))
+            rscale (int (select-div-scale sum n-count))]
+        (.divide ^java.math.BigDecimal sum
+                 ^java.math.BigDecimal n-bd
+                 rscale
+                 java.math.RoundingMode/HALF_UP)))))
 
 (defn filter-min
   "MIN that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
@@ -104,6 +240,52 @@
         elem-type (if (some? first-v) (pick-type first-v) :text)]
     (arr-fn elem-type vs)))
 
+(defn pg-many-ref-array
+  "Per-row Datalog fn for `:db.cardinality/many :db.type/ref` SQL
+   projection: given the source entity-id, fetch all values of
+   `ref-attr` (each is a target entity-id), look up `target-pk-attr`
+   on each, and return a PgArray of the resulting PK values.
+
+   Empty for source entities with no ref values — matches what a
+   real PG `int[]` column would render for a row that has no
+   elements. Avoids the Datalog `array_agg` + or-join dance because
+   it runs per-row in pure Clojure: the source entity is already
+   bound, so we just do two lookups and box.
+
+   Used as `[(?pg-many-ref-array $ ?source-eid :order/tags :tag/id) ?out]`
+   in the translator-emitted Datalog query."
+  [db source-eid ref-attr target-pk-attr]
+  (let [arr-ns (some-> 'datahike.pg.arrays find-ns)
+        _ (when-not arr-ns (require 'datahike.pg.arrays))
+        arr-fn (resolve 'datahike.pg.arrays/array)
+        ;; eavt scan: all `[source-eid ref-attr v]` datoms.
+        datoms-fn (requiring-resolve 'datahike.api/datoms)
+        target-eids (mapv :v (datoms-fn db {:index :eavt
+                                            :components [source-eid ref-attr]}))
+        ;; Per-target lookup of the PK value. Nil targets (deleted
+        ;; or schema-attr eids) drop out; real-target-with-no-PK
+        ;; passes through nil, matching PG's NULL element.
+        pks (vec
+             (for [eid target-eids
+                   :let [pk-datoms (datoms-fn db {:index :eavt
+                                                  :components [eid target-pk-attr]})
+                         v (some-> ^datahike.datom.Datom (first pk-datoms) .-v)]
+                   :when (some? v)]
+               v))
+        ;; Element type from the target PK attr's :db/valueType, NOT
+        ;; from the first sample value (which would mistype an empty
+        ;; array as :text). Defaults to :int8 — most FK PKs are bigint.
+        schema (:schema db)
+        target-vtype (get-in schema [target-pk-attr :db/valueType])
+        elem-type (case target-vtype
+                    :db.type/long    :int8
+                    :db.type/string  :text
+                    :db.type/uuid    :uuid
+                    :db.type/bigdec  :numeric
+                    :db.type/instant :timestamptz
+                    :int8)]
+    (arr-fn elem-type pks)))
+
 (defn filter-count-distinct
   "SQL COUNT(DISTINCT col) — counts distinct non-NULL values."
   [coll]
@@ -111,6 +293,63 @@
 
 (defn- drop-nulls [coll]
   (remove #(or (nil? %) (= :__null__ %)) coll))
+
+(defn- drop-pair-nulls
+  "For pair-aggregate inputs `[[p v] …]`, drop pairs whose value is
+   nil/sentinel. Used by percentile / mode aggregates that receive the
+   ordered-set parameter alongside the per-row value."
+  [coll]
+  (remove (fn [[_ v]] (or (nil? v) (= :__null__ v))) coll))
+
+(defn filter-percentile-cont
+  "PG `PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY x)` — linearly-
+   interpolated continuous percentile. Receives a coll of `[p x]` pairs
+   (every `p` is the same constant, threaded per-row by the translator
+   so the aggregate fn can stay single-arg per Datahike's aggregate
+   contract). Returns the interpolated p-th percentile of the x values,
+   `:__null__` for an empty input."
+  [coll]
+  (let [pairs (drop-pair-nulls coll)
+        vs    (sort (map second pairs))
+        n     (count vs)]
+    (cond
+      (zero? n) :__null__
+      (== 1 n)  (first vs)
+      :else
+      (let [p (double (first (first pairs)))
+            idx (* p (dec n))
+            lo (long (Math/floor idx))
+            hi (long (Math/ceil idx))
+            frac (- idx lo)]
+        (+ (* (nth vs lo) (- 1.0 frac))
+           (* (nth vs hi) frac))))))
+
+(defn filter-percentile-disc
+  "PG `PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY x)` — discrete
+   percentile, no interpolation. Returns the value at position
+   `ceil(p * n)` (1-based) in the sorted non-null x values."
+  [coll]
+  (let [pairs (drop-pair-nulls coll)
+        vs    (sort (map second pairs))
+        n     (count vs)]
+    (if (zero? n)
+      :__null__
+      (let [p (double (first (first pairs)))
+            idx (max 0 (min (dec n) (dec (long (Math/ceil (* p n))))))]
+        (nth vs idx)))))
+
+(defn filter-mode
+  "PG `MODE() WITHIN GROUP (ORDER BY x)` — most frequent value.
+   Receives raw x values (no percentile parameter). Tie-broken by
+   ORDER BY ascending, matching PG's stable-sort tiebreak."
+  [coll]
+  (let [vs (drop-nulls coll)]
+    (if (empty? vs)
+      :__null__
+      (let [freq (frequencies vs)
+            max-cnt (apply max (vals freq))
+            winners (filter #(= max-cnt (val %)) freq)]
+        (first (sort (map key winners)))))))
 
 (defn filter-variance-samp
   "SQL VAR_SAMP(x) — sample variance, ignores :__null__/nil. Returns
@@ -244,6 +483,75 @@
   "Stub: always returns true (all tables are visible in the default schema)."
   [_oid] true)
 
+;; The other `pg_*_is_visible` predicates: psql's `\df`, `\da`, `\dT`,
+;; `\dF`, `\dD` all gate their list queries on these. We don't model
+;; per-namespace visibility (everything lives in `public`), so they
+;; mirror pg_table_is_visible's stub.
+(def pg-function-is-visible (constantly true))
+(def pg-type-is-visible (constantly true))
+(def pg-namespace-is-visible (constantly true))
+(def pg-ts-config-is-visible (constantly true))
+(def pg-operator-is-visible (constantly true))
+(def pg-conversion-is-visible (constantly true))
+
+;; Function-introspection stubs. psql `\df` / `\sf` / `\df+` issue
+;; these against pg_proc. We don't surface user-defined fns yet, so
+;; they return empty strings — psql renders an empty cell rather than
+;; failing.
+(def pg-get-function-arguments (constantly ""))
+(def pg-get-function-result    (constantly ""))
+(def pg-get-functiondef        (constantly ""))
+(def pg-get-function-identity-arguments (constantly ""))
+
+;; Size functions. psql `\d+` / `\dt+` show "Size" via
+;; `pg_size_pretty(pg_table_size(c.oid))`. We don't track on-disk
+;; size for Datahike-backed tables; report 0 with a human-formatted
+;; pretty-print so the cell isn't blank.
+(def pg-table-size      (constantly 0))
+(def pg-relation-size   (constantly 0))
+(def pg-indexes-size    (constantly 0))
+(def pg-database-size   (constantly 0))
+(def pg-total-relation-size (constantly 0))
+
+(defn pg-size-pretty
+  "Format a byte count as PG's pretty string ('1024 bytes', '12 kB',
+   '5 MB'). Mirrors `pg_size_pretty` in src/backend/utils/adt/dbsize.c."
+  [bytes]
+  (let [n (long (or bytes 0))]
+    (cond
+      (< n 10240)              (str n " bytes")
+      (< n (* 10240 1024))     (str (long (/ (+ n 512) 1024)) " kB")
+      (< n (* 10240 1024 1024)) (str (long (/ (+ n (* 512 1024)) (* 1024 1024))) " MB")
+      :else                    (str (long (/ (+ n (* 512 1024 1024)) (* 1024 1024 1024))) " GB"))))
+
+;; Encoding/locale stubs. psql `\l` shows server encoding via
+;; `pg_encoding_to_char(d.encoding)`. We're always UTF8 — no other
+;; encoding is meaningful for in-memory Datahike.
+(def pg-encoding-to-char (constantly "UTF8"))
+
+;; Object-definition reconstructors. psql `\d <table>`, `\d+`, `\dY`
+;; query these against pg_statistic_ext, pg_partitioned_table,
+;; pg_view, pg_trigger, pg_rewrite. We don't track any of these
+;; entities, so reconstruct returns nil — psql renders no row /
+;; "(none)" / blank.
+(def pg-get-statisticsobjdef        (constantly :__null__))
+(def pg-get-statisticsobjdef-columns (constantly :__null__))
+(def pg-get-statisticsobjdef-expressions (constantly :__null__))
+(def pg-get-partkeydef              (constantly :__null__))
+(def pg-get-viewdef                 (constantly :__null__))
+(def pg-get-triggerdef              (constantly :__null__))
+(def pg-get-ruledef                 (constantly :__null__))
+(def pg-get-publication-tables      (constantly :__null__))
+(def pg-tablespace-location         (constantly :__null__))
+
+;; Publication / replication stubs. psql `\d <table>` (12+) probes
+;; pg_relation_is_publishable to render the "Publications" footer.
+;; We don't model logical replication; everything is publishable but
+;; nothing is published.
+(def pg-relation-is-publishable     (constantly true))
+(def pg-get-replica-identity-index  (constantly :__null__))
+(def pg-get-replica-identity        (constantly "d"))
+
 (defn pg-format-type
   "Convert a type OID + type modifier to a type name string.
    Delegates to the centralized type registry."
@@ -288,7 +596,14 @@
    "var_pop"        'variance
    "median"         'median
    "corr"           'datahike.pg.sql/filter-corr
-   "array_agg"      'datahike.pg.sql/filter-array-agg})
+   "array_agg"      'datahike.pg.sql/filter-array-agg
+   ;; Ordered-set aggregates — `WITHIN GROUP (ORDER BY x)` syntax.
+   ;; Translator routes them through the pair-aggregate path (like
+   ;; corr) since the percentile fraction is a constant alongside
+   ;; the per-row value, and Datalog aggregates take a single coll.
+   "percentile_cont" 'datahike.pg.sql/filter-percentile-cont
+   "percentile_disc" 'datahike.pg.sql/filter-percentile-disc
+   "mode"            'datahike.pg.sql/filter-mode})
 
 (defn aggregate-function? [^String fname]
   (contains? sql-aggregate->datalog (str/lower-case fname)))
@@ -330,6 +645,35 @@
    "octet_length" count
    "position"     sql-position
    "strpos"       sql-position
-   "pg_table_is_visible"  pg-table-is-visible
+   "pg_table_is_visible"      pg-table-is-visible
+   "pg_function_is_visible"   pg-function-is-visible
+   "pg_type_is_visible"       pg-type-is-visible
+   "pg_namespace_is_visible"  pg-namespace-is-visible
+   "pg_ts_config_is_visible"  pg-ts-config-is-visible
+   "pg_operator_is_visible"   pg-operator-is-visible
+   "pg_conversion_is_visible" pg-conversion-is-visible
+   "pg_get_function_arguments" pg-get-function-arguments
+   "pg_get_function_result"    pg-get-function-result
+   "pg_get_functiondef"        pg-get-functiondef
+   "pg_get_function_identity_arguments" pg-get-function-identity-arguments
+   "pg_table_size"          pg-table-size
+   "pg_relation_size"       pg-relation-size
+   "pg_indexes_size"        pg-indexes-size
+   "pg_database_size"       pg-database-size
+   "pg_total_relation_size" pg-total-relation-size
+   "pg_size_pretty"         pg-size-pretty
+   "pg_encoding_to_char"    pg-encoding-to-char
+   "pg_get_statisticsobjdef"            pg-get-statisticsobjdef
+   "pg_get_statisticsobjdef_columns"    pg-get-statisticsobjdef-columns
+   "pg_get_statisticsobjdef_expressions" pg-get-statisticsobjdef-expressions
+   "pg_get_partkeydef"      pg-get-partkeydef
+   "pg_get_viewdef"         pg-get-viewdef
+   "pg_get_triggerdef"      pg-get-triggerdef
+   "pg_get_ruledef"         pg-get-ruledef
+   "pg_get_publication_tables" pg-get-publication-tables
+   "pg_tablespace_location" pg-tablespace-location
+   "pg_relation_is_publishable"   pg-relation-is-publishable
+   "pg_get_replica_identity_index" pg-get-replica-identity-index
+   "pg_get_replica_identity"       pg-get-replica-identity
    "format_type"          pg-format-type
    "pg_get_expr"          pg-get-expr})

@@ -317,3 +317,222 @@
                      ") t WHERE t.schemaname = 'public'"))]
       (is (nil? (:err r)))
       (is (= 1 (count (:rows r)))))))
+
+;; ============================================================================
+;; pg_catalog function stubs — psql `\d` family probes
+;;
+;; psql's meta-commands (\df \da \dF \l \d+ \sf …) gate their list
+;; queries on pg_*_is_visible predicates and project pg_get_*_arguments
+;; / pg_table_size / pg_size_pretty / pg_encoding_to_char. Without the
+;; stubs the parser succeeds but execution raises "Unknown function";
+;; with them, psql renders an empty/zero-valued row instead of an
+;; error. These cover the wire-level shapes psql actually emits.
+;; ============================================================================
+
+(deftest test-pg-is-visible-stubs-return-true
+  (doseq [fn-name ["pg_table_is_visible" "pg_function_is_visible"
+                   "pg_type_is_visible" "pg_namespace_is_visible"
+                   "pg_ts_config_is_visible" "pg_operator_is_visible"
+                   "pg_conversion_is_visible"]]
+    (testing fn-name
+      (let [r (ex (str "SELECT " fn-name "(0)"))]
+        (is (nil? (:err r)) (str fn-name " errored: " (:err r)))
+        (is (= "t" (first (first (:rows r)))))))))
+
+(deftest test-pg-get-function-stubs-return-empty-string
+  (doseq [fn-name ["pg_get_function_arguments" "pg_get_function_result"
+                   "pg_get_functiondef" "pg_get_function_identity_arguments"]]
+    (testing fn-name
+      (let [r (ex (str "SELECT " fn-name "(0)"))]
+        (is (nil? (:err r)))
+        (is (= "" (first (first (:rows r)))))))))
+
+(deftest test-pg-table-size-stub-returns-zero
+  (let [r (ex "SELECT pg_table_size(0)")]
+    (is (nil? (:err r)))
+    (is (= "0" (first (first (:rows r)))))))
+
+(deftest test-pg-size-pretty-formatting
+  (testing "byte-count formatter matches dbsize.c boundaries"
+    (doseq [[bytes expected] [[0       "0 bytes"]
+                              [1023    "1023 bytes"]
+                              [10239   "10239 bytes"]
+                              [10240   "10 kB"]
+                              [1048576 "1024 kB"]
+                              [10485760 "10 MB"]
+                              [10737418240 "10 GB"]]]
+      (let [r (ex (str "SELECT pg_size_pretty(" bytes ")"))]
+        (is (nil? (:err r)))
+        (is (= expected (first (first (:rows r))))
+            (str bytes " bytes → " expected))))))
+
+(deftest test-pg-encoding-to-char-returns-utf8
+  (let [r (ex "SELECT pg_encoding_to_char(6)")]
+    (is (nil? (:err r)))
+    (is (= "UTF8" (first (first (:rows r)))))))
+
+(deftest test-psql-df-shape
+  ;; Canonical \df SQL — pg_function_is_visible + pg_get_function_*.
+  ;; Validates the whole pipeline, not just individual stubs.
+  (testing "psql \\df SQL parses and executes against an empty pg_proc"
+    (let [r (ex (str "SELECT n.nspname, p.proname,"
+                     " pg_catalog.pg_get_function_result(p.oid),"
+                     " pg_catalog.pg_get_function_arguments(p.oid)"
+                     " FROM pg_catalog.pg_proc p"
+                     " LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace"
+                     " WHERE pg_catalog.pg_function_is_visible(p.oid)"
+                     "   AND n.nspname <> 'pg_catalog'"
+                     "   AND n.nspname <> 'information_schema'"
+                     " ORDER BY 1, 2"))]
+      (is (nil? (:err r)) (str "expected clean parse+execute, got: " (:err r))))))
+
+(deftest test-psql-d-plus-shape
+  ;; Canonical \d+ SQL — adds pg_size_pretty(pg_table_size(c.oid))
+  ;; on top of \dt's pg_class scan.
+  (testing "psql \\d+ SQL parses and renders Size column"
+    (let [r (ex (str "SELECT n.nspname, c.relname,"
+                     " pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) AS size"
+                     " FROM pg_catalog.pg_class c"
+                     " LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                     " WHERE c.relkind IN ('r','p','v','m','S','f','')"
+                     "   AND pg_catalog.pg_table_is_visible(c.oid)"))]
+      (is (nil? (:err r)) (str "got: " (:err r)))
+      ;; Every relation reports "0 bytes" — we don't track on-disk size.
+      (is (every? (fn [row] (= "0 bytes" (nth row 2)))
+                  (:rows r))))))
+
+;; ============================================================================
+;; OPERATOR(qual.op) and COLLATE qual.X stripping — psql `\d <table>`.
+;;
+;; psql emits `relname OPERATOR(pg_catalog.~) '^x$' COLLATE pg_catalog.default`
+;; for every "describe one thing by name" command. JSqlParser doesn't
+;; accept either construct; we strip them in preprocess-sql so the
+;; parser sees `relname ~ '^x$'`.
+;; ============================================================================
+
+(deftest test-operator-qualifier-strip
+  (testing "OPERATOR(pg_catalog.~) strips to ~"
+    (let [r (ex (str "SELECT relname FROM pg_class "
+                     "WHERE relname OPERATOR(pg_catalog.~) '^person$'"))]
+      (is (nil? (:err r)) (str "got: " (:err r)))
+      (is (= ["person"] (mapv first (:rows r))))))
+  (testing "Multiple operators in one query"
+    (let [r (ex (str "SELECT relname FROM pg_class "
+                     "WHERE relname OPERATOR(pg_catalog.~) '^.*$' "
+                     "  AND relkind OPERATOR(pg_catalog.=) 'r'"))]
+      (is (nil? (:err r))))))
+
+(deftest test-collate-qualifier-strip
+  (testing "COLLATE pg_catalog.default is stripped"
+    (let [r (ex "SELECT relname FROM pg_class WHERE relname = 'person' COLLATE pg_catalog.default")]
+      (is (nil? (:err r)) (str "got: " (:err r)))))
+  (testing "COLLATE \"C\" (bare quoted) also stripped"
+    (let [r (ex "SELECT relname FROM pg_class WHERE relname = 'person' COLLATE \"C\"")]
+      (is (nil? (:err r))))))
+
+;; ============================================================================
+;; PG-style typinput: implicit coercion of unknown-string literals
+;;
+;; Mirrors src/backend/parser/parse_coerce.c:233 — when an unknown
+;; (single-quoted) literal lands as the operand of an operator whose
+;; other side has a determined type, PG runs the type's typinput. We
+;; do the same at translate time when one operand resolves to a
+;; Datahike-typed schema attribute. Drives `WHERE c.oid = '16384'`
+;; from psql's `\d <table>` family.
+;; ============================================================================
+
+(deftest test-string-literal-coerced-to-long-on-equality
+  (testing "oid = '<digits>' parses to long and matches"
+    (let [pg-class-rows (rows "SELECT oid FROM pg_class WHERE relname = 'person'")
+          oid (first (first pg-class-rows))]
+      (is (= [[oid]]
+             (rows (str "SELECT oid FROM pg_class WHERE oid = '" oid "'")))))))
+
+(deftest test-string-literal-coerced-in-in-clause
+  (testing "oid IN ('a','b','c') — each unknown literal coerced"
+    (let [oids (set (map first
+                         (rows "SELECT oid FROM pg_class WHERE relname IN ('person','pg_class')")))]
+      ;; The IN-list literals are digit strings; the typinput should
+      ;; long-coerce them and match.
+      (let [oid-list (str/join "," (map #(str "'" % "'") oids))
+            r (ex (str "SELECT oid FROM pg_class WHERE oid IN (" oid-list ")"))]
+        (is (nil? (:err r)))
+        (is (= oids (set (map first (:rows r)))))))))
+
+(deftest test-string-literal-coerced-in-between
+  (testing "oid BETWEEN '<lo>' AND '<hi>' — both bounds typinput-coerced"
+    (let [;; Fetch the actual pg_class oids and bracket them.
+          oids (mapv (comp #(Long/parseLong %) first)
+                     (rows "SELECT oid FROM pg_class"))
+          lo (str (apply min oids))
+          hi (str (apply max oids))
+          r (ex (str "SELECT relname FROM pg_class "
+                     "WHERE oid BETWEEN '" lo "' AND '" hi "'"))]
+      (is (nil? (:err r)))
+      (is (= (count oids) (count (:rows r)))
+          "BETWEEN with quoted bounds should match every row in [min..max]"))))
+
+(deftest test-text-column-comparison-uncoerced
+  (testing "text-typed column = 'literal' stays as string equality (no coercion)"
+    (let [r (ex "SELECT relname FROM pg_class WHERE relname = 'person'")]
+      (is (nil? (:err r)))
+      (is (= [["person"]] (:rows r))))))
+
+;; ============================================================================
+;; BooleanValue + ParenthesedSelect in WHERE
+;;
+;; psql `\dC` (list casts) emits `WHERE ((true AND fn1) OR (true AND fn2))`.
+;; psql `\dT` emits `WHERE (typrelid=0 OR (SELECT relkind='c' FROM ...))`.
+;; ============================================================================
+
+(deftest test-where-boolean-true-no-constraint
+  (testing "WHERE true matches all rows"
+    (let [r (ex "SELECT relname FROM pg_class WHERE true")]
+      (is (nil? (:err r)))
+      (is (pos? (count (:rows r)))))))
+
+(deftest test-where-boolean-false-zero-rows
+  (testing "WHERE false matches no rows"
+    (let [r (ex "SELECT relname FROM pg_class WHERE false")]
+      (is (nil? (:err r)))
+      (is (= 0 (count (:rows r)))))))
+
+(deftest test-where-true-and-fn-collapses-to-fn
+  (testing "(true AND <fn>) OR (true AND <fn>) — psql \\dC shape"
+    (let [r (ex (str "SELECT 1 FROM pg_class WHERE "
+                     "((true AND pg_table_is_visible(oid)) "
+                     " OR (true AND pg_table_is_visible(oid)))"))]
+      (is (nil? (:err r))))))
+
+(deftest test-where-scalar-subquery-treated-as-bool
+  (testing "WHERE (SELECT relkind = 'r' FROM pg_class WHERE oid = ...) — \\dT shape"
+    ;; The inner subquery is correlated — falls back to constant-false
+    ;; (no rows match) which is semantically correct since the catalog
+    ;; tables involved are empty in our impl. The query parses and
+    ;; executes without error; that's the assertion.
+    (let [r (ex (str "SELECT relname FROM pg_class WHERE "
+                     "(SELECT c.relkind = 'r' FROM pg_class c WHERE c.oid = pg_class.oid)"))]
+      (is (nil? (:err r)) (str "got: " (:err r))))))
+
+;; ============================================================================
+;; Scalar subquery in projection + ARRAY(SELECT) constructor.
+;; psql `\d <table>` and `\dD` rely on these.
+;; ============================================================================
+
+(deftest test-scalar-subquery-in-projection
+  (testing "Correlated scalar subquery against a non-existent attribute → NULL"
+    ;; psql \d <table> projects:
+    ;;   (SELECT pg_get_expr(d.adbin, d.adrelid, true) FROM pg_attrdef d
+    ;;    WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef)
+    ;; We don't model pg_attrdef so the inner produces no rows for any
+    ;; outer row → NULL. The translator pre-evaluates and falls back
+    ;; to :__null__ on correlation; the outer query parses cleanly.
+    (let [r (ex (str "SELECT relname,"
+                     " (SELECT 1 FROM pg_class c WHERE c.oid = pg_class.oid AND false) AS x"
+                     " FROM pg_class LIMIT 1"))]
+      (is (nil? (:err r))))))
+
+(deftest test-array-from-subquery
+  (testing "ARRAY(SELECT col FROM tbl) — empty result → empty array"
+    (let [r (ex "SELECT array(SELECT relname FROM pg_class WHERE relname = '__no_such__')")]
+      (is (nil? (:err r))))))

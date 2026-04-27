@@ -45,6 +45,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -91,30 +92,42 @@
 
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
-   ops can index into it uniformly. Inputs come from three places:
+   ops can index into it uniformly. Inputs come from four places:
 
      - an ArrayConstructor literal that already produced a pg-arr;
-     - a catalog column (e.g. pg_constraint.conkey) stored as the PG
-       array text form `\"{1,2,3}\"`;
+     - a native PG array column stored as canonical PG text
+       (`\"{1,2,3}\"`), reconstructed via `from-pg-text`;
+     - a catalog column (e.g. pg_constraint.conkey) stored the same
+       way (no schema-side `:pg/array-elem`);
      - a Clojure collection from a function call.
+
+   Two-arity form `(coerce-pg-array v elem-type)` is preferred when
+   the call site knows the element keyword from schema metadata
+   (translate-time capture from `:pg/array-elem`). The single-arity
+   form auto-detects: tries `:int8` first (catches int catalogs and
+   any int-typed user array), then `:float8`, then falls back to
+   `:text` (which always succeeds because tokens parse as raw strings).
 
    Returns a `pg-arr/array` or nil if the value isn't array-shaped.
    Best-effort: a parse failure means the value wasn't an array, so
-   the calling op can return false / true per ANY/ALL semantics.
+   the calling op can return false / true per ANY/ALL semantics."
+  ([v] (coerce-pg-array v nil))
+  ([v elem-type]
+   (cond
+     (pg-arr/array? v)
+     v
 
-   We default the element-type to `:int8` for catalog-text arrays —
-   pg_constraint.conkey is the only catalog column that flows through
-   this path, and its element type matches attnums (which we encode
-   as int8). Datahike doesn't preserve a type tag on the stored
-   string, so guessing wider than int2 keeps `(member? arr c)` from
-   failing on long-vs-short equality."
-  [v]
-  (cond
-    (pg-arr/array? v)   v
-    (string? v)         (try (pg-arr/from-pg-text v :int8)
-                             (catch Throwable _ nil))
-    (sequential? v)     (pg-arr/array :unknown (vec v))
-    :else               nil))
+     (and (string? v) (clojure.string/starts-with? (clojure.string/triml v) "{"))
+     (let [trial (fn [t] (try (pg-arr/from-pg-text v t) (catch Throwable _ nil)))]
+       (or (when elem-type (trial elem-type))
+           (trial :int8)
+           (trial :float8)
+           (trial :text)))
+
+     (sequential? v)
+     (pg-arr/array (or elem-type :unknown) (vec v))
+
+     :else nil)))
 
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
@@ -385,14 +398,17 @@
         result-var)
 
       ;; --- Array meta functions -----------------------------------------
-      ;; array_length(arr, dim) — NULL for empty, count otherwise.
-      ;; PG supports multi-dim; we only honour dim=1.
+      ;; array_length(arr, dim) — NULL for empty or out-of-range dim,
+      ;; per-dim count otherwise. Note PG returns NULL for length-0
+      ;; even when dim is in range, so we check positivity.
+      ;; `coerce-pg-array` reconstructs the PgArray when arr is a
+      ;; stored canonical-text string from a native array column.
       (= fname "array_length")
       (let [fn-param (symbol (str "?arr-len" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (= 1 (long dim))
-                               (pos? (pg-arr/length arr)))
-                        (pg-arr/length arr)
+                      (if-let [a (coerce-pg-array arr)]
+                        (let [n (pg-arr/length-d a (long dim))]
+                          (if (and n (pos? (long n))) n :__null__))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -403,9 +419,11 @@
       (= fname "array_upper")
       (let [fn-param (symbol (str "?arr-upper" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (= 1 (long dim))
-                               (pos? (pg-arr/length arr)))
-                        (pg-arr/length arr)
+                      (if-let [a (coerce-pg-array arr)]
+                        (let [n (pg-arr/length-d a (long dim))]
+                          (if (and n (pos? (long n)))
+                            (pg-arr/ubound a (long dim))
+                            :__null__))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -416,9 +434,11 @@
       (= fname "array_lower")
       (let [fn-param (symbol (str "?arr-lower" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr dim]
-                      (if (and (pg-arr/array? arr) (= 1 (long dim))
-                               (pos? (pg-arr/length arr)))
-                        (:lbound arr)
+                      (if-let [a (coerce-pg-array arr)]
+                        (if (and (pos? (pg-arr/length a))
+                                 (<= (long dim) (pg-arr/ndim a)))
+                          (pg-arr/lbound a (long dim))
+                          :__null__)
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -426,11 +446,15 @@
                [(list fn-param (first args) (or (second args) 1)) result-var])
         result-var)
 
-      ;; cardinality(arr) — 0 for empty (differs from array_length NULL)
+      ;; cardinality(arr) — total leaf count across all dimensions
+      ;; (PG: differs from array_length, which is per-dim and NULL for
+      ;; empty). 0 for empty array; sum across all dims for multi-dim.
       (= fname "cardinality")
       (let [fn-param (symbol (str "?card" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr]
-                      (if (pg-arr/array? arr) (pg-arr/length arr) 0))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (count (pg-arr/flat-elements a))
+                        0))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -438,16 +462,21 @@
         result-var)
 
       ;; array_to_string(arr, sep [, null_replace])
+      ;; array_to_string(arr, sep [, null_str]) — flattens ALL
+      ;; dimensions to leaves and joins with sep. PG: per-leaf
+      ;; iteration via ArrayGetNItems regardless of ndim
+      ;; (varlena.c:3888). NULL elements are silently skipped when
+      ;; null_str is absent; rendered as null_str when provided.
       (= fname "array_to_string")
       (let [fn-param (symbol (str "?arr-to-str" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr sep & [null-replace]]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (let [elts (:elements arr)
+                      (if-let [a (coerce-pg-array arr)]
+                        (let [leaves (pg-arr/flat-elements a)
                               mapped (if null-replace
-                                       (mapv #(if (nil? %) (str null-replace) (str %)) elts)
-                                       (keep (fn [e] (when (some? e) (str e))) elts))]
-                          (str/join (str sep) mapped))))]
+                                       (mapv #(if (nil? %) (str null-replace) (str %)) leaves)
+                                       (keep (fn [e] (when (some? e) (str e))) leaves))]
+                          (str/join (str sep) mapped))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -455,11 +484,23 @@
         result-var)
 
       ;; --- Array operator-style functions -------------------------------
+      ;; array_append(arr, x) — PG rejects multi-dim
+      ;; (`array_userfuncs.c:172-174`); only 1-D supported. NULL arr →
+      ;; NULL; NULL x → appended as a NULL leaf. Empty arr starts
+      ;; index at 1 (we keep lbound=1 for the result).
       (= fname "array_append")
       (let [fn-param (symbol (str "?arr-app" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr v]
-                      (if (pg-arr/array? arr)
-                        (pg-arr/array (:elem-type arr) (conj (:elements arr) v))
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_append: argument must be empty or one-dimensional array"
+                                            {:sqlstate "2202E"
+                                             :ndim (pg-arr/ndim a)})))
+                          (pg-arr/array (:elem-type a)
+                                        (conj (:elements a) v)
+                                        nil
+                                        (:lbounds a)))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -467,11 +508,23 @@
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_prepend(x, arr) — PG rejects multi-dim
+      ;; (`array_userfuncs.c:257-259`). 1-D only. PG inserts at
+      ;; lbound-1 then restores lbound (line 268-274), so the result
+      ;; lbound is unchanged from the input.
       (= fname "array_prepend")
       (let [fn-param (symbol (str "?arr-prep" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [v arr]
-                      (if (pg-arr/array? arr)
-                        (pg-arr/array (:elem-type arr) (into [v] (:elements arr)))
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_prepend: argument must be empty or one-dimensional array"
+                                            {:sqlstate "2202E"
+                                             :ndim (pg-arr/ndim a)})))
+                          (pg-arr/array (:elem-type a)
+                                        (into [v] (:elements a))
+                                        nil
+                                        (:lbounds a)))
                         :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
@@ -479,54 +532,84 @@
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_cat(a, b) and `||` — PG handles 3 cases via
+      ;; cat-rejecting-mismatch in arrays.clj (line 316-548 of
+      ;; array_userfuncs.c). NULL handling: a||NULL=a, NULL||b=b
+      ;; (line 348-359). Both NULL → NULL.
       (= fname "array_cat")
       (let [fn-param (symbol (str "?arr-cat" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [a b]
-                      (cond
-                        (and (pg-arr/array? a) (pg-arr/array? b)) (pg-arr/concat-arrs a b)
-                        (pg-arr/array? a) a
-                        (pg-arr/array? b) b
-                        :else :__null__))]
+                      (let [pa (coerce-pg-array a)
+                            pb (coerce-pg-array b)]
+                        (cond
+                          (and pa pb) (pg-arr/concat-arrs pa pb)
+                          pa pa
+                          pb pb
+                          :else :__null__)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_position(arr, v [, start]) — PG rejects multi-dim
+      ;; (`array_userfuncs.c:1345`). Returns position relative to
+      ;; lbound. NULL arr → NULL; not-found → NULL; matches IS NOT
+      ;; DISTINCT FROM (so NULL element matches NULL search target).
       (= fname "array_position")
       (let [fn-param (symbol (str "?arr-pos" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [arr v]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (let [idx (first (keep-indexed (fn [i e] (when (= e v) (inc i)))
-                                                       (:elements arr)))]
-                          (or idx :__null__))))]
+            impl-fn (fn [arr v & [start]]
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_position: searching for elements in multidimensional arrays is not supported"
+                                            {:sqlstate "0A000"
+                                             :ndim (pg-arr/ndim a)})))
+                          (let [lb (pg-arr/lbound a 1)
+                                start-off (max 0 (- (long (or start lb)) (long lb)))
+                                elts (subvec (:elements a) start-off)
+                                idx (first (keep-indexed
+                                            (fn [i e] (when (= e v) (+ i start-off (long lb))))
+                                            elts))]
+                            (or idx :__null__)))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
-               [(list fn-param (first args) (second args)) result-var])
+               [(apply list fn-param (first args) (second args) (drop 2 args)) result-var])
         result-var)
 
+      ;; array_remove(arr, v) — PG rejects multi-dim
+      ;; (`arrayfuncs.c:6423-6426`). 1-D only. Removes ALL elements
+      ;; matching v (IS NOT DISTINCT FROM). Result lbound preserved.
       (= fname "array_remove")
       (let [fn-param (symbol (str "?arr-rem" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr v]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (pg-arr/array (:elem-type arr)
-                                      (vec (remove #(= % v) (:elements arr))))))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (do
+                          (when (pg-arr/multidim? a)
+                            (throw (ex-info "array_remove: removing elements from multidimensional arrays is not supported"
+                                            {:sqlstate "0A000"
+                                             :ndim (pg-arr/ndim a)})))
+                          (pg-arr/array (:elem-type a)
+                                        (vec (remove #(= % v) (:elements a)))
+                                        nil
+                                        (:lbounds a)))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
                [(list fn-param (first args) (second args)) result-var])
         result-var)
 
+      ;; array_replace(arr, from, to) — replaces ALL leaf occurrences
+      ;; regardless of dim (`arrayfuncs.c:6662`). Shape preserved.
       (= fname "array_replace")
       (let [fn-param (symbol (str "?arr-rep" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [arr from to]
-                      (if-not (pg-arr/array? arr)
-                        :__null__
-                        (pg-arr/array (:elem-type arr)
-                                      (mapv #(if (= % from) to %) (:elements arr)))))]
+                      (if-let [a (coerce-pg-array arr)]
+                        (pg-arr/replace-leaves a #(if (= % from) to %))
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -1391,8 +1474,8 @@
       (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
       ;; Constant value — cast at translation time
         (cond
-          is-int?  (Long/parseLong (str inner-raw))
-          is-float? (Double/parseDouble (str inner-raw))
+          is-int?  (coerce/coerce-numeric inner-raw :long)
+          is-float? (coerce/coerce-numeric inner-raw :double)
           is-text? (str inner-raw)
           is-bool? (Boolean/parseBoolean (str inner-raw))
         ;; ::date — extract the LocalDate so serialization can omit the
@@ -1595,10 +1678,52 @@
     (instance? Column expr)
     (let [^Column col-expr expr
           tbl (.getTable col-expr)
-          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))]
-      (if (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
+          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
+          ;; JSqlParser parses `xs[2]` as a Column with a side-channel
+          ;; `ArrayConstructor` carrying the indices: `(.getColumnName)`
+          ;; returns the bare name `xs`; `(.getArrayConstructor)` is the
+          ;; `[2]` part. For deeper chains like `xs[2][3]`, JSqlParser
+          ;; emits `ArrayExpression(Column[xs[2]], 3)` — handled by the
+          ;; ArrayExpression branch above. We only need to recognise
+          ;; the single-bracket Column-with-ArrayConstructor case here
+          ;; so users can write `WHERE xs[2] = 20` or `SELECT xs[2]`.
+          ac (.getArrayConstructor col-expr)]
+      (cond
+        (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
         ;; Bound by UPDATE ... FROM (VALUES ...) AS alias(cols)
         (get-in params/*from-bindings* [tbl-name (unquote-ident (.getColumnName col-expr))])
+
+        (some? ac)
+        ;; Walk the bracket-expressions left-to-right, applying
+        ;; pg-arr/subscript once per `[expr]`. Each step routes the
+        ;; input through coerce-pg-array so a stored canonical-text
+        ;; array column is reconstructed transparently.
+        (let [bare-col (let [c (Column.)]
+                         (.setColumnName c (.getColumnName col-expr))
+                         (when tbl (.setTable c ^Table tbl))
+                         c)
+              base-var (translate-expr ctx bare-col)
+              base-var (if (seq? base-var) (ctx/materialize-arg! ctx base-var) base-var)
+              idx-exprs (.getExpressions ^ArrayConstructor ac)]
+          (reduce (fn [container idx-expr]
+                    (let [idx-val   (translate-expr ctx idx-expr)
+                          idx-val   (if (seq? idx-val) (ctx/materialize-arg! ctx idx-val) idx-val)
+                          fn-param  (symbol (str "?col-sub" (swap! (:var-counter ctx) inc)))
+                          sub-fn    (fn [arr i]
+                                      (if-let [a (coerce-pg-array arr)]
+                                        (let [v (pg-arr/subscript a i)]
+                                          (if (nil? v) :__null__ v))
+                                        :__null__))
+                          result-var (ctx/fresh-var! ctx)]
+                      (swap! (:in-params ctx) conj fn-param)
+                      (swap! (:in-args ctx) conj sub-fn)
+                      (swap! (:where-clauses ctx) conj
+                             [(list fn-param container idx-val) result-var])
+                      result-var))
+                  base-var
+                  idx-exprs))
+
+        :else
         (let [resolved (ctx/resolve-column expr
                                            (:table-aliases ctx)
                                            (:default-table ctx)
@@ -1632,15 +1757,33 @@
     ;; jsonb_build_array branch below.
     (instance? ArrayConstructor expr)
     (let [exprs (.getExpressions ^ArrayConstructor expr)
-          elem-type (let [first-typed
-                          (some (fn [e]
-                                  (cond
-                                    (instance? LongValue e)    :int8
-                                    (instance? DoubleValue e)  :float8
-                                    (instance? StringValue e)  :text
-                                    (instance? BooleanValue e) :bool))
-                                exprs)]
-                      (or first-typed :text))
+          ;; Detect the leaf element type by walking through nested
+          ;; ArrayConstructors. Without this, `ARRAY[ARRAY[1,2],
+          ;; ARRAY[3,4]]` gets an outer `:elem-type :text` (no
+          ;; LongValue at the top level) — wrong for OID inference
+          ;; and for any operator that reads `:elem-type` directly.
+          ;; Falls back to :text when no typed literal is found
+          ;; (matches PG's empty-array-untyped behaviour).
+          detect-elem (fn detect-elem [es]
+                        (or (some (fn [e]
+                                    (cond
+                                      (instance? LongValue e)        :int8
+                                      (instance? DoubleValue e)      :float8
+                                      (instance? StringValue e)      :text
+                                      (instance? BooleanValue e)     :bool
+                                      (instance? ArrayConstructor e)
+                                      (detect-elem (.getExpressions ^ArrayConstructor e))
+                                      (instance? CastExpression e)
+                                      (let [t (-> (str (.getColDataType ^CastExpression e))
+                                                  clojure.string/lower-case
+                                                  clojure.string/trim
+                                                  ;; strip (p,s) typmod
+                                                  (clojure.string/replace #"\s*\([^)]*\)" ""))]
+                                        (get types/sql-name->elem-kw t))
+                                      :else nil))
+                                  es)
+                            :text))
+          elem-type (detect-elem exprs)
           args (mapv #(translate-expr ctx %) exprs)
           arg-vars (mapv #(if (seq? %) (ctx/materialize-arg! ctx %) %) args)
           fn-param (symbol (str "?pg-arr-ctor" (swap! (:var-counter ctx) inc)))
@@ -1708,8 +1851,8 @@
               hi (if (seq? hi) (ctx/materialize-arg! ctx hi) hi)
               fn-param (symbol (str "?pg-arr-slice" (swap! (:var-counter ctx) inc)))
               slice-fn (fn [arr lo hi]
-                         (if (pg-arr/array? arr)
-                           (pg-arr/slice arr lo hi)
+                         (if-let [a (coerce-pg-array arr)]
+                           (pg-arr/slice a lo hi)
                            :__null__))]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj slice-fn)
@@ -1725,8 +1868,8 @@
               idx (if (seq? idx) (ctx/materialize-arg! ctx idx) idx)
               fn-param (symbol (str "?pg-arr-sub" (swap! (:var-counter ctx) inc)))
               sub-fn (fn [arr i]
-                       (if (pg-arr/array? arr)
-                         (let [v (pg-arr/subscript arr i)]
+                       (if-let [a (coerce-pg-array arr)]
+                         (let [v (pg-arr/subscript a i)]
                            (if (nil? v) :__null__ v))
                          :__null__))]
           (swap! (:in-params ctx) conj fn-param)
@@ -1867,12 +2010,58 @@
     ;; Functions — aggregate or scalar
     (instance? Function expr)
     (let [^Function f expr
-          fname (str/lower-case (.getName f))]
-      (if (fns/aggregate-function? fname)
+          fname (str/lower-case (.getName f))
+          params (when-let [pl (.getParameters f)]
+                   (.getExpressions ^ExpressionList pl))]
+      (cond
+        ;; ARRAY(SELECT col FROM …) — PG's "construct array from
+        ;; subquery". JSqlParser parses it as Function name="array"
+        ;; with the inner SELECT as the sole argument. Pre-evaluate
+        ;; the inner SELECT (catalog-enriched db is in scope) and
+        ;; wrap all returned rows in a PgArray. Single-column inner
+        ;; → flat 1-D array (matches PG); multi-column inner is rare
+        ;; in PG idiom and would need a row-typed array, so we take
+        ;; the first column only and document it.
+        ;;
+        ;; psql's `\d <table>` uses this:
+        ;;   array_to_string(array(SELECT rolname FROM pg_roles
+        ;;                          WHERE oid = ANY(pol.polroles)), ',')
+        ;; Correlated against the outer pol row. With our virtual
+        ;; pg_policy empty, the outer never iterates and the array()
+        ;; never executes — but we still need a valid translation.
+        (and (= fname "array")
+             (= 1 (count params))
+             (or (instance? PlainSelect (first params))
+                 (instance? ParenthesedSelect (first params))))
+        (let [arg (first params)
+              inner (if (instance? ParenthesedSelect arg)
+                      (.getSelect ^ParenthesedSelect arg)
+                      arg)
+              db (:db ctx)]
+          (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
+            (try
+              (let [parse-fn (:parse-sql ctx)
+                    parsed   (parse-fn (str inner) (:schema ctx) db)
+                    q        (:query parsed)
+                    in-args  (:in-args parsed)
+                    query-db (or (:enriched-db parsed) db)
+                    q-fn     (requiring-resolve 'datahike.api/q)
+                    results  (if (seq in-args)
+                               (apply q-fn q query-db in-args)
+                               (q-fn q query-db))
+                    flat     (vec (map (fn [row]
+                                         (if (sequential? row) (first row) row))
+                                       results))]
+                (pg-arr/array :text flat))
+              (catch Throwable _ (pg-arr/array :text [])))
+            (pg-arr/array :text [])))
+
+        (fns/aggregate-function? fname)
         ;; handled at select-item level — return marker
         {:aggregate true :fn fname :params (.getParameters f)}
+
         ;; Non-aggregate function → Datalog function binding
-        (translate-function-call ctx f)))
+        :else (translate-function-call ctx f)))
 
     ;; CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME
     (instance? TimeKeyExpression expr)
@@ -1945,6 +2134,51 @@
         (instance? Between expr)
         (instance? InExpression expr))
     (translate-predicate-expr ctx expr)
+
+    ;; Scalar subquery in projection / expression position — `(SELECT
+    ;; col FROM t WHERE …)`. PG semantics: returns one value per outer
+    ;; row, NULL if the inner produces no rows.
+    ;;
+    ;; psql's `\d <table>` projects two such subqueries:
+    ;;   (SELECT pg_get_expr(d.adbin, d.adrelid, true) FROM pg_attrdef d
+    ;;    WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef)
+    ;;   (SELECT c.collname FROM pg_collation c, pg_type t WHERE …)
+    ;; Both reference catalog tables that are empty in our virtual
+    ;; catalog (we don't track column defaults or collations as rows),
+    ;; so the inner produces no rows for any outer row → NULL.
+    ;;
+    ;; Strategy: attempt to evaluate the inner SELECT once at
+    ;; translate time against the (catalog-enriched) db. Three cases:
+    ;;   1. Non-correlated, returns rows → use first row's first col.
+    ;;   2. Non-correlated, returns 0 rows → :__null__.
+    ;;   3. Correlated (references outer aliases the inner translator
+    ;;      can't resolve) → translate-select throws → :__null__.
+    ;; Case 3 is a planned conservative fallback: we don't yet have a
+    ;; per-row scalar-subquery executor, but the catalog tables that
+    ;; drive correlated psql probes (pg_attrdef, pg_collation) are
+    ;; empty in our impl, so the correct PG result IS NULL.
+    (or (instance? ParenthesedSelect expr) (instance? PlainSelect expr))
+    (let [inner (if (instance? ParenthesedSelect expr)
+                  (.getSelect ^ParenthesedSelect expr)
+                  expr)
+          db    (:db ctx)]
+      (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
+        (try
+          (let [parse-fn   (:parse-sql ctx)
+                inner-sql  (str inner)
+                parsed     (parse-fn inner-sql (:schema ctx) db)
+                q          (:query parsed)
+                in-args    (:in-args parsed)
+                query-db   (or (:enriched-db parsed) db)
+                q-fn       (requiring-resolve 'datahike.api/q)
+                results    (if (seq in-args)
+                             (apply q-fn q query-db in-args)
+                             (q-fn q query-db))
+                first-row  (first results)
+                v          (if (sequential? first-row) (first first-row) first-row)]
+            (if (some? v) v :__null__))
+          (catch Throwable _ :__null__))
+        :__null__))
 
     :else
     (throw (ex-info (str "Unsupported SQL expression: " (type expr) " — " (str expr))
@@ -2019,6 +2253,54 @@
                [(list fn-param col' arr') result-var])
         [[(list 'identity result-var)]]))))
 
+(defn- column-vtype
+  "Return the Datahike `:db/valueType` of the schema attribute that
+   `col` resolves to in the current ctx; nil when resolution fails or
+   the attr isn't in the schema. Used for PG-style typinput dispatch
+   on unknown-string operands of comparisons / IN / BETWEEN."
+  [ctx ^Column col]
+  (when-let [resolved (try (ctx/resolve-column col
+                                               (:table-aliases ctx)
+                                               (:default-table ctx)
+                                               (:col-overrides ctx)
+                                               (:derived-aliases ctx))
+                           (catch Throwable _ nil))]
+    (let [attr (cond (keyword? resolved) resolved
+                     (and (vector? resolved) (= 3 (count resolved))) (nth resolved 2)
+                     :else nil)]
+      (when attr (get-in (:schema ctx) [attr :db/valueType])))))
+
+(defn- coerce-unknown-literal
+  "If `lit` is a `StringValue` and `col` resolves to a Datahike-typed
+   schema attribute, return the typinput-coerced value (long, double,
+   bigdec, bool, uuid, instant) per PG's unknown-literal resolution.
+   Otherwise return nil so the caller falls through to translate-expr.
+
+   Mirrors `parse_coerce.c:coerce_type` line 233 — when an `unknown`
+   literal lands as the operand of an operator whose other side has a
+   determined type, PG calls that type's typinput function to produce
+   a typed Const. Without this, `WHERE c.oid = '16384'` compares long
+   to string and matches nothing — real PG resolves the literal via
+   `oidin('16384')`."
+  [ctx ^Column col lit]
+  (when (and (instance? StringValue lit)
+             (instance? Column col))
+    (when-let [vt (column-vtype ctx col)]
+      (let [s (.getNotExcapedValue ^StringValue lit)
+            v (coerce/coerce-unknown s vt parse-timestamp-string)]
+        (when (not (identical? v s))   ; only signal coercion when it produced a typed value
+          v)))))
+
+(defn- coerce-comparison-operands
+  "Apply PG-style unknown-literal coercion to a `[left right]` pair of
+   AST nodes for a binary comparison. Returns `[left' right']` where
+   each side is either the original AST node or a pre-resolved
+   typed Clojure value (Long/Double/Boolean/UUID/Date/...). The
+   caller's translate-expr branch handles both."
+  [ctx left right]
+  [(or (coerce-unknown-literal ctx right left) left)
+   (or (coerce-unknown-literal ctx left right) right)])
+
 (defn translate-comparison
   "Translate a binary comparison to Datalog predicate clauses.
 
@@ -2037,7 +2319,11 @@
 
    Special-cased: `col <op> ANY/ALL(arr)` on the RHS dispatches through
    `translate-quantified-cmp` so we don't try to bind an array against
-   a scalar."
+   a scalar.
+
+   Implicit text-to-int coercion: `<long-col> = '<digits>'` (and the
+   reverse) coerces the digit literal to a long. Matches PG's implicit
+   `oidin('16384')` resolution that powers psql's `\\d <table>` queries."
   [ctx op left right]
   (if (and (instance? Function right)
            (#{"any" "all"}
@@ -2047,8 +2333,13 @@
           params (.getParameters fn-expr)
           arr-expr (when params (first params))]
       (translate-quantified-cmp ctx op left arr-expr kind))
-    (let [l (translate-expr ctx left)
-          r (translate-expr ctx right)
+    (let [[left right] (coerce-comparison-operands ctx left right)
+          ;; Each side is either an AST node (translate-expr-bound) or
+          ;; a pre-resolved typed Clojure value from coerce-unknown.
+          l (if (instance? net.sf.jsqlparser.expression.Expression left)
+              (translate-expr ctx left) left)
+          r (if (instance? net.sf.jsqlparser.expression.Expression right)
+              (translate-expr ctx right) right)
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
           guards (ctx/null-guard-clauses ctx [l r])]
@@ -2068,16 +2359,74 @@
     (let [^OrExpression e expr
           left-clauses (translate-predicate ctx (.getLeftExpression e))
           right-clauses (translate-predicate ctx (.getRightExpression e))
-          ;; Collect all variables referenced by both branches for or-join
-          all-vars (into (ctx/collect-vars left-clauses) (ctx/collect-vars right-clauses))
-          shared-vars (vec (sort-by str all-vars))]
-      [(concat ['or-join shared-vars]
-               [(if (= 1 (count left-clauses))
-                  (first left-clauses)
-                  (concat ['and] left-clauses))]
-               [(if (= 1 (count right-clauses))
-                  (first right-clauses)
-                  (concat ['and] right-clauses))])])
+          ;; The canonical "always false" sentinel produced by EXISTS /
+          ;; IN-subquery handlers when the inner evaluates to no rows.
+          ;; A branch carrying this sentinel (alone or under an `and`)
+          ;; is constant-false — it cannot match any outer row.
+          ;; `(and false …)` short-circuits to false, so any AND containing
+          ;; the sentinel is also constant-false.
+          false-sentinel? (fn false-sentinel? [form]
+                            (cond
+                              (and (vector? form)
+                                   (= 1 (count form))
+                                   (= '(not= 1 1) (first form)))
+                              true
+                              (and (seq? form) (= 'and (first form)))
+                              (some false-sentinel? (rest form))
+                              :else false))
+          ;; Build the per-branch form. translate-predicate returns a
+          ;; *vector of clauses* implicitly ANDed; wrap it back into a
+          ;; single form for OR composition. Empty vector = "no
+          ;; constraint" = always-true; in OR that subsumes the other
+          ;; branch (true OR x = true), so handled in the outer cond.
+          mk-branch    (fn [cs]
+                         (cond
+                           (empty? cs)      ::always-true
+                           (= 1 (count cs)) (first cs)
+                           :else            (concat ['and] cs)))
+          all-branches (mapv mk-branch [left-clauses right-clauses])]
+      (cond
+        ;; Any branch is always-true → OR(true, x) = true → no constraint.
+        ;; Returning [] means translate-predicate's caller (the AND in
+        ;; the surrounding WHERE) just skips this clause.
+        (some #(= ::always-true %) all-branches)
+        []
+
+        ;; Drop constant-false branches. OR(false, x) = x; OR(false, false) = false.
+        :else
+        (let [live-branches (vec (remove false-sentinel? all-branches))]
+          (cond
+            ;; All branches false → OR is false. Emit one canonical
+            ;; false-sentinel as a top-level clause; the surrounding AND
+            ;; short-circuits to false, the query returns no rows.
+            (empty? live-branches)
+            [[(list 'not= 1 1)]]
+
+            ;; Single live branch → unwrap to flat clauses so the outer
+            ;; translate-predicate keeps its vec-of-clauses shape.
+            (= 1 (count live-branches))
+            (let [b (first live-branches)]
+              (cond
+                (and (seq? b) (= 'and (first b))) (vec (rest b))
+                (vector? b)                       [b]
+                :else                             [b]))
+
+            ;; Two live branches → emit OR. shared-vars =
+            ;; (branch-vars ∩ outer-bound-vars). Datomic / legacy-engine
+            ;; semantics: shared-vars are the bridge between branches and
+            ;; the outer query (limit-context projects each branch's
+            ;; result to these). Branch-locals (e.g. the ?c1 introduced
+            ;; inside a correlated EXISTS subquery) must stay out of
+            ;; shared-vars or the post-projection `limit-rel`
+            ;; mismatches across branches. Empty intersection → use
+            ;; plain `or`.
+            :else
+            (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                  outer-vars  (ctx/collect-vars @(:where-clauses ctx))
+                  shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
+              [(if (seq shared-vars)
+                 (concat ['or-join shared-vars] live-branches)
+                 (concat ['or] live-branches))])))))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
@@ -2147,8 +2496,13 @@
               (swap! (:where-clauses ctx) conj
                      [(list fn-param col arr-val) result-var])
               [[(list 'identity result-var)]])))
-        ;; Special case: column = value can be a ground filter
+        ;; Special case: column = value can be a ground filter. Skip
+        ;; the fast-path when the Column carries an ArrayConstructor
+        ;; (e.g. `xs[2]`) — that needs translate-expr's subscript
+        ;; rewrite, which the fast-path bypasses by routing straight
+        ;; through resolve-column / col-var!.
         (if (and (instance? Column left)
+                 (nil? (.getArrayConstructor ^Column left))
                  (or (instance? LongValue right)
                      (instance? DoubleValue right)
                      (instance? StringValue right)))
@@ -2157,7 +2511,12 @@
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx))
-                val (translate-expr ctx right)]
+                ;; PG-style unknown-literal coercion: `<typed-col> = '<lit>'`
+                ;; routes the literal through the column's typinput when
+                ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
+                ;; See coerce/coerce-unknown for the dispatch.
+                coerced (coerce-unknown-literal ctx left right)
+                val (or coerced (translate-expr ctx right))]
             (if (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
               (let [evar (ctx/entity-var! ctx (second resolved))]
@@ -2224,9 +2583,16 @@
     (instance? Between expr)
     (let [^Between e expr
           not-between? (.isNot e)
-          col (translate-expr ctx (.getLeftExpression e))
-          lo (translate-expr ctx (.getBetweenExpressionStart e))
-          hi (translate-expr ctx (.getBetweenExpressionEnd e))
+          left-ast (.getLeftExpression e)
+          col (translate-expr ctx left-ast)
+          ;; PG-style typinput on each bound when LHS is a typed Column
+          ;; — `oid BETWEEN '16000' AND '17000'` and similar.
+          coerce-bound (fn [bound-ast]
+                         (or (when (instance? Column left-ast)
+                               (coerce-unknown-literal ctx left-ast bound-ast))
+                             (translate-expr ctx bound-ast)))
+          lo (coerce-bound (.getBetweenExpressionStart e))
+          hi (coerce-bound (.getBetweenExpressionEnd e))
           guards (ctx/null-guard-clauses ctx [col lo hi])]
       (if not-between?
         ;; NOT BETWEEN → val < lo OR val > hi. Guard against NULL col
@@ -2484,14 +2850,23 @@
     (instance? InExpression expr)
     (let [^InExpression e expr
           not-in? (.isNot e)
-          col (translate-expr ctx (.getLeftExpression e))
+          left-ast (.getLeftExpression e)
+          col (translate-expr ctx left-ast)
           right (.getRightExpression e)
+          ;; PG-style typinput: when the LHS is a typed Column, route
+          ;; each unknown StringValue in the IN-list through the
+          ;; column's typinput. Mirrors `c.oid IN ('16384','16385')`
+          ;; from pgjdbc's getColumns probe.
+          translate-in-elem (fn [el]
+                              (or (when (instance? Column left-ast)
+                                    (coerce-unknown-literal ctx left-ast el))
+                                  (translate-expr ctx el)))
           vals (cond
                  (instance? ParenthesedExpressionList right)
-                 (mapv #(translate-expr ctx %) ^ParenthesedExpressionList right)
+                 (mapv translate-in-elem ^ParenthesedExpressionList right)
 
                  (instance? ExpressionList right)
-                 (mapv #(translate-expr ctx %) ^ExpressionList right)
+                 (mapv translate-in-elem ^ExpressionList right)
 
                  ;; Subquery: execute it and extract single-column values
                  (instance? ParenthesedSelect right)
@@ -3077,6 +3452,35 @@
                                        (:derived-aliases ctx))
           col-var (ctx/col-var! ctx resolved)]
       [[(list '= col-var true)]])
+
+    ;; Boolean literals — `WHERE true` adds no constraint, `WHERE false`
+    ;; emits the canonical false-sentinel so the surrounding AND
+    ;; short-circuits to no rows. psql's `\dC` (list casts) emits
+    ;; `WHERE ((true AND fn1(...)) OR (true AND fn2(...)))` with
+    ;; literal trues; this branch + the existing OrExpression false-
+    ;; sentinel handling collapse it to the live-fn predicates.
+    (instance? BooleanValue expr)
+    (if (.getValue ^BooleanValue expr)
+      []                              ; WHERE true → no constraint
+      [[(list 'not= 1 1)]])           ; WHERE false → constant-false sentinel
+
+    ;; Scalar (boolean) subquery in WHERE. psql's `\dT` emits
+    ;;   WHERE (t.typrelid = 0 OR
+    ;;          (SELECT c.relkind = 'c' FROM pg_class c WHERE c.oid = t.typrelid))
+    ;; Try to evaluate the inner SELECT once at translate time; treat
+    ;; the result as boolean. Correlated subqueries fail to translate
+    ;; against the outer-bare ctx → fall back to constant-false (no
+    ;; match) so the surrounding OR/AND short-circuits correctly. The
+    ;; catalog tables driving these psql probes are empty in our
+    ;; impl, so the correct PG result IS no match.
+    (instance? ParenthesedSelect expr)
+    (let [v (translate-expr ctx expr)]
+      (cond
+        (true? v)  []                       ; always-true → no constraint
+        (false? v) [[(list 'not= 1 1)]]     ; always-false → drop branch
+        (= :__null__ v) [[(list 'not= 1 1)]] ; NULL in bool position → false (PG 3VL)
+        :else (let [v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+                [[(list '= v true)]])))
 
     ;; Boolean-valued expressions used directly as predicates:
     ;; `WHERE <bool-fn>(...)`, `WHERE CASE WHEN ... END`, etc. PG

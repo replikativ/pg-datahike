@@ -76,6 +76,29 @@ public final class PgWireServer {
     public static final int OID_UUID        = 2950;
     public static final int OID_JSONB       = 3802;
 
+    // Array OIDs — exposed so PgParamCodec can dispatch binary
+    // encode/decode through the scalar element codec without
+    // duplicating the registry.
+    public static final int OID_BOOL_ARRAY        = 1000;
+    public static final int OID_BYTEA_ARRAY       = 1001;
+    public static final int OID_NAME_ARRAY        = 1003;
+    public static final int OID_INT2_ARRAY        = 1005;
+    public static final int OID_INT4_ARRAY        = 1007;
+    public static final int OID_TEXT_ARRAY        = 1009;
+    public static final int OID_INT8_ARRAY        = 1016;
+    public static final int OID_FLOAT4_ARRAY      = 1021;
+    public static final int OID_FLOAT8_ARRAY      = 1022;
+    public static final int OID_OID_ARRAY         = 1028;
+    public static final int OID_VARCHAR_ARRAY     = 1015;
+    public static final int OID_DATE_ARRAY        = 1182;
+    public static final int OID_TIME_ARRAY        = 1183;
+    public static final int OID_TIMESTAMP_ARRAY   = 1115;
+    public static final int OID_TIMESTAMPTZ_ARRAY = 1185;
+    public static final int OID_NUMERIC_ARRAY     = 1231;
+    public static final int OID_UUID_ARRAY        = 2951;
+    public static final int OID_JSON_ARRAY        = 199;
+    public static final int OID_JSONB_ARRAY       = 3807;
+
     /**
      * Callback interface for query execution.
      * Implementations may hold per-connection state (transaction state,
@@ -237,6 +260,15 @@ public final class PgWireServer {
          * catalog join. May be null (treated as "0 for every column").
          */
         public short[] columnAttnums;
+        /**
+         * Per-column PG-style atttypmod. Encodes {@code NUMERIC(p, s)}
+         * precision+scale (and varchar(n) length when DDL captures it).
+         * Drives pgjdbc's {@code ResultSetMetaData.getPrecision/getScale}
+         * and Metabase's column-type rendering. {@code -1} for any column
+         * means "unspecified" — that's also the default emitted when
+         * this array is null. Lengths must match {@code columnNames}.
+         */
+        public int[] columnTypmods;
         public final String error;
         /** PostgreSQL SQLSTATE code when {@link #error} is non-null. Defaults to "XX000" (internal error). */
         public String sqlstate;
@@ -311,6 +343,15 @@ public final class PgWireServer {
         public QueryResult withColumnSources(int[] tableOids, short[] attnums) {
             this.columnTableOids = tableOids;
             this.columnAttnums = attnums;
+            return this;
+        }
+
+        /**
+         * Attach per-column atttypmod values for RowDescription.
+         * See {@link #columnTypmods}.
+         */
+        public QueryResult withColumnTypmods(int[] typmods) {
+            this.columnTypmods = typmods;
             return this;
         }
     }
@@ -859,7 +900,8 @@ public final class PgWireServer {
                     sendCommandComplete(out, result.commandTag);
                 } else {
                     sendRowDescription(out, result.columnNames, result.columnOids,
-                                      result.columnTableOids, result.columnAttnums, null);
+                                      result.columnTableOids, result.columnAttnums,
+                                      result.columnTypmods, null);
                     for (String[] row : result.rows) {
                         sendDataRow(out, row);
                     }
@@ -1207,7 +1249,8 @@ public final class PgWireServer {
             trace("send NoData");
         } else {
             sendRowDescription(out, meta.columnNames, meta.columnOids,
-                              meta.columnTableOids, meta.columnAttnums, null);
+                              meta.columnTableOids, meta.columnAttnums,
+                              meta.columnTypmods, null);
             trace("send RowDescription cols=" + meta.columnNames.length);
             // Mark BOTH the portal and the underlying statement as
             // described. pgJDBC caches row metadata per-statement: once
@@ -1287,6 +1330,7 @@ public final class PgWireServer {
             if (!alreadyDescribed) {
                 sendRowDescription(out, result.columnNames, result.columnOids,
                                   result.columnTableOids, result.columnAttnums,
+                                  result.columnTypmods,
                                   portal.resultFormats);
                 trace("send RowDescription cols=" + result.columnNames.length);
             } else {
@@ -1369,6 +1413,7 @@ public final class PgWireServer {
 
     private void sendRowDescription(DataOutputStream out, String[] names, int[] oids,
                                     int[] tableOids, short[] attnums,
+                                    int[] typmods,
                                     short[] formats) throws IOException {
         int bodyLen = 2;
         byte[][] nameBytes = new byte[names.length][];
@@ -1388,7 +1433,7 @@ public final class PgWireServer {
             out.writeShort(attnums  != null && i < attnums.length  ? attnums[i]  : 0);
             out.writeInt(oids[i]);    // type OID
             out.writeShort(typeSize(oids[i]));
-            out.writeInt(-1);         // type modifier
+            out.writeInt(typmods != null && i < typmods.length ? typmods[i] : -1);  // type modifier
             out.writeShort(formatFor(formats, i));  // format (0=text, 1=binary)
         }
 

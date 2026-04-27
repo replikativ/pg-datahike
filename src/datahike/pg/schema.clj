@@ -121,37 +121,325 @@
                          hint))]
     (transact-fn conn [entity])))
 
+(defn ref-attrs-from-schema
+  "Return the seq of `:db.type/ref :db.cardinality/one` attribute idents
+   in `schema`. Excludes internal namespaces."
+  [schema]
+  (keep (fn [[k v]]
+          (when (and (keyword? k)
+                     (namespace k)
+                     (not (contains? internal-ns-prefixes (namespace k)))
+                     (= :db.type/ref (:db/valueType v))
+                     (= :db.cardinality/one (:db/cardinality v)))
+            k))
+        schema))
+
+;; Per-(schema, hints) warn dedup: the warning set is keyed on the
+;; schema map's identity so two different schemas (e.g. across tests)
+;; warn independently, and the same schema doesn't re-warn every
+;; translate. Schema is the natural scope because the warnings here
+;; are about schema-level facts (ref-target convention misses).
+;;
+;; WeakHashMap means GC reclaims warning state when a schema goes
+;; away (test conn closed, server shut down) — a long-running server
+;; that re-creates schemas during its lifetime gets fresh state per
+;; schema instance without manual cleanup.
+(def ^:private schema-warn-sets
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- schema-warn-set
+  "Get-or-create the warned-key set for a given schema map."
+  [schema]
+  (or (.get ^java.util.Map schema-warn-sets schema)
+      (let [a (atom #{})]
+        (.put ^java.util.Map schema-warn-sets schema a)
+        a)))
+
+(defn- warn-once!
+  "Print a one-shot warning to *err*, keyed so repeated calls for the
+   same `(schema, k)` are no-ops. The dedup is scoped to the schema
+   value — distinct schemas (e.g. across test runs that build fresh
+   conns) warn independently, and a long-running server that
+   re-creates a schema after a fix gets a fresh warning emit. Plain
+   println; pgwire-datahike doesn't depend on a logging library yet."
+  [schema k msg]
+  (let [warned (schema-warn-set schema)]
+    (when-not (contains? @warned k)
+      (swap! warned conj k)
+      (binding [*out* *err*]
+        (println (str "[pgwire-datahike] WARN: " msg))))))
+
+(def ^:private ref-targets-cache
+  "Memoization for `derive-ref-targets`. Outer key is the schema map
+   itself (WeakHashMap — releases when the conn's schema is GC'd);
+   inner value is a HashMap of `hints → result` so a single schema
+   shared by multiple conn-with-different-hints scenarios doesn't
+   thrash. Schemas are value-typed and typically stable across queries,
+   so the cache hit rate is near-100%."
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+;; Per-query memoisation for `schema-hints` and `derive-virtual-tables`.
+;;
+;; In a single parse-sql call, `catalog-data-for*` (catalog.clj) is
+;; invoked once per catalog table referenced — pg_class, pg_attribute,
+;; pg_index, … — and each invocation calls
+;; `(derive-virtual-tables user-schema (schema-hints cte-db))`. Both
+;; inputs are stable across the whole query, so we walk the user
+;; schema and re-run the hint Datalog query N times where 1 would
+;; suffice. On a 600-table Odoo schema with 5 catalog tables in one
+;; query, that's ~5 schema walks instead of 1.
+;;
+;; Why IdentityHashMap rather than WeakHashMap:
+;;   - WeakHashMap uses `.equals` for hash-collision resolution.
+;;   - `datahike.db.DB.equals` (db.cljc:302) throws ClassCastException
+;;     on two distinct DB records (it iterates an internal map but
+;;     treats Datoms as Map.Entry). Any second `.get` for a different
+;;     DB on the same hash bucket would crash, surfacing as
+;;     "SQL parse error: class datahike.datom.Datom cannot be cast to
+;;      class java.util.Map$Entry".
+;;   - IdentityHashMap uses `==` (System.identityHashCode), never
+;;     touches `.equals`, so the broken DB equality doesn't matter.
+;;
+;; Lifetime: bound to a fresh map per parse-sql call (sql.clj
+;; catalog-enrichment block), so the map is GC'd with the query — no
+;; leak even though IdentityHashMap doesn't have weak references.
+
+(def ^:dynamic *catalog-tx-cache*
+  "When non-nil, a map `{:hints ihm :tables ihm}` of two
+   IdentityHashMaps used to memoise `schema-hints` (keyed by db) and
+   `derive-virtual-tables` (keyed by schema, with inner keyed by
+   hints). Bound at the top of parse-sql's catalog enrichment block
+   so all `catalog-data-for*` calls in one query share the cache."
+  nil)
+
+(defn make-catalog-tx-cache
+  "Construct a fresh per-query cache. Caller `binding`s
+   *catalog-tx-cache* to the result around their unit of work."
+  []
+  {:hints  (java.util.IdentityHashMap.)
+   :tables (java.util.IdentityHashMap.)})
+
+(defn derive-ref-targets
+  "For each `:db.type/ref` attribute, determine the *target PK attribute*
+   that SQL projection should dereference to. `SELECT order.customer FROM
+   order` should return the customer's PK value (1, 2, 3) — what a real
+   PostgreSQL FK column stores — not the Datahike entity-id (10, 11, 12)
+   that the ref attribute physically holds.
+
+   Returns `{ref-attr-ident → target-pk-attr-ident}` (a subset of the
+   ref attrs in the schema; refs with no resolvable target are omitted
+   and fall back to projecting the raw entity-id).
+
+   Resolution order:
+   1. Explicit `:datahike.pg/references K` hint (authoritative).
+   2. Convention: `(name ref-attr)` names a namespace, and the
+      `:db.unique/identity` attr in that namespace is the target.
+      Example: `:order/customer` (ref) → namespace `customer` →
+      `:customer/id` (the only `:db.unique/identity` in `customer`).
+      This matches the seed style most projects use, where ref attrs
+      are named after the table they point to.
+
+   Both `:db.cardinality/one` AND `:db.cardinality/many` refs are
+   included. The result map's value is a `target-pk-attr` for the
+   one-cardinality case, OR a vector `[target-pk-attr :many]` for
+   many-cardinality refs — the translator branches on the shape:
+     - one  → emit a chained `get-else` that derefs to a single
+              target-PK value (matching real PG INT FK columns)
+     - many → emit a per-row Clojure fn (`fns/pg-many-ref-array`)
+              that boxes all target PKs into a PgArray (matching
+              `int8[]` columns)
+
+   Pure schema-side derivation; for runtime data validation against the
+   actual entities a ref points to (polymorphism detection,
+   namespace-mismatch detection), see `validate-ref-targets!`.
+
+   Memoized — schema is value-typed and typically stable per conn, so
+   recomputing per query is wasted work."
+  [schema hints]
+  (let [hint-key (or hints {})
+        ;; Two-level cache: outer is WeakHashMap by schema (releases
+        ;; with conn); inner is HashMap by hints. Prevents the
+        ;; cache-key vector from being GC'd-before-use that would
+        ;; happen with a single-level WeakHashMap[[schema hints]].
+        inner (or (.get ^java.util.Map ref-targets-cache schema)
+                  (let [m (java.util.Collections/synchronizedMap
+                           (java.util.HashMap.))]
+                    (.put ^java.util.Map ref-targets-cache schema m)
+                    m))]
+    (or (.get ^java.util.Map inner hint-key)
+        (let [ns->unique-id (reduce-kv
+                             (fn [m k v]
+                               (if (and (keyword? k)
+                                        (= :db.unique/identity (:db/unique v))
+                                        (namespace k))
+                                 (assoc m (namespace k) k)
+                                 m))
+                             {}
+                             schema)
+              result (reduce-kv
+                      (fn [m attr-ident props]
+                        (if (and (keyword? attr-ident)
+                                 (= :db.type/ref (:db/valueType props)))
+                          (let [hint (get hints attr-ident)
+                                target (or (:references hint)
+                                           (get ns->unique-id (name attr-ident)))
+                                cardinality (:db/cardinality props)]
+                            (cond
+                              (and target (= :db.cardinality/one cardinality))
+                              (assoc m attr-ident target)
+                              (and target (= :db.cardinality/many cardinality))
+                              (assoc m attr-ident [target :many])
+                              :else m))
+                          m))
+                      {}
+                      schema)]
+          (.put ^java.util.Map inner hint-key result)
+          result))))
+
+(defn- bulk-ref-target-namespaces
+  "Single Datalog query that returns `{ref-attr → #{target-namespace}}`
+   for every ref attr in `ref-attrs` at once. Avoids N+1 round-trips
+   when `validate-ref-targets!` cross-checks the schema against live
+   data — which it does on every translate-select.
+
+   Empty namespace sets for refs with no current entities pass through
+   unchanged so the caller can trust the convention until data
+   appears."
+  [db ref-attrs]
+  (when (and db (seq ref-attrs))
+    (let [q-fn (requiring-resolve 'datahike.api/q)
+          ;; One query: walk every datom whose attr is in the
+          ;; ref-attrs set, follow the ref, then take any attr on the
+          ;; target as a namespace witness. Filtering internal attrs
+          ;; here keeps the post-processing simple.
+          rows (q-fn '{:find  [?ref ?attr]
+                       :in    [$ [?ref ...]]
+                       :where [[_ ?ref ?target]
+                               [?target ?attr _]]}
+                     db (vec ref-attrs))]
+      (reduce (fn [acc [ref-attr attr]]
+                (if (and (keyword? attr)
+                         (some? (namespace attr))
+                         (not (contains? internal-ns-prefixes (namespace attr))))
+                  (update acc ref-attr (fnil conj #{}) (namespace attr))
+                  acc))
+              ;; Initialise every ref to empty set so the caller can
+              ;; tell "no data yet" from "missing entry".
+              (zipmap ref-attrs (repeat #{}))
+              rows))))
+
+(defn validate-ref-targets!
+  "Cross-check `ref-targets` (from `derive-ref-targets`) against the
+   actual data in `db`. Drops:
+   - polymorphic refs — entities span multiple namespaces; convention
+     can't pick a single target safely. User must add an explicit
+     `:datahike.pg/references` hint per polymorphic ref.
+   - namespace-mismatched refs — convention picked target X but the
+     data points to namespace Y. Often means the user intended `:X` but
+     named the ref attr after a different concept (`:order/buyer` ref
+     to `customer`). Hint should override.
+
+   Each drop emits a one-shot stderr warning. Returns the validated
+   subset of `ref-targets`. Refs with no current data (empty set)
+   pass through unchanged — the convention is the best guess until
+   data appears.
+
+   Also warns about ref attrs that have NO ref-targets entry at all
+   (no hint, no namespace match) so the user knows to set a hint
+   if they want SQL-FK projection on that column."
+  [db schema ref-targets]
+  (when (and db schema)
+    (doseq [ref-attr (ref-attrs-from-schema schema)
+            :when (not (contains? ref-targets ref-attr))]
+      (warn-once! schema [::no-target ref-attr]
+                  (str "ref attr " ref-attr " has no SQL FK target — "
+                       "set :datahike.pg/references hint to enable "
+                       "FK-style projection (otherwise it projects as "
+                       "the raw entity-id)."))))
+  (if-not (and db (seq ref-targets))
+    ref-targets
+    (let [;; One bulk query for every ref attr in ref-targets. Replaces
+          ;; the old per-attr Datalog round-trip — for a schema with
+          ;; N ref attrs, drops translate-time cost from O(N) round-
+          ;; trips to 1.
+          ns-by-ref (bulk-ref-target-namespaces db (keys ref-targets))]
+      (reduce-kv
+       (fn [acc ref-attr target-entry]
+         (let [target-pk (if (vector? target-entry) (first target-entry) target-entry)
+               actual-ns (get ns-by-ref ref-attr #{})
+               expected-ns (namespace target-pk)]
+           (cond
+             ;; No data yet — trust the convention/hint.
+             (zero? (count actual-ns)) (assoc acc ref-attr target-entry)
+
+             (= 1 (count actual-ns))
+             (if (= (first actual-ns) expected-ns)
+               (assoc acc ref-attr target-entry)
+               (do (warn-once! schema [::namespace-mismatch ref-attr]
+                               (str "ref attr " ref-attr " resolves to target "
+                                    target-pk " (namespace " expected-ns ")"
+                                    " but data points to namespace "
+                                    (first actual-ns)
+                                    ". SQL projection will fall back to the "
+                                    "raw entity-id; set :datahike.pg/references "
+                                    "to override."))
+                   acc))
+
+             :else
+             (do (warn-once! schema [::polymorphic-ref ref-attr]
+                             (str "ref attr " ref-attr " is polymorphic — "
+                                  "entities span namespaces " (sort actual-ns)
+                                  ". SQL projection falls back to the raw "
+                                  "entity-id; set :datahike.pg/references to "
+                                  "force a single target."))
+                 acc))))
+       {}
+       ref-targets))))
+
+(defn- schema-hints*
+  [db]
+  (let [q-fn (requiring-resolve 'datahike.api/q)
+        ;; The :datahike.pg/* attrs may not yet be in the schema (bare
+        ;; conn without ensure-pg-schema!) — keep the query resilient
+        ;; to each attr being absent by using per-attr lookups instead
+        ;; of a single join.
+        rows (q-fn '{:find [?for-ident ?e]
+                     :where [[?e :datahike.pg/for-ident ?for-ident]]}
+                   db)
+        pull-fn (requiring-resolve 'datahike.api/pull)]
+    (into {}
+          (keep (fn [[for-ident e]]
+                  (let [p (pull-fn db
+                                   '[:datahike.pg/column
+                                     :datahike.pg/hidden
+                                     :datahike.pg/references
+                                     :datahike.pg/table]
+                                   e)
+                        h (cond-> {}
+                            (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
+                            (:datahike.pg/hidden p)     (assoc :hidden true)
+                            (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
+                            (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
+                    (when (seq h) [for-ident h]))))
+          rows)))
+
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
    by scanning the db for :datahike.pg/for-ident-rooted hint entities.
-   Nil-safe: returns an empty map when `db` is nil (pure-schema call sites)."
+   Nil-safe: returns an empty map when `db` is nil (pure-schema call sites).
+   When `*catalog-tx-cache*` is bound (within parse-sql's catalog
+   enrichment), reuses the result across all `catalog-data-for*` calls
+   in the current query."
   [db]
-  (if db
-    (let [q-fn (requiring-resolve 'datahike.api/q)
-          ;; The :datahike.pg/* attrs may not yet be in the schema (bare
-          ;; conn without ensure-pg-schema!) — keep the query resilient
-          ;; to each attr being absent by using per-attr lookups instead
-          ;; of a single join.
-          rows (q-fn '{:find [?for-ident ?e]
-                       :where [[?e :datahike.pg/for-ident ?for-ident]]}
-                     db)
-          pull-fn (requiring-resolve 'datahike.api/pull)]
-      (into {}
-            (keep (fn [[for-ident e]]
-                    (let [p (pull-fn db
-                                     '[:datahike.pg/column
-                                       :datahike.pg/hidden
-                                       :datahike.pg/references
-                                       :datahike.pg/table]
-                                     e)
-                          h (cond-> {}
-                              (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
-                              (:datahike.pg/hidden p)     (assoc :hidden true)
-                              (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
-                              (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
-                      (when (seq h) [for-ident h]))))
-            rows))
-    {}))
+  (cond
+    (nil? db) {}
+    (some? *catalog-tx-cache*)
+    (let [^java.util.IdentityHashMap m (:hints *catalog-tx-cache*)]
+      (or (.get m db)
+          (let [v (schema-hints* db)]
+            (.put m db v)
+            v)))
+    :else (schema-hints* db)))
 
 (def ^:const row-marker-col "db-row-exists")
 
@@ -230,6 +518,54 @@
   (when-let [ns (namespace ident)]
     [ns (name ident)]))
 
+(defn- derive-virtual-tables*
+  [schema hints]
+  (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
+                                           (internal-attr? k)
+                                           (nil? (namespace k))
+                                           (:hidden (get hints k))))
+                           schema)
+        tables-from-attrs (reduce
+                           (fn [tables [ident props]]
+                             (let [[table-name local-col] (attr->table-col ident)
+                                   h (get hints ident)
+                                   col-name (or (:column h) local-col)
+                                   vtype (:db/valueType props)
+                                   col {:name        col-name
+                                        :attr        ident
+                                        :oid         (oid-for-valuetype vtype)
+                                        :valuetype   vtype
+                                        :cardinality (:db/cardinality props)
+                                        :unique      (:db/unique props)
+                                        :ref?        (= vtype :db.type/ref)
+                                        :references  (:references h)
+                                        :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
+                               (-> tables
+                                   (update-in [table-name :columns] (fnil conj []) col)
+                                   (assoc-in [table-name :attrs col-name] ident))))
+                           {}
+                           user-attrs)
+         ;; Also surface tables that exist in the schema but have NO own
+         ;; user columns — typically INHERITS children whose columns all
+         ;; live in the parent's namespace. Without this, pg_class doesn't
+         ;; list them, Odoo's `table_exists()` returns false, and Odoo
+         ;; issues a redundant CREATE TABLE that we then reject as 42P07.
+         ;; Detect via the row-marker attr (`<table>/db-row-exists`) which
+         ;; every pgwire CREATE TABLE installs.
+        marker-tables (into #{}
+                            (keep (fn [[k _]]
+                                    (when (and (keyword? k)
+                                               (= (name k) row-marker-col)
+                                               (namespace k))
+                                      (namespace k))))
+                            schema)]
+    (reduce (fn [tables tname]
+              (cond-> tables
+                (not (contains? tables tname))
+                (assoc tname {:columns [] :attrs {}})))
+            tables-from-attrs
+            marker-tables)))
+
 (defn derive-virtual-tables
   "Derive virtual table definitions from a Datahike schema map.
 
@@ -246,34 +582,25 @@
    - `:datahike.pg/hidden true`  → attribute excluded entirely
    - `:datahike.pg/column \"x\"` → column renamed to \"x\"
    - `:datahike.pg/references K`→ carried through on the col as `:references`
-     for the translator's FK-via-ref JOIN rewrite."
+     for the translator's FK-via-ref JOIN rewrite.
+
+   Each catalog table referenced in a query calls this with the same
+   schema/hints. When `*catalog-tx-cache*` is bound, the result is
+   memoised across all calls in the current parse-sql so the schema
+   walk happens once per query (not once per catalog table)."
   ([schema] (derive-virtual-tables schema {}))
   ([schema hints]
-   (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
-                                            (internal-attr? k)
-                                            (nil? (namespace k))
-                                            (:hidden (get hints k))))
-                            schema)]
-     (reduce
-      (fn [tables [ident props]]
-        (let [[table-name local-col] (attr->table-col ident)
-              h (get hints ident)
-              col-name (or (:column h) local-col)
-              vtype (:db/valueType props)
-              col {:name        col-name
-                   :attr        ident
-                   :oid         (oid-for-valuetype vtype)
-                   :valuetype   vtype
-                   :cardinality (:db/cardinality props)
-                   :unique      (:db/unique props)
-                   :ref?        (= vtype :db.type/ref)
-                   :references  (:references h)
-                   :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
-          (-> tables
-              (update-in [table-name :columns] (fnil conj []) col)
-              (assoc-in [table-name :attrs col-name] ident))))
-      {}
-      user-attrs))))
+   (if-let [c *catalog-tx-cache*]
+     (let [^java.util.IdentityHashMap outer (:tables c)
+           inner (or (.get outer schema)
+                     (let [m (java.util.IdentityHashMap.)]
+                       (.put outer schema m)
+                       m))]
+       (or (.get ^java.util.IdentityHashMap inner hints)
+           (let [v (derive-virtual-tables* schema hints)]
+             (.put ^java.util.IdentityHashMap inner hints v)
+             v)))
+     (derive-virtual-tables* schema hints))))
 
 (defn table-names
   "Return sorted list of virtual table names for a schema."

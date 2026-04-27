@@ -389,25 +389,40 @@
           where-clauses)))
 
 (defn- compute-column-sources
-  "Per-column [tableOid attnum] pairs for the RowDescription. Returns
-   [int[] short[]] when at least one column has a known source table;
-   otherwise nil (caller omits the fields — pgjdbc sees zeros and
-   short-circuits getBaseColumnName to \"\", which is the existing
-   behavior for non-table expressions).
+  "Per-column [tableOid attnum typmod] arrays for the RowDescription.
+   Returns [int[] short[] int[]] when at least one column has a known
+   source table; otherwise nil (caller omits the fields — pgjdbc sees
+   zeros and short-circuits getBaseColumnName to \"\", which is the
+   existing behavior for non-table expressions).
 
-   pgjdbc uses (tableOid, attnum) as the cache key for its field-metadata
-   query, so these values MUST agree with the rows we emit in pg_class
-   and pg_attribute — that's why both sides route through schema.clj
-   helpers (table-oid, column-attnum)."
+   typmod (PG's per-column type modifier, e.g. NUMERIC(10, 2)
+   precision+scale encoded per types/encode-numeric-typmod) is read
+   from the attribute's `:pg/typmod` ident-attached marker via the
+   live db. Defaults to -1 (unspecified) when no marker is set —
+   matches PG's RowDescription default for unconstrained columns.
+
+   pgjdbc uses (tableOid, attnum) as the cache key for its field-
+   metadata query, so these values MUST agree with the rows we emit
+   in pg_class and pg_attribute — that's why both sides route through
+   schema.clj helpers (table-oid, column-attnum)."
   [parsed db]
   (when (and db (:find-aliases parsed) (:query parsed))
     (let [aliases (:find-aliases parsed)
           find-vars (:find (:query parsed))
           var->attr (find-var->attr parsed)
           schema (:schema db)
+          ;; Bulk-fetch typmods for the schema attrs we'll need; falls
+          ;; back to -1 per column when the attr has none. One Datalog
+          ;; query per RowDescription emission instead of N point lookups.
+          typmod-map (when db
+                       (into {} (d/q '{:find [?ident ?tm]
+                                       :where [[?e :db/ident ?ident]
+                                               [?e :pg/typmod ?tm]]}
+                                     db)))
           n (count aliases)
           toids (int-array n)
           attnums (short-array n)
+          typmods (int-array n -1)
           any? (atom false)]
       (dotimes [i n]
         (let [fvar (when (< i (count find-vars)) (nth find-vars i))
@@ -416,12 +431,16 @@
               cname (when attr (name attr))
               toid (when tname (pgs/table-oid db tname))
               anum (when (and tname cname)
-                     (pgs/column-attnum schema tname cname))]
+                     (pgs/column-attnum schema tname cname))
+              tm (when attr (get typmod-map attr))]
           (when (and toid anum)
             (reset! any? true)
             (aset-int toids i (int toid))
-            (aset-short attnums i (short anum)))))
-      (when @any? [toids attnums]))))
+            (aset-short attnums i (short anum)))
+          (when tm
+            (reset! any? true)
+            (aset-int typmods i (int tm)))))
+      (when @any? [toids attnums typmods]))))
 
 (defn- compute-schema-oids
   "Resolve the PG OID for each :find element of a parsed SELECT.
@@ -460,27 +479,44 @@
                                   :where [[?e :db/ident ?ident]
                                           [?e :pg/type ?pt]]}
                                 db)))]
-    (int-array
-     (map-indexed
-      (fn [i alias]
-        (let [fvar (when (< i (count find-vars)) (nth find-vars i))
-              attr (when (symbol? fvar) (get var->attr fvar))
-              props (when attr (get schema attr))]
-          (if props
-            (if-let [pgtype (and pgtype-map (get pgtype-map attr))]
-              (case pgtype
-                "jsonb" types/oid-jsonb
-                "json"  types/oid-jsonb
-                (pgs/oid-for-valuetype (:db/valueType props)))
-              (pgs/oid-for-valuetype (:db/valueType props)))
-            (or (some (fn [[attr-kw p]]
-                        (when (and (keyword? attr-kw)
-                                   (= (name attr-kw) alias)
-                                   (not (str/starts-with? (str (namespace attr-kw)) "__")))
-                          (pgs/oid-for-valuetype (:db/valueType p))))
-                      schema)
-                -1))))
-      find-aliases))))
+    (let [;; Promote cardinality-many props to array OIDs — matches what
+          ;; col-var! emits for `:db.cardinality/many :db.type/ref`
+          ;; columns (PgArray of target PKs). Without this, describe-
+          ;; Result reports int8 for what's actually int8[], and pgjdbc
+          ;; calls .toLong on the PgArray.
+          oid-for-props (fn [props]
+                          (let [base (pgs/oid-for-valuetype (:db/valueType props))]
+                            (if (= :db.cardinality/many (:db/cardinality props))
+                              (get types/element-oid->array-oid
+                                   base
+                                   types/oid-text-array)
+                              base)))]
+      (int-array
+       (map-indexed
+        (fn [i alias]
+          (let [fvar (when (< i (count find-vars)) (nth find-vars i))
+                attr (when (symbol? fvar) (get var->attr fvar))
+                props (when attr (get schema attr))]
+            (if props
+              (if-let [pgtype (and pgtype-map (get pgtype-map attr))]
+                (case pgtype
+                  "jsonb" types/oid-jsonb
+                  "json"  types/oid-jsonb
+                  ;; Native PG array column: `:pg/type "_T"` resolves
+                  ;; via pg-name->oid to the corresponding array OID
+                  ;; (`_int4` → 1007 etc.). Fall back to the storage
+                  ;; type's OID when not in the array registry.
+                  (or (get types/pg-name->oid pgtype)
+                      (oid-for-props props)))
+                (oid-for-props props))
+              (or (some (fn [[attr-kw p]]
+                          (when (and (keyword? attr-kw)
+                                     (= (name attr-kw) alias)
+                                     (not (str/starts-with? (str (namespace attr-kw)) "__")))
+                            (oid-for-props p)))
+                        schema)
+                  -1))))
+        find-aliases)))))
 
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
@@ -1156,20 +1192,23 @@
   "All FK constraints where the given table is the PARENT side — i.e.
    the FKs that must be checked when a row in `table-name` is deleted
    (or its PK is updated). Used by DELETE / UPDATE to enforce
-   parent-side RESTRICT."
+   parent-side RESTRICT and CASCADE actions."
   [db table-name]
   (let [q-fn (requiring-resolve 'datahike.api/q)]
-    (map (fn [[n ct cc pc]]
+    (map (fn [[n ct cc pc od]]
            {:name n :child-table ct
             :child-cols (vec (jb/parse-jsonb cc))
-            :parent-cols (vec (jb/parse-jsonb pc))})
-         (q-fn '{:find [?n ?ct ?cc ?pc]
+            :parent-cols (vec (jb/parse-jsonb pc))
+            ;; PG default for missing ON DELETE is NO ACTION.
+            :on-delete (or od :no-action)})
+         (q-fn '{:find [?n ?ct ?cc ?pc ?od]
                  :in [$ ?pt]
                  :where [[?e :pg/fk-name ?n]
                          [?e :pg/fk-parent-table ?pt]
                          [?e :pg/fk-child-table ?ct]
                          [?e :pg/fk-child-cols ?cc]
-                         [?e :pg/fk-parent-cols ?pc]]}
+                         [?e :pg/fk-parent-cols ?pc]
+                         [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
                db table-name))))
 
 (defn- enforce-fk-on-insert!
@@ -1209,45 +1248,115 @@
                        :table table-name
                        :constraint name})))))))))
 
-(defn- enforce-fk-restrict-on-delete!
-  "Before DELETE retracts `eids` from `table-name`, verify no FK
-   references them (the parent-side RESTRICT behavior). Raises 23503
-   if any child row would become an orphan. Called from execute-delete
-   with the CURRENT db (pre-transact) — restrict is a prohibition,
-   not a cascade, so we only need to see committed child rows."
+(defn- find-fk-children
+  "Find child eids that reference any of the parent eids via the given FK.
+   Returns the eids as a set, or empty set if none."
+  [db table-name fk eids]
+  (let [q-fn (requiring-resolve 'datahike.api/q)
+        {:keys [child-table child-cols parent-cols]} fk
+        parent-attrs (mapv #(keyword table-name %) parent-cols)
+        child-attrs (mapv #(keyword child-table %) child-cols)]
+    (into #{}
+          (mapcat (fn [eid]
+                    (let [parent-vals (mapv (fn [a]
+                                              (ffirst (q-fn {:find '[?v]
+                                                             :in '[$ ?e]
+                                                             :where [['?e a '?v]]}
+                                                            db eid)))
+                                            parent-attrs)]
+                      (when (every? some? parent-vals)
+                        (let [patterns (mapv (fn [attr v] ['?c attr v])
+                                             child-attrs parent-vals)
+                              q {:find '[?c] :where patterns}]
+                          (mapv first (q-fn q db)))))))
+          eids)))
+
+(defn- collect-fk-cascade-retractions!
+  "Walk all FKs with this table as parent. For RESTRICT/NO ACTION, raise
+   23503 if any child references the deleted eids. For CASCADE, recurse:
+   collect the child eids and ALSO walk THEIR children. Returns a set of
+   cascade-eids (across all child tables) to retract in the same tx.
+   PG-equivalent (commands/trigger.c::RI_FKey_cascade_del). Walks
+   iteratively against `db` (pre-transact); since retractEntity is
+   atomic, the same tx removes parent + transitively-cascading children."
   [db table-name eids]
   (when (seq eids)
-    (let [fks (seq (read-fks-referring-to db table-name))]
-      (when fks
-        (let [q-fn (requiring-resolve 'datahike.api/q)]
-          (doseq [eid eids
-                  {:keys [name child-table child-cols parent-cols]} fks
-                  :let [parent-attrs (mapv #(keyword table-name %) parent-cols)
+    (loop [pending [[table-name eids]]
+           visited #{}                  ;; [table-name eid] pairs already cascaded
+           cascade-eids #{}]
+      (if (empty? pending)
+        cascade-eids
+        (let [[t es] (first pending)
+              fks (read-fks-referring-to db t)
+              ;; Bucket FKs by action.
+              by-action (group-by :on-delete fks)
+              ;; RESTRICT / NO ACTION: any child = abort.
+              restrict-fks (concat (get by-action :no-action)
+                                   (get by-action :restrict))]
+          ;; Raise on first restrict violation.
+          (doseq [{:keys [name parent-cols] :as fk} restrict-fks
+                  :let [hits (find-fk-children db t fk es)]
+                  :when (seq hits)
+                  :let [parent-attrs (mapv #(keyword t %) parent-cols)
+                        eid (first es)
                         parent-vals (mapv (fn [a]
-                                            (ffirst (q-fn {:find '[?v]
-                                                           :in '[$ ?e]
-                                                           :where [['?e a '?v]]}
-                                                          db eid)))
-                                          parent-attrs)]
-                  :when (every? some? parent-vals)
-                  :let [child-attrs (mapv #(keyword child-table %) child-cols)
-                        patterns (mapv (fn [attr v] ['?c attr v])
-                                       child-attrs parent-vals)
-                        q {:find '[?c] :where patterns}
-                        child-hits (q-fn q db)]
-                  :when (seq child-hits)]
+                                            (ffirst ((requiring-resolve 'datahike.api/q)
+                                                     {:find '[?v]
+                                                      :in '[$ ?e]
+                                                      :where [['?e a '?v]]}
+                                                     db eid)))
+                                          parent-attrs)]]
             (throw (ex-info
-                    (str "update or delete on table \"" table-name
+                    (str "update or delete on table \"" t
                          "\" violates foreign key constraint \""
                          name "\" on table \""
-                         child-table "\": Key ("
+                         (:child-table fk) "\": Key ("
                          (str/join ", " parent-cols) ")=("
                          (str/join ", " (map pr-str parent-vals))
                          ") is still referenced from table \""
-                         child-table "\"")
+                         (:child-table fk) "\"")
                     {:sqlstate "23503"
-                     :table child-table
-                     :constraint name}))))))))
+                     :table (:child-table fk)
+                     :constraint name})))
+          ;; CASCADE: collect new child eids, recurse on those.
+          (let [cascades (get by-action :cascade)
+                new-by-table
+                (reduce (fn [acc fk]
+                          (let [hits (find-fk-children db t fk es)
+                                fresh (remove (fn [c]
+                                                (contains? visited [(:child-table fk) c]))
+                                              hits)]
+                            (if (seq fresh)
+                              (update acc (:child-table fk) (fnil into #{}) fresh)
+                              acc)))
+                        {} cascades)
+                next-pending (concat (rest pending)
+                                     (for [[t' es'] new-by-table] [t' es']))
+                next-visited (into visited
+                                   (mapcat (fn [[t' es']]
+                                             (map vector (repeat t') es')))
+                                   new-by-table)
+                next-cascade (into cascade-eids
+                                   (mapcat val) new-by-table)]
+            ;; SET NULL / SET DEFAULT not yet supported — surface clearly.
+            (when-let [unsupported (seq (concat (get by-action :set-null)
+                                                (get by-action :set-default)))]
+              (throw (ex-info
+                      (str "ON DELETE " (name (:on-delete (first unsupported)))
+                           " is not yet implemented for FK \""
+                           (:name (first unsupported)) "\"")
+                      {:sqlstate "0A000"
+                       :constraint (:name (first unsupported))})))
+            (recur next-pending next-visited next-cascade)))))))
+
+(defn- enforce-fk-restrict-on-delete!
+  "Compatibility shim — older sites call this. Walks the FK graph and
+   either raises 23503 (RESTRICT/NO ACTION) or returns nil (we don't
+   add cascade retractions through this path; new callers should use
+   collect-fk-cascade-retractions! and append to tx-data)."
+  [db table-name eids]
+  (collect-fk-cascade-retractions! db table-name eids)
+  nil)
 
 (defn- enforce-fk-restrict-on-update!
   "Mirror of enforce-fk-restrict-on-delete!, but for UPDATE: when an
@@ -1567,10 +1676,15 @@
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
-                             (build-returning-result returning db eids table schema))]
-      (enforce-fk-restrict-on-delete! db table eids)
-      (when (seq tx-data)
-        (d/transact conn tx-data))
+                             (build-returning-result returning db eids table schema))
+          ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
+          ;; to retract atomically alongside the parent deletion.
+          cascade-eids (collect-fk-cascade-retractions! db table eids)
+          cascade-tx (when (seq cascade-eids)
+                       (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
+          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))]
+      (when (seq full-tx)
+        (d/transact conn full-tx))
       (or returning-result
           (empty-result (str "DELETE " (count eids)))))
     (catch Exception e
@@ -1931,6 +2045,17 @@
         spec [[:pg/type str1]
               [:pg/table-oid long1]
               [:pg/not-null bool1]
+              ;; PG-style atttypmod — encodes NUMERIC(p, s) precision +
+              ;; scale, plus length for VARCHAR(n) etc. Stored as a long;
+              ;; -1 means unconstrained (PG default).
+              [:pg/typmod long1]
+              ;; Native PG array column metadata (Option C storage):
+              ;; element-keyword (:int4 / :text / …) drives from-pg-text
+              ;; reconstruction; ndim records dimensionality so the
+              ;; codec can validate shape and the OID inferer reports
+              ;; the correct array OID (`pg/type "_T"` resolves it).
+              [:pg/array-elem kw1]
+              [:pg/array-ndim long1]
               [:pg/default-kind kw1]
               [:pg/default-value str1]
               [:pg/default-arg str1]
@@ -2954,39 +3079,106 @@
 
 ;; --- Sequence handlers ------------------------------------------------------
 
+(def ^:private nextval-max-retries
+  "Bound on the optimistic-retry loop in handle-nextval. Real
+   contention on a single sequence shouldn't push past a handful of
+   retries even at thousands of qps; 100 is generous."
+  100)
+
 (defn- handle-nextval
-  "SELECT nextval('seq_name') — read-modify-write the sequence entity."
-  [{:keys [conn tx-state]} parsed]
+  "SELECT nextval('seq_name') — atomically advance the sequence entity
+   and return the new value.
+
+   PG semantics: a `nextval` advance is never rolled back, even by
+   ROLLBACK on the surrounding transaction. We match that by always
+   committing to the live conn, regardless of the session's `:in-tx?`
+   state.
+
+   Atomicity: optimistic CAS-retry. Each iteration reads the current
+   :__seq__/value, computes the new value, and submits
+
+       [[:db/cas seq-eid :__seq__/value curr new]]
+
+   to `d/transact`. Datahike's transactor serialises tx applications
+   per conn, so two concurrent CAS submissions see each other: the
+   first wins, the second's old-val no longer matches the
+   transactor's current value and the CAS raises `:transact/cas`. We
+   re-read and retry. The loser thread will see the winner's new
+   value, compute the next slot, and commit cleanly.
+
+   Why CAS instead of the simpler `:db.fn/call` pattern: Datahike's
+   writer batches multiple in-flight transactions for a single
+   commit, then writes the SAME `:db-after` (the batch's final db)
+   into every tx-report in the batch. So reading `(:db-after report)`
+   to recover the value this call assigned doesn't work — it returns
+   the LAST tx in the batch. CAS sidesteps that: the value we
+   intended is the literal `new` slot of the op-vec, available
+   without reading `:db-after`."
+  [{:keys [conn]} parsed]
   (try
     (let [seq-name (:seq-name parsed)
-          in-tx? (:in-tx? @tx-state)
-          lookup-db (if in-tx? (:speculative-db @tx-state) (d/db conn))
-          seq-eid (ffirst (d/q '{:find [?e]
-                                 :where [[?e :__seq__/name ?n]]
-                                 :in [$ ?n]}
-                               lookup-db seq-name))]
-      (if-not seq-eid
-        (error-result (str "Sequence '" seq-name "' does not exist"))
-        (let [curr-val (or (ffirst (d/q '{:find [?v]
-                                          :where [[?e :__seq__/value ?v]]
-                                          :in [$ ?e]}
-                                        lookup-db seq-eid))
-                           0)
-              increment (or (ffirst (d/q '{:find [?i]
-                                           :where [[?e :__seq__/increment ?i]]
-                                           :in [$ ?e]}
-                                         lookup-db seq-eid))
-                            1)
-              new-val (+ curr-val increment)
-              seq-tx [[:db/add seq-eid :__seq__/value new-val]]]
-          (if in-tx?
-            (let [spec-report (dc/with lookup-db seq-tx)]
-              (swap! tx-state (fn [st]
-                                (-> st
-                                    (assoc :speculative-db (:db-after spec-report))
-                                    (update :tx-buffer into seq-tx)))))
-            (d/transact conn seq-tx))
-          (single-row-result "nextval" PgWireServer/OID_INT8 (str new-val)))))
+          q-fn (requiring-resolve 'datahike.api/q)
+          ;; Look up seq-eid + increment ONCE (they don't change after
+          ;; CREATE SEQUENCE). Only the running value moves under
+          ;; contention.
+          db0 (d/db conn)
+          eid (ffirst (q-fn '{:find [?e]
+                              :where [[?e :__seq__/name ?n]]
+                              :in [$ ?n]}
+                            db0 seq-name))
+          _ (when-not eid
+              (throw (ex-info (str "Sequence '" seq-name "' does not exist")
+                              {:sqlstate "42P01" :seq-name seq-name})))
+          incr (or (ffirst (q-fn '{:find [?i]
+                                   :where [[?e :__seq__/increment ?i]]
+                                   :in [$ ?e]}
+                                 db0 eid))
+                   1)
+          read-curr (fn [^long _attempt]
+                      (ffirst (q-fn '{:find [?v]
+                                      :where [[?e :__seq__/value ?v]]
+                                      :in [$ ?e]}
+                                    (d/db conn) eid)))
+          ;; CAS failure detection: Datahike's transactor raises an
+          ;; ex-info with `{:error :transact/cas}`, but the writer's
+          ;; throwable-promise + CompletableFuture wrapping strips
+          ;; the structured ex-data by the time we see the throw on
+          ;; the caller thread. The original message is preserved
+          ;; (verbatim "_db.fn/cas failed_" substring), so we match
+          ;; on that.
+          cas-failure? (fn [^Throwable e]
+                         (when-let [m (.getMessage e)]
+                           (.contains m ":db.fn/cas failed")))
+          new-val
+          ;; Exponential backoff between retries: 1ms, 2ms, 4ms, …
+          ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
+          ;; (commit-wait-time) between batches before flushing, so
+          ;; without a sleep the retrying caller spins on a still-
+          ;; stale conn-atom and burns through its retry budget before
+          ;; the winner's commit lands. With backoff we yield long
+          ;; enough for the writer to publish, then re-read the now-
+          ;; advanced value and try again.
+          (loop [attempt 0]
+            (let [curr (or (read-curr attempt) 0)
+                  next (+ curr incr)
+                  cas-ok?
+                  (try
+                    (d/transact conn [[:db/cas eid :__seq__/value curr next]])
+                    true
+                    (catch Throwable e
+                      (if (cas-failure? e)
+                        false
+                        (throw e))))]
+              (cond
+                cas-ok? next
+                (>= attempt nextval-max-retries)
+                (throw (ex-info (str "nextval('" seq-name "') gave up after "
+                                     nextval-max-retries " contention retries")
+                                {:sqlstate "40001" :seq-name seq-name}))
+                :else
+                (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
+                    (recur (inc attempt))))))]
+      (single-row-result "nextval" PgWireServer/OID_INT8 (str new-val)))
     (catch Exception e
       (classified-error "nextval error: " e))))
 
@@ -3202,7 +3394,9 @@
                                 (make-array String 0 0))
                     "SELECT 0")]
             (if sources
-              (.withColumnSources qr (first sources) (second sources))
+              (-> qr
+                  (.withColumnSources (first sources) (second sources))
+                  (.withColumnTypmods (nth sources 2)))
               qr))
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT — the executor
@@ -3518,19 +3712,31 @@
                                                     results-vec)))))))
                                       results)
                   ;; SQL requires: aggregate on empty result → one row with defaults
-                  ;; COUNT(*) → 0, SUM/AVG/MIN/MAX → NULL
-                                    results (if (and has-aggregates? (empty? (seq results)))
-                                              (let [find-elems (:find query)
-                                                    default-row (mapv (fn [elem]
-                                                                        (if (and (seq? elem) (symbol? (first elem)))
-                                                                          (let [agg-name (name (first elem))]
-                                                                            (if (or (= agg-name "count")
-                                                                                    (= agg-name "count-distinct")
-                                                                                    (= agg-name "filter-count")
-                                                                                    (= agg-name "filter-count-distinct"))
-                                                                              0
-                                                                              nil))
-                                                                          nil))
+                  ;; COUNT(*) → 0, SUM/AVG/MIN/MAX → NULL.
+                  ;; This applies ONLY when there is no GROUP BY — i.e.
+                  ;; every :find element is an aggregate form. With a
+                  ;; group-by column in :find (a plain `?var` element),
+                  ;; an empty result means zero matching groups, so PG
+                  ;; returns zero rows. The earlier always-on default
+                  ;; synthesis turned `WHERE …→ 0 rows GROUP BY status`
+                  ;; into a single bogus `[null, 0]` row.
+                                    find-elems (:find query)
+                                    all-aggregates? (and (seq find-elems)
+                                                         (every? (fn [elem]
+                                                                   (and (seq? elem)
+                                                                        (symbol? (first elem))))
+                                                                 find-elems))
+                                    results (if (and has-aggregates?
+                                                     all-aggregates?
+                                                     (empty? (seq results)))
+                                              (let [default-row (mapv (fn [elem]
+                                                                        (let [agg-name (name (first elem))]
+                                                                          (if (or (= agg-name "count")
+                                                                                  (= agg-name "count-distinct")
+                                                                                  (= agg-name "filter-count")
+                                                                                  (= agg-name "filter-count-distinct"))
+                                                                            0
+                                                                            nil)))
                                                                       find-elems)]
                                                 [default-row])
                                               results)
@@ -3666,8 +3872,9 @@
                                       sources (compute-column-sources parsed-with-shape db)
                                       result (format-query-result results find-aliases schema-oids)]
                                   (if sources
-                                    (.withColumnSources ^PgWireServer$QueryResult result
-                                                        (first sources) (second sources))
+                                    (-> ^PgWireServer$QueryResult result
+                                        (.withColumnSources (first sources) (second sources))
+                                        (.withColumnTypmods (nth sources 2)))
                                     result)))))
 
                           :insert
@@ -4023,6 +4230,13 @@
                               (let [code (or (:sqlstate parsed)
                                              (errors/classify-message msg)
                                              "XX000")]
+                                ;; Parse-time errors abort the surrounding
+                                ;; tx the same way execute-time errors do —
+                                ;; otherwise the next stmt sees a "live" tx
+                                ;; instead of the canonical 25P02
+                                ;; in_failed_sql_transaction state.
+                                (when (:in-tx? @tx-state)
+                                  (swap! tx-state assoc :aborted? true))
                                 (error-result msg code))))
 
             ;; fallback
