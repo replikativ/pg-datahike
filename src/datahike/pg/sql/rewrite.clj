@@ -394,17 +394,250 @@
                 (recur (inc i) acc)))))))))
 
 ;; ============================================================================
+;; COLLATE — strip both qualified (`COLLATE pg_catalog.default`) and bare
+;; (`COLLATE "C"` / `COLLATE default`) forms. We don't track collations.
+;; ============================================================================
+
+(defn collate-rule
+  "Strip `COLLATE <name>`, `COLLATE <qual>.<name>`, `COLLATE \"<name>\"`.
+
+   Token-driven: the matcher only fires on `:ident COLLATE` tokens, so
+   the substring `COLLATE` inside a string literal or a comment is
+   invisible to it (those are `:string` / `:comment` tokens)."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth toks i)]
+          (if-not (= "collate" (kw-text t))
+            (recur (inc i) acc)
+            (let [t1 (nth toks (inc i) nil)
+                  t2 (nth toks (+ i 2) nil)
+                  t3 (nth toks (+ i 3) nil)]
+              (cond
+                ;; COLLATE <ident> . <ident>
+                (and (ident-tok? t1) (punct? t2 ".")
+                     (or (ident-tok? t3) (= :quoted (:type t3))))
+                (recur (+ i 4) (conj acc [(:pos t) (:end t3) " "]))
+                ;; COLLATE <ident> | COLLATE "<quoted>"
+                (or (ident-tok? t1) (= :quoted (:type t1)))
+                (recur (+ i 2) (conj acc [(:pos t) (:end t1) " "]))
+                :else
+                (recur (inc i) acc)))))))))
+
+;; ============================================================================
+;; OPERATOR(qual.op) — psql `\d` family emits operator-schema-qualified
+;; references. JSqlParser doesn't accept the wrapper. Collapse to the
+;; bare op symbol; we don't honour cross-schema operator scoping.
+;; ============================================================================
+
+(defn operator-paren-rule
+  "Match `OPERATOR ( <ident> . <op> )` and replace the whole span with
+   the bare operator symbol. The op token may be any `:op` — single or
+   multi-char (`~`, `!~`, `~*`, `||`, etc.)."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth toks i)]
+          (if-not (= "operator" (kw-text t))
+            (recur (inc i) acc)
+            (let [t1 (nth toks (inc i) nil)
+                  t2 (nth toks (+ i 2) nil)
+                  t3 (nth toks (+ i 3) nil)
+                  t4 (nth toks (+ i 4) nil)
+                  t5 (nth toks (+ i 5) nil)]
+              (if (and (punct? t1 "(")
+                       (ident-tok? t2)
+                       (punct? t3 ".")
+                       (= :op (:type t4))
+                       (punct? t5 ")"))
+                (recur (+ i 6)
+                       (conj acc [(:pos t) (:end t5) (:text t4)]))
+                (recur (inc i) acc)))))))))
+
+;; ============================================================================
+;; ALTER COLUMN <name> DROP DEFAULT — no-op clause. Strip the whole clause
+;; (and the trailing comma if present) so the surrounding ALTER TABLE
+;; survives.
+;; ============================================================================
+
+(defn alter-column-drop-default-rule
+  "Match `ALTER COLUMN [<quote>]<name>[<quote>] DROP DEFAULT [,]` anywhere
+   in the token stream and remove it. JSqlParser would parse the form
+   but our schema can't honour it (we don't store DEFAULT values that
+   could be dropped); the regex tail in preprocess-sql used to handle
+   this. Token rule is immune to the substring appearing in literals or
+   comments."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (- n 4))
+        acc
+        (let [t (nth toks i)]
+          (if-not (= "alter" (kw-text t))
+            (recur (inc i) acc)
+            (let [t1 (nth toks (inc i) nil)
+                  t2 (nth toks (+ i 2) nil)
+                  t3 (nth toks (+ i 3) nil)
+                  t4 (nth toks (+ i 4) nil)
+                  t5 (nth toks (+ i 5) nil)]
+              (if (and (= "column" (kw-text t1))
+                       (or (ident-tok? t2) (= :quoted (:type t2)))
+                       (= "drop" (kw-text t3))
+                       (= "default" (kw-text t4)))
+                (let [end-pos (if (punct? t5 ",")
+                                (:end t5)
+                                (:end t4))
+                      next-i (if (punct? t5 ",") (+ i 6) (+ i 5))]
+                  (recur next-i (conj acc [(:pos t) end-pos " "])))
+                (recur (inc i) acc)))))))))
+
+;; ============================================================================
+;; (PRIMARY KEY (<col>)) — INHERITS table body that contains only a PK.
+;; Replace the outer parenthesised body with `(id serial)` so JSqlParser
+;; sees a viable column list. We don't enforce inherited PKs on the child;
+;; this rewrite is purely to make INHERITS bootstrap parse cleanly.
+;; ============================================================================
+
+(defn primary-key-only-body-rule
+  "Match `( PRIMARY KEY ( <ident> [, <ident>]* ) )` as a complete
+   parenthesised body — i.e. nothing else inside the outer `(...)` —
+   and replace with `(id serial)`. Used by Odoo's bootstrap-DDL where
+   tables declared with `INHERITS (parent)` carry only a PK."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth toks i)]
+          (if-not (punct? t "(")
+            (recur (inc i) acc)
+            (let [t1 (nth toks (inc i) nil)
+                  t2 (nth toks (+ i 2) nil)
+                  t3 (nth toks (+ i 3) nil)]
+              (if (and (= "primary" (kw-text t1))
+                       (= "key" (kw-text t2))
+                       (punct? t3 "("))
+                (let [;; Walk to the inner `)` matching t3.
+                      inner-end-idx (loop [k (inc (+ i 3)), depth 1]
+                                      (let [x (nth toks k nil)]
+                                        (cond
+                                          (nil? x) nil
+                                          (punct? x "(") (recur (inc k) (inc depth))
+                                          (punct? x ")") (if (= depth 1)
+                                                           k
+                                                           (recur (inc k) (dec depth)))
+                                          :else (recur (inc k) depth))))
+                      ;; The token immediately after the inner `)` must be
+                      ;; the outer `)`. Otherwise the body has more than
+                      ;; just `PRIMARY KEY(...)` and we leave it alone.
+                      outer-end (when inner-end-idx
+                                  (let [x (nth toks (inc inner-end-idx) nil)]
+                                    (when (punct? x ")") x)))]
+                  (if outer-end
+                    (recur (+ inner-end-idx 2)
+                           (conj acc [(:pos t) (:end outer-end) "(id serial)"]))
+                    (recur (inc i) acc)))
+                (recur (inc i) acc)))))))))
+
+;; ============================================================================
+;; ALTER TABLE … TYPE <type> USING <expr> — strip the USING half.
+;; PG accepts a USING clause to convert column data; we treat the rewrite
+;; as a no-op so callers can issue the same DDL they'd issue against PG.
+;; ============================================================================
+
+(defn type-using-rule
+  "Match `TYPE <ident>[(...)] [<more idents>]* USING <anything>` and strip
+   from `USING` to the end of the statement (next `;` at depth 0 or
+   end of input).
+
+   The `TYPE`-prefixed gating is what makes this safe: a bare `USING`
+   keyword (e.g. JOIN ... USING (col)) never has a preceding `TYPE`
+   token in the same clause, so it isn't matched."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (let [t (nth toks i)]
+          (if-not (= "type" (kw-text t))
+            (recur (inc i) acc)
+            ;; Walk forward looking for USING. Stop at `;` or EOF.
+            (let [using-idx
+                  (loop [k (inc i), depth 0]
+                    (let [x (nth toks k nil)]
+                      (cond
+                        (nil? x) nil
+                        (punct? x "(") (recur (inc k) (inc depth))
+                        (punct? x ")") (recur (inc k) (max 0 (dec depth)))
+                        (and (zero? depth) (punct? x ";")) nil
+                        (and (zero? depth) (= "using" (kw-text x))) k
+                        :else (recur (inc k) depth))))]
+              (if (nil? using-idx)
+                (recur (inc i) acc)
+                ;; Span: from the USING token to either the next top-
+                ;; level `;` or end of input.
+                (let [end-idx (loop [k (inc using-idx), depth 0]
+                                (let [x (nth toks k nil)]
+                                  (cond
+                                    (nil? x) k
+                                    (punct? x "(") (recur (inc k) (inc depth))
+                                    (punct? x ")") (recur (inc k) (max 0 (dec depth)))
+                                    (and (zero? depth) (punct? x ";")) k
+                                    :else (recur (inc k) depth))))
+                      using-tok (nth toks using-idx)
+                      end-pos (if (and (< end-idx n)
+                                       (= ";" (:text (nth toks end-idx))))
+                                (:pos (nth toks end-idx))
+                                (:end (nth toks (dec end-idx))))]
+                  (recur end-idx
+                         (conj acc [(:pos using-tok) end-pos " "])))))))))))
+
+;; ============================================================================
+;; INDEX/KEY varchar — quote a reserved-word column name. PG accepts
+;; `index varchar` as a column declaration; JSqlParser rejects the
+;; reserved word in column position. Quote it so the AST builds.
+;; ============================================================================
+
+(defn reserved-column-name-rule
+  "Match `<INDEX|KEY> varchar` and quote the first ident: `\"INDEX\" varchar`."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (dec n))
+        acc
+        (let [t  (nth toks i)
+              t1 (nth toks (inc i) nil)
+              kw (kw-text t)]
+          (if (and (or (= "index" kw) (= "key" kw))
+                   (= "varchar" (kw-text t1)))
+            (recur (+ i 2)
+                   (conj acc [(:pos t) (:end t)
+                              (str "\"" (:text t) "\"")]))
+            (recur (inc i) acc)))))))
+
+;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
 
 (def default-rules
-  "Rules replacing the most-error-prone regex replacements in the old
-   preprocess-sql. Others (reserved-word quoting, ALTER TABLE TYPE
-   USING stripping, complex DEFAULT paren-peel, ALTER COLUMN DROP
-   DEFAULT) remain as regex in sql.clj for now — they're narrow
-   enough that the regex is low-risk. Migrate them incrementally as
-   needed."
+  "Token-driven rewrites applied in `datahike.pg.sql/preprocess-sql`
+   before JSqlParser sees the SQL. Each rule operates on tokens, not
+   on raw source, so a keyword the rule matches inside a string literal
+   or comment is invisible to it.
+
+   Order matters only for rules that target the same source span; all
+   rules here are disjoint."
   [inline-references-rule
    create-index-anonymous-rule
    select-from-rule
-   quote-reserved-alias-rule])
+   quote-reserved-alias-rule
+   collate-rule
+   operator-paren-rule
+   alter-column-drop-default-rule
+   primary-key-only-body-rule
+   type-using-rule
+   reserved-column-name-rule])

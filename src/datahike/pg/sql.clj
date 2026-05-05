@@ -189,57 +189,27 @@
 (defn- preprocess-sql
   "Preprocess SQL to handle constructs that JSqlParser can't parse.
 
-   Two layers:
-   1. Token-driven rewrites via datahike.pg.sql.rewrite (robust against
-      keywords inside strings / comments / dollar-quotes):
-        - inline REFERENCES stripping + unsupported-action 0A000
-        - CREATE [UNIQUE] INDEX ON … name injection
-        - SELECT FROM … projection injection
-   2. Narrow regex rewrites for rarer shapes where the added
-      complexity of a token-rule doesn't pay off: reserved-word
-      column quoting, INHERITS+PK-only body, DEFAULT outer-paren
-      stripping, ALTER TABLE … TYPE … USING, ALTER COLUMN DROP
-      DEFAULT. Migrate these to rewrite.clj incrementally if they
-      start misfiring."
+   All rewrites are token-driven (`datahike.pg.sql.rewrite`) — a keyword
+   the rule matches inside a string literal or comment is invisible to
+   the matcher because those are `:string` / `:comment` tokens, not
+   `:ident`s.
+
+   Rules in `rw/default-rules`:
+     - inline REFERENCES stripping + unsupported-action 0A000
+     - CREATE [UNIQUE] INDEX ON … name injection
+     - SELECT FROM … projection injection
+     - reserved-keyword aliases (`AS select` → `AS \"select\"`)
+     - COLLATE strip (qualified + bare)
+     - OPERATOR(qual.op) → bare op
+     - ALTER COLUMN … DROP DEFAULT removal
+     - (PRIMARY KEY(col)) → (id serial) for INHERITS bodies
+     - ALTER TABLE … TYPE … USING half stripping
+     - reserved column name (INDEX/KEY varchar) quoting
+
+   ::regnamespace / ::regclass casts are handled in
+   expr/translate-cast-expr, no preprocessing needed."
   [^String sql]
-  (-> sql
-      (rw/rewrite rw/default-rules)
-      ;; ::regnamespace / ::regclass — handled in expr/translate-cast-expr,
-      ;; no preprocessing needed.
-      ;; CHECK — parsed by JSqlParser and lifted in translate-create-
-      ;; table into :pg/check-* entities, no preprocessing needed.
-      ;; Reserved words used as column names (INDEX/KEY + varchar).
-      (str/replace #"(?i)\b(index|key)\s+varchar" "\"$1\" varchar")
-      ;; Standalone PRIMARY KEY(col) in an INHERITS table body.
-      (str/replace #"(?i)\(\s*primary\s+key\s*\([^)]*\)\s*\)" "(id serial)")
-      ;; (Removed: DEFAULT (now() AT TIME ZONE 'X') paren-peel.
-      ;;  JSqlParser 5.2 parses the parenthesised form natively. The
-      ;;  old regex stripped the parens, which then broke the AT TIME
-      ;;  ZONE expression because the column-spec parser doesn't
-      ;;  accept it without parens — exactly the opposite of what
-      ;;  the regex was trying to achieve. Caught by Odoo's
-      ;;  base_data.sql which uses this exact pattern.)
-      ;; ALTER TABLE … TYPE … USING expr — strip the USING half.
-      (str/replace #"(?i)(\bTYPE\s+\w+(?:\s+\w+)*)\s+USING\s+.+$" "$1")
-      ;; ALTER COLUMN … DROP DEFAULT — no-op in our schema.
-      (str/replace #"(?i)ALTER\s+COLUMN\s+\"?\w+\"?\s+DROP\s+DEFAULT\s*,?\s*" "")
-      ;; OPERATOR(qual.op) — explicit operator-schema qualification,
-      ;; emitted by psql's \d <table> / \dt+ <table> / \dS family
-      ;; (`relname OPERATOR(pg_catalog.~) '^x$'`). JSqlParser doesn't
-      ;; accept the `OPERATOR(...)` wrapper. We don't honour
-      ;; cross-schema operator scoping (everything's in `public`), so
-      ;; collapse `OPERATOR(qualifier.OP)` to bare `OP`. The captured
-      ;; group is the operator symbol — kept intact so `~`, `!~`, `=`,
-      ;; `<>`, `||`, etc. all flow through.
-      (str/replace #"(?i)OPERATOR\s*\(\s*\w+\s*\.\s*([!~=<>@?#&|+/*-]+)\s*\)" "$1")
-      ;; COLLATE qual.X — collation specifier emitted by the same psql
-      ;; `\d` queries (`'^x$' COLLATE pg_catalog.default`). We don't
-      ;; track collations; strip the whole clause so the surrounding
-      ;; expression reads as a plain string compare. Two forms:
-      ;; qualified (`COLLATE pg_catalog.default`) and bare
-      ;; (`COLLATE \"C\"`).
-      (str/replace #"(?i)\s+COLLATE\s+\w+\s*\.\s*\w+" "")
-      (str/replace #"(?i)\s+COLLATE\s+\"?\w+\"?" "")))
+  (rw/rewrite sql rw/default-rules))
 
 (defn parse-sql
   "Parse a SQL statement and return a translation result.
