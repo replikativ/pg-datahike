@@ -677,9 +677,9 @@
                 (recur (inc i) false false (inc pos-idx)))
             (= c \$)
             ;; $N — consume digits
-            (let [j (loop [k (inc i)]
-                      (if (and (< k len) (Character/isDigit (.charAt template k)))
-                        (recur (inc k)) k))]
+            (let [j (long (loop [k (inc i)]
+                            (if (and (< k len) (Character/isDigit (.charAt template k)))
+                              (recur (inc k)) k)))]
               (if (> j (inc i))
                 (let [n (Long/parseLong (subs template (inc i) j))
                       ;; $1 → args[0]
