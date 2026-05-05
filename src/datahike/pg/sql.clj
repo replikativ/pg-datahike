@@ -15,8 +15,8 @@
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
-            [datahike.pg.classify :as cls]
-            [datahike.pg.rewrite :as rw]
+            [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.ctx :as ctx]
@@ -190,7 +190,7 @@
   "Preprocess SQL to handle constructs that JSqlParser can't parse.
 
    Two layers:
-   1. Token-driven rewrites via datahike.pg.rewrite (robust against
+   1. Token-driven rewrites via datahike.pg.sql.rewrite (robust against
       keywords inside strings / comments / dollar-quotes):
         - inline REFERENCES stripping + unsupported-action 0A000
         - CREATE [UNIQUE] INDEX ON … name injection

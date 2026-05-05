@@ -1,4 +1,4 @@
-(ns datahike.pg.classify
+(ns datahike.pg.sql.classify
   "Structural SQL classifier — routes statements to the right handler
    before JSqlParser sees them.
 
@@ -25,7 +25,7 @@
    :kind :generic-sql means 'pass to JSqlParser unchanged'.
 
    Non-goals: full PG lexer, expression parsing. The token-driven
-   preprocess-sql rewriter lives in datahike.pg.rewrite and consumes
+   preprocess-sql rewriter lives in datahike.pg.sql.rewrite and consumes
    this tokenizer's output."
   (:require [clojure.string :as str]))
 

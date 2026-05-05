@@ -19,11 +19,11 @@
             [datahike.core :as dc]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
-            [datahike.pg.classify :as cls]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
             [datahike.pg.window :as window]
@@ -2162,7 +2162,7 @@
    :history | :branch | :commit-id and value is the string (or nil for
    reset/clear), or nil if the SQL isn't a recognized session-var op.
 
-   Implemented on top of datahike.pg.classify — the classifier gives
+   Implemented on top of datahike.pg.sql.classify — the classifier gives
    us {:kind :set :var \"…\" :value \"…\"} or {:kind :reset :var \"…\"}
    without any regex of our own."
   [^String sql]

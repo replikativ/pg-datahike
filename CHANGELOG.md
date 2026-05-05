@@ -24,11 +24,11 @@ All notable changes to pgwire-datahike.
 - Public API facade `datahike.pg` (start-server, stop-server,
   make-query-handler, register-catalog-table!, unregister-catalog-table!,
   reset-lock-registry!, reset-advisory-locks!).
-- Token-driven SQL classification (`datahike.pg.classify`) — routes
+- Token-driven SQL classification (`datahike.pg.sql.classify`) — routes
   statements to the right handler before JSqlParser sees them.
-- Structural SELECT shape matcher (`datahike.pg.shape`) — identifies
+- Structural SELECT shape matcher (`datahike.pg.sql.shape`) — identifies
   pgjdbc/Odoo catalog probes without substring matching.
-- Token-driven source rewriter (`datahike.pg.rewrite`) — inline
+- Token-driven source rewriter (`datahike.pg.sql.rewrite`) — inline
   REFERENCES stripping, CREATE INDEX anonymous-name injection,
   SELECT-FROM empty-projection injection.
 - Constraint enforcement (NOT NULL, DEFAULT, CHECK, FK child-side +

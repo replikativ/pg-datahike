@@ -175,7 +175,7 @@
 
       ;; current_database() / current_schema() used inline as a value
       ;; expression — the sole-select path is classified by
-      ;; datahike.pg.classify, but column-position use lands here.
+      ;; datahike.pg.sql.classify, but column-position use lands here.
       (= fname "current_database")
       (let [fn-param (symbol (str "?cur-db" (swap! (:var-counter ctx) inc)))
             ;; Resolve the bound db-name from session-state if available;

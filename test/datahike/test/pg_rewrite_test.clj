@@ -4,7 +4,7 @@
    inputs like `SELECT 'REFERENCES'` or `-- REFERENCES` do NOT trigger
    the REFERENCES stripper."
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.rewrite :as rw]))
+            [datahike.pg.sql.rewrite :as rw]))
 
 ;; ============================================================================
 ;; inline-references-rule

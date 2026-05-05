@@ -4,8 +4,8 @@
    substring-match was vulnerable to (keywords inside string
    literals, qualified identifiers inside comments)."
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.shape :as shape]
-            [datahike.pg.classify :as cls]))
+            [datahike.pg.sql.shape :as shape]
+            [datahike.pg.sql.classify :as cls]))
 
 ;; ============================================================================
 ;; summarize — structural extraction

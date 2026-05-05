@@ -1,7 +1,7 @@
-(ns datahike.pg.rewrite
+(ns datahike.pg.sql.rewrite
   "Token-driven SQL source rewrites. Normalize SQL before JSqlParser
    sees it by excising or injecting source-level spans — all based on
-   positions captured by the datahike.pg.classify tokenizer.
+   positions captured by the datahike.pg.sql.classify tokenizer.
 
    Each rule is a pure function `(tokens) -> seq of spans`, where a
    span is `[start end replacement]`. The rewriter applies all non-
@@ -17,7 +17,7 @@
 
    Callers: sql/preprocess-sql."
   (:require [clojure.string :as str]
-            [datahike.pg.classify :as cls]))
+            [datahike.pg.sql.classify :as cls]))
 
 ;; ============================================================================
 ;; Core rewriter

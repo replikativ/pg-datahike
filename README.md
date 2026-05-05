@@ -279,12 +279,12 @@ model and ORM-harness setup.
 ## Architecture
 
 ```
-SQL → classify      (tokenize + structural routing)
-    → shape         (structural matcher for catalog-probe SELECTs)
-    → rewrite       (token-driven source rewrites before JSqlParser)
+SQL → sql.classify   (tokenize + structural routing)
+    → sql.shape      (structural matcher for catalog-probe SELECTs)
+    → sql.rewrite    (token-driven source rewrites before JSqlParser)
     → JSqlParser
-    → sql.*         (translate AST → Datalog / tx-data)
-    → server        (handler dispatch, wire protocol)
+    → sql.*          (translate AST → Datalog / tx-data)
+    → server         (handler dispatch, wire protocol)
     → Datahike
 ```
 
@@ -292,15 +292,15 @@ Module inventory (`src/datahike/pg/`):
 
 | Module | Role |
 |---|---|
-| `classify` | Token-based routing for SET, SAVEPOINT, system fns, etc. |
-| `rewrite` | Span-based source rewriter for SQL shapes JSqlParser rejects |
-| `shape` | Structural SELECT probe matcher for catalog queries |
-| `sql.*` | AST → Datalog / tx-data translation (expr, stmt, ctx, ddl, catalog, fns, params) |
+| `sql` | Top-level dispatch: preprocess + parse-sql + result-type routing. |
+| `sql.classify` | Token-based routing for SET, SAVEPOINT, system fns, etc. |
+| `sql.rewrite` | Span-based source rewriter for SQL shapes JSqlParser rejects |
+| `sql.shape` | Structural SELECT probe matcher for catalog queries |
+| `sql.{ddl,stmt,expr,ctx,catalog,fns,params,coerce,oid_infer}` | AST → Datalog / tx-data translation |
 | `schema` | Virtual-table derivation + `:datahike.pg/*` hint support |
 | `server` | Handler reify, wire dispatch, constraint enforcement |
 | `errors` | Exception → SQLSTATE classification at the wire boundary |
-| `types` / `jsonb` | Type coercion + JSONB helpers |
-| `window` | Window-function post-processing |
+| `types` / `arrays` / `jsonb` / `window` | Runtime value model + post-processing |
 
 ## License
 
