@@ -247,6 +247,15 @@ Known gaps (by design or deferred):
 - Cursor materialization is eager (entire result set held in memory)
 - No deferrable constraints
 - Generated columns parse but aren't enforced
+- **Constraint enforcement is one-directional in 0.1.** SQL constraints
+  declared via DDL — `NOT NULL`, `CHECK`, `UNIQUE`, foreign-key
+  child-side and parent-side `RESTRICT` — are enforced by the pgwire
+  handler at write time. Direct `(d/transact)` writes from Clojure
+  bypass these checks because Datahike's schema does not yet carry
+  the corresponding constraint vocabulary. Use the SQL path for
+  constrained inserts, or validate explicitly before transacting.
+  A future release will lift enforcement into Datahike's tx layer
+  so both paths are gated.
 
 ## Development
 
