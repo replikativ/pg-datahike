@@ -105,6 +105,27 @@
       (is (= sql (preprocess sql))))))
 
 ;; ============================================================================
+;; statement_timeout — the parser lives in server.clj but the same
+;; literal-not-in-string invariant applies. See pg-server-test for the
+;; round-trip tests; here we only assert that the substring inside a
+;; literal is not visible to the timeout extractor.
+;; ============================================================================
+
+(deftest statement-timeout-in-string-literal-not-extracted
+  (testing "a SELECT whose literal mentions `set statement_timeout = 5s` must NOT trigger a timeout"
+    (let [parse #'datahike.pg.server/parse-statement-timeout
+          sql "SELECT * FROM t WHERE note = 'set statement_timeout to 5s'"]
+      (is (nil? (parse sql))))))
+
+(deftest statement-timeout-set-extracted
+  (testing "real SET statement_timeout extracts the milliseconds value"
+    (let [parse #'datahike.pg.server/parse-statement-timeout]
+      (is (= 5000 (parse "SET statement_timeout = 5000")))
+      (is (= 5000 (parse "SET statement_timeout = '5s'")))
+      (is (= 0 (parse "SET statement_timeout TO DEFAULT")))
+      (is (= 0 (parse "RESET statement_timeout"))))))
+
+;; ============================================================================
 ;; INDEX/KEY varchar — quote reserved-word column names
 ;; ============================================================================
 

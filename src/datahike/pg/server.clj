@@ -2188,31 +2188,36 @@
                 :else nil)
           :else [key v])))))
 
-(defn- parse-statement-timeout
-  "Match SET statement_timeout = 5000 / = '5s' / = 0 / RESET
-   statement_timeout. Returns the value in milliseconds, 0 (disabled),
-   or nil if not a statement_timeout SET.
-
-   PG accepts raw integers as milliseconds, strings as time units
-   ('5s', '2min'). We accept int ms and 's'/'ms' suffixes — enough
-   for the client drivers that honor this setting."
-  [^String sql]
-  (let [lower (str/lower-case (str/trim sql))]
+(defn- parse-statement-timeout-value
+  "Decode the value portion of `SET statement_timeout`. Accepts integer
+   ms (`5000`), suffixed time units (`'5s'`, `'250ms'`, `'2min'` —
+   typically quoted), or the bareword `default` (returns 0 = disabled).
+   Returns ms as a long, or nil if unparseable."
+  [^String raw]
+  (let [v (str/lower-case raw)]
     (cond
-      (re-find #"(?i)^reset\s+statement_timeout" lower) 0
-      (re-find #"(?i)^set\s+statement_timeout\s+to\s+default" lower) 0
-      :else
-      (when-let [[_ raw] (re-find #"(?i)set\s+statement_timeout\s*(?:to|=)\s*'?([^'\s;]+)'?"
-                                  sql)]
-        (cond
-          (re-matches #"\d+" raw) (Long/parseLong raw)
-          (re-matches #"(\d+)ms" raw)
-          (Long/parseLong (second (re-matches #"(\d+)ms" raw)))
-          (re-matches #"(\d+)s" raw)
-          (* 1000 (Long/parseLong (second (re-matches #"(\d+)s" raw))))
-          (re-matches #"(\d+)min" raw)
-          (* 60000 (Long/parseLong (second (re-matches #"(\d+)min" raw))))
-          :else nil)))))
+      (= v "default") 0
+      (re-matches #"\d+" v) (Long/parseLong v)
+      (re-matches #"(\d+)ms" v)  (Long/parseLong (second (re-matches #"(\d+)ms" v)))
+      (re-matches #"(\d+)s" v)   (* 1000   (Long/parseLong (second (re-matches #"(\d+)s" v))))
+      (re-matches #"(\d+)min" v) (* 60000  (Long/parseLong (second (re-matches #"(\d+)min" v))))
+      :else nil)))
+
+(defn- parse-statement-timeout
+  "Recognise `SET statement_timeout = …` / `SET LOCAL statement_timeout
+   TO …` / `RESET statement_timeout`. Returns the timeout in
+   milliseconds (0 disables), or nil if the SQL is not a
+   statement_timeout op.
+
+   Implemented on top of cls/classify so the matcher cannot fire on a
+   string literal that happens to contain the phrase
+   `set statement_timeout`."
+  [^String sql]
+  (let [{:keys [kind var value]} (cls/classify sql)]
+    (when (= "statement_timeout" var)
+      (cond
+        (= kind :reset) 0
+        (= kind :set)   (when value (parse-statement-timeout-value value))))))
 
 (defn- apply-temporal
   "Apply temporal + branch wrappers to a database based on session state.
