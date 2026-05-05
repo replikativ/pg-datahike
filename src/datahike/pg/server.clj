@@ -3259,15 +3259,34 @@
                        server's tenancy. Typically supplied by
                        `start-server` with the keys of its registry;
                        omit for single-DB / bare-handler use.
+     :dispatch-stats   optional atom; when supplied, the handler bumps
+                       :fast-path-count or :full-parse-count on each
+                       parse-sql invocation depending on whether
+                       catalog/system-query? matched. Used by tests
+                       and observability tooling to detect when an
+                       upgrade silently demotes a probe to the slow
+                       path.
 
    Supports temporal session variables:
      SET datahike.as_of = '2024-01-15T00:00:00Z'
      SET datahike.since = '2024-01-01T00:00:00Z'
      SET datahike.history = 'true'
      RESET datahike.as_of"
-  ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch] :as opts}]]
+  ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
+                                              dispatch-stats]
+                                       :as opts}]]
   (ensure-pg-schema! conn)
   (let [silently-accept (resolve-silently-accept opts)
+        ;; Closure that bumps the caller-supplied stats atom by parse
+        ;; result :type. Centralises the rule so the two parse-sql
+        ;; call sites (parse + execute's non-cached branch) stay in
+        ;; lock-step.
+        bump-dispatch! (when dispatch-stats
+                         (fn [parsed]
+                           (let [bucket (if (= :system (:type parsed))
+                                          :fast-path-count
+                                          :full-parse-count)]
+                             (swap! dispatch-stats update bucket (fnil inc 0)))))
         session-state (atom (cond-> {:db-name (or db-name "datahike")}
                               ;; When the factory saw `database=X:feature`
                               ;; in the StartupMessage, pin the branch so
@@ -3324,6 +3343,7 @@
                 ;; working even though parse-sql may not have set it for
                 ;; non-system types.
                 parsed (assoc parsed :sql sql)]
+            (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
             ;; under Extended Query mode. Pure dispatch — no side
@@ -3521,12 +3541,16 @@
                     ;; Prepared-statement path: reuse the Parse-time result
                     ;; and resolve ParamRef placeholders against the bound
                     ;; values decoded by the wire layer. Simple Query and
-                    ;; non-parameterized prepared statements re-parse.
+                    ;; non-parameterized prepared statements re-parse — bump
+                    ;; the dispatch counter only on the re-parse branch
+                    ;; (Extended-Query Parse already counted at this.parse).
                           parsed (if-let [cached *cached-parsed*]
                                    (if-let [bound *cached-bound*]
                                      (resolve-param-refs cached bound)
                                      cached)
-                                   (sql/parse-sql sql schema db))]
+                                   (let [p (sql/parse-sql sql schema db)]
+                                     (when bump-dispatch! (bump-dispatch! p))
+                                     p))]
                       (let [ctx {:conn conn
                                  :session-id session-id
                                  :session-state session-state
