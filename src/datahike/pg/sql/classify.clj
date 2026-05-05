@@ -474,6 +474,9 @@
       (kw=? t1 "now")           {:kind :now}
       (kw=? t1 "current_schema") {:kind :current-schema}
       (kw=? t1 "current_database") {:kind :current-database}
+      ;; SQL-spec equivalents — both are bare-keyword expressions, not
+      ;; function calls. Tokeniser treats them as :ident, no parens.
+      (kw=? t1 "current_catalog") {:kind :current-database}
       (kw=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (kw=? t1 "txid_current")  {:kind :txid-current}
       (kw=? t1 "pg_sleep")
