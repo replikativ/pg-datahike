@@ -43,3 +43,7 @@ Thumbs.db
 # Runtime logs
 *.log
 /tmp/
+
+# Local design notes / scratch — never committed; team members keep their
+# own notes here. Persisted across worktree switches but never pushed.
+/.internal/
