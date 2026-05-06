@@ -27,6 +27,32 @@ Flyway-style migrations). Not a full PG dialect; see
 
 ## Quickstart
 
+### Standalone server (no Clojure setup)
+
+Each pg-datahike release ships a runnable uberjar on
+[GitHub releases](https://github.com/replikativ/pg-datahike/releases) —
+JDK 17+ is the only prerequisite:
+
+```bash
+java -jar pg-datahike-VERSION-standalone.jar
+# pg-datahike VERSION ready on 127.0.0.1:5432
+#   backend:  file (~/.local/share/pg-datahike)
+#   CREATE DATABASE:  enabled
+#   databases: ["datahike"]
+
+psql postgresql://datahike@localhost:5432/datahike
+```
+
+Useful flags (`--help` for the full list):
+
+```bash
+java -jar pg-datahike.jar --memory                      # ephemeral
+java -jar pg-datahike.jar --port 15432 --data-dir /var/lib/dh
+java -jar pg-datahike.jar --db prod --db staging        # pre-create dbs
+```
+
+### Embedded library
+
 ```clojure
 ;; deps.edn
 {:deps {org.replikativ/datahike     {:mvn/version "LATEST"}

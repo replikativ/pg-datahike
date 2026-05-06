@@ -367,6 +367,58 @@ jobs:
           name: Deploy to Clojars
           command: bb clojars
 
+  build-uber:
+    executor: clj-jdk21
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci
+      - install-clj-tools
+      - run:
+          name: Build standalone uberjar
+          command: bb uber
+      - persist_to_workspace:
+          root: /home/circleci/
+          paths:
+            - project/target
+
+  release:
+    executor: clj-jdk21
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Install GitHub CLI
+          command: |
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+      - run:
+          name: Create GitHub release
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${GITHUB_TOKEN}" ]; then
+              JAR_FILE=$(ls target/pg-datahike-*.jar | grep -v standalone | head -1)
+              UBER_FILE=$(ls target/pg-datahike-*-standalone.jar | head -1)
+              VERSION=$(basename "$JAR_FILE" | sed 's/pg-datahike-//' | sed 's/.jar//')
+              echo "Creating release for version ${VERSION}"
+              gh release create "v${VERSION}" \
+                --title "Release ${VERSION}" \
+                --notes "pg-datahike ${VERSION} — library jar + standalone server uberjar.
+
+Run with:
+
+    java -jar pg-datahike-${VERSION}-standalone.jar [--port N --host ADDR --data-dir DIR --memory --db NAME ...]
+
+See \`--help\` for the full CLI surface." \
+                "$JAR_FILE" "$UBER_FILE" || echo "Release may already exist"
+            else
+              echo "Skipping release - not on main branch or no GITHUB_TOKEN"
+            fi
+
 workflows:
   build-test-and-deploy:
     jobs:
@@ -419,6 +471,23 @@ workflows:
             - pgjdbc-conformance
             - hibernate-app-conformance
             - sqlalchemy-conformance
+      - build-uber:
+          context: ghcr-read-package
+          filters:
+            branches:
+              only: main
+          requires:
+            - build
+      - release:
+          context:
+            - ghcr-read-package
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - deploy
+            - build-uber
 
   # Nightly: wire-protocol regression targets that aren't release-ready
   # yet. The harness scripts work cleanly; the SUT doesn't cover enough of

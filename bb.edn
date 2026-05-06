@@ -46,6 +46,9 @@
   jar {:doc "Build deployable jar."
        :task (shell "clojure -T:build jar")}
 
+  uber {:doc "Build a runnable uberjar at target/pg-datahike-VERSION-standalone.jar."
+        :task (shell "clojure -T:build uber")}
+
   install {:doc "Install jar to local ~/.m2."
            :task (shell "clojure -T:build install")}
 
