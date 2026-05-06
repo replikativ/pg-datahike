@@ -1243,6 +1243,32 @@
                  (mapv #(translate-expr ctx %) ^ParenthesedExpressionList right)
                  (instance? ExpressionList right)
                  (mapv #(translate-expr ctx %) ^ExpressionList right)
+                 ;; IN (SELECT …) — evaluate the subquery once at
+                 ;; translate-time and lift its result column to a
+                 ;; value list. Same conservative pattern as the
+                 ;; scalar-subquery branch below (translate-expr's
+                 ;; ParenthesedSelect handler): non-correlated only;
+                 ;; correlated subqueries that throw inside the inner
+                 ;; translator fall back to an empty list, which makes
+                 ;; the outer `IN` evaluate to false (or, if wrapped
+                 ;; in `IS NOT TRUE`, to true). Surfaced by Odoo's
+                 ;; view-loading probes that wrap an IN-subquery in
+                 ;; IS NOT TRUE.
+                 (instance? ParenthesedSelect right)
+                 (if-let [parse-fn (:parse-sql ctx)]
+                   (try
+                     (let [inner-sql (str (.getSelect ^ParenthesedSelect right))
+                           parsed   (parse-fn inner-sql (:schema ctx) (:db ctx))
+                           q        (:query parsed)
+                           in-args  (:in-args parsed)
+                           query-db (or (:enriched-db parsed) (:db ctx))
+                           q-fn     (requiring-resolve 'datahike.api/q)
+                           rows     (if (seq in-args)
+                                      (apply q-fn q query-db in-args)
+                                      (q-fn q query-db))]
+                       (mapv (fn [r] (if (sequential? r) (first r) r)) rows))
+                     (catch Throwable _ []))
+                   [])
                  :else
                  (throw (ex-info (str "IN expression form unsupported in predicate-expr context: "
                                       (type right))
