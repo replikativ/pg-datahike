@@ -405,15 +405,18 @@ jobs:
               UBER_FILE=$(ls target/pg-datahike-*-standalone.jar | head -1)
               VERSION=$(basename "$JAR_FILE" | sed 's/pg-datahike-//' | sed 's/.jar//')
               echo "Creating release for version ${VERSION}"
+              cat > /tmp/release-notes.md <<EOF
+            pg-datahike ${VERSION} — library jar + standalone server uberjar.
+
+            Run with:
+
+                java -jar pg-datahike-${VERSION}-standalone.jar [--port N --host ADDR --data-dir DIR --memory --db NAME ...]
+
+            See \`--help\` for the full CLI surface.
+            EOF
               gh release create "v${VERSION}" \
                 --title "Release ${VERSION}" \
-                --notes "pg-datahike ${VERSION} — library jar + standalone server uberjar.
-
-Run with:
-
-    java -jar pg-datahike-${VERSION}-standalone.jar [--port N --host ADDR --data-dir DIR --memory --db NAME ...]
-
-See \`--help\` for the full CLI surface." \
+                --notes-file /tmp/release-notes.md \
                 "$JAR_FILE" "$UBER_FILE" || echo "Release may already exist"
             else
               echo "Skipping release - not on main branch or no GITHUB_TOKEN"
