@@ -405,7 +405,7 @@ jobs:
               UBER_FILE=$(ls target/pg-datahike-*-standalone.jar | head -1)
               VERSION=$(basename "$JAR_FILE" | sed 's/pg-datahike-//' | sed 's/.jar//')
               echo "Creating release for version ${VERSION}"
-              cat > /tmp/release-notes.md <<EOF
+              cat > /tmp/release-notes.md \<<EOF
             pg-datahike ${VERSION} — library jar + standalone server uberjar.
 
             Run with:
