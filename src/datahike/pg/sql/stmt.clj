@@ -147,12 +147,20 @@
         ;; Without this, a multi-cond ON falls through to the generic
         ;; predicate path and emits INNER-style equality predicates,
         ;; which break LEFT JOIN semantics on empty right tables.
+        ;; Recursively descend through both AndExpression and
+        ;; size-1 ParenthesedExpressionList, since `ON (a AND b)` parses
+        ;; as a paren-list wrapping an AndExpression and we want to
+        ;; route each conjunct through the per-EqualsTo branch below.
         flatten-and (fn flatten-and [e]
-                      (if (instance? net.sf.jsqlparser.expression.operators.conditional.AndExpression e)
+                      (cond
+                        (instance? net.sf.jsqlparser.expression.operators.conditional.AndExpression e)
                         (let [^net.sf.jsqlparser.expression.operators.conditional.AndExpression ae e]
                           (concat (flatten-and (.getLeftExpression ae))
                                   (flatten-and (.getRightExpression ae))))
-                        [e]))
+                        (and (instance? ParenthesedExpressionList e)
+                             (= 1 (.size ^ParenthesedExpressionList e)))
+                        (flatten-and (.get ^ParenthesedExpressionList e 0))
+                        :else [e]))
         on-exprs (some-> (.getOnExpressions join) seq
                          (->> (mapcat flatten-and)))
         ;; Track ref-attr info for outer join post-processing
