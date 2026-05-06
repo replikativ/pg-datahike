@@ -1457,6 +1457,17 @@
                            (java.time.format.DateTimeFormatter/ofPattern "M/d/y"))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
+     ;; PG also accepts 'Y/M/d' when the year leads (4 digits): the
+     ;; canonical Chinook fixture uses '2002/8/14'-style dates. Real
+     ;; PG parses these via DateStyle=ISO,MDY so we mirror that.
+     (when (re-matches #"\d{4}/\d{1,2}/\d{1,2}" trimmed)
+       (try (java.util.Date/from
+             (.toInstant (.atStartOfDay
+                          (java.time.LocalDate/parse
+                           trimmed
+                           (java.time.format.DateTimeFormatter/ofPattern "yyyy/M/d"))
+                          java.time.ZoneOffset/UTC)))
+            (catch Exception _ nil)))
      ;; All parsing failed — return raw string
      s)))
 
