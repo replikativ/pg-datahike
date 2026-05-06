@@ -103,16 +103,28 @@ PYTHONPATH="${ODOO_ROOT}:${PYTHONPATH:-}" \
 ODOO_RC=$?
 
 # ---- parse the log --------------------------------------------------------
-# Odoo writes "Module base loaded" then "PASS: <test_name>" or
-# "FAIL: <test_name>" per test. Count both.
-PASSED=$(grep -cE '^.*odoo\.tests.*\b(test_|TestORM)' "${LOG}" 2>/dev/null || echo 0)
-RAN=$(grep -cE 'odoo\.tests\.runner.*\bran\b' "${LOG}" 2>/dev/null | head -1)
-SUMMARY="$(grep -E 'odoo\.tests.*Ran [0-9]+ tests' "${LOG}" | tail -1)"
+# Odoo 18+ emits a single result line:
+#   `odoo.tests.result: <F> failed, <E> error(s) of <N> tests when loading database`
+# Older Odoo (≤17) emitted `Ran N tests in T s` + per-test PASS/FAIL.
+# Try the modern form first; fall back to the legacy one if missing.
+RESULT_LINE="$(grep -E 'odoo\.tests\.result.*[0-9]+ failed.*[0-9]+ error.*of [0-9]+ tests' \
+                    "${LOG}" 2>/dev/null | tail -1 || true)"
 
-# More reliable: look for the explicit "OK"/"FAILED" + test count.
-TESTS_RAN=$(echo "${SUMMARY}" | grep -oE 'Ran [0-9]+' | grep -oE '[0-9]+' | head -1)
-FAILURES=$(grep -cE 'FAIL: |ERROR: ' "${LOG}" 2>/dev/null || echo 0)
-PASS_COUNT=$(( ${TESTS_RAN:-0} - FAILURES ))
+if [[ -n "${RESULT_LINE}" ]]; then
+  TESTS_RAN="$(echo "${RESULT_LINE}" | grep -oE 'of [0-9]+ tests' | grep -oE '[0-9]+' | head -1)"
+  FAILURES="$(echo "${RESULT_LINE}" | grep -oE '[0-9]+ failed'   | grep -oE '[0-9]+' | head -1)"
+  ERRORS="$(echo   "${RESULT_LINE}" | grep -oE '[0-9]+ error'    | grep -oE '[0-9]+' | head -1)"
+  PASS_COUNT=$(( ${TESTS_RAN:-0} - ${FAILURES:-0} - ${ERRORS:-0} ))
+  SUMMARY="${RESULT_LINE}"
+else
+  # Legacy parser. Grep with `|| true` so a no-match (exit 1) doesn't
+  # leak a stray "0\n0" into FAILURES — that would break the
+  # arithmetic context further down.
+  SUMMARY="$(grep -E 'odoo\.tests.*Ran [0-9]+ tests' "${LOG}" 2>/dev/null | tail -1 || true)"
+  TESTS_RAN="$(echo "${SUMMARY}" | grep -oE 'Ran [0-9]+' | grep -oE '[0-9]+' | head -1)"
+  FAILURES="$(grep -cE 'FAIL: |ERROR: ' "${LOG}" 2>/dev/null || true)"
+  PASS_COUNT=$(( ${TESTS_RAN:-0} - ${FAILURES:-0} ))
+fi
 
 echo
 echo "[run] odoo exit code: ${ODOO_RC}"
