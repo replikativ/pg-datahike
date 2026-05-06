@@ -67,7 +67,8 @@
      (dump conn {:sections #{:schema}})     ; or #{:data}, default :all
      (dump conn {:exclude-tables #{\"x\"}})  ; skip these table namespaces"
   (:require [clojure.string :as str]
-            [datahike.api :as d]))
+            [datahike.api :as d]
+            [datahike.pg.schema :as pgs]))
 
 ;; ----------------------------------------------------------------------------
 ;; Schema introspection
@@ -106,25 +107,44 @@
 (defn- collect-tables
   "Walk the schema: group attribute keywords by namespace, drop the
    internal ones, return [{:table str :columns [{:name str :ident kw
-   :spec map :ent map} ...]}]. The `:<table>/db-row-exists` row-marker
-   is dropped from each table's columns — it's an internal Datahike-
-   side mechanism that pg-datahike re-adds on CREATE TABLE."
+   :spec map :ent map} ...]}].
+
+   Column ordering follows `pgs/column-order-from-db` (which orders
+   by entity-id == CREATE TABLE order), falling back to alphabetical
+   if no per-table order is recoverable from the db. Preserving
+   declaration order matters for `SELECT *` callers and for
+   bidirectional roundtrip equality.
+
+   The `:<table>/db-row-exists` row-marker is dropped — internal
+   bookkeeping pg-datahike re-adds on CREATE TABLE.
+
+   `:db.type/tuple` attrs are dropped — those represent composite
+   primary keys, which Datahike auto-populates from their component
+   attributes. They aren't actual SQL columns; emitting them would
+   produce a phantom `<table>_pkey` column on the target."
   [db]
   (let [schema (:schema db)
         by-ns (->> schema
                    keys
                    (filter keyword?)
                    (remove #(internal-namespace? (namespace %)))
-                   (group-by namespace))]
+                   (group-by namespace))
+        non-tuple? (fn [ident]
+                     (not= :db.type/tuple (:db/valueType (get schema ident))))]
     (for [[table-ns idents] (sort by-ns)
-          :let [cols (->> idents
-                          (remove #(= "db-row-exists" (name %)))
-                          sort
-                          (mapv (fn [ident]
-                                  {:name (name ident)
-                                   :ident ident
-                                   :spec (get schema ident)
-                                   :ent (attr-entity db ident)})))]
+          :let [filtered (->> idents
+                              (remove #(= "db-row-exists" (name %)))
+                              (filter non-tuple?))
+                ident-by-name (into {} (map (juxt name identity)) filtered)
+                ordered-names (or (some-> (pgs/column-order-from-db db table-ns) seq)
+                                  (sort (map name filtered)))
+                cols (mapv (fn [n]
+                             (let [ident (get ident-by-name n)]
+                               {:name (name ident)
+                                :ident ident
+                                :spec (get schema ident)
+                                :ent (attr-entity db ident)}))
+                           (filter ident-by-name ordered-names))]
           :when (seq cols)]
       {:table table-ns
        :columns cols})))

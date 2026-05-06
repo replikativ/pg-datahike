@@ -90,6 +90,29 @@
          interpret-form
          parse-timestamp-string)
 
+(defn string-value-text
+  "Extract the text of a JSqlParser `StringValue`, applying SQL/PG
+   semantics for the `N'...'` (national character) prefix.
+
+   PG observed behaviour: `N'foo '` (with trailing space) stores as
+   `'foo'` — a CHAR-style trailing-space trim. `'foo '` (no prefix)
+   preserves the trailing space. The PG docs say `N'...'` is
+   identical to `'...'`, but empirically (any 12+ release) PG
+   coerces `N` literals through CHAR, which strips trailing blanks.
+   The Chinook fixture relies on this — its source SQL has trailing
+   spaces inside `N'...'` that PG strips, and our roundtrip needs
+   to match.
+
+   Pass-through for non-`N` prefixes (`E'...'`, `B'...'`, etc.) and
+   for unprefixed strings."
+  [^net.sf.jsqlparser.expression.StringValue sv]
+  (let [v (.getNotExcapedValue sv)
+        prefix (.getPrefix sv)]
+    (if (and v prefix (.equalsIgnoreCase ^String prefix "N"))
+      ;; CHAR-coerce: rstrip trailing ASCII spaces.
+      (str/replace v #" +$" "")
+      v)))
+
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
    ops can index into it uniformly. Inputs come from four places:
@@ -1690,7 +1713,7 @@
       (let [inner ^JsonExpression (first idents)
             inner-base (.getExpression inner)
             outer-key (cond
-                        (instance? StringValue inner-base) (.getNotExcapedValue ^StringValue inner-base)
+                        (instance? StringValue inner-base) (string-value-text ^StringValue inner-base)
                         (instance? LongValue inner-base)   (.getValue ^LongValue inner-base)
                         :else (str inner-base))
             outer-op (first ops)
@@ -1700,7 +1723,7 @@
       ;; Simple: single step — ident is a literal key or index
       (let [ident (first idents)
             key-val (cond
-                      (instance? StringValue ident) (.getNotExcapedValue ^StringValue ident)
+                      (instance? StringValue ident) (string-value-text ^StringValue ident)
                       (instance? LongValue ident)   (.getValue ^LongValue ident)
                       :else (str ident))]
         {:base base :chain [[key-val (first ops)]]}))))
@@ -1791,7 +1814,7 @@
     (.getValue ^DoubleValue expr)
 
     (instance? StringValue expr)
-    (.getNotExcapedValue ^StringValue expr)
+    (string-value-text ^StringValue expr)
 
     (instance? NullValue expr)
     nil

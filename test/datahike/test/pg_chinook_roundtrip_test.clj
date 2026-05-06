@@ -49,6 +49,21 @@
   ["album" "artist" "customer" "employee" "genre" "invoice"
    "invoice_line" "media_type" "playlist" "playlist_track" "track"])
 
+(def ^:private chinook-pks
+  "Primary key column(s) per table — used as a stable sort key for
+   per-row comparison. playlist_track has a composite PK."
+  {"album"          ["album_id"]
+   "artist"         ["artist_id"]
+   "customer"       ["customer_id"]
+   "employee"       ["employee_id"]
+   "genre"          ["genre_id"]
+   "invoice"        ["invoice_id"]
+   "invoice_line"   ["invoice_line_id"]
+   "media_type"     ["media_type_id"]
+   "playlist"       ["playlist_id"]
+   "playlist_track" ["playlist_id" "track_id"]
+   "track"          ["track_id"]})
+
 (defn- preprocess-chinook
   "Strip db-management lines that target a real-PG `\\c chinook` flow:
    we host the schema in our own pre-created datahike DB."
@@ -83,6 +98,79 @@
   [^Connection c ^String sql]
   (with-open [stmt (.createStatement c)]
     (.execute stmt sql)))
+
+(defn- fetch-table
+  "Fetch every row of TABLE from C, ordered by its primary key, as a
+   vector of vectors (column values left-to-right per RowDescription).
+   Used by the per-row comparison check."
+  [^Connection c ^String table]
+  (let [pk-cols (or (chinook-pks table)
+                    (throw (ex-info "no PK known for table" {:table table})))
+        order-by (str/join ", " pk-cols)
+        sql (str "SELECT * FROM " table " ORDER BY " order-by)]
+    (with-open [stmt (.createStatement c)
+                rs (.executeQuery stmt sql)]
+      (let [meta (.getMetaData rs)
+            n (.getColumnCount meta)]
+        (loop [out []]
+          (if (.next rs)
+            (recur (conj out (mapv #(.getObject rs (int %)) (range 1 (inc n)))))
+            out))))))
+
+(defn- value-equal?
+  "Compare two JDBC-returned values with the right semantics for each
+   PG-mapped Java type. The default `.equals` is wrong in two cases:
+
+   - BigDecimal: `1.50.equals(1.5)` is FALSE (it checks scale). PG
+     reports the same NUMERIC value either way; we use .compareTo.
+   - Numbers across types (Long vs Integer for INT columns, etc.)
+     should compare by value, not by class.
+
+   nil is equal only to nil. Everything else falls through to ="
+  [a b]
+  (cond
+    (and (nil? a) (nil? b)) true
+    (or (nil? a) (nil? b)) false
+    (and (instance? java.math.BigDecimal a)
+         (instance? java.math.BigDecimal b))
+    (zero? (.compareTo ^java.math.BigDecimal a ^java.math.BigDecimal b))
+    (and (number? a) (number? b)) (= (long a) (long b))
+    :else (= a b)))
+
+(defn- diff-table
+  "Return a description of the first row pair that differs between
+   BASELINE-ROWS and TARGET-ROWS, or nil when they match. The two
+   inputs must be ordered identically (we sort by PK in fetch-table).
+
+   Surfaces both differing values and length mismatches so a failing
+   test gives the operator something to act on instead of just `is
+   false`."
+  [baseline-rows target-rows]
+  (let [bn (count baseline-rows)
+        tn (count target-rows)]
+    (cond
+      (not= bn tn) {:reason :length-mismatch :baseline bn :target tn}
+      :else
+      (loop [i 0]
+        (cond
+          (>= i bn) nil
+          :else
+          (let [b (nth baseline-rows i)
+                t (nth target-rows i)
+                diff-col (loop [j 0]
+                           (cond
+                             (>= j (count b)) nil
+                             (not (value-equal? (nth b j) (nth t j))) j
+                             :else (recur (inc j))))]
+            (if diff-col
+              {:reason :value-mismatch
+               :row-index i
+               :col-index diff-col
+               :baseline-value (nth b diff-col)
+               :target-value (nth t diff-col)
+               :baseline-row b
+               :target-row t}
+              (recur (inc i)))))))))
 
 ;; ============================================================================
 ;; Test driver: full source → pg-datahike → dump → target roundtrip.
@@ -164,6 +252,61 @@
               (let [counts (count-tables c)]
                 (is (= *baseline-counts* counts)
                     "Per-table row counts must match the real-PG baseline")))
+            (finally
+              (.stop ^datahike.pg.PgWireServer (:server srv))
+              (d/release conn)
+              (d/delete-database cfg))))))))
+
+(deftest chinook-roundtrip-per-row-equality
+  ;; Strongest assertion: every row of every table is byte-identical
+  ;; (via type-aware equality) between the real-PG baseline and the
+  ;; roundtripped target. Catches NUMERIC precision drift, timestamp
+  ;; tz drift, NULL-vs-empty-string confusion, value reordering — all
+  ;; the ways count-only checks can succeed on a corrupted dump.
+  (when-not *real-pg-skip-reason*
+    (testing "real-PG → pg-datahike → dump → real-PG: every row matches by value"
+      (pg/reset-lock-registry!)
+      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+                 :schema-flexibility :write :keep-history? false}]
+        (d/create-database cfg)
+        (let [conn (d/connect cfg)
+              srv (pg/start-server conn {:port 0})
+              port (.getPort ^datahike.pg.PgWireServer (:server srv))]
+          (try
+            ;; Ingest into pg-datahike, dump, replay into chinook_rt.
+            (with-open [c (DriverManager/getConnection
+                           (str "jdbc:postgresql://localhost:" port "/datahike"
+                                "?user=datahike&password=datahike"))]
+              (execute-multistatement! c (preprocess-chinook *fixture-sql*)))
+            (let [dump-sql (dump/dump-to-string conn)]
+              (with-open [c (DriverManager/getConnection (real-pg-url real-pg-admin-db))]
+                (try (exec! c "DROP DATABASE IF EXISTS chinook_rt") (catch Throwable _))
+                (exec! c "CREATE DATABASE chinook_rt"))
+              (with-open [c (DriverManager/getConnection (real-pg-url "chinook_rt"))]
+                (execute-multistatement! c dump-sql)))
+
+            ;; Per-table per-row diff against the baseline.
+            (with-open [bc (DriverManager/getConnection (real-pg-url "chinook"))
+                        tc (DriverManager/getConnection (real-pg-url "chinook_rt"))]
+              (doseq [t chinook-tables]
+                (testing (str "table " t)
+                  (let [baseline (fetch-table bc t)
+                        target   (fetch-table tc t)
+                        diff     (diff-table baseline target)]
+                    (is (nil? diff)
+                        (str "table " t ": "
+                             (case (:reason diff)
+                               :length-mismatch
+                               (str "row count differs (baseline " (:baseline diff)
+                                    ", target " (:target diff) ")")
+                               :value-mismatch
+                               (str "row " (:row-index diff)
+                                    " col " (:col-index diff)
+                                    ": baseline=" (pr-str (:baseline-value diff))
+                                    " target=" (pr-str (:target-value diff))
+                                    " baseline-row=" (pr-str (:baseline-row diff))
+                                    " target-row=" (pr-str (:target-row diff)))
+                               diff)))))))
             (finally
               (.stop ^datahike.pg.PgWireServer (:server srv))
               (d/release conn)

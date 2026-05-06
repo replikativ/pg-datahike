@@ -496,7 +496,7 @@
           value (cond
                   (instance? LongValue right) (.getValue ^LongValue right)
                   (instance? DoubleValue right) (.getValue ^DoubleValue right)
-                  (instance? StringValue right) (.getNotExcapedValue ^StringValue right)
+                  (instance? StringValue right) (expr/string-value-text ^StringValue right)
                   :else (str right))]
       {:op op :col-idx col-idx :value value})
 
@@ -2196,7 +2196,7 @@
           (catch NumberFormatException _
             (java.math.BigInteger. ^String (.getStringValue ^LongValue e))))
      (instance? DoubleValue e) (.getValue ^DoubleValue e)
-     (instance? StringValue e) (.getNotExcapedValue ^StringValue e)
+     (instance? StringValue e) (expr/string-value-text ^StringValue e)
      (instance? BooleanValue e) (.getValue ^BooleanValue e)
      (instance? NullValue e) nil
      (instance? SignedExpression e)
@@ -2511,7 +2511,7 @@
     (.getValue ^DoubleValue value-expr)
 
     (instance? StringValue value-expr)
-    (.getNotExcapedValue ^StringValue value-expr)
+    (expr/string-value-text ^StringValue value-expr)
 
     (instance? BooleanValue value-expr)
     (.getValue ^BooleanValue value-expr)
