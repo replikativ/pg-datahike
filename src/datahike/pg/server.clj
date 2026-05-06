@@ -3214,6 +3214,841 @@
     (catch Exception e
       (classified-error "setval error: " e))))
 
+;; ============================================================================
+;; Per-type executors — each handles one (:type parsed) value.
+;;
+;; Every executor takes [ctx parsed] and returns a PgWireServer$QueryResult.
+;; ctx is constructed once per query in make-query-handler's execute body
+;; (see the comment block above that ctx literal for the key contract).
+;; ============================================================================
+
+(defn- exec-system
+  "Dispatch on (:system-type parsed). System-types are recognised by
+   cls/classify (token-driven) and don't go through JSqlParser — most
+   delegate to the handle-X defns above; a handful are inline empty-
+   result tags for synthetic success of no-op DDL (CREATE/DROP SCHEMA,
+   COMMENT ON, LOCK TABLE, …)."
+  [ctx parsed]
+  (let [{:keys [conn session-state schema tx-state
+                on-create-database on-delete-database registry-atom]} ctx]
+    (case (:system-type parsed)
+      :set      (empty-result "SET")
+      :prepare          (handle-prepare ctx parsed)
+      :execute-prepared (handle-execute-prepared ctx parsed)
+      :deallocate       (handle-deallocate ctx parsed)
+      :declare-cursor   (handle-declare-cursor ctx parsed)
+      :fetch-cursor     (handle-fetch-cursor ctx parsed)
+      :close-cursor     (handle-close-cursor ctx parsed)
+      :move-cursor      (handle-move-cursor ctx parsed)
+      :begin                 (handle-begin ctx parsed)
+      :savepoint             (handle-savepoint ctx parsed)
+      :release-savepoint     (handle-release-savepoint ctx parsed)
+      :commit                (handle-commit ctx parsed)
+      :rollback              (handle-rollback ctx parsed)
+      :rollback-to-savepoint (handle-rollback-to-savepoint ctx parsed)
+      :discard-all           (handle-discard-all ctx parsed)
+      :discard-scoped
+      ;; DISCARD PLANS/SEQUENCES/TEMP/LOCKS. No-op in our model;
+      ;; report the actual variant in the command tag. classify
+      ;; exposes the lowercased scope.
+      (empty-result (str "DISCARD " (str/upper-case (:scope parsed))))
+      :comment-on (empty-result "COMMENT")
+      :lock-table (empty-result "LOCK TABLE")
+      :maintenance-noop
+      ;; VACUUM / REINDEX / CLUSTER — classify carries the verb
+      ;; as :tag already ("VACUUM" / "REINDEX" / "CLUSTER").
+      (empty-result (:tag parsed))
+      :schema-noop
+      ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
+      ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
+      (empty-result (:tag parsed))
+
+      :create-database
+      ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via the
+      ;; operator-supplied :on-create-database hook. On success the
+      ;; new conn is added to the server's mutable registry under
+      ;; db-name; subsequent connections with database=foo route
+      ;; to it. Without a hook configured we return SQLSTATE 0A000
+      ;; — provisioning from SQL is a deployment policy decision,
+      ;; not a default. See datahike.pg.sql.database/db-from-template.
+      (let [{:keys [db-name options if-not-exists?]} parsed]
+        (cond
+          (and if-not-exists? registry-atom
+               (contains? @registry-atom db-name))
+          (empty-result "CREATE DATABASE")
+
+          (nil? on-create-database)
+          (-> (PgWireServer$QueryResult.
+               (str "CREATE DATABASE not supported — configure "
+                    ":on-create-database on the server"))
+              (.withSqlstate "0A000"))
+
+          (and registry-atom (contains? @registry-atom db-name))
+          (-> (PgWireServer$QueryResult.
+               (str "database \"" db-name "\" already exists"))
+              (.withSqlstate "42P04"))
+
+          :else
+          (try
+            (let [new-conn (on-create-database db-name options)]
+              (when registry-atom
+                (swap! registry-atom assoc db-name new-conn))
+              (empty-result "CREATE DATABASE"))
+            (catch clojure.lang.ExceptionInfo e
+              (let [data (ex-data e)
+                    state (or (:sqlstate data)
+                              (case (:error data)
+                                :syntax-error "42601"
+                                :feature-not-supported "0A000"
+                                "XX000"))]
+                (-> (PgWireServer$QueryResult.
+                     (str "CREATE DATABASE failed: " (.getMessage e)))
+                    (.withSqlstate state))))
+            (catch Throwable e
+              (-> (PgWireServer$QueryResult.
+                   (str "CREATE DATABASE failed: " (.getMessage e)))
+                  (.withSqlstate "XX000"))))))
+
+      :drop-database
+      ;; SQL `DROP DATABASE [IF EXISTS] foo;`. Routed via
+      ;; :on-delete-database. Removes the entry from the registry
+      ;; on success and calls the hook so the operator can release
+      ;; + delete the backing store.
+      (let [{:keys [db-name if-exists?]} parsed
+            existing (when registry-atom (get @registry-atom db-name))]
+        (cond
+          (and (nil? existing) if-exists?)
+          (empty-result "DROP DATABASE")
+
+          (nil? existing)
+          (-> (PgWireServer$QueryResult.
+               (str "database \"" db-name "\" does not exist"))
+              (.withSqlstate "3D000"))
+
+          (nil? on-delete-database)
+          (-> (PgWireServer$QueryResult.
+               (str "DROP DATABASE not supported — configure "
+                    ":on-delete-database on the server"))
+              (.withSqlstate "0A000"))
+
+          :else
+          (try
+            (on-delete-database db-name existing nil)
+            (when registry-atom
+              (swap! registry-atom dissoc db-name))
+            (empty-result "DROP DATABASE")
+            (catch Throwable e
+              (-> (PgWireServer$QueryResult.
+                   (str "DROP DATABASE failed: " (.getMessage e)))
+                  (.withSqlstate "XX000"))))))
+
+      ;; Advisory locks (see defonce ^:private advisory-locks above).
+      :advisory-lock           (handle-advisory-lock ctx parsed)
+      :try-advisory-lock       (handle-try-advisory-lock ctx parsed)
+      :advisory-xact-lock      (handle-advisory-xact-lock ctx parsed)
+      :try-advisory-xact-lock  (handle-try-advisory-xact-lock ctx parsed)
+      :advisory-unlock         (handle-advisory-unlock ctx parsed)
+      :advisory-unlock-all     (handle-advisory-unlock-all ctx parsed)
+
+      ;; Session introspection
+      :pg-backend-pid          (handle-pg-backend-pid ctx parsed)
+      :txid-current            (handle-txid-current ctx parsed)
+      :pg-sleep                (handle-pg-sleep ctx parsed)
+      ;; Catalog probes (shape-matched in system-query?*)
+      :empty-catalog      (handle-empty-catalog ctx parsed)
+      :create-view        (empty-result "CREATE VIEW")
+      :create-index       (empty-result "CREATE INDEX")
+      :get-fk-conname     (handle-get-fk-conname ctx parsed)
+      :get-primary-keys   (handle-get-primary-keys ctx parsed)
+      :get-field-metadata (handle-get-field-metadata ctx parsed)
+
+      ;; Simple info queries
+      :show              (handle-show (:var parsed) schema session-state)
+      :version           (handle-version)
+      :pg-keywords       (handle-pg-keywords ctx parsed)
+      :current-schema    (handle-current-schema)
+      :current-database  (handle-current-database (:db-name @session-state))
+      :now               (handle-now ctx parsed)
+
+      ;; Sequence functions (classify supplies :seq-name / :new-value)
+      :nextval           (handle-nextval ctx parsed)
+      :currval           (handle-currval ctx parsed)
+      :setval            (handle-setval ctx parsed)
+
+      ;; datahike.* branching / versioning
+      :dh-branches       (handle-dh-branches conn ctx parsed)
+      :dh-current-branch (handle-dh-current-branch conn session-state)
+      :dh-commit-id      (handle-dh-commit-id conn session-state)
+      :dh-parent-commits (handle-dh-parent-commits conn session-state)
+      :dh-create-branch  (handle-dh-create-branch conn parsed)
+      :dh-delete-branch  (handle-dh-delete-branch conn parsed)
+      (empty-result "OK"))))
+
+(defn- exec-select
+  "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
+   UPDATE row-locking variants (skip / nowait / block), aggregate-on-
+   empty default rows, server-side null-safe ORDER BY, hidden ORDER-BY
+   column stripping, window functions, HAVING, compound aggregate
+   expressions, DISTINCT-on-aggregates, and schema-derived OID
+   computation for the result-set metadata."
+  [ctx parsed]
+  (let [{:keys [db tx-state]} ctx
+        {:keys [query find-aliases limit offset
+                having has-aggregates? has-distinct?
+                in-args hidden-count compound-exprs window-specs
+                sql-order-by sql-limit sql-offset
+                enriched-db literal-row literal-rows for-update]} parsed]
+    (if (or literal-row literal-rows)
+      ;; Table-free SELECT: return literal row(s) directly.
+      ;; :literal-rows is used by table-function expansions
+      ;; (unnest(array_fill(...))) that produce N rows from
+      ;; compile-time-known arguments. Pass :select-item-oids
+      ;; (via a synthetic schema-oids array keyed by
+      ;; -1 sentinel) so SELECT TRUE reports BOOL even when
+      ;; value inference would look at a String.
+      (let [item-oids (:select-item-oids parsed)
+            schema-oids (when item-oids
+                          (int-array
+                           (map #(int (or % -1)) item-oids)))]
+        (format-query-result (or literal-rows [literal-row])
+                             find-aliases
+                             schema-oids))
+      (let [;; Use enriched db when CTEs/derived tables created speculative data
+            query-db (or enriched-db db)
+            hidden-count (or hidden-count 0)
+            q-input (cond-> query
+                      limit  (assoc :limit limit)
+                      offset (assoc :offset offset)
+                      :always (assoc :cancel (current-cancel)))
+            results (if (seq in-args)
+                      (apply d/q q-input query-db in-args)
+                      (d/q q-input query-db))
+            ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
+            ;; Extract the `id` column from each result row, check the
+            ;; server-wide lock registry, and either:
+            ;;   :skip    — drop rows held by another session
+            ;;   :nowait  — raise 55P03 if any row held by another
+            ;;   :block   — acquire optimistically (no real blocking
+            ;;              possible; behaves like :nowait for correctness)
+            results
+            (if for-update
+              (let [{:keys [wait table]} for-update
+                    id-idx (some (fn [[i a]]
+                                   (when (and (string? a)
+                                              (or (= a "id")
+                                                  (str/ends-with? a ".id")))
+                                     i))
+                                 (map-indexed vector find-aliases))
+                    session-id (:session-id @tx-state)]
+                (if-not (and id-idx session-id)
+                  results ;; can't lock without an id column; no-op
+                  (let [results-vec (mapv (fn [r] (if (sequential? r) (vec r) [r]))
+                                          results)]
+                    (case wait
+                      :skip
+                      (let [kept (vec (keep (fn [row]
+                                              (let [id (nth row id-idx nil)]
+                                                (when (and (some? id)
+                                                           (= :acquired (acquire-lock! session-id table id)))
+                                                  (swap! tx-state update :owned-locks (fnil conj #{}) [table id])
+                                                  row)))
+                                            results-vec))]
+                        kept)
+                      :nowait
+                      (let [conflict (some (fn [row]
+                                             (let [id (nth row id-idx nil)]
+                                               (when (and (some? id)
+                                                          (= :conflict (acquire-lock! session-id table id)))
+                                                 id)))
+                                           results-vec)]
+                        (if conflict
+                          (throw (ex-info "lock not available"
+                                          {:error :lock-not-available
+                                           :table table}))
+                          (do
+                            (doseq [row results-vec
+                                    :let [id (nth row id-idx nil)]
+                                    :when (some? id)]
+                              (swap! tx-state update :owned-locks (fnil conj #{}) [table id]))
+                            results-vec)))
+                      :block
+                      ;; No way to actually wait; behave like :nowait
+                      ;; (strict) — the session that would block simply
+                      ;; sees the error. Most PG clients retry.
+                      (let [conflict (some (fn [row]
+                                             (let [id (nth row id-idx nil)]
+                                               (when (and (some? id)
+                                                          (= :conflict (acquire-lock! session-id table id)))
+                                                 id)))
+                                           results-vec)]
+                        (if conflict
+                          (throw (ex-info "lock not available"
+                                          {:error :lock-not-available
+                                           :table table}))
+                          (do
+                            (doseq [row results-vec
+                                    :let [id (nth row id-idx nil)]
+                                    :when (some? id)]
+                              (swap! tx-state update :owned-locks (fnil conj #{}) [table id]))
+                            results-vec)))))))
+              results)
+            ;; SQL requires: aggregate on empty result → one row with defaults
+            ;; COUNT(*) → 0, SUM/AVG/MIN/MAX → NULL.
+            ;; This applies ONLY when there is no GROUP BY — i.e.
+            ;; every :find element is an aggregate form. With a
+            ;; group-by column in :find (a plain `?var` element),
+            ;; an empty result means zero matching groups, so PG
+            ;; returns zero rows. The earlier always-on default
+            ;; synthesis turned `WHERE …→ 0 rows GROUP BY status`
+            ;; into a single bogus `[null, 0]` row.
+            find-elems (:find query)
+            all-aggregates? (and (seq find-elems)
+                                 (every? (fn [elem]
+                                           (and (seq? elem)
+                                                (symbol? (first elem))))
+                                         find-elems))
+            results (if (and has-aggregates?
+                             all-aggregates?
+                             (empty? (seq results)))
+                      (let [default-row (mapv (fn [elem]
+                                                (let [agg-name (name (first elem))]
+                                                  (if (or (= agg-name "count")
+                                                          (= agg-name "count-distinct")
+                                                          (= agg-name "filter-count")
+                                                          (= agg-name "filter-count-distinct"))
+                                                    0
+                                                    nil)))
+                                              find-elems)]
+                        [default-row])
+                      results)
+            ;; Server-side null-safe sort (when ORDER BY has nullable columns)
+            results (if sql-order-by
+                      (let [null-safe-cmp
+                            (fn [a b]
+                              (let [av (if (sequential? a) a [a])
+                                    bv (if (sequential? b) b [b])]
+                                (loop [specs (partition 2 sql-order-by)]
+                                  (if-let [[idx dir] (first specs)]
+                                    (let [va (nth av idx nil)
+                                          vb (nth bv idx nil)
+                                          a-null? (or (nil? va) (= :__null__ va))
+                                          b-null? (or (nil? vb) (= :__null__ vb))
+                                          c (cond
+                                              (and a-null? b-null?) 0
+                                              ;; NULLs last for ASC, first for DESC (PG default)
+                                              a-null? (if (= dir :asc) 1 -1)
+                                              b-null? (if (= dir :asc) -1 1)
+                                              :else (if (= dir :desc)
+                                                      (compare vb va)
+                                                      (compare va vb)))]
+                                      (if (zero? c)
+                                        (recur (rest specs))
+                                        c))
+                                    0))))]
+                        (let [sorted (sort null-safe-cmp results)]
+                          (cond->> sorted
+                            sql-offset (drop sql-offset)
+                            sql-limit  (take sql-limit))))
+                      results)
+            ;; Strip hidden ORDER BY columns from results and aliases
+            [results find-aliases]
+            (if (pos? hidden-count)
+              (let [visible (- (count (:find query)) hidden-count)]
+                [(map (fn [row]
+                        (if (sequential? row)
+                          (vec (take visible row))
+                          row))
+                      results)
+                 find-aliases])
+              [results find-aliases])
+            ;; Apply window functions: ROW_NUMBER, RANK, SUM OVER, etc.
+            ;; Window specs reference column indices in the result tuples.
+            ;; The window engine appends computed values to each row.
+            [results find-aliases]
+            (if (seq window-specs)
+              (let [;; Ensure results are vectors of vectors
+                    vec-results (mapv (fn [r] (if (sequential? r) (vec r) [r])) results)
+                    windowed (window/execute-window-functions vec-results window-specs)
+                    ;; Add window aliases
+                    win-aliases (mapv (fn [spec]
+                                        (or (:alias spec) (name (:op spec))))
+                                      window-specs)
+                    new-aliases (into (vec find-aliases) win-aliases)
+                    ;; Hide internal window helper columns (__win_*)
+                    visible-indices (into []
+                                          (keep-indexed (fn [i a]
+                                                          (when-not (and (string? a)
+                                                                         (.startsWith ^String a "__win_"))
+                                                            i)))
+                                          new-aliases)
+                    final-results (mapv (fn [row]
+                                          (mapv #(nth row % nil) visible-indices))
+                                        windowed)
+                    final-aliases (mapv #(nth new-aliases %) visible-indices)]
+                [final-results final-aliases])
+              [results find-aliases])
+            ;; Apply HAVING filter when present
+            results (apply-having results find-aliases having)
+            ;; Apply compound aggregate expressions: MAX(a) - MIN(a)
+            ;; Each compound-expr has {:alias :op :l-idx :r-idx}.
+            ;; We compute the derived value and replace the hidden agg columns.
+            [results find-aliases]
+            (if (seq compound-exprs)
+              (let [ops {'+ + '- - '* * '/ /}
+                    ;; Compute the compound values for each row
+                    new-results
+                    (mapv (fn [row]
+                            (let [rv (if (sequential? row) (vec row) [row])]
+                              (reduce (fn [r {:keys [op l-idx r-idx]}]
+                                        (let [lv (nth r l-idx nil)
+                                              rv-val (nth r r-idx nil)
+                                              op-fn (get ops op)]
+                                          (conj r (when (and lv rv-val op-fn
+                                                             (number? lv) (number? rv-val))
+                                                    (op-fn lv rv-val)))))
+                                      rv compound-exprs)))
+                          results)
+                    ;; Build new aliases: keep originals + add compound aliases
+                    compound-aliases (mapv :alias compound-exprs)
+                    new-aliases (into (vec find-aliases) compound-aliases)
+                    ;; Hide the internal aggregate columns (prefixed with __compound_)
+                    visible-indices (into []
+                                          (keep-indexed (fn [i a]
+                                                          (when-not (and (string? a)
+                                                                         (.startsWith ^String a "__compound_"))
+                                                            i)))
+                                          new-aliases)
+                    final-results (mapv (fn [row]
+                                          (mapv #(nth row %) visible-indices))
+                                        new-results)
+                    final-aliases (mapv #(nth new-aliases %) visible-indices)]
+                [final-results final-aliases])
+              [results find-aliases])
+            ;; Apply DISTINCT deduplication for aggregate queries
+            results (if (and has-distinct? has-aggregates?)
+                      (distinct results)
+                      results)]
+        ;; Derive schema-based OIDs for proper type metadata.
+        ;; Shared with describeResult; see compute-schema-oids.
+        (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
+              schema-oids (compute-schema-oids parsed-with-shape db)
+              ;; Blend parse-time OIDs (oid-infer)
+              ;; over the -1 sentinel so empty
+              ;; result sets and aggregate /
+              ;; CAST / literal columns keep the
+              ;; correct type when value inference
+              ;; would otherwise fall back to TEXT.
+              item-oids (:select-item-oids parsed)
+              schema-oids (if (and item-oids (seq find-aliases))
+                            (let [n (count find-aliases)
+                                  out (int-array n)]
+                              (dotimes [i n]
+                                (let [so (aget ^ints schema-oids i)
+                                      io (when (< i (count item-oids))
+                                           (nth item-oids i))]
+                                  (aset out i
+                                        (int (if (and (= so -1) io) io so)))))
+                              out)
+                            schema-oids)
+              sources (compute-column-sources parsed-with-shape db)
+              result (format-query-result results find-aliases schema-oids)]
+          (if sources
+            (-> ^PgWireServer$QueryResult result
+                (.withColumnSources (first sources) (second sources))
+                (.withColumnTypmods (nth sources 2)))
+            result))))))
+
+(defn- exec-insert
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx]
+    (if (:in-tx? @tx-state)
+      (try
+        (let [table-name (:table parsed)
+              spec-db (:speculative-db @tx-state)
+              tx-data (-> (:tx-data parsed)
+                          (auto-populate-identity table-name spec-db)
+                          (apply-column-constraints table-name
+                                                    (:ns parsed)
+                                                    spec-db))
+              spec-report (dc/with spec-db tx-data)
+              new-tempids (into {} (keep (fn [[tid eid]] (when (string? tid) [eid tid])))
+                                (:tempids spec-report))
+              db-after (:db-after spec-report)]
+          (swap! tx-state (fn [ts]
+                            (-> ts
+                                (update :tx-buffer into tx-data)
+                                (assoc :speculative-db db-after)
+                                (update :eid->tempid merge new-tempids))))
+          (if-let [returning (:returning parsed)]
+            ;; RETURNING: read values from speculative db-after.
+            ;; Order matters — Odoo matches RETURNING rows positionally
+            ;; to VALUES. Extract tempids from the parsed tx-data
+            ;; (preserves VALUES order) and resolve each to an eid.
+            ;; Falls back to hash-order if tempids can't be recovered
+            ;; (e.g. ON CONFLICT path where tx-data is :db.fn/call).
+            (let [ns-prefix (str table-name "/")
+                  tempids-map (:tempids spec-report)
+                  has-row? (fn [eid]
+                             (some (fn [^datahike.datom.Datom d]
+                                     (let [a (.-a d)]
+                                       (and (keyword? a)
+                                            (.startsWith (str (namespace a) "/") ns-prefix)
+                                            (not= (name a) "db-row-exists"))))
+                                   (d/datoms db-after :eavt eid)))
+                  ;; ON CONFLICT path records row-positional eids/tempids
+                  ;; via :row-refs atom set in translate-insert.
+                  ;; Non-ON-CONFLICT path uses :db/id tempids on entity maps.
+                  ordered-refs (if-let [refs (:row-refs parsed)]
+                                 @refs
+                                 (keep #(when (and (map? %) (string? (:db/id %)))
+                                          (:db/id %))
+                                       (:tx-data parsed)))
+                  ordered-eids (vec (keep (fn [ref]
+                                            (cond
+                                              ;; already an eid (DO UPDATE case)
+                                              (integer? ref) ref
+                                              ;; tempid string — resolve via tempids map
+                                              (string? ref) (get tempids-map ref)
+                                              :else nil))
+                                          ordered-refs))
+                  data-eids (if (seq ordered-eids)
+                              (filterv has-row? ordered-eids)
+                              (filterv has-row? (vals tempids-map)))]
+              (build-returning-result returning db-after data-eids table-name (:schema db-after)))
+            (empty-result (str "INSERT 0 " (:count parsed)))))
+        (catch Exception e
+          (swap! tx-state assoc :aborted? true)
+          (classified-error "INSERT error: " e)))
+      (execute-insert conn parsed))))
+
+(defn- exec-update-with-recursive
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx]
+    (if (:in-tx? @tx-state)
+      (try
+        (let [spec-db (:speculative-db @tx-state)
+              eid->tempid (:eid->tempid @tx-state)
+              {:keys [eids tx-data]} (build-update-with-recursive-tx spec-db parsed)
+              spec-report (when (seq tx-data) (dc/with spec-db tx-data))
+              commit-tx-data (mapv (fn [[op eid attr val]]
+                                     [op (get eid->tempid eid eid) attr val])
+                                   tx-data)]
+          (swap! tx-state (fn [ts]
+                            (cond-> ts
+                              true (update :tx-buffer into commit-tx-data)
+                              spec-report (assoc :speculative-db (:db-after spec-report)))))
+          (empty-result (str "UPDATE " (count eids))))
+        (catch Exception e
+          (swap! tx-state assoc :aborted? true)
+          (classified-error "UPDATE (WITH RECURSIVE) error: " e)))
+      (execute-update-with-recursive conn parsed))))
+
+(defn- exec-update
+  [ctx parsed]
+  (let [{:keys [conn schema tx-state]} ctx]
+    (if (:in-tx? @tx-state)
+      (try
+        (let [spec-db (:speculative-db @tx-state)
+              eid->tempid (:eid->tempid @tx-state)
+              {:keys [eids tx-data]} (build-update-tx spec-db schema parsed)
+              _ (check-update-identity-collisions! spec-db schema tx-data)
+              _ (check-not-null-on-update! spec-db tx-data)
+              _ (check-updates-against-row-constraints!
+                 spec-db (:table parsed) (or (:ns parsed) (:table parsed)) tx-data)
+              _ (enforce-fk-restrict-on-update! spec-db (:table parsed) tx-data)
+              ;; Apply to speculative-db with ORIGINAL entity IDs
+              spec-report (dc/with spec-db tx-data)
+              ;; For the commit buffer, remap real eids to tempids.
+              ;; Drop :db/retract ops that would remap onto a tempid —
+              ;; the entity is new in this tx, so there's no prior
+              ;; value to retract, and Datahike rejects tempids in
+              ;; :db/retract.
+              commit-tx-data (vec (keep (fn [[op eid attr val]]
+                                          (let [mapped (get eid->tempid eid eid)]
+                                            (when-not (and (= op :db/retract)
+                                                           (not= mapped eid))
+                                              [op mapped attr val])))
+                                        tx-data))]
+          (swap! tx-state (fn [ts]
+                            (-> ts
+                                (update :tx-buffer into commit-tx-data)
+                                (assoc :speculative-db (:db-after spec-report)))))
+          (empty-result (str "UPDATE " (count eids))))
+        (catch Exception e
+          (swap! tx-state assoc :aborted? true)
+          (classified-error "UPDATE error: " e)))
+      (execute-update conn parsed schema))))
+
+(defn- exec-delete
+  [ctx parsed]
+  (let [{:keys [conn schema tx-state]} ctx]
+    (if (:in-tx? @tx-state)
+      (try
+        (let [spec-db (:speculative-db @tx-state)
+              eid->tempid (:eid->tempid @tx-state)
+              {:keys [eids]} (build-delete-tx spec-db schema parsed)
+              _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
+              ;; Apply to speculative-db with ORIGINAL entity IDs
+              spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
+              spec-report (dc/with spec-db spec-tx-data)
+              ;; For commit buffer, remap to tempids
+              commit-tx-data (mapv (fn [eid] [:db/retractEntity (get eid->tempid eid eid)]) eids)]
+          (swap! tx-state (fn [ts]
+                            (-> ts
+                                (update :tx-buffer into commit-tx-data)
+                                (assoc :speculative-db (:db-after spec-report)))))
+          (empty-result (str "DELETE " (count eids))))
+        (catch Exception e
+          (swap! tx-state assoc :aborted? true)
+          (classified-error "DELETE error: " e)))
+      (execute-delete conn parsed schema))))
+
+(defn- exec-ddl-create
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx]
+    (execute-ddl-create conn parsed tx-state)))
+
+(defn- exec-ddl-create-sequence
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE SEQUENCE")
+      (try
+        (d/transact conn (:tx-data parsed))
+        (empty-result "CREATE SEQUENCE")
+        (catch Exception e
+          (classified-error "CREATE SEQUENCE error: " e))))))
+
+(defn- exec-savepoint
+  [ctx _parsed]
+  (let [{:keys [tx-state]} ctx]
+    (do (swap! tx-state update :savepoints (fnil conj [])
+               {:speculative-db (:speculative-db @tx-state)
+                :tx-buffer (:tx-buffer @tx-state)
+                :eid->tempid (:eid->tempid @tx-state)})
+        (empty-result "SAVEPOINT"))))
+
+(defn- exec-release-savepoint
+  [ctx _parsed]
+  (let [{:keys [tx-state]} ctx]
+    (do (swap! tx-state update :savepoints
+               (fn [sp] (if (seq sp) (pop sp) [])))
+        (empty-result "RELEASE SAVEPOINT"))))
+
+(defn- exec-rollback-to-savepoint
+  [ctx _parsed]
+  (let [{:keys [tx-state]} ctx
+        sp-stack (:savepoints @tx-state)]
+    (when (seq sp-stack)
+      (let [{:keys [speculative-db tx-buffer eid->tempid]} (peek sp-stack)]
+        (swap! tx-state assoc
+               :aborted? false  ;; ROLLBACK TO clears error state
+               :speculative-db speculative-db
+               :tx-buffer tx-buffer
+               :eid->tempid eid->tempid
+               :savepoints (pop sp-stack))))
+    (empty-result "ROLLBACK")))
+
+(defn- exec-ddl-create-index
+  [_ctx _parsed]
+  (empty-result "CREATE INDEX"))
+
+(defn- exec-ddl-alter
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx]
+    (try
+      (let [{:keys [table operations]} parsed
+            tx-data (vec (mapcat
+                          (fn [{:keys [op columns]}]
+                            (when (= op :add-column)
+                              (for [{:keys [name type]} columns
+                                    :let [base-type (str/replace type #"\s*\([^)]*\)" "")
+                                          dh-type (or (get types/sql-name->dh-type type)
+                                                      (get types/sql-name->dh-type base-type)
+                                                      :db.type/string)]]
+                                (cond-> {:db/ident (keyword table name)
+                                         :db/valueType dh-type
+                                         :db/cardinality :db.cardinality/one}
+                                  (#{"jsonb" "json"} base-type)
+                                  (assoc :pg/type base-type)))))
+                          operations))]
+        (if (seq tx-data)
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
+            (do (d/transact conn tx-data)
+                (empty-result "ALTER TABLE")))
+          (empty-result "ALTER TABLE")))
+      (catch Exception e
+        (classified-error "ALTER TABLE error: " e)))))
+
+(defn- exec-ddl-drop
+  [ctx parsed]
+  (let [{:keys [conn]} ctx]
+    (try
+      (let [table (:table parsed)
+            db (d/db conn)
+            db-schema (:schema db)
+            ;; Find all entity IDs that have at least one attribute in this table's namespace
+            ns-prefix (str table "/")
+            table-attrs (into []
+                              (keep (fn [[attr-kw _]]
+                                      (when (and (keyword? attr-kw)
+                                                 (= (namespace attr-kw) table))
+                                        attr-kw)))
+                              db-schema)
+            ;; Collect all entity IDs for this table. An earlier
+            ;; version queried only the FIRST attr, which missed
+            ;; rows where that attr was null (pgjdbc's boolfloat
+            ;; inserts (i, a, NULL) — if first-attr was `b`, the
+            ;; row was never retracted and accumulated across
+            ;; DROP/CREATE cycles). Union across every attr to
+            ;; catch all rows.
+            data-eids (when (seq table-attrs)
+                        (into #{}
+                              (mapcat (fn [attr]
+                                        (map first
+                                             (d/q {:find '[?e]
+                                                   :where [['?e attr]]}
+                                                  db))))
+                              table-attrs))
+            ;; Retract all data entities
+            data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
+            ;; Retract the schema attribute definitions themselves
+            schema-tx-data (mapv (fn [attr-kw]
+                                   (let [attr-eid (ffirst (d/q {:find ['?e]
+                                                                :where [['?e :db/ident attr-kw]]}
+                                                               db))]
+                                     (when attr-eid [:db/retractEntity attr-eid])))
+                                 table-attrs)
+            all-tx-data (into data-tx-data (filter some? schema-tx-data))]
+        (when (seq all-tx-data)
+          (d/transact conn all-tx-data))
+        (empty-result "DROP TABLE"))
+      (catch Exception e
+        (classified-error "DROP TABLE error: " e)))))
+
+(defn- exec-ddl-drop-sequence
+  [ctx parsed]
+  (let [{:keys [conn]} ctx]
+    (try
+      (let [seq-name (:seq-name parsed)
+            db (d/db conn)
+            seq-eid (ffirst (d/q '{:find [?e]
+                                   :where [[?e :__seq__/name ?n]]
+                                   :in [$ ?n]}
+                                 db seq-name))]
+        (when seq-eid
+          (d/transact conn [[:db/retractEntity seq-eid]]))
+        (empty-result "DROP SEQUENCE"))
+      (catch Exception e
+        (classified-error "DROP SEQUENCE error: " e)))))
+
+(defn- exec-set-operation
+  [ctx parsed]
+  (let [{:keys [db]} ctx
+        {:keys [op sub-results enriched-db]} parsed
+        ;; When the top-level UNION / INTERSECT
+        ;; references catalog tables (or CTEs via
+        ;; a parent scope), parse-sql attaches
+        ;; :enriched-db here so each sub-query
+        ;; runs against the enriched speculative
+        ;; db, not the handler's raw connection db.
+        query-db (or enriched-db db)
+        ;; Execute each sub-query and strip any hidden ORDER-BY
+        ;; columns before combining — sub-queries may add entity-id
+        ;; (or similar) to :find for server-side sort, which must
+        ;; not leak into UNION/INTERSECT/EXCEPT row comparison or
+        ;; the returned result shape.
+        exec-sub (fn [{:keys [query in-args find-aliases hidden-count]}]
+                   (let [q-input (assoc query :cancel (current-cancel))
+                         raw (if (seq in-args)
+                               (apply d/q q-input query-db in-args)
+                               (d/q q-input query-db))
+                         hc (or hidden-count 0)
+                         visible (- (count (:find query)) hc)
+                         results (if (pos? hc)
+                                   (map (fn [row]
+                                          (if (sequential? row)
+                                            (vec (take visible row))
+                                            row))
+                                        raw)
+                                   raw)]
+                     {:results results :find-aliases find-aliases}))
+        executed (mapv exec-sub sub-results)
+        find-aliases (:find-aliases (first executed))
+        ;; Combine results based on operation type
+        combined (case op
+                   :union-all (mapcat :results executed)
+                   :union     (distinct (mapcat :results executed))
+                   :intersect (let [sets (map #(set (:results %)) executed)]
+                                (apply clojure.set/intersection sets))
+                   :except    (let [first-set (set (:results (first executed)))
+                                    rest-sets (map #(set (:results %)) (rest executed))]
+                                (apply clojure.set/difference first-set rest-sets))
+                   (mapcat :results executed))]
+    (format-query-result combined find-aliases)))
+
+(defn- exec-full-join
+  [ctx parsed]
+  ;; FULL JOIN = LEFT JOIN results + right-only rows
+  ;; Execute two LEFT JOINs (original + swapped), combine
+  (let [{:keys [db]} ctx
+        {:keys [left-query right-query find-aliases]} parsed
+        ;; Strip hidden ORDER-BY columns from each sub-query's rows
+        ;; so row-set comparison sees only projected columns.
+        exec-select (fn [{:keys [query in-args hidden-count]}]
+                      (let [q (assoc query :cancel (current-cancel))
+                            raw (if (seq in-args)
+                                  (apply d/q q db in-args)
+                                  (d/q q db))
+                            hc (or hidden-count 0)
+                            visible (- (count (:find query)) hc)]
+                        (if (pos? hc)
+                          (map (fn [row]
+                                 (if (sequential? row)
+                                   (vec (take visible row))
+                                   row))
+                               raw)
+                          raw)))
+        left-results (vec (exec-select left-query))
+        right-results (vec (exec-select right-query))
+        ;; Right-only rows: appear in right-results but not left-results
+        ;; (matched rows appear in both with same values)
+        left-set (set left-results)
+        right-only (remove left-set right-results)
+        combined (concat left-results right-only)]
+    (format-query-result combined (or find-aliases (:find-aliases left-query)))))
+
+(defn- exec-error
+  "Parse-time failure handler. Returns a plain `:message` string,
+   optionally with an explicit :sqlstate (for known-unsupported DDL
+   like GRANT/REVOKE/RLS — see CT6). Without one, run the message
+   through the regex classifier so pgJDBC sees e.g. 42601 for syntax
+   errors instead of XX000.
+
+   Silent-accept escape hatch: if the parse result carries a
+   :reject-kind and the handler was configured to swallow that kind
+   (via :silently-accept / :compat :permissive), return a synthetic
+   success tag instead of an error. Lets Hibernate/Odoo/Alembic-class
+   clients boot cleanly against a Datahike-backed PG without each
+   emitting its own \"IGNORE ERRORS\" try/catch."
+  [ctx parsed]
+  (let [{:keys [silently-accept tx-state]} ctx
+        msg (:message parsed)
+        kind (:reject-kind parsed)]
+    (if (and kind (contains? silently-accept kind))
+      (empty-result (or (:reject-tag parsed) "OK"))
+      (let [code (or (:sqlstate parsed)
+                     (errors/classify-message msg)
+                     "XX000")]
+        ;; Parse-time errors abort the surrounding tx the same way
+        ;; execute-time errors do — otherwise the next stmt sees a
+        ;; "live" tx instead of the canonical 25P02
+        ;; in_failed_sql_transaction state.
+        (when (:in-tx? @tx-state)
+          (swap! tx-state assoc :aborted? true))
+        (error-result msg code)))))
+
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
 
@@ -3532,6 +4367,24 @@
                                    (let [p (sql/parse-sql sql schema db)]
                                      (when bump-dispatch! (bump-dispatch! p))
                                      p))]
+                      ;; ctx is the dispatch context shared across every
+                      ;; per-type executor. Keys:
+                      ;;   :conn           — Datahike conn for THIS db
+                      ;;   :session-id     — UUID, unique per pgwire connection
+                      ;;   :session-state  — atom of session GUCs / temporal vars
+                      ;;   :tx-state       — atom of {:in-tx? :aborted? :tx-buffer …}
+                      ;;   :sql-prepared   — atom of session-scope PREPAREd stmts
+                      ;;   :cursors        — atom of session-scope DECLAREd cursors
+                      ;;   :silently-accept — set of reject-kinds to swallow as success
+                      ;;   :handler        — the QueryHandler reify (for re-entrancy)
+                      ;;   :sql            — the original SQL string
+                      ;;   :db             — speculative or live Datahike db value
+                      ;;   :schema         — (:schema db); cached to avoid repeated reach-in
+                      ;;   :on-create-database / :on-delete-database
+                      ;;                   — operator-supplied provisioning hooks for SQL
+                      ;;                     CREATE/DROP DATABASE; nil → 0A000
+                      ;;   :registry-atom  — server-level {name → conn} atom; CREATE/DROP
+                      ;;                     DATABASE swap! through it
                       (let [ctx {:conn conn
                                  :session-id session-id
                                  :session-state session-state
@@ -3542,799 +4395,30 @@
                                  :handler this
                                  :sql sql
                                  :db db
-                                 :schema schema}]
+                                 :schema schema
+                                 :on-create-database on-create-database
+                                 :on-delete-database on-delete-database
+                                 :registry-atom registry-atom}]
                         (case (:type parsed)
-                          :system
-                          (case (:system-type parsed)
-                            :set      (empty-result "SET")
-                            :prepare          (handle-prepare ctx parsed)
-                            :execute-prepared (handle-execute-prepared ctx parsed)
-                            :deallocate       (handle-deallocate ctx parsed)
-                            :declare-cursor   (handle-declare-cursor ctx parsed)
-                            :fetch-cursor     (handle-fetch-cursor ctx parsed)
-                            :close-cursor     (handle-close-cursor ctx parsed)
-                            :move-cursor      (handle-move-cursor ctx parsed)
-                            :begin                 (handle-begin ctx parsed)
-                            :savepoint             (handle-savepoint ctx parsed)
-                            :release-savepoint     (handle-release-savepoint ctx parsed)
-                            :commit                (handle-commit ctx parsed)
-                            :rollback              (handle-rollback ctx parsed)
-                            :rollback-to-savepoint (handle-rollback-to-savepoint ctx parsed)
-                            :discard-all           (handle-discard-all ctx parsed)
-                            :discard-scoped
-              ;; DISCARD PLANS/SEQUENCES/TEMP/LOCKS. No-op in our model;
-              ;; report the actual variant in the command tag. classify
-              ;; exposes the lowercased scope.
-                            (empty-result (str "DISCARD " (str/upper-case (:scope parsed))))
-                            :comment-on (empty-result "COMMENT")
-                            :lock-table (empty-result "LOCK TABLE")
-                            :maintenance-noop
-              ;; VACUUM / REINDEX / CLUSTER — classify carries the verb
-              ;; as :tag already ("VACUUM" / "REINDEX" / "CLUSTER").
-                            (empty-result (:tag parsed))
-                            :schema-noop
-              ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
-              ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
-                            (empty-result (:tag parsed))
-
-                            :create-database
-              ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via
-              ;; the operator-supplied `:on-create-database` hook
-              ;; (`(fn [db-name parsed-options] -> conn)`). On success
-              ;; the new conn is added to the server's mutable
-              ;; registry under `db-name`; subsequent connections
-              ;; with `database=foo` route to it. Without a hook
-              ;; configured we return SQLSTATE 0A000 — provisioning
-              ;; from SQL is a deployment policy decision, not a
-              ;; default. See datahike.pg.sql.database/db-from-template.
-                            (let [{:keys [db-name options if-not-exists?]} parsed]
-                              (cond
-                                (and if-not-exists? registry-atom
-                                     (contains? @registry-atom db-name))
-                                (empty-result "CREATE DATABASE")
-
-                                (nil? on-create-database)
-                                (-> (PgWireServer$QueryResult.
-                                     (str "CREATE DATABASE not supported — configure "
-                                          ":on-create-database on the server"))
-                                    (.withSqlstate "0A000"))
-
-                                (and registry-atom (contains? @registry-atom db-name))
-                                (-> (PgWireServer$QueryResult.
-                                     (str "database \"" db-name "\" already exists"))
-                                    (.withSqlstate "42P04"))
-
-                                :else
-                                (try
-                                  (let [new-conn (on-create-database db-name options)]
-                                    (when registry-atom
-                                      (swap! registry-atom assoc db-name new-conn))
-                                    (empty-result "CREATE DATABASE"))
-                                  (catch clojure.lang.ExceptionInfo e
-                                    (let [data (ex-data e)
-                                          ;; Map known error keys back to PG
-                                          ;; SQLSTATEs so a CREATE DATABASE
-                                          ;; with a typo'd option surfaces as
-                                          ;; 42601 syntax_error rather than
-                                          ;; XX000 internal_error.
-                                          state (or (:sqlstate data)
-                                                    (case (:error data)
-                                                      :syntax-error "42601"
-                                                      :feature-not-supported "0A000"
-                                                      "XX000"))]
-                                      (-> (PgWireServer$QueryResult.
-                                           (str "CREATE DATABASE failed: " (.getMessage e)))
-                                          (.withSqlstate state))))
-                                  (catch Throwable e
-                                    (-> (PgWireServer$QueryResult.
-                                         (str "CREATE DATABASE failed: " (.getMessage e)))
-                                        (.withSqlstate "XX000"))))))
-
-                            :drop-database
-              ;; SQL `DROP DATABASE [IF EXISTS] foo;`. Routed via
-              ;; `:on-delete-database (fn [db-name conn parsed] -> _)`.
-              ;; Removes the entry from the registry on success and
-              ;; calls the hook so the operator can release + delete
-              ;; the backing store.
-                            (let [{:keys [db-name if-exists?]} parsed
-                                  existing (when registry-atom (get @registry-atom db-name))]
-                              (cond
-                                (and (nil? existing) if-exists?)
-                                (empty-result "DROP DATABASE")
-
-                                (nil? existing)
-                                (-> (PgWireServer$QueryResult.
-                                     (str "database \"" db-name "\" does not exist"))
-                                    (.withSqlstate "3D000"))
-
-                                (nil? on-delete-database)
-                                (-> (PgWireServer$QueryResult.
-                                     (str "DROP DATABASE not supported — configure "
-                                          ":on-delete-database on the server"))
-                                    (.withSqlstate "0A000"))
-
-                                :else
-                                (try
-                                  (on-delete-database db-name existing nil)
-                                  (when registry-atom
-                                    (swap! registry-atom dissoc db-name))
-                                  (empty-result "DROP DATABASE")
-                                  (catch Throwable e
-                                    (-> (PgWireServer$QueryResult.
-                                         (str "DROP DATABASE failed: " (.getMessage e)))
-                                        (.withSqlstate "XX000"))))))
-
-              ;; Advisory locks (see defonce ^:private advisory-locks above).
-                            :advisory-lock           (handle-advisory-lock ctx parsed)
-                            :try-advisory-lock       (handle-try-advisory-lock ctx parsed)
-                            :advisory-xact-lock      (handle-advisory-xact-lock ctx parsed)
-                            :try-advisory-xact-lock  (handle-try-advisory-xact-lock ctx parsed)
-                            :advisory-unlock         (handle-advisory-unlock ctx parsed)
-                            :advisory-unlock-all     (handle-advisory-unlock-all ctx parsed)
-
-              ;; Session introspection
-                            :pg-backend-pid          (handle-pg-backend-pid ctx parsed)
-                            :txid-current            (handle-txid-current ctx parsed)
-                            :pg-sleep                (handle-pg-sleep ctx parsed)
-              ;; Catalog probes (shape-matched in system-query?*)
-                            :empty-catalog      (handle-empty-catalog ctx parsed)
-                            :create-view        (empty-result "CREATE VIEW")
-                            :create-index       (empty-result "CREATE INDEX")
-                            :get-fk-conname     (handle-get-fk-conname ctx parsed)
-                            :get-primary-keys   (handle-get-primary-keys ctx parsed)
-                            :get-field-metadata (handle-get-field-metadata ctx parsed)
-
-              ;; Simple info queries
-                            :show              (handle-show (:var parsed) schema session-state)
-                            :version           (handle-version)
-                            :pg-keywords       (handle-pg-keywords ctx parsed)
-                            :current-schema    (handle-current-schema)
-                            :current-database  (handle-current-database (:db-name @session-state))
-                            :now               (handle-now ctx parsed)
-
-              ;; Sequence functions (classify supplies :seq-name / :new-value)
-                            :nextval           (handle-nextval ctx parsed)
-                            :currval           (handle-currval ctx parsed)
-                            :setval            (handle-setval ctx parsed)
-
-              ;; datahike.* branching / versioning
-                            :dh-branches       (handle-dh-branches conn ctx parsed)
-                            :dh-current-branch (handle-dh-current-branch conn session-state)
-                            :dh-commit-id      (handle-dh-commit-id conn session-state)
-                            :dh-parent-commits (handle-dh-parent-commits conn session-state)
-                            :dh-create-branch  (handle-dh-create-branch conn parsed)
-                            :dh-delete-branch  (handle-dh-delete-branch conn parsed)
-                            (empty-result "OK"))
-
-                          :select
-                          (let [{:keys [query find-aliases limit offset
-                                        having has-aggregates? has-distinct?
-                                        in-args hidden-count compound-exprs window-specs
-                                        sql-order-by sql-limit sql-offset
-                                        enriched-db literal-row literal-rows for-update]} parsed]
-                            (if (or literal-row literal-rows)
-                ;; Table-free SELECT: return literal row(s) directly.
-                ;; :literal-rows is used by table-function expansions
-                ;; (unnest(array_fill(...))) that produce N rows from
-                ;; compile-time-known arguments. Pass :select-item-oids
-                ;; (via a synthetic schema-oids array keyed by
-                ;; -1 sentinel) so SELECT TRUE reports BOOL even when
-                ;; value inference would look at a String.
-                              (let [item-oids (:select-item-oids parsed)
-                                    schema-oids (when item-oids
-                                                  (int-array
-                                                   (map #(int (or % -1)) item-oids)))]
-                                (format-query-result (or literal-rows [literal-row])
-                                                     find-aliases
-                                                     schema-oids))
-                              (let [;; Use enriched db when CTEs/derived tables created speculative data
-                                    query-db (or enriched-db db)
-                                    hidden-count (or hidden-count 0)
-                                    q-input (cond-> query
-                                              limit  (assoc :limit limit)
-                                              offset (assoc :offset offset)
-                                              :always (assoc :cancel (current-cancel)))
-                                    results (if (seq in-args)
-                                              (apply d/q q-input query-db in-args)
-                                              (d/q q-input query-db))
-                  ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
-                  ;; Extract the `id` column from each result row, check the
-                  ;; server-wide lock registry, and either:
-                  ;;   :skip    — drop rows held by another session
-                  ;;   :nowait  — raise 55P03 if any row held by another
-                  ;;   :block   — acquire optimistically (no real blocking
-                  ;;              possible; behaves like :nowait for correctness)
-                                    results
-                                    (if for-update
-                                      (let [{:keys [wait table]} for-update
-                                            id-idx (some (fn [[i a]]
-                                                           (when (and (string? a)
-                                                                      (or (= a "id")
-                                                                          (str/ends-with? a ".id")))
-                                                             i))
-                                                         (map-indexed vector find-aliases))
-                                            session-id (:session-id @tx-state)]
-                                        (if-not (and id-idx session-id)
-                                          results ;; can't lock without an id column; no-op
-                                          (let [results-vec (mapv (fn [r] (if (sequential? r) (vec r) [r]))
-                                                                  results)]
-                                            (case wait
-                                              :skip
-                                              (let [kept (vec (keep (fn [row]
-                                                                      (let [id (nth row id-idx nil)]
-                                                                        (when (and (some? id)
-                                                                                   (= :acquired (acquire-lock! session-id table id)))
-                                                                          (swap! tx-state update :owned-locks (fnil conj #{}) [table id])
-                                                                          row)))
-                                                                    results-vec))]
-                                                kept)
-                                              :nowait
-                                              (let [conflict (some (fn [row]
-                                                                     (let [id (nth row id-idx nil)]
-                                                                       (when (and (some? id)
-                                                                                  (= :conflict (acquire-lock! session-id table id)))
-                                                                         id)))
-                                                                   results-vec)]
-                                                (if conflict
-                                                  (throw (ex-info "lock not available"
-                                                                  {:error :lock-not-available
-                                                                   :table table}))
-                                                  (do
-                                                    (doseq [row results-vec
-                                                            :let [id (nth row id-idx nil)]
-                                                            :when (some? id)]
-                                                      (swap! tx-state update :owned-locks (fnil conj #{}) [table id]))
-                                                    results-vec)))
-                                              :block
-                            ;; No way to actually wait; behave like :nowait
-                            ;; (strict) — the session that would block simply
-                            ;; sees the error. Most PG clients retry.
-                                              (let [conflict (some (fn [row]
-                                                                     (let [id (nth row id-idx nil)]
-                                                                       (when (and (some? id)
-                                                                                  (= :conflict (acquire-lock! session-id table id)))
-                                                                         id)))
-                                                                   results-vec)]
-                                                (if conflict
-                                                  (throw (ex-info "lock not available"
-                                                                  {:error :lock-not-available
-                                                                   :table table}))
-                                                  (do
-                                                    (doseq [row results-vec
-                                                            :let [id (nth row id-idx nil)]
-                                                            :when (some? id)]
-                                                      (swap! tx-state update :owned-locks (fnil conj #{}) [table id]))
-                                                    results-vec)))))))
-                                      results)
-                  ;; SQL requires: aggregate on empty result → one row with defaults
-                  ;; COUNT(*) → 0, SUM/AVG/MIN/MAX → NULL.
-                  ;; This applies ONLY when there is no GROUP BY — i.e.
-                  ;; every :find element is an aggregate form. With a
-                  ;; group-by column in :find (a plain `?var` element),
-                  ;; an empty result means zero matching groups, so PG
-                  ;; returns zero rows. The earlier always-on default
-                  ;; synthesis turned `WHERE …→ 0 rows GROUP BY status`
-                  ;; into a single bogus `[null, 0]` row.
-                                    find-elems (:find query)
-                                    all-aggregates? (and (seq find-elems)
-                                                         (every? (fn [elem]
-                                                                   (and (seq? elem)
-                                                                        (symbol? (first elem))))
-                                                                 find-elems))
-                                    results (if (and has-aggregates?
-                                                     all-aggregates?
-                                                     (empty? (seq results)))
-                                              (let [default-row (mapv (fn [elem]
-                                                                        (let [agg-name (name (first elem))]
-                                                                          (if (or (= agg-name "count")
-                                                                                  (= agg-name "count-distinct")
-                                                                                  (= agg-name "filter-count")
-                                                                                  (= agg-name "filter-count-distinct"))
-                                                                            0
-                                                                            nil)))
-                                                                      find-elems)]
-                                                [default-row])
-                                              results)
-                  ;; Server-side null-safe sort (when ORDER BY has nullable columns)
-                                    results (if sql-order-by
-                                              (let [null-safe-cmp
-                                                    (fn [a b]
-                                                      (let [av (if (sequential? a) a [a])
-                                                            bv (if (sequential? b) b [b])]
-                                                        (loop [specs (partition 2 sql-order-by)]
-                                                          (if-let [[idx dir] (first specs)]
-                                                            (let [va (nth av idx nil)
-                                                                  vb (nth bv idx nil)
-                                                                  a-null? (or (nil? va) (= :__null__ va))
-                                                                  b-null? (or (nil? vb) (= :__null__ vb))
-                                                                  c (cond
-                                                                      (and a-null? b-null?) 0
-                                                    ;; NULLs last for ASC, first for DESC (PG default)
-                                                                      a-null? (if (= dir :asc) 1 -1)
-                                                                      b-null? (if (= dir :asc) -1 1)
-                                                                      :else (if (= dir :desc)
-                                                                              (compare vb va)
-                                                                              (compare va vb)))]
-                                                              (if (zero? c)
-                                                                (recur (rest specs))
-                                                                c))
-                                                            0))))]
-                                                (let [sorted (sort null-safe-cmp results)]
-                                                  (cond->> sorted
-                                                    sql-offset (drop sql-offset)
-                                                    sql-limit  (take sql-limit))))
-                                              results)
-                  ;; Strip hidden ORDER BY columns from results and aliases
-                                    [results find-aliases]
-                                    (if (pos? hidden-count)
-                                      (let [visible (- (count (:find query)) hidden-count)]
-                                        [(map (fn [row]
-                                                (if (sequential? row)
-                                                  (vec (take visible row))
-                                                  row))
-                                              results)
-                                         find-aliases])
-                                      [results find-aliases])
-                  ;; Apply window functions: ROW_NUMBER, RANK, SUM OVER, etc.
-                  ;; Window specs reference column indices in the result tuples.
-                  ;; The window engine appends computed values to each row.
-                                    [results find-aliases]
-                                    (if (seq window-specs)
-                                      (let [;; Ensure results are vectors of vectors
-                                            vec-results (mapv (fn [r] (if (sequential? r) (vec r) [r])) results)
-                                            windowed (window/execute-window-functions vec-results window-specs)
-                          ;; Add window aliases
-                                            win-aliases (mapv (fn [spec]
-                                                                (or (:alias spec) (name (:op spec))))
-                                                              window-specs)
-                                            new-aliases (into (vec find-aliases) win-aliases)
-                          ;; Hide internal window helper columns (__win_*)
-                                            visible-indices (into []
-                                                                  (keep-indexed (fn [i a]
-                                                                                  (when-not (and (string? a)
-                                                                                                 (.startsWith ^String a "__win_"))
-                                                                                    i)))
-                                                                  new-aliases)
-                                            final-results (mapv (fn [row]
-                                                                  (mapv #(nth row % nil) visible-indices))
-                                                                windowed)
-                                            final-aliases (mapv #(nth new-aliases %) visible-indices)]
-                                        [final-results final-aliases])
-                                      [results find-aliases])
-                  ;; Apply HAVING filter when present
-                                    results (apply-having results find-aliases having)
-                  ;; Apply compound aggregate expressions: MAX(a) - MIN(a)
-                  ;; Each compound-expr has {:alias :op :l-idx :r-idx}.
-                  ;; We compute the derived value and replace the hidden agg columns.
-                                    [results find-aliases]
-                                    (if (seq compound-exprs)
-                                      (let [ops {'+ + '- - '* * '/ /}
-                          ;; Compute the compound values for each row
-                                            new-results
-                                            (mapv (fn [row]
-                                                    (let [rv (if (sequential? row) (vec row) [row])]
-                                                      (reduce (fn [r {:keys [op l-idx r-idx]}]
-                                                                (let [lv (nth r l-idx nil)
-                                                                      rv-val (nth r r-idx nil)
-                                                                      op-fn (get ops op)]
-                                                                  (conj r (when (and lv rv-val op-fn
-                                                                                     (number? lv) (number? rv-val))
-                                                                            (op-fn lv rv-val)))))
-                                                              rv compound-exprs)))
-                                                  results)
-                          ;; Build new aliases: keep originals + add compound aliases
-                                            compound-aliases (mapv :alias compound-exprs)
-                                            new-aliases (into (vec find-aliases) compound-aliases)
-                          ;; Hide the internal aggregate columns (prefixed with __compound_)
-                                            visible-indices (into []
-                                                                  (keep-indexed (fn [i a]
-                                                                                  (when-not (and (string? a)
-                                                                                                 (.startsWith ^String a "__compound_"))
-                                                                                    i)))
-                                                                  new-aliases)
-                                            final-results (mapv (fn [row]
-                                                                  (mapv #(nth row %) visible-indices))
-                                                                new-results)
-                                            final-aliases (mapv #(nth new-aliases %) visible-indices)]
-                                        [final-results final-aliases])
-                                      [results find-aliases])
-                  ;; Apply DISTINCT deduplication for aggregate queries
-                                    results (if (and has-distinct? has-aggregates?)
-                                              (distinct results)
-                                              results)]
-              ;; Derive schema-based OIDs for proper type metadata.
-              ;; Shared with describeResult; see compute-schema-oids.
-                                (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
-                                      schema-oids (compute-schema-oids parsed-with-shape db)
-                                      ;; Blend parse-time OIDs (oid-infer)
-                                      ;; over the -1 sentinel so empty
-                                      ;; result sets and aggregate /
-                                      ;; CAST / literal columns keep the
-                                      ;; correct type when value inference
-                                      ;; would otherwise fall back to TEXT.
-                                      item-oids (:select-item-oids parsed)
-                                      schema-oids (if (and item-oids (seq find-aliases))
-                                                    (let [n (count find-aliases)
-                                                          out (int-array n)]
-                                                      (dotimes [i n]
-                                                        (let [so (aget ^ints schema-oids i)
-                                                              io (when (< i (count item-oids))
-                                                                   (nth item-oids i))]
-                                                          (aset out i
-                                                                (int (if (and (= so -1) io) io so)))))
-                                                      out)
-                                                    schema-oids)
-                                      sources (compute-column-sources parsed-with-shape db)
-                                      result (format-query-result results find-aliases schema-oids)]
-                                  (if sources
-                                    (-> ^PgWireServer$QueryResult result
-                                        (.withColumnSources (first sources) (second sources))
-                                        (.withColumnTypmods (nth sources 2)))
-                                    result)))))
-
-                          :insert
-                          (if (:in-tx? @tx-state)
-                            (try
-                              (let [table-name (:table parsed)
-                                    spec-db (:speculative-db @tx-state)
-                                    tx-data (-> (:tx-data parsed)
-                                                (auto-populate-identity table-name spec-db)
-                                                (apply-column-constraints table-name
-                                                                          (:ns parsed)
-                                                                          spec-db))
-                                    spec-report (dc/with spec-db tx-data)
-                                    new-tempids (into {} (keep (fn [[tid eid]] (when (string? tid) [eid tid])))
-                                                      (:tempids spec-report))
-                                    db-after (:db-after spec-report)]
-                                (swap! tx-state (fn [ts]
-                                                  (-> ts
-                                                      (update :tx-buffer into tx-data)
-                                                      (assoc :speculative-db db-after)
-                                                      (update :eid->tempid merge new-tempids))))
-                                (if-let [returning (:returning parsed)]
-                    ;; RETURNING: read values from speculative db-after.
-                    ;; Order matters — Odoo matches RETURNING rows positionally
-                    ;; to VALUES. Extract tempids from the parsed tx-data
-                    ;; (preserves VALUES order) and resolve each to an eid.
-                    ;; Falls back to hash-order if tempids can't be recovered
-                    ;; (e.g. ON CONFLICT path where tx-data is :db.fn/call).
-                                  (let [ns-prefix (str table-name "/")
-                                        tempids-map (:tempids spec-report)
-                                        has-row? (fn [eid]
-                                                   (some (fn [^datahike.datom.Datom d]
-                                                           (let [a (.-a d)]
-                                                             (and (keyword? a)
-                                                                  (.startsWith (str (namespace a) "/") ns-prefix)
-                                                                  (not= (name a) "db-row-exists"))))
-                                                         (d/datoms db-after :eavt eid)))
-                          ;; ON CONFLICT path records row-positional eids/tempids
-                          ;; via :row-refs atom set in translate-insert.
-                          ;; Non-ON-CONFLICT path uses :db/id tempids on entity maps.
-                                        ordered-refs (if-let [refs (:row-refs parsed)]
-                                                       @refs
-                                                       (keep #(when (and (map? %) (string? (:db/id %)))
-                                                                (:db/id %))
-                                                             (:tx-data parsed)))
-                                        ordered-eids (vec (keep (fn [ref]
-                                                                  (cond
-                                                      ;; already an eid (DO UPDATE case)
-                                                                    (integer? ref) ref
-                                                      ;; tempid string — resolve via tempids map
-                                                                    (string? ref) (get tempids-map ref)
-                                                                    :else nil))
-                                                                ordered-refs))
-                                        data-eids (if (seq ordered-eids)
-                                                    (filterv has-row? ordered-eids)
-                                                    (filterv has-row? (vals tempids-map)))]
-                                    (build-returning-result returning db-after data-eids table-name (:schema db-after)))
-                                  (empty-result (str "INSERT 0 " (:count parsed)))))
-                              (catch Exception e
-                                (swap! tx-state assoc :aborted? true)
-                                (classified-error "INSERT error: " e)))
-                            (execute-insert conn parsed))
-
-                          :update-with-recursive
-                          (if (:in-tx? @tx-state)
-                            (try
-                              (let [spec-db (:speculative-db @tx-state)
-                                    eid->tempid (:eid->tempid @tx-state)
-                                    {:keys [eids tx-data]} (build-update-with-recursive-tx spec-db parsed)
-                                    spec-report (when (seq tx-data) (dc/with spec-db tx-data))
-                                    commit-tx-data (mapv (fn [[op eid attr val]]
-                                                           [op (get eid->tempid eid eid) attr val])
-                                                         tx-data)]
-                                (swap! tx-state (fn [ts]
-                                                  (cond-> ts
-                                                    true (update :tx-buffer into commit-tx-data)
-                                                    spec-report (assoc :speculative-db (:db-after spec-report)))))
-                                (empty-result (str "UPDATE " (count eids))))
-                              (catch Exception e
-                                (swap! tx-state assoc :aborted? true)
-                                (classified-error "UPDATE (WITH RECURSIVE) error: " e)))
-                            (execute-update-with-recursive conn parsed))
-
-                          :update
-                          (if (:in-tx? @tx-state)
-                            (try
-                              (let [spec-db (:speculative-db @tx-state)
-                                    eid->tempid (:eid->tempid @tx-state)
-                                    {:keys [eids tx-data]} (build-update-tx spec-db schema parsed)
-                                    _ (check-update-identity-collisions! spec-db schema tx-data)
-                                    _ (check-not-null-on-update! spec-db tx-data)
-                                    _ (check-updates-against-row-constraints!
-                                       spec-db (:table parsed) (or (:ns parsed) (:table parsed)) tx-data)
-                                    _ (enforce-fk-restrict-on-update! spec-db (:table parsed) tx-data)
-                      ;; Apply to speculative-db with ORIGINAL entity IDs
-                                    spec-report (dc/with spec-db tx-data)
-                      ;; For the commit buffer, remap real eids to tempids.
-                      ;; Drop :db/retract ops that would remap onto a tempid —
-                      ;; the entity is new in this tx, so there's no prior
-                      ;; value to retract, and Datahike rejects tempids in
-                      ;; :db/retract.
-                                    commit-tx-data (vec (keep (fn [[op eid attr val]]
-                                                                (let [mapped (get eid->tempid eid eid)]
-                                                                  (when-not (and (= op :db/retract)
-                                                                                 (not= mapped eid))
-                                                                    [op mapped attr val])))
-                                                              tx-data))]
-                                (swap! tx-state (fn [ts]
-                                                  (-> ts
-                                                      (update :tx-buffer into commit-tx-data)
-                                                      (assoc :speculative-db (:db-after spec-report)))))
-                                (empty-result (str "UPDATE " (count eids))))
-                              (catch Exception e
-                                (swap! tx-state assoc :aborted? true)
-                                (classified-error "UPDATE error: " e)))
-                            (execute-update conn parsed schema))
-
-                          :delete
-                          (if (:in-tx? @tx-state)
-                            (try
-                              (let [spec-db (:speculative-db @tx-state)
-                                    eid->tempid (:eid->tempid @tx-state)
-                                    {:keys [eids]} (build-delete-tx spec-db schema parsed)
-                                    _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
-                      ;; Apply to speculative-db with ORIGINAL entity IDs
-                                    spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
-                                    spec-report (dc/with spec-db spec-tx-data)
-                      ;; For commit buffer, remap to tempids
-                                    commit-tx-data (mapv (fn [eid] [:db/retractEntity (get eid->tempid eid eid)]) eids)]
-                                (swap! tx-state (fn [ts]
-                                                  (-> ts
-                                                      (update :tx-buffer into commit-tx-data)
-                                                      (assoc :speculative-db (:db-after spec-report)))))
-                                (empty-result (str "DELETE " (count eids))))
-                              (catch Exception e
-                                (swap! tx-state assoc :aborted? true)
-                                (classified-error "DELETE error: " e)))
-                            (execute-delete conn parsed schema))
-
-                          :ddl-create
-                          (execute-ddl-create conn parsed tx-state)
-
-                          :ddl-create-sequence
-                          (if (:in-tx? @tx-state)
-                            (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE SEQUENCE")
-                            (try
-                              (d/transact conn (:tx-data parsed))
-                              (empty-result "CREATE SEQUENCE")
-                              (catch Exception e
-                                (classified-error "CREATE SEQUENCE error: " e))))
-
-                          :savepoint
-                          (do (swap! tx-state update :savepoints (fnil conj [])
-                                     {:speculative-db (:speculative-db @tx-state)
-                                      :tx-buffer (:tx-buffer @tx-state)
-                                      :eid->tempid (:eid->tempid @tx-state)})
-                              (empty-result "SAVEPOINT"))
-
-                          :release-savepoint
-                          (do (swap! tx-state update :savepoints
-                                     (fn [sp] (if (seq sp) (pop sp) [])))
-                              (empty-result "RELEASE SAVEPOINT"))
-
-                          :rollback-to-savepoint
-                          (let [sp-stack (:savepoints @tx-state)]
-                            (when (seq sp-stack)
-                              (let [{:keys [speculative-db tx-buffer eid->tempid]} (peek sp-stack)]
-                                (swap! tx-state assoc
-                                       :aborted? false  ;; ROLLBACK TO clears error state
-                                       :speculative-db speculative-db
-                                       :tx-buffer tx-buffer
-                                       :eid->tempid eid->tempid
-                                       :savepoints (pop sp-stack))))
-                            (empty-result "ROLLBACK"))
-
-                          :ddl-create-index
-                          (empty-result "CREATE INDEX")
-
-                          :ddl-alter
-                          (try
-                            (let [{:keys [table operations]} parsed
-                                  tx-data (vec (mapcat
-                                                (fn [{:keys [op columns]}]
-                                                  (when (= op :add-column)
-                                                    (for [{:keys [name type]} columns
-                                                          :let [base-type (str/replace type #"\s*\([^)]*\)" "")
-                                                                dh-type (or (get types/sql-name->dh-type type)
-                                                                            (get types/sql-name->dh-type base-type)
-                                                                            :db.type/string)]]
-                                                      (cond-> {:db/ident (keyword table name)
-                                                               :db/valueType dh-type
-                                                               :db/cardinality :db.cardinality/one}
-                                                        (#{"jsonb" "json"} base-type)
-                                                        (assoc :pg/type base-type)))))
-                                                operations))]
-                              (if (seq tx-data)
-                                (if (:in-tx? @tx-state)
-                                  (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
-                                  (do (d/transact conn tx-data)
-                                      (empty-result "ALTER TABLE")))
-                                (empty-result "ALTER TABLE")))
-                            (catch Exception e
-                              (classified-error "ALTER TABLE error: " e)))
-
-                          :ddl-drop
-                          (try
-                            (let [table (:table parsed)
-                                  db (d/db conn)
-                                  db-schema (:schema db)
-                    ;; Find all entity IDs that have at least one attribute in this table's namespace
-                                  ns-prefix (str table "/")
-                                  table-attrs (into []
-                                                    (keep (fn [[attr-kw _]]
-                                                            (when (and (keyword? attr-kw)
-                                                                       (= (namespace attr-kw) table))
-                                                              attr-kw)))
-                                                    db-schema)
-                    ;; Collect all entity IDs for this table. An earlier
-                    ;; version queried only the FIRST attr, which missed
-                    ;; rows where that attr was null (pgjdbc's boolfloat
-                    ;; inserts (i, a, NULL) — if first-attr was `b`, the
-                    ;; row was never retracted and accumulated across
-                    ;; DROP/CREATE cycles). Union across every attr to
-                    ;; catch all rows.
-                                  data-eids (when (seq table-attrs)
-                                              (into #{}
-                                                    (mapcat (fn [attr]
-                                                              (map first
-                                                                   (d/q {:find '[?e]
-                                                                         :where [['?e attr]]}
-                                                                        db))))
-                                                    table-attrs))
-                    ;; Retract all data entities
-                                  data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
-                    ;; Retract the schema attribute definitions themselves
-                                  schema-tx-data (mapv (fn [attr-kw]
-                                                         (let [attr-eid (ffirst (d/q {:find ['?e]
-                                                                                      :where [['?e :db/ident attr-kw]]}
-                                                                                     db))]
-                                                           (when attr-eid [:db/retractEntity attr-eid])))
-                                                       table-attrs)
-                                  all-tx-data (into data-tx-data (filter some? schema-tx-data))]
-                              (when (seq all-tx-data)
-                                (d/transact conn all-tx-data))
-                              (empty-result "DROP TABLE"))
-                            (catch Exception e
-                              (classified-error "DROP TABLE error: " e)))
-
-                          :ddl-drop-sequence
-                          (try
-                            (let [seq-name (:seq-name parsed)
-                                  db (d/db conn)
-                                  seq-eid (ffirst (d/q '{:find [?e]
-                                                         :where [[?e :__seq__/name ?n]]
-                                                         :in [$ ?n]}
-                                                       db seq-name))]
-                              (when seq-eid
-                                (d/transact conn [[:db/retractEntity seq-eid]]))
-                              (empty-result "DROP SEQUENCE"))
-                            (catch Exception e
-                              (classified-error "DROP SEQUENCE error: " e)))
-
-                          :set-operation
-                          (let [{:keys [op sub-results enriched-db]} parsed
-                                ;; When the top-level UNION / INTERSECT
-                                ;; references catalog tables (or CTEs via
-                                ;; a parent scope), parse-sql attaches
-                                ;; :enriched-db here so each sub-query
-                                ;; runs against the enriched speculative
-                                ;; db, not the handler's raw connection db.
-                                query-db (or enriched-db db)
-                  ;; Execute each sub-query and strip any hidden ORDER-BY
-                  ;; columns before combining — sub-queries may add entity-id
-                  ;; (or similar) to :find for server-side sort, which must
-                  ;; not leak into UNION/INTERSECT/EXCEPT row comparison or
-                  ;; the returned result shape.
-                                exec-sub (fn [{:keys [query in-args find-aliases hidden-count]}]
-                                           (let [q-input (assoc query :cancel (current-cancel))
-                                                 raw (if (seq in-args)
-                                                       (apply d/q q-input query-db in-args)
-                                                       (d/q q-input query-db))
-                                                 hc (or hidden-count 0)
-                                                 visible (- (count (:find query)) hc)
-                                                 results (if (pos? hc)
-                                                           (map (fn [row]
-                                                                  (if (sequential? row)
-                                                                    (vec (take visible row))
-                                                                    row))
-                                                                raw)
-                                                           raw)]
-                                             {:results results :find-aliases find-aliases}))
-                                executed (mapv exec-sub sub-results)
-                                find-aliases (:find-aliases (first executed))
-                  ;; Combine results based on operation type
-                                combined (case op
-                                           :union-all (mapcat :results executed)
-                                           :union     (distinct (mapcat :results executed))
-                                           :intersect (let [sets (map #(set (:results %)) executed)]
-                                                        (apply clojure.set/intersection sets))
-                                           :except    (let [first-set (set (:results (first executed)))
-                                                            rest-sets (map #(set (:results %)) (rest executed))]
-                                                        (apply clojure.set/difference first-set rest-sets))
-                                           (mapcat :results executed))]
-                            (format-query-result combined find-aliases))
-
-                          :full-join
-            ;; FULL JOIN = LEFT JOIN results + right-only rows
-            ;; Execute two LEFT JOINs (original + swapped), combine
-                          (let [{:keys [left-query right-query find-aliases]} parsed
-                  ;; Strip hidden ORDER-BY columns from each sub-query's rows
-                  ;; so row-set comparison sees only projected columns.
-                                exec-select (fn [{:keys [query in-args hidden-count]}]
-                                              (let [q (assoc query :cancel (current-cancel))
-                                                    raw (if (seq in-args)
-                                                          (apply d/q q db in-args)
-                                                          (d/q q db))
-                                                    hc (or hidden-count 0)
-                                                    visible (- (count (:find query)) hc)]
-                                                (if (pos? hc)
-                                                  (map (fn [row]
-                                                         (if (sequential? row)
-                                                           (vec (take visible row))
-                                                           row))
-                                                       raw)
-                                                  raw)))
-                                left-results (vec (exec-select left-query))
-                                right-results (vec (exec-select right-query))
-                  ;; Right-only rows: appear in right-results but not left-results
-                  ;; (matched rows appear in both with same values)
-                                left-set (set left-results)
-                                right-only (remove left-set right-results)
-                                combined (concat left-results right-only)]
-                            (format-query-result combined (or find-aliases (:find-aliases left-query))))
-
-                          :error
-            ;; Parse-time failures return a plain `:message` string, optionally
-            ;; with an explicit :sqlstate (for known-unsupported DDL like
-            ;; GRANT/REVOKE/RLS — see CT6). Without one, run the message
-            ;; through the regex classifier so pgJDBC sees e.g. 42601 for
-            ;; syntax errors instead of XX000.
-            ;;
-            ;; Silent-accept escape hatch: if the parse result carries a
-            ;; :reject-kind and the handler was configured to swallow
-            ;; that kind (via :silently-accept / :compat :permissive),
-            ;; return a synthetic success tag instead of an error. Lets
-            ;; Hibernate/Odoo/Alembic-class clients boot cleanly against
-            ;; a Datahike-backed PG without each emitting its own
-            ;; "IGNORE ERRORS" try/catch.
-                          (let [msg (:message parsed)
-                                kind (:reject-kind parsed)]
-                            (if (and kind (contains? silently-accept kind))
-                              (empty-result (or (:reject-tag parsed) "OK"))
-                              (let [code (or (:sqlstate parsed)
-                                             (errors/classify-message msg)
-                                             "XX000")]
-                                ;; Parse-time errors abort the surrounding
-                                ;; tx the same way execute-time errors do —
-                                ;; otherwise the next stmt sees a "live" tx
-                                ;; instead of the canonical 25P02
-                                ;; in_failed_sql_transaction state.
-                                (when (:in-tx? @tx-state)
-                                  (swap! tx-state assoc :aborted? true))
-                                (error-result msg code))))
-
-            ;; fallback
+                          :system                (exec-system ctx parsed)
+                          :select                (exec-select ctx parsed)
+                          :insert                (exec-insert ctx parsed)
+                          :update-with-recursive (exec-update-with-recursive ctx parsed)
+                          :update                (exec-update ctx parsed)
+                          :delete                (exec-delete ctx parsed)
+                          :ddl-create            (exec-ddl-create ctx parsed)
+                          :ddl-create-sequence   (exec-ddl-create-sequence ctx parsed)
+                          :savepoint             (exec-savepoint ctx parsed)
+                          :release-savepoint     (exec-release-savepoint ctx parsed)
+                          :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
+                          :ddl-create-index      (exec-ddl-create-index ctx parsed)
+                          :ddl-alter             (exec-ddl-alter ctx parsed)
+                          :ddl-drop              (exec-ddl-drop ctx parsed)
+                          :ddl-drop-sequence     (exec-ddl-drop-sequence ctx parsed)
+                          :set-operation         (exec-set-operation ctx parsed)
+                          :full-join             (exec-full-join ctx parsed)
+                          :error                 (exec-error ctx parsed)
+                          ;; fallback
                           (error-result (str "Unknown parse result type: " (:type parsed))))))))
                 (catch Exception e
                   (when (:in-tx? @tx-state) (swap! tx-state assoc :aborted? true))
