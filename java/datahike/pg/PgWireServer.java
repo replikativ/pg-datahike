@@ -157,6 +157,48 @@ public final class PgWireServer {
          * releases all row/advisory locks.
          */
         default void close() {}
+
+        /**
+         * COPY-IN sub-protocol: the server has emitted CopyInResponse
+         * (because a previous {@link #execute} returned a QueryResult
+         * with {@link QueryResult#copyInMode} set). The client now
+         * streams CopyData ('d') messages, each delivering a chunk of
+         * the COPY data; the wire layer routes each chunk's payload
+         * here. Chunk boundaries do NOT have to align with row
+         * boundaries — the handler is responsible for buffering /
+         * line-splitting.
+         *
+         * Default: throw — handlers that haven't opted in to COPY
+         * support get a clean 22023 from the wire layer.
+         */
+        default void copyChunk(byte[] chunk) {
+            throw new IllegalStateException("COPY-IN not implemented for this handler");
+        }
+
+        /**
+         * COPY-IN sub-protocol: the client sent CopyDone ('c'). The
+         * handler should flush any pending state and return a
+         * QueryResult whose {@code commandTag} is "COPY &lt;n&gt;"
+         * (n = rows committed). The wire layer emits CommandComplete
+         * + ReadyForQuery and clears COPY-IN state.
+         *
+         * Default: throw — same as {@link #copyChunk}.
+         */
+        default QueryResult copyComplete() {
+            throw new IllegalStateException("COPY-IN not implemented for this handler");
+        }
+
+        /**
+         * COPY-IN sub-protocol: the client sent CopyFail ('f'). The
+         * handler should discard any pending state without
+         * transacting. The wire layer then emits ErrorResponse with
+         * the supplied reason and ReadyForQuery, clears COPY-IN
+         * state, and resumes normal message dispatch.
+         *
+         * Default: no-op (the wire layer's ErrorResponse handles the
+         * client visible part).
+         */
+        default void copyAbort(String reason) { /* default: nothing */ }
     }
 
     /**
@@ -284,6 +326,23 @@ public final class PgWireServer {
         /** Transaction status: 'I' = idle, 'T' = in transaction, 'E' = error in transaction. */
         public char txStatus;
 
+        /**
+         * COPY-IN sub-protocol entry signal. When true, the wire
+         * layer emits CopyInResponse instead of CommandComplete and
+         * transitions to COPY-IN mode; subsequent CopyData / CopyDone
+         * / CopyFail messages route through {@link QueryHandler#copyChunk}
+         * / {@link QueryHandler#copyComplete} / {@link QueryHandler#copyAbort}.
+         *
+         * Number of columns in the COPY target: clients use this to
+         * pre-size their per-column format-code arrays. We always send
+         * format code 0 (text) for every column — pg-datahike doesn't
+         * yet support binary COPY. {@code copyColumnCount} of 0 is
+         * accepted by PG (a zero-column table is a degenerate but
+         * valid case).
+         */
+        public boolean copyInMode;
+        public int copyColumnCount;
+
         /** Successful result with rows. */
         public QueryResult(String[] columnNames, int[] columnOids,
                            String[][] rows, String commandTag) {
@@ -352,6 +411,18 @@ public final class PgWireServer {
          */
         public QueryResult withColumnTypmods(int[] typmods) {
             this.columnTypmods = typmods;
+            return this;
+        }
+
+        /**
+         * Mark this result as the COPY-IN entry signal. The wire
+         * layer will emit CopyInResponse with {@code columnCount}
+         * columns (all text format) and transition to COPY-IN state
+         * before reading the next message.
+         */
+        public QueryResult withCopyInMode(int columnCount) {
+            this.copyInMode = true;
+            this.copyColumnCount = columnCount;
             return this;
         }
     }
@@ -537,6 +608,13 @@ public final class PgWireServer {
             // and doesn't enter this state — handleQuery always ends with
             // ReadyForQuery regardless of errors inside.
             boolean[] inError = new boolean[]{false};
+            // COPY-IN sub-protocol state. 0 = NONE, 1 = COPY_IN. The
+            // wire loop dispatches 'd' (CopyData), 'c' (CopyDone),
+            // 'f' (CopyFail) messages to the handler's copyChunk /
+            // copyComplete / copyAbort callbacks while in COPY_IN.
+            // 'H' (Flush) and 'S' (Sync) are silently ignored in this
+            // state, per PG protocol.sgml:1313-1318.
+            int[] copyState = new int[]{0};
 
             boolean debug = System.getenv("DATAHIKE_WIRE_DEBUG") != null;
 
@@ -597,13 +675,67 @@ public final class PgWireServer {
                 }
 
                 try {
+                    // COPY-IN routing: while in COPY_IN, normal message
+                    // dispatch is suspended. The frontend streams 'd'
+                    // (CopyData) until either 'c' (CopyDone) or 'f'
+                    // (CopyFail). 'H' (Flush) and 'S' (Sync) are
+                    // ignored here, per PG protocol.sgml:1313-1318.
+                    // Anything else aborts the copy with an error.
+                    if (copyState[0] == 1) {
+                        switch (msgType) {
+                            case 'd' -> {
+                                handler.copyChunk(body);
+                            }
+                            case 'c' -> {
+                                QueryResult cr = handler.copyComplete();
+                                copyState[0] = 0;
+                                if (cr != null && cr.error != null) {
+                                    sendError(out, "ERROR",
+                                            cr.sqlstate != null ? cr.sqlstate : "XX000",
+                                            cr.error, cr.errorFields);
+                                    if (txStatus[0] == 'T') txStatus[0] = 'E';
+                                } else {
+                                    sendCommandComplete(out,
+                                            cr != null && cr.commandTag != null
+                                                ? cr.commandTag : "COPY 0");
+                                }
+                                sendReadyForQuery(out, txStatus[0]);
+                                out.flush();
+                            }
+                            case 'f' -> {
+                                String reason = readCopyFailReason(body);
+                                handler.copyAbort(reason);
+                                copyState[0] = 0;
+                                sendError(out, "ERROR", "57014",
+                                        "COPY from stdin failed: " + reason);
+                                if (txStatus[0] == 'T') txStatus[0] = 'E';
+                                sendReadyForQuery(out, txStatus[0]);
+                                out.flush();
+                            }
+                            // Flush / Sync — ignored during COPY-IN
+                            case 'H', 'S' -> { /* no-op */ }
+                            case 'X' -> { return; }
+                            default -> {
+                                handler.copyAbort("unexpected message type during COPY-IN: " + (char) msgType);
+                                copyState[0] = 0;
+                                sendError(out, "ERROR", "08P01",
+                                        "Unsupported message during COPY-IN: " + (char) msgType);
+                                if (txStatus[0] == 'T') txStatus[0] = 'E';
+                                sendReadyForQuery(out, txStatus[0]);
+                                out.flush();
+                            }
+                        }
+                        // Skip the regular dispatch for this iteration
+                        continue;
+                    }
+
                     switch (msgType) {
-                        case 'Q' -> handleQuery(body, out, txStatus, handler);
+                        case 'Q' -> handleQuery(body, out, txStatus, handler, copyState);
                         case 'X' -> { return; }
                         case 'P' -> handleParse(body, out, statements, handler);
                         case 'B' -> handleBind(body, out, statements, portals);
                         case 'D' -> handleDescribe(body, out, statements, portals, handler);
-                        case 'E' -> handleExecuteMsg(body, out, portals, txStatus, handler);
+                        case 'E' -> handleExecuteMsg(body, out, portals, txStatus, handler, copyState);
                         case 'S' -> handleSync(out, txStatus);
                         case 'C' -> handleClose(body, out, statements, portals);
                         // Flush ('H'): PG requires pending responses to be sent immediately.
@@ -839,7 +971,7 @@ public final class PgWireServer {
     // Simple Query protocol
     // ========================================================================
 
-    private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler) throws IOException {
+    private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler, int[] copyState) throws IOException {
         String sql = new String(body, 0, body.length - 1, StandardCharsets.UTF_8).trim();
 
         if (sql.isEmpty()) {
@@ -896,6 +1028,15 @@ public final class PgWireServer {
                             result.error, result.errorFields);
                     if (txStatus[0] == 'T') txStatus[0] = 'E';
                     errored = true;
+                } else if (result.copyInMode) {
+                    // Server-side enters COPY-IN. We send CopyInResponse
+                    // and DON'T emit ReadyForQuery — the client now
+                    // streams CopyData until CopyDone/CopyFail. The
+                    // outer loop's COPY-IN dispatch handles those.
+                    sendCopyInResponse(out, result.copyColumnCount);
+                    out.flush();
+                    copyState[0] = 1;
+                    return;
                 } else if (result.columnNames.length == 0) {
                     sendCommandComplete(out, result.commandTag);
                 } else {
@@ -1276,7 +1417,8 @@ public final class PgWireServer {
     private void handleExecuteMsg(byte[] body, DataOutputStream out,
                                   java.util.Map<String, Portal> portals,
                                   char[] txStatus,
-                                  QueryHandler handler) throws IOException {
+                                  QueryHandler handler,
+                                  int[] copyState) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String portalName = readCString(buf);
         int maxRows = buf.getInt();
@@ -1317,6 +1459,15 @@ public final class PgWireServer {
                 result.sqlstate != null ? result.sqlstate : "XX000",
                 result.error,
                 result.errorFields);
+        } else if (result.copyInMode) {
+            // Extended-Query path also supports COPY-IN — though in
+            // practice clients use Simple Query for COPY. We send
+            // CopyInResponse and trip copyState; the next message
+            // will be a 'd'/'c'/'f' which the outer loop routes.
+            sendCopyInResponse(out, result.copyColumnCount);
+            out.flush();
+            copyState[0] = 1;
+            return;
         } else if (result.columnNames.length == 0) {
             sendCommandComplete(out, result.commandTag);
             trace("send CommandComplete \"" + result.commandTag + "\"");
@@ -1494,6 +1645,41 @@ public final class PgWireServer {
         out.write(tagBytes);
         out.writeByte(0);
 
+    }
+
+    /**
+     * Emit CopyInResponse ('G') with the given column count. We always
+     * declare overall format = 0 (text) and per-column format = 0
+     * (text) for every column — pg-datahike's wire path doesn't yet
+     * support binary COPY.
+     *
+     *   Byte1('G') | Int32(length) | Int8(format) | Int16(numColumns) |
+     *     Int16[numColumns](perColumnFormatCodes)
+     *
+     * Spec: protocol.sgml:636-672.
+     */
+    private void sendCopyInResponse(DataOutputStream out, int numColumns) throws IOException {
+        // 4 (length) + 1 (overall format) + 2 (numColumns) + 2*numColumns (formats)
+        int payloadLen = 4 + 1 + 2 + (2 * numColumns);
+        out.writeByte('G');
+        out.writeInt(payloadLen);
+        out.writeByte(0);                       // overall format: 0 = text
+        out.writeShort((short) numColumns);
+        for (int i = 0; i < numColumns; i++) {
+            out.writeShort((short) 0);          // per-column format: 0 = text
+        }
+    }
+
+    /**
+     * Decode a CopyFail message body. Per protocol.sgml:670-682, the
+     * body is a single C-string with an optional human-readable
+     * reason.
+     */
+    private String readCopyFailReason(byte[] body) {
+        // Strip trailing NUL byte if present
+        int end = body.length;
+        while (end > 0 && body[end - 1] == 0) end--;
+        return new String(body, 0, end, StandardCharsets.UTF_8);
     }
 
     private void sendError(DataOutputStream out, String severity, String code, String message) throws IOException {

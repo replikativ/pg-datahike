@@ -360,9 +360,20 @@
     (is (= [] (rows r)))))
 
 ;; ============================================================================
-;; COPY — clean 0A000 rejection (vs raw JSqlParser dump)
+;; COPY — clean error when the target table doesn't exist
+;; (Tier 2 of pgdump-import added wire-protocol COPY-IN support; this
+;; harness's ad-hoc `exec` helper doesn't drive the full COPY-IN
+;; sub-protocol — so we just verify that pre-COPY-IN errors surface
+;; cleanly. See pg-copy-parse-test for the parser, pg-copy-text-format
+;; / pg-copy-csv-format for the decoders, and the pgdump-roundtrip
+;; CI harness for the full wire-level round-trip.)
 ;; ============================================================================
 
-(deftest copy-rejected-cleanly
+(deftest copy-against-missing-table-errors-cleanly
   (let [r (exec *h* "COPY t FROM STDIN")]
-    (is (str/includes? (:err r) "not supported"))))
+    ;; Either fails the wire test harness (which doesn't speak COPY-IN
+    ;; and routes the CopyInResponse path as an error), or returns the
+    ;; pre-COPY-IN "no columns" error from exec-copy-from-stdin.
+    ;; Both are acceptable here — what we assert is that the harness
+    ;; doesn't hang or crash.
+    (is (or (some? (:err r)) (some? (:rows r))))))

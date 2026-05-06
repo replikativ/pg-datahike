@@ -17,6 +17,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.copy :as copy]
             [datahike.pg.sql.database :as database]
             [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.schema :as pgs]
@@ -275,6 +276,26 @@
                    {:type :error
                     :message (.getMessage e)
                     :sqlstate "42601"}))
+
+               :copy-from-stdin
+               (try
+                 (let [toks (copy/tokenize sql)
+                       parsed (copy/parse-copy-from-stdin toks)]
+                   (merge base parsed))
+                 (catch clojure.lang.ExceptionInfo e
+                   (let [data (ex-data e)
+                         state (or (:sqlstate data)
+                                   (case (:error data)
+                                     :feature-not-supported "0A000"
+                                     :syntax-error "42601"
+                                     "XX000"))]
+                     {:type :error
+                      :message (.getMessage e)
+                      :sqlstate state}))
+                 (catch Throwable e
+                   {:type :error
+                    :message (.getMessage e)
+                    :sqlstate "XX000"}))
 
                base))
 

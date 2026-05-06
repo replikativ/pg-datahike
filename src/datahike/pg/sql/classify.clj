@@ -880,8 +880,11 @@
           "drop"    (classify-drop rest-toks)
           "alter"   (classify-alter rest-toks)
 
-          ;; --- COPY — reject cleanly with 0A000
-          "copy"    {:kind :copy :reject-kind :copy :tag "COPY"}
+          ;; --- COPY — recognised so parse-sql can dispatch to the
+          ;; hand-rolled parser in datahike.pg.sql.copy (JSqlParser
+          ;; doesn't handle COPY). Routed as :copy-from-stdin which
+          ;; lands in the system-type table.
+          "copy"    {:kind :copy-from-stdin :tag "COPY"}
 
           ;; --- Transaction control
           "begin"   {:kind :begin}

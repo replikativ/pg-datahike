@@ -4,6 +4,12 @@
    all — UnsupportedStatement — so the wire-protocol layer needs
    structured access before it can drive the COPY-IN sub-protocol.
 
+   Also exposes `row->entity-map`: shared helper used by the COPY-IN
+   exec handler (server.clj) to turn a vector of decoded
+   String|::null values into a Datahike entity map keyed by
+   `:<ns>/<col>` attributes, with per-column string→type coercion
+   driven by `:db/valueType`.
+
    Mirrors the structure of `datahike.pg.sql.database`: tokenise,
    parse the prefix (table + optional column list + FROM/TO target),
    then parse the option list in either:
@@ -391,6 +397,142 @@
      :encoding       encoding
      :freeze?        (boolean freeze?)
      :default-marker default-marker}))
+
+;; ----------------------------------------------------------------------------
+;; Top-level parser
+;; ----------------------------------------------------------------------------
+
+;; ----------------------------------------------------------------------------
+;; Row → entity-map coercion
+;; ----------------------------------------------------------------------------
+;;
+;; Both decoders (text-format and csv-format) use these sentinels for
+;; null values; the COPY-IN exec handler converts them to nil entries
+;; in the entity map (which Datahike treats as "don't write this attr").
+(def ^:private text-null  :datahike.pg.sql.copy.text-format/null)
+(def ^:private csv-null   :datahike.pg.sql.copy.csv-format/null)
+
+(defn- null-sentinel? [v] (or (= v text-null) (= v csv-null)))
+
+(defn- parse-instant
+  "Parse an ISO-8601 / PG-timestamp string to a java.util.Date.
+   Tolerant: accepts `2024-01-15`, `2024-01-15 10:00:00`,
+   `2024-01-15T10:00:00Z`, with or without timezone."
+  ^java.util.Date [^String s]
+  (try
+    (.parse (java.time.format.DateTimeFormatter/ISO_INSTANT) s
+            java.time.Instant/from)
+    (catch Throwable _
+      (try
+        (java.util.Date/from
+         (.toInstant (java.time.OffsetDateTime/parse s)))
+        (catch Throwable _
+          (try
+            (let [ldt (java.time.LocalDateTime/parse
+                       (str/replace s " " "T"))]
+              (java.util.Date/from
+               (.toInstant
+                (.atZone ldt (java.time.ZoneId/of "UTC")))))
+            (catch Throwable _
+              (try
+                (let [ld (java.time.LocalDate/parse s)]
+                  (java.util.Date/from
+                   (.toInstant
+                    (.atStartOfDay ld (java.time.ZoneId/of "UTC")))))
+                (catch Throwable _ nil)))))))))
+
+(defn- coerce-string-to-attr-type
+  "Convert a raw string from a COPY data row into the typed value
+   expected by `attr`'s `:db/valueType`. Returns the typed value, or
+   the raw string if no coercion is recognised. Any string→long
+   parse error throws ex-info `:invalid-text-representation` (the
+   PG SQLSTATE 22P02 we surface to clients via the wire).
+
+   This is COPY-specific because all values arrive as strings; INSERT
+   values come through JSqlParser typed and use `coerce-insert-value`
+   for any further normalisation."
+  [^String raw attr schema]
+  (let [vtype (get-in schema [attr :db/valueType])
+        elem  (get-in schema [attr :pg/array-elem])]
+    (cond
+      ;; Native PG-array column — pass the raw text through; the array
+      ;; column path in coerce-insert-value will parse it.
+      (some? elem) raw
+      :else
+      (try
+        (case vtype
+          :db.type/long      (Long/parseLong raw)
+          :db.type/bigint    (BigInteger. raw)
+          :db.type/bigdec    (BigDecimal. raw)
+          :db.type/double    (Double/parseDouble raw)
+          :db.type/float     (Float/parseFloat raw)
+          :db.type/boolean   (case (str/lower-case raw)
+                               ("t" "true" "yes" "on" "1") true
+                               ("f" "false" "no" "off" "0") false
+                               (throw (ex-info (str "invalid boolean: " raw)
+                                               {:error :invalid-text-representation
+                                                :type "boolean"
+                                                :value raw})))
+          :db.type/string    raw
+          :db.type/keyword   (keyword raw)
+          :db.type/symbol    (symbol raw)
+          :db.type/uuid      (java.util.UUID/fromString raw)
+          :db.type/instant   (or (parse-instant raw)
+                                 (throw (ex-info (str "invalid timestamp: " raw)
+                                                 {:error :invalid-text-representation
+                                                  :type "timestamp"
+                                                  :value raw})))
+          ;; :db.type/ref — coerce-insert-value handles the lookup-ref
+          ;; bridge; we just need to convert the raw string to the
+          ;; target attr's value type. Best-effort: try a long first
+          ;; (FK columns are usually long-valued), else pass as
+          ;; string.
+          :db.type/ref       (try (Long/parseLong raw) (catch Throwable _ raw))
+          ;; Default — pass through unchanged
+          raw)
+        (catch NumberFormatException _
+          (throw (ex-info (str "invalid input syntax for type "
+                               (some-> vtype name) ": " raw)
+                          {:error :invalid-text-representation
+                           :type (some-> vtype name)
+                           :value raw})))))))
+
+(defn row->entity-map
+  "Build a Datahike entity map from a single COPY data row.
+
+     row         — vector of (String | text-null-sentinel | csv-null-sentinel)
+     columns     — vector of lower-case column-name strings (length
+                    must match row)
+     ns          — table namespace (string)
+     row-marker  — row-existence marker keyword (e.g.
+                    `:users/db-row-exists`) — set true on every
+                    entity so `SELECT *` row-marker filtering finds
+                    them, matching the convention pg-datahike's INSERT
+                    translator uses (stmt.clj:856).
+     schema      — Datahike :schema map
+     row-idx     — sequential row index (used to mint a fresh
+                    `:db/id \"copy-row-<n>\"` tempid)
+
+   NULL values are dropped from the entity (Datahike treats missing
+   keys as 'no datom for this attr', which is the same as SQL NULL).
+   Empty fields are kept as empty strings; not-null enforcement
+   happens later via `apply-column-constraints`."
+  [row columns ns row-marker schema row-idx]
+  (let [tempid (str "copy-row-" row-idx)
+        base   (cond-> {:db/id tempid}
+                 row-marker (assoc row-marker true))]
+    (reduce
+     (fn [acc i]
+       (let [col (nth columns i)
+             raw (nth row i nil)
+             attr (keyword ns col)]
+         (cond
+           (nil? raw)             acc      ;; row shorter than columns — drop
+           (null-sentinel? raw)   acc      ;; explicit NULL → no datom
+           :else
+           (assoc acc attr (coerce-string-to-attr-type raw attr schema)))))
+     base
+     (range (count columns)))))
 
 ;; ----------------------------------------------------------------------------
 ;; Top-level parser

@@ -3222,6 +3222,12 @@
 ;; (see the comment block above that ctx literal for the key contract).
 ;; ============================================================================
 
+;; Forward declarations — exec-system dispatches to exec-copy-from-stdin
+;; for `:copy-from-stdin`, but exec-copy-from-stdin (which depends on
+;; helpers like columns-from-schema, copy-flush-batch!) is defined further
+;; below to keep related code contiguous.
+(declare exec-copy-from-stdin)
+
 (defn- exec-system
   "Dispatch on (:system-type parsed). System-types are recognised by
    cls/classify (token-driven) and don't go through JSqlParser — most
@@ -3282,6 +3288,31 @@
       ;; the SELECT completes cleanly. The 3-arg form returns the
       ;; new value as text; we return empty-string.
       (single-row-result "set_config" PgWireServer/OID_TEXT "")
+
+      :copy-from-stdin
+      ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
+      ;; QueryResult flagged copyInMode — the wire layer emits
+      ;; CopyInResponse and transitions to COPY-IN sub-protocol;
+      ;; subsequent CopyData/CopyDone/CopyFail messages route to
+      ;; the QueryHandler reify's copyChunk/copyComplete/copyAbort
+      ;; methods, which mutate the :copy-state atom.
+      (try
+        (exec-copy-from-stdin ctx parsed)
+        (catch clojure.lang.ExceptionInfo e
+          (let [data (ex-data e)
+                state (or (:sqlstate data)
+                          (case (:error data)
+                            :undefined-table "42P01"
+                            :feature-not-supported "0A000"
+                            :syntax-error "42601"
+                            "XX000"))]
+            (-> (PgWireServer$QueryResult.
+                 (str "COPY failed: " (.getMessage e)))
+                (.withSqlstate state))))
+        (catch Throwable e
+          (-> (PgWireServer$QueryResult.
+               (str "COPY failed: " (.getMessage e)))
+              (.withSqlstate "XX000"))))
 
       :create-database
       ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via the
@@ -4069,6 +4100,101 @@
           (swap! tx-state assoc :aborted? true))
         (error-result msg code)))))
 
+(defn- columns-from-schema
+  "When `COPY t FROM stdin` is invoked WITHOUT an explicit column
+   list, derive the column names from `t`'s schema. Order is the same
+   as `pg_attribute.attnum` would expose — we look at every keyword
+   attribute in the schema whose namespace matches `ns`, in
+   alphabetical order (deterministic; pg_dump uses an explicit
+   column list anyway, so this fallback is mostly used by hand-typed
+   psql `COPY t FROM stdin` invocations)."
+  [schema ns]
+  (->> schema
+       keys
+       (filter keyword?)
+       (filter #(= ns (namespace %)))
+       (remove #(= "db-row-exists" (name %)))
+       (mapv name)
+       sort
+       vec))
+
+(defn- exec-copy-from-stdin
+  "Initialise a COPY-IN session and return a QueryResult signalling
+   `copyInMode`. The wire layer reads that and emits CopyInResponse,
+   then routes subsequent CopyData/CopyDone/CopyFail messages to
+   the QueryHandler reify's copyChunk/copyComplete/copyAbort
+   methods (which read the session out of `:copy-state`)."
+  [ctx parsed]
+  (let [{:keys [schema copy-state]} ctx
+        {:keys [ns table columns options]} parsed
+        ns (or ns table)
+        col-names (or columns (columns-from-schema schema ns))]
+    (when (empty? col-names)
+      (throw (ex-info (str "no columns found for COPY into \"" table "\"")
+                      {:error :undefined-table :table table})))
+    (let [format (:format options)
+          decoder-ns (case format
+                       :text 'datahike.pg.sql.copy.text-format
+                       :csv  'datahike.pg.sql.copy.csv-format)
+          _ (require decoder-ns)
+          make-fn      (resolve (symbol (str decoder-ns) "make-decoder"))
+          step-fn      (resolve (symbol (str decoder-ns) "decode-step"))
+          finalize-fn  (resolve (symbol (str decoder-ns) "decode-finalize"))
+          decoder      (make-fn (assoc options :columns col-names))]
+      (reset! copy-state
+              {:decoder         decoder
+               :decode-step-fn  step-fn
+               :decode-finalize-fn finalize-fn
+               :columns         col-names
+               :ns              ns
+               :table           table
+               :row-marker      (pgs/row-marker-attr table)
+               :rows-committed  0
+               :pending-rows    []
+               :batch-size      1000
+               :error           nil})
+      ;; Return QueryResult signalling COPY-IN with the column count.
+      (let [r (PgWireServer$QueryResult/empty "COPY 0")]
+        (.withCopyInMode r (count col-names))
+        r))))
+
+(defn- copy-flush-batch!
+  "Transact a batch of rows from the copy-state's pending buffer.
+   Mutates the session: clears pending, adds row-count, and on
+   error sets :error so future chunks no-op until copyComplete /
+   copyAbort surfaces it."
+  [ctx]
+  (let [{:keys [conn copy-state]} ctx
+        s @copy-state
+        rows (:pending-rows s)]
+    (when (and (seq rows) (nil? (:error s)))
+      (try
+        (let [tx-data' (-> rows
+                           (auto-populate-identity (:table s) (d/db conn))
+                           (apply-column-constraints (:table s) (:ns s) (d/db conn)))]
+          (d/transact conn tx-data')
+          (swap! copy-state #(-> %
+                                 (assoc :pending-rows [])
+                                 (update :rows-committed + (count rows)))))
+        (catch Throwable e
+          (swap! copy-state assoc :error (.getMessage e))
+          (throw e))))))
+
+(defn- copy-process-rows!
+  "Fold a batch of decoded rows into the session: build entity maps
+   via `copy/row->entity-map`, append to pending, and flush whenever
+   we cross batch-size."
+  [ctx rows]
+  (let [{:keys [copy-state schema]} ctx
+        {:keys [columns ns row-marker batch-size]} @copy-state]
+    (doseq [row rows]
+      (let [next-idx (-> @copy-state :rows-committed (+ (count (:pending-rows @copy-state))))
+            entity (datahike.pg.sql.copy/row->entity-map
+                    row columns ns row-marker schema next-idx)]
+        (swap! copy-state update :pending-rows conj entity)))
+    (when (>= (count (:pending-rows @copy-state)) batch-size)
+      (copy-flush-batch! ctx))))
+
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
 
@@ -4146,7 +4272,19 @@
         ;; DECLARE and hand out slices on FETCH. Good enough for the
         ;; small-result-set ORM usage pattern — streaming cursors would
         ;; need a deeper refactor.
-        cursors (atom {})]
+        cursors (atom {})
+        ;; COPY-IN session state. Set when exec-copy-from-stdin returns
+        ;; a copyInMode QueryResult; the wire layer then routes
+        ;; CopyData / CopyDone / CopyFail messages here. Holds:
+        ;;   {:decoder format-decoder
+        ;;    :decode-step-fn   fn taking [decoder chunk] → [d' rows eod?]
+        ;;    :decode-finalize-fn  fn taking [decoder] → [rows eod?]
+        ;;    :columns ["id" "name" ...]
+        ;;    :ns "users"  :table "users"
+        ;;    :rows-committed long
+        ;;    :pending-rows  vec of partial-batch rows
+        ;;    :batch-size    long}
+        copy-state (atom nil)]
     (reify PgWireServer$QueryHandler
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
@@ -4154,9 +4292,61 @@
         ;; session, and clear transaction state.
         (release-session-locks! session-id)
         (release-advisory-locks! session-id)
+        (reset! copy-state nil)
         (reset! tx-state {:in-tx? false :aborted? false
                           :session-id session-id
                           :owned-locks #{}}))
+
+      ;; --- COPY-IN sub-protocol callbacks --------------------------------
+      ;; The wire layer in PgWireServer.java routes CopyData / CopyDone /
+      ;; CopyFail messages here while the connection is in COPY-IN state
+      ;; (entered when a previous execute() returned a copyInMode-flagged
+      ;; QueryResult). The session lives on the :copy-state atom; ctx is
+      ;; built fresh per call from this reify's closures (we don't have
+      ;; the per-execute ctx available here because we're not inside an
+      ;; execute() call — we're a separate Java callback).
+
+      (copyChunk [_ chunk-bytes]
+        (when-let [s @copy-state]
+          (let [chunk (String. ^bytes chunk-bytes java.nio.charset.StandardCharsets/UTF_8)
+                step-fn (:decode-step-fn s)
+                [d' rows _eod?] (step-fn (:decoder s) chunk)
+                ctx-fresh {:conn conn
+                           :schema (:schema (d/db conn))
+                           :copy-state copy-state}]
+            (swap! copy-state assoc :decoder d')
+            (when (seq rows)
+              (copy-process-rows! ctx-fresh rows)))))
+
+      (copyComplete [_]
+        (let [s @copy-state]
+          (if (nil? s)
+            (PgWireServer$QueryResult/empty "COPY 0")
+            (let [ctx-fresh {:conn conn
+                             :schema (:schema (d/db conn))
+                             :copy-state copy-state}
+                  finalize-fn (:decode-finalize-fn s)
+                  [final-rows _eod?] (finalize-fn (:decoder s))]
+              (when (seq final-rows)
+                (copy-process-rows! ctx-fresh final-rows))
+              (try
+                ;; Drain remaining pending rows
+                (copy-flush-batch! ctx-fresh)
+                (let [committed (:rows-committed @copy-state)]
+                  (reset! copy-state nil)
+                  (PgWireServer$QueryResult/empty (str "COPY " committed)))
+                (catch Throwable e
+                  (let [committed (:rows-committed @copy-state)]
+                    (reset! copy-state nil)
+                    (-> (PgWireServer$QueryResult.
+                         (str "COPY failed after " committed " rows: "
+                              (.getMessage e)))
+                        (.withSqlstate
+                         (or (some-> e ex-data :sqlstate)
+                             "XX000"))))))))))
+
+      (copyAbort [_ _reason]
+        (reset! copy-state nil))
 
       ;; --- Extended Query protocol methods -------------------------------
 
@@ -4405,12 +4595,18 @@
                       ;;                     CREATE/DROP DATABASE; nil → 0A000
                       ;;   :registry-atom  — server-level {name → conn} atom; CREATE/DROP
                       ;;                     DATABASE swap! through it
+                      ;;   :copy-state     — atom holding the COPY-IN session
+                      ;;                     (decoder, decoder fns, target table, batch
+                      ;;                     accumulator, rows-committed counter); set
+                      ;;                     by exec-copy-from-stdin, mutated by
+                      ;;                     copyChunk/copyComplete/copyAbort callbacks
                       (let [ctx {:conn conn
                                  :session-id session-id
                                  :session-state session-state
                                  :tx-state tx-state
                                  :sql-prepared sql-prepared
                                  :cursors cursors
+                                 :copy-state copy-state
                                  :silently-accept silently-accept
                                  :handler this
                                  :sql sql

@@ -211,9 +211,13 @@
   (is (= :schema-noop (kind "DROP SCHEMA foo"))))
 
 (deftest classify-copy-rejected
-  (is (= {:kind :copy :reject-kind :copy :tag "COPY"}
+  ;; Tier 2 of pgdump-import wired COPY through to a real parser; the
+  ;; classifier now routes to :copy-from-stdin (a system-type) instead
+  ;; of rejecting at the wire boundary. See pg-copy-parse-test for the
+  ;; structured parse coverage.
+  (is (= {:kind :copy-from-stdin :tag "COPY"}
          (c/classify "COPY t FROM STDIN")))
-  (is (= {:kind :copy :reject-kind :copy :tag "COPY"}
+  (is (= {:kind :copy-from-stdin :tag "COPY"}
          (c/classify "COPY t TO STDOUT"))))
 
 (deftest classify-passthrough-dml

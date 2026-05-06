@@ -1213,6 +1213,11 @@
     :create-database :drop-database
     ;; pg_dump-emitted utility statements we silently accept
     :owner-noop :psql-meta :set-config
+    ;; COPY-IN routes through the wire-protocol sub-protocol; the
+    ;; exec-system handler is just a thin trampoline that returns a
+    ;; QueryResult with copyInMode set, so the Java wire layer
+    ;; emits CopyInResponse and transitions to COPY-IN.
+    :copy-from-stdin
     ;; datahike.* branching / versioning functions
     :dh-branches :dh-current-branch :dh-commit-id :dh-parent-commits
     :dh-create-branch :dh-delete-branch})
