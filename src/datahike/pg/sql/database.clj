@@ -112,6 +112,16 @@
                         :else (recur (unchecked-inc j))))]
             (recur (unchecked-inc end) (conj toks [:ident (subs sql (unchecked-inc i) end)])))
 
+          ;; Single-char operators / wildcards. We don't need a real
+          ;; expression parser at this layer — just need to surface
+          ;; these characters as their own tokens so downstream
+          ;; consumers (notably the COPY parser's FORCE_NULL * /
+          ;; FORCE_NOT_NULL * forms) can recognise them. Without this
+          ;; the unrecognised-char branch silently drops them.
+          (#{\* \+ \/ \%} (.charAt sql i))
+          (recur (unchecked-inc i)
+                 (conj toks [:ident (str (.charAt sql i))]))
+
           :else
           (let [end (loop [j i]
                       (cond
