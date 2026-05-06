@@ -4,7 +4,7 @@
    inputs like `SELECT 'REFERENCES'` or `-- REFERENCES` do NOT trigger
    the REFERENCES stripper."
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.rewrite :as rw]))
+            [datahike.pg.sql.rewrite :as rw]))
 
 ;; ============================================================================
 ;; inline-references-rule
@@ -55,12 +55,62 @@
                     nil
                     (catch clojure.lang.ExceptionInfo e e))]
         (is (some? ex))
-        (is (= "0A000" (:sqlstate (ex-data ex))))))))
+        ;; Resolve through the wire-boundary classifier — that's the
+        ;; contract clients see, not the raw ex-data shape. Throw sites
+        ;; describe errors structurally via :error keys; classifier
+        ;; maps to SQLSTATE.
+        (is (= "0A000" (first (datahike.pg.errors/classify-exception ex))))))))
 
 (deftest inline-references-table-level-not-stripped
   (testing "FOREIGN KEY (col) REFERENCES … is preserved — preceded by )"
     (let [sql "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES p (id))"]
       (is (= sql (strip-refs sql))))))
+
+;; ============================================================================
+;; boolean-is-rule — wrap LHS of `IS [NOT] (TRUE|FALSE|UNKNOWN)`
+;; ============================================================================
+
+(defn- bool-is [sql] (rw/rewrite sql [rw/boolean-is-rule]))
+
+(deftest boolean-is-wraps-in-expression
+  (testing "x IN (...) IS NOT TRUE — IN's parens belong to IN, not to a boolean primary"
+    (is (= "SELECT * FROM t WHERE (x IN (1)) IS NOT TRUE"
+           (bool-is "SELECT * FROM t WHERE x IN (1) IS NOT TRUE"))))
+  (testing "the canonical Odoo view-loading shape"
+    (let [sql "WHERE md.module IN (SELECT name FROM ir_module_module) IS NOT TRUE"]
+      (is (= "WHERE (md.module IN (SELECT name FROM ir_module_module)) IS NOT TRUE"
+             (bool-is sql))))))
+
+(deftest boolean-is-wraps-comparison
+  (testing "x = 5 IS TRUE — comparison parses standalone but trips with IS"
+    (is (= "SELECT * FROM t WHERE (x = 5) IS TRUE"
+           (bool-is "SELECT * FROM t WHERE x = 5 IS TRUE")))))
+
+(deftest boolean-is-wraps-exists
+  (is (= "SELECT * FROM t WHERE (EXISTS (SELECT 1 FROM s)) IS TRUE"
+         (bool-is "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM s) IS TRUE"))))
+
+(deftest boolean-is-already-parenthesised-not-rewrapped
+  (testing "leave a single existing parenthesised group alone"
+    (let [sql "SELECT * FROM t WHERE (x IN (1)) IS NOT TRUE"]
+      (is (= sql (bool-is sql))))))
+
+(deftest boolean-is-stops-at-AND-OR
+  (testing "AND boundary: only the right-hand operand gets wrapped"
+    (is (= "SELECT * FROM t WHERE x = 'foo' AND (y IN (1)) IS NOT TRUE"
+           (bool-is "SELECT * FROM t WHERE x = 'foo' AND y IN (1) IS NOT TRUE")))))
+
+(deftest boolean-is-hostile-cases
+  (testing "IS NOT TRUE inside a string literal is NOT rewritten"
+    (let [sql "SELECT 'IN (1) IS NOT TRUE' AS s FROM t"]
+      (is (= sql (bool-is sql)))))
+  (testing "IS NOT TRUE inside a block comment is NOT rewritten"
+    (let [sql "SELECT 1 /* x IN (1) IS NOT TRUE */ FROM t"]
+      (is (= sql (bool-is sql))))))
+
+;; ============================================================================
+;; inline-references — hostile cases (cross-cutting rule check)
+;; ============================================================================
 
 (deftest inline-references-hostile-cases
   (testing "REFERENCES inside a string literal is NOT stripped"

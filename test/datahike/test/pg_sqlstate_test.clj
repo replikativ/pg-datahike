@@ -140,3 +140,101 @@
       (is (= "t" (.get fields "t")))
       (is (= "age" (.get fields "c")))
       (is (= "long" (.get fields "d"))))))
+
+;; ============================================================================
+;; Pgwire-side error categories (the new error-categories registry)
+;; ============================================================================
+
+(deftest test-undefined-column-formats-pg-message
+  (testing "{:error :undefined-column :table … :column …} produces a PG-shaped message + 42703"
+    (let [e (ex-info "internal: column resolution failed"
+                     {:error :undefined-column :table "employee" :column "dept_id"})
+          [code msg fields] (errors/classify-exception e)]
+      (is (= "42703" code))
+      (is (= "column \"dept_id\" of relation \"employee\" does not exist" msg))
+      (is (= "employee" (.get fields "t")))
+      (is (= "dept_id" (.get fields "c"))))))
+
+(deftest test-undefined-table
+  (let [e (ex-info "x" {:error :undefined-table :table "nonsuch"})
+        [code msg _] (errors/classify-exception e)]
+    (is (= "42P01" code))
+    (is (= "relation \"nonsuch\" does not exist" msg))))
+
+(deftest test-undefined-database
+  (let [e (ex-info "x" {:error :undefined-database :database "missing"})
+        [code msg _] (errors/classify-exception e)]
+    (is (= "3D000" code))
+    (is (= "database \"missing\" does not exist" msg))))
+
+(deftest test-not-null-violation
+  (let [e (ex-info "x" {:error :not-null-violation :table "t" :column "c"})
+        [code msg _] (errors/classify-exception e)]
+    (is (= "23502" code))
+    (is (re-find #"null value in column \"c\"" msg))))
+
+(deftest test-unique-violation-with-constraint
+  (let [e (ex-info "x" {:error :unique-violation
+                        :table "person" :column "email"
+                        :constraint "person_email_key"
+                        :value "alice@example.com"})
+        [code msg fields] (errors/classify-exception e)]
+    (is (= "23505" code))
+    (is (re-find #"duplicate key value violates unique constraint \"person_email_key\"" msg))
+    (is (= "person_email_key" (.get fields "n")))))
+
+(deftest test-feature-not-supported
+  (let [e (ex-info "x" {:error :feature-not-supported :feature "GRANT"})
+        [code msg _] (errors/classify-exception e)]
+    (is (= "0A000" code))
+    (is (= "GRANT is not supported" msg))))
+
+(deftest test-query-canceled
+  (let [e (ex-info "x" {:error :query-canceled})
+        [code msg _] (errors/classify-exception e)]
+    (is (= "57014" code))
+    (is (re-find #"user request" msg))))
+
+(deftest test-explicit-sqlstate-skips-formatter
+  (testing "explicit :sqlstate wins over :error category — message stays as-is"
+    (let [e (ex-info "boom"
+                     {:sqlstate "57P03"
+                      :error :undefined-column :table "x" :column "y"})
+          [code msg _] (errors/classify-exception e)]
+      (is (= "57P03" code))
+      (is (= "boom" msg)))))
+
+;; ============================================================================
+;; Datahike-message rewriting — the SQLAlchemy regression
+;; ============================================================================
+
+(deftest test-rewrites-undefined-attribute-to-undefined-column
+  (testing "Datahike's `Bad entity attribute …` for an unknown attr → 42703 with PG vocabulary"
+    (let [e (ex-info "Bad entity attribute :employee/dept_id at {:db/id 47, :employee/dept_id 1}, not defined in current schema"
+                     {:error :transact/schema})
+          [code msg fields] (errors/classify-exception e)]
+      (is (= "42703" code))
+      (is (= "column \"dept_id\" of relation \"employee\" does not exist" msg))
+      (is (= "employee" (.get fields "t")))
+      (is (= "dept_id"  (.get fields "c"))))))
+
+(deftest test-rewrites-bad-entity-value-to-22P02-with-clean-message
+  (testing "Datahike's `Bad entity value … at [:db/add ID :ns/col VALUE]` rewrites the message to PG vocabulary"
+    (let [e (ex-info "Bad entity value 47 at [:db/add 99 :person/age oops], value '47' does not match schema definition"
+                     {:error :transact/schema})
+          [code msg _] (errors/classify-exception e)]
+      (is (= "22P02" code))
+      (is (re-find #"invalid input syntax for column \"age\" of relation \"person\"" msg)))))
+
+;; ============================================================================
+;; Cause-chain message walk
+;; ============================================================================
+
+(deftest test-walks-cause-chain-for-message
+  (testing "outer wrapper without a useful message — pull from cause"
+    (let [inner (ex-info "Bad entity attribute :employee/dept_id at X, not defined in current schema"
+                         {:error :transact/schema})
+          outer (RuntimeException. "" inner)
+          [code msg _] (errors/classify-exception outer)]
+      (is (= "42703" code))
+      (is (re-find #"column \"dept_id\"" msg)))))

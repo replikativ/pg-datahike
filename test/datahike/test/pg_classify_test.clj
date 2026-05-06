@@ -5,7 +5,7 @@
      (for the kinds that ship)
    - hostile cases: keyword inside a string / comment / dollar-quote"
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.classify :as c]))
+            [datahike.pg.sql.classify :as c]))
 
 ;; ============================================================================
 ;; Tokenizer
@@ -278,7 +278,7 @@
             (str "span mismatch for " tok))))))
 
 ;; ============================================================================
-;; tokenize-all — emits comments (datahike.pg.rewrite span-rewriter needs this)
+;; tokenize-all — emits comments (datahike.pg.sql.rewrite span-rewriter needs this)
 ;; ============================================================================
 
 (deftest tokenize-all-emits-comments

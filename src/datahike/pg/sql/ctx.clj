@@ -319,14 +319,13 @@
     (when (and col-name agg-set
                (contains? agg-set (str/lower-case col-name))
                (not (get (:schema ctx) (if (vector? attr) (nth attr 2) attr))))
-      (throw (ex-info (str "column \"" col-name "\" does not exist")
-                      {:sqlstate "42703"
-                       :error    :sql/undefined-column
-                       :column   col-name
-                       :hint     (str "\"" col-name "\" is a SELECT-list "
-                                      "aggregation alias and cannot be "
-                                      "referenced in WHERE; use HAVING or "
-                                      "wrap the query in a subquery")})))))
+      (throw (ex-info "undefined column referenced in WHERE"
+                      {:error  :undefined-column
+                       :column col-name
+                       :hint   (str "\"" col-name "\" is a SELECT-list "
+                                    "aggregation alias and cannot be "
+                                    "referenced in WHERE; use HAVING or "
+                                    "wrap the query in a subquery")})))))
 
 (defn col-var!
   "Get or create the logic variable for an attribute.

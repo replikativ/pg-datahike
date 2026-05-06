@@ -1,7 +1,7 @@
-(ns datahike.pg.shape
+(ns datahike.pg.sql.shape
   "Structural shape matching for long-form SELECT statements.
 
-   A companion to datahike.pg.classify: classify routes by the first
+   A companion to datahike.pg.sql.classify: classify routes by the first
    few tokens; shape answers 'what does the rest of this SELECT look
    like?'. Used by sql/system-query?* to identify pgjdbc + Odoo
    catalog probes that can't be recognized by a leading keyword —
@@ -22,7 +22,7 @@
      (catalog-probe sql) → :get-fk-conname | :get-primary-keys
                          | :get-field-metadata | :empty-catalog | nil"
   (:require [clojure.string :as str]
-            [datahike.pg.classify :as cls]))
+            [datahike.pg.sql.classify :as cls]))
 
 ;; ============================================================================
 ;; Token helpers

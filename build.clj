@@ -5,6 +5,7 @@
      clojure -T:build compile-java   ;; javac → target/classes
      clojure -T:build clean
      clojure -T:build jar
+     clojure -T:build uber           ;; standalone runnable jar
      clojure -T:build install        ;; ~/.m2
      clojure -T:build deploy         ;; Clojars (needs CLOJARS_USERNAME/_PASSWORD)"
   (:require [clojure.tools.build.api :as b]
@@ -21,6 +22,7 @@
 (def version (format "0.1.%s" (b/git-count-revs nil)))
 (def class-dir "target/classes")
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
+(def uber-file (format "target/%s-%s-standalone.jar" (name lib) version))
 
 (defn- basis [] (b/create-basis {:project "deps.edn"}))
 
@@ -33,11 +35,21 @@
             :basis (basis)
             :javac-opts ["-source" "17" "-target" "17"]}))
 
+(defn- write-version-resource!
+  "Embed the version string at `pg-datahike.version` on the classpath
+   so the `--version` CLI flag (and any future telemetry) can read it
+   without needing to recompute via b/git-count-revs at runtime."
+  []
+  (let [f (java.io.File. class-dir "pg-datahike.version")]
+    (.mkdirs (.getParentFile f))
+    (spit f version)))
+
 (defn jar [_]
   (clean nil)
   (compile-java nil)
   (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})
+  (write-version-resource!)
   (b/write-pom {:class-dir class-dir
                 :lib lib
                 :version version
@@ -51,6 +63,30 @@
                              [:distribution "repo"]]]]})
   (b/jar {:class-dir class-dir
           :jar-file jar-file}))
+
+(defn uber
+  "Build a standalone executable jar that bundles every dependency.
+
+       java -jar target/pg-datahike-VERSION-standalone.jar [OPTIONS]
+
+   AOT-compiles `datahike.pg.main` (the CLI entrypoint) and packages
+   it with all transitive deps. End-users don't need a Clojure
+   installation — only a JDK 17+."
+  [_]
+  (clean nil)
+  (compile-java nil)
+  (b/copy-dir {:src-dirs ["src"]
+               :target-dir class-dir})
+  (write-version-resource!)
+  (b/compile-clj {:basis (basis)
+                  :class-dir class-dir
+                  :src-dirs ["src"]
+                  :ns-compile '[datahike.pg.main]})
+  (b/uber {:class-dir class-dir
+           :uber-file uber-file
+           :basis (basis)
+           :main 'datahike.pg.main})
+  (println (str "Uberjar: " uber-file " (version " version ")")))
 
 (defn install [_]
   (jar nil)

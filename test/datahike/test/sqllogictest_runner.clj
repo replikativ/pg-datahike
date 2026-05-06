@@ -137,7 +137,7 @@
                                 (recur (inc j) (conj acc (nth lines j)))))
                   [sql-parts next-i] sql-lines
                   sql (str/trim (str/join " " sql-parts))]
-              (recur next-i (conj records {:type :statement :expect expect :sql sql})))
+              (recur (long next-i) (conj records {:type :statement :expect expect :sql sql})))
 
             ;; query <types> [sort]
             (str/starts-with? line "query")
@@ -159,7 +159,7 @@
                                [acc j]
                                (recur (inc j) (conj acc (nth lines j)))))
                   [exp-lines next-i] expected]
-              (recur next-i
+              (recur (long next-i)
                      (conj records {:type :query :types types :sort sort-mode
                                     :sql sql :expected (vec exp-lines)})))
 

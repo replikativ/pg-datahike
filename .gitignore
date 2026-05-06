@@ -33,6 +33,8 @@ Thumbs.db
 # Metabase: JAR (downloaded by setup.sh) and its private H2 metadata DB.
 /test/integration/metabase/metabase.jar
 /test/integration/metabase/data/
+# Metabase third-party DB drivers + sample H2 DB (downloaded at runtime).
+/plugins/
 # Maven build output for the Hibernate integration app.
 /test/integration/hibernate-app/target/
 # SQLAlchemy dialect bytecode cache.
@@ -41,3 +43,7 @@ Thumbs.db
 # Runtime logs
 *.log
 /tmp/
+
+# Local design notes / scratch — never committed; team members keep their
+# own notes here. Persisted across worktree switches but never pushed.
+/.internal/

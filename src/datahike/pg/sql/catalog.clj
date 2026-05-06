@@ -21,9 +21,9 @@
        (pgjdbc's field-metadata, Hibernate's feature detection) into
        fast paths before JSqlParser even runs."
   (:require [clojure.string :as str]
-            [datahike.pg.classify :as cls]
             [datahike.pg.schema :as pgs]
-            [datahike.pg.shape :as shape]
+            [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.shape :as shape]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
@@ -1210,6 +1210,7 @@
     :pg-backend-pid :txid-current :pg-sleep
     :comment-on :lock-table :create-view :create-index
     :maintenance-noop :schema-noop
+    :create-database :drop-database
     ;; datahike.* branching / versioning functions
     :dh-branches :dh-current-branch :dh-commit-id :dh-parent-commits
     :dh-create-branch :dh-delete-branch})
@@ -1234,7 +1235,7 @@
   "Check if a SQL string is a system/catalog query and return the
    handler keyword for the dispatch in server.clj; nil otherwise.
 
-   Delegates the leading-keyword routing to datahike.pg.classify for
+   Delegates the leading-keyword routing to datahike.pg.sql.classify for
    structural correctness (keyword-inside-string, keyword-inside-
    comment, case mix). A handful of complex pgjdbc / Odoo catalog
    probes still use substring matching on deep SELECT bodies — those

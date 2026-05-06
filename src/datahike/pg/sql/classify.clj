@@ -1,4 +1,4 @@
-(ns datahike.pg.classify
+(ns datahike.pg.sql.classify
   "Structural SQL classifier — routes statements to the right handler
    before JSqlParser sees them.
 
@@ -25,7 +25,7 @@
    :kind :generic-sql means 'pass to JSqlParser unchanged'.
 
    Non-goals: full PG lexer, expression parsing. The token-driven
-   preprocess-sql rewriter lives in datahike.pg.rewrite and consumes
+   preprocess-sql rewriter lives in datahike.pg.sql.rewrite and consumes
    this tokenizer's output."
   (:require [clojure.string :as str]))
 
@@ -474,6 +474,9 @@
       (kw=? t1 "now")           {:kind :now}
       (kw=? t1 "current_schema") {:kind :current-schema}
       (kw=? t1 "current_database") {:kind :current-database}
+      ;; SQL-spec equivalents — both are bare-keyword expressions, not
+      ;; function calls. Tokeniser treats them as :ident, no parens.
+      (kw=? t1 "current_catalog") {:kind :current-database}
       (kw=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (kw=? t1 "txid_current")  {:kind :txid-current}
       (kw=? t1 "pg_sleep")
@@ -538,6 +541,7 @@
       (kw=? t1 "extension") {:kind :create-extension :reject-kind :create-extension
                              :tag "CREATE EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
+      (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
       (kw=? t1 "view")      {:kind :create-view}
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
@@ -551,6 +555,7 @@
       (kw=? t1 "extension") {:kind :drop-extension :reject-kind :create-extension
                              :tag "DROP EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
+      (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
       :else                 {:kind :generic-sql})))
 
 (defn- classify-alter [toks]

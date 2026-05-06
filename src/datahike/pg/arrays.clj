@@ -76,7 +76,9 @@
                   (when (seq (rest child-shapes))
                     (when-not (apply = child-shapes)
                       (throw (ex-info "ragged array — all sub-arrays must have same shape"
-                                      {:input elements}))))
+                                      {:error :array-element-error
+                                       :detail "ragged array — all sub-arrays must have same shape"
+                                       :input elements}))))
                   (into [(count vs)] (or (first child-shapes) [])))
                 ;; Leaf-level vector / PgArray
                 vs
@@ -274,7 +276,8 @@
       (do
         (when (and (> na 1) (not= (vec (rest adims)) (vec (rest bdims))))
           (throw (ex-info "cannot concatenate incompatible arrays — inner dims must match"
-                          {:sqlstate "2202E"
+                          {:error :array-element-error
+                           :detail "cannot concatenate incompatible arrays — inner dims must match"
                            :a-dims adims :b-dims bdims})))
         (->PgArray (:elem-type a)
                    (into aelts belts)
@@ -287,7 +290,8 @@
       (do
         (when (not (match-shape a b))
           (throw (ex-info "cannot concatenate incompatible arrays — sub-array shape mismatch"
-                          {:sqlstate "2202E"
+                          {:error :array-element-error
+                           :detail "cannot concatenate incompatible arrays — sub-array shape mismatch"
                            :a-dims adims :b-dims bdims})))
         (->PgArray (:elem-type a)
                    (conj aelts belts)
@@ -299,7 +303,8 @@
       (do
         (when (not (match-shape b a))
           (throw (ex-info "cannot concatenate incompatible arrays — sub-array shape mismatch"
-                          {:sqlstate "2202E"
+                          {:error :array-element-error
+                           :detail "cannot concatenate incompatible arrays — sub-array shape mismatch"
                            :a-dims adims :b-dims bdims})))
         (->PgArray (:elem-type b)
                    (into [aelts] belts)
@@ -308,7 +313,8 @@
 
       :else
       (throw (ex-info "cannot concatenate arrays of different dimensionality"
-                      {:sqlstate "2202E"
+                      {:error :array-element-error
+                       :detail "cannot concatenate arrays of different dimensionality"
                        :a-ndim na :b-ndim nb})))))
 
 ;; ---------------------------------------------------------------------------
@@ -473,10 +479,16 @@
           (let [lo (Long/parseLong (nth m 1))
                 rest-s (nth m 3)]
             (recur rest-s (conj lbs lo)))
-          (throw (ex-info "Invalid array lbound prefix" {:input s})))
+          (throw (ex-info "Invalid array lbound prefix"
+                          {:error :invalid-text-representation :type "array"
+                           :detail "invalid array lbound prefix"
+                           :input s})))
         (do
           (when-not (str/starts-with? s "=")
-            (throw (ex-info "Expected `=` after array lbound prefix" {:input s})))
+            (throw (ex-info "Expected `=` after array lbound prefix"
+                            {:error :invalid-text-representation :type "array"
+                             :detail "expected `=` after array lbound prefix"
+                             :input s})))
           [(subs s 1) lbs])))))
 
 (defn- parse-tree
@@ -502,7 +514,10 @@
   [^String s start]
   (let [n (.length s)]
     (when-not (and (< start n) (= \{ (.charAt s start)))
-      (throw (ex-info "Expected `{`" {:input s :at start})))
+      (throw (ex-info "Expected `{`"
+                      {:error :invalid-text-representation :type "array"
+                       :detail "malformed array literal — expected `{`"
+                       :input s :at start})))
     (loop [i        (inc start)
            items    []
            current  (StringBuilder.)
@@ -511,7 +526,10 @@
            escape?   false
            pending?  false]
       (when (>= i n)
-        (throw (ex-info "Unterminated array literal" {:input s})))
+        (throw (ex-info "Unterminated array literal"
+                        {:error :invalid-text-representation :type "array"
+                         :detail "unterminated array literal"
+                         :input s})))
       (let [c (.charAt s i)]
         (cond
           escape?
@@ -541,7 +559,10 @@
                    false false false false))
 
           (and (not in-quote?) pending? (= c \{))
-          (throw (ex-info "Unexpected `{` mid-token" {:input s :at i}))
+          (throw (ex-info "Unexpected `{` mid-token"
+                          {:error :invalid-text-representation :type "array"
+                           :detail "unexpected `{` mid-token in array literal"
+                           :input s :at i}))
 
           (and (not in-quote?) (= c \,))
           ;; Close the current slot. If pending? is false, the slot
@@ -590,12 +611,16 @@
                 (when (seq (rest child-dims))
                   (when-not (apply = child-dims)
                     (throw (ex-info "ragged array — sub-arrays must have same shape"
-                                    {:dims child-dims}))))
+                                    {:error :array-element-error
+                                     :detail "ragged array — sub-arrays must have same shape"
+                                     :dims child-dims}))))
                 [(mapv first children)
                  (into [(count node)] (or (first child-dims) []))])
 
               :else
-              (throw (ex-info "Unexpected parse-tree shape" {:node node}))))]
+              (throw (ex-info "Unexpected parse-tree shape"
+                              {:error :internal-error
+                               :node node}))))]
     (walk tree)))
 
 (defn from-pg-text
@@ -614,7 +639,10 @@
         [body lbounds] (parse-lbound-prefix s)
         body (str/trim body)]
     (when-not (and (str/starts-with? body "{") (str/ends-with? body "}"))
-      (throw (ex-info "Invalid array text literal" {:input s})))
+      (throw (ex-info "Invalid array text literal"
+                      {:error :invalid-text-representation :type "array"
+                       :detail "malformed array literal — must start with `{` and end with `}`"
+                       :input s})))
     (let [{:keys [tree]} (parse-tree body 0)]
       (if (empty? tree)
         (array elem-type [] [0] (or lbounds [1]))
