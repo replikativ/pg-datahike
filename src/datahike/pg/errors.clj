@@ -205,6 +205,12 @@
    {:sqlstate "57014"
     :format (fn [_] "canceling statement due to statement timeout")}
 
+   :lock-not-available
+   {:sqlstate "55P03"
+    :format (fn [{:keys [table]}]
+              (when table
+                (str "could not obtain lock on row in relation \"" table "\"")))}
+
    ;; --- generic fallbacks ---------------------------------------------
    :invalid-parameter-value
    {:sqlstate "22023"
@@ -215,6 +221,38 @@
 
    :internal-error
    {:sqlstate "XX000" :format nil}})
+
+;; ============================================================================
+;; Throw-site helpers
+;; ============================================================================
+
+(defn pg-error-message
+  "Return the PG-shaped formatted message for `category` given `data`,
+   or nil when the category has no formatter or it doesn't produce
+   a message for the given data."
+  [category data]
+  (when-let [cat (get error-categories category)]
+    (when-let [f (:format cat)]
+      (f (assoc data :error category)))))
+
+(defn pg-error
+  "Build an ex-info whose message is the PG-shaped formatted form for
+   the category + data, suitable to pass to `throw`. Sets `:error` so
+   `classify-exception` produces the right SQLSTATE + fields when the
+   exception flows through the wire boundary's catch.
+
+   Throw sites should prefer this over raw `ex-info` because:
+   - `.getMessage(e)` returns the PG-shaped string directly, so paths
+     that bypass `classify-exception` (e.g. QueryHandler.parse() going
+     straight to the Java wire layer) still produce a correct
+     user-facing message.
+   - The full ex-data is preserved so downstream classifier passes
+     extract structured fields (table, column, constraint, …)."
+  [category data]
+  (let [data' (assoc data :error category)
+        msg (or (pg-error-message category data')
+                (str (clojure.core/name category)))]
+    (ex-info msg data')))
 
 ;; ============================================================================
 ;; Datahike-internal error mapping (legacy + extended)

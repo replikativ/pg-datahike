@@ -15,6 +15,7 @@
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.schema :as pgs]
@@ -924,9 +925,24 @@
                    {:type :error :message (str "Unsupported SQL statement: " (type stmt))})]
              (if (map? result) (attach-params result) result)))) ; close :else let, cond, outer let
        (catch Exception e
+         ;; Resolve the exception structurally: throw sites may carry
+         ;; either :sqlstate (legacy / explicit override) or :error
+         ;; (structured category). The errors namespace knows how to
+         ;; map both to a (sqlstate, message, fields) tuple.
          (let [data (ex-data e)
-               msg (if (:sqlstate data)
-                     (.getMessage e)
-                     (str "SQL parse error: " (.getMessage e)))]
-           (cond-> {:type :error :message msg}
-             (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))))))
+               [classified-code classified-msg] (errors/classify-exception e)
+               ;; Only prepend "SQL parse error:" when neither :sqlstate
+               ;; nor a registered :error category was set — those came
+               ;; from a real SQL-shape failure where the prefix is
+               ;; useful diagnostic context. Structured throws already
+               ;; produce PG-shaped messages.
+               structured? (or (:sqlstate data)
+                               (and (:error data)
+                                    (contains? errors/error-categories
+                                               (:error data))))
+               msg (if structured?
+                     classified-msg
+                     (str "SQL parse error: " classified-msg))]
+           {:type :error
+            :message msg
+            :sqlstate classified-code}))))))

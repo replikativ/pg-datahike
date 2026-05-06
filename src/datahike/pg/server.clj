@@ -1158,10 +1158,8 @@
                       (sql/eval-check-predicate ast entity-map ns schema)
                       (catch Exception _ ::error))]
             (when (false? val)
-              (throw (ex-info (str "new row for relation \"" table-name
-                                   "\" violates check constraint \""
-                                   name "\"")
-                              {:sqlstate "23514"
+              (throw (ex-info "check constraint violation"
+                              {:error :check-violation
                                :table table-name
                                :constraint name})))))))))
 
@@ -1235,18 +1233,16 @@
                    :where patterns}
                 hit (ffirst (q-fn q txdb))]
             (when-not hit
-              (throw (ex-info
-                      (str "insert or update on table \"" table-name
-                           "\" violates foreign key constraint \""
-                           name "\": Key ("
-                           (str/join ", " child-cols)
-                           ")=("
-                           (str/join ", " (map pr-str child-vals))
-                           ") is not present in table \""
-                           parent-table "\"")
-                      {:sqlstate "23503"
-                       :table table-name
-                       :constraint name})))))))))
+              (throw (ex-info "foreign key violation"
+                              {:error :foreign-key-violation
+                               :table table-name
+                               :constraint name
+                               :detail (str "Key ("
+                                            (str/join ", " child-cols)
+                                            ")=("
+                                            (str/join ", " (map pr-str child-vals))
+                                            ") is not present in table \""
+                                            parent-table "\"")})))))))))
 
 (defn- find-fk-children
   "Find child eids that reference any of the parent eids via the given FK.
@@ -1306,18 +1302,16 @@
                                                       :where [['?e a '?v]]}
                                                      db eid)))
                                           parent-attrs)]]
-            (throw (ex-info
-                    (str "update or delete on table \"" t
-                         "\" violates foreign key constraint \""
-                         name "\" on table \""
-                         (:child-table fk) "\": Key ("
-                         (str/join ", " parent-cols) ")=("
-                         (str/join ", " (map pr-str parent-vals))
-                         ") is still referenced from table \""
-                         (:child-table fk) "\"")
-                    {:sqlstate "23503"
-                     :table (:child-table fk)
-                     :constraint name})))
+            (throw (ex-info "foreign key still referenced"
+                            {:error :foreign-key-violation
+                             :table (:child-table fk)
+                             :constraint name
+                             :detail (str "Key ("
+                                          (str/join ", " parent-cols)
+                                          ")=("
+                                          (str/join ", " (map pr-str parent-vals))
+                                          ") is still referenced from table \""
+                                          (:child-table fk) "\"")})))
           ;; CASCADE: collect new child eids, recurse on those.
           (let [cascades (get by-action :cascade)
                 new-by-table
@@ -1341,12 +1335,11 @@
             ;; SET NULL / SET DEFAULT not yet supported — surface clearly.
             (when-let [unsupported (seq (concat (get by-action :set-null)
                                                 (get by-action :set-default)))]
-              (throw (ex-info
-                      (str "ON DELETE " (name (:on-delete (first unsupported)))
-                           " is not yet implemented for FK \""
-                           (:name (first unsupported)) "\"")
-                      {:sqlstate "0A000"
-                       :constraint (:name (first unsupported))})))
+              (throw (ex-info "ON DELETE action not implemented"
+                              {:error :feature-not-supported
+                               :feature (str "ON DELETE "
+                                             (name (:on-delete (first unsupported))))
+                               :constraint (:name (first unsupported))})))
             (recur next-pending next-visited next-cascade)))))))
 
 (defn- enforce-fk-restrict-on-delete!
@@ -1402,18 +1395,16 @@
                       patterns (mapv (fn [a v] ['?c a v]) child-attrs parent-vals)
                       child-hits (q-fn {:find '[?c] :where patterns} db)]
                 :when (seq child-hits)]
-          (throw (ex-info
-                  (str "update or delete on table \"" table-name
-                       "\" violates foreign key constraint \""
-                       name "\" on table \"" child-table
-                       "\": Key ("
-                       (str/join ", " parent-cols) ")=("
-                       (str/join ", " (map pr-str parent-vals))
-                       ") is still referenced from table \""
-                       child-table "\"")
-                  {:sqlstate "23503"
-                   :table child-table
-                   :constraint name})))))))
+          (throw (ex-info "foreign key still referenced"
+                          {:error :foreign-key-violation
+                           :table child-table
+                           :constraint name
+                           :detail (str "Key ("
+                                        (str/join ", " parent-cols)
+                                        ")=("
+                                        (str/join ", " (map pr-str parent-vals))
+                                        ") is still referenced from table \""
+                                        child-table "\"")})))))))
 
 (defn- read-column-constraints
   "Return {col-name {:attr ident :not-null? bool :default [kind value arg]}}
@@ -1531,13 +1522,10 @@
                                   present-key
                                   (let [v (get-in st [:filled present-key])]
                                     (if (and not-null? (nil? v))
-                                      (throw (ex-info (str "null value in column \""
-                                                           col-name "\" of relation \""
-                                                           table-name
-                                                           "\" violates not-null constraint")
-                                                      {:sqlstate "23502"
-                                                       :table    table-name
-                                                       :column   col-name}))
+                                      (throw (ex-info "not-null violation"
+                                                      {:error  :not-null-violation
+                                                       :table  table-name
+                                                       :column col-name}))
                                       st))
 
                                   default
@@ -1551,39 +1539,28 @@
                                               (assoc-in [:filled ns-attr] nxt)
                                               (update :seq-ops conj seq-tx))
                                           (if not-null?
-                                            (throw (ex-info
-                                                    (str "null value in column \""
-                                                         col-name "\" of relation \""
-                                                         table-name
-                                                         "\" violates not-null constraint")
-                                                    {:sqlstate "23502"
-                                                     :table    table-name
-                                                     :column   col-name}))
+                                            (throw (ex-info "not-null violation"
+                                                            {:error  :not-null-violation
+                                                             :table  table-name
+                                                             :column col-name}))
                                             st)))
 
                                       (nil? v)
                                       (if not-null?
-                                        (throw (ex-info
-                                                (str "null value in column \""
-                                                     col-name "\" of relation \""
-                                                     table-name
-                                                     "\" violates not-null constraint")
-                                                {:sqlstate "23502"
-                                                 :table    table-name
-                                                 :column   col-name}))
+                                        (throw (ex-info "not-null violation"
+                                                        {:error  :not-null-violation
+                                                         :table  table-name
+                                                         :column col-name}))
                                         st)
 
                                       :else
                                       (assoc-in st [:filled ns-attr] v)))
 
                                   not-null?
-                                  (throw (ex-info (str "null value in column \""
-                                                       col-name "\" of relation \""
-                                                       table-name
-                                                       "\" violates not-null constraint")
-                                                  {:sqlstate "23502"
-                                                   :table    table-name
-                                                   :column   col-name}))
+                                  (throw (ex-info "not-null violation"
+                                                  {:error  :not-null-violation
+                                                   :table  table-name
+                                                   :column col-name}))
 
                                   :else st)))
                             {:filled entry :seq-ops []}
@@ -1819,23 +1796,21 @@
                                          :where [[?e ?a ?v]]}
                                        db a v))]
         (when-not (= existing eid)
-          (throw (ex-info
-                  (str "duplicate key value violates unique constraint \""
-                       (namespace a) "_pkey\"")
-                  {:sqlstate "23505"
-                   :table (namespace a)
-                   :column (name a)
-                   :constraint (str (namespace a) "_pkey")
-                   :datahike/collision [a v]}))))
+          (throw (ex-info "unique violation"
+                          {:error      :unique-violation
+                           :table      (namespace a)
+                           :column     (name a)
+                           :constraint (str (namespace a) "_pkey")
+                           :value      v
+                           :datahike/collision [a v]}))))
       (when (contains? (get @seen a) v)
-        (throw (ex-info
-                (str "duplicate key value violates unique constraint \""
-                     (namespace a) "_pkey\"")
-                {:sqlstate "23505"
-                 :table (namespace a)
-                 :column (name a)
-                 :constraint (str (namespace a) "_pkey")
-                 :datahike/collision [a v]})))
+        (throw (ex-info "unique violation"
+                        {:error      :unique-violation
+                         :table      (namespace a)
+                         :column     (name a)
+                         :constraint (str (namespace a) "_pkey")
+                         :value      v
+                         :datahike/collision [a v]})))
       (vswap! seen update a (fnil conj #{}) v))))
 
 (defn- check-not-null-on-update!
@@ -1857,12 +1832,9 @@
           (when (and (contains? not-null-attrs attr)
                      (or (= verb :db/retract)
                          (and (= verb :db/add) (nil? val))))
-            (throw (ex-info (str "null value in column \"" (name attr)
-                                 "\" of relation \""
-                                 (namespace attr)
-                                 "\" violates not-null constraint")
-                            {:sqlstate "23502"
-                             :table (namespace attr)
+            (throw (ex-info "not-null violation"
+                            {:error  :not-null-violation
+                             :table  (namespace attr)
                              :column (name attr)}))))))))
 
 (defn- check-updates-against-row-constraints!
@@ -2262,8 +2234,10 @@
          (.atStartOfDay (java.time.LocalDate/parse s)
                         java.time.ZoneOffset/UTC))
         (catch Exception _
-          (throw (ex-info (str "Cannot parse temporal value: " s)
-                          {:value s :sqlstate "22P02"})))))))
+          (throw (ex-info "cannot parse temporal value"
+                          {:error :invalid-text-representation
+                           :type "timestamp"
+                           :value s})))))))
 
 ;; ============================================================================
 ;; Prepared-statement support — thread cached parse result + bound params
@@ -2710,18 +2684,15 @@
                                 (= their-attrs ::any)
                                 (some their-attrs our-attrs))]
             (when conflict?
-              (throw (ex-info
-                      (str "could not serialize access due to "
-                           "concurrent update (base=" begin-max-tx
-                           ", current=" current-max-tx
-                           ", overlap="
-                           (cond wildcard? "wildcard (retractEntity)"
-                                 (= their-attrs ::any) "query-failed"
-                                 :else (pr-str
-                                        (filter their-attrs our-attrs)))
-                           ")")
-                      {:sqlstate "40001"
-                       :error :db.error/serialization})))))
+              (throw (ex-info "could not serialize access due to concurrent update"
+                              {:error  :serialization-failure
+                               :detail (str "base=" begin-max-tx
+                                            ", current=" current-max-tx
+                                            ", overlap="
+                                            (cond wildcard? "wildcard (retractEntity)"
+                                                  (= their-attrs ::any) "query-failed"
+                                                  :else (pr-str
+                                                         (filter their-attrs our-attrs))))})))))
         (when (seq buf) (d/transact conn buf))
         (release-session-locks! session-id)
         (release-advisory-locks! session-id true)
@@ -2942,8 +2913,10 @@
   [conn parsed]
   (let [[new-name from] (:args parsed)]
     (when-not (and new-name from)
-      (throw (ex-info "datahike.create_branch requires (new-name, from-branch-or-commit)"
-                      {:sqlstate "42601" :args (:args parsed)})))
+      (throw (ex-info "datahike.create_branch arity"
+                      {:error :syntax-error
+                       :detail "datahike.create_branch requires (new-name, from-branch-or-commit)"
+                       :args (:args parsed)})))
     (let [from-ref (if (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
                                    from)
                      (java.util.UUID/fromString from)
@@ -2957,8 +2930,10 @@
   [conn parsed]
   (let [[bname] (:args parsed)]
     (when-not bname
-      (throw (ex-info "datahike.delete_branch requires (branch-name)"
-                      {:sqlstate "42601" :args (:args parsed)})))
+      (throw (ex-info "datahike.delete_branch arity"
+                      {:error :syntax-error
+                       :detail "datahike.delete_branch requires (branch-name)"
+                       :args (:args parsed)})))
     (versioning/delete-branch! conn (keyword bname))
     (single-row-result "delete_branch" PgWireServer/OID_TEXT bname)))
 
@@ -3132,8 +3107,9 @@
                               :in [$ ?n]}
                             db0 seq-name))
           _ (when-not eid
-              (throw (ex-info (str "Sequence '" seq-name "' does not exist")
-                              {:sqlstate "42P01" :seq-name seq-name})))
+              (throw (ex-info "sequence does not exist"
+                              {:error :undefined-sequence
+                               :sequence seq-name})))
           incr (or (ffirst (q-fn '{:find [?i]
                                    :where [[?e :__seq__/increment ?i]]
                                    :in [$ ?e]}
@@ -3177,9 +3153,11 @@
               (cond
                 cas-ok? next
                 (>= attempt nextval-max-retries)
-                (throw (ex-info (str "nextval('" seq-name "') gave up after "
-                                     nextval-max-retries " contention retries")
-                                {:sqlstate "40001" :seq-name seq-name}))
+                (throw (ex-info "nextval contention retry budget exhausted"
+                                {:error  :serialization-failure
+                                 :detail (str "nextval('" seq-name "') gave up after "
+                                              nextval-max-retries " contention retries")
+                                 :sequence seq-name}))
                 :else
                 (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
                     (recur (inc attempt))))))]
@@ -3516,9 +3494,10 @@
                                  :branch    (keyword v)
                                  :commit-id (try (java.util.UUID/fromString v)
                                                  (catch Exception _
-                                                   (throw (ex-info
-                                                           (str "Not a valid commit UUID: " v)
-                                                           {:value v :sqlstate "22P02"}))))
+                                                   (throw (ex-info "invalid commit UUID"
+                                                                   {:error :invalid-text-representation
+                                                                    :type "uuid"
+                                                                    :value v}))))
                                  (parse-instant v)))
                         (swap! session-state dissoc k))
                       (empty-result "SET"))
@@ -3708,10 +3687,9 @@
                                                                          id)))
                                                                    results-vec)]
                                                 (if conflict
-                                                  (throw (ex-info
-                                                          (str "could not obtain lock on row in relation \""
-                                                               table "\"")
-                                                          {:sqlstate "55P03"}))
+                                                  (throw (ex-info "lock not available"
+                                                                  {:error :lock-not-available
+                                                                   :table table}))
                                                   (do
                                                     (doseq [row results-vec
                                                             :let [id (nth row id-idx nil)]
@@ -3729,10 +3707,9 @@
                                                                          id)))
                                                                    results-vec)]
                                                 (if conflict
-                                                  (throw (ex-info
-                                                          (str "could not obtain lock on row in relation \""
-                                                               table "\"")
-                                                          {:sqlstate "55P03"}))
+                                                  (throw (ex-info "lock not available"
+                                                                  {:error :lock-not-available
+                                                                   :table table}))
                                                   (do
                                                     (doseq [row results-vec
                                                             :let [id (nth row id-idx nil)]
@@ -4286,8 +4263,11 @@
   (reify PgWireServer$QueryHandler
     (close [_])
     (parse [_ _ _]
-      (throw (ex-info (str "database \"" db-name "\" does not exist")
-                      {:sqlstate "3D000"})))
+      ;; Direct throw to Java wire layer — use pg-error so .getMessage()
+      ;; returns the PG-shaped string. Java's catch still emits XX000
+      ;; because we don't subclass PgProtocolException, but the message
+      ;; text now carries the right user-facing form.
+      (throw (errors/pg-error :undefined-database {:database db-name})))
     (describeParams [_ _] (int-array 0))
     (executePrepared [_ _ _]
       (-> (PgWireServer$QueryResult. (str "database \"" db-name "\" does not exist"))

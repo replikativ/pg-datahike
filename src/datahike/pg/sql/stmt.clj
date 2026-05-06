@@ -1098,8 +1098,10 @@
                     (do
                       (reset! has-aggregates? true)
                       (when (empty? order-by-list)
-                        (throw (ex-info (str fname " requires WITHIN GROUP (ORDER BY ...)")
-                                        {:fname fname})))
+                        (throw (ex-info "WITHIN GROUP missing"
+                                        {:error :syntax-error
+                                         :detail (str fname " requires WITHIN GROUP (ORDER BY ...)")
+                                         :fname fname})))
                       (let [first-ob ^net.sf.jsqlparser.statement.select.OrderByElement
                             (first order-by-list)
                             x-expr (.getExpression first-ob)
@@ -1528,9 +1530,10 @@
                                             v)
                                         ;; Detect unsupported: aggregate in ORDER BY not in SELECT
                                         _ (when (and (map? v) (:aggregate v))
-                                            (throw (ex-info (str "ORDER BY on aggregate not in SELECT list is not supported: " (str expr))
-                                                            {:expr (str expr)
-                                                             :sqlstate "0A000"})))]
+                                            (throw (ex-info "ORDER BY on aggregate not in SELECT list"
+                                                            {:error :feature-not-supported
+                                                             :feature "ORDER BY on aggregate not in SELECT list"
+                                                             :detail (str "ORDER BY on aggregate not in SELECT list is not supported: " (str expr))})))]
                                     [v (if asc? :asc :desc)]))
                                 order-by)))
 
@@ -3056,14 +3059,13 @@
                                 schema)
                           seen (volatile! {})
                           raise! (fn [attr val constraint]
-                                   (throw (ex-info
-                                           (format "duplicate key value violates unique constraint \"%s\""
-                                                   constraint)
-                                           {:sqlstate "23505"
-                                            :table table-name
-                                            :column (name attr)
-                                            :constraint constraint
-                                            :datahike/collision [attr val]})))]
+                                   (throw (ex-info "unique violation"
+                                                   {:error      :unique-violation
+                                                    :table      table-name
+                                                    :column     (name attr)
+                                                    :constraint constraint
+                                                    :value      val
+                                                    :datahike/collision [attr val]})))]
                       (doseq [attrs row-attrs]
                     ;; 1) Scalar identity checks
                         (doseq [[a v] attrs

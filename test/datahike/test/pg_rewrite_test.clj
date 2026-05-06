@@ -55,7 +55,11 @@
                     nil
                     (catch clojure.lang.ExceptionInfo e e))]
         (is (some? ex))
-        (is (= "0A000" (:sqlstate (ex-data ex))))))))
+        ;; Resolve through the wire-boundary classifier — that's the
+        ;; contract clients see, not the raw ex-data shape. Throw sites
+        ;; describe errors structurally via :error keys; classifier
+        ;; maps to SQLSTATE.
+        (is (= "0A000" (first (datahike.pg.errors/classify-exception ex))))))))
 
 (deftest inline-references-table-level-not-stripped
   (testing "FOREIGN KEY (col) REFERENCES … is preserved — preceded by )"

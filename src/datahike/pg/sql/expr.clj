@@ -246,8 +246,10 @@
             impl-fn (fn [name & [missing-ok]]
                       (or (get settings (str name))
                           (when missing-ok :__null__)
-                          (throw (ex-info (str "unrecognized configuration parameter \"" name "\"")
-                                          {:sqlstate "42704"}))))]
+                          (throw (ex-info "unrecognized configuration parameter"
+                                          {:error :undefined-object
+                                           :kind "configuration parameter"
+                                           :name name}))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -494,8 +496,9 @@
                       (if-let [a (coerce-pg-array arr)]
                         (do
                           (when (pg-arr/multidim? a)
-                            (throw (ex-info "array_append: argument must be empty or one-dimensional array"
-                                            {:sqlstate "2202E"
+                            (throw (ex-info "array_append rejects multi-dim"
+                                            {:error :array-element-error
+                                             :detail "array_append: argument must be empty or one-dimensional array"
                                              :ndim (pg-arr/ndim a)})))
                           (pg-arr/array (:elem-type a)
                                         (conj (:elements a) v)
@@ -518,8 +521,9 @@
                       (if-let [a (coerce-pg-array arr)]
                         (do
                           (when (pg-arr/multidim? a)
-                            (throw (ex-info "array_prepend: argument must be empty or one-dimensional array"
-                                            {:sqlstate "2202E"
+                            (throw (ex-info "array_prepend rejects multi-dim"
+                                            {:error :array-element-error
+                                             :detail "array_prepend: argument must be empty or one-dimensional array"
                                              :ndim (pg-arr/ndim a)})))
                           (pg-arr/array (:elem-type a)
                                         (into [v] (:elements a))
@@ -562,8 +566,10 @@
                       (if-let [a (coerce-pg-array arr)]
                         (do
                           (when (pg-arr/multidim? a)
-                            (throw (ex-info "array_position: searching for elements in multidimensional arrays is not supported"
-                                            {:sqlstate "0A000"
+                            (throw (ex-info "array_position rejects multi-dim"
+                                            {:error :feature-not-supported
+                                             :feature "array_position on multidimensional array"
+                                             :detail "searching for elements in multidimensional arrays is not supported"
                                              :ndim (pg-arr/ndim a)})))
                           (let [lb (pg-arr/lbound a 1)
                                 start-off (max 0 (- (long (or start lb)) (long lb)))
@@ -588,8 +594,10 @@
                       (if-let [a (coerce-pg-array arr)]
                         (do
                           (when (pg-arr/multidim? a)
-                            (throw (ex-info "array_remove: removing elements from multidimensional arrays is not supported"
-                                            {:sqlstate "0A000"
+                            (throw (ex-info "array_remove rejects multi-dim"
+                                            {:error :feature-not-supported
+                                             :feature "array_remove on multidimensional array"
+                                             :detail "removing elements from multidimensional arrays is not supported"
                                              :ndim (pg-arr/ndim a)})))
                           (pg-arr/array (:elem-type a)
                                         (vec (remove #(= % v) (:elements a)))
@@ -1095,9 +1103,11 @@
                                then (translate-expr ctx then-val)]
                            ;; Detect unsupported: aggregate refs in CASE branches
                            (when (or (map? test) (map? then))
-                             (throw (ex-info "CASE expressions referencing aggregate functions (e.g. CASE WHEN COUNT(*) > 1) are not supported in Datahike SQL. Use a subquery."
-                                             {:expr (str case-expr)
-                                              :sqlstate "0A000"})))
+                             (throw (ex-info "aggregate in CASE not supported"
+                                             {:error :feature-not-supported
+                                              :feature "aggregate function in CASE branch"
+                                              :detail "CASE expressions referencing aggregate functions (e.g. CASE WHEN COUNT(*) > 1) are not supported in Datahike SQL. Use a subquery."
+                                              :expr (str case-expr)})))
                            {:test test :then then}))
                        when-clauses)
         else-val (when else-expr (translate-expr ctx else-expr))
@@ -1270,9 +1280,10 @@
                      (catch Throwable _ []))
                    [])
                  :else
-                 (throw (ex-info (str "IN expression form unsupported in predicate-expr context: "
-                                      (type right))
-                                 {:expr (str right) :sqlstate "0A000"})))
+                 (throw (ex-info "IN form unsupported in predicate-expr context"
+                                 {:error :feature-not-supported
+                                  :feature (str "IN expression form: " (.getName ^Class (type right)))
+                                  :expr (str right)})))
           non-null-vals (filterv some? vals)
           has-param? (some symbol? non-null-vals)
           set-form (if has-param?
@@ -1377,9 +1388,11 @@
       (or (instance? ExistsExpression expr)
           (instance? JsonOperator expr)
           (instance? DoubleAnd expr))
-      (throw (ex-info (str "Predicate expression not supported in inline boolean context: "
-                           (type expr))
-                      {:expr (str expr) :sqlstate "0A000"}))
+      (throw (ex-info "predicate not supported in inline boolean context"
+                      {:error :feature-not-supported
+                       :feature (str "predicate of type " (.getName ^Class (type expr))
+                                     " in inline boolean context")
+                       :expr (str expr)}))
       :else
       (translate-expr ctx expr))))
 
@@ -2207,8 +2220,10 @@
         :__null__))
 
     :else
-    (throw (ex-info (str "Unsupported SQL expression: " (type expr) " — " (str expr))
-                    {:expr (str expr) :sqlstate "0A000"}))))
+    (throw (ex-info "unsupported SQL expression"
+                    {:error :feature-not-supported
+                     :feature (str "expression of type " (.getName ^Class (type expr)))
+                     :expr (str expr)}))))
 
 ;; ============================================================================
 ;; WHERE clause translation: SQL predicates → Datalog :where clauses
@@ -2912,12 +2927,17 @@
                      (mapv (fn [row]
                              (if (sequential? row) (first row) row))
                            inner-results))
-                   (throw (ex-info "Subquery requires database context (use parse-sql with db parameter)"
-                                   {:expr (str right) :sqlstate "XX000"})))
+                   (throw (ex-info "subquery requires database context"
+                                   {:error :internal-error
+                                    :detail "subquery requires database context (use parse-sql with db parameter)"
+                                    :expr (str right)})))
 
                  :else
-                 (throw (ex-info (str "Unsupported IN expression: " (type right))
-                                 {:expr (str right) :sqlstate "0A000"})))
+                 (throw (ex-info "unsupported IN expression form"
+                                 {:error :feature-not-supported
+                                  :feature (str "IN with right-hand of type "
+                                                (.getName ^Class (type right)))
+                                  :expr (str right)})))
           non-null-vals (filterv some? vals)
           ;; Detect parameterised values — JdbcParameter substitution
           ;; emits `?pN` symbols. A `(contains? #{?p1} ?col)` clause
@@ -3307,7 +3327,9 @@
                   []
                   [[(list 'not= 1 1)]])))))
         (throw (ex-info "EXISTS subquery requires database context"
-                        {:expr (str expr) :sqlstate "XX000"}))))
+                        {:error :internal-error
+                         :detail "EXISTS subquery requires database context"
+                         :expr (str expr)}))))
 
     ;; Parenthesized predicate
     (instance? Parenthesis expr)
@@ -3320,8 +3342,10 @@
       (if (= 1 (count pel))
         (translate-predicate ctx (first pel))
         ;; Multi-element: shouldn't appear in WHERE, but handle gracefully
-        (throw (ex-info (str "Multi-element ParenthesedExpressionList in WHERE: " (str expr))
-                        {:expr (str expr) :sqlstate "0A000"}))))
+        (throw (ex-info "multi-element parens in WHERE"
+                        {:error :feature-not-supported
+                         :feature "multi-element ParenthesedExpressionList in WHERE"
+                         :expr (str expr)}))))
 
     ;; jsonb field access in WHERE: name->>'key' = 'value'
     ;; JSqlParser folds the comparison into the JsonExpression's ident list
@@ -3520,5 +3544,7 @@
       [[(list '= v true)]])
 
     :else
-    (throw (ex-info (str "Unsupported WHERE expression: " (type expr))
-                    {:expr (str expr) :sqlstate "0A000"}))))
+    (throw (ex-info "unsupported WHERE expression"
+                    {:error :feature-not-supported
+                     :feature (str "WHERE expression of type " (.getName ^Class (type expr)))
+                     :expr (str expr)}))))

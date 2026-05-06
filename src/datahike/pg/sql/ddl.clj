@@ -485,16 +485,16 @@
                                                    (column-is-not-null? col))
                                default-spec (column-default-spec col)
                                _ (when (= :unsupported (:kind default-spec))
-                                   (throw (ex-info
-                                           (str "DEFAULT expression not supported for "
-                                                col-name ": " (:raw default-spec)
-                                                " — only literals, now(), "
-                                                "current_date, current_time, "
-                                                "current_user, and nextval('seq') "
-                                                "are implemented")
-                                           {:sqlstate "0A000"
-                                            :column col-name
-                                            :default (:raw default-spec)})))]
+                                   (throw (ex-info "DEFAULT expression not supported"
+                                                   {:error :feature-not-supported
+                                                    :feature (str "DEFAULT expression " (pr-str (:raw default-spec))
+                                                                  " on column \"" col-name "\"")
+                                                    :detail (str "DEFAULT expression " (pr-str (:raw default-spec))
+                                                                 " on column \"" col-name "\" is not supported"
+                                                                 " — only literals, now(), current_date,"
+                                                                 " current_time, current_user, and"
+                                                                 " nextval('seq') are implemented")
+                                                    :column col-name})))]
                          :when (not (skip-col? col-name))]
                      (cond-> {:db/ident       (keyword ns col-name)
                               :db/valueType   dh-type
@@ -606,23 +606,27 @@
         _ (doseq [fk fk-entities]
             (when (contains? #{:set-null :set-default}
                              (:pg/fk-on-delete fk))
-              (throw (ex-info
-                      (str "FOREIGN KEY ON DELETE "
-                           (name (:pg/fk-on-delete fk))
-                           " is not yet supported for " (:pg/fk-name fk)
-                           " — only NO ACTION / RESTRICT / CASCADE are enforced")
-                      {:sqlstate "0A000"
-                       :fk (:pg/fk-name fk)
-                       :action (:pg/fk-on-delete fk)})))
+              (throw (ex-info "ON DELETE action not supported"
+                              {:error :feature-not-supported
+                               :feature (str "FOREIGN KEY ON DELETE "
+                                             (name (:pg/fk-on-delete fk)))
+                               :detail (str "FOREIGN KEY ON DELETE "
+                                            (name (:pg/fk-on-delete fk))
+                                            " is not yet supported for "
+                                            (:pg/fk-name fk)
+                                            " — only NO ACTION / RESTRICT / CASCADE are enforced")
+                               :constraint (:pg/fk-name fk)})))
             (when (contains? #{:cascade :set-null :set-default}
                              (:pg/fk-on-update fk))
-              (throw (ex-info
-                      (str "FOREIGN KEY ON UPDATE "
-                           (name (:pg/fk-on-update fk))
-                           " is not yet supported for " (:pg/fk-name fk))
-                      {:sqlstate "0A000"
-                       :fk (:pg/fk-name fk)
-                       :action (:pg/fk-on-update fk)}))))
+              (throw (ex-info "ON UPDATE action not supported"
+                              {:error :feature-not-supported
+                               :feature (str "FOREIGN KEY ON UPDATE "
+                                             (name (:pg/fk-on-update fk)))
+                               :detail (str "FOREIGN KEY ON UPDATE "
+                                            (name (:pg/fk-on-update fk))
+                                            " is not yet supported for "
+                                            (:pg/fk-name fk))
+                               :constraint (:pg/fk-name fk)}))))
         ;; Sequence schema + initial entity for each IDENTITY column
         seq-tx (vec (mapcat (fn [col-name]
                               (let [seq-name (str table-name "_" col-name "_seq")]

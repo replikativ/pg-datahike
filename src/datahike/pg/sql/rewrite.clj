@@ -229,12 +229,11 @@
                     (or (contains? #{"set null" "set default"} act)
                         (and (= "update" verb)
                              (contains? #{"cascade" "set null" "set default"} act)))
-                    (throw (ex-info
-                            (str "foreign-key action ON "
-                                 (str/upper-case (or verb "DELETE")) " "
-                                 (str/upper-case act)
-                                 " is not supported by datahike pgwire")
-                            {:sqlstate "0A000"}))
+                    (throw (ex-info "unsupported foreign-key action"
+                                    {:error :feature-not-supported
+                                     :feature (str "foreign-key action ON "
+                                                   (str/upper-case (or verb "DELETE")) " "
+                                                   (str/upper-case act))}))
 
                     ;; ON DELETE CASCADE — lift to table-level FK so our
                     ;; runtime cascade machinery (server.clj
