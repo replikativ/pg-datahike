@@ -3263,6 +3263,26 @@
       ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
       (empty-result (:tag parsed))
 
+      :owner-noop
+      ;; ALTER <object> ... OWNER TO <role>. pg_dump-emitted; we
+      ;; don't have a role system. classify carries the matching
+      ;; tag ("ALTER TABLE" / "ALTER SEQUENCE" / …).
+      (empty-result (:tag parsed))
+
+      :psql-meta
+      ;; \restrict / \unrestrict / \connect / \c / \set markers
+      ;; that pg_dump emits and that leaked through psql. classify
+      ;; carries the original \-prefixed metacommand as :tag.
+      (empty-result (:tag parsed))
+
+      :set-config
+      ;; SELECT pg_catalog.set_config('search_path', '', false) —
+      ;; pg_dump session-prelude. We don't honor the GUC (no
+      ;; equivalent in Datahike); just synthesize a 1-row result so
+      ;; the SELECT completes cleanly. The 3-arg form returns the
+      ;; new value as text; we return empty-string.
+      (single-row-result "set_config" PgWireServer/OID_TEXT "")
+
       :create-database
       ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via the
       ;; operator-supplied :on-create-database hook. On success the

@@ -1211,6 +1211,8 @@
     :comment-on :lock-table :create-view :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database
+    ;; pg_dump-emitted utility statements we silently accept
+    :owner-noop :psql-meta :set-config
     ;; datahike.* branching / versioning functions
     :dh-branches :dh-current-branch :dh-commit-id :dh-parent-commits
     :dh-create-branch :dh-delete-branch})

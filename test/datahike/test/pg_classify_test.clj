@@ -369,3 +369,54 @@
          (c/classify "SELECT setval('s1', 100)")))
   (testing "setval 3-arg form (is_called flag) — still extracts name + new-value"
     (is (= "s1" (:seq-name (c/classify "SELECT setval('s1', 100, true)"))))))
+
+;; ============================================================================
+;; pg_dump utility-statement support (tier 1)
+;; ============================================================================
+
+(deftest classify-owner-noop
+  (testing "ALTER <object> ... OWNER TO <role> — silently accept by object kind"
+    (is (= :owner-noop (kind "ALTER TABLE public.users OWNER TO postgres")))
+    (is (= :owner-noop (kind "ALTER SEQUENCE public.users_id_seq OWNER TO postgres")))
+    (is (= :owner-noop (kind "ALTER VIEW v OWNER TO bob")))
+    (is (= :owner-noop (kind "ALTER INDEX i OWNER TO bob")))
+    (is (= :owner-noop (kind "ALTER FUNCTION f() OWNER TO bob")))
+    (is (= :owner-noop (kind "ALTER TYPE t OWNER TO bob")))
+    (is (= :owner-noop (kind "ALTER MATERIALIZED VIEW mv OWNER TO bob")))
+    (is (= :owner-noop (kind "ALTER FOREIGN TABLE ft OWNER TO bob")))
+    (is (= :owner-noop (kind "ALTER LARGE OBJECT 12345 OWNER TO bob"))))
+
+  (testing "tag matches the object kind"
+    (is (= "ALTER TABLE"    (:tag (c/classify "ALTER TABLE t OWNER TO bob"))))
+    (is (= "ALTER SEQUENCE" (:tag (c/classify "ALTER SEQUENCE s OWNER TO bob")))))
+
+  (testing "ALTER without OWNER TO falls through to other handlers"
+    (is (= :generic-sql (kind "ALTER TABLE t ADD COLUMN x INT")))
+    (is (= :rls         (kind "ALTER TABLE t ENABLE ROW LEVEL SECURITY")))))
+
+(deftest classify-psql-meta
+  (testing "psql metacommands at the head of a statement"
+    (is (= :psql-meta (kind "\\restrict abc123")))
+    (is (= :psql-meta (kind "\\unrestrict abc123")))
+    (is (= :psql-meta (kind "\\connect mydb")))
+    (is (= :psql-meta (kind "\\c otherdb")))
+    (is (= :psql-meta (kind "\\set var value"))))
+
+  (testing "tag preserves the original metacommand name"
+    (is (= "\\restrict" (:tag (c/classify "\\restrict abc"))))
+    (is (= "\\connect"  (:tag (c/classify "\\connect mydb")))))
+
+  (testing "unknown \\foo metacommands fall through (don't accidentally swallow)"
+    (is (not= :psql-meta (kind "\\foobar this is unknown"))))
+
+  (testing "non-meta statements aren't accidentally classified as meta"
+    (is (= :begin     (kind "BEGIN")))
+    (is (= :generic-sql (kind "SELECT 1")))))
+
+(deftest classify-set-config
+  (testing "SELECT pg_catalog.set_config(...) — pg_dump session prelude"
+    (is (= :set-config (kind "SELECT pg_catalog.set_config('search_path', '', false)")))
+    (is (= :set-config (kind "SELECT set_config('client_encoding', 'UTF8', false)"))))
+
+  (testing "other set_* functions don't accidentally classify as set-config"
+    (is (= :setval (kind "SELECT setval('s', 100)")))))

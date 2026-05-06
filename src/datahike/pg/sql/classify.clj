@@ -477,6 +477,12 @@
       ;; SQL-spec equivalents — both are bare-keyword expressions, not
       ;; function calls. Tokeniser treats them as :ident, no parens.
       (kw=? t1 "current_catalog") {:kind :current-database}
+      ;; pg_dump session-prelude function — sets a GUC. We don't honor
+      ;; the side-effect (the GUC has no Datahike equivalent), but we
+      ;; need to silently accept the call so the dump replays.
+      ;; The 3-arg form is `set_config(name, value, is_local)`; we
+      ;; accept any args.
+      (kw=? t1 "set_config") {:kind :set-config}
       (kw=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (kw=? t1 "txid_current")  {:kind :txid-current}
       (kw=? t1 "pg_sleep")
@@ -558,11 +564,47 @@
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
       :else                 {:kind :generic-sql})))
 
+(defn- contains-owner-to?
+  "Scan the (already-consumed-prelude) token tail for a bare-ident
+   `OWNER` followed immediately by a bare-ident `TO`. Used to detect
+   `ALTER <object> ... OWNER TO <role>` — pg_dump emits this verb
+   for every table/sequence/view/index/function/type it dumps. Real
+   PG doesn't allow `OWNER` or `TO` as bare column / constraint names
+   in DDL (they're reserved-ish in this context), so the false-positive
+   risk is low."
+  [toks]
+  (loop [ts (seq toks)]
+    (cond
+      (nil? ts) false
+      (and (kw=? (first ts) "owner")
+           (kw=? (second ts) "to"))
+      true
+      :else (recur (next ts)))))
+
 (defn- classify-alter [toks]
   (let [[t1 & rest-toks] toks]
     (cond
       (kw=? t1 "policy")  {:kind :alter-policy :reject-kind :policy :tag "ALTER POLICY"}
       (kw=? t1 "schema")  {:kind :schema-noop :tag "ALTER SCHEMA"}
+
+      ;; ALTER <object> ... OWNER TO ... — pg_dump-emitted boilerplate.
+      ;; We don't have a role system, so silently accept with the
+      ;; matching command tag. Detected here (before the per-object-
+      ;; type dispatch) so we cover ALTER TABLE / SEQUENCE / VIEW /
+      ;; INDEX / FUNCTION / TYPE / DOMAIN / AGGREGATE / ... uniformly.
+      (and (or (kw-in? t1 #{"table" "sequence" "view" "index"
+                            "function" "procedure" "type" "domain"
+                            "aggregate" "operator" "language"
+                            "materialized" "publication" "subscription"
+                            "foreign" "server" "trigger" "rule"
+                            "collation" "conversion"})
+               ;; ALTER LARGE OBJECT, ALTER GROUP, etc.
+               (kw-in? t1 #{"large" "group" "role" "user"
+                            "tablespace" "database"}))
+           (contains-owner-to? rest-toks))
+      {:kind :owner-noop
+       :tag (str "ALTER " (str/upper-case (:text t1)))}
+
       (kw=? t1 "table")
       ;; Consume optional [IF EXISTS] and the table name (possibly
       ;; schema.name), then inspect what follows. If it's ENABLE/
@@ -776,6 +818,23 @@
                     :else nil)]
     {:kind :set :var var-name :value value-str}))
 
+(def ^:private psql-metacommand-names
+  "Lower-case psql metacommand names that pg_dump emits unprefixed
+   (i.e. as a leading `\\NAME` token). psql normally consumes these
+   itself, but a script that pipes the dump directly through a JDBC
+   `executeStatement` will leak them through to us.
+
+   Limited to the metacommands we actually see in pg_dump output —
+   not a full psql lexicon. False-positive risk: if someone genuinely
+   wants to send a `\\connect` as application SQL, we'll accept-and-
+   ignore it. That's the same outcome as if they'd sent it through
+   real psql, so it's a wash."
+  #{"restrict" "unrestrict"
+    "connect" "c"
+    "set" "i" "ir"
+    "encoding"
+    "echo" "qecho"})
+
 (defn classify
   "Classify a SQL string. See namespace docstring for the output
    contract."
@@ -792,8 +851,24 @@
         toks (vec (take 64 skipped))
         t1 (first toks)
         rest-toks (subvec toks (if (seq toks) 1 0))]
-    (if (nil? t1)
+    (cond
+      (nil? t1)
       {:kind :empty}
+
+      ;; psql metacommand at the head of the statement.
+      ;; Tokenizer emits `\` as :op (it's not in op-chars but falls
+      ;; through to the single-char-punct fallback). The next ident
+      ;; carries the metacommand name. pg_dump 18+ emits `\restrict`
+      ;; / `\unrestrict` markers; older versions emit `\connect`
+      ;; before each database in a multi-database dump.
+      (and (= "\\" (:text t1))
+           (= :ident (:type (first rest-toks)))
+           (contains? psql-metacommand-names
+                      (str/lower-case (:text (first rest-toks)))))
+      {:kind :psql-meta
+       :tag (str "\\" (str/lower-case (:text (first rest-toks))))}
+
+      :else
       (let [kw (when (= :ident (:type t1)) (str/lower-case (:text t1)))]
         (case kw
           ;; --- authorization DDL — rejected by default, opt-in silent-accept
