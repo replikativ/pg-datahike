@@ -404,7 +404,13 @@
             ;; Count prepared-statement placeholders once at the AST
             ;; level — reused for INSERT/UPDATE/DELETE which don't
             ;; accumulate placeholders in a ctx (unlike translate-select).
-                 param-indices (params/ast-param-indices stmt)
+            ;; Short-circuit when the SQL contains no `?` outside
+            ;; quoted strings/comments — the reflection-based AST walk
+            ;; was a measurable hot-spot on literal-only INSERTs (the
+            ;; pg_dump load path).
+                 param-indices (if (params/has-param-marker? sql)
+                                 (params/ast-param-indices stmt)
+                                 #{})
                  param-count   (if (empty? param-indices) 0 (apply max param-indices))
             ;; Best-effort param OID inference so Describe('S') emits a
             ;; real ParameterDescription — lets JDBC drivers pick the

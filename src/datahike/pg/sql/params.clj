@@ -179,6 +179,82 @@
 ;; ---------------------------------------------------------------------------
 ;; AST parameter-index walker
 
+(defn has-param-marker?
+  "Fast scan: does SQL contain a `?` or `$N` placeholder OUTSIDE a
+   quoted string, dollar-quoted body, or comment? When false, the
+   parser doesn't need to walk the AST for parameter indices — a
+   real win for pg_dump-style INSERTs (literal-only) where the
+   reflection-based AST walk dominated parse time.
+
+   pgjdbc rewrites `?` to numbered `$N` before sending Parse, so the
+   on-wire SQL never has `?` from a JDBC client — must detect both
+   forms."
+  [^String sql]
+  (let [n (long (.length sql))]
+    (loop [i (long 0), in-sq false, in-dq false, in-dollar false, dollar-tag nil]
+      (if (>= i n)
+        false
+        (let [c (.charAt sql i)]
+          (cond
+            ;; Found `?` in non-quoted, non-comment context.
+            (and (not in-sq) (not in-dq) (not in-dollar) (= c \?))
+            true
+
+            ;; Found `$N` (digit follows `$`) in non-quoted, non-
+            ;; comment context. Plain `$$...$$` (no digit, no tag)
+            ;; is the dollar-quote case, handled below.
+            (and (not in-sq) (not in-dq) (not in-dollar)
+                 (= c \$) (< (inc i) n)
+                 (Character/isDigit (.charAt sql (unchecked-inc i))))
+            true
+
+            ;; Dollar-quoted string body.
+            (and (not in-sq) (not in-dq) in-dollar)
+            (let [taglen (long (.length ^String dollar-tag))]
+              (if (and (= c \$) (<= (+ i taglen) n)
+                       (= dollar-tag (subs sql i (+ i taglen))))
+                (recur (+ i taglen) in-sq in-dq false nil)
+                (recur (unchecked-inc i) in-sq in-dq in-dollar dollar-tag)))
+
+            ;; Potential dollar-quote start.
+            (and (not in-sq) (not in-dq) (= c \$))
+            (let [tag-end (long (loop [j (unchecked-inc i)]
+                                  (if (>= j n) j
+                                      (let [c2 (.charAt sql j)]
+                                        (if (or (Character/isLetterOrDigit c2) (= c2 \_))
+                                          (recur (unchecked-inc j)) j)))))]
+              (if (and (< tag-end n) (= \$ (.charAt sql tag-end)))
+                (recur (unchecked-inc tag-end) in-sq in-dq true (subs sql i (unchecked-inc tag-end)))
+                (recur (unchecked-inc i) in-sq in-dq in-dollar dollar-tag)))
+
+            ;; '...'
+            (and (not in-dq) (= c \'))
+            (recur (unchecked-inc i) (not in-sq) in-dq in-dollar dollar-tag)
+
+            ;; "..."
+            (and (not in-sq) (= c \"))
+            (recur (unchecked-inc i) in-sq (not in-dq) in-dollar dollar-tag)
+
+            ;; -- line comment
+            (and (not in-sq) (not in-dq) (not in-dollar)
+                 (= c \-) (< (inc i) n) (= \- (.charAt sql (unchecked-inc i))))
+            (let [eol (long (.indexOf sql (int \newline) (int i)))]
+              (recur (if (neg? eol) n (unchecked-inc eol)) in-sq in-dq in-dollar dollar-tag))
+
+            ;; /* block comment */
+            (and (not in-sq) (not in-dq) (not in-dollar)
+                 (= c \/) (< (inc i) n) (= \* (.charAt sql (unchecked-inc i))))
+            (let [end (long (loop [j (+ i 2)]
+                              (cond
+                                (>= (inc j) n) n
+                                (and (= \* (.charAt sql j)) (= \/ (.charAt sql (unchecked-inc j))))
+                                (+ j 2)
+                                :else (recur (unchecked-inc j)))))]
+              (recur end in-sq in-dq in-dollar dollar-tag))
+
+            :else
+            (recur (unchecked-inc i) in-sq in-dq in-dollar dollar-tag)))))))
+
 (defn ast-param-indices
   "Recursively walk a JSqlParser AST, returning a sorted set of
    1-based parameter indices (`?` / `$N` placeholders).

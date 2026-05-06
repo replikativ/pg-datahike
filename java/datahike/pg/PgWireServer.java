@@ -537,6 +537,22 @@ public final class PgWireServer {
             while (running.get()) {
                 try {
                     Socket client = serverSocket.accept();
+                    // Disable Nagle's algorithm. PG's wire protocol is
+                    // a chatty request-response shape (Parse → Bind →
+                    // Describe → Execute → Sync, each a small message
+                    // with its own flush). Without TCP_NODELAY the
+                    // kernel coalesces these against the 40 ms
+                    // delayed-ACK timeout, giving every roundtrip a
+                    // floor of ~40 ms — fatal for any prepared-
+                    // statement loop where the client waits on each
+                    // response before sending the next message.
+                    try { client.setTcpNoDelay(true); }
+                    catch (IOException e) {
+                        // Non-fatal — log and continue. The connection
+                        // is still functional, just slow.
+                        System.err.println("PgWire: setTcpNoDelay failed on "
+                                + client.getRemoteSocketAddress() + ": " + e);
+                    }
                     Thread.ofVirtual().name("pgwire-conn-" + client.getRemoteSocketAddress())
                         .start(() -> handleConnection(client));
                 } catch (IOException e) {
