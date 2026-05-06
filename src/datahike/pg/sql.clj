@@ -17,6 +17,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.database :as database]
             [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.catalog :as catalog]
@@ -251,9 +252,31 @@
              sys-type (catalog/system-query?* sql cls-info)]
          (cond
            sys-type
-           (merge
-            (when (contains? catalog/classify-system-kinds sys-type) cls-info)
-            {:type :system :system-type sys-type :sql sql})
+           (let [base (merge
+                       (when (contains? catalog/classify-system-kinds sys-type) cls-info)
+                       {:type :system :system-type sys-type :sql sql})]
+             (case sys-type
+               :create-database
+               (try
+                 (let [toks (database/tokenize sql)
+                       parsed (database/parse-create-database toks)]
+                   (merge base parsed))
+                 (catch Throwable e
+                   {:type :error
+                    :message (.getMessage e)
+                    :sqlstate "42601"}))
+
+               :drop-database
+               (try
+                 (let [toks (database/tokenize sql)
+                       parsed (database/parse-drop-database toks)]
+                   (merge base parsed))
+                 (catch Throwable e
+                   {:type :error
+                    :message (.getMessage e)
+                    :sqlstate "42601"}))
+
+               base))
 
         ;; Reject authorization/RLS/extension/COPY DDL with a clean PG
         ;; error code (0A000 feature_not_supported). The classifier tags

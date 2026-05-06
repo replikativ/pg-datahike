@@ -541,6 +541,7 @@
       (kw=? t1 "extension") {:kind :create-extension :reject-kind :create-extension
                              :tag "CREATE EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
+      (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
       (kw=? t1 "view")      {:kind :create-view}
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
@@ -554,6 +555,7 @@
       (kw=? t1 "extension") {:kind :drop-extension :reject-kind :create-extension
                              :tag "DROP EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
+      (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
       :else                 {:kind :generic-sql})))
 
 (defn- classify-alter [toks]

@@ -1210,6 +1210,7 @@
     :pg-backend-pid :txid-current :pg-sleep
     :comment-on :lock-table :create-view :create-index
     :maintenance-noop :schema-noop
+    :create-database :drop-database
     ;; datahike.* branching / versioning functions
     :dh-branches :dh-current-branch :dh-commit-id :dh-parent-commits
     :dh-create-branch :dh-delete-branch})

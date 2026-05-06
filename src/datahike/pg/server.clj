@@ -3251,7 +3251,9 @@
      SET datahike.history = 'true'
      RESET datahike.as_of"
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
-                                              dispatch-stats]
+                                              dispatch-stats
+                                              on-create-database on-delete-database
+                                              registry-atom]
                                        :as opts}]]
   (ensure-pg-schema! conn)
   (let [silently-accept (resolve-silently-accept opts)
@@ -3574,6 +3576,93 @@
               ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
               ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
                             (empty-result (:tag parsed))
+
+                            :create-database
+              ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via
+              ;; the operator-supplied `:on-create-database` hook
+              ;; (`(fn [db-name parsed-options] -> conn)`). On success
+              ;; the new conn is added to the server's mutable
+              ;; registry under `db-name`; subsequent connections
+              ;; with `database=foo` route to it. Without a hook
+              ;; configured we return SQLSTATE 0A000 — provisioning
+              ;; from SQL is a deployment policy decision, not a
+              ;; default. See datahike.pg.sql.database/db-from-template.
+                            (let [{:keys [db-name options if-not-exists?]} parsed]
+                              (cond
+                                (and if-not-exists? registry-atom
+                                     (contains? @registry-atom db-name))
+                                (empty-result "CREATE DATABASE")
+
+                                (nil? on-create-database)
+                                (-> (PgWireServer$QueryResult.
+                                     (str "CREATE DATABASE not supported — configure "
+                                          ":on-create-database on the server"))
+                                    (.withSqlstate "0A000"))
+
+                                (and registry-atom (contains? @registry-atom db-name))
+                                (-> (PgWireServer$QueryResult.
+                                     (str "database \"" db-name "\" already exists"))
+                                    (.withSqlstate "42P04"))
+
+                                :else
+                                (try
+                                  (let [new-conn (on-create-database db-name options)]
+                                    (when registry-atom
+                                      (swap! registry-atom assoc db-name new-conn))
+                                    (empty-result "CREATE DATABASE"))
+                                  (catch clojure.lang.ExceptionInfo e
+                                    (let [data (ex-data e)
+                                          ;; Map known error keys back to PG
+                                          ;; SQLSTATEs so a CREATE DATABASE
+                                          ;; with a typo'd option surfaces as
+                                          ;; 42601 syntax_error rather than
+                                          ;; XX000 internal_error.
+                                          state (or (:sqlstate data)
+                                                    (case (:error data)
+                                                      :syntax-error "42601"
+                                                      :feature-not-supported "0A000"
+                                                      "XX000"))]
+                                      (-> (PgWireServer$QueryResult.
+                                           (str "CREATE DATABASE failed: " (.getMessage e)))
+                                          (.withSqlstate state))))
+                                  (catch Throwable e
+                                    (-> (PgWireServer$QueryResult.
+                                         (str "CREATE DATABASE failed: " (.getMessage e)))
+                                        (.withSqlstate "XX000"))))))
+
+                            :drop-database
+              ;; SQL `DROP DATABASE [IF EXISTS] foo;`. Routed via
+              ;; `:on-delete-database (fn [db-name conn parsed] -> _)`.
+              ;; Removes the entry from the registry on success and
+              ;; calls the hook so the operator can release + delete
+              ;; the backing store.
+                            (let [{:keys [db-name if-exists?]} parsed
+                                  existing (when registry-atom (get @registry-atom db-name))]
+                              (cond
+                                (and (nil? existing) if-exists?)
+                                (empty-result "DROP DATABASE")
+
+                                (nil? existing)
+                                (-> (PgWireServer$QueryResult.
+                                     (str "database \"" db-name "\" does not exist"))
+                                    (.withSqlstate "3D000"))
+
+                                (nil? on-delete-database)
+                                (-> (PgWireServer$QueryResult.
+                                     (str "DROP DATABASE not supported — configure "
+                                          ":on-delete-database on the server"))
+                                    (.withSqlstate "0A000"))
+
+                                :else
+                                (try
+                                  (on-delete-database db-name existing nil)
+                                  (when registry-atom
+                                    (swap! registry-atom dissoc db-name))
+                                  (empty-result "DROP DATABASE")
+                                  (catch Throwable e
+                                    (-> (PgWireServer$QueryResult.
+                                         (str "DROP DATABASE failed: " (.getMessage e)))
+                                        (.withSqlstate "XX000"))))))
 
               ;; Advisory locks (see defonce ^:private advisory-locks above).
                             :advisory-lock           (handle-advisory-lock ctx parsed)
@@ -4319,17 +4408,29 @@
 
    Intended for callers who want to wrap their own PgWireServer (e.g.
    custom host/port binding); `start-server` uses it internally."
-  ^PgWireServer$QueryHandlerFactory [registry & [opts]]
-  (let [names (vec (keys registry))]
+  ^PgWireServer$QueryHandlerFactory [registry-or-atom & [opts]]
+  ;; Accept either a plain map (legacy) or an atom around one (new).
+  ;; Wrapping a plain map in a fresh atom gives a single, internal
+  ;; mutable surface for the SQL `CREATE/DROP DATABASE` handlers and
+  ;; `add-database!` / `remove-database!` to share — without
+  ;; changing the call shapes that were already public.
+  (let [registry-atom (if (instance? clojure.lang.Atom registry-or-atom)
+                        registry-or-atom
+                        (atom registry-or-atom))
+        opts (assoc opts :registry-atom registry-atom)]
     (reify PgWireServer$QueryHandlerFactory
       (create [_]
         ;; No startup params available (shouldn't happen with the real
         ;; Java server, but keep it safe). Use the first registered name.
-        (make-query-handler (get registry (first names))
-                            (assoc opts :db-name (first names)
-                                   :registered-databases names)))
+        (let [registry @registry-atom
+              names (vec (keys registry))]
+          (make-query-handler (get registry (first names))
+                              (assoc opts :db-name (first names)
+                                     :registered-databases names))))
       (create [_ startup-params]
-        (let [raw (or (.get ^java.util.Map startup-params "database")
+        (let [registry @registry-atom
+              names (vec (keys registry))
+              raw (or (.get ^java.util.Map startup-params "database")
                       (first names))
               [requested branch] (parse-db-name raw)]
           (if-let [conn (get registry requested)]
@@ -4357,30 +4458,104 @@
      :default   — Database name used when `conn-or-registry` is a bare
                   conn (default \"datahike\"). Ignored when a map is
                   supplied.
+     :on-create-database
+                — Hook (fn [db-name parsed-options]) -> conn that runs
+                  when a SQL client issues `CREATE DATABASE name [WITH …]`.
+                  Without this hook configured, `CREATE DATABASE`
+                  returns SQLSTATE 0A000 (provisioning from SQL is a
+                  deployment policy decision, not a default). See
+                  `datahike.pg.sql.database/db-from-template` for the
+                  common template-driven helper.
+     :on-delete-database
+                — Hook (fn [db-name conn parsed-options]) that runs on
+                  `DROP DATABASE name`. Should release the conn and
+                  delete the backing store. Symmetric with
+                  `:on-create-database`; without it, DROP DATABASE
+                  returns 0A000.
+     :database-template
+                — Convenience shorthand: a partial datahike config
+                  template that pg-datahike uses to build both
+                  `:on-create-database` and `:on-delete-database` via
+                  `db-from-template` / `db-delete-from-template`. The
+                  template can interpolate `{{name}}` in string values
+                  (handy for file backends with per-database paths).
+                  Mutually composable with the explicit hooks; if both
+                  are given, the explicit hook wins.
 
-   Returns a map with :server (PgWireServer) and :registry (the
-   normalized {name → conn} map).
+   Returns a map with :server (PgWireServer), :registry-atom (an atom
+   holding the live {name → conn} map — mutated by SQL CREATE/DROP
+   DATABASE and `add-database!` / `remove-database!`), :port, :host.
 
    Examples:
-     ;; single DB
+     ;; single DB, no SQL provisioning
      (def srv (pg/start-server conn {:port 5433}))
 
-     ;; multi-DB
+     ;; multi-DB, static
      (def srv (pg/start-server {\"prod\" prod-conn
                                 \"staging\" staging-conn}
                                {:port 5432}))
 
+     ;; SQL CREATE/DROP DATABASE provisioned in-memory
+     (def srv (pg/start-server {}
+                {:port 5432
+                 :database-template {:store {:backend :memory}
+                                     :schema-flexibility :write}}))
+
      (pg/stop-server srv)"
-  [conn-or-registry & [{:keys [port host on-query default]
+  [conn-or-registry & [{:keys [port host on-query default
+                                on-create-database on-delete-database
+                                database-template]
                         :or {port 5432 host "127.0.0.1" default "datahike"}
                         :as opts}]]
   (let [registry (normalize-registry conn-or-registry default)
-        factory  (make-query-handler-factory registry (select-keys opts [:on-query :compat :silently-accept]))
+        registry-atom (atom registry)
+        ;; Build hooks from template if not explicitly supplied. The
+        ;; explicit hook wins over the template-built one — operators
+        ;; who want different create/delete behavior just pass the fns.
+        on-create (or on-create-database
+                      (when database-template
+                        (require 'datahike.pg.sql.database)
+                        ((resolve 'datahike.pg.sql.database/db-from-template)
+                         database-template)))
+        on-delete (or on-delete-database
+                      (when database-template
+                        (require 'datahike.pg.sql.database)
+                        ((resolve 'datahike.pg.sql.database/db-delete-from-template)
+                         database-template)))
+        factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
+                                            :dispatch-stats])
+                         (cond-> on-create (assoc :on-create-database on-create)
+                                 on-delete (assoc :on-delete-database on-delete)))
+        factory  (make-query-handler-factory registry-atom factory-opts)
         server   (PgWireServer. (int port) ^String host factory)]
     (.start server)
     (println (str "Datahike PgWire server listening on " host ":" port
                   " — databases: " (vec (keys registry))))
-    {:server server :registry registry :port port :host host}))
+    {:server server :registry-atom registry-atom :port port :host host}))
+
+(defn add-database!
+  "Add a Datahike conn to a running pg-datahike server's registry under
+   `name`. Subsequent client connections with `database=name` will
+   route to it. Returns the new registry contents.
+
+   Symmetric with the SQL `CREATE DATABASE` path: `add-database!` is
+   the Clojure-side knob, `:on-create-database` is the SQL-side
+   knob, and they share the same atom so either source is visible
+   to both."
+  [server-result name conn]
+  (swap! (:registry-atom server-result) assoc name conn))
+
+(defn remove-database!
+  "Remove a database from a running pg-datahike server's registry.
+   Does NOT release the conn or delete the backing store — that's
+   the operator's call. Returns the new registry contents."
+  [server-result name]
+  (swap! (:registry-atom server-result) dissoc name))
+
+(defn databases
+  "Return the current set of database names registered with the server."
+  [server-result]
+  (set (keys @(:registry-atom server-result))))
 
 (defn stop-server
   "Stop a running PgWire server."
