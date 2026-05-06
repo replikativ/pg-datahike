@@ -620,6 +620,83 @@
             (recur (inc i) acc)))))))
 
 ;; ============================================================================
+;; <expr> IS [NOT] (TRUE|FALSE|UNKNOWN) — JSqlParser only accepts a
+;; "boolean primary" on the left of IS. `IN (…)`, `EXISTS (…)`,
+;; comparison expressions etc. parse fine standalone but trip the
+;; grammar when followed by IS. Wrap the LHS in parens — this lifts
+;; the arbitrary predicate to a boolean primary.
+;;
+;; Surfaced by Odoo's view-loading queries (`<col> IN (SELECT …) IS NOT TRUE`).
+;; ============================================================================
+
+(def ^:private is-bool-clause-boundaries
+  "Tokens that delimit a boolean expression in WHERE / ON / HAVING /
+   CASE-WHEN context. We walk back from `IS` over balanced parens until
+   one of these (at depth 0) — that token sits one before the LHS."
+  #{"where" "and" "or" "having" "on" "when" "then" "else" "by" "select"})
+
+(defn- bool-is-tail?
+  "True if `(IS [NOT] (TRUE|FALSE|UNKNOWN))` starts at index i. Returns
+   the index of the boolean literal on match, nil otherwise."
+  [toks ^long i]
+  (when (= "is" (kw-text (nth toks i nil)))
+    (let [t1 (nth toks (inc i) nil)
+          not? (= "not" (kw-text t1))
+          bl-idx (if not? (+ i 2) (inc i))
+          bl (nth toks bl-idx nil)]
+      (when (#{"true" "false" "unknown"} (kw-text bl))
+        bl-idx))))
+
+(defn boolean-is-rule
+  "Wrap the LHS of `<expr> IS [NOT] (TRUE|FALSE|UNKNOWN)` in parens
+   when it isn't already a single parenthesised group. JSqlParser's
+   grammar requires a `boolean_primary` on the left; an `IN (…)` or
+   `EXISTS (…)` parses standalone but trips when followed by IS.
+
+   Walking back: balanced-paren walk until a clause-boundary keyword
+   (WHERE / AND / OR / …), comma, semicolon, or unmatched `(` — the
+   token immediately after that boundary is where the LHS starts."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (if-not (bool-is-tail? toks i)
+          (recur (inc i) acc)
+          (let [boundary-idx
+                (loop [k (dec i), depth 0]
+                  (cond
+                    (neg? k) -1
+                    (punct? (nth toks k) ")") (recur (dec k) (inc depth))
+                    (and (zero? depth) (punct? (nth toks k) "(")) k
+                    (punct? (nth toks k) "(") (recur (dec k) (dec depth))
+                    (and (zero? depth)
+                         (or (is-bool-clause-boundaries (kw-text (nth toks k)))
+                             (= "," (:text (nth toks k)))
+                             (= ";" (:text (nth toks k)))))
+                    k
+                    :else (recur (dec k) depth)))
+                lhs-start-idx (inc boundary-idx)
+                lhs-start-tok (nth toks lhs-start-idx nil)
+                lhs-end-tok   (nth toks (dec i) nil)]
+            (if (or (nil? lhs-start-tok) (nil? lhs-end-tok)
+                    ;; LHS is already exactly one parenthesised group.
+                    (and (punct? lhs-start-tok "(")
+                         (= (dec i)
+                            ;; Find the matching `)` index from lhs-start-idx
+                            (loop [k (inc lhs-start-idx), d 1]
+                              (cond
+                                (>= k i) -1
+                                (punct? (nth toks k) "(") (recur (inc k) (inc d))
+                                (punct? (nth toks k) ")") (if (= d 1) k (recur (inc k) (dec d)))
+                                :else (recur (inc k) d))))))
+              (recur (inc i) acc)
+              (recur (inc i)
+                     (-> acc
+                         (conj [(:pos lhs-start-tok) (:pos lhs-start-tok) "("])
+                         (conj [(:end lhs-end-tok)   (:end lhs-end-tok)   ")"]))))))))))
+
+;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
 
@@ -640,4 +717,5 @@
    alter-column-drop-default-rule
    primary-key-only-body-rule
    type-using-rule
-   reserved-column-name-rule])
+   reserved-column-name-rule
+   boolean-is-rule])
