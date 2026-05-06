@@ -1134,7 +1134,7 @@ public final class PgWireServer {
             // Semicolon outside all quoted contexts
             if (c == ';' && !inSingleQuote && !inDoubleQuote && !inDollarQuote) {
                 String part = stripComments(sql.substring(start, i));
-                if (!part.isEmpty()) {
+                if (!part.trim().isEmpty()) {
                     stmts.add(part);
                 }
                 start = i + 1;
@@ -1142,7 +1142,7 @@ public final class PgWireServer {
         }
         if (start < len) {
             String part = stripComments(sql.substring(start));
-            if (!part.isEmpty()) {
+            if (!part.trim().isEmpty()) {
                 stmts.add(part);
             }
         }
@@ -1253,10 +1253,19 @@ public final class PgWireServer {
                              QueryHandler handler) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String stmtName = readCString(buf);
-        String query = readCString(buf);
+        String rawQuery = readCString(buf);
         short numParamOids = buf.getShort();
         int[] paramOids = new int[numParamOids];
         for (int i = 0; i < numParamOids; i++) paramOids[i] = buf.getInt();
+
+        // Strip SQL comments and trim. The simple-query path runs
+        // splitStatements + stripComments; the extended-query path
+        // (this method) historically passed the raw query to
+        // JSqlParser, which chokes on trailing line comments after
+        // a `;`. Mirroring stripComments here closes that gap so
+        // pgjdbc's Statement.execute (which always uses extended
+        // query for single statements) accepts the same SQL psql does.
+        String query = rawQuery.isEmpty() ? rawQuery : stripComments(rawQuery);
 
         if (WIRE_TRACE) {
             trace("recv Parse stmt=\"" + stmtName + "\" paramOids="

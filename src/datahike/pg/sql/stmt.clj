@@ -2927,13 +2927,22 @@
                                                txdb seq-prefix)
                              identity-cols
                              (vec (keep (fn [[sname]]
-                                          (when (and (str/starts-with? sname seq-prefix)
-                                                     (str/ends-with? sname "_seq"))
-                                            (let [col-name (subs sname (count seq-prefix)
-                                                                 (- (count sname) 4))
-                                                  attr (keyword table-name col-name)]
-                                              (when (get (:schema txdb) attr)
-                                                {:col col-name :attr attr :seq-name sname}))))
+                                          ;; PG's auto-generated SERIAL/IDENTITY sequences
+                                          ;; are named `<table>_<col>_seq` — require a
+                                          ;; non-empty `<col>` between prefix and suffix
+                                          ;; or we'll false-match a sequence the user
+                                          ;; happens to have named `<table>_seq`
+                                          ;; (no col), e.g. an `ord_seq` next to an
+                                          ;; `ord` table.
+                                          (let [pref-len (count seq-prefix)
+                                                tail-end (- (count sname) 4)]
+                                            (when (and (str/starts-with? sname seq-prefix)
+                                                       (str/ends-with? sname "_seq")
+                                                       (< pref-len tail-end))
+                                              (let [col-name (subs sname pref-len tail-end)
+                                                    attr (keyword table-name col-name)]
+                                                (when (get (:schema txdb) attr)
+                                                  {:col col-name :attr attr :seq-name sname})))))
                                         seq-results))
                              seq-state (atom
                                         (into {}

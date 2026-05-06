@@ -658,7 +658,7 @@
   "Translate CREATE SEQUENCE to Datahike schema + initial entity.
    Sequences are stored as entities with :__seq__/* attributes."
   [^CreateSequence cs]
-  (let [seq-name (str (.getName (.getSequence cs)))
+  (let [seq-name (params/unquote-ident (str (.getName (.getSequence cs))))
         ;; Parse options: START WITH, INCREMENT BY
         full-sql (str cs)
         lower (str/lower-case full-sql)
