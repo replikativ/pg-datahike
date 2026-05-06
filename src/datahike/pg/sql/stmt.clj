@@ -325,19 +325,41 @@
                 ;; emits plain patterns for right-side columns referenced
                 ;; here.
                   (let [l-var (expr/translate-expr ctx left)
-                      ;; Determine which side is left vs right table
-                        left-alias (:default-table ctx)
                         l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
                         r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
-                      ;; Right-side attr is the one from the right table
+                      ;; Right-side attr is the one from THIS join's right
+                      ;; table (== right-alias). The previous heuristic
+                      ;; compared l-ns to (:default-table ctx) (the FROM
+                      ;; table) — that works for a single LEFT JOIN, but
+                      ;; for chained joins like
+                      ;;   FROM main
+                      ;;     LEFT JOIN a AS aa ON main.x = aa.y
+                      ;;     LEFT JOIN b AS bb ON aa.z = bb.w
+                      ;; the second join's ON sides reference `aa` and
+                      ;; `bb`, neither equals the FROM table, so the
+                      ;; heuristic falls through to the swapped branch
+                      ;; unconditionally and ends up using the LEFT
+                      ;; operand's attr as right-key-attr. That produces
+                      ;; matched-key patterns of the form
+                      ;;   [right-evar <left-table-attr> left-key-var]
+                      ;; which is malformed (entity-var from the right
+                      ;; table, attribute namespace from the left table)
+                      ;; and surfaces downstream as an or-join branch
+                      ;; whose limit-rel projection drops different
+                      ;; subsets of the join-vars per branch — the
+                      ;; `Can't sum relations with different attrs`
+                      ;; failure on Odoo's ir_model_access access-group
+                      ;; query.
                         [left-key-var right-key-attr]
                         (let [l-ns (if (vector? l-resolved) (second l-resolved) (namespace l-resolved))
-                              r-ns (if (vector? r-resolved) (second r-resolved) (namespace r-resolved))
+                              l-attr (if (vector? l-resolved) (nth l-resolved 2) l-resolved)
                               r-attr (if (vector? r-resolved) (nth r-resolved 2) r-resolved)]
-                          (if (= l-ns left-alias)
-                            [l-var r-attr]
-                          ;; Swapped: right col is actually from left table
-                            [(expr/translate-expr ctx right) (if (vector? l-resolved) (nth l-resolved 2) l-resolved)]))]
+                          (if (= l-ns right-alias)
+                          ;; LHS is from THIS join's right table → swap
+                            [(expr/translate-expr ctx right) l-attr]
+                          ;; LHS is from another table (the "left" side
+                          ;; of the join from this join's perspective)
+                            [l-var r-attr]))]
                     (reset! ref-info {:value-join? true
                                       :left-key-var left-key-var
                                       :right-key-attr right-key-attr
