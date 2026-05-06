@@ -63,6 +63,8 @@
 (def ->ParamRef params/->ParamRef)
 (def param-ref? params/param-ref?)
 (def substitute-params params/substitute-params)
+(def nextval-marker? params/nextval-marker?)
+(def resolve-nextvals! params/resolve-nextvals!)
 (def ^:private unquote-ident params/unquote-ident)
 
 ;; Aggregate + scalar fns moved to datahike.pg.sql.fns. Re-export at the old

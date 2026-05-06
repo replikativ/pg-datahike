@@ -2290,6 +2290,36 @@
                           (update :in-args sql/substitute-params fetch)))
                       subs))))))
 
+(declare nextval!)
+
+(defn- resolve-nextval-markers
+  "Sibling pass to `resolve-param-refs`: walk `parsed`'s tx-data /
+   in-args / sub-results and replace every `{:fn :nextval :seq-name S}`
+   marker (emitted by translate-* for `nextval('s')` in VALUES / SET
+   expressions) with the long produced by an actual nextval against
+   the live conn.
+
+   Runs after ParamRef substitution and before per-type dispatch so the
+   markers never reach the transactor. Each call commits independently
+   via the same CAS-retry path `SELECT nextval(...)` uses, matching
+   PG's non-transactional `nextval` semantics: advances stick even if
+   the surrounding tx rolls back, and concurrent advances yield
+   distinct values."
+  [parsed conn]
+  (let [resolver #(nextval! conn %)
+        resolve  #(sql/resolve-nextvals! % resolver)]
+    (cond-> parsed
+      (contains? parsed :in-args)     (update :in-args resolve)
+      (contains? parsed :tx-data)     (update :tx-data resolve)
+      (contains? parsed :sub-results)
+      (update :sub-results
+              (fn [subs]
+                (mapv (fn [sub]
+                        (cond-> sub
+                          (contains? sub :in-args) (update :in-args resolve)
+                          (contains? sub :tx-data) (update :tx-data resolve)))
+                      subs))))))
+
 (def ^:private compat-presets
   "Named bundles for :compat. Each maps to a :silently-accept set
    that's merged on top of the caller's explicit set.
@@ -3065,13 +3095,14 @@
    retries even at thousands of qps; 100 is generous."
   100)
 
-(defn- handle-nextval
-  "SELECT nextval('seq_name') — atomically advance the sequence entity
-   and return the new value.
+(defn nextval!
+  "Atomically advance the named sequence on `conn` and return the new
+   long. Shared core of `SELECT nextval(...)` and INSERT-VALUES nextval
+   resolution.
 
    PG semantics: a `nextval` advance is never rolled back, even by
    ROLLBACK on the surrounding transaction. We match that by always
-   committing to the live conn, regardless of the session's `:in-tx?`
+   committing to the live conn, regardless of any session's `:in-tx?`
    state.
 
    Atomicity: optimistic CAS-retry. Each iteration reads the current
@@ -3093,75 +3124,70 @@
    to recover the value this call assigned doesn't work — it returns
    the LAST tx in the batch. CAS sidesteps that: the value we
    intended is the literal `new` slot of the op-vec, available
-   without reading `:db-after`."
+   without reading `:db-after`.
+
+   Throws ex-info `:undefined-sequence` if the named sequence does
+   not exist, and `:serialization-failure` if the contention retry
+   budget is exhausted."
+  [conn ^String seq-name]
+  (let [q-fn (requiring-resolve 'datahike.api/q)
+        db0 (d/db conn)
+        eid (ffirst (q-fn '{:find [?e]
+                            :where [[?e :__seq__/name ?n]]
+                            :in [$ ?n]}
+                          db0 seq-name))
+        _ (when-not eid
+            (throw (ex-info "sequence does not exist"
+                            {:error :undefined-sequence
+                             :sequence seq-name})))
+        incr (or (ffirst (q-fn '{:find [?i]
+                                 :where [[?e :__seq__/increment ?i]]
+                                 :in [$ ?e]}
+                               db0 eid))
+                 1)
+        read-curr (fn []
+                    (ffirst (q-fn '{:find [?v]
+                                    :where [[?e :__seq__/value ?v]]
+                                    :in [$ ?e]}
+                                  (d/db conn) eid)))
+        ;; CAS failure detection: Datahike's transactor raises an
+        ;; ex-info with `{:error :transact/cas}`, but the writer's
+        ;; throwable-promise + CompletableFuture wrapping strips
+        ;; the structured ex-data by the time we see the throw on
+        ;; the caller thread. The original message is preserved
+        ;; (verbatim "_db.fn/cas failed_" substring), so we match
+        ;; on that.
+        cas-failure? (fn [^Throwable e]
+                       (when-let [m (.getMessage e)]
+                         (.contains m ":db.fn/cas failed")))]
+    ;; Exponential backoff between retries: 1ms, 2ms, 4ms, …
+    ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
+    ;; (commit-wait-time) between batches before flushing.
+    (loop [attempt 0]
+      (let [curr (or (read-curr) 0)
+            next (+ curr incr)
+            cas-ok?
+            (try (d/transact conn [[:db/cas eid :__seq__/value curr next]])
+                 true
+                 (catch Throwable e
+                   (if (cas-failure? e) false (throw e))))]
+        (cond
+          cas-ok? next
+          (>= attempt nextval-max-retries)
+          (throw (ex-info "nextval contention retry budget exhausted"
+                          {:error :serialization-failure
+                           :detail (str "nextval('" seq-name "') gave up after "
+                                        nextval-max-retries " contention retries")
+                           :sequence seq-name}))
+          :else
+          (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
+              (recur (inc attempt))))))))
+
+(defn- handle-nextval
+  "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
   [{:keys [conn]} parsed]
   (try
-    (let [seq-name (:seq-name parsed)
-          q-fn (requiring-resolve 'datahike.api/q)
-          ;; Look up seq-eid + increment ONCE (they don't change after
-          ;; CREATE SEQUENCE). Only the running value moves under
-          ;; contention.
-          db0 (d/db conn)
-          eid (ffirst (q-fn '{:find [?e]
-                              :where [[?e :__seq__/name ?n]]
-                              :in [$ ?n]}
-                            db0 seq-name))
-          _ (when-not eid
-              (throw (ex-info "sequence does not exist"
-                              {:error :undefined-sequence
-                               :sequence seq-name})))
-          incr (or (ffirst (q-fn '{:find [?i]
-                                   :where [[?e :__seq__/increment ?i]]
-                                   :in [$ ?e]}
-                                 db0 eid))
-                   1)
-          read-curr (fn [^long _attempt]
-                      (ffirst (q-fn '{:find [?v]
-                                      :where [[?e :__seq__/value ?v]]
-                                      :in [$ ?e]}
-                                    (d/db conn) eid)))
-          ;; CAS failure detection: Datahike's transactor raises an
-          ;; ex-info with `{:error :transact/cas}`, but the writer's
-          ;; throwable-promise + CompletableFuture wrapping strips
-          ;; the structured ex-data by the time we see the throw on
-          ;; the caller thread. The original message is preserved
-          ;; (verbatim "_db.fn/cas failed_" substring), so we match
-          ;; on that.
-          cas-failure? (fn [^Throwable e]
-                         (when-let [m (.getMessage e)]
-                           (.contains m ":db.fn/cas failed")))
-          new-val
-          ;; Exponential backoff between retries: 1ms, 2ms, 4ms, …
-          ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
-          ;; (commit-wait-time) between batches before flushing, so
-          ;; without a sleep the retrying caller spins on a still-
-          ;; stale conn-atom and burns through its retry budget before
-          ;; the winner's commit lands. With backoff we yield long
-          ;; enough for the writer to publish, then re-read the now-
-          ;; advanced value and try again.
-          (loop [attempt 0]
-            (let [curr (or (read-curr attempt) 0)
-                  next (+ curr incr)
-                  cas-ok?
-                  (try
-                    (d/transact conn [[:db/cas eid :__seq__/value curr next]])
-                    true
-                    (catch Throwable e
-                      (if (cas-failure? e)
-                        false
-                        (throw e))))]
-              (cond
-                cas-ok? next
-                (>= attempt nextval-max-retries)
-                (throw (ex-info "nextval contention retry budget exhausted"
-                                {:error  :serialization-failure
-                                 :detail (str "nextval('" seq-name "') gave up after "
-                                              nextval-max-retries " contention retries")
-                                 :sequence seq-name}))
-                :else
-                (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
-                    (recur (inc attempt))))))]
-      (single-row-result "nextval" PgWireServer/OID_INT8 (str new-val)))
+    (single-row-result "nextval" PgWireServer/OID_INT8 (str (nextval! conn (:seq-name parsed))))
     (catch Exception e
       (classified-error "nextval error: " e))))
 
@@ -4576,7 +4602,12 @@
                                      cached)
                                    (let [p (sql/parse-sql sql schema db)]
                                      (when bump-dispatch! (bump-dispatch! p))
-                                     p))]
+                                     p))
+                          ;; Sibling pass to ParamRef substitution: any
+                          ;; `nextval('s')` markers left in tx-data/in-args
+                          ;; resolve here against the live conn (PG's
+                          ;; non-transactional nextval semantics).
+                          parsed (resolve-nextval-markers parsed conn)]
                       ;; ctx is the dispatch context shared across every
                       ;; per-type executor. Keys:
                       ;;   :conn           — Datahike conn for THIS db

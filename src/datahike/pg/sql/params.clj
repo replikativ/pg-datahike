@@ -134,6 +134,49 @@
       (walk x))))
 
 ;; ---------------------------------------------------------------------------
+;; nextval() marker + resolution
+;;
+;; Translators emit `{:fn :nextval :seq-name "s"}` for `nextval('s')`
+;; expressions in INSERT VALUES / UPDATE SET. These markers can't be
+;; resolved at Parse or Bind time — they need a live conn to advance
+;; the sequence entity. So they survive substitute-params and are
+;; resolved in a sibling pass right before transact, with the same
+;; CAS-retry path SELECT nextval(...) uses (PG semantics: nextval is
+;; non-transactional — advances stick even if the surrounding tx
+;; rolls back, and concurrent advances yield distinct values).
+
+(defn nextval-marker?
+  "True if v is the placeholder map produced for a `nextval('seq')`
+   expression in a VALUES / SET tuple."
+  [v]
+  (and (map? v) (= :nextval (:fn v)) (string? (:seq-name v))))
+
+(defn resolve-nextvals!
+  "Walk `x` replacing every `{:fn :nextval :seq-name S}` marker with the
+   long produced by an actual `nextval('S')` against the live conn.
+   Each call commits independently via CAS-retry — same path
+   `handle-nextval` uses for `SELECT nextval(...)`. PG semantics:
+   non-transactional advances; concurrent callers get distinct values.
+
+   `nextval-fn` is `(fn [seq-name] long-or-throw)`. Decoupling the
+   resolver from the conn lets server.clj wire `handle-nextval` in
+   without `params.clj` taking a server.clj dependency.
+
+   Sibling shape to `substitute-params`: leaves functions, records,
+   and other opaque values alone, recurses into map values / vectors /
+   seqs."
+  [x nextval-fn]
+  (letfn [(walk [v]
+            (cond
+              (nextval-marker? v) (nextval-fn (:seq-name v))
+              (map? v)            (reduce-kv (fn [m k x] (assoc m k (walk x)))
+                                             {} v)
+              (vector? v)         (mapv walk v)
+              (seq? v)            (map walk v)
+              :else               v))]
+    (walk x)))
+
+;; ---------------------------------------------------------------------------
 ;; AST parameter-index walker
 
 (defn ast-param-indices

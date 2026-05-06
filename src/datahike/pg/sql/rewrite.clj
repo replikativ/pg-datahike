@@ -696,6 +696,66 @@
                          (conj [(:end lhs-end-tok)   (:end lhs-end-tok)   ")"]))))))))))
 
 ;; ============================================================================
+;; DEFAULT <fn>(<args>) — JSqlParser's grammar rejects a function call with
+;; a string-literal argument in a DEFAULT clause (5.2 and 5.3 — the parser
+;; expects `::` after the close paren, hinting at PG cast-syntax ambiguity
+;; in the DEFAULT-expression production). The exact same call wrapped in
+;; an extra paren — `DEFAULT (nextval('seq'))` — parses cleanly with
+;; identical AST. So we rewrite source-level.
+;;
+;; This unblocks pg_dump output, which always emits `DEFAULT nextval(<seq>)`
+;; for SERIAL/BIGSERIAL/IDENTITY columns.
+;; ============================================================================
+
+(def ^:private default-paren-fns
+  "Sequence-fns that JSqlParser stumbles on in DEFAULT position."
+  #{"nextval" "currval" "lastval"})
+
+(defn default-fn-call-paren-rule
+  "Match `DEFAULT <fn>(...)` for fn ∈ {nextval, currval, lastval} where
+   the call isn't already wrapped in extra parens, and inject parens
+   around the call. Same semantics, parser-friendly form.
+
+   Skipped when the token after DEFAULT is already `(` — assume the
+   user already wrapped, leave alone."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (- n 3))
+        acc
+        (let [t0 (nth toks i)]
+          (if-not (= "default" (kw-text t0))
+            (recur (inc i) acc)
+            (let [t1 (nth toks (inc i) nil)
+                  t2 (nth toks (+ i 2) nil)]
+              (cond
+                ;; Already parenthesised — caller did the dance.
+                (punct? t1 "(") (recur (inc i) acc)
+
+                ;; <fn>(...)
+                (and (some? t1)
+                     (contains? default-paren-fns (kw-text t1))
+                     (punct? t2 "("))
+                (let [close-idx
+                      (loop [k (+ i 3), depth 1]
+                        (cond
+                          (>= k n) -1
+                          (punct? (nth toks k) "(") (recur (inc k) (inc depth))
+                          (punct? (nth toks k) ")")
+                          (if (= depth 1) k (recur (inc k) (dec depth)))
+                          :else (recur (inc k) depth)))]
+                  (if (neg? close-idx)
+                    (recur (inc i) acc)
+                    (let [open-pos  (:pos t1)
+                          close-end (:end (nth toks close-idx))]
+                      (recur (inc close-idx)
+                             (-> acc
+                                 (conj [open-pos open-pos "("])
+                                 (conj [close-end close-end ")"]))))))
+
+                :else (recur (inc i) acc)))))))))
+
+;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
 
@@ -717,4 +777,5 @@
    primary-key-only-body-rule
    type-using-rule
    reserved-column-name-rule
-   boolean-is-rule])
+   boolean-is-rule
+   default-fn-call-paren-rule])
