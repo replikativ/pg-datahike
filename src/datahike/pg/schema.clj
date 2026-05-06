@@ -87,7 +87,15 @@
    {:db/ident :datahike.pg/table
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one
-    :db/doc "Override the SQL table name for the target attribute's namespace. Rare — namespace/table symmetry is usually what you want."}])
+    :db/doc "Override the SQL table name for the target attribute's namespace. Rare — namespace/table symmetry is usually what you want."}
+   {:db/ident :datahike.pg/enum-of
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Column's SQL type is a registered ENUM (`:datahike.pg.enum/name`). Storage lowers to text; the dump re-emits with the enum type name."}
+   {:db/ident :datahike.pg/domain-of
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Column's SQL type is a registered DOMAIN (`:datahike.pg.domain/name`). Storage lowers to the domain's base type; the dump re-emits with the domain name."}])
 
 (defn ensure-hint-schema!
   "Idempotently install the :datahike.pg/* hint schema attrs on `conn`.

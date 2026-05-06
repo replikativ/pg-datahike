@@ -19,6 +19,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.copy :as copy]
             [datahike.pg.sql.database :as database]
+            [datahike.pg.sql.types :as user-types]
             [datahike.pg.sql.rewrite :as rw]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.catalog :as catalog]
@@ -298,6 +299,45 @@
                    {:type :error
                     :message (.getMessage e)
                     :sqlstate "XX000"}))
+
+               :create-type-enum
+               (try
+                 ;; Skip the leading CREATE before passing to the parser —
+                 ;; classify already consumed it conceptually.
+                 (let [toks (database/tokenize sql)
+                       toks (drop-while (fn [t]
+                                          (or (not= :ident (first t))
+                                              (not= "create"
+                                                    (clojure.string/lower-case
+                                                     (second t)))))
+                                        toks)
+                       toks (rest toks) ;; past CREATE
+                       parsed (user-types/parse-create-type-enum toks sql)]
+                   (assoc base :type :ddl-create-enum
+                          :type-name (:type-name parsed)
+                          :values (:values parsed)
+                          :original-sql sql))
+                 (catch Throwable e
+                   {:type :error
+                    :message (.getMessage e)
+                    :sqlstate "42601"}))
+
+               :create-domain
+               (try
+                 (let [toks (database/tokenize sql)
+                       toks (drop-while (fn [t]
+                                          (or (not= :ident (first t))
+                                              (not= "create"
+                                                    (clojure.string/lower-case
+                                                     (second t)))))
+                                        toks)
+                       toks (rest toks)
+                       parsed (user-types/parse-create-domain toks sql)]
+                   (assoc base :type :ddl-create-domain :domain parsed))
+                 (catch Throwable e
+                   {:type :error
+                    :message (.getMessage e)
+                    :sqlstate "42601"}))
 
                base))
 

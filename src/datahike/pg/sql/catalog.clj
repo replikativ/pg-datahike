@@ -1211,6 +1211,9 @@
     :comment-on :lock-table :create-view :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database
+    ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
+    ;; (which can't / won't parse them) and run our own parsers.
+    :create-type-enum :create-domain
     ;; pg_dump-emitted utility statements we silently accept
     :owner-noop :psql-meta :set-config
     ;; COPY-IN routes through the wire-protocol sub-protocol; the

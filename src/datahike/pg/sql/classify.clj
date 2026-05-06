@@ -552,6 +552,55 @@
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
       (kw=? t1 "sequence")  {:kind :generic-sql}
+
+      ;; CREATE TYPE — only AS ENUM is supported as a first-class
+      ;; type (lowered to string + check-in). Other forms (composite,
+      ;; range, base) fall through to a silently-accepted reject so
+      ;; pg_dump output keeps loading; the fields/values aren't used.
+      (kw=? t1 "type")
+      (let [;; toks already past CREATE; t1 is "type". Scan for AS ENUM.
+            after-type (rest toks)
+            ;; skip the type name (possibly schema-qualified, possibly
+            ;; quoted) — we only need to know whether AS ENUM follows.
+            scan (drop-while
+                  (fn [t] (and t (not (or (kw=? t "as")
+                                          (kw=? t "is")))))
+                  after-type)
+            after-as (rest scan)]
+        (if (kw=? (first after-as) "enum")
+          {:kind :create-type-enum :system? true
+           :tag "CREATE TYPE … AS ENUM"}
+          ;; non-ENUM CREATE TYPE — silently accept
+          {:kind :create-type :reject-kind :type :tag "CREATE TYPE"}))
+
+      (kw=? t1 "domain")
+      {:kind :create-domain :system? true :tag "CREATE DOMAIN"}
+
+      ;; pg_dump-emitted DDL we don't model. Each gets a dedicated
+      ;; :reject-kind so operators can opt-in selectively (or via
+      ;; the :pg-dump compat preset). Classified here — before
+      ;; JSqlParser sees the SQL — so the function body's `$$…$$`
+      ;; / TRIGGER body / etc. never reach the parser.
+      (kw=? t1 "trigger")
+      {:kind :create-trigger :reject-kind :trigger :tag "CREATE TRIGGER"}
+      (kw=? t1 "function")
+      {:kind :create-function :reject-kind :function :tag "CREATE FUNCTION"}
+      (kw=? t1 "procedure")
+      {:kind :create-procedure :reject-kind :procedure :tag "CREATE PROCEDURE"}
+      (kw=? t1 "aggregate")
+      {:kind :create-aggregate :reject-kind :aggregate :tag "CREATE AGGREGATE"}
+      (and (kw=? t1 "materialized") (kw=? (second toks) "view"))
+      {:kind :create-materialized-view :reject-kind :materialized-view
+       :tag "CREATE MATERIALIZED VIEW"}
+      (kw=? t1 "rule")
+      {:kind :create-rule :reject-kind :rule :tag "CREATE RULE"}
+      (kw=? t1 "operator")
+      {:kind :create-operator :reject-kind :operator :tag "CREATE OPERATOR"}
+      (kw=? t1 "cast")
+      {:kind :create-cast :reject-kind :cast :tag "CREATE CAST"}
+      (kw=? t1 "language")
+      {:kind :create-language :reject-kind :language :tag "CREATE LANGUAGE"}
+
       :else                 {:kind :generic-sql})))
 
 (defn- classify-drop [toks]
@@ -562,6 +611,21 @@
                              :tag "DROP EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
+
+      ;; Symmetric with classify-create — reuse the same :reject-kind
+      ;; so a single :silently-accept entry covers both ends.
+      (kw=? t1 "trigger")    {:kind :drop-trigger :reject-kind :trigger :tag "DROP TRIGGER"}
+      (kw=? t1 "function")   {:kind :drop-function :reject-kind :function :tag "DROP FUNCTION"}
+      (kw=? t1 "procedure")  {:kind :drop-procedure :reject-kind :procedure :tag "DROP PROCEDURE"}
+      (kw=? t1 "aggregate")  {:kind :drop-aggregate :reject-kind :aggregate :tag "DROP AGGREGATE"}
+      (and (kw=? t1 "materialized") (kw=? (second toks) "view"))
+      {:kind :drop-materialized-view :reject-kind :materialized-view
+       :tag "DROP MATERIALIZED VIEW"}
+      (kw=? t1 "rule")       {:kind :drop-rule :reject-kind :rule :tag "DROP RULE"}
+      (kw=? t1 "operator")   {:kind :drop-operator :reject-kind :operator :tag "DROP OPERATOR"}
+      (kw=? t1 "cast")       {:kind :drop-cast :reject-kind :cast :tag "DROP CAST"}
+      (kw=? t1 "language")   {:kind :drop-language :reject-kind :language :tag "DROP LANGUAGE"}
+
       :else                 {:kind :generic-sql})))
 
 (defn- contains-owner-to?
@@ -606,23 +670,43 @@
        :tag (str "ALTER " (str/upper-case (:text t1)))}
 
       (kw=? t1 "table")
-      ;; Consume optional [IF EXISTS] and the table name (possibly
-      ;; schema.name), then inspect what follows. If it's ENABLE/
-      ;; DISABLE/FORCE/NO FORCE … ROW LEVEL SECURITY, classify as
-      ;; RLS; otherwise pass through.
-      (let [ts (if (and (kw=? (first rest-toks) "if")
-                        (kw=? (second rest-toks) "exists"))
-                 (drop 2 rest-toks)
-                 rest-toks)
+      ;; Consume optional [ONLY], [IF EXISTS] and the table name (possibly
+      ;; schema.name), then inspect what follows.
+      (let [ts (if (kw=? (first rest-toks) "only") (rest rest-toks) rest-toks)
+            ts (if (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
+                 (drop 2 ts) ts)
             ;; Consume exactly one (possibly schema-qualified) name.
             ts (if (ident-tok? (first ts)) (rest ts) ts)
             ts (if (and (= "." (:text (first ts)))
                         (ident-tok? (second ts)))
                  (drop 2 ts)
                  ts)]
-        (if (alter-table-rls? ts)
+        (cond
+          (alter-table-rls? ts)
           {:kind :rls :reject-kind :rls :tag "ALTER TABLE ROW LEVEL SECURITY"}
-          {:kind :generic-sql}))
+
+          ;; ALTER TABLE [ONLY] x ATTACH PARTITION ... — partition
+          ;; management. We don't model partitions; pg_dump emits these
+          ;; per child table. The data is in the children either way.
+          (and (kw=? (first ts) "attach") (kw=? (second ts) "partition"))
+          {:kind :attach-partition :reject-kind :attach-partition
+           :tag "ALTER TABLE ATTACH PARTITION"}
+
+          (and (kw=? (first ts) "detach") (kw=? (second ts) "partition"))
+          {:kind :detach-partition :reject-kind :attach-partition
+           :tag "ALTER TABLE DETACH PARTITION"}
+
+          :else {:kind :generic-sql}))
+
+      ;; ALTER TYPE / ALTER DOMAIN — pg_dump emits these for setval
+      ;; defaults and ownership; we silently accept under :pg-dump.
+      ;; ALTER TYPE name OWNER TO ... is already covered by the
+      ;; OWNER TO branch above.
+      (kw=? t1 "type")
+      {:kind :alter-type :reject-kind :alter-type :tag "ALTER TYPE"}
+      (kw=? t1 "domain")
+      {:kind :alter-domain :reject-kind :alter-domain :tag "ALTER DOMAIN"}
+
       :else {:kind :generic-sql})))
 
 (defn- classify-rollback [toks]

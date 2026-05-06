@@ -155,14 +155,21 @@
 
 (defn- vtype->sql-type
   "Reverse-map a Datahike :db/valueType to a PostgreSQL type name.
-   :pg/type override (set by our DDL translator for JSONB and
-   array-of-anything) wins; :pg/array-elem turns the result into
-   `T[]`."
+   :datahike.pg/enum-of and :datahike.pg/domain-of win first — when
+   present, the column was declared with an ENUM or DOMAIN and we
+   must emit the type name (not the lowered base) so the dump
+   replays into a target that knows the type. :pg/type override
+   (set for JSONB and array-of-anything) wins next; :pg/array-elem
+   turns the result into `T[]`."
   [{:keys [spec ent]}]
   (let [vtype (:db/valueType spec)
+        enum-of (:datahike.pg/enum-of ent)
+        domain-of (:datahike.pg/domain-of ent)
         pg-type (:pg/type ent)
         array-elem (:pg/array-elem ent)]
     (cond
+      enum-of    enum-of   ;; ENUM-typed column
+      domain-of  domain-of ;; DOMAIN-typed column
       pg-type pg-type     ;; explicit override (e.g. "jsonb")
       array-elem (str (vtype->sql-type
                        {:spec {:db/valueType array-elem}
@@ -272,6 +279,64 @@
 (defn- emit-setval [{:keys [name value]}]
   ;; `is_called = true` → next nextval returns value+increment.
   (str "SELECT pg_catalog.setval('" name "', " value ", true);"))
+
+;; ----------------------------------------------------------------------------
+;; ENUMs and DOMAINs (registry entities under :datahike.pg.enum/* and
+;; :datahike.pg.domain/*). Emitted ahead of CREATE TABLE so column-type
+;; references resolve at replay time.
+;; ----------------------------------------------------------------------------
+
+(defn- collect-enums
+  "Walk the enum registry. Returns [{:name str :values [str ...]}]
+   sorted by name for stable dump output."
+  [db]
+  (->> (d/q '{:find [?n ?vs-ord]
+              :where [[?e :datahike.pg.enum/name ?n]
+                      [?e :datahike.pg.enum/values-ordered ?vs-ord]]}
+            db)
+       (sort-by first)
+       (mapv (fn [[n vs-ord]]
+               {:name n
+                :values (str/split (or vs-ord "") #"\n")}))))
+
+(defn- emit-create-enum
+  [{:keys [name values]}]
+  (str "CREATE TYPE " (quote-ident name) " AS ENUM ("
+       (str/join ", " (map #(str "'" (str/replace % #"'" "''") "'") values))
+       ");"))
+
+(defn- collect-domains
+  "Walk the domain registry. Returns
+   [{:name str :base-type str :base-args [...] :check-name str|nil
+     :check-expr str|nil :not-null bool :default-raw str|nil}]."
+  [db]
+  (let [results (d/q '{:find [?e ?n]
+                       :where [[?e :datahike.pg.domain/name ?n]]}
+                     db)]
+    (->> results
+         (sort-by second)
+         (mapv (fn [[eid n]]
+                 (let [ent (into {} (d/entity db eid))]
+                   {:name n
+                    :base-type (:datahike.pg.domain/base-type ent)
+                    :base-args (some-> (:datahike.pg.domain/base-args ent) sort vec)
+                    :check-name (:datahike.pg.domain/check-name ent)
+                    :check-expr (:datahike.pg.domain/check-expr ent)
+                    :not-null (:datahike.pg.domain/not-null ent)
+                    :default-raw (:datahike.pg.domain/default-raw ent)}))))))
+
+(defn- emit-create-domain
+  [{:keys [name base-type base-args check-name check-expr not-null default-raw]}]
+  (let [base (str base-type
+                  (when (seq base-args)
+                    (str "(" (str/join "," base-args) ")")))]
+    (str "CREATE DOMAIN " (quote-ident name) " AS " base
+         (when not-null " NOT NULL")
+         (when default-raw (str " DEFAULT " default-raw))
+         (when check-expr
+           (str (when check-name (str " CONSTRAINT " (quote-ident check-name)))
+                " CHECK (" check-expr ")"))
+         ";")))
 
 ;; ----------------------------------------------------------------------------
 ;; Foreign keys (post-data)
@@ -412,6 +477,16 @@
       ["-- pg-datahike dump"
        "SET client_encoding = 'UTF8';"
        "SET standard_conforming_strings = on;"]
+
+      ;; ENUMs and DOMAINs first — CREATE TABLE may reference them.
+      (when schema?
+        (let [enums (collect-enums db)
+              domains (collect-domains db)]
+          (concat
+           (when (seq enums)
+             (concat [""] (map emit-create-enum enums)))
+           (when (seq domains)
+             (concat [""] (map emit-create-domain domains))))))
 
       ;; CREATE TABLE
       (when schema?

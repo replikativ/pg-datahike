@@ -2329,12 +2329,28 @@
                        has no meaning in our data model: GRANT, REVOKE,
                        POLICY, RLS, CREATE/DROP EXTENSION. Makes
                        Hibernate, Odoo, Alembic, Flyway, etc. boot
-                       cleanly. (COMMENT ON, LOCK TABLE, CREATE VIEW,
-                       CREATE INDEX and arbitrary SET vars are already
-                       silently accepted unconditionally — see
-                       sql/system-query?.)"
+                       cleanly.
+   :pg-dump          — superset of :permissive that also accepts the
+                       extra DDL `pg_dump` emits for non-data schema
+                       objects we don't model: triggers, functions,
+                       procedures, aggregates, materialized views,
+                       rules, operators, casts, languages, partition
+                       attach/detach, ALTER TYPE / ALTER DOMAIN
+                       boilerplate. The data load + roundtrip still
+                       work; advisory side-effects (audit triggers,
+                       computed defaults driven by triggers) are lost.
+
+   (COMMENT ON, LOCK TABLE, CREATE VIEW, CREATE INDEX and arbitrary
+   SET vars are already silently accepted unconditionally — see
+   sql/system-query?.)"
   {:strict     #{}
-   :permissive #{:grant :revoke :policy :rls :create-extension}})
+   :permissive #{:grant :revoke :policy :rls :create-extension}
+   :pg-dump    #{:grant :revoke :policy :rls :create-extension
+                 :trigger :function :procedure :aggregate
+                 :materialized-view :rule :operator :cast :language
+                 :attach-partition :alter-type :alter-domain
+                 ;; non-ENUM CREATE TYPE forms (composite, range, base)
+                 :type}})
 
 (defn- resolve-silently-accept [{:keys [compat silently-accept]}]
   (let [preset (get compat-presets (or compat :strict))]
@@ -2424,6 +2440,7 @@
     :nextval                {:names ["nextval"]                    :oids [PgWireServer/OID_INT8]}
     :currval                {:names ["currval"]                    :oids [PgWireServer/OID_INT8]}
     :setval                 {:names ["setval"]                     :oids [PgWireServer/OID_INT8]}
+    :set-config             {:names ["set_config"]                 :oids [PgWireServer/OID_TEXT]}
     :advisory-lock          {:names ["pg_advisory_lock"]           :oids [OID_VOID]}
     :advisory-xact-lock     {:names ["pg_advisory_xact_lock"]      :oids [OID_VOID]}
     :advisory-unlock-all    {:names ["pg_advisory_unlock_all"]     :oids [OID_VOID]}
@@ -3132,10 +3149,16 @@
   [conn ^String seq-name]
   (let [q-fn (requiring-resolve 'datahike.api/q)
         db0 (d/db conn)
+        ;; Schema-qualified name (`public.foo_seq`)? Sequences live in a
+        ;; flat namespace in pg-datahike, so strip the schema prefix —
+        ;; same convention CREATE SEQUENCE uses.
+        bare-name (if (and seq-name (clojure.string/includes? seq-name "."))
+                    (last (clojure.string/split seq-name #"\." 2))
+                    seq-name)
         eid (ffirst (q-fn '{:find [?e]
                             :where [[?e :__seq__/name ?n]]
                             :in [$ ?n]}
-                          db0 seq-name))
+                          db0 bare-name))
         _ (when-not eid
             (throw (ex-info "sequence does not exist"
                             {:error :undefined-sequence
@@ -3197,7 +3220,9 @@
    and good enough for the common idempotent-seed pattern)."
   [{:keys [conn tx-state]} parsed]
   (try
-    (let [seq-name (:seq-name parsed)
+    (let [seq-name (some-> (:seq-name parsed)
+                           (#(if (clojure.string/includes? % ".")
+                               (last (clojure.string/split % #"\." 2)) %)))
           lookup-db (if (:in-tx? @tx-state)
                       (:speculative-db @tx-state)
                       (d/db conn))
@@ -3217,7 +3242,9 @@
    (we just persist N)."
   [{:keys [conn tx-state]} parsed]
   (try
-    (let [seq-name (:seq-name parsed)
+    (let [seq-name (some-> (:seq-name parsed)
+                           (#(if (clojure.string/includes? % ".")
+                               (last (clojure.string/split % #"\." 2)) %)))
           new-val (:new-value parsed)
           lookup-db (if (:in-tx? @tx-state)
                       (:speculative-db @tx-state)
@@ -3895,6 +3922,87 @@
         (empty-result "CREATE SEQUENCE")
         (catch Exception e
           (classified-error "CREATE SEQUENCE error: " e))))))
+
+(defn- enum-tx-data
+  "Build the registry tx-data for a CREATE TYPE … AS ENUM. Stored as a
+   single entity under the `:datahike.pg.enum/*` namespace.
+
+   - `:datahike.pg.enum/name` — unique by identity
+   - `:datahike.pg.enum/values` — vector of strings (declaration order)
+   - `:datahike.pg.enum/value-set` — same values as a `:db.type/string`
+     :cardinality/many for fast membership tests"
+  [type-name values]
+  [;; idempotent schema attrs (ok to re-transact across CREATEs).
+   {:db/ident :datahike.pg.enum/name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :datahike.pg.enum/values
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many}
+   {:db/ident :datahike.pg.enum/values-ordered
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   ;; the entity itself. We store values both as a many-cardinality
+   ;; set (for fast contains?) AND as a single ordered string
+   ;; (newline-separated) so dump can recover declaration order.
+   {:datahike.pg.enum/name type-name
+    :datahike.pg.enum/values (set values)
+    :datahike.pg.enum/values-ordered (clojure.string/join "\n" values)}])
+
+(defn- exec-ddl-create-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        tx-data (enum-tx-data (:type-name parsed) (:values parsed))]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
+      (try
+        (d/transact conn tx-data)
+        (empty-result "CREATE TYPE")
+        (catch Exception e
+          (classified-error "CREATE TYPE error: " e))))))
+
+(defn- domain-tx-data
+  "Build the registry tx-data for a CREATE DOMAIN. Stored as a single
+   entity under `:datahike.pg.domain/*`. Optional attrs (check-name,
+   check-expr, default-raw) are dissoc'd when nil so we don't write
+   `nil`s as datoms."
+  [{:keys [domain-name base-type base-args
+           check-name check-expr not-null default-raw]}]
+  [{:db/ident :datahike.pg.domain/name
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :datahike.pg.domain/base-type
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/base-args
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :datahike.pg.domain/check-name
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/check-expr
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/not-null
+    :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/default-raw
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   (cond-> {:datahike.pg.domain/name domain-name
+            :datahike.pg.domain/base-type base-type
+            :datahike.pg.domain/not-null (boolean not-null)}
+     (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args))
+     check-name              (assoc :datahike.pg.domain/check-name check-name)
+     check-expr              (assoc :datahike.pg.domain/check-expr check-expr)
+     default-raw             (assoc :datahike.pg.domain/default-raw default-raw))])
+
+(defn- exec-ddl-create-domain
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        tx-data (domain-tx-data (:domain parsed))]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE DOMAIN")
+      (try
+        (d/transact conn tx-data)
+        (empty-result "CREATE DOMAIN")
+        (catch Exception e
+          (classified-error "CREATE DOMAIN error: " e))))))
 
 (defn- exec-savepoint
   [ctx _parsed]
@@ -4655,6 +4763,8 @@
                           :delete                (exec-delete ctx parsed)
                           :ddl-create            (exec-ddl-create ctx parsed)
                           :ddl-create-sequence   (exec-ddl-create-sequence ctx parsed)
+                          :ddl-create-enum       (exec-ddl-create-enum ctx parsed)
+                          :ddl-create-domain     (exec-ddl-create-domain ctx parsed)
                           :savepoint             (exec-savepoint ctx parsed)
                           :release-savepoint     (exec-release-savepoint ctx parsed)
                           :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
