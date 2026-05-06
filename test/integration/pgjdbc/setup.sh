@@ -53,6 +53,25 @@ else
   git clone --depth=1 --branch="${REPO_TAG}" "${REPO_URL}" "${CLONE_DIR}"
 fi
 
+# ---- strip develocity (build-scan telemetry plugin) -------------------------
+#
+# pgjdbc REL42.7.5's settings.gradle.kts requires the
+# `com.gradle.develocity` Gradle plugin (build-scan service hosted at
+# gradle.com). It's resolved from Gradle's Plugin Portal at build time —
+# which intermittently 404s from CircleCI's egress, breaking pgjdbc-
+# conformance entirely. Develocity is *only* used for build-scan upload
+# (a telemetry feature), not the actual compile/test path, so we strip
+# both the plugin reference and the `develocity {}` config block before
+# running gradle. Idempotent — safe to re-run on an existing clone.
+SETTINGS="${CLONE_DIR}/settings.gradle.kts"
+if grep -q 'com.gradle.develocity' "${SETTINGS}" 2>/dev/null; then
+  echo "[setup] stripping com.gradle.develocity plugin from ${SETTINGS}"
+  sed -i \
+    -e '/id("com.gradle.develocity") version/d' \
+    -e '/^develocity {/,/^}/d' \
+    "${SETTINGS}"
+fi
+
 # ---- local properties -------------------------------------------------------
 
 # pgjdbc reads $JDBC_SRC/build.local.properties to override build.properties.
