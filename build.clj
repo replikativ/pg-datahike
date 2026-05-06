@@ -71,9 +71,13 @@
 
    AOT-compiles `datahike.pg.main` (the CLI entrypoint) and packages
    it with all transitive deps. End-users don't need a Clojure
-   installation — only a JDK 17+."
+   installation — only a JDK 17+.
+
+   Does NOT clean target/ first — sits next to whatever the `jar`
+   task already produced so CI can attach the workspace from `build`
+   and end up with both jars in target/ for the `release` job. Mirrors
+   stratum's build.clj pattern."
   [_]
-  (clean nil)
   (compile-java nil)
   (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})

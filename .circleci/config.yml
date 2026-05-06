@@ -118,6 +118,7 @@ jobs:
           root: /home/circleci/
           paths:
             - .m2
+            - project/target
 
   format:
     executor: clj-jdk21
