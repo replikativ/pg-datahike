@@ -41,7 +41,7 @@ A plain Clojure-created Datahike database is already a PG database:
 (require '[datahike.api :as d]
          '[datahike.pg :as pg])
 
-(def cfg {:store {:backend :mem :id (random-uuid)}
+(def cfg {:store {:backend :memory :id (random-uuid)}
           :schema-flexibility :write})
 (d/create-database cfg)
 (def conn (d/connect cfg))
@@ -82,8 +82,10 @@ and datoms. They're immediately queryable from Clojure:
 
 ### 1. Multi-database server
 
-One `start-server` call can serve many Datahike connections; clients
-route on the JDBC URL's database name:
+One `start-server` call serves many Datahike connections; clients route
+on the JDBC URL's database name. Three modes for managing the registry:
+
+#### Static — register from Clojure once
 
 ```clojure
 (pg/start-server {"prod"    prod-conn
@@ -100,6 +102,76 @@ jdbc:postgresql://localhost:5432/nonsuch   → 3D000 invalid_catalog_name
 
 `SELECT current_database()` returns the connected name; `pg_database`
 enumerates the registry.
+
+#### Dynamic — mutate from Clojure at runtime
+
+```clojure
+(def srv (pg/start-server {"main" main-conn} {:port 5432}))
+
+(pg/add-database!    srv "extra"  extra-conn)   ; new client connections route
+(pg/remove-database! srv "extra")               ; drop from the registry
+(pg/databases        srv)                       ; #{"main"}
+```
+
+The Clojure-side and SQL-side mutation paths share the same atom, so
+either source is visible to both.
+
+#### SQL-driven — clients self-provision via `CREATE DATABASE`
+
+Set a `:database-template` (a partial Datahike config) and pgwire
+clients can use plain SQL to provision and tear down databases:
+
+```clojure
+(pg/start-server {"datahike" boot-conn}
+                 {:port 5432
+                  :database-template {:store {:backend :memory}
+                                      :schema-flexibility :write
+                                      :keep-history? false}})
+```
+
+```sql
+CREATE DATABASE myapp;                                    -- new memory store, fresh UUID id
+CREATE DATABASE myapp2 WITH KEEP_HISTORY = true;          -- override per database
+CREATE DATABASE histdb WITH (BACKEND = 'memory',          -- Yugabyte-style paren form also works
+                              KEEP_HISTORY = true);
+DROP DATABASE myapp;
+DROP DATABASE IF EXISTS old_one;
+```
+
+Without a `:database-template` (or explicit `:on-create-database` /
+`:on-delete-database` hooks), `CREATE`/`DROP DATABASE` return SQLSTATE
+`0A000 feature_not_supported` — provisioning from SQL is a deployment
+policy decision, not a default.
+
+The accepted `WITH` clause maps option names case-insensitively to
+Datahike config:
+
+| `WITH` option | Datahike config | Notes |
+|---|---|---|
+| `BACKEND` | `[:store :backend]` keyword | `'memory'`, `'file'`, `'pg'`, `'redis'`, `…` |
+| `STORE_ID` | `[:store :id]` | Defaults to a fresh UUID per CREATE if omitted |
+| `PATH` | `[:store :path]` | File backend; `{{name}}` interpolation supported |
+| `HOST` / `PORT` / `USER` / `PASSWORD` / `DBNAME` | `[:store :*]` | `pg` / `redis` backends |
+| `SCHEMA_FLEXIBILITY` | `:schema-flexibility` keyword | `'read'` or `'write'` |
+| `KEEP_HISTORY` | `:keep-history?` boolean | |
+| `INDEX` | `:index` keyword | `'persistent-set'` → `:datahike.index/persistent-set` |
+| `OWNER` / `TEMPLATE` / `ENCODING` / `LC_COLLATE` / `LC_CTYPE` / `LOCALE` / `TABLESPACE` / … | — | PostgreSQL-only; silently accepted with a NOTICE for `pg_dump` round-trips |
+
+Unknown non-PG option names return SQLSTATE `42601 syntax_error`. For
+full control bypassing the template, set the hooks directly:
+
+```clojure
+(pg/start-server {"main" main-conn}
+  {:port 5432
+   :on-create-database (fn [name parsed-options]
+                         ;; full Clojure freedom — derive config however
+                         (let [cfg (operator-policy-for name parsed-options)]
+                           (d/create-database cfg)
+                           (d/connect cfg)))
+   :on-delete-database (fn [name conn _parsed-options]
+                         (d/release conn)
+                         (d/delete-database (operator-config-for name)))})
+```
 
 ### 2. Schema hints (native DBs)
 
@@ -306,6 +378,7 @@ Module inventory (`src/datahike/pg/`):
 | `sql.rewrite` | Span-based source rewriter for SQL shapes JSqlParser rejects |
 | `sql.shape` | Structural SELECT probe matcher for catalog queries |
 | `sql.{ddl,stmt,expr,ctx,catalog,fns,params,coerce,oid_infer}` | AST → Datalog / tx-data translation |
+| `sql.database` | `CREATE`/`DROP DATABASE` token-parser + provisioning helpers |
 | `schema` | Virtual-table derivation + `:datahike.pg/*` hint support |
 | `server` | Handler reify, wire dispatch, constraint enforcement |
 | `errors` | Exception → SQLSTATE classification at the wire boundary |
