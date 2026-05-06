@@ -153,6 +153,26 @@
 ;; Type reverse-mapping
 ;; ----------------------------------------------------------------------------
 
+(defn- scalar-vtype->sql-type
+  "Reverse-map a single :db/valueType to a PG scalar type. Used
+   internally; callers above this should use vtype->sql-type which
+   also handles enum/domain/array/cardinality-many wrappers."
+  [vtype]
+  (case vtype
+    :db.type/long      "bigint"
+    :db.type/bigint    "numeric"
+    :db.type/bigdec    "numeric"
+    :db.type/float     "real"
+    :db.type/double    "double precision"
+    :db.type/string    "text"
+    :db.type/boolean   "boolean"
+    :db.type/instant   "timestamp"
+    :db.type/uuid      "uuid"
+    :db.type/keyword   "text"
+    :db.type/symbol    "text"
+    :db.type/ref       "bigint"
+    "text"))
+
 (defn- vtype->sql-type
   "Reverse-map a Datahike :db/valueType to a PostgreSQL type name.
    :datahike.pg/enum-of and :datahike.pg/domain-of win first — when
@@ -160,37 +180,26 @@
    must emit the type name (not the lowered base) so the dump
    replays into a target that knows the type. :pg/type override
    (set for JSONB and array-of-anything) wins next; :pg/array-elem
-   turns the result into `T[]`."
+   turns the result into `T[]`. Finally, `:db.cardinality/many` (a
+   native Datahike feature with no SQL equivalent for scalars) is
+   lowered to `T[]` so the array-aware INSERT branch can render the
+   value as a PG array literal."
   [{:keys [spec ent]}]
   (let [vtype (:db/valueType spec)
+        cardinality-many? (= :db.cardinality/many (:db/cardinality spec))
         enum-of (:datahike.pg/enum-of ent)
         domain-of (:datahike.pg/domain-of ent)
         pg-type (:pg/type ent)
-        array-elem (:pg/array-elem ent)]
-    (cond
-      enum-of    enum-of   ;; ENUM-typed column
-      domain-of  domain-of ;; DOMAIN-typed column
-      pg-type pg-type     ;; explicit override (e.g. "jsonb")
-      array-elem (str (vtype->sql-type
-                       {:spec {:db/valueType array-elem}
-                        :ent (dissoc ent :pg/array-elem)})
-                      "[]")
-      :else
-      (case vtype
-        :db.type/long      "bigint"
-        :db.type/bigint    "numeric"
-        :db.type/bigdec    "numeric"
-        :db.type/float     "real"
-        :db.type/double    "double precision"
-        :db.type/string    "text"
-        :db.type/boolean   "boolean"
-        :db.type/instant   "timestamp"
-        :db.type/uuid      "uuid"
-        :db.type/keyword   "text"
-        :db.type/symbol    "text"
-        :db.type/ref       "bigint"
-        ;; Default — stringify
-        "text"))))
+        array-elem (:pg/array-elem ent)
+        scalar (cond
+                 enum-of    enum-of
+                 domain-of  domain-of
+                 pg-type    pg-type
+                 array-elem (str (scalar-vtype->sql-type array-elem) "[]")
+                 :else      (scalar-vtype->sql-type vtype))]
+    (if cardinality-many?
+      (str scalar "[]")
+      scalar)))
 
 ;; ----------------------------------------------------------------------------
 ;; Identifier quoting
@@ -368,31 +377,93 @@
 ;; ----------------------------------------------------------------------------
 
 (defn- table-rows
-  "Pull all rows for `table`. Filters on the row-marker so partial
-   entities (e.g. lingering schema-attribute entities) are excluded."
+  "Pull all rows for `table`.
+
+   Row discovery: SQL-created tables carry a `:<table>/db-row-exists`
+   marker attribute that pg-datahike sets at INSERT time. Native
+   Datahike databases (no SQL layer) don't have it. So we use the
+   marker if present; otherwise we discover entity-ids by 'has any
+   attribute in this table's namespace' — broader but works for any
+   schema."
   [db table cols]
   (let [marker-attr (keyword table "db-row-exists")
-        col-idents (mapv :ident cols)]
-    (let [eids (mapv first
+        marker-present? (contains? (:schema db) marker-attr)
+        col-idents (mapv :ident cols)
+        eids (if marker-present?
+               (mapv first
                      (sort (d/q '{:find [?e]
                                   :in [$ ?marker]
                                   :where [[?e ?marker true]]}
-                                db marker-attr)))]
-      (mapv (fn [eid]
-              (mapv (fn [attr]
-                      (let [v (ffirst (d/q '{:find [?v]
-                                             :in [$ ?e ?a]
-                                             :where [[?e ?a ?v]]}
-                                           db eid attr))]
-                        v))
-                    col-idents))
-            eids))))
+                                db marker-attr)))
+               ;; Native fallback: any entity that has at least one
+               ;; column attr from this table. Schema-attribute
+               ;; entities (which also live in the db) are filtered
+               ;; out by the column query — they have :db/ident and
+               ;; :db/valueType, never the user's column attrs.
+               (sort
+                (into #{}
+                      (mapcat (fn [attr]
+                                (mapv first
+                                      (d/q '{:find [?e]
+                                             :in [$ ?a]
+                                             :where [[?e ?a]]}
+                                           db attr))))
+                      col-idents)))]
+    (mapv (fn [eid]
+            (mapv (fn [{:keys [ident spec]}]
+                    (let [many? (= :db.cardinality/many (:db/cardinality spec))
+                          values (mapv first
+                                       (d/q '{:find [?v]
+                                              :in [$ ?e ?a]
+                                              :where [[?e ?a ?v]]}
+                                            db eid ident))]
+                      (cond
+                        ;; cardinality-many: collect ALL values into a vec
+                        ;; so the array-aware formatter can render `'{a,b}'`.
+                        many? (when (seq values) (vec values))
+                        ;; cardinality-one: single value (or nil).
+                        :else (first values))))
+                  cols))
+          eids)))
+
+(defn- escape-array-element
+  "Render one element of a PG array literal `'{...}'`. Strings are
+   double-quoted with backslash-escapes; numbers/bools are bare;
+   nil is the literal NULL token."
+  [v]
+  (cond
+    (nil? v) "NULL"
+    (boolean? v) (if v "t" "f")
+    (number? v) (str v)
+    (string? v)
+    (str "\""
+         (-> v
+             (str/replace "\\" "\\\\")
+             (str/replace "\"" "\\\""))
+         "\"")
+    (instance? java.util.Date v)
+    (str "\""
+         (.format (java.time.format.DateTimeFormatter/ofPattern
+                   "yyyy-MM-dd HH:mm:ss.SSSXXX"
+                   java.util.Locale/ROOT)
+                  (.atZone (.toInstant ^java.util.Date v)
+                           (java.time.ZoneId/of "UTC")))
+         "\"")
+    (instance? java.util.UUID v) (str v)
+    (keyword? v) (subs (str v) 1)
+    :else (str v)))
 
 (defn- format-value-for-insert
   "Render a Clojure value as a SQL literal for an INSERT clause."
   [v col]
   (cond
     (nil? v) "NULL"
+    ;; cardinality-many — render as PG array literal `'{a,b,c}'`.
+    ;; The column's value is a vector (or nil if the entity has no
+    ;; values for this attr).
+    (and (vector? v)
+         (= :db.cardinality/many (-> col :spec :db/cardinality)))
+    (str "'{" (str/join "," (map escape-array-element v)) "}'")
     (boolean? v) (if v "true" "false")
     (number? v) (str v)
     (string? v) (str "'" (str/replace v #"'" "''") "'")
