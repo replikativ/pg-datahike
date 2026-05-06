@@ -4503,8 +4503,8 @@
 
      (pg/stop-server srv)"
   [conn-or-registry & [{:keys [port host on-query default
-                                on-create-database on-delete-database
-                                database-template]
+                               on-create-database on-delete-database
+                               database-template]
                         :or {port 5432 host "127.0.0.1" default "datahike"}
                         :as opts}]]
   (let [registry (normalize-registry conn-or-registry default)
