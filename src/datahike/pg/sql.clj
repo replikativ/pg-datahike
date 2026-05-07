@@ -1180,9 +1180,23 @@
                   (when (and placeholder-parsed
                              (= :insert (:type placeholder-parsed))
                              (vector? (:tx-data placeholder-parsed)))
-                    (template/typed-substitute placeholder-parsed
-                                               (:literals tem)
-                                               schema)))
+                    (when-let [substituted (template/typed-substitute
+                                            placeholder-parsed
+                                            (:literals tem)
+                                            schema)]
+                      ;; Reset placeholder counts on the substituted result
+                      ;; — pgjdbc parsed the ORIGINAL SQL (no `?`) and pre-
+                      ;; sized its SimpleParameterList for that. If we
+                      ;; report the templated form's `:param-count 1` via
+                      ;; describeParams, the wire-layer ParameterDescription
+                      ;; carries one OID and pgjdbc's `setResolvedType(0,…)`
+                      ;; ArrayIndex-OOBs on its 0-length internal array.
+                      ;; The templated SQL's placeholders are already bound
+                      ;; (typed-substitute resolved them); from the client's
+                      ;; perspective there are no params to describe.
+                      (assoc substituted
+                             :param-count 0
+                             :param-oids {}))))
                 (catch Throwable _ nil)))))))))
 
 (defn parse-sql
