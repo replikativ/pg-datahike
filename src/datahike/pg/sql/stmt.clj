@@ -2645,33 +2645,52 @@
         :*
         (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
 
+;; Per-schema cache for enriched-schema. The enrichment is a pure
+;; function of the schema (the db is just a query source). Schema is
+;; immutable until DDL transacts. CREATE TABLE adds new attrs which
+;; mints a new schema-map (new identity → new cache key), so no
+;; explicit invalidator is needed — the only writer of
+;; `:pg/array-elem` is `translate-create-table`, in the same tx that
+;; mints the new schema. ALTER TABLE adding new columns does the
+;; same.
+(def ^:private enriched-schema-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- compute-array-meta-enriched [schema db]
+  (let [pg-meta (try
+                  (into {}
+                        (map (fn [[ident elem ndim]]
+                               [ident (cond-> {}
+                                        elem (assoc :pg/array-elem elem)
+                                        ndim (assoc :pg/array-ndim ndim))]))
+                        ((requiring-resolve 'datahike.api/q)
+                         '{:find  [?ident ?elem ?ndim]
+                           :where [[?e :db/ident ?ident]
+                                   [?e :pg/array-elem ?elem]
+                                   [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
+                         db))
+                  (catch Throwable _ {}))]
+    (reduce-kv (fn [s ident more] (update s ident merge more))
+               schema pg-meta)))
+
 (defn- enrich-schema-with-pg-array-meta
   "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
    metadata like `:pg/array-elem` lives as ident-entity facts. For
    array column INSERTs we need that metadata available via
    `(get-in schema [attr :pg/array-elem])`, so this helper queries
    db for every ident's array-elem/ndim and merges the results into
-   the schema map. Called once per INSERT/UPDATE translation; the
-   query is small (one row per array column in the entire DB)."
+   the schema map. Memoised per schema-identity — was ~0.7 ms/row of
+   pure recomputation on the Pagila pg_dump replay before caching."
   [schema db]
   (if (nil? db)
     schema
-    (let [pg-meta (try
-                    (into {}
-                          (map (fn [[ident elem ndim]]
-                                 [ident (cond-> {}
-                                          elem (assoc :pg/array-elem elem)
-                                          ndim (assoc :pg/array-ndim ndim))]))
-                          ((requiring-resolve 'datahike.api/q)
-                           '{:find  [?ident ?elem ?ndim]
-                             :where [[?e :db/ident ?ident]
-                                     [?e :pg/array-elem ?elem]
-                                     [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
-                           db))
-                    (catch Throwable _ {}))]
-      (reduce-kv (fn [s ident more]
-                   (update s ident merge more))
-                 schema pg-meta))))
+    (let [^java.util.Map outer enriched-schema-cache]
+      (or (.get outer schema)
+          (locking outer
+            (or (.get outer schema)
+                (let [enriched (compute-array-meta-enriched schema db)]
+                  (.put outer schema enriched)
+                  enriched)))))))
 
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.

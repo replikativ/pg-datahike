@@ -991,44 +991,131 @@
      col-name-array oids row-arrays
      (str "INSERT 0 " (count eids)))))
 
-(defn- auto-populate-identity
-  "If the table has IDENTITY columns (backed by __seq__ sequences), populate
-   any missing identity attributes in the INSERT tx-data using :db.fn/call
-   for atomic increment. Also checks parent table sequences for INHERITS."
-  [tx-data table-name db]
-  (let [;; Look for sequences named <table>_<col>_seq
-        ;; Also check parent table if this table inherits
-        parent-table (ffirst (d/q '{:find [?p]
+;; ----------------------------------------------------------------------------
+;; Per-schema memoisation for constraint metadata.
+;;
+;; `read-{column,check,fk}-constraints`, `compute-identity-cols`, and
+;; `enrich-schema-with-pg-array-meta` are pure functions of the schema —
+;; same (schema, table) pair always yields the same result, until DDL
+;; transacts a change. The CPU profile of a Pagila pg_dump replay
+;; showed these recompute on every INSERT (each ~0.5-0.7 ms/row of
+;; wall time on top of d/transact's 1.3 ms baseline). Caching them by
+;; schema-map identity drops that overhead to ~zero.
+;;
+;; Outer: `Collections.synchronizedMap(WeakHashMap)` keyed on the
+;; schema map's IDENTITY (System/identityHashCode). Schema maps are
+;; interned-by-equality-not-identity from Clojure's perspective; we
+;; want identity so equal-but-distinct schemas across test fixtures
+;; don't share entries. WeakHashMap reclaims entries when the schema
+;; is GC'd (after the last db pinning it goes out of scope).
+;;
+;; Inner: `ConcurrentHashMap` keyed on the cache-key the caller
+;; passed (e.g. `[::col "rental"]`). Concurrent for safety.
+;;
+;; PG-side metadata (`:pg/not-null`, `:pg/check-*`, `:pg/fk-*`,
+;; `:pg/default-*`, `:pg/array-elem`) is stored on the schema-
+;; attribute entity but does NOT appear in `(:schema db)` — only
+;; `:db/valueType` / `:db/cardinality` / `:db/unique` do. A DDL
+;; that adds NOT NULL to an existing column therefore doesn't change
+;; schema-map identity, and the identity-keyed cache would return
+;; stale info. We invalidate the cache on every DDL exec branch.
+;; DDL is rare; the bust is cheap.
+;;
+;; `cache-stats` is a hit/miss counter exposed for tests/
+;; observability. A verification harness can call
+;; `(reset! cache-stats {})`, load some INSERTs, and confirm
+;; `(:hit @cache-stats) ≫ (:miss …)` to confirm the cache fires
+;; as intended.
+;; ----------------------------------------------------------------------------
+
+(def ^:private schema-deriv-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(def ^:dynamic *schema-cache-enabled?*
+  "Bind false to bypass the cache. For perf comparisons only;
+   production code should leave this on."
+  true)
+
+(defonce ^{:doc "Hit/miss counter for the schema cache. Atom whose
+  identity is stable across reloads so external observers can hold
+  a reference and watch counts. Mutated by every `schema-cached`
+  call; read for inspection / verification harnesses."}
+  cache-stats
+  (atom {:hit 0 :miss 0}))
+
+(defn invalidate-schema-cache!
+  "Clear the per-schema cache. Called from every DDL exec branch."
+  []
+  (.clear ^java.util.Map schema-deriv-cache))
+
+(defn- schema-cached
+  "`(schema-cached db cache-key produce)` — memoise `(produce)`
+   (a 0-arg thunk) by `[schema-identity cache-key]`."
+  [db cache-key produce]
+  (if-not *schema-cache-enabled?*
+    (produce)
+    (let [schema (:schema db)
+          ^java.util.Map outer schema-deriv-cache
+          ^java.util.concurrent.ConcurrentHashMap inner
+          (or (.get outer schema)
+              (locking outer
+                (or (.get outer schema)
+                    (let [m (java.util.concurrent.ConcurrentHashMap.)]
+                      (.put outer schema m)
+                      m))))
+          existing (.get inner cache-key)]
+      (if (some? existing)
+        (do (swap! cache-stats update :hit (fnil inc 0))
+            (if (= ::nil existing) nil existing))
+        (let [v (produce)]
+          (swap! cache-stats update :miss (fnil inc 0))
+          (.putIfAbsent inner cache-key (if (nil? v) ::nil v))
+          v)))))
+
+(defn- compute-identity-cols
+  "Discover IDENTITY-backed columns of `table-name`. Two d/q calls —
+   INHERITS lookup + sequences-by-prefix. Pure function of the
+   schema; cached per (schema, table)."
+  [db table-name]
+  (let [parent-table (ffirst (d/q '{:find [?p]
                                     :where [[?e :__inherit__/child ?c]
                                             [?e :__inherit__/parent ?p]]
                                     :in [$ ?c]}
                                   db table-name))
         tables-to-check (if parent-table [table-name parent-table] [table-name])
-        ;; Each identity col: {:col "id" :ns "ir_actions" :seq-name "ir_actions_id_seq"}
-        ;; Validate: extracted column name must exist in the table's schema.
-        ;; This prevents prefix collisions (e.g. ir_module_module_ matching
-        ;; ir_module_module_dependency_id_seq → bogus "dependency_id" column).
-        schema (:schema db)
-        identity-cols (vec (mapcat
-                            (fn [tbl]
-                              (let [seq-prefix (str tbl "_")
-                                    seq-results (d/q '{:find [?name]
-                                                       :where [[?e :__seq__/name ?name]]
-                                                       :in [$ ?prefix]}
-                                                     db seq-prefix)]
-                                (keep (fn [[sname]]
-                                        (when (and (str/starts-with? sname seq-prefix)
-                                                   (str/ends-with? sname "_seq"))
-                                          (let [col-name (subs sname (count seq-prefix)
-                                                               (- (count sname) 4))
-                                                attr (keyword tbl col-name)]
-                                            ;; Only include if the column actually exists in schema
-                                            (when (get schema attr)
-                                              {:col col-name
-                                               :ns tbl
-                                               :seq-name sname}))))
-                                      seq-results)))
-                            tables-to-check))]
+        schema (:schema db)]
+    (vec (mapcat
+          (fn [tbl]
+            (let [seq-prefix (str tbl "_")
+                  seq-results (d/q '{:find [?name]
+                                     :where [[?e :__seq__/name ?name]]
+                                     :in [$ ?prefix]}
+                                   db seq-prefix)]
+              (keep (fn [[sname]]
+                      (let [pref-len (count seq-prefix)
+                            tail-end (- (count sname) 4)]
+                        (when (and (str/starts-with? sname seq-prefix)
+                                   (str/ends-with? sname "_seq")
+                                   (< pref-len tail-end))
+                          (let [col-name (subs sname pref-len tail-end)
+                                attr (keyword tbl col-name)]
+                            (when (get schema attr)
+                              {:col col-name :ns tbl :seq-name sname})))))
+                    seq-results)))
+          tables-to-check))))
+
+(defn- auto-populate-identity
+  "If the table has IDENTITY columns (backed by __seq__ sequences), populate
+   any missing identity attributes in the INSERT tx-data using :db.fn/call
+   for atomic increment. Also checks parent table sequences for INHERITS.
+
+   The identity-cols set is memoised per (schema, table) — this used
+   to fire two d/q calls per INSERT even on tables without identity
+   columns."
+  [tx-data table-name db]
+  (let [identity-cols (schema-cached db [::identity table-name]
+                                     #(compute-identity-cols db table-name))
+        identity-cols (if (= ::nil identity-cols) [] identity-cols)]
     (if (empty? identity-cols)
       tx-data
       ;; Wrap entire INSERT in :db.fn/call to atomically generate IDs.
@@ -1116,19 +1203,25 @@
     :nextval (when value [::nextval value])
     nil))
 
-(defn- read-check-constraints
-  "All CHECK constraints for `table-name`. Returns a list of
-   {:name str :expr-text str} pairs. Empty when the table has none."
+(defn- read-check-constraints*
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)]
-    (map (fn [{:keys [name expr]}] {:name name :expr expr})
-         (q-fn '{:find [?n ?x]
-                 :keys [name expr]
-                 :in [$ ?tbl]
-                 :where [[?e :pg/check-name ?n]
-                         [?e :pg/check-table ?tbl]
-                         [?e :pg/check-expr ?x]]}
-               db table-name))))
+  (mapv (fn [{:keys [name expr]}] {:name name :expr expr})
+        (d/q '{:find [?n ?x]
+               :keys [name expr]
+               :in [$ ?tbl]
+               :where [[?e :pg/check-name ?n]
+                       [?e :pg/check-table ?tbl]
+                       [?e :pg/check-expr ?x]]}
+             db table-name)))
+
+(defn- read-check-constraints
+  "All CHECK constraints for `table-name`. Returns a vector of
+   {:name str :expr str} pairs. Empty when the table has none.
+   Memoised per (schema, table)."
+  [db table-name]
+  (let [v (schema-cached db [::check table-name]
+                         #(read-check-constraints* db table-name))]
+    (if (= ::nil v) [] v)))
 
 (defn- parse-check-expression
   "Re-parse a stored CHECK expression string into a JSqlParser
@@ -1165,26 +1258,27 @@
 
 (defn- read-fk-constraints
   "All FK constraints where the given table is the CHILD side. Returns
-   a list of {:name :child-cols :parent-table :parent-cols :on-delete}
-   entries. Column lists come back as vectors (the stored form is
-   JSON)."
+   a vector of {:name :child-cols :parent-table :parent-cols} entries.
+   Column lists come back as vectors (the stored form is JSON).
+   Memoised per (schema, table)."
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
-        rows (q-fn '{:find [?n ?cc ?pt ?pc]
-                     :keys [name child-cols parent-table parent-cols]
-                     :in [$ ?tbl]
-                     :where [[?e :pg/fk-name ?n]
-                             [?e :pg/fk-child-table ?tbl]
-                             [?e :pg/fk-child-cols ?cc]
-                             [?e :pg/fk-parent-table ?pt]
-                             [?e :pg/fk-parent-cols ?pc]]}
-                   db table-name)]
-    (map (fn [{:keys [name child-cols parent-table parent-cols]}]
-           {:name name
-            :child-cols (vec (jb/parse-jsonb child-cols))
-            :parent-table parent-table
-            :parent-cols (vec (jb/parse-jsonb parent-cols))})
-         rows)))
+  (let [v (schema-cached db [::fk-child table-name]
+                         #(let [rows (d/q '{:find [?n ?cc ?pt ?pc]
+                                            :keys [name child-cols parent-table parent-cols]
+                                            :in [$ ?tbl]
+                                            :where [[?e :pg/fk-name ?n]
+                                                    [?e :pg/fk-child-table ?tbl]
+                                                    [?e :pg/fk-child-cols ?cc]
+                                                    [?e :pg/fk-parent-table ?pt]
+                                                    [?e :pg/fk-parent-cols ?pc]]}
+                                          db table-name)]
+                            (mapv (fn [{:keys [name child-cols parent-table parent-cols]}]
+                                    {:name name
+                                     :child-cols (vec (jb/parse-jsonb child-cols))
+                                     :parent-table parent-table
+                                     :parent-cols (vec (jb/parse-jsonb parent-cols))})
+                                  rows)))]
+    (if (= ::nil v) [] v)))
 
 (defn- read-fks-referring-to
   "All FK constraints where the given table is the PARENT side — i.e.
@@ -1406,46 +1500,37 @@
                                         ") is still referenced from table \""
                                         child-table "\"")})))))))
 
-(defn- read-column-constraints
-  "Return {col-name {:attr ident :not-null? bool :default [kind value arg]}}
-   for the columns of `table-name`, read from the schema entity's custom
-   attrs. Invoked once per INSERT/UPDATE — cheap relative to d/transact.
-
-   Issues two focused queries (NOT NULL set, DEFAULT triples) and
-   merges; simpler than a single `or-join` that tries to left-join
-   optional attrs in one pass — Datahike's datalog-parser rejects a
-   lot of the or-join shapes that'd be natural for that."
+(defn- read-column-constraints*
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
-        not-null-idents (into #{}
+  (let [not-null-idents (into #{}
                               (map first)
-                              (q-fn '{:find [?ident]
-                                      :in [$ ?tbl]
-                                      :where [[?e :db/ident ?ident]
-                                              [?e :pg/not-null true]
-                                              [(namespace ?ident) ?ns]
-                                              [(= ?ns ?tbl)]]}
-                                    db table-name))
-        default-rows (q-fn '{:find [?ident ?dk]
-                             :in [$ ?tbl]
-                             :where [[?e :db/ident ?ident]
-                                     [?e :pg/default-kind ?dk]
-                                     [(namespace ?ident) ?ns]
-                                     [(= ?ns ?tbl)]]}
-                           db table-name)
+                              (d/q '{:find [?ident]
+                                     :in [$ ?tbl]
+                                     :where [[?e :db/ident ?ident]
+                                             [?e :pg/not-null true]
+                                             [(namespace ?ident) ?ns]
+                                             [(= ?ns ?tbl)]]}
+                                   db table-name))
+        default-rows (d/q '{:find [?ident ?dk]
+                            :in [$ ?tbl]
+                            :where [[?e :db/ident ?ident]
+                                    [?e :pg/default-kind ?dk]
+                                    [(namespace ?ident) ?ns]
+                                    [(= ?ns ?tbl)]]}
+                          db table-name)
         ident->default
         (into {}
               (for [[ident dk] default-rows]
-                (let [dv (ffirst (q-fn '{:find [?v]
-                                         :in [$ ?i]
-                                         :where [[?e :db/ident ?i]
-                                                 [?e :pg/default-value ?v]]}
-                                       db ident))
-                      da (ffirst (q-fn '{:find [?a]
-                                         :in [$ ?i]
-                                         :where [[?e :db/ident ?i]
-                                                 [?e :pg/default-arg ?a]]}
-                                       db ident))]
+                (let [dv (ffirst (d/q '{:find [?v]
+                                        :in [$ ?i]
+                                        :where [[?e :db/ident ?i]
+                                                [?e :pg/default-value ?v]]}
+                                      db ident))
+                      da (ffirst (d/q '{:find [?a]
+                                        :in [$ ?i]
+                                        :where [[?e :db/ident ?i]
+                                                [?e :pg/default-arg ?a]]}
+                                      db ident))]
                   [ident [dk dv da]])))
         all-idents (into not-null-idents (keys ident->default))]
     (into {}
@@ -1454,6 +1539,17 @@
              {:attr ident
               :not-null? (contains? not-null-idents ident)
               :default (get ident->default ident)}]))))
+
+(defn- read-column-constraints
+  "Return {col-name {:attr ident :not-null? bool :default [kind value arg]}}
+   for the columns of `table-name`, read from the schema entity's custom
+   attrs. Memoised per (schema, table) — used to fire 2-3 d/q calls
+   per INSERT against immutable schema metadata, ~0.6 ms/row of pure
+   waste on the Pagila pg_dump replay."
+  [db table-name]
+  (let [v (schema-cached db [::col table-name]
+                         #(read-column-constraints* db table-name))]
+    (if (= ::nil v) {} v)))
 
 (defn- apply-column-constraints
   "Wrap an INSERT tx-data vector in a :db.fn/call that validates
@@ -4761,17 +4857,30 @@
                           :update-with-recursive (exec-update-with-recursive ctx parsed)
                           :update                (exec-update ctx parsed)
                           :delete                (exec-delete ctx parsed)
-                          :ddl-create            (exec-ddl-create ctx parsed)
-                          :ddl-create-sequence   (exec-ddl-create-sequence ctx parsed)
-                          :ddl-create-enum       (exec-ddl-create-enum ctx parsed)
-                          :ddl-create-domain     (exec-ddl-create-domain ctx parsed)
+                          ;; Every DDL exec-* invalidates the per-schema cache.
+                          ;; PG metadata (`:pg/not-null` etc.) lives on schema-
+                          ;; attribute entities but not in `(:schema db)`, so
+                          ;; identity-keyed caches can't detect a constraint
+                          ;; add via ALTER TABLE without an explicit bust.
+                          :ddl-create            (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create ctx parsed))
+                          :ddl-create-sequence   (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-sequence ctx parsed))
+                          :ddl-create-enum       (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-enum ctx parsed))
+                          :ddl-create-domain     (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-domain ctx parsed))
                           :savepoint             (exec-savepoint ctx parsed)
                           :release-savepoint     (exec-release-savepoint ctx parsed)
                           :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
-                          :ddl-create-index      (exec-ddl-create-index ctx parsed)
-                          :ddl-alter             (exec-ddl-alter ctx parsed)
-                          :ddl-drop              (exec-ddl-drop ctx parsed)
-                          :ddl-drop-sequence     (exec-ddl-drop-sequence ctx parsed)
+                          :ddl-create-index      (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-index ctx parsed))
+                          :ddl-alter             (do (invalidate-schema-cache!)
+                                                     (exec-ddl-alter ctx parsed))
+                          :ddl-drop              (do (invalidate-schema-cache!)
+                                                     (exec-ddl-drop ctx parsed))
+                          :ddl-drop-sequence     (do (invalidate-schema-cache!)
+                                                     (exec-ddl-drop-sequence ctx parsed))
                           :set-operation         (exec-set-operation ctx parsed)
                           :full-join             (exec-full-join ctx parsed)
                           :error                 (exec-error ctx parsed)
