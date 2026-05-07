@@ -4,6 +4,43 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Bulk-insert performance
+
+- **Pagila replay: 274s → 12s (23×).** Cumulative across five
+  changes layered on the wire path:
+  - **Deferred-CC INSERT batching** in both Simple Query (`Q`) and
+    Extended Query (`Bind/Execute … Sync`) so multiple INSERTs in
+    one sync group commit through a single `d/transact`. dc/with at
+    append time keeps constraint errors synchronous (matches PG
+    IMMEDIATE semantics); only system-level / cross-connection
+    failures land deferred.
+  - **Parse-sql LRU cache** + **JSqlParser AST cache** keyed on the
+    SQL string so repeated SQL (pgjdbc unnamed prepared statements,
+    ORM-generated select-by-id, repeated INSERT shapes) skips re-
+    parsing.
+  - **Lexical INSERT-VALUES templater** (`datahike.pg.sql.template`)
+    rewrites `INSERT INTO t (cols) VALUES (lit, …)` to
+    `(? , …)` and captures literals. The templated SQL hits the
+    cache; per-row work is a typed-substitute walk (~10 µs vs
+    ~1 ms full parse). Bails on ON CONFLICT, INSERT … SELECT,
+    SQL with existing `?` placeholders, and any non-templatable
+    token shape — slow path stays correct.
+  - **`now()` / `current_timestamp` family marker-ised** like the
+    existing `nextval` marker so the cached parsed map doesn't
+    bake a parse-time `Date`. Resolved per-execute; identity-
+    tracked so the same marker appearing in multiple parts of
+    tx-data resolves once per logical use.
+  - **`describeParams` infers OIDs for column-less INSERTs** by
+    falling back to `pgs/column-info`'s declared column order. Fixes
+    pgjdbc's `executeBatch` with positional `INSERT INTO t VALUES
+    (?, ?, ?)` (was raising `Can't change resolved type for param`).
+- **Throughput at 1000 rows/connection:**
+  - JDBC `PreparedStatement.executeBatch`: ~5 k r/s
+  - Simple-Query multi-stmt (`psql -f`, `pg_dump` replay): ~4 k r/s
+  - Explicit `BEGIN; INSERT*; COMMIT`: ~1.4 k r/s
+  - Single-stmt-per-call (default JDBC): ~370 r/s (bound by
+    per-call commit cost in Datahike).
+
 ### Migration & pg_dump interop
 
 - **`dump` tool + CLI** — `datahike.pg.dump/dump` walks any Datahike
