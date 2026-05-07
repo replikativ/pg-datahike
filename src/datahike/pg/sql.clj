@@ -14,6 +14,7 @@
                               | {:type :system :result QueryResult}
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
+              [datahike.api :as d]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
@@ -467,7 +468,7 @@
                    (let [used-catalogs (catalog/catalog-tables-in-stmt stmt)]
                      (if (empty? used-catalogs)
                        [db schema]
-                       (let [with-fn (requiring-resolve 'datahike.api/db-with)
+                       (let [with-fn d/db-with
                              sorted-names (sort used-catalogs)
                              cache *catalog-cache*
                              cache-key [(hash (:schema db)) sorted-names]
@@ -897,7 +898,7 @@
                                                               (let [inner-parsed (parse-sql (str expr) cte-schema cte-db)
                                                                     inner-query (:query inner-parsed)
                                                                     inner-in-args (:in-args inner-parsed)
-                                                                    q-fn (requiring-resolve 'datahike.api/q)
+                                                                    q-fn d/q
                                                                     rows (if (seq inner-in-args)
                                                                            (apply q-fn inner-query cte-db inner-in-args)
                                                                            (q-fn inner-query cte-db))

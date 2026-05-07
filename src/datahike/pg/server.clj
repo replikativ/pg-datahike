@@ -840,7 +840,7 @@
    (not an entity id), so `?a` is already the keyword we want."
   [db begin-tx]
   (try
-    (let [q-fn (requiring-resolve 'datahike.api/q)]
+    (let [q-fn d/q]
       (into #{}
             (map first)
             (q-fn '{:find [?a]
@@ -1124,7 +1124,7 @@
       ;; prior rows' sequence increments).
       [[:db.fn/call
         (fn [txdb]
-          (let [q-fn (requiring-resolve 'datahike.api/q)
+          (let [q-fn d/q
                 ;; Pre-fetch sequence state for each identity column
                 seq-state (atom
                            (into {}
@@ -1426,7 +1426,7 @@
    (or its PK is updated). Used by DELETE / UPDATE to enforce
    parent-side RESTRICT and CASCADE actions."
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)]
+  (let [q-fn d/q]
     (map (fn [[n ct cc pc od]]
            {:name n :child-table ct
             :child-cols (vec (jb/parse-jsonb cc))
@@ -1452,7 +1452,7 @@
   [txdb table-name ns entity-maps]
   (let [fks (seq (read-fk-constraints txdb table-name))]
     (when fks
-      (let [q-fn (requiring-resolve 'datahike.api/q)]
+      (let [q-fn d/q]
         (doseq [em entity-maps
                 {:keys [name child-cols parent-table parent-cols]} fks
                 :let [child-vals (mapv #(get em (keyword ns %)) child-cols)]
@@ -1482,7 +1482,7 @@
   "Find child eids that reference any of the parent eids via the given FK.
    Returns the eids as a set, or empty set if none."
   [db table-name fk eids]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         {:keys [child-table child-cols parent-cols]} fk
         parent-attrs (mapv #(keyword table-name %) parent-cols)
         child-attrs (mapv #(keyword child-table %) child-cols)]
@@ -1530,7 +1530,7 @@
                   :let [parent-attrs (mapv #(keyword t %) parent-cols)
                         eid (first es)
                         parent-vals (mapv (fn [a]
-                                            (ffirst ((requiring-resolve 'datahike.api/q)
+                                            (ffirst (d/q
                                                      {:find '[?v]
                                                       :in '[$ ?e]
                                                       :where [['?e a '?v]]}
@@ -1597,7 +1597,7 @@
   [db table-name tx-data]
   (let [fks (seq (read-fks-referring-to db table-name))]
     (when fks
-      (let [q-fn (requiring-resolve 'datahike.api/q)
+      (let [q-fn d/q
             parent-col-attrs (into #{}
                                    (mapcat (fn [{:keys [parent-cols]}]
                                              (map #(keyword table-name %) parent-cols))
@@ -1720,7 +1720,7 @@
       tx-data
       [[:db.fn/call
         (fn [txdb]
-          (let [q-fn (requiring-resolve 'datahike.api/q)
+          (let [q-fn d/q
                 bump-seq! (fn [seq-name]
                             ;; Mirror the behavior in auto-populate-identity:
                             ;; find the sequence entity, compute next value,
@@ -2058,7 +2058,7 @@
    A retract of a non-null attr is equivalent to setting it to NULL,
    which PG rejects."
   [db tx-data]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         not-null-attrs (into #{}
                              (map first)
                              (q-fn '{:find [?ident]
@@ -3386,7 +3386,7 @@
    not exist, and `:serialization-failure` if the contention retry
    budget is exhausted."
   [conn ^String seq-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         db0 (d/db conn)
         ;; Schema-qualified name (`public.foo_seq`)? Sequences live in a
         ;; flat namespace in pg-datahike, so strip the schema prefix —

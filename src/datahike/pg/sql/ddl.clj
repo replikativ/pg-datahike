@@ -19,6 +19,7 @@
      - extract-ddl-constraints — CHECK / NOT NULL / UNIQUE / FK clauses
      - extract-inherits        — PostgreSQL INHERITS"
   (:require [clojure.string :as str]
+              [datahike.api :as d]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params]
@@ -347,7 +348,7 @@
         ;; list without INHERITS — both refer to the same child table).
         parent-from-sql (extract-inherits ct)
         parent-from-db (when db
-                         (ffirst ((requiring-resolve 'datahike.api/q)
+                         (ffirst (d/q
                                   '{:find [?p]
                                     :where [[?e :__inherit__/child ?c]
                                             [?e :__inherit__/parent ?p]]
@@ -451,7 +452,7 @@
                                ;; Check the enum registry first, then the
                                ;; domain registry. Either lowers to a
                                ;; concrete base type for the column.
-                               q-fn (requiring-resolve 'datahike.api/q)
+                               q-fn d/q
                                enum-match (when db
                                             (ffirst (q-fn '{:find [?vs-ord]
                                                             :where [[?e :datahike.pg.enum/name ?n]
@@ -461,7 +462,7 @@
                                domain-match (when (and db (not enum-match))
                                               (let [e (when (some? type-no-schema)
                                                         (try
-                                                          ((requiring-resolve 'datahike.api/entity)
+                                                          (d/entity
                                                            db [:datahike.pg.domain/name type-no-schema])
                                                           (catch Throwable _ nil)))]
                                                 (when (and e (:datahike.pg.domain/base-type e))

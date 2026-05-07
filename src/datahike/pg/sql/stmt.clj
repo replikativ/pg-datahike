@@ -39,6 +39,7 @@
      stmt → params (ParamRef, *from-bindings*, *parse-db*)
      stmt → jsonb, schema, types   (type coercion + jsonb ops)"
   (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.datom]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -584,7 +585,7 @@
   (let [sub-alias (when-let [a (.getAlias ps)]
                     (unquote-ident (str/trim (.getName ^Alias a))))
         sub-name (or sub-alias (str "derived_" (System/nanoTime)))
-        with-fn (requiring-resolve 'datahike.api/db-with)
+        with-fn d/db-with
         inner (.getSelect ps)
         inner-ps (when (instance? PlainSelect inner) inner)
         inner-from (when inner-ps (.getFromItem ^PlainSelect inner-ps))]
@@ -636,7 +637,7 @@
    tables can't be expressed natively in Datalog — we have to flatten
    them into a single virtual table."
   [inner target-name db schema]
-  (let [with-fn (requiring-resolve 'datahike.api/db-with)
+  (let [with-fn d/db-with
         is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
         branch-parsed
         (if is-union?
@@ -668,7 +669,7 @@
         ;; pick a type then). Aligns the speculative-db's
         ;; :db/valueType with what describeResult will tell clients.
         sub-oids (:select-item-oids sub-parsed)
-        q-fn (requiring-resolve 'datahike.api/q)
+        q-fn d/q
         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
                      (let [q (cond-> query
                                (:limit p)  (assoc :limit (:limit p))
@@ -2229,8 +2230,8 @@
                  q (:query parsed)
                  in-args (:in-args parsed)
                  results (if (seq in-args)
-                           (apply (requiring-resolve 'datahike.api/q) q db in-args)
-                           ((requiring-resolve 'datahike.api/q) q db))
+                           (apply d/q q db in-args)
+                           (d/q q db))
                  first-row (first results)]
              (if (sequential? first-row) (first first-row) first-row))
            nil))
@@ -2681,7 +2682,7 @@
                                [ident (cond-> {}
                                         elem (assoc :pg/array-elem elem)
                                         ndim (assoc :pg/array-ndim ndim))]))
-                        ((requiring-resolve 'datahike.api/q)
+                        (d/q
                          '{:find  [?ident ?elem ?ndim]
                            :where [[?e :db/ident ?ident]
                                    [?e :pg/array-elem ?elem]
@@ -2758,7 +2759,7 @@
             inner-parsed (params/*parse-sql* (str inner-select) schema db)
             inner-query (:query inner-parsed)
             inner-in-args (:in-args inner-parsed)
-            q-fn (requiring-resolve 'datahike.api/q)
+            q-fn d/q
             inner-results (if (seq inner-in-args)
                             (apply q-fn inner-query db inner-in-args)
                             (q-fn inner-query db))
@@ -2818,7 +2819,7 @@
                      :tx-data
                      [[:db.fn/call
                        (fn [txdb]
-                         (let [q (requiring-resolve 'datahike.api/q)]
+                         (let [q d/q]
                            (vec
                             (mapcat
                              (fn [attrs]
@@ -2918,7 +2919,7 @@
                         row-attrs)
         ;; For INHERITS: also add parent's row-marker so parent queries find this entity
             parent-table (when db
-                           (ffirst ((requiring-resolve 'datahike.api/q)
+                           (ffirst (d/q
                                     '{:find [?p]
                                       :where [[?e :__inherit__/child ?c]
                                               [?e :__inherit__/parent ?p]]
@@ -2957,7 +2958,7 @@
                      (fn [txdb]
                  ;; Pre-fetch sequence state for identity column auto-population.
                  ;; Sequences are named <table>_<col>_seq.
-                       (let [q-fn (requiring-resolve 'datahike.api/q)
+                       (let [q-fn d/q
                              seq-prefix (str table-name "_")
                              seq-results (q-fn '{:find [?name] :where [[?e :__seq__/name ?name]]
                                                  :in [$ ?prefix]}
@@ -3038,7 +3039,7 @@
                                                 ;; Evaluate using server's eval-update-expr
                                                          :else
                                                          (let [;; Build entity map with current values + EXCLUDED values
-                                                               old-datoms ((requiring-resolve 'datahike.api/datoms) txdb :eavt existing)
+                                                               old-datoms (d/datoms txdb :eavt existing)
                                                                old-map (into {} (map (fn [^Datom d]
                                                                                        [(.-a d) (.-v d)])
                                                                                      old-datoms))
@@ -3114,7 +3115,7 @@
                 [[:db.fn/call
                   (fn unique-check [txdb row-attrs]
                     (let [schema (:schema txdb)
-                          q-fn (requiring-resolve 'datahike.api/q)
+                          q-fn d/q
                       ;; Partition identity attrs by shape.
                       ;;   scalar-ids → {:attr constraint-name}
                       ;;   tuple-ids  → [{:attr :cols [component-attrs] :name c}]

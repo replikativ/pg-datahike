@@ -27,6 +27,8 @@
    public here so the extracted translate-* namespaces can reach
    them without re-exporting through the top-level sql ns."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
+            [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params])
   (:import [net.sf.jsqlparser.expression Alias]
            [net.sf.jsqlparser.schema Column Table]))
@@ -88,7 +90,7 @@
     ;; Check for inheritance: is there a parent table?
     (let [table-name (namespace attr)
           col-name (name attr)
-          q-fn (requiring-resolve 'datahike.api/q)
+          q-fn d/q
           parent (ffirst (q-fn '{:find [?p]
                                  :where [[?e :__inherit__/child ?c]
                                          [?e :__inherit__/parent ?p]]
@@ -247,7 +249,7 @@
         fn-param (or (get @(:col->var ctx) param-key)
                      (let [p (symbol (str "?pg-many-ref-array"
                                           (swap! (:var-counter ctx) inc)))
-                           f (requiring-resolve 'datahike.pg.sql.fns/pg-many-ref-array)]
+                           f #'fns/pg-many-ref-array]
                        (swap! (:in-params ctx) conj p)
                        (swap! (:in-args ctx)   conj f)
                        (swap! (:col->var ctx) assoc param-key p)

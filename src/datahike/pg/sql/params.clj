@@ -26,6 +26,8 @@
    db snapshot so OID inference can consult :pg/type metadata that
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -352,7 +354,7 @@
    *parse-db* when nil."
   [db attr]
   (when-let [d (or db *parse-db*)]
-    (ffirst ((requiring-resolve 'datahike.api/q)
+    (ffirst (d/q
              '{:find [?pt]
                :in [$ ?ident]
                :where [[?e :db/ident ?ident]
@@ -424,8 +426,7 @@
                  ;; synthetic db_id prepended by column-info — INSERT
                  ;; VALUES is positional against user-declared columns.
                  (when table-ns
-                   (let [col-info-fn (requiring-resolve 'datahike.pg.schema/column-info)
-                         info (col-info-fn schema table-ns db)]
+                   (let [info (pgs/column-info schema table-ns db)]
                      (when (seq info)
                        (vec (keep (fn [c]
                                     (when (not= :db/id (:attr c))

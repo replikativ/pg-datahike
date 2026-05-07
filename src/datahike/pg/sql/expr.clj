@@ -41,6 +41,8 @@
    Side effects flow through the ctx's atoms (`:where-clauses`,
    `:in-args`, `:param-placeholders`, `:entity-vars`, `:col->var`)."
   (:require [clojure.set :as set]
+            [datahike.api :as d]
+            [datahike.pg.sql.oid-infer :as oid-infer]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.jsonb :as jb]
@@ -354,12 +356,8 @@
                      :table-aliases (:table-aliases ctx)
                      :default-table (:default-table ctx)
                      :hints         (:hints ctx)}
-            ;; Use a runtime require to avoid a load cycle (oid-infer
-            ;; depends on types only; pulling it from expr is fine but
-            ;; the namespace isn't aliased at the top of this file).
             arg-oid (try
-                      ((requiring-resolve 'datahike.pg.sql.oid-infer/expr-oid)
-                       arg-expr oid-env)
+                      (oid-infer/expr-oid arg-expr oid-env)
                       (catch Throwable _ nil))
             type-name (or (get types/oid->pg-name arg-oid) "text")
             fn-param (symbol (str "?pg-typeof" (swap! (:var-counter ctx) inc)))
@@ -1295,7 +1293,7 @@
                            q        (:query parsed)
                            in-args  (:in-args parsed)
                            query-db (or (:enriched-db parsed) (:db ctx))
-                           q-fn     (requiring-resolve 'datahike.api/q)
+                           q-fn     d/q
                            rows     (if (seq in-args)
                                       (apply q-fn q query-db in-args)
                                       (q-fn q query-db))]
@@ -2118,7 +2116,7 @@
                     q        (:query parsed)
                     in-args  (:in-args parsed)
                     query-db (or (:enriched-db parsed) db)
-                    q-fn     (requiring-resolve 'datahike.api/q)
+                    q-fn     d/q
                     results  (if (seq in-args)
                                (apply q-fn q query-db in-args)
                                (q-fn q query-db))
@@ -2243,7 +2241,7 @@
                 q          (:query parsed)
                 in-args    (:in-args parsed)
                 query-db   (or (:enriched-db parsed) db)
-                q-fn       (requiring-resolve 'datahike.api/q)
+                q-fn       d/q
                 results    (if (seq in-args)
                              (apply q-fn q query-db in-args)
                              (q-fn q query-db))
@@ -2953,9 +2951,9 @@
                          ;; Use enriched-db when subquery has derived tables/CTEs
                          query-db (or (:enriched-db inner-parsed) db)
                          inner-results (if (seq inner-in-args)
-                                         (apply (requiring-resolve 'datahike.api/q)
+                                         (apply d/q
                                                 inner-query query-db inner-in-args)
-                                         ((requiring-resolve 'datahike.api/q)
+                                         (d/q
                                           inner-query query-db))]
                      ;; Extract single-column values from results
                      (mapv (fn [row]
@@ -3296,9 +3294,9 @@
                                 inner-in-args (:in-args inner-parsed)
                                 query-db (or (:enriched-db inner-parsed) db)
                                 inner-results (if (seq inner-in-args)
-                                                (apply (requiring-resolve 'datahike.api/q)
+                                                (apply d/q
                                                        inner-query query-db inner-in-args)
-                                                ((requiring-resolve 'datahike.api/q)
+                                                (d/q
                                                  inner-query query-db))
                                 has-results? (boolean (seq inner-results))]
                             (if (if not-exists? (not has-results?) has-results?)
@@ -3336,9 +3334,9 @@
                       inner-in-args (:in-args inner-parsed)
                       query-db (or (:enriched-db inner-parsed) db)
                       inner-results (if (seq inner-in-args)
-                                      (apply (requiring-resolve 'datahike.api/q)
+                                      (apply d/q
                                              inner-query query-db inner-in-args)
-                                      ((requiring-resolve 'datahike.api/q)
+                                      (d/q
                                        inner-query query-db))
                       has-results? (boolean (seq inner-results))]
                   (if (if not-exists? (not has-results?) has-results?)
@@ -3352,9 +3350,9 @@
                     inner-in-args (:in-args inner-parsed)
                     query-db (or (:enriched-db inner-parsed) db)
                     inner-results (if (seq inner-in-args)
-                                    (apply (requiring-resolve 'datahike.api/q)
+                                    (apply d/q
                                            inner-query query-db inner-in-args)
-                                    ((requiring-resolve 'datahike.api/q)
+                                    (d/q
                                      inner-query query-db))
                     has-results? (boolean (seq inner-results))]
                 (if (if not-exists? (not has-results?) has-results?)

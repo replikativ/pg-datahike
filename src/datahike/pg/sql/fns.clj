@@ -34,6 +34,8 @@
    for backward compat with already-prepared statements cached on
    clients."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
+            [datahike.pg.arrays :as pg-arr]
             [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)
@@ -215,17 +217,12 @@
   "SQL array_agg(col) — collect all non-NULL values into a PgArray.
    Element-type inferred from the first non-nil element; falls back
    to :text when the input is empty (PG would return NULL; we follow
-   that by returning `:__null__`).
-
-   Requires datahike.pg.arrays which lives below this ns on the load
-   order — use requiring-resolve at call time to avoid a cycle."
+   that by returning `:__null__`)."
   [coll]
-  (let [arr-ns (some-> 'datahike.pg.arrays find-ns)
-        _ (when-not arr-ns (require 'datahike.pg.arrays))
-        vs (into []
+  (let [vs (into []
                  (map #(if (= :__null__ %) nil %))
                  coll)
-        arr-fn (resolve 'datahike.pg.arrays/array)
+        arr-fn pg-arr/array
         pick-type (fn [v]
                     (cond
                       (instance? Long v)    :int8
@@ -259,7 +256,7 @@
         _ (when-not arr-ns (require 'datahike.pg.arrays))
         arr-fn (resolve 'datahike.pg.arrays/array)
         ;; eavt scan: all `[source-eid ref-attr v]` datoms.
-        datoms-fn (requiring-resolve 'datahike.api/datoms)
+        datoms-fn d/datoms
         target-eids (mapv :v (datoms-fn db {:index :eavt
                                             :components [source-eid ref-attr]}))
         ;; Per-target lookup of the PK value. Nil targets (deleted
