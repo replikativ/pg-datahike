@@ -2176,14 +2176,20 @@
   "Extract a Clojure value from a JSqlParser expression for INSERT VALUES.
    Optional schema+db params enable scalar subquery evaluation.
 
-   When the expression is a JdbcParameter (prepared-statement placeholder),
-   returns a ParamRef that the wire layer resolves at Bind time against
-   the decoded client value."
+   When the expression is a JdbcParameter (prepared-statement placeholder):
+     - if `params/*bound-params*` is bound (lexical-template fast path
+       or execute-time re-translation), resolve the parameter inline
+       to the bound value — no ParamRef leaves this function;
+     - otherwise emit a ParamRef sentinel that the wire layer resolves
+       at Bind time against the decoded client value."
   ([e] (extract-value e nil nil))
   ([e schema db]
    (cond
      (instance? JdbcParameter e)
-     (->ParamRef (.getIndex ^JdbcParameter e))
+     (let [idx (.getIndex ^JdbcParameter e)]
+       (if-let [bound params/*bound-params*]
+         (nth bound (dec (long idx)))
+         (->ParamRef idx)))
 
      (instance? LongValue e)
     ;; JSqlParser stores every integer literal as LongValue, including

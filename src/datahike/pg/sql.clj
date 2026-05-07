@@ -30,6 +30,7 @@
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
+            [datahike.pg.sql.template :as template]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
@@ -228,6 +229,47 @@
    isolated map; nil disables caching entirely."
   global-parse-cache)
 
+;; ----------------------------------------------------------------------------
+;; JSqlParser AST cache
+;;
+;; JSqlParser is the dominant per-call cost in parse-sql (~73%).
+;; Templated SQL strings are stable across rows of the same INSERT
+;; shape, so caching the AST turns every-row-but-the-first into a
+;; sub-µs lookup. Translation (~0.3 ms / call) still runs per call,
+;; which lets us bind `*bound-params*` to per-row literals and reach
+;; the inline-resolution branch in `expr/extract-value` — that's
+;; what makes the lexical-template fast path correct (translate-insert
+;; never produces ParamRefs inside `:db.fn/call` closure captures).
+;;
+;; Thread-safety: JSqlParser AST is read-only after parse for the
+;; usages we have (all `.getXxx` / instance-of branches, no setters).
+;; Concurrent translation against the same cached AST is safe.
+
+(def ^:private ast-cache-max-entries 4096)
+
+(def ^:private global-ast-cache
+  (java.util.Collections/synchronizedMap
+   (proxy [java.util.LinkedHashMap] [16 0.75 true]
+     (removeEldestEntry [_]
+       (> (.size ^java.util.LinkedHashMap this) ast-cache-max-entries)))))
+
+(def ^:dynamic *ast-cache*
+  "Server-wide JSqlParser AST cache, keyed on the preprocessed SQL
+   string. Tests can rebind to an isolated map; nil disables caching."
+  global-ast-cache)
+
+(defn- ast-parse
+  "JSqlParser parse with the result memoised in `*ast-cache*` keyed on
+   the preprocessed SQL. Falls through to a direct parse when caching
+   is disabled."
+  [^String preprocessed]
+  (if-let [cache *ast-cache*]
+    (or (.get ^java.util.Map cache preprocessed)
+        (let [ast (CCJSqlParserUtil/parse preprocessed)]
+          (.put ^java.util.Map cache preprocessed ast)
+          ast))
+    (CCJSqlParserUtil/parse preprocessed)))
+
 (defn- cacheable-parse?
   "True if this parse result can safely live in the cross-call cache.
    Excludes session-dependent system queries, transient errors, and
@@ -397,8 +439,8 @@
            :else
         ;; Fall through to JSqlParser.
 
-      ;; Parse with JSqlParser
-           (let [stmt (CCJSqlParserUtil/parse ^String (preprocess-sql sql))
+      ;; Parse with JSqlParser (AST-cached; see ast-parse).
+           (let [stmt (ast-parse (preprocess-sql sql))
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a
@@ -1081,6 +1123,40 @@
             :message msg
             :sqlstate classified-code})))))
 
+(defn- templated-parse
+  "Lexical INSERT-VALUES fast path. Returns a parsed result on
+   success, or nil if the templater rejected the SQL (caller falls
+   through to parse-sql*).
+
+   Templates the SQL into placeholder form, parses literals to Java
+   values, binds `*bound-params*` so translate-insert resolves
+   JdbcParameter nodes inline (no ParamRef placeholders end up in the
+   `:db.fn/call` closure capture). The JSqlParser AST cache then
+   amortises the parse cost across all rows of one INSERT shape.
+
+   Skip-conditions:
+     - non-INSERT or INSERT … SELECT shapes (template-insert-sql
+       returns nil),
+     - ON CONFLICT clauses (template-insert-sql bails),
+     - SQL that already contains `?` / `$N` placeholders — mixing
+       user-bound and template-bound params would scramble indices,
+     - templates that captured no literals (no win to be had,
+       avoids nth on an empty bound vector when the SQL had
+       only function-call values),
+     - any literal token the parser can't safely reduce (returns
+       templater-fail sentinel)."
+  [^String sql schema db]
+  (when (nil? params/*bound-params*)
+    (when-not (params/has-param-marker? sql)
+      (when-let [tem (template/template-insert-sql sql)]
+        (when (seq (:literals tem))
+          (let [bound (mapv template/parse-literal-token (:literals tem))]
+            (when-not (some template/templater-fail? bound)
+              (try
+                (binding [params/*bound-params* (vec bound)]
+                  (parse-sql* (:templated tem) schema db))
+                (catch Throwable _ nil)))))))))
+
 (defn parse-sql
   "Parse a SQL statement and return a translation result.
 
@@ -1095,20 +1171,30 @@
 
    Optional db parameter enables subquery execution during translation.
 
-   Wraps `parse-sql*` with the cross-call result cache. JSqlParser AST
-   construction is the dominant per-call cost (~73% of parse-sql); a
-   workload that re-runs identical SQL — pgjdbc unnamed prepared
-   statements, repeated INSERT shapes, ORM-generated select-by-id —
-   pays it on every Parse message without a cache."
+   Three cache levels stack:
+     - **Result cache** (`*parse-cache*`) — for SQL strings re-issued
+       verbatim (pgjdbc unnamed prepared statements, ORM select-by-id).
+     - **Lexical INSERT-VALUES templating** + AST cache — for `INSERT
+       INTO t [(cols)] VALUES (lit, …)` shapes the literals are
+       captured, the SQL is normalised to `(? , …)`, and the resulting
+       AST is reused across all rows of the same shape. Translation
+       still runs per row with `*bound-params*` bound so JdbcParameter
+       nodes resolve to concrete values inline (no ParamRef closure
+       captures).
+     - **AST cache** (`*ast-cache*`) — covers everything else that
+       hits JSqlParser, repeated or not."
   ([^String sql schema] (parse-sql sql schema nil))
   ([^String sql schema db]
    (let [cache *parse-cache*
          schema-key (when cache (hash schema))
          cache-key (when cache [sql schema-key])
          cached (when cache (cache-get cache cache-key))]
-     (if cached
-       cached
-       (let [parsed (parse-sql* sql schema db)]
-         (when (and cache (cacheable-parse? parsed))
-           (cache-put! cache cache-key parsed))
-         parsed)))))
+     (cond
+       cached cached
+
+       :else
+       (or (templated-parse sql schema db)
+           (let [parsed (parse-sql* sql schema db)]
+             (when (and cache (cacheable-parse? parsed))
+               (cache-put! cache cache-key parsed))
+             parsed))))))
