@@ -273,12 +273,21 @@
 
 (defn- cacheable-parse?
   "True if this parse result can safely live in the cross-call cache.
-   Excludes session-dependent system queries, transient errors, and
-   results enriched against db rows."
+   Excludes session-dependent system queries, transient errors,
+   results enriched against db rows, and parsed maps that carry
+   mutable per-call state.
+
+   The `:row-refs` exclusion in particular guards against the ON
+   CONFLICT path: translate-insert allocates an atom there and the
+   `:db.fn/call` closure appends per-row tempids/eids into it.
+   Caching that atom and returning it on a subsequent identical SQL
+   would leak prior-call state into the new tx-data — d/transact
+   would see the accumulated entries from the previous run."
   [parsed]
   (and parsed
        (not (#{:system :error} (:type parsed)))
-       (not (:enriched-db parsed))))
+       (not (:enriched-db parsed))
+       (not (contains? parsed :row-refs))))
 
 ;; ============================================================================
 ;; Table alias tracking

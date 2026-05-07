@@ -207,6 +207,16 @@
   ;; National-char prefix N'…' is also accepted.
   #"[Nn]?'(?:''|[^'])*'(?:\s*::\s*[a-zA-Z_][\w\.]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)?")
 
+(defn- regclass-cast?
+  "Detect `'…'::regclass` and the symmetric `::regtype/::regnamespace/…`
+   shapes. The full parser routes these through `apply-sql-cast` to
+   resolve a real OID; the lexical templater would just unwrap the
+   string and lose the cast — diverging from the slow path. Bail
+   on these so the slow path runs (rare in INSERT VALUES; common in
+   pg_dump's DEFAULT clauses but those don't reach the templater)."
+  [^String tok]
+  (boolean (re-find #"::\s*reg[a-z]+" (str/lower-case tok))))
+
 (defn- token-kind
   "Classify a trimmed token. `:literal` means we'll emit a `?` and
    capture the raw token. `:nonliteral` means we leave the token
@@ -217,6 +227,7 @@
         lc (str/lower-case t)]
     (cond
       (empty? t) :nonliteral
+      (regclass-cast? t) :nonliteral
       (re-matches numeric-pattern t) :literal
       (#{"null" "true" "false"} lc) :literal
       (re-matches string-pattern t) :literal

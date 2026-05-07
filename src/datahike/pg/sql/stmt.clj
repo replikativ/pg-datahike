@@ -2529,21 +2529,33 @@
               (.isNot e) (not in?)
               :else      in?))))
 
-      :else
-      ;; Fallback — the operand may itself evaluate to a truthy value
-      ;; (e.g. boolean column `CHECK (active)`). Anything not-nil and
-      ;; not false counts as satisfied.
-      ;;
-      ;; Risk: a CHECK shape we don't structurally recognise (LIKE,
-      ;; IS DISTINCT FROM, regex, …) lands here, the operand call
-      ;; returns the expression's `(str e)` representation, and the
-      ;; non-nil/non-false branch returns `true` — i.e. the check
-      ;; silently passes everything. Any future addition for those
-      ;; shapes belongs above this fallback, before we lose the AST.
+      ;; Leaf truthy-check — `CHECK (active)` where `active` is a
+      ;; boolean column lands here. We only enter this branch for
+      ;; shapes whose `operand` result is genuinely a stored value
+      ;; (Column ref, scalar literal). Other AST shapes (Function,
+      ;; LikeExpression, RegExp, IS DISTINCT FROM, …) return `nil`
+      ;; below to honestly admit "unknown" — better to leave a
+      ;; row uncommitted-as-validated than to silently mark every
+      ;; row as passing because the operand stringified to a non-
+      ;; empty SQL fragment.
+      (or (instance? Column expr)
+          (instance? LongValue expr)
+          (instance? DoubleValue expr)
+          (instance? StringValue expr)
+          (instance? BooleanValue expr)
+          (instance? NullValue expr))
       (let [v (operand expr)]
         (cond (nil? v) nil
               (false? v) false
-              :else true)))))
+              :else true))
+
+      ;; Unrecognised shape — return nil (PG 3VL unknown). This
+      ;; matches the conservative "we couldn't evaluate, treat as
+      ;; satisfied" stance for CHECK constraints, but distinct from
+      ;; the explicit `true` we emit when we DID evaluate to a
+      ;; satisfied predicate. A future LIKE / regex / function-call
+      ;; clause should land above this `:else`.
+      :else nil)))
 
 (defn eval-update-expr
   "Evaluate an UPDATE SET expression for a specific entity.
