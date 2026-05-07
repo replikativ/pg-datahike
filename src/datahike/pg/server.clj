@@ -3858,10 +3858,50 @@
                 (.withColumnTypmods (nth sources 2)))
             result))))))
 
+(defn- exec-batchable-insert
+  "Append-time half of deferred-CC batching. Builds the same tx-data
+   as `execute-insert` (auto-populate-identity + apply-column-
+   constraints), validates it via `dc/with` against the running
+   speculative-db, and — on success — returns a `withBatchable`
+   QueryResult so the wire layer holds the CommandComplete and parks
+   the tx-data into its per-connection buffer.
+
+   Constraint violations (NOT NULL, CHECK, FK, etc.) fire here via
+   `dc/with` and surface synchronously: matches PG's IMMEDIATE
+   constraint behaviour for auto-commit. Only system-level errors
+   (konserve I/O) and cross-connection races against another
+   connection's commit can land at flush time."
+  [ctx parsed batch-state]
+  (let [{:keys [conn]} ctx
+        table-name (:table parsed)
+        ;; Anchor on the spec-db when present so consecutive batched
+        ;; INSERTs see each other's effects (sequence increments,
+        ;; uniqueness, FKs to siblings). First call in a scope reads
+        ;; live db.
+        anchor-db (or (:spec-db @batch-state) (d/db conn))
+        tx-data (-> (:tx-data parsed)
+                    (auto-populate-identity table-name anchor-db)
+                    (apply-column-constraints table-name (:ns parsed) anchor-db))]
+    (try
+      (let [spec-report (dc/with anchor-db tx-data)]
+        ;; Update the running spec-db so the next batchable INSERT
+        ;; sees this row. The wire layer keeps the parallel tx-data
+        ;; list and CommandComplete tags.
+        (swap! batch-state assoc :spec-db (:db-after spec-report))
+        (.withBatchable ^PgWireServer$QueryResult
+                        (empty-result (str "INSERT 0 " (:count parsed)))
+                        tx-data))
+      (catch Exception e
+        ;; Synchronous validation failure — return a normal error
+        ;; result. The batch state isn't updated, so subsequent
+        ;; statements continue from the prior spec-db / live db.
+        (classified-error "INSERT error: " e)))))
+
 (defn- exec-insert
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx]
-    (if (:in-tx? @tx-state)
+  (let [{:keys [conn tx-state batch-state]} ctx]
+    (cond
+      (:in-tx? @tx-state)
       (try
         (let [table-name (:table parsed)
               spec-db (:speculative-db @tx-state)
@@ -3919,6 +3959,29 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
+
+      ;; Auto-commit + wire-layer-driven batching scope. Only INSERTs
+      ;; whose tx-data is a vector (i.e. ordinary INSERT VALUES /
+      ;; INSERT … SELECT) and that don't need RETURNING (which would
+      ;; have to read db-after row-by-row to build the response) take
+      ;; the batchable path. ON CONFLICT wraps tx-data in :db.fn/call
+      ;; and writes through a row-refs atom — that's incompatible
+      ;; with held-CC semantics, so it falls through.
+      ;;
+      ;; The Java wire layer handles deferral for both protocol modes:
+      ;; for Simple Query 'Q' it holds CommandComplete strings; for
+      ;; Extended Query (P/B/D/E) it holds the full per-statement
+      ;; response byte chunks (ParseComplete + BindComplete +
+      ;; NoData/RowDescription + CC) so the relative wire-message
+      ;; order matches what default PG would emit.
+      (and batch-state
+           @batch-state
+           (vector? (:tx-data parsed))
+           (not (:returning parsed))
+           (not *snapshot-db*))
+      (exec-batchable-insert ctx parsed batch-state)
+
+      :else
       (execute-insert conn parsed))))
 
 (defn- exec-update-with-recursive
@@ -4514,7 +4577,21 @@
         ;;    :rows-committed long
         ;;    :pending-rows  vec of partial-batch rows
         ;;    :batch-size    long}
-        copy-state (atom nil)]
+        copy-state (atom nil)
+        ;; Deferred-CC INSERT batching state (see exec-insert's batchable
+        ;; branch). Set by beginBatchScope to a per-handler atom; nil when
+        ;; the handler isn't being driven by a wire layer that supports
+        ;; batching. The scope flag is also the signal that we're allowed
+        ;; to return `(.withBatchable r)` results — direct .execute callers
+        ;; never call beginBatchScope, so they always get synchronous
+        ;; commits.
+        ;;
+        ;; Holds: {:spec-db <speculative-db>}  — the speculative-db built
+        ;; up by sequential dc/with calls across batchable INSERTs. The
+        ;; wire layer keeps the parallel tx-data list and CC tags; we
+        ;; only need the running spec-db so the next dc/with sees prior
+        ;; rows in the same scope.
+        batch-state (atom nil)]
     (reify PgWireServer$QueryHandler
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
@@ -4577,6 +4654,46 @@
 
       (copyAbort [_ _reason]
         (reset! copy-state nil))
+
+      ;; --- Deferred-CC INSERT batching ---------------------------------
+      ;; The wire layer calls beginBatchScope once per connection; that
+      ;; flips the per-handler batch-state atom from nil to
+      ;; {:spec-db nil}. exec-insert keys on that scalar to decide
+      ;; whether to take the batchable path. Direct .execute callers
+      ;; (test fixtures, embedded use) never call beginBatchScope, so
+      ;; batch-state stays nil and every INSERT commits synchronously
+      ;; via execute-insert.
+      (beginBatchScope [_]
+        ;; Idempotent: only the first call activates scope; subsequent
+        ;; calls leave a running spec-db (if any) intact.
+        (compare-and-set! batch-state nil {:spec-db nil}))
+
+      ;; flushBatch is called by the wire layer when it must drain
+      ;; the per-connection buffer (Sync, end-of-Q, or before a non-
+      ;; batchable statement). The argument is the in-arrival-order
+      ;; list of tx-data payloads we returned via withBatchable.
+      ;;
+      ;; dc/with at append time already validated each row against
+      ;; the running spec-db, so the only failure modes we can hit
+      ;; here are system-level (konserve I/O) or cross-connection
+      ;; races (another connection's commit landed between our
+      ;; dc/with and this transact and invalidated the row's
+      ;; uniqueness). Both are documented PG situations where an
+      ;; Error at COMMIT is acceptable.
+      (flushBatch [_ tx-data-list]
+        ;; Clear the running spec-db so the next batchable INSERT
+        ;; (after this flush) re-anchors on the now-committed live
+        ;; db. Scope itself stays open until the connection closes.
+        (when @batch-state
+          (swap! batch-state assoc :spec-db nil))
+        (when (and tx-data-list (pos? (.size tx-data-list)))
+          (try
+            (let [combined (vec (mapcat identity tx-data-list))]
+              (when (seq combined)
+                (d/transact conn combined)))
+            nil
+            (catch Exception e
+              (classified-error "INSERT (batched) error: " e)))))
 
       ;; --- Extended Query protocol methods -------------------------------
 
@@ -4842,6 +4959,7 @@
                                  :sql-prepared sql-prepared
                                  :cursors cursors
                                  :copy-state copy-state
+                                 :batch-state batch-state
                                  :silently-accept silently-accept
                                  :handler this
                                  :sql sql

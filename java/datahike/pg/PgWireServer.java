@@ -199,6 +199,40 @@ public final class PgWireServer {
          * client visible part).
          */
         default void copyAbort(String reason) { /* default: nothing */ }
+
+        /**
+         * Signal that this handler is being driven by a wire layer
+         * that supports deferred-CC batching. The handler is free
+         * to return {@link QueryResult#withBatchable} from now on;
+         * outside of a scope it must execute every statement
+         * synchronously (so direct-call paths and Extended-Query
+         * clients without pipelining see the usual error semantics).
+         *
+         * Idempotent. Default: no-op (handler stays in synchronous
+         * mode).
+         */
+        default void beginBatchScope() { /* default: no-op */ }
+
+        /**
+         * Commit the pending INSERT batch. Called by the wire layer
+         * when it must drain the buffer:
+         *   - end of a 'Q' simple-query message,
+         *   - 'S' Sync after one or more Bind/Execute pairs,
+         *   - just before dispatching a non-batchable statement
+         *     that interleaves with the batch.
+         *
+         * The argument is the list of {@link QueryResult#batchTxData}
+         * payloads in arrival order — the handler concatenates and
+         * runs a single underlying transact. Returns null on success
+         * (the wire layer then emits the held CommandCompletes), or
+         * a {@link QueryResult} carrying an error which replaces the
+         * held CCs as the response.
+         *
+         * Default: no-op returning null (treated as "nothing was
+         * batched"). Handlers that didn't enter scope should never
+         * receive a non-empty list, so the default is safe.
+         */
+        default QueryResult flushBatch(java.util.List<Object> batchTxData) { return null; }
     }
 
     /**
@@ -279,6 +313,98 @@ public final class PgWireServer {
     }
 
     /**
+     * Per-connection state for deferred-CC INSERT batching in the
+     * Simple Query ('Q') protocol path.
+     *
+     * The wire layer parks {@link QueryResult#batchTxData} payloads
+     * here while the handler reports batchable INSERTs, alongside
+     * the CommandComplete tags those statements would have emitted
+     * synchronously. At a flush point we hand the txData list to
+     * {@link QueryHandler#flushBatch} and — on success — write the
+     * held CCs in arrival order. On flush failure the held CCs are
+     * dropped and an Error is sent in their place.
+     *
+     * Always created per-connection (not shared); access is
+     * single-threaded by the connection loop.
+     */
+    static final class BatchBuffer {
+        final java.util.List<Object> txData = new java.util.ArrayList<>();
+        final java.util.List<String> heldTags = new java.util.ArrayList<>();
+
+        boolean isEmpty() { return txData.isEmpty(); }
+
+        void append(Object data, String commandTag) {
+            txData.add(data);
+            heldTags.add(commandTag);
+        }
+
+        void clear() {
+            txData.clear();
+            heldTags.clear();
+        }
+    }
+
+    /**
+     * Per-connection state for deferred-response INSERT batching in
+     * the Extended Query (P/B/D/E + S) protocol path. Differs from
+     * {@link BatchBuffer}: there we held only the CommandComplete
+     * tag, because Simple Query has no per-statement Parse/Bind/
+     * Describe responses to defer. Extended Query DOES — and PG's
+     * wire protocol guarantees per-message-type response order, so
+     * once we hold any statement's bytes we must hold every
+     * subsequent statement's pre-Execute responses too, until we
+     * drain.
+     *
+     * The wire layer routes Parse/Bind/Describe writes through
+     * {@code curOut} (a DataOutputStream over {@code cur}) instead
+     * of the real socket stream. At each Execute boundary, the
+     * accumulated bytes either move into {@link #heldBytes} (if the
+     * statement was batchable) or get flushed to the socket along
+     * with the response (if not).
+     *
+     * Memory is bounded by the size of one Sync group: each held
+     * statement is ~30-50 bytes (PC + BC + ND + CC), so a 1000-row
+     * batch is ~50 KB. {@link #clear} is called at every Sync and
+     * on error, so accumulation across Sync groups doesn't happen.
+     */
+    static final class ExtBatchBuffer {
+        /** Current in-flight statement's accumulated wire bytes. */
+        final java.io.ByteArrayOutputStream cur = new java.io.ByteArrayOutputStream(256);
+        /** DataOutputStream view of {@link #cur} — handlers write here. */
+        final DataOutputStream curOut = new DataOutputStream(cur);
+        /** Snapshotted byte chunks for held batchable statements. */
+        final java.util.List<byte[]> heldBytes = new java.util.ArrayList<>();
+        /** Per-stmt {@link QueryResult#batchTxData} payloads, parallel to heldBytes. */
+        final java.util.List<Object> heldTxData = new java.util.ArrayList<>();
+
+        boolean isEmpty() { return heldTxData.isEmpty() && cur.size() == 0; }
+
+        boolean hasHeld() { return !heldTxData.isEmpty(); }
+
+        /**
+         * Snapshot the current buffer (which now contains PC, BC,
+         * ND, CC for the just-completed statement) and queue it
+         * alongside the tx-data the handler returned. Reset the
+         * buffer for the next statement.
+         */
+        void hold(Object txData) {
+            heldBytes.add(cur.toByteArray());
+            heldTxData.add(txData);
+            cur.reset();
+        }
+
+        /** Reset for the next statement after a non-batchable drain. */
+        void resetCur() { cur.reset(); }
+
+        /** Drop all held bytes + tx-data + current buffer. Used on error. */
+        void clear() {
+            heldBytes.clear();
+            heldTxData.clear();
+            cur.reset();
+        }
+    }
+
+    /**
      * Result of a SQL query execution.
      */
     public static final class QueryResult {
@@ -342,6 +468,29 @@ public final class PgWireServer {
          */
         public boolean copyInMode;
         public int copyColumnCount;
+
+        /**
+         * Deferred-CC batching marker. When {@code true}, the wire
+         * layer holds back this result's CommandComplete and parks
+         * {@link #batchTxData} in the connection's pending-batch
+         * buffer instead of writing anything immediately. The held
+         * CommandComplete is emitted later when the buffer is
+         * flushed via {@link QueryHandler#flushBatch}; on flush
+         * failure it's dropped and an Error is sent in its place.
+         *
+         * Only valid for results that would otherwise be a simple
+         * CommandComplete (no rows, no copyInMode, no error).
+         */
+        public boolean batchable;
+        /**
+         * Opaque per-statement payload appended to the connection's
+         * pending-batch buffer when {@link #batchable} is set. The
+         * Clojure handler stores its concrete tx-data here and
+         * unpacks it at flush time; the wire layer only ever moves
+         * it from the result into the buffer and back out into
+         * {@link QueryHandler#flushBatch}.
+         */
+        public Object batchTxData;
 
         /** Successful result with rows. */
         public QueryResult(String[] columnNames, int[] columnOids,
@@ -423,6 +572,19 @@ public final class PgWireServer {
         public QueryResult withCopyInMode(int columnCount) {
             this.copyInMode = true;
             this.copyColumnCount = columnCount;
+            return this;
+        }
+
+        /**
+         * Mark this result as a batchable INSERT. The wire layer
+         * will hold the CommandComplete and queue {@code txData}
+         * into the pending-batch buffer instead of emitting a
+         * response, until the next flush point (Sync, end-of-Q, or
+         * a non-batchable statement triggering a pre-flush).
+         */
+        public QueryResult withBatchable(Object txData) {
+            this.batchable = true;
+            this.batchTxData = txData;
             return this;
         }
     }
@@ -632,6 +794,28 @@ public final class PgWireServer {
             // state, per PG protocol.sgml:1313-1318.
             int[] copyState = new int[]{0};
 
+            // Deferred-CC INSERT batch buffer. Populated when the
+            // handler returns a {@link QueryResult#batchable} result;
+            // drained at flush points (end-of-Q, Sync, or before a
+            // non-batchable statement). The held-CC list is parallel
+            // to txData — both grow together. Discarded on extended-
+            // query errors (the inError-state Sync branch) since the
+            // batch can't be safely committed past a protocol break.
+            BatchBuffer batch = new BatchBuffer();
+            // Extended-query batch buffer. P/B/D/E handlers write
+            // their wire responses into this buffer's curOut stream
+            // instead of the socket; at Execute we either hold the
+            // whole stmt's response chunk (batchable) or drain it
+            // alongside the prior held chunks (non-batchable). Sync
+            // drains everything. Always allocated; the pre-Execute
+            // overhead is one BAOS write per message (~µs), invisible
+            // next to the wire-layer parse + dispatch costs.
+            ExtBatchBuffer extBatch = new ExtBatchBuffer();
+            // Activate batching on the handler. Idempotent; default
+            // implementation is a no-op so handlers that don't
+            // support batching simply never return batchable=true.
+            try { handler.beginBatchScope(); } catch (Exception ignore) {}
+
             boolean debug = System.getenv("DATAHIKE_WIRE_DEBUG") != null;
 
             // Lookup the command-read gate registered at startup. Set
@@ -680,6 +864,13 @@ public final class PgWireServer {
                 // (which clears the state and sends RFQ) and Terminate.
                 if (inError[0]) {
                     if (msgType == 'S') {
+                        // Drop any held extended-query state. The client
+                        // got no CommandCompletes for the held INSERTs
+                        // and no Parse/Bind/Describe responses for any
+                        // pre-Execute messages still in the cur buffer,
+                        // so dropping them keeps the wire response and
+                        // the persisted state in sync.
+                        extBatch.clear();
                         sendReadyForQuery(out, txStatus[0]);
                         out.flush();
                         inError[0] = false;
@@ -746,18 +937,37 @@ public final class PgWireServer {
                     }
 
                     switch (msgType) {
-                        case 'Q' -> handleQuery(body, out, txStatus, handler, copyState);
+                        case 'Q' -> handleQuery(body, out, txStatus, handler, copyState, batch);
                         case 'X' -> { return; }
-                        case 'P' -> handleParse(body, out, statements, handler);
-                        case 'B' -> handleBind(body, out, statements, portals);
-                        case 'D' -> handleDescribe(body, out, statements, portals, handler);
-                        case 'E' -> handleExecuteMsg(body, out, portals, txStatus, handler, copyState);
-                        case 'S' -> handleSync(out, txStatus);
-                        case 'C' -> handleClose(body, out, statements, portals);
-                        // Flush ('H'): PG requires pending responses to be sent immediately.
-                        // We flush after every handler anyway; still, acknowledge the message
-                        // so clients don't get out of sync.
-                        case 'H' -> out.flush();
+                        case 'P' -> handleParse(body, extBatch.curOut, statements, handler);
+                        case 'B' -> handleBind(body, extBatch.curOut, statements, portals);
+                        case 'D' -> handleDescribe(body, extBatch.curOut, statements, portals, handler);
+                        case 'E' -> handleExecuteMsg(body, out, portals, txStatus, handler, copyState, extBatch);
+                        case 'S' -> handleSync(out, txStatus, handler, extBatch);
+                        case 'C' -> handleClose(body, extBatch.curOut, statements, portals);
+                        // Flush ('H'): PG asks the server to send all
+                        // pending output. With Option-A buffering this
+                        // requires draining the extended-query batch
+                        // first (commits held INSERTs, writes their
+                        // bytes), then draining the in-flight cur
+                        // buffer's Parse/Bind/Describe responses.
+                        // Failure becomes an ErrorResponse — at H we
+                        // can't enter extended-query error-skip mode
+                        // since H doesn't get its own RFQ; the next
+                        // message after H still gets processed.
+                        case 'H' -> {
+                            QueryResult hFlushErr = flushExtHeld(out, handler, extBatch);
+                            if (hFlushErr != null) {
+                                sendError(out, "ERROR",
+                                          hFlushErr.sqlstate != null ? hFlushErr.sqlstate : "XX000",
+                                          hFlushErr.error, hFlushErr.errorFields);
+                                if (txStatus[0] == 'T') txStatus[0] = 'E';
+                            } else if (extBatch.cur.size() > 0) {
+                                extBatch.cur.writeTo(out);
+                            }
+                            extBatch.resetCur();
+                            out.flush();
+                        }
                         default -> {
                             // Unknown top-level message — e.g. F/d/c/f/p
                             // sent out-of-context. PG requires that
@@ -987,7 +1197,7 @@ public final class PgWireServer {
     // Simple Query protocol
     // ========================================================================
 
-    private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler, int[] copyState) throws IOException {
+    private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler, int[] copyState, BatchBuffer batch) throws IOException {
         String sql = new String(body, 0, body.length - 1, StandardCharsets.UTF_8).trim();
 
         if (sql.isEmpty()) {
@@ -1044,18 +1254,58 @@ public final class PgWireServer {
                             result.error, result.errorFields);
                     if (txStatus[0] == 'T') txStatus[0] = 'E';
                     errored = true;
+                } else if (result.batchable) {
+                    // Hold the CommandComplete and park the tx-data
+                    // payload for a batched commit at the end of this
+                    // 'Q' (or before the next non-batchable stmt).
+                    // The handler has already validated the row via
+                    // dc/with against its running spec-db, so the
+                    // only failure modes left are system-level
+                    // (konserve I/O) and cross-connection races.
+                    batch.append(result.batchTxData, result.commandTag);
                 } else if (result.copyInMode) {
                     // Server-side enters COPY-IN. We send CopyInResponse
                     // and DON'T emit ReadyForQuery — the client now
                     // streams CopyData until CopyDone/CopyFail. The
                     // outer loop's COPY-IN dispatch handles those.
+                    QueryResult flushErr = flushBatch(out, handler, batch);
+                    if (flushErr != null) {
+                        sendError(out, "ERROR",
+                                flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                                flushErr.error, flushErr.errorFields);
+                        if (txStatus[0] == 'T') txStatus[0] = 'E';
+                        errored = true;
+                        break;
+                    }
                     sendCopyInResponse(out, result.copyColumnCount);
                     out.flush();
                     copyState[0] = 1;
                     return;
                 } else if (result.columnNames.length == 0) {
+                    // Non-batchable single command (DDL, SET, BEGIN,
+                    // …). Drain the held batch first so its rows are
+                    // visible to anything that follows; surface a
+                    // flush failure as the per-stmt error.
+                    QueryResult flushErr = flushBatch(out, handler, batch);
+                    if (flushErr != null) {
+                        sendError(out, "ERROR",
+                                flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                                flushErr.error, flushErr.errorFields);
+                        if (txStatus[0] == 'T') txStatus[0] = 'E';
+                        errored = true;
+                        break;
+                    }
                     sendCommandComplete(out, result.commandTag);
                 } else {
+                    QueryResult flushErr = flushBatch(out, handler, batch);
+                    if (flushErr != null) {
+                        sendError(out, "ERROR",
+                                flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                                flushErr.error, flushErr.errorFields);
+                        if (txStatus[0] == 'T') txStatus[0] = 'E';
+                        errored = true;
+                        break;
+                    }
                     sendRowDescription(out, result.columnNames, result.columnOids,
                                       result.columnTableOids, result.columnAttnums,
                                       result.columnTypmods, null);
@@ -1069,6 +1319,23 @@ public final class PgWireServer {
                         e.getMessage() != null ? e.getMessage() : e.getClass().getName());
                 if (txStatus[0] == 'T') txStatus[0] = 'E';
                 errored = true;
+            }
+        }
+
+        // End-of-Q drain. On the error path the rows were never
+        // CommandComplete'd to the client, so dropping them keeps
+        // wire response and persisted state in sync. On the success
+        // path flushBatch emits the held CCs in arrival order before
+        // RFQ.
+        if (errored) {
+            batch.clear();
+        } else {
+            QueryResult flushErr = flushBatch(out, handler, batch);
+            if (flushErr != null) {
+                sendError(out, "ERROR",
+                        flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                        flushErr.error, flushErr.errorFields);
+                if (txStatus[0] == 'T') txStatus[0] = 'E';
             }
         }
 
@@ -1443,7 +1710,8 @@ public final class PgWireServer {
                                   java.util.Map<String, Portal> portals,
                                   char[] txStatus,
                                   QueryHandler handler,
-                                  int[] copyState) throws IOException {
+                                  int[] copyState,
+                                  ExtBatchBuffer extBatch) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String portalName = readCString(buf);
         int maxRows = buf.getInt();
@@ -1460,6 +1728,18 @@ public final class PgWireServer {
         // src/backend/tcop/postgres.c — exec_execute_message, where an
         // empty portal produces 'I' and clients know it's a no-op.
         if (portal.stmt.parsed == null) {
+            // The empty-query statement still went through Parse/Bind
+            // (so PC, BC, ND were buffered into extBatch.cur). Drain
+            // whatever's there along with any held INSERTs before the
+            // EmptyQueryResponse, in arrival order.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
             sendEmptyQueryResponse(out);
             out.flush();
             return;
@@ -1475,28 +1755,89 @@ public final class PgWireServer {
 
         if (result == null) {
             // Shouldn't happen — handler contract returns a QueryResult.
+            // Treat as a non-batchable boundary: drain held + cur, then
+            // emit a synthetic CC.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
             sendCommandComplete(out, "SELECT 0");
         } else if (result.error != null) {
-            // Propagate as a protocol exception so the connection loop
-            // sends ErrorResponse, transitions T→E, and enters extended-
-            // query error-skip until the next Sync.
+            // Best-effort commit of any held INSERTs (their dc/with
+            // already validated; the failing stmt is independent).
+            // Successful held responses go to wire so JDBC sees per-
+            // row counts. The current statement's pre-Execute bytes
+            // are dropped — they're never wire-acknowledged. Then we
+            // throw, the connection loop sends ErrorResponse, and
+            // extended-query error-skip drains the rest until Sync.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            extBatch.resetCur();
+            if (flushErr != null) {
+                // Held flush failed AND current stmt errored. Report
+                // the held-flush error (it happened first); the per-
+                // stmt error gets dropped — its CC was never going
+                // to land anyway.
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
             throw new PgProtocolException(
                 result.sqlstate != null ? result.sqlstate : "XX000",
                 result.error,
                 result.errorFields);
+        } else if (result.batchable) {
+            // Append CC to the current buffer, then snapshot it as a
+            // held statement-response chunk paired with its tx-data.
+            // Don't touch the socket — Sync (or the next non-batchable
+            // Execute) drives the drain.
+            sendCommandComplete(extBatch.curOut, result.commandTag);
+            extBatch.hold(result.batchTxData);
+            return;
         } else if (result.copyInMode) {
-            // Extended-Query path also supports COPY-IN — though in
-            // practice clients use Simple Query for COPY. We send
-            // CopyInResponse and trip copyState; the next message
-            // will be a 'd'/'c'/'f' which the outer loop routes.
+            // Extended-Query COPY-IN — rare, but supported. Drain held
+            // + cur first so the client sees a clean state before the
+            // CopyInResponse switch.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
             sendCopyInResponse(out, result.copyColumnCount);
             out.flush();
             copyState[0] = 1;
             return;
         } else if (result.columnNames.length == 0) {
+            // Non-batchable command (DDL, BEGIN, COMMIT, …). Commit
+            // any held INSERTs first, write their bytes to wire, then
+            // drain the current statement's pre-Execute responses, then
+            // emit the CC.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
             sendCommandComplete(out, result.commandTag);
             trace("send CommandComplete \"" + result.commandTag + "\"");
         } else {
+            // SELECT or other row-returning result.
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
             // PG contract: if Describe has already emitted RowDescription
             // (either on the statement or the portal), Execute sends only
             // DataRows + CommandComplete. Sending a duplicate leaves
@@ -1530,10 +1871,108 @@ public final class PgWireServer {
         out.flush();
     }
 
-    private void handleSync(DataOutputStream out, char[] txStatus) throws IOException {
+    private void handleSync(DataOutputStream out, char[] txStatus,
+                             QueryHandler handler, ExtBatchBuffer extBatch) throws IOException {
         trace("recv Sync → send RFQ '" + txStatus[0] + "'");
+        // Sync ends the extended-query message group. Drain any
+        // accumulated batch (commits held INSERTs) and any cur-buffer
+        // bytes (responses for an in-flight statement that didn't
+        // reach Execute, e.g. Parse-only). On flush failure surface
+        // a single ErrorResponse before RFQ — held bytes were never
+        // sent to the client, so this is wire-consistent.
+        QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+        if (flushErr != null) {
+            sendError(out, "ERROR",
+                      flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                      flushErr.error, flushErr.errorFields);
+            if (txStatus[0] == 'T') txStatus[0] = 'E';
+        } else if (extBatch.cur.size() > 0) {
+            extBatch.cur.writeTo(out);
+        }
+        extBatch.resetCur();
         sendReadyForQuery(out, txStatus[0]);
         out.flush();
+    }
+
+    /**
+     * Drain the held INSERT batch from {@link ExtBatchBuffer}.
+     *
+     * No-op (returns null) if there are no held statements. Otherwise:
+     *   - calls {@link QueryHandler#flushBatch} with the accumulated
+     *     tx-data,
+     *   - on success → writes each held byte chunk (PC, BC, ND, CC for
+     *     that statement) to {@code out} in arrival order, returns null.
+     *   - on failure → leaves {@code out} untouched, returns the error
+     *     result. The caller decides how to surface it.
+     *
+     * The held lists are always cleared (success or failure). The
+     * cur buffer is NOT touched — callers handle it separately, since
+     * the right thing to do with the in-flight statement's pre-Execute
+     * bytes depends on whether the current stmt itself errored.
+     */
+    private QueryResult flushExtHeld(DataOutputStream out, QueryHandler handler,
+                                      ExtBatchBuffer extBatch) throws IOException {
+        if (!extBatch.hasHeld()) return null;
+        java.util.List<Object> txData = new java.util.ArrayList<>(extBatch.heldTxData);
+        java.util.List<byte[]> bytes = new java.util.ArrayList<>(extBatch.heldBytes);
+        extBatch.heldTxData.clear();
+        extBatch.heldBytes.clear();
+        QueryResult res;
+        try {
+            res = handler.flushBatch(txData);
+        } catch (Exception e) {
+            return new QueryResult(
+                e.getMessage() != null ? e.getMessage() : e.getClass().getName(),
+                "XX000");
+        }
+        if (res != null && res.error != null) {
+            return res;
+        }
+        for (byte[] chunk : bytes) {
+            out.write(chunk);
+        }
+        return null;
+    }
+
+    /**
+     * Drain the per-connection Simple-Query batch buffer.
+     *
+     * No-op (returns null) if the buffer is empty. Otherwise calls
+     * {@link QueryHandler#flushBatch} with the accumulated tx-data:
+     *
+     *   - on success → writes each held CommandComplete to {@code out}
+     *     in arrival order and returns null. (No {@code out.flush()};
+     *     the caller controls the socket flush so adjacent messages
+     *     can coalesce.)
+     *   - on failure → leaves {@code out} untouched, returns the
+     *     error result. The caller decides whether to send an
+     *     ErrorResponse synchronously (Simple Query Q) or throw a
+     *     {@link PgProtocolException} so the connection loop drives
+     *     extended-query error-skip mode (Bind/Execute/Sync).
+     *
+     * The buffer is always cleared.
+     */
+    private QueryResult flushBatch(DataOutputStream out, QueryHandler handler,
+                                    BatchBuffer batch) throws IOException {
+        if (batch.isEmpty()) return null;
+        java.util.List<Object> txData = new java.util.ArrayList<>(batch.txData);
+        java.util.List<String> tags = new java.util.ArrayList<>(batch.heldTags);
+        batch.clear();
+        QueryResult res;
+        try {
+            res = handler.flushBatch(txData);
+        } catch (Exception e) {
+            return new QueryResult(
+                e.getMessage() != null ? e.getMessage() : e.getClass().getName(),
+                "XX000");
+        }
+        if (res != null && res.error != null) {
+            return res;
+        }
+        for (String tag : tags) {
+            sendCommandComplete(out, tag);
+        }
+        return null;
     }
 
     private void handleClose(byte[] body, DataOutputStream out,
