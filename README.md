@@ -313,7 +313,15 @@ Validated end-to-end against:
 - **Chinook** (15.6 k rows / 11 tables / FKs / NUMERIC / TIMESTAMP) —
   full bidirectional roundtrip, byte-identical per-row equality.
 - **Pagila** (50 k rows / 22 tables / ENUM / DOMAIN / partitioning /
-  triggers / functions) — schema parses end-to-end, data loads.
+  triggers / functions) — schema parses end-to-end, data loads in
+  ~12 s (≈ 4 k rows/s).
+
+Replay throughput depends on how the client sends the inserts. The
+fast paths are multi-statement Simple Query (what `psql -f` does),
+JDBC `PreparedStatement.executeBatch`, and explicit transactions —
+all of which commit batched rows through one underlying transact
+instead of per-row. Each-INSERT-its-own-roundtrip clients are bound
+by per-call commit cost (~370 r/s).
 
 ### pg-datahike → portable PG SQL (the `dump` tool)
 
@@ -438,8 +446,11 @@ Tested against:
 `CREATE SEQUENCE`, `nextval` / `currval` / `setval` (with PG-correct
 non-transactional semantics — advance survives rollback, concurrent
 callers get distinct values), `DEFAULT nextval('s'::regclass)`,
-`CREATE TYPE … AS ENUM`, `CREATE DOMAIN` (with CHECK clause stored
-for re-emission), `text[]` arrays, `tsvector` (opaque round-trip),
+`CREATE TYPE … AS ENUM` (membership enforced on INSERT — non-members
+raise 22P02), `CREATE DOMAIN … [NOT NULL] [CHECK (…)]` (CHECK predicate
+evaluated on INSERT — violations raise 23514, NOT NULL raises 23502;
+`VALUE` keyword resolves to the column value), `text[]` arrays,
+`tsvector` (opaque round-trip),
 `bytea`, `timestamp with time zone`, `CHARACTER(N)`, `SERIAL`,
 `COPY … FROM stdin` (text + CSV), `ALTER TABLE … ADD CONSTRAINT
 FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
@@ -467,9 +478,6 @@ land where they should.
 - Cursor materialization is eager (entire result set held in memory).
 - No deferrable constraints.
 - Generated columns parse but aren't enforced.
-- ENUM membership and DOMAIN CHECK are stored on the schema (round-trip
-  through dump correctly) but not enforced at INSERT time. The registry
-  carries the data; runtime enforcement is future work.
 - ENUM ordering is lexicographic (string storage) rather than PG's
   declaration-order. `ORDER BY` on enum-typed columns may diverge.
 - Partitioned tables: data lives in the children, not the parent (pg-
@@ -477,13 +485,15 @@ land where they should.
   need partition-aware routing into the parent table are out of scope.
 - **Constraint enforcement is one-directional in 0.1.** SQL constraints
   declared via DDL — `NOT NULL`, `CHECK`, `UNIQUE`, foreign-key
-  child-side and parent-side `RESTRICT` — are enforced by the pgwire
-  handler at write time. Direct `(d/transact)` writes from Clojure
-  bypass these checks because Datahike's schema does not yet carry
-  the corresponding constraint vocabulary. Use the SQL path for
-  constrained inserts, or validate explicitly before transacting.
-  A future release will lift enforcement into Datahike's tx layer
-  so both paths are gated.
+  child-side and parent-side `RESTRICT`, DOMAIN CHECK / NOT NULL,
+  ENUM membership — are enforced by the pgwire handler at write time
+  (via a `:db.fn/call` wrapper that runs against the speculative
+  txdb, mirroring PG IMMEDIATE constraint semantics). Direct
+  `(d/transact)` writes from Clojure bypass these checks because
+  Datahike's schema does not yet carry the corresponding constraint
+  vocabulary. Use the SQL path for constrained inserts, or validate
+  explicitly before transacting. A future release will lift enforcement
+  into Datahike's tx layer so both paths are gated.
 
 ## Development
 
@@ -534,6 +544,7 @@ Module inventory (`src/datahike/pg/`):
 | `sql.rewrite` | Span-based source rewriter for SQL shapes JSqlParser rejects |
 | `sql.shape` | Structural SELECT probe matcher for catalog queries |
 | `sql.{ddl,stmt,expr,ctx,catalog,fns,params,coerce,oid_infer}` | AST → Datalog / tx-data translation |
+| `sql.template` | Lexical INSERT-VALUES templater (literal → `?` rewrite + typed substitute) for parse-result reuse on bulk inserts |
 | `sql.database` | `CREATE`/`DROP DATABASE` token-parser + provisioning helpers |
 | `sql.types` | `CREATE TYPE … AS ENUM` / `CREATE DOMAIN` parsers (bypass JSqlParser); registry-entity model |
 | `sql.copy` / `sql.copy.{text_format,csv_format}` | `COPY … FROM stdin` parser + format decoders |

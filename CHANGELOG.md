@@ -90,9 +90,27 @@ All notable changes to pg-datahike.
 - **DOMAIN** — `CREATE DOMAIN [name] AS [base] [CHECK (…)]`. Same
   registry-entity architecture (`:datahike.pg.domain/{name,base-type,
   check-expr,not-null,…}`). Column resolution lowers to the base
-  type with `:datahike.pg/domain-of` for re-emission. CHECK clause
-  preserved on the registry entity for dump output (runtime
-  enforcement is future work).
+  type with `:datahike.pg/domain-of` for re-emission.
+- **DOMAIN / ENUM runtime enforcement** — INSERTs into a DOMAIN- or
+  ENUM-typed column are validated against the registry at txdb time:
+  - DOMAIN CHECK violations raise `23514` ("value for domain X violates
+    check constraint Y"). PG 3VL: NULL → unknown → satisfied.
+  - DOMAIN NOT NULL raises `23502` ("domain X does not allow null
+    values").
+  - ENUM non-members raise `22P02` ("invalid input syntax for type
+    {enum}"). NULL is allowed unless the column is also NOT NULL.
+  Implementation reuses the existing `:db.fn/call` wrapper layered on
+  INSERT tx-data — `apply-column-constraints` already runs at txdb-
+  time for NOT NULL / CHECK / FK; we add a sibling pass for domain/
+  enum. CHECK ASTs are pre-parsed at cache-build time, ENUM value-
+  sets frozen, both memoised per (schema, table). Tables without
+  domain- or enum-typed columns pay zero overhead. Pagila replay
+  (which has both `year` DOMAIN with CHECK and `mpaa_rating` ENUM)
+  stays at ~4 k rows/s.
+- **`consume-name` parses quoted-identifier domain names** including
+  `public."bıgınt"` (Turkish dotless-i in Pagila's schema), and the
+  symmetric `"schema"."name"` form. The existing rule only matched
+  bare-alphanumeric `schema.name`.
 
 ### `nextval` / sequence handling
 
