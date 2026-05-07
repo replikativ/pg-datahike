@@ -359,13 +359,35 @@
    column i → attribute type → PG OID. Returns a map {param-index → oid}.
 
    Only covers the flat single-row / multi-row VALUES case — which is
-   what JDBC setObject/setString produces for the common ORM path."
-  [^Insert insert schema]
+   what JDBC setObject/setString produces for the common ORM path.
+
+   When the INSERT omits the explicit column list (`INSERT INTO t
+   VALUES (?, ?, ?)`), falls back to the table's declared column order
+   from `pgs/column-info` (which honours both schema entity-ID order and
+   the `:datahike.pg/column-order` hint). This is what pgjdbc's
+   `executeBatch` needs: setLong(1, …) wants param 1's OID at Describe
+   time, and without inferred OIDs pgjdbc's resolved-type tracker
+   raises `Can't change resolved type for param: N from <oid> to 0`."
+  ([^Insert insert schema] (insert-param-oids insert schema nil))
+  ([^Insert insert schema db]
   (try
     (let [table-ns (when-let [^Table t (.getTable insert)]
                      (unquote-ident (.getName t)))
-          cols (some-> (.getColumns insert)
-                       (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
+          explicit-cols (some-> (.getColumns insert)
+                                (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
+          cols (if (seq explicit-cols)
+                 explicit-cols
+                 ;; No column list: derive from schema. Drop the
+                 ;; synthetic db_id prepended by column-info — INSERT
+                 ;; VALUES is positional against user-declared columns.
+                 (when table-ns
+                   (let [col-info-fn (requiring-resolve 'datahike.pg.schema/column-info)
+                         info (col-info-fn schema table-ns db)]
+                     (when (seq info)
+                       (vec (keep (fn [c]
+                                    (when (not= :db/id (:attr c))
+                                      (name (:attr c))))
+                                  info))))))
           select (.getSelect insert)
           col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))]
       (when (and table-ns (seq cols)
@@ -381,7 +403,7 @@
                   (when-let [oid (col-oid (nth cols i))]
                     (.put result (.getIndex ^JdbcParameter e) oid))))))
           (when (pos? (.size result)) (into {} result)))))
-    (catch Throwable _ nil)))
+    (catch Throwable _ nil))))
 
 (defn update-param-oids
   "Walk an UPDATE AST: for each SET col = ?, map param index to the

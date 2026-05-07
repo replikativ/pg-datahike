@@ -185,6 +185,59 @@
   v)
 
 ;; ============================================================================
+;; parse-sql result cache
+;; ============================================================================
+;;
+;; JSqlParser AST is the dominant per-row cost in parse-sql (~0.86 ms /
+;; ~73% of total). Per-row pg-datahike translation adds another ~0.3 ms.
+;; A workload that re-runs identical SQL — pgjdbc unnamed prepared
+;; statements (default `prepareThreshold=5`), repeated `INSERT INTO log
+;; VALUES (?)` calls, ORM-generated SELECT-by-id — pays this cost on
+;; every Parse message.
+;;
+;; The cache key is `[sql schema-hash]`. The schema-hash captures
+;; everything translation depends on: column types, identity unique-
+;; ness, FK metadata. Two connections with the same user schema share
+;; entries. DDL changes the schema → new hash → cache miss.
+;;
+;; We do NOT cache results that depend on transient state:
+;;   - :type :system            (current_user, now(), session GUCs)
+;;   - :type :error             (transient parse failures shouldn't pin)
+;;   - :enriched-db tagged maps (catalog data depends on db rows, not
+;;                               just schema; the enriched-db itself is
+;;                               cached separately by *catalog-cache*)
+;;   - bound-param substitution (callers Bind via resolve-param-refs
+;;                               on the cached map; we cache the
+;;                               un-substituted shape)
+
+(def ^:private parse-cache-max-entries
+  "Soft bound on the parse-sql result cache. 4k entries comfortably
+   covers Odoo / Metabase shapes (≈ a few hundred unique queries per
+   schema) plus headroom for ORM-generated INSERT/UPDATE shapes."
+  4096)
+
+(def ^:private global-parse-cache
+  (java.util.Collections/synchronizedMap
+   (proxy [java.util.LinkedHashMap] [16 0.75 true]
+     (removeEldestEntry [_]
+       (> (.size ^java.util.LinkedHashMap this)
+          parse-cache-max-entries)))))
+
+(def ^:dynamic *parse-cache*
+  "Server-wide cache for parse-sql results. Tests can rebind to an
+   isolated map; nil disables caching entirely."
+  global-parse-cache)
+
+(defn- cacheable-parse?
+  "True if this parse result can safely live in the cross-call cache.
+   Excludes session-dependent system queries, transient errors, and
+   results enriched against db rows."
+  [parsed]
+  (and parsed
+       (not (#{:system :error} (:type parsed)))
+       (not (:enriched-db parsed))))
+
+;; ============================================================================
 ;; Table alias tracking
 ;; ============================================================================
 
@@ -217,22 +270,11 @@
   [^String sql]
   (rw/rewrite sql rw/default-rules))
 
-(defn parse-sql
-  "Parse a SQL statement and return a translation result.
-
-   Returns one of:
-     {:type :select :query <datalog-map> :find-aliases [...] ...}
-     {:type :insert :tx-data [...] :count N}
-     {:type :update :table str :ns str :assignments [...] :where-expr expr}
-     {:type :delete :table str :ns str :where-expr expr}
-     {:type :ddl-create :tx-data [...]}
-     {:type :system :system-type keyword}
-     {:type :error :message str}
-
-   Optional db parameter enables subquery execution during translation."
-  ([^String sql schema] (parse-sql sql schema nil))
-  ([^String sql schema db]
-   (binding [params/*parse-db* db
+(defn- parse-sql*
+  "Inner parse-sql implementation — does the actual work. Public
+   parse-sql wraps this with the LRU result cache."
+  [^String sql schema db]
+  (binding [params/*parse-db* db
              params/*parse-sql* parse-sql
              ;; Per-query memoisation for `schema-hints` /
              ;; `derive-virtual-tables`. Both are called by every
@@ -419,7 +461,7 @@
                  inferred-oids
                  (when (pos? param-count)
                    (cond (instance? Insert stmt)
-                         (let [values-oids (params/insert-param-oids stmt schema)
+                         (let [values-oids (params/insert-param-oids stmt schema db)
                           ;; ON CONFLICT DO UPDATE SET col = ?: walk the
                           ;; conflict action's UpdateSet list the same
                           ;; way params/update-param-oids does.
@@ -1037,4 +1079,36 @@
                      (str "SQL parse error: " classified-msg))]
            {:type :error
             :message msg
-            :sqlstate classified-code}))))))
+            :sqlstate classified-code})))))
+
+(defn parse-sql
+  "Parse a SQL statement and return a translation result.
+
+   Returns one of:
+     {:type :select :query <datalog-map> :find-aliases [...] ...}
+     {:type :insert :tx-data [...] :count N}
+     {:type :update :table str :ns str :assignments [...] :where-expr expr}
+     {:type :delete :table str :ns str :where-expr expr}
+     {:type :ddl-create :tx-data [...]}
+     {:type :system :system-type keyword}
+     {:type :error :message str}
+
+   Optional db parameter enables subquery execution during translation.
+
+   Wraps `parse-sql*` with the cross-call result cache. JSqlParser AST
+   construction is the dominant per-call cost (~73% of parse-sql); a
+   workload that re-runs identical SQL — pgjdbc unnamed prepared
+   statements, repeated INSERT shapes, ORM-generated select-by-id —
+   pays it on every Parse message without a cache."
+  ([^String sql schema] (parse-sql sql schema nil))
+  ([^String sql schema db]
+   (let [cache *parse-cache*
+         schema-key (when cache (hash schema))
+         cache-key (when cache [sql schema-key])
+         cached (when cache (cache-get cache cache-key))]
+     (if cached
+       cached
+       (let [parsed (parse-sql* sql schema db)]
+         (when (and cache (cacheable-parse? parsed))
+           (cache-put! cache cache-key parsed))
+         parsed)))))
