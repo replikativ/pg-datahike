@@ -2502,10 +2502,44 @@
                            ^net.sf.jsqlparser.expression.operators.relational.ExpressionList rlist)))
             hit? (boolean (and items (some #(= l %) items)))]
         (if (.isNot e) (not hit?) hit?))
+
+      ;; `x BETWEEN lo AND hi` — symmetric, inclusive bounds, PG 3VL.
+      ;; Without this clause the :else fallback stringified the
+      ;; expression and returned a truthy "expression-text" — domains
+      ;; like `CHECK (VALUE BETWEEN 1 AND 100)` then accepted any
+      ;; value silently.
+      (instance? net.sf.jsqlparser.expression.operators.relational.Between expr)
+      (let [^net.sf.jsqlparser.expression.operators.relational.Between e expr
+            v  (operand (.getLeftExpression e))
+            lo (operand (.getBetweenExpressionStart e))
+            hi (operand (.getBetweenExpressionEnd e))]
+        (if (or (nil? v) (nil? lo) (nil? hi))
+          nil
+          (let [in? (or (when-let [[a b c] (and (number? v) (number? lo) (number? hi)
+                                                [v lo hi])]
+                          (and (>= a b) (<= a c)))
+                        (try
+                          (let [[a b c] [(Double/parseDouble (str v))
+                                         (Double/parseDouble (str lo))
+                                         (Double/parseDouble (str hi))]]
+                            (and (>= a b) (<= a c)))
+                          (catch Exception _ nil)))]
+            (cond
+              (nil? in?) nil
+              (.isNot e) (not in?)
+              :else      in?))))
+
       :else
       ;; Fallback — the operand may itself evaluate to a truthy value
       ;; (e.g. boolean column `CHECK (active)`). Anything not-nil and
       ;; not false counts as satisfied.
+      ;;
+      ;; Risk: a CHECK shape we don't structurally recognise (LIKE,
+      ;; IS DISTINCT FROM, regex, …) lands here, the operand call
+      ;; returns the expression's `(str e)` representation, and the
+      ;; non-nil/non-false branch returns `true` — i.e. the check
+      ;; silently passes everything. Any future addition for those
+      ;; shapes belongs above this fallback, before we lose the AST.
       (let [v (operand expr)]
         (cond (nil? v) nil
               (false? v) false

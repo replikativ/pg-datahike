@@ -133,6 +133,27 @@
     (let [rows (query-rows c "SELECT id, y FROM film ORDER BY id")]
       (is (= [[1 2020]] (mapv vec rows))))))
 
+(deftest domain-check-between-enforces
+  ;; `BETWEEN` had no clause in eval-check-predicate; the :else
+  ;; fallback stringified the AST and returned truthy, so any value
+  ;; passed. Regression guard.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN smallint_d AS integer CHECK (VALUE BETWEEN 1 AND 100)")
+    (exec! c "CREATE TABLE t (id int PRIMARY KEY, n smallint_d)")
+    (exec! c "INSERT INTO t VALUES (1, 50)")  ; in-range
+    (exec! c "INSERT INTO t VALUES (2, 1)")   ; lower bound, inclusive
+    (exec! c "INSERT INTO t VALUES (3, 100)") ; upper bound, inclusive
+    (let [raised (try (exec! c "INSERT INTO t VALUES (4, 0)") nil
+                      (catch java.sql.SQLException e e))]
+      (is (some? raised) "below-range BETWEEN must reject")
+      (is (= "23514" (.getSQLState raised))))
+    (let [raised (try (exec! c "INSERT INTO t VALUES (5, 101)") nil
+                      (catch java.sql.SQLException e e))]
+      (is (some? raised) "above-range BETWEEN must reject")
+      (is (= "23514" (.getSQLState raised))))
+    (let [rows (query-rows c "SELECT id FROM t ORDER BY id")]
+      (is (= [[1] [2] [3]] (mapv vec rows))))))
+
 (deftest domain-check-null-passes
   ;; PG 3VL: CHECK that yields UNKNOWN (null comparison) is treated
   ;; as satisfied — the domain-not-null bit is the separate gate.
