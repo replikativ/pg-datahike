@@ -1256,6 +1256,146 @@
                                :table table-name
                                :constraint name})))))))))
 
+(defn- read-domain-enum-checks*
+  [db table-name]
+  ;; Pull every column-attr in this table's namespace that has a
+  ;; :datahike.pg/domain-of or :datahike.pg/enum-of hint. For each,
+  ;; resolve the registry entity and pre-parse the CHECK expression
+  ;; (domains) / freeze the value-set (enums) so per-row enforcement
+  ;; is just a pre-computed lookup + AST eval / set membership.
+  ;;
+  ;; `get-else` doesn't accept nil as default; use the project-wide
+  ;; `:__null__` sentinel and unwrap it in Clojure (matches the
+  ;; convention in datahike.pg.jsonb / datahike.pg.window).
+  (let [unwrap-null (fn [v] (when (not= v :__null__) v))
+        domain-rows
+        (d/q '{:find [?ident ?dname ?cname ?cexpr ?nn]
+               :keys [ident domain-name check-name check-expr not-null]
+               :in [$ ?tbl]
+               :where [[?col :db/ident ?ident]
+                       [?col :datahike.pg/domain-of ?dname]
+                       [(namespace ?ident) ?ns]
+                       [(= ?ns ?tbl)]
+                       [?dom :datahike.pg.domain/name ?dname]
+                       [(get-else $ ?dom :datahike.pg.domain/check-name :__null__) ?cname]
+                       [(get-else $ ?dom :datahike.pg.domain/check-expr :__null__) ?cexpr]
+                       [(get-else $ ?dom :datahike.pg.domain/not-null false) ?nn]]}
+             db table-name)
+        enum-rows
+        (d/q '{:find [?ident ?ename ?vs]
+               :keys [ident enum-name values]
+               :in [$ ?tbl]
+               :where [[?col :db/ident ?ident]
+                       [?col :datahike.pg/enum-of ?ename]
+                       [(namespace ?ident) ?ns]
+                       [(= ?ns ?tbl)]
+                       [?en :datahike.pg.enum/name ?ename]
+                       [?en :datahike.pg.enum/values ?vs]]}
+             db table-name)
+        result (java.util.HashMap.)]
+    (doseq [{:keys [ident domain-name check-name check-expr not-null]} domain-rows]
+      (let [col (name ident)
+            check-expr (unwrap-null check-expr)
+            check-name (unwrap-null check-name)]
+        (.put result col
+              {:kind :domain
+               :attr ident
+               :domain-name domain-name
+               :check-name check-name
+               :not-null? not-null
+               :check-ast (when check-expr
+                            (try (parse-check-expression check-expr)
+                                 (catch Throwable _ nil)))})))
+    (let [enum-map (java.util.HashMap.)]
+      (doseq [{:keys [ident enum-name values]} enum-rows]
+        (let [col (name ident)
+              cur (.get enum-map col)]
+          (.put enum-map col
+                {:kind :enum
+                 :attr ident
+                 :enum-name enum-name
+                 :values (conj (or (:values cur) #{}) (str values))})))
+      (doseq [[col spec] enum-map]
+        (.put result col spec)))
+    (into {} result)))
+
+(defn- read-domain-enum-checks
+  "Cached per (schema, table). Returns
+     {col-name <spec>}
+   where <spec> is either
+     {:kind :domain :attr kw :domain-name str :check-name str
+      :not-null? bool :check-ast AST-or-nil}
+     {:kind :enum   :attr kw :enum-name str :values #{string ...}}.
+   Empty when the table has no domain- or enum-typed columns."
+  [db table-name]
+  (let [v (schema-cached db [::dom-enum table-name]
+                         #(read-domain-enum-checks* db table-name))]
+    (if (= ::nil v) {} v)))
+
+(defn- enforce-domain-enum-checks!
+  "Per-row column-level domain CHECK + enum membership enforcement.
+   Raises 23514 (CHECK violation) for domain failures, 22P02
+   (invalid_text_representation) for enum membership failures.
+   Both are PG-canonical. Cheap: each row visits only the columns
+   that are domain- or enum-typed in this table."
+  [db table-name ns entity-maps]
+  (let [specs (read-domain-enum-checks db table-name)]
+    (when (seq specs)
+      (let [schema (:schema db)]
+        (doseq [em entity-maps
+                [col-name spec] specs
+                :let [attr (:attr spec)
+                      ;; Look up the value under either the schema-
+                      ;; declared attr or the parsed ns-prefix; INSERT
+                      ;; tx-data uses the latter.
+                      v (or (get em attr) (get em (keyword ns col-name)))]]
+          (cond
+            ;; Domain :not-null lives on the domain itself, not the
+            ;; column. Column-level :pg/not-null already fired above
+            ;; in apply-column-constraints — this is the *domain*'s
+            ;; constraint. Both are 23502.
+            (and (= :domain (:kind spec))
+                 (:not-null? spec)
+                 (nil? v))
+            (throw (ex-info "domain not-null violation"
+                            {:error :not-null-violation
+                             :table table-name
+                             :column col-name
+                             :domain (:domain-name spec)}))
+
+            ;; Domain CHECK with a parsed AST. PG's `VALUE` keyword
+            ;; refers to the column's value; bind it under the
+            ;; conventional (keyword "" "VALUE") so the existing
+            ;; eval-check-predicate / eval-update-expr machinery
+            ;; resolves it without a special case.
+            (and (= :domain (:kind spec)) (some? v) (:check-ast spec))
+            (let [r (try
+                      (sql/eval-check-predicate (:check-ast spec)
+                                                {(keyword "" "VALUE") v}
+                                                "" schema)
+                      (catch Throwable _ ::error))]
+              (when (false? r)
+                (throw (ex-info "domain check constraint violation"
+                                {:error :check-violation
+                                 :table table-name
+                                 :column col-name
+                                 :constraint (or (:check-name spec)
+                                                 (str (:domain-name spec) "_check"))
+                                 :domain (:domain-name spec)
+                                 :value v}))))
+
+            ;; Enum membership. Stored values come back as :many
+            ;; strings, regardless of how the user inserted (string vs
+            ;; keyword). Compare via str-coercion so both shapes work.
+            (and (= :enum (:kind spec)) (some? v))
+            (when-not (contains? (:values spec) (str v))
+              (throw (ex-info "invalid input value for enum"
+                              {:error :invalid-text-representation
+                               :type  (:enum-name spec)
+                               :value v
+                               :table table-name
+                               :column col-name})))))))))
+
 (defn- read-fk-constraints
   "All FK constraints where the given table is the CHILD side. Returns
    a vector of {:name :child-cols :parent-table :parent-cols} entries.
@@ -1574,8 +1714,9 @@
   [tx-data table-name ns db]
   (let [cols (read-column-constraints db table-name)
         has-checks? (seq (read-check-constraints db table-name))
-        has-fks? (seq (read-fk-constraints db table-name))]
-    (if (and (empty? cols) (not has-checks?) (not has-fks?))
+        has-fks? (seq (read-fk-constraints db table-name))
+        has-domain-enum? (seq (read-domain-enum-checks db table-name))]
+    (if (and (empty? cols) (not has-checks?) (not has-fks?) (not has-domain-enum?))
       tx-data
       [[:db.fn/call
         (fn [txdb]
@@ -1672,6 +1813,8 @@
             (when has-checks?
               (doseq [em filled-entities]
                 (enforce-check-constraints! txdb table-name ns em)))
+            (when has-domain-enum?
+              (enforce-domain-enum-checks! txdb table-name ns filled-entities))
             (when has-fks?
               (enforce-fk-on-insert! txdb table-name ns filled-entities))
             result))]])))

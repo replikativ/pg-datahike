@@ -108,6 +108,65 @@
       (is (= "bigint" (:datahike.pg.domain/base-type ent)))
       (is (nil? (:datahike.pg.domain/check-expr ent))))))
 
+(deftest domain-check-enforces-on-insert
+  ;; The CHECK expression on a DOMAIN must reject INSERTs whose value
+  ;; falls outside the domain. PG raises 23514 (check_violation).
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN year AS integer CHECK (VALUE >= 1901 AND VALUE <= 2155)")
+    (exec! c "CREATE TABLE film (id int PRIMARY KEY, y year)")
+    ;; In-range value is accepted.
+    (exec! c "INSERT INTO film VALUES (1, 2020)")
+    ;; Out-of-range raises 23514 (check_violation).
+    (let [raised (try
+                   (exec! c "INSERT INTO film VALUES (2, 1850)")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (some? raised) "domain CHECK must reject out-of-range value")
+      (is (= "23514" (.getSQLState raised))))
+    (let [raised (try
+                   (exec! c "INSERT INTO film VALUES (3, 2200)")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (some? raised))
+      (is (= "23514" (.getSQLState raised))))
+    ;; Only the in-range row landed.
+    (let [rows (query-rows c "SELECT id, y FROM film ORDER BY id")]
+      (is (= [[1 2020]] (mapv vec rows))))))
+
+(deftest domain-check-null-passes
+  ;; PG 3VL: CHECK that yields UNKNOWN (null comparison) is treated
+  ;; as satisfied — the domain-not-null bit is the separate gate.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN nonneg AS integer CHECK (VALUE >= 0)")
+    (exec! c "CREATE TABLE t (id int PRIMARY KEY, n nonneg)")
+    (exec! c "INSERT INTO t VALUES (1, NULL)")  ; null → CHECK is unknown → ok
+    (is (= [[1 nil]] (mapv vec (query-rows c "SELECT id, n FROM t"))))))
+
+(deftest enum-membership-enforces-on-insert
+  ;; An ENUM column accepts only declared members. Non-members raise
+  ;; 22P02 (invalid_text_representation), matching real PG.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (exec! c "CREATE TABLE p (id int PRIMARY KEY, m mood)")
+    (exec! c "INSERT INTO p VALUES (1, 'happy')")
+    (let [raised (try
+                   (exec! c "INSERT INTO p VALUES (2, 'angry')")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (some? raised) "ENUM rejects non-members")
+      (is (= "22P02" (.getSQLState raised))))
+    (let [rows (query-rows c "SELECT id, m FROM p ORDER BY id")]
+      (is (= 1 (count rows))))))
+
+(deftest enum-membership-null-passes
+  ;; NULL into an ENUM column is allowed (column-level NULL stays
+  ;; the only gate on nullability).
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE status AS ENUM ('on', 'off')")
+    (exec! c "CREATE TABLE s (id int PRIMARY KEY, st status)")
+    (exec! c "INSERT INTO s VALUES (1, NULL)")
+    (is (= [[1 nil]] (mapv vec (query-rows c "SELECT id, st FROM s"))))))
+
 (deftest create-domain-quoted-name-with-non-ascii
   ;; Pagila's schema includes `CREATE DOMAIN public."bıgınt" AS bigint`
   ;; (Turkish dotless-i). Three quoted-name forms must all land under
