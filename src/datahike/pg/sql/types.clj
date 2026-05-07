@@ -42,26 +42,44 @@
 
 (defn- consume-name
   "Consume a possibly-schema-qualified identifier. Returns
-   [name remaining-toks]. Accepts `name`, `schema.name`, `\"name\"`,
-   `\"schema\".\"name\"`. Drops any schema prefix — pg-datahike has
-   one schema namespace so qualifying is informational only."
+   [name remaining-toks]. Accepts:
+     name                   → name
+     schema.name            → name           (one glued ident)
+     schema.\"name\"        → name           (ident-with-trailing-dot + quoted ident)
+     \"schema\".\"name\"    → name           (quoted ident + dot + quoted ident)
+     \"name\"               → name           (single quoted ident)
+   Drops any schema prefix — pg-datahike has one schema namespace
+   so qualifying is informational only."
   [toks]
   (let [t1 (first toks)]
     (when-not (= :ident (first t1))
       (throw (ex-info "expected identifier"
                       {:error :syntax-error :got t1})))
-    (let [first-text (second t1)]
-      ;; check for `schema.name` form: tokenizer already glues the dot
-      ;; into the ident text when it appears between alphanumerics.
-      (if (and (str/includes? first-text ".")
-               ;; only treat as schema-qualified if the dot separates two
-               ;; non-numeric segments (avoid splitting decimal numbers or
-               ;; ::regclass casts).
-               (re-matches #"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*"
-                           first-text))
-        (let [[_schema name-part] (str/split first-text #"\." 2)]
-          [name-part (rest toks)])
-        [first-text (rest toks)]))))
+    (let [first-text (second t1)
+          rest1 (rest toks)]
+      (cond
+        ;; `schema.name` glued into one token by the tokenizer (both
+        ;; sides are bare alphanumeric identifiers). Strip the schema.
+        (and (str/includes? first-text ".")
+             (re-matches #"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*"
+                         first-text))
+        [(second (str/split first-text #"\." 2)) rest1]
+
+        ;; `schema."name"` — the unquoted schema part absorbs the
+        ;; trailing dot, the quoted name follows as a separate
+        ;; `:ident` token.
+        (and (str/ends-with? first-text ".")
+             (= :ident (first (first rest1))))
+        [(second (first rest1)) (rest rest1)]
+
+        ;; `"schema"."name"` — three tokens: quoted ident, lone `.`,
+        ;; quoted ident. Tokenizer drops `.` as a single-char ident.
+        (and (= [:ident "."] (first rest1))
+             (= :ident (first (second rest1))))
+        [(second (second rest1)) (drop 2 rest1)]
+
+        :else
+        [first-text rest1]))))
 
 ;; ============================================================================
 ;; CREATE TYPE … AS ENUM

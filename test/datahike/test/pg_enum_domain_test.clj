@@ -108,6 +108,27 @@
       (is (= "bigint" (:datahike.pg.domain/base-type ent)))
       (is (nil? (:datahike.pg.domain/check-expr ent))))))
 
+(deftest create-domain-quoted-name-with-non-ascii
+  ;; Pagila's schema includes `CREATE DOMAIN public."bıgınt" AS bigint`
+  ;; (Turkish dotless-i). Three quoted-name forms must all land under
+  ;; the unquoted name only — the schema prefix is informational.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (testing "schema.\"name\""
+      (exec! c "CREATE DOMAIN public.\"bıgınt\" AS bigint")
+      (is (= "bigint" (:datahike.pg.domain/base-type
+                       (d/entity (d/db *conn*)
+                                 [:datahike.pg.domain/name "bıgınt"])))))
+    (testing "\"schema\".\"name\""
+      (exec! c "CREATE DOMAIN \"public\".\"smolint\" AS smallint")
+      (is (= "smallint" (:datahike.pg.domain/base-type
+                         (d/entity (d/db *conn*)
+                                   [:datahike.pg.domain/name "smolint"])))))
+    (testing "\"name\" alone"
+      (exec! c "CREATE DOMAIN \"qüöte\" AS text")
+      (is (= "text" (:datahike.pg.domain/base-type
+                     (d/entity (d/db *conn*)
+                               [:datahike.pg.domain/name "qüöte"])))))))
+
 (deftest domain-typed-column-uses-base-type
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN year AS integer CHECK (VALUE > 0)")
