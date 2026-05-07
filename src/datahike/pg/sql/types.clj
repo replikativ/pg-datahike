@@ -118,10 +118,10 @@
                          (= :comma (first next-t)) (recur (rest rest-ts) acc)
                          (= :rparen (first next-t)) [acc (rest rest-ts)]
                          :else (throw (ex-info "expected `,` or `)`"
-                                                {:error :syntax-error
-                                                 :got next-t}))))
+                                               {:error :syntax-error
+                                                :got next-t}))))
                      :else (throw (ex-info "expected string literal"
-                                            {:error :syntax-error :got t})))))
+                                           {:error :syntax-error :got t})))))
         [values _] values]
     (when (empty? values)
       (throw (ex-info "ENUM must have at least one value"

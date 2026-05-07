@@ -4032,7 +4032,7 @@
         ;; list and CommandComplete tags.
         (swap! batch-state assoc :spec-db (:db-after spec-report))
         (.withBatchable ^PgWireServer$QueryResult
-                        (empty-result (str "INSERT 0 " (:count parsed)))
+         (empty-result (str "INSERT 0 " (:count parsed)))
                         tx-data))
       (catch Exception e
         ;; Synchronous validation failure — return a normal error

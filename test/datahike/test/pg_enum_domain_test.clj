@@ -94,7 +94,7 @@
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN year AS integer CONSTRAINT year_check CHECK ((VALUE >= 1901) AND (VALUE <= 2155))")
     (let [ent (into {} (d/entity (d/db *conn*)
-                                  [:datahike.pg.domain/name "year"]))]
+                                 [:datahike.pg.domain/name "year"]))]
       (is (= "integer" (:datahike.pg.domain/base-type ent)))
       (is (= "year_check" (:datahike.pg.domain/check-name ent)))
       (is (str/includes? (:datahike.pg.domain/check-expr ent) ">="))
@@ -104,7 +104,7 @@
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE DOMAIN big AS bigint")
     (let [ent (into {} (d/entity (d/db *conn*)
-                                  [:datahike.pg.domain/name "big"]))]
+                                 [:datahike.pg.domain/name "big"]))]
       (is (= "bigint" (:datahike.pg.domain/base-type ent)))
       (is (nil? (:datahike.pg.domain/check-expr ent))))))
 

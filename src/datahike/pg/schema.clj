@@ -8,7 +8,7 @@
 
    Every virtual table gets an implicit 'db_id' column (the entity ID)."
   (:require [clojure.string :as str]
-              [datahike.api :as d]
+            [datahike.api :as d]
             [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)

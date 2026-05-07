@@ -309,37 +309,37 @@
   [^String sql]
   (try
     (when-not (has-on-conflict? sql)
-    (let [v-end (find-values-start sql)]
-      (when (>= v-end 0)
-        (let [n (.length sql)
-              sb (StringBuilder. ^String (subs sql 0 v-end))
-              lits (ArrayList.)]
-          (loop [i (long (skip-ws sql v-end)) first-row? true]
-            (cond
-              (>= i n)
-              {:templated (.toString sb) :literals (vec lits)}
+      (let [v-end (find-values-start sql)]
+        (when (>= v-end 0)
+          (let [n (.length sql)
+                sb (StringBuilder. ^String (subs sql 0 v-end))
+                lits (ArrayList.)]
+            (loop [i (long (skip-ws sql v-end)) first-row? true]
+              (cond
+                (>= i n)
+                {:templated (.toString sb) :literals (vec lits)}
 
-              (= (.charAt sql i) \()
-              (let [_ (when-not first-row? (.append sb ", "))
-                    _ (.append sb "(")
-                    [row-content end] (template-values-row sql (inc i) lits)
-                    _ (.append sb row-content)
-                    _ (.append sb ")")
-                    j (long (skip-ws sql end))]
-                (cond
-                  (>= j n)
-                  {:templated (.toString sb) :literals (vec lits)}
+                (= (.charAt sql i) \()
+                (let [_ (when-not first-row? (.append sb ", "))
+                      _ (.append sb "(")
+                      [row-content end] (template-values-row sql (inc i) lits)
+                      _ (.append sb row-content)
+                      _ (.append sb ")")
+                      j (long (skip-ws sql end))]
+                  (cond
+                    (>= j n)
+                    {:templated (.toString sb) :literals (vec lits)}
 
-                  (= (.charAt sql j) \,)
-                  (recur (long (skip-ws sql (inc j))) false)
+                    (= (.charAt sql j) \,)
+                    (recur (long (skip-ws sql (inc j))) false)
 
                   ;; Not a comma — anything else (RETURNING, ON CONFLICT,
                   ;; trailing `;`, whitespace+EOL, …) is the tail. Emit
                   ;; verbatim and stop.
-                  :else
-                  (do (.append sb " ")
-                      (.append sb (subs sql j))
-                      {:templated (.toString sb) :literals (vec lits)})))
+                    :else
+                    (do (.append sb " ")
+                        (.append sb (subs sql j))
+                        {:templated (.toString sb) :literals (vec lits)})))
 
               ;; We expected a `(` to start the next row but found
               ;; something else (most often this is INSERT … SELECT …
@@ -347,7 +347,7 @@
               ;; literal "VALUES" keyword inside a comment or quoted
               ;; identifier — find-values-start already filters those,
               ;; but bail conservatively).
-              :else nil))))))
+                :else nil))))))
     (catch Throwable _ nil)))
 
 (def ^:private templater-fail (Object.))

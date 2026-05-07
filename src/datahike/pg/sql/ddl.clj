@@ -19,7 +19,7 @@
      - extract-ddl-constraints — CHECK / NOT NULL / UNIQUE / FK clauses
      - extract-inherits        — PostgreSQL INHERITS"
   (:require [clojure.string :as str]
-              [datahike.api :as d]
+            [datahike.api :as d]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params]

@@ -415,39 +415,39 @@
    raises `Can't change resolved type for param: N from <oid> to 0`."
   ([^Insert insert schema] (insert-param-oids insert schema nil))
   ([^Insert insert schema db]
-  (try
-    (let [table-ns (when-let [^Table t (.getTable insert)]
-                     (unquote-ident (.getName t)))
-          explicit-cols (some-> (.getColumns insert)
-                                (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
-          cols (if (seq explicit-cols)
-                 explicit-cols
+   (try
+     (let [table-ns (when-let [^Table t (.getTable insert)]
+                      (unquote-ident (.getName t)))
+           explicit-cols (some-> (.getColumns insert)
+                                 (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
+           cols (if (seq explicit-cols)
+                  explicit-cols
                  ;; No column list: derive from schema. Drop the
                  ;; synthetic db_id prepended by column-info — INSERT
                  ;; VALUES is positional against user-declared columns.
-                 (when table-ns
-                   (let [info (pgs/column-info schema table-ns db)]
-                     (when (seq info)
-                       (vec (keep (fn [c]
-                                    (when (not= :db/id (:attr c))
-                                      (name (:attr c))))
-                                  info))))))
-          select (.getSelect insert)
-          col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))]
-      (when (and table-ns (seq cols)
-                 (instance? net.sf.jsqlparser.statement.select.Values select))
-        (let [rows (.getExpressions ^net.sf.jsqlparser.statement.select.Values select)
-              result (java.util.HashMap.)]
-          (doseq [row (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList rows)
-                             [rows] rows))]
-            (let [exprs (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList row)
-                               row [row]))]
-              (doseq [[i e] (map vector (range) exprs)]
-                (when (and (instance? JdbcParameter e) (< i (count cols)))
-                  (when-let [oid (col-oid (nth cols i))]
-                    (.put result (.getIndex ^JdbcParameter e) oid))))))
-          (when (pos? (.size result)) (into {} result)))))
-    (catch Throwable _ nil))))
+                  (when table-ns
+                    (let [info (pgs/column-info schema table-ns db)]
+                      (when (seq info)
+                        (vec (keep (fn [c]
+                                     (when (not= :db/id (:attr c))
+                                       (name (:attr c))))
+                                   info))))))
+           select (.getSelect insert)
+           col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))]
+       (when (and table-ns (seq cols)
+                  (instance? net.sf.jsqlparser.statement.select.Values select))
+         (let [rows (.getExpressions ^net.sf.jsqlparser.statement.select.Values select)
+               result (java.util.HashMap.)]
+           (doseq [row (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList rows)
+                              [rows] rows))]
+             (let [exprs (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList row)
+                                row [row]))]
+               (doseq [[i e] (map vector (range) exprs)]
+                 (when (and (instance? JdbcParameter e) (< i (count cols)))
+                   (when-let [oid (col-oid (nth cols i))]
+                     (.put result (.getIndex ^JdbcParameter e) oid))))))
+           (when (pos? (.size result)) (into {} result)))))
+     (catch Throwable _ nil))))
 
 (defn update-param-oids
   "Walk an UPDATE AST: for each SET col = ?, map param index to the
