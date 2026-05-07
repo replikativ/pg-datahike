@@ -2238,21 +2238,33 @@
      (instance? net.sf.jsqlparser.expression.Function e)
      (let [^net.sf.jsqlparser.expression.Function f e
            fname (str/lower-case (.getName f))]
-      ;; Support nextval('seq_name') in INSERT VALUES
-       (if (= fname "nextval")
+       (cond
+         ;; nextval('seq_name') in INSERT VALUES → marker resolved
+         ;; per-execute by resolve-nextval-markers.
+         (= fname "nextval")
          (let [params (.getParameters f)
                arg (first (.getExpressions params))]
            {:fn :nextval :seq-name (extract-value arg schema db)})
-         (if (= fname "now")
-           (java.util.Date.)
-           (str e))))
+
+         ;; now() and friends emit a marker too, so the parsed map
+         ;; doesn't bake in a parse-time Date — that would freeze
+         ;; the timestamp on every cache hit and make all rows of
+         ;; one INSERT shape carry the same wallclock. Resolved at
+         ;; execute time (resolve-nextval-markers).
+         (#{"now" "current_timestamp" "transaction_timestamp"
+            "statement_timestamp" "clock_timestamp"
+            "localtimestamp" "localtime" "current_date" "current_time"} fname)
+         {:fn :now}
+
+         :else (str e)))
      (instance? TimezoneExpression e)
-    ;; now() AT TIME ZONE 'UTC' → current timestamp
+    ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
+    ;; bare-function case above.
      (let [left (.getLeftExpression ^TimezoneExpression e)]
        (if (and (instance? net.sf.jsqlparser.expression.Function left)
                 (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))
-         (java.util.Date.)
-         (java.util.Date.)))  ;; any timezone expression defaults to current time
+         {:fn :now}
+         {:fn :now}))  ;; any timezone expression defaults to current time
 
     ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
     ;; Build a typed PgArray; coerce-insert-value will serialize it

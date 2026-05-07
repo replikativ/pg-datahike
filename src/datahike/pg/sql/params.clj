@@ -100,7 +100,7 @@
 ;; ---------------------------------------------------------------------------
 ;; ParamRef substitution
 
-(declare nextval-marker?)
+(declare nextval-marker? call-marker?)
 
 (defn substitute-params
   "Walk `x` replacing every ParamRef with the corresponding bound value
@@ -120,27 +120,28 @@
    drops nil literals (NullValue), but those land as ParamRef sentinels
    at parse time and only resolve to nil here.
 
-   Identity preservation: nextval markers (`{:fn :nextval :seq-name S}`)
-   are passed through unchanged — same Clojure object in, same object
-   out. Otherwise reduce-kv-create-new-map would hand resolve-nextvals!
-   distinct marker objects and double-resolve when the same marker
-   appears in multiple parts of tx-data (e.g. inside a `:db.fn/call`
-   arg AND in an outer entity-map via `assoc`)."
+   Identity preservation: deferred call-markers (`{:fn :nextval ...}`,
+   `{:fn :now}`) pass through unchanged — same Clojure object in,
+   same object out. Otherwise reduce-kv would mint new marker maps
+   and resolve-nextvals! would call the underlying function multiple
+   times when the same logical use appears in multiple parts of
+   tx-data (e.g. a `:db.fn/call` arg AND an outer entity-map via
+   `assoc`)."
   [x bound]
   (let [fetch (if (fn? bound) bound #(nth bound (dec (long %))))]
     (letfn [(walk [v]
               (cond
-                (param-ref? v)      (fetch (:idx v))
-                (nextval-marker? v) v
-                (map? v)            (reduce-kv (fn [m k x]
-                                                 (let [v' (walk x)]
-                                                   (if (nil? v')
-                                                     m
-                                                     (assoc m k v'))))
-                                               {} v)
-                (vector? v)         (mapv walk v)
-                (seq? v)            (map walk v)
-                :else               v))]
+                (param-ref? v)   (fetch (:idx v))
+                (call-marker? v) v
+                (map? v)         (reduce-kv (fn [m k x]
+                                              (let [v' (walk x)]
+                                                (if (nil? v')
+                                                  m
+                                                  (assoc m k v'))))
+                                            {} v)
+                (vector? v)      (mapv walk v)
+                (seq? v)         (map walk v)
+                :else            v))]
       (walk x))))
 
 ;; ---------------------------------------------------------------------------
@@ -155,9 +156,21 @@
 ;; non-transactional — advances stick even if the surrounding tx
 ;; rolls back, and concurrent advances yield distinct values).
 
+(def ^:private call-fns
+  "Function markers translate-* may emit for SQL constructs that must
+   be re-evaluated per execute (i.e. NOT cacheable as a parse-time
+   value). Resolved by `resolve-nextvals!` against a per-fn resolver."
+  #{:nextval :now})
+
+(defn call-marker?
+  "True if v is a deferred function-call marker emitted by translate-*
+   (currently `:nextval` and `:now`). These must survive the result-
+   cache intact and be resolved per execute."
+  [v]
+  (and (map? v) (contains? call-fns (:fn v))))
+
 (defn nextval-marker?
-  "True if v is the placeholder map produced for a `nextval('seq')`
-   expression in a VALUES / SET tuple."
+  "Back-compat alias: true only for the nextval flavour of call-marker."
   [v]
   (and (map? v) (= :nextval (:fn v)) (string? (:seq-name v))))
 
@@ -179,22 +192,31 @@
   ;; Identity-track: the same marker object can appear in multiple
   ;; parts of tx-data (e.g. inside a `:db.fn/call` arg AND in an
   ;; outer entity-map via `assoc`). Resolving it twice would advance
-  ;; the sequence twice per logical use. The atom keeps marker
-  ;; identity → resolved-value through one walk, so each unique
-  ;; marker calls nextval exactly once.
-  (let [seen (java.util.IdentityHashMap.)]
+  ;; the sequence twice per logical use, or call now() twice and get
+  ;; out-of-sync timestamps within one row. The IdentityHashMap
+  ;; keeps marker identity → resolved-value through one walk, so
+  ;; each unique marker resolves exactly once.
+  ;;
+  ;; The function table here is intentionally minimal — extend by
+  ;; adding to call-fns above and a clause here.
+  (let [seen (java.util.IdentityHashMap.)
+        resolve-marker
+        (fn [v]
+          (or (.get seen v)
+              (let [resolved
+                    (case (:fn v)
+                      :nextval (nextval-fn (:seq-name v))
+                      :now     (java.util.Date.))]
+                (.put seen v resolved)
+                resolved)))]
     (letfn [(walk [v]
               (cond
-                (nextval-marker? v)
-                (or (.get seen v)
-                    (let [resolved (nextval-fn (:seq-name v))]
-                      (.put seen v resolved)
-                      resolved))
-                (map? v)            (reduce-kv (fn [m k x] (assoc m k (walk x)))
-                                               {} v)
-                (vector? v)         (mapv walk v)
-                (seq? v)            (map walk v)
-                :else               v))]
+                (call-marker? v) (resolve-marker v)
+                (map? v)         (reduce-kv (fn [m k x] (assoc m k (walk x)))
+                                            {} v)
+                (vector? v)      (mapv walk v)
+                (seq? v)         (map walk v)
+                :else            v))]
       (walk x))))
 
 ;; ---------------------------------------------------------------------------
