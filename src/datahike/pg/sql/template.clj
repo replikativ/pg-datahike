@@ -430,6 +430,32 @@
       (walk (:tx-data parsed)))
     (into {} m)))
 
+(defn- refresh-tempids
+  "Walk a substituted tx-data and replace each entity-map's :db/id
+   with a fresh gensym. The cached placeholder-shape parsed map has
+   fixed tempid strings from translate-time; reusing them across
+   Bind/Execute cycles (or across batched rows in one Sync group)
+   makes Datahike collapse entity-maps that share a tempid. Mints
+   fresh strings per substitute pass so every commit sees unique
+   tempids."
+  [tx-data]
+  (let [renames (java.util.HashMap.)
+        rename (fn [old]
+                 (or (.get renames old)
+                     (let [new (str (gensym "tem-"))]
+                       (.put renames old new)
+                       new)))
+        walk (fn walk [v]
+               (cond
+                 (map? v)
+                 (if-let [old (:db/id v)]
+                   (assoc v :db/id (cond-> old (string? old) rename))
+                   v)
+                 (vector? v) (mapv walk v)
+                 (seq? v) (map walk v)
+                 :else v))]
+    (walk tx-data)))
+
 (defn typed-substitute
   "Replace ParamRefs in `parsed.tx-data` with bound values from
    `literals`, coercing each via `stmt/coerce-insert-value` against
@@ -441,7 +467,12 @@
    uses that as the signal to fall through to full parse-sql.
    `literals` is a 0-indexed vector of captured token strings (as
    returned by `template-insert-sql`); ParamRef N pulls
-   `(parse-literal-token (literals (dec N)))` and runs coercion."
+   `(parse-literal-token (literals (dec N)))` and runs coercion.
+
+   Also rewrites every entity-map's :db/id with a fresh gensym so
+   the cached parsed map (shared across calls) doesn't hand
+   Datahike colliding tempids when consecutive Bind/Execute cycles
+   land in the same wire-layer batch."
   [parsed literals schema]
   (try
     (let [idx->attr (collect-attr-by-idx parsed)
@@ -456,5 +487,7 @@
                                 (or (stmt/coerce-insert-value raw attr schema) raw)
                                 raw)))
                           (range) raws)]
-          (update parsed :tx-data params/substitute-params bound))))
+          (-> parsed
+              (update :tx-data params/substitute-params bound)
+              (update :tx-data refresh-tempids)))))
     (catch Throwable _ nil)))

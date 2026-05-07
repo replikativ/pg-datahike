@@ -3085,8 +3085,22 @@
               {:type :insert
                :tx-data
                (into
+                ;; Pass row-attrs as an explicit `:db.fn/call` arg AND
+                ;; keep entity-maps in outer tx-data. The arg form is
+                ;; reachable by substitute-params (which can't peek
+                ;; into a Clojure closure), enabling the templater's
+                ;; result-cache fast path. The outer entity-maps stay
+                ;; visible to apply-column-constraints / auto-populate-
+                ;; identity, which expect to walk maps in the outer
+                ;; tx-data shape and would no-op if we hid them.
+                ;;
+                ;; Identity preservation: substitute-params and
+                ;; resolve-nextvals! both keep nextval-marker objects
+                ;; intact across walks, so the same marker appearing
+                ;; in BOTH the args and the outer entity-maps gets
+                ;; resolved exactly once (see datahike.pg.sql.params).
                 [[:db.fn/call
-                  (fn [txdb]
+                  (fn unique-check [txdb row-attrs]
                     (let [schema (:schema txdb)
                           q-fn (requiring-resolve 'datahike.api/q)
                       ;; Partition identity attrs by shape.
@@ -3155,7 +3169,8 @@
                           (when (contains? (get @seen attr) tuple-val)
                             (raise! attr tuple-val cname))
                           (vswap! seen update attr (fnil conj #{}) tuple-val)))
-                      []))]]
+                      []))
+                  row-attrs]]
                 (vec (mapcat
                       (fn [attrs]
                         (when (seq attrs)

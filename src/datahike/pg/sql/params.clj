@@ -100,6 +100,8 @@
 ;; ---------------------------------------------------------------------------
 ;; ParamRef substitution
 
+(declare nextval-marker?)
+
 (defn substitute-params
   "Walk `x` replacing every ParamRef with the corresponding bound value
    from `bound` (1-indexed: `(->ParamRef 1)` → `(bound 1)` ... so `bound`
@@ -116,21 +118,29 @@
    but the correct PG behaviour for a nullable column is to simply
    not assert the attribute. The translate-time row-builder already
    drops nil literals (NullValue), but those land as ParamRef sentinels
-   at parse time and only resolve to nil here."
+   at parse time and only resolve to nil here.
+
+   Identity preservation: nextval markers (`{:fn :nextval :seq-name S}`)
+   are passed through unchanged — same Clojure object in, same object
+   out. Otherwise reduce-kv-create-new-map would hand resolve-nextvals!
+   distinct marker objects and double-resolve when the same marker
+   appears in multiple parts of tx-data (e.g. inside a `:db.fn/call`
+   arg AND in an outer entity-map via `assoc`)."
   [x bound]
   (let [fetch (if (fn? bound) bound #(nth bound (dec (long %))))]
     (letfn [(walk [v]
               (cond
-                (param-ref? v)  (fetch (:idx v))
-                (map? v)        (reduce-kv (fn [m k x]
-                                             (let [v' (walk x)]
-                                               (if (nil? v')
-                                                 m
-                                                 (assoc m k v'))))
-                                           {} v)
-                (vector? v)     (mapv walk v)
-                (seq? v)        (map walk v)
-                :else           v))]
+                (param-ref? v)      (fetch (:idx v))
+                (nextval-marker? v) v
+                (map? v)            (reduce-kv (fn [m k x]
+                                                 (let [v' (walk x)]
+                                                   (if (nil? v')
+                                                     m
+                                                     (assoc m k v'))))
+                                               {} v)
+                (vector? v)         (mapv walk v)
+                (seq? v)            (map walk v)
+                :else               v))]
       (walk x))))
 
 ;; ---------------------------------------------------------------------------
@@ -166,15 +176,26 @@
    and other opaque values alone, recurses into map values / vectors /
    seqs."
   [x nextval-fn]
-  (letfn [(walk [v]
-            (cond
-              (nextval-marker? v) (nextval-fn (:seq-name v))
-              (map? v)            (reduce-kv (fn [m k x] (assoc m k (walk x)))
-                                             {} v)
-              (vector? v)         (mapv walk v)
-              (seq? v)            (map walk v)
-              :else               v))]
-    (walk x)))
+  ;; Identity-track: the same marker object can appear in multiple
+  ;; parts of tx-data (e.g. inside a `:db.fn/call` arg AND in an
+  ;; outer entity-map via `assoc`). Resolving it twice would advance
+  ;; the sequence twice per logical use. The atom keeps marker
+  ;; identity → resolved-value through one walk, so each unique
+  ;; marker calls nextval exactly once.
+  (let [seen (java.util.IdentityHashMap.)]
+    (letfn [(walk [v]
+              (cond
+                (nextval-marker? v)
+                (or (.get seen v)
+                    (let [resolved (nextval-fn (:seq-name v))]
+                      (.put seen v resolved)
+                      resolved))
+                (map? v)            (reduce-kv (fn [m k x] (assoc m k (walk x)))
+                                               {} v)
+                (vector? v)         (mapv walk v)
+                (seq? v)            (map walk v)
+                :else               v))]
+      (walk x))))
 
 ;; ---------------------------------------------------------------------------
 ;; AST parameter-index walker

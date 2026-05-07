@@ -1128,23 +1128,28 @@
    success, or nil if the templater rejected the SQL (caller falls
    through to parse-sql*).
 
-   Templates the SQL into placeholder form, parses literals to Java
-   values, binds `*bound-params*` so translate-insert resolves
-   JdbcParameter nodes inline (no ParamRef placeholders end up in the
-   `:db.fn/call` closure capture). The JSqlParser AST cache then
-   amortises the parse cost across all rows of one INSERT shape.
+   Two-tier fast path:
+
+   1. Templater turns `INSERT INTO t (a, b) VALUES (1, 'x')` into
+      `INSERT INTO t (a, b) VALUES (?, ?)` and captures the literals.
+   2. We look up the templated SQL in the parse-sql result LRU.
+      First row of an INSERT shape misses, falls through to
+      parse-sql* (which produces a placeholder-shape parsed map with
+      ParamRefs in row-attrs and outer entity-maps), and stores
+      that in the result cache.
+   3. Subsequent rows of the same shape hit the cache and run only
+      `typed-substitute` — coerce-aware ParamRef substitution
+      keyed on the column's `:db/valueType`. ~10 µs/row vs ~400 µs
+      for translate-insert per call.
 
    Skip-conditions:
      - non-INSERT or INSERT … SELECT shapes (template-insert-sql
        returns nil),
      - ON CONFLICT clauses (template-insert-sql bails),
-     - SQL that already contains `?` / `$N` placeholders — mixing
-       user-bound and template-bound params would scramble indices,
-     - templates that captured no literals (no win to be had,
-       avoids nth on an empty bound vector when the SQL had
-       only function-call values),
-     - any literal token the parser can't safely reduce (returns
-       templater-fail sentinel)."
+     - SQL with existing `?` / `$N` placeholders (would scramble
+       param indices),
+     - empty literal capture (no win),
+     - any literal token the parser can't safely reduce."
   [^String sql schema db]
   (when (nil? params/*bound-params*)
     (when-not (params/has-param-marker? sql)
@@ -1153,8 +1158,21 @@
           (let [bound (mapv template/parse-literal-token (:literals tem))]
             (when-not (some template/templater-fail? bound)
               (try
-                (binding [params/*bound-params* (vec bound)]
-                  (parse-sql* (:templated tem) schema db))
+                (let [tem-sql (:templated tem)
+                      cache *parse-cache*
+                      cache-key (when cache [tem-sql (hash schema)])
+                      placeholder-parsed
+                      (or (when cache (cache-get cache cache-key))
+                          (let [p (parse-sql* tem-sql schema db)]
+                            (when (and cache (cacheable-parse? p))
+                              (cache-put! cache cache-key p))
+                            p))]
+                  (when (and placeholder-parsed
+                             (= :insert (:type placeholder-parsed))
+                             (vector? (:tx-data placeholder-parsed)))
+                    (template/typed-substitute placeholder-parsed
+                                               (:literals tem)
+                                               schema)))
                 (catch Throwable _ nil)))))))))
 
 (defn parse-sql
