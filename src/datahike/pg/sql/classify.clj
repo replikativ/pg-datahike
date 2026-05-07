@@ -477,6 +477,12 @@
       ;; SQL-spec equivalents — both are bare-keyword expressions, not
       ;; function calls. Tokeniser treats them as :ident, no parens.
       (kw=? t1 "current_catalog") {:kind :current-database}
+      ;; pg_dump session-prelude function — sets a GUC. We don't honor
+      ;; the side-effect (the GUC has no Datahike equivalent), but we
+      ;; need to silently accept the call so the dump replays.
+      ;; The 3-arg form is `set_config(name, value, is_local)`; we
+      ;; accept any args.
+      (kw=? t1 "set_config") {:kind :set-config}
       (kw=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (kw=? t1 "txid_current")  {:kind :txid-current}
       (kw=? t1 "pg_sleep")
@@ -546,6 +552,55 @@
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
       (kw=? t1 "sequence")  {:kind :generic-sql}
+
+      ;; CREATE TYPE — only AS ENUM is supported as a first-class
+      ;; type (lowered to string + check-in). Other forms (composite,
+      ;; range, base) fall through to a silently-accepted reject so
+      ;; pg_dump output keeps loading; the fields/values aren't used.
+      (kw=? t1 "type")
+      (let [;; toks already past CREATE; t1 is "type". Scan for AS ENUM.
+            after-type (rest toks)
+            ;; skip the type name (possibly schema-qualified, possibly
+            ;; quoted) — we only need to know whether AS ENUM follows.
+            scan (drop-while
+                  (fn [t] (and t (not (or (kw=? t "as")
+                                          (kw=? t "is")))))
+                  after-type)
+            after-as (rest scan)]
+        (if (kw=? (first after-as) "enum")
+          {:kind :create-type-enum :system? true
+           :tag "CREATE TYPE … AS ENUM"}
+          ;; non-ENUM CREATE TYPE — silently accept
+          {:kind :create-type :reject-kind :type :tag "CREATE TYPE"}))
+
+      (kw=? t1 "domain")
+      {:kind :create-domain :system? true :tag "CREATE DOMAIN"}
+
+      ;; pg_dump-emitted DDL we don't model. Each gets a dedicated
+      ;; :reject-kind so operators can opt-in selectively (or via
+      ;; the :pg-dump compat preset). Classified here — before
+      ;; JSqlParser sees the SQL — so the function body's `$$…$$`
+      ;; / TRIGGER body / etc. never reach the parser.
+      (kw=? t1 "trigger")
+      {:kind :create-trigger :reject-kind :trigger :tag "CREATE TRIGGER"}
+      (kw=? t1 "function")
+      {:kind :create-function :reject-kind :function :tag "CREATE FUNCTION"}
+      (kw=? t1 "procedure")
+      {:kind :create-procedure :reject-kind :procedure :tag "CREATE PROCEDURE"}
+      (kw=? t1 "aggregate")
+      {:kind :create-aggregate :reject-kind :aggregate :tag "CREATE AGGREGATE"}
+      (and (kw=? t1 "materialized") (kw=? (second toks) "view"))
+      {:kind :create-materialized-view :reject-kind :materialized-view
+       :tag "CREATE MATERIALIZED VIEW"}
+      (kw=? t1 "rule")
+      {:kind :create-rule :reject-kind :rule :tag "CREATE RULE"}
+      (kw=? t1 "operator")
+      {:kind :create-operator :reject-kind :operator :tag "CREATE OPERATOR"}
+      (kw=? t1 "cast")
+      {:kind :create-cast :reject-kind :cast :tag "CREATE CAST"}
+      (kw=? t1 "language")
+      {:kind :create-language :reject-kind :language :tag "CREATE LANGUAGE"}
+
       :else                 {:kind :generic-sql})))
 
 (defn- classify-drop [toks]
@@ -556,31 +611,102 @@
                              :tag "DROP EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
+
+      ;; Symmetric with classify-create — reuse the same :reject-kind
+      ;; so a single :silently-accept entry covers both ends.
+      (kw=? t1 "trigger")    {:kind :drop-trigger :reject-kind :trigger :tag "DROP TRIGGER"}
+      (kw=? t1 "function")   {:kind :drop-function :reject-kind :function :tag "DROP FUNCTION"}
+      (kw=? t1 "procedure")  {:kind :drop-procedure :reject-kind :procedure :tag "DROP PROCEDURE"}
+      (kw=? t1 "aggregate")  {:kind :drop-aggregate :reject-kind :aggregate :tag "DROP AGGREGATE"}
+      (and (kw=? t1 "materialized") (kw=? (second toks) "view"))
+      {:kind :drop-materialized-view :reject-kind :materialized-view
+       :tag "DROP MATERIALIZED VIEW"}
+      (kw=? t1 "rule")       {:kind :drop-rule :reject-kind :rule :tag "DROP RULE"}
+      (kw=? t1 "operator")   {:kind :drop-operator :reject-kind :operator :tag "DROP OPERATOR"}
+      (kw=? t1 "cast")       {:kind :drop-cast :reject-kind :cast :tag "DROP CAST"}
+      (kw=? t1 "language")   {:kind :drop-language :reject-kind :language :tag "DROP LANGUAGE"}
+
       :else                 {:kind :generic-sql})))
+
+(defn- contains-owner-to?
+  "Scan the (already-consumed-prelude) token tail for a bare-ident
+   `OWNER` followed immediately by a bare-ident `TO`. Used to detect
+   `ALTER <object> ... OWNER TO <role>` — pg_dump emits this verb
+   for every table/sequence/view/index/function/type it dumps. Real
+   PG doesn't allow `OWNER` or `TO` as bare column / constraint names
+   in DDL (they're reserved-ish in this context), so the false-positive
+   risk is low."
+  [toks]
+  (loop [ts (seq toks)]
+    (cond
+      (nil? ts) false
+      (and (kw=? (first ts) "owner")
+           (kw=? (second ts) "to"))
+      true
+      :else (recur (next ts)))))
 
 (defn- classify-alter [toks]
   (let [[t1 & rest-toks] toks]
     (cond
       (kw=? t1 "policy")  {:kind :alter-policy :reject-kind :policy :tag "ALTER POLICY"}
       (kw=? t1 "schema")  {:kind :schema-noop :tag "ALTER SCHEMA"}
+
+      ;; ALTER <object> ... OWNER TO ... — pg_dump-emitted boilerplate.
+      ;; We don't have a role system, so silently accept with the
+      ;; matching command tag. Detected here (before the per-object-
+      ;; type dispatch) so we cover ALTER TABLE / SEQUENCE / VIEW /
+      ;; INDEX / FUNCTION / TYPE / DOMAIN / AGGREGATE / ... uniformly.
+      (and (or (kw-in? t1 #{"table" "sequence" "view" "index"
+                            "function" "procedure" "type" "domain"
+                            "aggregate" "operator" "language"
+                            "materialized" "publication" "subscription"
+                            "foreign" "server" "trigger" "rule"
+                            "collation" "conversion"})
+               ;; ALTER LARGE OBJECT, ALTER GROUP, etc.
+               (kw-in? t1 #{"large" "group" "role" "user"
+                            "tablespace" "database"}))
+           (contains-owner-to? rest-toks))
+      {:kind :owner-noop
+       :tag (str "ALTER " (str/upper-case (:text t1)))}
+
       (kw=? t1 "table")
-      ;; Consume optional [IF EXISTS] and the table name (possibly
-      ;; schema.name), then inspect what follows. If it's ENABLE/
-      ;; DISABLE/FORCE/NO FORCE … ROW LEVEL SECURITY, classify as
-      ;; RLS; otherwise pass through.
-      (let [ts (if (and (kw=? (first rest-toks) "if")
-                        (kw=? (second rest-toks) "exists"))
-                 (drop 2 rest-toks)
-                 rest-toks)
+      ;; Consume optional [ONLY], [IF EXISTS] and the table name (possibly
+      ;; schema.name), then inspect what follows.
+      (let [ts (if (kw=? (first rest-toks) "only") (rest rest-toks) rest-toks)
+            ts (if (and (kw=? (first ts) "if") (kw=? (second ts) "exists"))
+                 (drop 2 ts) ts)
             ;; Consume exactly one (possibly schema-qualified) name.
             ts (if (ident-tok? (first ts)) (rest ts) ts)
             ts (if (and (= "." (:text (first ts)))
                         (ident-tok? (second ts)))
                  (drop 2 ts)
                  ts)]
-        (if (alter-table-rls? ts)
+        (cond
+          (alter-table-rls? ts)
           {:kind :rls :reject-kind :rls :tag "ALTER TABLE ROW LEVEL SECURITY"}
-          {:kind :generic-sql}))
+
+          ;; ALTER TABLE [ONLY] x ATTACH PARTITION ... — partition
+          ;; management. We don't model partitions; pg_dump emits these
+          ;; per child table. The data is in the children either way.
+          (and (kw=? (first ts) "attach") (kw=? (second ts) "partition"))
+          {:kind :attach-partition :reject-kind :attach-partition
+           :tag "ALTER TABLE ATTACH PARTITION"}
+
+          (and (kw=? (first ts) "detach") (kw=? (second ts) "partition"))
+          {:kind :detach-partition :reject-kind :attach-partition
+           :tag "ALTER TABLE DETACH PARTITION"}
+
+          :else {:kind :generic-sql}))
+
+      ;; ALTER TYPE / ALTER DOMAIN — pg_dump emits these for setval
+      ;; defaults and ownership; we silently accept under :pg-dump.
+      ;; ALTER TYPE name OWNER TO ... is already covered by the
+      ;; OWNER TO branch above.
+      (kw=? t1 "type")
+      {:kind :alter-type :reject-kind :alter-type :tag "ALTER TYPE"}
+      (kw=? t1 "domain")
+      {:kind :alter-domain :reject-kind :alter-domain :tag "ALTER DOMAIN"}
+
       :else {:kind :generic-sql})))
 
 (defn- classify-rollback [toks]
@@ -776,6 +902,23 @@
                     :else nil)]
     {:kind :set :var var-name :value value-str}))
 
+(def ^:private psql-metacommand-names
+  "Lower-case psql metacommand names that pg_dump emits unprefixed
+   (i.e. as a leading `\\NAME` token). psql normally consumes these
+   itself, but a script that pipes the dump directly through a JDBC
+   `executeStatement` will leak them through to us.
+
+   Limited to the metacommands we actually see in pg_dump output —
+   not a full psql lexicon. False-positive risk: if someone genuinely
+   wants to send a `\\connect` as application SQL, we'll accept-and-
+   ignore it. That's the same outcome as if they'd sent it through
+   real psql, so it's a wash."
+  #{"restrict" "unrestrict"
+    "connect" "c"
+    "set" "i" "ir"
+    "encoding"
+    "echo" "qecho"})
+
 (defn classify
   "Classify a SQL string. See namespace docstring for the output
    contract."
@@ -792,8 +935,24 @@
         toks (vec (take 64 skipped))
         t1 (first toks)
         rest-toks (subvec toks (if (seq toks) 1 0))]
-    (if (nil? t1)
+    (cond
+      (nil? t1)
       {:kind :empty}
+
+      ;; psql metacommand at the head of the statement.
+      ;; Tokenizer emits `\` as :op (it's not in op-chars but falls
+      ;; through to the single-char-punct fallback). The next ident
+      ;; carries the metacommand name. pg_dump 18+ emits `\restrict`
+      ;; / `\unrestrict` markers; older versions emit `\connect`
+      ;; before each database in a multi-database dump.
+      (and (= "\\" (:text t1))
+           (= :ident (:type (first rest-toks)))
+           (contains? psql-metacommand-names
+                      (str/lower-case (:text (first rest-toks)))))
+      {:kind :psql-meta
+       :tag (str "\\" (str/lower-case (:text (first rest-toks))))}
+
+      :else
       (let [kw (when (= :ident (:type t1)) (str/lower-case (:text t1)))]
         (case kw
           ;; --- authorization DDL — rejected by default, opt-in silent-accept
@@ -805,8 +964,11 @@
           "drop"    (classify-drop rest-toks)
           "alter"   (classify-alter rest-toks)
 
-          ;; --- COPY — reject cleanly with 0A000
-          "copy"    {:kind :copy :reject-kind :copy :tag "COPY"}
+          ;; --- COPY — recognised so parse-sql can dispatch to the
+          ;; hand-rolled parser in datahike.pg.sql.copy (JSqlParser
+          ;; doesn't handle COPY). Routed as :copy-from-stdin which
+          ;; lands in the system-type table.
+          "copy"    {:kind :copy-from-stdin :tag "COPY"}
 
           ;; --- Transaction control
           "begin"   {:kind :begin}

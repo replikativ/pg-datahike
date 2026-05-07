@@ -19,6 +19,7 @@
      - extract-ddl-constraints — CHECK / NOT NULL / UNIQUE / FK clauses
      - extract-inherits        — PostgreSQL INHERITS"
   (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params]
@@ -178,11 +179,14 @@
               low (str/lower-case peeled)
               strip-cast (fn [s]
                            ;; Strip a trailing `::typename` so
-                           ;; `0::int` and `'x'::text` parse as the
-                           ;; inner literal. We record the value
-                           ;; itself; coerce-insert-value adapts it
-                           ;; to the column type at INSERT time.
-                           (str/replace s #"\s*::\s*[a-zA-Z_][\w ]*(?:\([^)]*\))?\s*$" ""))
+                           ;; `0::int`, `'x'::text`, and pg_dump's
+                           ;; `'G'::public.mpaa_rating` (cast to a
+                           ;; schema-qualified custom type) all
+                           ;; parse as the inner literal. We record
+                           ;; the value itself; coerce-insert-value
+                           ;; adapts it to the column type at INSERT
+                           ;; time.
+                           (str/replace s #"\s*::\s*[a-zA-Z_][\w. ]*(?:\([^)]*\))?\s*$" ""))
               ;; JSqlParser tokenizes `now()` as ["now" "()"] which
               ;; joins to "now ()" — collapse whitespace between the
               ;; identifier and the parens so the fn-name regex
@@ -224,9 +228,15 @@
             (re-matches #"(?i)current_user(?:\(\))?|session_user(?:\(\))?|user"
                         base)
             {:kind :fn :value "current_user"}
-            ;; nextval('seqname') — literal arg.
-            (re-matches #"(?i)nextval\s*\(\s*'([^']+)'\s*\)" base)
-            (let [m (re-matches #"(?i)nextval\s*\(\s*'([^']+)'\s*\)" base)]
+            ;; nextval('seqname') — literal arg. Also accepts:
+            ;;   - schema-qualified seq names: nextval('public.foo_id_seq')
+            ;;     (we drop the schema; sequences live in a flat namespace)
+            ;;   - the ::regclass cast that pg_dump always emits:
+            ;;     nextval('foo_seq'::regclass)
+            ;;   - parens preserved by our DEFAULT-paren rewrite rule:
+            ;;     (nextval('foo_seq'::regclass))
+            (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)
+            (let [m (re-matches #"(?i)\(?\s*nextval\s*\(\s*'(?:[^'.]+\.)?([^']+)'\s*(?:::\s*regclass)?\s*\)\s*\)?" base)]
               {:kind :nextval :value (second m)})
             :else
             {:kind :unsupported :raw raw}))))))
@@ -338,7 +348,7 @@
         ;; list without INHERITS — both refer to the same child table).
         parent-from-sql (extract-inherits ct)
         parent-from-db (when db
-                         (ffirst ((requiring-resolve 'datahike.api/q)
+                         (ffirst (d/q
                                   '{:find [?p]
                                     :where [[?e :__inherit__/child ?c]
                                             [?e :__inherit__/parent ?p]]
@@ -434,7 +444,40 @@
                    (for [^ColumnDefinition col columns
                          :let [col-name (params/unquote-ident (.getColumnName col))
                                ^ColDataType cdt (.getColDataType col)
-                               raw-type (str/lower-case (str (.getDataType cdt)))
+                               raw-type-orig (str/lower-case (str (.getDataType cdt)))
+                               ;; Strip schema prefix from type names. pg_dump
+                               ;; emits `public.year`, `public.mpaa_rating` —
+                               ;; we have a flat type namespace.
+                               type-no-schema (last (str/split raw-type-orig #"\." 2))
+                               ;; Check the enum registry first, then the
+                               ;; domain registry. Either lowers to a
+                               ;; concrete base type for the column.
+                               q-fn d/q
+                               enum-match (when db
+                                            (ffirst (q-fn '{:find [?vs-ord]
+                                                            :where [[?e :datahike.pg.enum/name ?n]
+                                                                    [?e :datahike.pg.enum/values-ordered ?vs-ord]]
+                                                            :in [$ ?n]}
+                                                          db type-no-schema)))
+                               domain-match (when (and db (not enum-match))
+                                              (let [e (when (some? type-no-schema)
+                                                        (try
+                                                          (d/entity
+                                                           db [:datahike.pg.domain/name type-no-schema])
+                                                          (catch Throwable _ nil)))]
+                                                (when (and e (:datahike.pg.domain/base-type e))
+                                                  (into {} e))))
+                               ;; Resolved raw-type: enum → 'text', domain →
+                               ;; its base-type + any args. Otherwise pass
+                               ;; through.
+                               raw-type (cond
+                                          enum-match "text"
+                                          domain-match
+                                          (let [b (:datahike.pg.domain/base-type domain-match)
+                                                args (some->> (:datahike.pg.domain/base-args domain-match)
+                                                              seq (str/join ",") (#(str "(" % ")")))]
+                                            (str b args))
+                                          :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
                                ;; Detect array column. JSqlParser exposes
                                ;; the array dimensions via getArrayData()
@@ -544,6 +587,23 @@
                                 (#{"time without time zone"
                                    "time with time zone"} base-type) "time"
                                 :else base-type))
+
+                       ;; ENUM-typed column: remember the enum's name so
+                       ;; the dump can re-emit the column as `<enum>`
+                       ;; (not `text`). Membership constraints could be
+                       ;; bolted on via `:pg/check-in` once the runtime
+                       ;; CHECK enforcement lands; for now we only need
+                       ;; to round-trip the type identity.
+                       enum-match
+                       (assoc :datahike.pg/enum-of type-no-schema)
+
+                       ;; DOMAIN-typed column: remember the domain so the
+                       ;; dump can emit `<domain>` instead of the lowered
+                       ;; base type. The domain's CHECK clause lives on
+                       ;; the registry entity and gets re-emitted as part
+                       ;; of the CREATE DOMAIN block in the dump header.
+                       domain-match
+                       (assoc :datahike.pg/domain-of type-no-schema)
                        ;; Single-col PRIMARY KEY → upsert identity.
                        (and single-pk-col (= col-name single-pk-col))
                        (assoc :db/unique :db.unique/identity)
@@ -658,7 +718,7 @@
   "Translate CREATE SEQUENCE to Datahike schema + initial entity.
    Sequences are stored as entities with :__seq__/* attributes."
   [^CreateSequence cs]
-  (let [seq-name (str (.getName (.getSequence cs)))
+  (let [seq-name (params/unquote-ident (str (.getName (.getSequence cs))))
         ;; Parse options: START WITH, INCREMENT BY
         full-sql (str cs)
         lower (str/lower-case full-sql)

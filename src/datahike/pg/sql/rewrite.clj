@@ -696,6 +696,146 @@
                          (conj [(:end lhs-end-tok)   (:end lhs-end-tok)   ")"]))))))))))
 
 ;; ============================================================================
+;; CREATE SEQUENCE … NO MINVALUE / NO MAXVALUE / NO CYCLE — JSqlParser's
+;; grammar accepts MINVALUE n / MAXVALUE n / CYCLE / etc. but rejects the
+;; `NO` modifier pg_dump emits. The clause is a no-op semantically (use
+;; default min/max, no cycling), so strip the two-token group.
+;; ============================================================================
+
+(defn create-sequence-no-clause-rule
+  "Strip `NO MINVALUE`, `NO MAXVALUE`, `NO CYCLE` token pairs anywhere
+   they appear (typically inside a CREATE SEQUENCE statement). Replaces
+   each with a single space.
+
+   We don't restrict to CREATE SEQUENCE context because a `NO MINVALUE`
+   pair would only appear there in well-formed SQL, and the token-driven
+   matcher is comment- and string-literal-safe via classify."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (dec n))
+        acc
+        (let [t0 (nth toks i)
+              t1 (nth toks (inc i) nil)]
+          (if (and (= "no" (kw-text t0))
+                   (#{"minvalue" "maxvalue" "cycle"} (kw-text t1)))
+            (recur (+ i 2)
+                   (conj acc [(:pos t0) (:end t1) " "]))
+            (recur (inc i) acc)))))))
+
+;; ============================================================================
+;; CREATE TABLE … (cols) PARTITION BY <strategy> (<expr>) — JSqlParser
+;; chokes on the `RANGE` / `LIST` / `HASH` keyword after the closing `)`
+;; of the column definition list. We don't model partitioning; pg_dump
+;; emits one CREATE TABLE per partition child anyway, and the data
+;; lands in the children. Strip the trailing `PARTITION BY …` clause
+;; so the parent table parses as a normal (empty) base table.
+;;
+;; Match shape (after the column-def `)`):
+;;   PARTITION BY <ident>(RANGE|LIST|HASH) ( <balanced-paren-group> )
+;; ============================================================================
+
+(defn partition-by-rule
+  "Strip `PARTITION BY <strategy> (<expr>)` after a top-level CREATE TABLE
+   body. Replaces the matched span with a single space; the trailing
+   `;` stays in place so statement boundaries are unaffected.
+
+   Walks the token stream looking for `partition` `by` <ident>
+   followed by a `(...)` group. The clause is paired with a CREATE
+   TABLE — not a CREATE INDEX or other DDL — but the rule doesn't
+   need that context: PARTITION BY only appears in CREATE TABLE in
+   any well-formed PG SQL, and the pre-parse rewrite is conservative
+   (we'd at worst delete a syntactically-similar but semantically-
+   absurd substring elsewhere)."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (- n 3))
+        acc
+        (let [t0 (nth toks i)
+              t1 (nth toks (inc i) nil)
+              t2 (nth toks (+ i 2) nil)
+              t3 (nth toks (+ i 3) nil)]
+          (if (and (= "partition" (kw-text t0))
+                   (= "by" (kw-text t1))
+                   (#{"range" "list" "hash"} (kw-text t2))
+                   (punct? t3 "("))
+            (let [close-idx (loop [k (+ i 4), depth 1]
+                              (cond
+                                (>= k n) -1
+                                (punct? (nth toks k) "(") (recur (inc k) (inc depth))
+                                (punct? (nth toks k) ")")
+                                (if (= depth 1) k (recur (inc k) (dec depth)))
+                                :else (recur (inc k) depth)))]
+              (if (neg? close-idx)
+                (recur (inc i) acc)
+                (let [start-pos (:pos t0)
+                      end-pos (:end (nth toks close-idx))]
+                  (recur (inc close-idx)
+                         (conj acc [start-pos end-pos " "])))))
+            (recur (inc i) acc)))))))
+
+;; ============================================================================
+;; DEFAULT <fn>(<args>) — JSqlParser's grammar rejects a function call with
+;; a string-literal argument in a DEFAULT clause (5.2 and 5.3 — the parser
+;; expects `::` after the close paren, hinting at PG cast-syntax ambiguity
+;; in the DEFAULT-expression production). The exact same call wrapped in
+;; an extra paren — `DEFAULT (nextval('seq'))` — parses cleanly with
+;; identical AST. So we rewrite source-level.
+;;
+;; This unblocks pg_dump output, which always emits `DEFAULT nextval(<seq>)`
+;; for SERIAL/BIGSERIAL/IDENTITY columns.
+;; ============================================================================
+
+(def ^:private default-paren-fns
+  "Sequence-fns that JSqlParser stumbles on in DEFAULT position."
+  #{"nextval" "currval" "lastval"})
+
+(defn default-fn-call-paren-rule
+  "Match `DEFAULT <fn>(...)` for fn ∈ {nextval, currval, lastval} where
+   the call isn't already wrapped in extra parens, and inject parens
+   around the call. Same semantics, parser-friendly form.
+
+   Skipped when the token after DEFAULT is already `(` — assume the
+   user already wrapped, leave alone."
+  [toks]
+  (let [n (count toks)]
+    (loop [i 0, acc []]
+      (if (>= i (- n 3))
+        acc
+        (let [t0 (nth toks i)]
+          (if-not (= "default" (kw-text t0))
+            (recur (inc i) acc)
+            (let [t1 (nth toks (inc i) nil)
+                  t2 (nth toks (+ i 2) nil)]
+              (cond
+                ;; Already parenthesised — caller did the dance.
+                (punct? t1 "(") (recur (inc i) acc)
+
+                ;; <fn>(...)
+                (and (some? t1)
+                     (contains? default-paren-fns (kw-text t1))
+                     (punct? t2 "("))
+                (let [close-idx
+                      (loop [k (+ i 3), depth 1]
+                        (cond
+                          (>= k n) -1
+                          (punct? (nth toks k) "(") (recur (inc k) (inc depth))
+                          (punct? (nth toks k) ")")
+                          (if (= depth 1) k (recur (inc k) (dec depth)))
+                          :else (recur (inc k) depth)))]
+                  (if (neg? close-idx)
+                    (recur (inc i) acc)
+                    (let [open-pos  (:pos t1)
+                          close-end (:end (nth toks close-idx))]
+                      (recur (inc close-idx)
+                             (-> acc
+                                 (conj [open-pos open-pos "("])
+                                 (conj [close-end close-end ")"]))))))
+
+                :else (recur (inc i) acc)))))))))
+
+;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
 
@@ -717,4 +857,7 @@
    primary-key-only-body-rule
    type-using-rule
    reserved-column-name-rule
-   boolean-is-rule])
+   boolean-is-rule
+   default-fn-call-paren-rule
+   partition-by-rule
+   create-sequence-no-clause-rule])

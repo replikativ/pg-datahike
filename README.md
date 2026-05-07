@@ -51,6 +51,15 @@ java -jar pg-datahike.jar --port 15432 --data-dir /var/lib/dh
 java -jar pg-datahike.jar --db prod --db staging        # pre-create dbs
 ```
 
+The `dump` subcommand exports a database to portable PostgreSQL SQL —
+replay-ready in either pg-datahike or real PG via `psql`. See
+[Migration & pg_dump interop](#migration--pg_dump-interop):
+
+```bash
+java -jar pg-datahike.jar dump --data-dir /var/lib/dh --db prod \
+                              --out prod.sql
+```
+
 ### Embedded library
 
 ```clojure
@@ -276,6 +285,94 @@ conn-wide. Users who need to write to a specific branch open a
 second connection on `/<db>:<branch>` or use the Clojure API
 (`datahike.versioning/branch!`, `merge!`, …). Post-0.1 item.
 
+## Migration & pg_dump interop
+
+pg-datahike round-trips with real PostgreSQL via `pg_dump` SQL on both
+sides. Three concrete workflows:
+
+### Real PostgreSQL → pg-datahike (load a `pg_dump` file)
+
+`pg_dump` output replays straight into pg-datahike via `psql` or any
+JDBC client. Schema-side coverage includes `CREATE TABLE` with FK
+constraints, `CREATE SEQUENCE`, `DEFAULT nextval(...)`, `CREATE TYPE …
+AS ENUM`, `CREATE DOMAIN`, partitioned tables (parent + children).
+Data-side coverage includes `INSERT` (single + multi-VALUES) and
+`COPY … FROM stdin` (text and CSV formats). Run with the `:pg-dump`
+compat preset to silently accept the rest of `pg_dump`'s noise
+(triggers, functions, materialized views, ALTER OWNER):
+
+```clojure
+(pg/start-server registry {:port 5432 :compat :pg-dump})
+```
+
+```bash
+psql -h localhost -p 5432 -U datahike -d datahike -f my_pg_dump.sql
+```
+
+Validated end-to-end against:
+- **Chinook** (15.6 k rows / 11 tables / FKs / NUMERIC / TIMESTAMP) —
+  full bidirectional roundtrip, byte-identical per-row equality.
+- **Pagila** (50 k rows / 22 tables / ENUM / DOMAIN / partitioning /
+  triggers / functions) — schema parses end-to-end, data loads in
+  ~12 s (≈ 4 k rows/s).
+
+Replay throughput depends on how the client sends the inserts. The
+fast paths are multi-statement Simple Query (what `psql -f` does),
+JDBC `PreparedStatement.executeBatch`, and explicit transactions —
+all of which commit batched rows through one underlying transact
+instead of per-row. Each-INSERT-its-own-roundtrip clients are bound
+by per-call commit cost (~370 r/s).
+
+### pg-datahike → portable PG SQL (the `dump` tool)
+
+`datahike.pg.dump/dump` walks a Datahike database and emits pg_dump-
+shaped SQL. The output replays into either pg-datahike or real
+PostgreSQL via `psql`:
+
+```clojure
+(require '[datahike.pg.dump :as dump])
+
+(spit "out.sql" (dump/dump-to-string conn))
+;; or stream:
+(doseq [stmt (dump/dump conn)] (println stmt))
+```
+
+Or via the standalone uberjar's `dump` subcommand:
+
+```bash
+java -jar pg-datahike.jar dump --data-dir DIR --db NAME --out out.sql
+java -jar pg-datahike.jar dump --config datahike-config.edn --copy
+```
+
+Options: `--inserts` (default) / `--copy`, `--schema-only` /
+`--data-only`, `--exclude-table NAME`. The `--config` flag accepts a
+full Datahike config EDN — works for any konserve backend (file, jdbc,
+s3, redis, lmdb, …); store-id is auto-discovered from the persisted
+`:db` branch so you don't need it up front.
+
+### Native Datahike databases dump too — no setup required
+
+A plain Datahike database (created via `d/transact`, never touched by
+SQL) dumps as clean PG SQL out of the box:
+
+- `:db.unique/identity` → `PRIMARY KEY NOT NULL`
+- `:db.unique/value` → `UNIQUE`
+- `:db.cardinality/many T` → `T[]` with PG array literals (`'{a,b}'`)
+- `:db.type/ref` → `bigint` (the entity-id)
+
+For FK constraints in the dump, opt in with `set-hint!` on ref attrs:
+
+```clojure
+(pg/set-hint! conn :order/customer {:references :customer/id})
+;; → ALTER TABLE "order" ADD CONSTRAINT … FOREIGN KEY ("customer")
+;;     REFERENCES "customer"("id");
+```
+
+This makes the "evaluate Datahike, fall back to real PG cleanly"
+story concrete: a native Datahike database can be exported to a
+PostgreSQL-shaped SQL file at any time, replayed on real PG, and
+queried there. No schema rewrite, no second source of truth.
+
 ## Embedding without TCP
 
 Bypass the wire layer for tests or in-process applications:
@@ -290,19 +387,27 @@ Bypass the wire layer for tests or in-process applications:
 ## Compat with strict vs. permissive clients
 
 By default the handler rejects unsupported DDL (GRANT, REVOKE, POLICY,
-ROW LEVEL SECURITY, CREATE EXTENSION, COPY) with SQLSTATE
-`0A000 feature_not_supported`. Most ORMs emit some of these
-unconditionally — accept them silently per-feature or by named preset:
+ROW LEVEL SECURITY, CREATE EXTENSION, triggers, functions, …) with
+SQLSTATE `0A000 feature_not_supported`. Real-world clients emit a lot
+of this noise unconditionally — opt in by named preset:
 
 ```clojure
-;; silently accept every auth/RLS/extension no-op (Hibernate, Odoo, Rails)
+;; ORM noise: GRANT/REVOKE/POLICY/RLS/EXTENSION (Hibernate, Odoo, Rails)
 (pg/make-query-handler conn {:compat :permissive})
 
-;; accept specific kinds only
+;; pg_dump output: superset of :permissive that also accepts
+;; CREATE TRIGGER / FUNCTION / PROCEDURE / AGGREGATE / RULE,
+;; MATERIALIZED VIEW, ATTACH PARTITION, ALTER TYPE/DOMAIN, etc.
+;; Use this when loading dump files from real PostgreSQL.
+(pg/make-query-handler conn {:compat :pg-dump})
+
+;; or accept specific kinds only
 (pg/make-query-handler conn {:silently-accept #{:grant :policy}})
 ```
 
-See `datahike.pg.server/compat-presets` for the preset bundles.
+See `datahike.pg.server/compat-presets` for the preset bundles. The
+underlying `:silently-accept` set is also exposed on the standalone
+server: `(pg/start-server … {:compat :pg-dump})`.
 
 ## Extending the catalog
 
@@ -333,27 +438,62 @@ Tested against:
 - **Rails ActiveRecord** / Ecto (via `pg` gems)
 - **Odoo** 17 / 19 boot + module loading + TestORM suite
 - **Flyway** / **Alembic** migrations (via advisory locks)
+- **Chinook** + **Pagila** `pg_dump` fixtures load end-to-end (see
+  [Migration & pg_dump interop](#migration--pg_dump-interop))
 
-Known gaps (by design or deferred):
-- No PL/pgSQL / stored functions
-- No triggers / rules
-- No `LISTEN` / `NOTIFY`
-- No `COPY FROM/TO STDIN` (rejected with 0A000)
+### Modeled / first-class
+
+`CREATE SEQUENCE`, `nextval` / `currval` / `setval` (with PG-correct
+non-transactional semantics — advance survives rollback, concurrent
+callers get distinct values), `DEFAULT nextval('s'::regclass)`,
+`CREATE TYPE … AS ENUM` (membership enforced on INSERT — non-members
+raise 22P02), `CREATE DOMAIN … [NOT NULL] [CHECK (…)]` (CHECK predicate
+evaluated on INSERT — violations raise 23514, NOT NULL raises 23502;
+`VALUE` keyword resolves to the column value), `text[]` arrays,
+`tsvector` (opaque round-trip),
+`bytea`, `timestamp with time zone`, `CHARACTER(N)`, `SERIAL`,
+`COPY … FROM stdin` (text + CSV), `ALTER TABLE … ADD CONSTRAINT
+FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
+
+### Accepted under `:compat :pg-dump` (no semantics, schema loads)
+
+`CREATE TRIGGER`, `CREATE FUNCTION` (incl. `$$…$$` body),
+`CREATE PROCEDURE`, `CREATE AGGREGATE`, `CREATE RULE`, `CREATE OPERATOR`,
+`CREATE CAST`, `CREATE LANGUAGE`, `CREATE MATERIALIZED VIEW`,
+`ALTER TYPE / DOMAIN`, `ALTER TABLE … ATTACH PARTITION` /
+`DETACH PARTITION`, `ALTER … OWNER TO`, `\restrict`/`\unrestrict`
+psql metacommands, `pg_catalog.set_config(...)`. Partitioned tables
+load: the parent's `PARTITION BY` clause is stripped, partition
+children load as independent tables, and pg_dump's per-child INSERTs
+land where they should.
+
+### Known gaps (by design or deferred)
+
+- No PL/pgSQL execution (CREATE FUNCTION's body is silently accepted
+  but never invoked).
+- No `LISTEN` / `NOTIFY`.
 - FK `ON DELETE CASCADE` / `SET NULL` / `SET DEFAULT` rejected at DDL
-  (RESTRICT is the default and only supported action)
-- Single `public` schema — `CREATE SCHEMA` silently accepted but no-op
-- Cursor materialization is eager (entire result set held in memory)
-- No deferrable constraints
-- Generated columns parse but aren't enforced
+  (RESTRICT is the default and only supported action).
+- Single `public` schema — `CREATE SCHEMA` silently accepted but no-op.
+- Cursor materialization is eager (entire result set held in memory).
+- No deferrable constraints.
+- Generated columns parse but aren't enforced.
+- ENUM ordering is lexicographic (string storage) rather than PG's
+  declaration-order. `ORDER BY` on enum-typed columns may diverge.
+- Partitioned tables: data lives in the children, not the parent (pg-
+  datahike doesn't model the partition relation). Live workloads that
+  need partition-aware routing into the parent table are out of scope.
 - **Constraint enforcement is one-directional in 0.1.** SQL constraints
   declared via DDL — `NOT NULL`, `CHECK`, `UNIQUE`, foreign-key
-  child-side and parent-side `RESTRICT` — are enforced by the pgwire
-  handler at write time. Direct `(d/transact)` writes from Clojure
-  bypass these checks because Datahike's schema does not yet carry
-  the corresponding constraint vocabulary. Use the SQL path for
-  constrained inserts, or validate explicitly before transacting.
-  A future release will lift enforcement into Datahike's tx layer
-  so both paths are gated.
+  child-side and parent-side `RESTRICT`, DOMAIN CHECK / NOT NULL,
+  ENUM membership — are enforced by the pgwire handler at write time
+  (via a `:db.fn/call` wrapper that runs against the speculative
+  txdb, mirroring PG IMMEDIATE constraint semantics). Direct
+  `(d/transact)` writes from Clojure bypass these checks because
+  Datahike's schema does not yet carry the corresponding constraint
+  vocabulary. Use the SQL path for constrained inserts, or validate
+  explicitly before transacting. A future release will lift enforcement
+  into Datahike's tx layer so both paths are gated.
 
 ## Development
 
@@ -404,9 +544,14 @@ Module inventory (`src/datahike/pg/`):
 | `sql.rewrite` | Span-based source rewriter for SQL shapes JSqlParser rejects |
 | `sql.shape` | Structural SELECT probe matcher for catalog queries |
 | `sql.{ddl,stmt,expr,ctx,catalog,fns,params,coerce,oid_infer}` | AST → Datalog / tx-data translation |
+| `sql.template` | Lexical INSERT-VALUES templater (literal → `?` rewrite + typed substitute) for parse-result reuse on bulk inserts |
 | `sql.database` | `CREATE`/`DROP DATABASE` token-parser + provisioning helpers |
+| `sql.types` | `CREATE TYPE … AS ENUM` / `CREATE DOMAIN` parsers (bypass JSqlParser); registry-entity model |
+| `sql.copy` / `sql.copy.{text_format,csv_format}` | `COPY … FROM stdin` parser + format decoders |
 | `schema` | Virtual-table derivation + `:datahike.pg/*` hint support |
 | `server` | Handler reify, wire dispatch, constraint enforcement |
+| `dump` | Reverse direction: walk schema + data, emit pg_dump-shaped SQL |
+| `main` | Standalone CLI (`serve` / `dump` subcommands) |
 | `errors` | Exception → SQLSTATE classification at the wire boundary |
 | `types` / `arrays` / `jsonb` / `window` | Runtime value model + post-processing |
 

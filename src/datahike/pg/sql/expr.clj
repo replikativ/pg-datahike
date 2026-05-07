@@ -41,6 +41,8 @@
    Side effects flow through the ctx's atoms (`:where-clauses`,
    `:in-args`, `:param-placeholders`, `:entity-vars`, `:col->var`)."
   (:require [clojure.set :as set]
+            [datahike.api :as d]
+            [datahike.pg.sql.oid-infer :as oid-infer]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.jsonb :as jb]
@@ -89,6 +91,29 @@
          flatten-json-chain
          interpret-form
          parse-timestamp-string)
+
+(defn string-value-text
+  "Extract the text of a JSqlParser `StringValue`, applying SQL/PG
+   semantics for the `N'...'` (national character) prefix.
+
+   PG observed behaviour: `N'foo '` (with trailing space) stores as
+   `'foo'` — a CHAR-style trailing-space trim. `'foo '` (no prefix)
+   preserves the trailing space. The PG docs say `N'...'` is
+   identical to `'...'`, but empirically (any 12+ release) PG
+   coerces `N` literals through CHAR, which strips trailing blanks.
+   The Chinook fixture relies on this — its source SQL has trailing
+   spaces inside `N'...'` that PG strips, and our roundtrip needs
+   to match.
+
+   Pass-through for non-`N` prefixes (`E'...'`, `B'...'`, etc.) and
+   for unprefixed strings."
+  [^net.sf.jsqlparser.expression.StringValue sv]
+  (let [v (.getNotExcapedValue sv)
+        prefix (.getPrefix sv)]
+    (if (and v prefix (.equalsIgnoreCase ^String prefix "N"))
+      ;; CHAR-coerce: rstrip trailing ASCII spaces.
+      (str/replace v #" +$" "")
+      v)))
 
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
@@ -331,12 +356,8 @@
                      :table-aliases (:table-aliases ctx)
                      :default-table (:default-table ctx)
                      :hints         (:hints ctx)}
-            ;; Use a runtime require to avoid a load cycle (oid-infer
-            ;; depends on types only; pulling it from expr is fine but
-            ;; the namespace isn't aliased at the top of this file).
             arg-oid (try
-                      ((requiring-resolve 'datahike.pg.sql.oid-infer/expr-oid)
-                       arg-expr oid-env)
+                      (oid-infer/expr-oid arg-expr oid-env)
                       (catch Throwable _ nil))
             type-name (or (get types/oid->pg-name arg-oid) "text")
             fn-param (symbol (str "?pg-typeof" (swap! (:var-counter ctx) inc)))
@@ -1272,7 +1293,7 @@
                            q        (:query parsed)
                            in-args  (:in-args parsed)
                            query-db (or (:enriched-db parsed) (:db ctx))
-                           q-fn     (requiring-resolve 'datahike.api/q)
+                           q-fn     d/q
                            rows     (if (seq in-args)
                                       (apply q-fn q query-db in-args)
                                       (q-fn q query-db))]
@@ -1455,6 +1476,17 @@
                           (java.time.LocalDate/parse
                            trimmed
                            (java.time.format.DateTimeFormatter/ofPattern "M/d/y"))
+                          java.time.ZoneOffset/UTC)))
+            (catch Exception _ nil)))
+     ;; PG also accepts 'Y/M/d' when the year leads (4 digits): the
+     ;; canonical Chinook fixture uses '2002/8/14'-style dates. Real
+     ;; PG parses these via DateStyle=ISO,MDY so we mirror that.
+     (when (re-matches #"\d{4}/\d{1,2}/\d{1,2}" trimmed)
+       (try (java.util.Date/from
+             (.toInstant (.atStartOfDay
+                          (java.time.LocalDate/parse
+                           trimmed
+                           (java.time.format.DateTimeFormatter/ofPattern "yyyy/M/d"))
                           java.time.ZoneOffset/UTC)))
             (catch Exception _ nil)))
      ;; All parsing failed — return raw string
@@ -1679,7 +1711,7 @@
       (let [inner ^JsonExpression (first idents)
             inner-base (.getExpression inner)
             outer-key (cond
-                        (instance? StringValue inner-base) (.getNotExcapedValue ^StringValue inner-base)
+                        (instance? StringValue inner-base) (string-value-text ^StringValue inner-base)
                         (instance? LongValue inner-base)   (.getValue ^LongValue inner-base)
                         :else (str inner-base))
             outer-op (first ops)
@@ -1689,7 +1721,7 @@
       ;; Simple: single step — ident is a literal key or index
       (let [ident (first idents)
             key-val (cond
-                      (instance? StringValue ident) (.getNotExcapedValue ^StringValue ident)
+                      (instance? StringValue ident) (string-value-text ^StringValue ident)
                       (instance? LongValue ident)   (.getValue ^LongValue ident)
                       :else (str ident))]
         {:base base :chain [[key-val (first ops)]]}))))
@@ -1780,7 +1812,7 @@
     (.getValue ^DoubleValue expr)
 
     (instance? StringValue expr)
-    (.getNotExcapedValue ^StringValue expr)
+    (string-value-text ^StringValue expr)
 
     (instance? NullValue expr)
     nil
@@ -2084,7 +2116,7 @@
                     q        (:query parsed)
                     in-args  (:in-args parsed)
                     query-db (or (:enriched-db parsed) db)
-                    q-fn     (requiring-resolve 'datahike.api/q)
+                    q-fn     d/q
                     results  (if (seq in-args)
                                (apply q-fn q query-db in-args)
                                (q-fn q query-db))
@@ -2209,7 +2241,7 @@
                 q          (:query parsed)
                 in-args    (:in-args parsed)
                 query-db   (or (:enriched-db parsed) db)
-                q-fn       (requiring-resolve 'datahike.api/q)
+                q-fn       d/q
                 results    (if (seq in-args)
                              (apply q-fn q query-db in-args)
                              (q-fn q query-db))
@@ -2919,9 +2951,9 @@
                          ;; Use enriched-db when subquery has derived tables/CTEs
                          query-db (or (:enriched-db inner-parsed) db)
                          inner-results (if (seq inner-in-args)
-                                         (apply (requiring-resolve 'datahike.api/q)
+                                         (apply d/q
                                                 inner-query query-db inner-in-args)
-                                         ((requiring-resolve 'datahike.api/q)
+                                         (d/q
                                           inner-query query-db))]
                      ;; Extract single-column values from results
                      (mapv (fn [row]
@@ -3262,9 +3294,9 @@
                                 inner-in-args (:in-args inner-parsed)
                                 query-db (or (:enriched-db inner-parsed) db)
                                 inner-results (if (seq inner-in-args)
-                                                (apply (requiring-resolve 'datahike.api/q)
+                                                (apply d/q
                                                        inner-query query-db inner-in-args)
-                                                ((requiring-resolve 'datahike.api/q)
+                                                (d/q
                                                  inner-query query-db))
                                 has-results? (boolean (seq inner-results))]
                             (if (if not-exists? (not has-results?) has-results?)
@@ -3302,9 +3334,9 @@
                       inner-in-args (:in-args inner-parsed)
                       query-db (or (:enriched-db inner-parsed) db)
                       inner-results (if (seq inner-in-args)
-                                      (apply (requiring-resolve 'datahike.api/q)
+                                      (apply d/q
                                              inner-query query-db inner-in-args)
-                                      ((requiring-resolve 'datahike.api/q)
+                                      (d/q
                                        inner-query query-db))
                       has-results? (boolean (seq inner-results))]
                   (if (if not-exists? (not has-results?) has-results?)
@@ -3318,9 +3350,9 @@
                     inner-in-args (:in-args inner-parsed)
                     query-db (or (:enriched-db inner-parsed) db)
                     inner-results (if (seq inner-in-args)
-                                    (apply (requiring-resolve 'datahike.api/q)
+                                    (apply d/q
                                            inner-query query-db inner-in-args)
-                                    ((requiring-resolve 'datahike.api/q)
+                                    (d/q
                                      inner-query query-db))
                     has-results? (boolean (seq inner-results))]
                 (if (if not-exists? (not has-results?) has-results?)

@@ -8,6 +8,7 @@
 
    Every virtual table gets an implicit 'db_id' column (the entity ID)."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)
@@ -87,7 +88,15 @@
    {:db/ident :datahike.pg/table
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one
-    :db/doc "Override the SQL table name for the target attribute's namespace. Rare — namespace/table symmetry is usually what you want."}])
+    :db/doc "Override the SQL table name for the target attribute's namespace. Rare — namespace/table symmetry is usually what you want."}
+   {:db/ident :datahike.pg/enum-of
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Column's SQL type is a registered ENUM (`:datahike.pg.enum/name`). Storage lowers to text; the dump re-emits with the enum type name."}
+   {:db/ident :datahike.pg/domain-of
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Column's SQL type is a registered DOMAIN (`:datahike.pg.domain/name`). Storage lowers to the domain's base type; the dump re-emits with the domain name."}])
 
 (defn ensure-hint-schema!
   "Idempotently install the :datahike.pg/* hint schema attrs on `conn`.
@@ -96,8 +105,8 @@
    running under `:schema-flexibility :read` can prime the schema
    before their first `set-hint!` or eager hint transaction."
   [conn]
-  (let [transact-fn (requiring-resolve 'datahike.api/transact)
-        db-fn       (requiring-resolve 'datahike.api/db)
+  (let [transact-fn d/transact
+        db-fn       d/db
         schema      (:schema (db-fn conn))
         missing     (remove (fn [{:keys [db/ident]}] (get schema ident))
                             hint-schema)]
@@ -113,7 +122,7 @@
    is installed first so callers needn't pre-install."
   [conn target hint]
   (ensure-hint-schema! conn)
-  (let [transact-fn (requiring-resolve 'datahike.api/transact)
+  (let [transact-fn d/transact
         entity (-> {:datahike.pg/for-ident target}
                    (into (keep (fn [[k v]]
                                  (when (some? v)
@@ -307,7 +316,7 @@
    appears."
   [db ref-attrs]
   (when (and db (seq ref-attrs))
-    (let [q-fn (requiring-resolve 'datahike.api/q)
+    (let [q-fn d/q
           ;; One query: walk every datom whose attr is in the
           ;; ref-attrs set, follow the ref, then take any attr on the
           ;; target as a namespace witness. Filtering internal attrs
@@ -398,7 +407,7 @@
 
 (defn- schema-hints*
   [db]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         ;; The :datahike.pg/* attrs may not yet be in the schema (bare
         ;; conn without ensure-pg-schema!) — keep the query resilient
         ;; to each attr being absent by using per-attr lookups instead
@@ -406,7 +415,7 @@
         rows (q-fn '{:find [?for-ident ?e]
                      :where [[?e :datahike.pg/for-ident ?for-ident]]}
                    db)
-        pull-fn (requiring-resolve 'datahike.api/pull)]
+        pull-fn d/pull]
     (into {}
           (keep (fn [[for-ident e]]
                   (let [p (pull-fn db
@@ -461,7 +470,7 @@
    attrs (:db/valueType etc.); custom attrs on the ident entity require
    a Datalog lookup against the db."
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)]
+  (let [q-fn d/q]
     (ffirst (q-fn '{:find [?oid]
                     :in [$ ?ident]
                     :where [[?e :db/ident ?ident]
@@ -473,7 +482,7 @@
    attribute is attached to the row-marker entity, not part of the
    :schema map."
   [db]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         used (into #{}
                    (map first)
                    (q-fn '{:find [?oid]
@@ -634,7 +643,7 @@
    Requires a Datahike db value. Falls back to alphabetical if db is nil."
   [db table-name]
   (if db
-    (let [q-fn (requiring-resolve 'datahike.api/q)
+    (let [q-fn d/q
           ns-prefix (str table-name "/")
           results (q-fn '{:find [?e ?ident]
                           :where [[?e :db/ident ?ident]]

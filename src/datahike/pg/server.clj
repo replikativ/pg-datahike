@@ -840,7 +840,7 @@
    (not an entity id), so `?a` is already the keyword we want."
   [db begin-tx]
   (try
-    (let [q-fn (requiring-resolve 'datahike.api/q)]
+    (let [q-fn d/q]
       (into #{}
             (map first)
             (q-fn '{:find [?a]
@@ -991,44 +991,131 @@
      col-name-array oids row-arrays
      (str "INSERT 0 " (count eids)))))
 
-(defn- auto-populate-identity
-  "If the table has IDENTITY columns (backed by __seq__ sequences), populate
-   any missing identity attributes in the INSERT tx-data using :db.fn/call
-   for atomic increment. Also checks parent table sequences for INHERITS."
-  [tx-data table-name db]
-  (let [;; Look for sequences named <table>_<col>_seq
-        ;; Also check parent table if this table inherits
-        parent-table (ffirst (d/q '{:find [?p]
+;; ----------------------------------------------------------------------------
+;; Per-schema memoisation for constraint metadata.
+;;
+;; `read-{column,check,fk}-constraints`, `compute-identity-cols`, and
+;; `enrich-schema-with-pg-array-meta` are pure functions of the schema —
+;; same (schema, table) pair always yields the same result, until DDL
+;; transacts a change. The CPU profile of a Pagila pg_dump replay
+;; showed these recompute on every INSERT (each ~0.5-0.7 ms/row of
+;; wall time on top of d/transact's 1.3 ms baseline). Caching them by
+;; schema-map identity drops that overhead to ~zero.
+;;
+;; Outer: `Collections.synchronizedMap(WeakHashMap)` keyed on the
+;; schema map's IDENTITY (System/identityHashCode). Schema maps are
+;; interned-by-equality-not-identity from Clojure's perspective; we
+;; want identity so equal-but-distinct schemas across test fixtures
+;; don't share entries. WeakHashMap reclaims entries when the schema
+;; is GC'd (after the last db pinning it goes out of scope).
+;;
+;; Inner: `ConcurrentHashMap` keyed on the cache-key the caller
+;; passed (e.g. `[::col "rental"]`). Concurrent for safety.
+;;
+;; PG-side metadata (`:pg/not-null`, `:pg/check-*`, `:pg/fk-*`,
+;; `:pg/default-*`, `:pg/array-elem`) is stored on the schema-
+;; attribute entity but does NOT appear in `(:schema db)` — only
+;; `:db/valueType` / `:db/cardinality` / `:db/unique` do. A DDL
+;; that adds NOT NULL to an existing column therefore doesn't change
+;; schema-map identity, and the identity-keyed cache would return
+;; stale info. We invalidate the cache on every DDL exec branch.
+;; DDL is rare; the bust is cheap.
+;;
+;; `cache-stats` is a hit/miss counter exposed for tests/
+;; observability. A verification harness can call
+;; `(reset! cache-stats {})`, load some INSERTs, and confirm
+;; `(:hit @cache-stats) ≫ (:miss …)` to confirm the cache fires
+;; as intended.
+;; ----------------------------------------------------------------------------
+
+(def ^:private schema-deriv-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(def ^:dynamic *schema-cache-enabled?*
+  "Bind false to bypass the cache. For perf comparisons only;
+   production code should leave this on."
+  true)
+
+(defonce ^{:doc "Hit/miss counter for the schema cache. Atom whose
+  identity is stable across reloads so external observers can hold
+  a reference and watch counts. Mutated by every `schema-cached`
+  call; read for inspection / verification harnesses."}
+  cache-stats
+  (atom {:hit 0 :miss 0}))
+
+(defn invalidate-schema-cache!
+  "Clear the per-schema cache. Called from every DDL exec branch."
+  []
+  (.clear ^java.util.Map schema-deriv-cache))
+
+(defn- schema-cached
+  "`(schema-cached db cache-key produce)` — memoise `(produce)`
+   (a 0-arg thunk) by `[schema-identity cache-key]`."
+  [db cache-key produce]
+  (if-not *schema-cache-enabled?*
+    (produce)
+    (let [schema (:schema db)
+          ^java.util.Map outer schema-deriv-cache
+          ^java.util.concurrent.ConcurrentHashMap inner
+          (or (.get outer schema)
+              (locking outer
+                (or (.get outer schema)
+                    (let [m (java.util.concurrent.ConcurrentHashMap.)]
+                      (.put outer schema m)
+                      m))))
+          existing (.get inner cache-key)]
+      (if (some? existing)
+        (do (swap! cache-stats update :hit (fnil inc 0))
+            (if (= ::nil existing) nil existing))
+        (let [v (produce)]
+          (swap! cache-stats update :miss (fnil inc 0))
+          (.putIfAbsent inner cache-key (if (nil? v) ::nil v))
+          v)))))
+
+(defn- compute-identity-cols
+  "Discover IDENTITY-backed columns of `table-name`. Two d/q calls —
+   INHERITS lookup + sequences-by-prefix. Pure function of the
+   schema; cached per (schema, table)."
+  [db table-name]
+  (let [parent-table (ffirst (d/q '{:find [?p]
                                     :where [[?e :__inherit__/child ?c]
                                             [?e :__inherit__/parent ?p]]
                                     :in [$ ?c]}
                                   db table-name))
         tables-to-check (if parent-table [table-name parent-table] [table-name])
-        ;; Each identity col: {:col "id" :ns "ir_actions" :seq-name "ir_actions_id_seq"}
-        ;; Validate: extracted column name must exist in the table's schema.
-        ;; This prevents prefix collisions (e.g. ir_module_module_ matching
-        ;; ir_module_module_dependency_id_seq → bogus "dependency_id" column).
-        schema (:schema db)
-        identity-cols (vec (mapcat
-                            (fn [tbl]
-                              (let [seq-prefix (str tbl "_")
-                                    seq-results (d/q '{:find [?name]
-                                                       :where [[?e :__seq__/name ?name]]
-                                                       :in [$ ?prefix]}
-                                                     db seq-prefix)]
-                                (keep (fn [[sname]]
-                                        (when (and (str/starts-with? sname seq-prefix)
-                                                   (str/ends-with? sname "_seq"))
-                                          (let [col-name (subs sname (count seq-prefix)
-                                                               (- (count sname) 4))
-                                                attr (keyword tbl col-name)]
-                                            ;; Only include if the column actually exists in schema
-                                            (when (get schema attr)
-                                              {:col col-name
-                                               :ns tbl
-                                               :seq-name sname}))))
-                                      seq-results)))
-                            tables-to-check))]
+        schema (:schema db)]
+    (vec (mapcat
+          (fn [tbl]
+            (let [seq-prefix (str tbl "_")
+                  seq-results (d/q '{:find [?name]
+                                     :where [[?e :__seq__/name ?name]]
+                                     :in [$ ?prefix]}
+                                   db seq-prefix)]
+              (keep (fn [[sname]]
+                      (let [pref-len (count seq-prefix)
+                            tail-end (- (count sname) 4)]
+                        (when (and (str/starts-with? sname seq-prefix)
+                                   (str/ends-with? sname "_seq")
+                                   (< pref-len tail-end))
+                          (let [col-name (subs sname pref-len tail-end)
+                                attr (keyword tbl col-name)]
+                            (when (get schema attr)
+                              {:col col-name :ns tbl :seq-name sname})))))
+                    seq-results)))
+          tables-to-check))))
+
+(defn- auto-populate-identity
+  "If the table has IDENTITY columns (backed by __seq__ sequences), populate
+   any missing identity attributes in the INSERT tx-data using :db.fn/call
+   for atomic increment. Also checks parent table sequences for INHERITS.
+
+   The identity-cols set is memoised per (schema, table) — this used
+   to fire two d/q calls per INSERT even on tables without identity
+   columns."
+  [tx-data table-name db]
+  (let [identity-cols (schema-cached db [::identity table-name]
+                                     #(compute-identity-cols db table-name))
+        identity-cols (if (= ::nil identity-cols) [] identity-cols)]
     (if (empty? identity-cols)
       tx-data
       ;; Wrap entire INSERT in :db.fn/call to atomically generate IDs.
@@ -1037,7 +1124,7 @@
       ;; prior rows' sequence increments).
       [[:db.fn/call
         (fn [txdb]
-          (let [q-fn (requiring-resolve 'datahike.api/q)
+          (let [q-fn d/q
                 ;; Pre-fetch sequence state for each identity column
                 seq-state (atom
                            (into {}
@@ -1116,19 +1203,25 @@
     :nextval (when value [::nextval value])
     nil))
 
-(defn- read-check-constraints
-  "All CHECK constraints for `table-name`. Returns a list of
-   {:name str :expr-text str} pairs. Empty when the table has none."
+(defn- read-check-constraints*
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)]
-    (map (fn [{:keys [name expr]}] {:name name :expr expr})
-         (q-fn '{:find [?n ?x]
-                 :keys [name expr]
-                 :in [$ ?tbl]
-                 :where [[?e :pg/check-name ?n]
-                         [?e :pg/check-table ?tbl]
-                         [?e :pg/check-expr ?x]]}
-               db table-name))))
+  (mapv (fn [{:keys [name expr]}] {:name name :expr expr})
+        (d/q '{:find [?n ?x]
+               :keys [name expr]
+               :in [$ ?tbl]
+               :where [[?e :pg/check-name ?n]
+                       [?e :pg/check-table ?tbl]
+                       [?e :pg/check-expr ?x]]}
+             db table-name)))
+
+(defn- read-check-constraints
+  "All CHECK constraints for `table-name`. Returns a vector of
+   {:name str :expr str} pairs. Empty when the table has none.
+   Memoised per (schema, table)."
+  [db table-name]
+  (let [v (schema-cached db [::check table-name]
+                         #(read-check-constraints* db table-name))]
+    (if (= ::nil v) [] v)))
 
 (defn- parse-check-expression
   "Re-parse a stored CHECK expression string into a JSqlParser
@@ -1163,28 +1256,169 @@
                                :table table-name
                                :constraint name})))))))))
 
+(defn- read-domain-enum-checks*
+  [db table-name]
+  ;; Pull every column-attr in this table's namespace that has a
+  ;; :datahike.pg/domain-of or :datahike.pg/enum-of hint. For each,
+  ;; resolve the registry entity and pre-parse the CHECK expression
+  ;; (domains) / freeze the value-set (enums) so per-row enforcement
+  ;; is just a pre-computed lookup + AST eval / set membership.
+  ;;
+  ;; `get-else` doesn't accept nil as default; use the project-wide
+  ;; `:__null__` sentinel and unwrap it in Clojure (matches the
+  ;; convention in datahike.pg.jsonb / datahike.pg.window).
+  (let [unwrap-null (fn [v] (when (not= v :__null__) v))
+        domain-rows
+        (d/q '{:find [?ident ?dname ?cname ?cexpr ?nn]
+               :keys [ident domain-name check-name check-expr not-null]
+               :in [$ ?tbl]
+               :where [[?col :db/ident ?ident]
+                       [?col :datahike.pg/domain-of ?dname]
+                       [(namespace ?ident) ?ns]
+                       [(= ?ns ?tbl)]
+                       [?dom :datahike.pg.domain/name ?dname]
+                       [(get-else $ ?dom :datahike.pg.domain/check-name :__null__) ?cname]
+                       [(get-else $ ?dom :datahike.pg.domain/check-expr :__null__) ?cexpr]
+                       [(get-else $ ?dom :datahike.pg.domain/not-null false) ?nn]]}
+             db table-name)
+        enum-rows
+        (d/q '{:find [?ident ?ename ?vs]
+               :keys [ident enum-name values]
+               :in [$ ?tbl]
+               :where [[?col :db/ident ?ident]
+                       [?col :datahike.pg/enum-of ?ename]
+                       [(namespace ?ident) ?ns]
+                       [(= ?ns ?tbl)]
+                       [?en :datahike.pg.enum/name ?ename]
+                       [?en :datahike.pg.enum/values ?vs]]}
+             db table-name)
+        result (java.util.HashMap.)]
+    (doseq [{:keys [ident domain-name check-name check-expr not-null]} domain-rows]
+      (let [col (name ident)
+            check-expr (unwrap-null check-expr)
+            check-name (unwrap-null check-name)]
+        (.put result col
+              {:kind :domain
+               :attr ident
+               :domain-name domain-name
+               :check-name check-name
+               :not-null? not-null
+               :check-ast (when check-expr
+                            (try (parse-check-expression check-expr)
+                                 (catch Throwable _ nil)))})))
+    (let [enum-map (java.util.HashMap.)]
+      (doseq [{:keys [ident enum-name values]} enum-rows]
+        (let [col (name ident)
+              cur (.get enum-map col)]
+          (.put enum-map col
+                {:kind :enum
+                 :attr ident
+                 :enum-name enum-name
+                 :values (conj (or (:values cur) #{}) (str values))})))
+      (doseq [[col spec] enum-map]
+        (.put result col spec)))
+    (into {} result)))
+
+(defn- read-domain-enum-checks
+  "Cached per (schema, table). Returns
+     {col-name <spec>}
+   where <spec> is either
+     {:kind :domain :attr kw :domain-name str :check-name str
+      :not-null? bool :check-ast AST-or-nil}
+     {:kind :enum   :attr kw :enum-name str :values #{string ...}}.
+   Empty when the table has no domain- or enum-typed columns."
+  [db table-name]
+  (let [v (schema-cached db [::dom-enum table-name]
+                         #(read-domain-enum-checks* db table-name))]
+    (if (= ::nil v) {} v)))
+
+(defn- enforce-domain-enum-checks!
+  "Per-row column-level domain CHECK + enum membership enforcement.
+   Raises 23514 (CHECK violation) for domain failures, 22P02
+   (invalid_text_representation) for enum membership failures.
+   Both are PG-canonical. Cheap: each row visits only the columns
+   that are domain- or enum-typed in this table."
+  [db table-name ns entity-maps]
+  (let [specs (read-domain-enum-checks db table-name)]
+    (when (seq specs)
+      (let [schema (:schema db)]
+        (doseq [em entity-maps
+                [col-name spec] specs
+                :let [attr (:attr spec)
+                      ;; Look up the value under either the schema-
+                      ;; declared attr or the parsed ns-prefix; INSERT
+                      ;; tx-data uses the latter.
+                      v (or (get em attr) (get em (keyword ns col-name)))]]
+          (cond
+            ;; Domain :not-null lives on the domain itself, not the
+            ;; column. Column-level :pg/not-null already fired above
+            ;; in apply-column-constraints — this is the *domain*'s
+            ;; constraint. Both are 23502.
+            (and (= :domain (:kind spec))
+                 (:not-null? spec)
+                 (nil? v))
+            (throw (ex-info "domain not-null violation"
+                            {:error :not-null-violation
+                             :table table-name
+                             :column col-name
+                             :domain (:domain-name spec)}))
+
+            ;; Domain CHECK with a parsed AST. PG's `VALUE` keyword
+            ;; refers to the column's value; bind it under the
+            ;; conventional (keyword "" "VALUE") so the existing
+            ;; eval-check-predicate / eval-update-expr machinery
+            ;; resolves it without a special case.
+            (and (= :domain (:kind spec)) (some? v) (:check-ast spec))
+            (let [r (try
+                      (sql/eval-check-predicate (:check-ast spec)
+                                                {(keyword "" "VALUE") v}
+                                                "" schema)
+                      (catch Throwable _ ::error))]
+              (when (false? r)
+                (throw (ex-info "domain check constraint violation"
+                                {:error :check-violation
+                                 :table table-name
+                                 :column col-name
+                                 :constraint (or (:check-name spec)
+                                                 (str (:domain-name spec) "_check"))
+                                 :domain (:domain-name spec)
+                                 :value v}))))
+
+            ;; Enum membership. Stored values come back as :many
+            ;; strings, regardless of how the user inserted (string vs
+            ;; keyword). Compare via str-coercion so both shapes work.
+            (and (= :enum (:kind spec)) (some? v))
+            (when-not (contains? (:values spec) (str v))
+              (throw (ex-info "invalid input value for enum"
+                              {:error :invalid-text-representation
+                               :type  (:enum-name spec)
+                               :value v
+                               :table table-name
+                               :column col-name})))))))))
+
 (defn- read-fk-constraints
   "All FK constraints where the given table is the CHILD side. Returns
-   a list of {:name :child-cols :parent-table :parent-cols :on-delete}
-   entries. Column lists come back as vectors (the stored form is
-   JSON)."
+   a vector of {:name :child-cols :parent-table :parent-cols} entries.
+   Column lists come back as vectors (the stored form is JSON).
+   Memoised per (schema, table)."
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
-        rows (q-fn '{:find [?n ?cc ?pt ?pc]
-                     :keys [name child-cols parent-table parent-cols]
-                     :in [$ ?tbl]
-                     :where [[?e :pg/fk-name ?n]
-                             [?e :pg/fk-child-table ?tbl]
-                             [?e :pg/fk-child-cols ?cc]
-                             [?e :pg/fk-parent-table ?pt]
-                             [?e :pg/fk-parent-cols ?pc]]}
-                   db table-name)]
-    (map (fn [{:keys [name child-cols parent-table parent-cols]}]
-           {:name name
-            :child-cols (vec (jb/parse-jsonb child-cols))
-            :parent-table parent-table
-            :parent-cols (vec (jb/parse-jsonb parent-cols))})
-         rows)))
+  (let [v (schema-cached db [::fk-child table-name]
+                         #(let [rows (d/q '{:find [?n ?cc ?pt ?pc]
+                                            :keys [name child-cols parent-table parent-cols]
+                                            :in [$ ?tbl]
+                                            :where [[?e :pg/fk-name ?n]
+                                                    [?e :pg/fk-child-table ?tbl]
+                                                    [?e :pg/fk-child-cols ?cc]
+                                                    [?e :pg/fk-parent-table ?pt]
+                                                    [?e :pg/fk-parent-cols ?pc]]}
+                                          db table-name)]
+                            (mapv (fn [{:keys [name child-cols parent-table parent-cols]}]
+                                    {:name name
+                                     :child-cols (vec (jb/parse-jsonb child-cols))
+                                     :parent-table parent-table
+                                     :parent-cols (vec (jb/parse-jsonb parent-cols))})
+                                  rows)))]
+    (if (= ::nil v) [] v)))
 
 (defn- read-fks-referring-to
   "All FK constraints where the given table is the PARENT side — i.e.
@@ -1192,7 +1426,7 @@
    (or its PK is updated). Used by DELETE / UPDATE to enforce
    parent-side RESTRICT and CASCADE actions."
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)]
+  (let [q-fn d/q]
     (map (fn [[n ct cc pc od]]
            {:name n :child-table ct
             :child-cols (vec (jb/parse-jsonb cc))
@@ -1218,7 +1452,7 @@
   [txdb table-name ns entity-maps]
   (let [fks (seq (read-fk-constraints txdb table-name))]
     (when fks
-      (let [q-fn (requiring-resolve 'datahike.api/q)]
+      (let [q-fn d/q]
         (doseq [em entity-maps
                 {:keys [name child-cols parent-table parent-cols]} fks
                 :let [child-vals (mapv #(get em (keyword ns %)) child-cols)]
@@ -1248,7 +1482,7 @@
   "Find child eids that reference any of the parent eids via the given FK.
    Returns the eids as a set, or empty set if none."
   [db table-name fk eids]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         {:keys [child-table child-cols parent-cols]} fk
         parent-attrs (mapv #(keyword table-name %) parent-cols)
         child-attrs (mapv #(keyword child-table %) child-cols)]
@@ -1296,7 +1530,7 @@
                   :let [parent-attrs (mapv #(keyword t %) parent-cols)
                         eid (first es)
                         parent-vals (mapv (fn [a]
-                                            (ffirst ((requiring-resolve 'datahike.api/q)
+                                            (ffirst (d/q
                                                      {:find '[?v]
                                                       :in '[$ ?e]
                                                       :where [['?e a '?v]]}
@@ -1363,7 +1597,7 @@
   [db table-name tx-data]
   (let [fks (seq (read-fks-referring-to db table-name))]
     (when fks
-      (let [q-fn (requiring-resolve 'datahike.api/q)
+      (let [q-fn d/q
             parent-col-attrs (into #{}
                                    (mapcat (fn [{:keys [parent-cols]}]
                                              (map #(keyword table-name %) parent-cols))
@@ -1406,46 +1640,37 @@
                                         ") is still referenced from table \""
                                         child-table "\"")})))))))
 
-(defn- read-column-constraints
-  "Return {col-name {:attr ident :not-null? bool :default [kind value arg]}}
-   for the columns of `table-name`, read from the schema entity's custom
-   attrs. Invoked once per INSERT/UPDATE — cheap relative to d/transact.
-
-   Issues two focused queries (NOT NULL set, DEFAULT triples) and
-   merges; simpler than a single `or-join` that tries to left-join
-   optional attrs in one pass — Datahike's datalog-parser rejects a
-   lot of the or-join shapes that'd be natural for that."
+(defn- read-column-constraints*
   [db table-name]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
-        not-null-idents (into #{}
+  (let [not-null-idents (into #{}
                               (map first)
-                              (q-fn '{:find [?ident]
-                                      :in [$ ?tbl]
-                                      :where [[?e :db/ident ?ident]
-                                              [?e :pg/not-null true]
-                                              [(namespace ?ident) ?ns]
-                                              [(= ?ns ?tbl)]]}
-                                    db table-name))
-        default-rows (q-fn '{:find [?ident ?dk]
-                             :in [$ ?tbl]
-                             :where [[?e :db/ident ?ident]
-                                     [?e :pg/default-kind ?dk]
-                                     [(namespace ?ident) ?ns]
-                                     [(= ?ns ?tbl)]]}
-                           db table-name)
+                              (d/q '{:find [?ident]
+                                     :in [$ ?tbl]
+                                     :where [[?e :db/ident ?ident]
+                                             [?e :pg/not-null true]
+                                             [(namespace ?ident) ?ns]
+                                             [(= ?ns ?tbl)]]}
+                                   db table-name))
+        default-rows (d/q '{:find [?ident ?dk]
+                            :in [$ ?tbl]
+                            :where [[?e :db/ident ?ident]
+                                    [?e :pg/default-kind ?dk]
+                                    [(namespace ?ident) ?ns]
+                                    [(= ?ns ?tbl)]]}
+                          db table-name)
         ident->default
         (into {}
               (for [[ident dk] default-rows]
-                (let [dv (ffirst (q-fn '{:find [?v]
-                                         :in [$ ?i]
-                                         :where [[?e :db/ident ?i]
-                                                 [?e :pg/default-value ?v]]}
-                                       db ident))
-                      da (ffirst (q-fn '{:find [?a]
-                                         :in [$ ?i]
-                                         :where [[?e :db/ident ?i]
-                                                 [?e :pg/default-arg ?a]]}
-                                       db ident))]
+                (let [dv (ffirst (d/q '{:find [?v]
+                                        :in [$ ?i]
+                                        :where [[?e :db/ident ?i]
+                                                [?e :pg/default-value ?v]]}
+                                      db ident))
+                      da (ffirst (d/q '{:find [?a]
+                                        :in [$ ?i]
+                                        :where [[?e :db/ident ?i]
+                                                [?e :pg/default-arg ?a]]}
+                                      db ident))]
                   [ident [dk dv da]])))
         all-idents (into not-null-idents (keys ident->default))]
     (into {}
@@ -1454,6 +1679,17 @@
              {:attr ident
               :not-null? (contains? not-null-idents ident)
               :default (get ident->default ident)}]))))
+
+(defn- read-column-constraints
+  "Return {col-name {:attr ident :not-null? bool :default [kind value arg]}}
+   for the columns of `table-name`, read from the schema entity's custom
+   attrs. Memoised per (schema, table) — used to fire 2-3 d/q calls
+   per INSERT against immutable schema metadata, ~0.6 ms/row of pure
+   waste on the Pagila pg_dump replay."
+  [db table-name]
+  (let [v (schema-cached db [::col table-name]
+                         #(read-column-constraints* db table-name))]
+    (if (= ::nil v) {} v)))
 
 (defn- apply-column-constraints
   "Wrap an INSERT tx-data vector in a :db.fn/call that validates
@@ -1478,12 +1714,13 @@
   [tx-data table-name ns db]
   (let [cols (read-column-constraints db table-name)
         has-checks? (seq (read-check-constraints db table-name))
-        has-fks? (seq (read-fk-constraints db table-name))]
-    (if (and (empty? cols) (not has-checks?) (not has-fks?))
+        has-fks? (seq (read-fk-constraints db table-name))
+        has-domain-enum? (seq (read-domain-enum-checks db table-name))]
+    (if (and (empty? cols) (not has-checks?) (not has-fks?) (not has-domain-enum?))
       tx-data
       [[:db.fn/call
         (fn [txdb]
-          (let [q-fn (requiring-resolve 'datahike.api/q)
+          (let [q-fn d/q
                 bump-seq! (fn [seq-name]
                             ;; Mirror the behavior in auto-populate-identity:
                             ;; find the sequence entity, compute next value,
@@ -1576,6 +1813,8 @@
             (when has-checks?
               (doseq [em filled-entities]
                 (enforce-check-constraints! txdb table-name ns em)))
+            (when has-domain-enum?
+              (enforce-domain-enum-checks! txdb table-name ns filled-entities))
             (when has-fks?
               (enforce-fk-on-insert! txdb table-name ns filled-entities))
             result))]])))
@@ -1819,7 +2058,7 @@
    A retract of a non-null attr is equivalent to setting it to NULL,
    which PG rejects."
   [db tx-data]
-  (let [q-fn (requiring-resolve 'datahike.api/q)
+  (let [q-fn d/q
         not-null-attrs (into #{}
                              (map first)
                              (q-fn '{:find [?ident]
@@ -2290,6 +2529,36 @@
                           (update :in-args sql/substitute-params fetch)))
                       subs))))))
 
+(declare nextval!)
+
+(defn- resolve-nextval-markers
+  "Sibling pass to `resolve-param-refs`: walk `parsed`'s tx-data /
+   in-args / sub-results and replace every `{:fn :nextval :seq-name S}`
+   marker (emitted by translate-* for `nextval('s')` in VALUES / SET
+   expressions) with the long produced by an actual nextval against
+   the live conn.
+
+   Runs after ParamRef substitution and before per-type dispatch so the
+   markers never reach the transactor. Each call commits independently
+   via the same CAS-retry path `SELECT nextval(...)` uses, matching
+   PG's non-transactional `nextval` semantics: advances stick even if
+   the surrounding tx rolls back, and concurrent advances yield
+   distinct values."
+  [parsed conn]
+  (let [resolver #(nextval! conn %)
+        resolve  #(sql/resolve-nextvals! % resolver)]
+    (cond-> parsed
+      (contains? parsed :in-args)     (update :in-args resolve)
+      (contains? parsed :tx-data)     (update :tx-data resolve)
+      (contains? parsed :sub-results)
+      (update :sub-results
+              (fn [subs]
+                (mapv (fn [sub]
+                        (cond-> sub
+                          (contains? sub :in-args) (update :in-args resolve)
+                          (contains? sub :tx-data) (update :tx-data resolve)))
+                      subs))))))
+
 (def ^:private compat-presets
   "Named bundles for :compat. Each maps to a :silently-accept set
    that's merged on top of the caller's explicit set.
@@ -2299,12 +2568,28 @@
                        has no meaning in our data model: GRANT, REVOKE,
                        POLICY, RLS, CREATE/DROP EXTENSION. Makes
                        Hibernate, Odoo, Alembic, Flyway, etc. boot
-                       cleanly. (COMMENT ON, LOCK TABLE, CREATE VIEW,
-                       CREATE INDEX and arbitrary SET vars are already
-                       silently accepted unconditionally — see
-                       sql/system-query?.)"
+                       cleanly.
+   :pg-dump          — superset of :permissive that also accepts the
+                       extra DDL `pg_dump` emits for non-data schema
+                       objects we don't model: triggers, functions,
+                       procedures, aggregates, materialized views,
+                       rules, operators, casts, languages, partition
+                       attach/detach, ALTER TYPE / ALTER DOMAIN
+                       boilerplate. The data load + roundtrip still
+                       work; advisory side-effects (audit triggers,
+                       computed defaults driven by triggers) are lost.
+
+   (COMMENT ON, LOCK TABLE, CREATE VIEW, CREATE INDEX and arbitrary
+   SET vars are already silently accepted unconditionally — see
+   sql/system-query?.)"
   {:strict     #{}
-   :permissive #{:grant :revoke :policy :rls :create-extension}})
+   :permissive #{:grant :revoke :policy :rls :create-extension}
+   :pg-dump    #{:grant :revoke :policy :rls :create-extension
+                 :trigger :function :procedure :aggregate
+                 :materialized-view :rule :operator :cast :language
+                 :attach-partition :alter-type :alter-domain
+                 ;; non-ENUM CREATE TYPE forms (composite, range, base)
+                 :type}})
 
 (defn- resolve-silently-accept [{:keys [compat silently-accept]}]
   (let [preset (get compat-presets (or compat :strict))]
@@ -2394,6 +2679,7 @@
     :nextval                {:names ["nextval"]                    :oids [PgWireServer/OID_INT8]}
     :currval                {:names ["currval"]                    :oids [PgWireServer/OID_INT8]}
     :setval                 {:names ["setval"]                     :oids [PgWireServer/OID_INT8]}
+    :set-config             {:names ["set_config"]                 :oids [PgWireServer/OID_TEXT]}
     :advisory-lock          {:names ["pg_advisory_lock"]           :oids [OID_VOID]}
     :advisory-xact-lock     {:names ["pg_advisory_xact_lock"]      :oids [OID_VOID]}
     :advisory-unlock-all    {:names ["pg_advisory_unlock_all"]     :oids [OID_VOID]}
@@ -3065,13 +3351,14 @@
    retries even at thousands of qps; 100 is generous."
   100)
 
-(defn- handle-nextval
-  "SELECT nextval('seq_name') — atomically advance the sequence entity
-   and return the new value.
+(defn nextval!
+  "Atomically advance the named sequence on `conn` and return the new
+   long. Shared core of `SELECT nextval(...)` and INSERT-VALUES nextval
+   resolution.
 
    PG semantics: a `nextval` advance is never rolled back, even by
    ROLLBACK on the surrounding transaction. We match that by always
-   committing to the live conn, regardless of the session's `:in-tx?`
+   committing to the live conn, regardless of any session's `:in-tx?`
    state.
 
    Atomicity: optimistic CAS-retry. Each iteration reads the current
@@ -3093,75 +3380,76 @@
    to recover the value this call assigned doesn't work — it returns
    the LAST tx in the batch. CAS sidesteps that: the value we
    intended is the literal `new` slot of the op-vec, available
-   without reading `:db-after`."
+   without reading `:db-after`.
+
+   Throws ex-info `:undefined-sequence` if the named sequence does
+   not exist, and `:serialization-failure` if the contention retry
+   budget is exhausted."
+  [conn ^String seq-name]
+  (let [q-fn d/q
+        db0 (d/db conn)
+        ;; Schema-qualified name (`public.foo_seq`)? Sequences live in a
+        ;; flat namespace in pg-datahike, so strip the schema prefix —
+        ;; same convention CREATE SEQUENCE uses.
+        bare-name (if (and seq-name (clojure.string/includes? seq-name "."))
+                    (last (clojure.string/split seq-name #"\." 2))
+                    seq-name)
+        eid (ffirst (q-fn '{:find [?e]
+                            :where [[?e :__seq__/name ?n]]
+                            :in [$ ?n]}
+                          db0 bare-name))
+        _ (when-not eid
+            (throw (ex-info "sequence does not exist"
+                            {:error :undefined-sequence
+                             :sequence seq-name})))
+        incr (or (ffirst (q-fn '{:find [?i]
+                                 :where [[?e :__seq__/increment ?i]]
+                                 :in [$ ?e]}
+                               db0 eid))
+                 1)
+        read-curr (fn []
+                    (ffirst (q-fn '{:find [?v]
+                                    :where [[?e :__seq__/value ?v]]
+                                    :in [$ ?e]}
+                                  (d/db conn) eid)))
+        ;; CAS failure detection: Datahike's transactor raises an
+        ;; ex-info with `{:error :transact/cas}`, but the writer's
+        ;; throwable-promise + CompletableFuture wrapping strips
+        ;; the structured ex-data by the time we see the throw on
+        ;; the caller thread. The original message is preserved
+        ;; (verbatim "_db.fn/cas failed_" substring), so we match
+        ;; on that.
+        cas-failure? (fn [^Throwable e]
+                       (when-let [m (.getMessage e)]
+                         (.contains m ":db.fn/cas failed")))]
+    ;; Exponential backoff between retries: 1ms, 2ms, 4ms, …
+    ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
+    ;; (commit-wait-time) between batches before flushing.
+    (loop [attempt 0]
+      (let [curr (or (read-curr) 0)
+            next (+ curr incr)
+            cas-ok?
+            (try (d/transact conn [[:db/cas eid :__seq__/value curr next]])
+                 true
+                 (catch Throwable e
+                   (if (cas-failure? e) false (throw e))))]
+        (cond
+          cas-ok? next
+          (>= attempt nextval-max-retries)
+          (throw (ex-info "nextval contention retry budget exhausted"
+                          {:error :serialization-failure
+                           :detail (str "nextval('" seq-name "') gave up after "
+                                        nextval-max-retries " contention retries")
+                           :sequence seq-name}))
+          :else
+          (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
+              (recur (inc attempt))))))))
+
+(defn- handle-nextval
+  "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
   [{:keys [conn]} parsed]
   (try
-    (let [seq-name (:seq-name parsed)
-          q-fn (requiring-resolve 'datahike.api/q)
-          ;; Look up seq-eid + increment ONCE (they don't change after
-          ;; CREATE SEQUENCE). Only the running value moves under
-          ;; contention.
-          db0 (d/db conn)
-          eid (ffirst (q-fn '{:find [?e]
-                              :where [[?e :__seq__/name ?n]]
-                              :in [$ ?n]}
-                            db0 seq-name))
-          _ (when-not eid
-              (throw (ex-info "sequence does not exist"
-                              {:error :undefined-sequence
-                               :sequence seq-name})))
-          incr (or (ffirst (q-fn '{:find [?i]
-                                   :where [[?e :__seq__/increment ?i]]
-                                   :in [$ ?e]}
-                                 db0 eid))
-                   1)
-          read-curr (fn [^long _attempt]
-                      (ffirst (q-fn '{:find [?v]
-                                      :where [[?e :__seq__/value ?v]]
-                                      :in [$ ?e]}
-                                    (d/db conn) eid)))
-          ;; CAS failure detection: Datahike's transactor raises an
-          ;; ex-info with `{:error :transact/cas}`, but the writer's
-          ;; throwable-promise + CompletableFuture wrapping strips
-          ;; the structured ex-data by the time we see the throw on
-          ;; the caller thread. The original message is preserved
-          ;; (verbatim "_db.fn/cas failed_" substring), so we match
-          ;; on that.
-          cas-failure? (fn [^Throwable e]
-                         (when-let [m (.getMessage e)]
-                           (.contains m ":db.fn/cas failed")))
-          new-val
-          ;; Exponential backoff between retries: 1ms, 2ms, 4ms, …
-          ;; capped at 100ms. Datahike's commit-loop waits up to 50ms
-          ;; (commit-wait-time) between batches before flushing, so
-          ;; without a sleep the retrying caller spins on a still-
-          ;; stale conn-atom and burns through its retry budget before
-          ;; the winner's commit lands. With backoff we yield long
-          ;; enough for the writer to publish, then re-read the now-
-          ;; advanced value and try again.
-          (loop [attempt 0]
-            (let [curr (or (read-curr attempt) 0)
-                  next (+ curr incr)
-                  cas-ok?
-                  (try
-                    (d/transact conn [[:db/cas eid :__seq__/value curr next]])
-                    true
-                    (catch Throwable e
-                      (if (cas-failure? e)
-                        false
-                        (throw e))))]
-              (cond
-                cas-ok? next
-                (>= attempt nextval-max-retries)
-                (throw (ex-info "nextval contention retry budget exhausted"
-                                {:error  :serialization-failure
-                                 :detail (str "nextval('" seq-name "') gave up after "
-                                              nextval-max-retries " contention retries")
-                                 :sequence seq-name}))
-                :else
-                (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
-                    (recur (inc attempt))))))]
-      (single-row-result "nextval" PgWireServer/OID_INT8 (str new-val)))
+    (single-row-result "nextval" PgWireServer/OID_INT8 (str (nextval! conn (:seq-name parsed))))
     (catch Exception e
       (classified-error "nextval error: " e))))
 
@@ -3171,7 +3459,9 @@
    and good enough for the common idempotent-seed pattern)."
   [{:keys [conn tx-state]} parsed]
   (try
-    (let [seq-name (:seq-name parsed)
+    (let [seq-name (some-> (:seq-name parsed)
+                           (#(if (clojure.string/includes? % ".")
+                               (last (clojure.string/split % #"\." 2)) %)))
           lookup-db (if (:in-tx? @tx-state)
                       (:speculative-db @tx-state)
                       (d/db conn))
@@ -3191,7 +3481,9 @@
    (we just persist N)."
   [{:keys [conn tx-state]} parsed]
   (try
-    (let [seq-name (:seq-name parsed)
+    (let [seq-name (some-> (:seq-name parsed)
+                           (#(if (clojure.string/includes? % ".")
+                               (last (clojure.string/split % #"\." 2)) %)))
           new-val (:new-value parsed)
           lookup-db (if (:in-tx? @tx-state)
                       (:speculative-db @tx-state)
@@ -3221,6 +3513,12 @@
 ;; ctx is constructed once per query in make-query-handler's execute body
 ;; (see the comment block above that ctx literal for the key contract).
 ;; ============================================================================
+
+;; Forward declarations — exec-system dispatches to exec-copy-from-stdin
+;; for `:copy-from-stdin`, but exec-copy-from-stdin (which depends on
+;; helpers like columns-from-schema, copy-flush-batch!) is defined further
+;; below to keep related code contiguous.
+(declare exec-copy-from-stdin)
 
 (defn- exec-system
   "Dispatch on (:system-type parsed). System-types are recognised by
@@ -3262,6 +3560,51 @@
       ;; CREATE / DROP / ALTER SCHEMA — classify :tag already
       ;; encodes the full "CREATE SCHEMA" / "DROP SCHEMA" / etc.
       (empty-result (:tag parsed))
+
+      :owner-noop
+      ;; ALTER <object> ... OWNER TO <role>. pg_dump-emitted; we
+      ;; don't have a role system. classify carries the matching
+      ;; tag ("ALTER TABLE" / "ALTER SEQUENCE" / …).
+      (empty-result (:tag parsed))
+
+      :psql-meta
+      ;; \restrict / \unrestrict / \connect / \c / \set markers
+      ;; that pg_dump emits and that leaked through psql. classify
+      ;; carries the original \-prefixed metacommand as :tag.
+      (empty-result (:tag parsed))
+
+      :set-config
+      ;; SELECT pg_catalog.set_config('search_path', '', false) —
+      ;; pg_dump session-prelude. We don't honor the GUC (no
+      ;; equivalent in Datahike); just synthesize a 1-row result so
+      ;; the SELECT completes cleanly. The 3-arg form returns the
+      ;; new value as text; we return empty-string.
+      (single-row-result "set_config" PgWireServer/OID_TEXT "")
+
+      :copy-from-stdin
+      ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
+      ;; QueryResult flagged copyInMode — the wire layer emits
+      ;; CopyInResponse and transitions to COPY-IN sub-protocol;
+      ;; subsequent CopyData/CopyDone/CopyFail messages route to
+      ;; the QueryHandler reify's copyChunk/copyComplete/copyAbort
+      ;; methods, which mutate the :copy-state atom.
+      (try
+        (exec-copy-from-stdin ctx parsed)
+        (catch clojure.lang.ExceptionInfo e
+          (let [data (ex-data e)
+                state (or (:sqlstate data)
+                          (case (:error data)
+                            :undefined-table "42P01"
+                            :feature-not-supported "0A000"
+                            :syntax-error "42601"
+                            "XX000"))]
+            (-> (PgWireServer$QueryResult.
+                 (str "COPY failed: " (.getMessage e)))
+                (.withSqlstate state))))
+        (catch Throwable e
+          (-> (PgWireServer$QueryResult.
+               (str "COPY failed: " (.getMessage e)))
+              (.withSqlstate "XX000"))))
 
       :create-database
       ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via the
@@ -3658,10 +4001,50 @@
                 (.withColumnTypmods (nth sources 2)))
             result))))))
 
+(defn- exec-batchable-insert
+  "Append-time half of deferred-CC batching. Builds the same tx-data
+   as `execute-insert` (auto-populate-identity + apply-column-
+   constraints), validates it via `dc/with` against the running
+   speculative-db, and — on success — returns a `withBatchable`
+   QueryResult so the wire layer holds the CommandComplete and parks
+   the tx-data into its per-connection buffer.
+
+   Constraint violations (NOT NULL, CHECK, FK, etc.) fire here via
+   `dc/with` and surface synchronously: matches PG's IMMEDIATE
+   constraint behaviour for auto-commit. Only system-level errors
+   (konserve I/O) and cross-connection races against another
+   connection's commit can land at flush time."
+  [ctx parsed batch-state]
+  (let [{:keys [conn]} ctx
+        table-name (:table parsed)
+        ;; Anchor on the spec-db when present so consecutive batched
+        ;; INSERTs see each other's effects (sequence increments,
+        ;; uniqueness, FKs to siblings). First call in a scope reads
+        ;; live db.
+        anchor-db (or (:spec-db @batch-state) (d/db conn))
+        tx-data (-> (:tx-data parsed)
+                    (auto-populate-identity table-name anchor-db)
+                    (apply-column-constraints table-name (:ns parsed) anchor-db))]
+    (try
+      (let [spec-report (dc/with anchor-db tx-data)]
+        ;; Update the running spec-db so the next batchable INSERT
+        ;; sees this row. The wire layer keeps the parallel tx-data
+        ;; list and CommandComplete tags.
+        (swap! batch-state assoc :spec-db (:db-after spec-report))
+        (.withBatchable ^PgWireServer$QueryResult
+         (empty-result (str "INSERT 0 " (:count parsed)))
+                        tx-data))
+      (catch Exception e
+        ;; Synchronous validation failure — return a normal error
+        ;; result. The batch state isn't updated, so subsequent
+        ;; statements continue from the prior spec-db / live db.
+        (classified-error "INSERT error: " e)))))
+
 (defn- exec-insert
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx]
-    (if (:in-tx? @tx-state)
+  (let [{:keys [conn tx-state batch-state]} ctx]
+    (cond
+      (:in-tx? @tx-state)
       (try
         (let [table-name (:table parsed)
               spec-db (:speculative-db @tx-state)
@@ -3719,6 +4102,29 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
+
+      ;; Auto-commit + wire-layer-driven batching scope. Only INSERTs
+      ;; whose tx-data is a vector (i.e. ordinary INSERT VALUES /
+      ;; INSERT … SELECT) and that don't need RETURNING (which would
+      ;; have to read db-after row-by-row to build the response) take
+      ;; the batchable path. ON CONFLICT wraps tx-data in :db.fn/call
+      ;; and writes through a row-refs atom — that's incompatible
+      ;; with held-CC semantics, so it falls through.
+      ;;
+      ;; The Java wire layer handles deferral for both protocol modes:
+      ;; for Simple Query 'Q' it holds CommandComplete strings; for
+      ;; Extended Query (P/B/D/E) it holds the full per-statement
+      ;; response byte chunks (ParseComplete + BindComplete +
+      ;; NoData/RowDescription + CC) so the relative wire-message
+      ;; order matches what default PG would emit.
+      (and batch-state
+           @batch-state
+           (vector? (:tx-data parsed))
+           (not (:returning parsed))
+           (not *snapshot-db*))
+      (exec-batchable-insert ctx parsed batch-state)
+
+      :else
       (execute-insert conn parsed))))
 
 (defn- exec-update-with-recursive
@@ -3818,6 +4224,87 @@
         (empty-result "CREATE SEQUENCE")
         (catch Exception e
           (classified-error "CREATE SEQUENCE error: " e))))))
+
+(defn- enum-tx-data
+  "Build the registry tx-data for a CREATE TYPE … AS ENUM. Stored as a
+   single entity under the `:datahike.pg.enum/*` namespace.
+
+   - `:datahike.pg.enum/name` — unique by identity
+   - `:datahike.pg.enum/values` — vector of strings (declaration order)
+   - `:datahike.pg.enum/value-set` — same values as a `:db.type/string`
+     :cardinality/many for fast membership tests"
+  [type-name values]
+  [;; idempotent schema attrs (ok to re-transact across CREATEs).
+   {:db/ident :datahike.pg.enum/name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :datahike.pg.enum/values
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many}
+   {:db/ident :datahike.pg.enum/values-ordered
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   ;; the entity itself. We store values both as a many-cardinality
+   ;; set (for fast contains?) AND as a single ordered string
+   ;; (newline-separated) so dump can recover declaration order.
+   {:datahike.pg.enum/name type-name
+    :datahike.pg.enum/values (set values)
+    :datahike.pg.enum/values-ordered (clojure.string/join "\n" values)}])
+
+(defn- exec-ddl-create-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        tx-data (enum-tx-data (:type-name parsed) (:values parsed))]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
+      (try
+        (d/transact conn tx-data)
+        (empty-result "CREATE TYPE")
+        (catch Exception e
+          (classified-error "CREATE TYPE error: " e))))))
+
+(defn- domain-tx-data
+  "Build the registry tx-data for a CREATE DOMAIN. Stored as a single
+   entity under `:datahike.pg.domain/*`. Optional attrs (check-name,
+   check-expr, default-raw) are dissoc'd when nil so we don't write
+   `nil`s as datoms."
+  [{:keys [domain-name base-type base-args
+           check-name check-expr not-null default-raw]}]
+  [{:db/ident :datahike.pg.domain/name
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :datahike.pg.domain/base-type
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/base-args
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+   {:db/ident :datahike.pg.domain/check-name
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/check-expr
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/not-null
+    :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.domain/default-raw
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   (cond-> {:datahike.pg.domain/name domain-name
+            :datahike.pg.domain/base-type base-type
+            :datahike.pg.domain/not-null (boolean not-null)}
+     (seq base-args)         (assoc :datahike.pg.domain/base-args (set base-args))
+     check-name              (assoc :datahike.pg.domain/check-name check-name)
+     check-expr              (assoc :datahike.pg.domain/check-expr check-expr)
+     default-raw             (assoc :datahike.pg.domain/default-raw default-raw))])
+
+(defn- exec-ddl-create-domain
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        tx-data (domain-tx-data (:domain parsed))]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE DOMAIN")
+      (try
+        (d/transact conn tx-data)
+        (empty-result "CREATE DOMAIN")
+        (catch Exception e
+          (classified-error "CREATE DOMAIN error: " e))))))
 
 (defn- exec-savepoint
   [ctx _parsed]
@@ -4049,6 +4536,101 @@
           (swap! tx-state assoc :aborted? true))
         (error-result msg code)))))
 
+(defn- columns-from-schema
+  "When `COPY t FROM stdin` is invoked WITHOUT an explicit column
+   list, derive the column names from `t`'s schema. Order is the same
+   as `pg_attribute.attnum` would expose — we look at every keyword
+   attribute in the schema whose namespace matches `ns`, in
+   alphabetical order (deterministic; pg_dump uses an explicit
+   column list anyway, so this fallback is mostly used by hand-typed
+   psql `COPY t FROM stdin` invocations)."
+  [schema ns]
+  (->> schema
+       keys
+       (filter keyword?)
+       (filter #(= ns (namespace %)))
+       (remove #(= "db-row-exists" (name %)))
+       (mapv name)
+       sort
+       vec))
+
+(defn- exec-copy-from-stdin
+  "Initialise a COPY-IN session and return a QueryResult signalling
+   `copyInMode`. The wire layer reads that and emits CopyInResponse,
+   then routes subsequent CopyData/CopyDone/CopyFail messages to
+   the QueryHandler reify's copyChunk/copyComplete/copyAbort
+   methods (which read the session out of `:copy-state`)."
+  [ctx parsed]
+  (let [{:keys [schema copy-state]} ctx
+        {:keys [ns table columns options]} parsed
+        ns (or ns table)
+        col-names (or columns (columns-from-schema schema ns))]
+    (when (empty? col-names)
+      (throw (ex-info (str "no columns found for COPY into \"" table "\"")
+                      {:error :undefined-table :table table})))
+    (let [format (:format options)
+          decoder-ns (case format
+                       :text 'datahike.pg.sql.copy.text-format
+                       :csv  'datahike.pg.sql.copy.csv-format)
+          _ (require decoder-ns)
+          make-fn      (resolve (symbol (str decoder-ns) "make-decoder"))
+          step-fn      (resolve (symbol (str decoder-ns) "decode-step"))
+          finalize-fn  (resolve (symbol (str decoder-ns) "decode-finalize"))
+          decoder      (make-fn (assoc options :columns col-names))]
+      (reset! copy-state
+              {:decoder         decoder
+               :decode-step-fn  step-fn
+               :decode-finalize-fn finalize-fn
+               :columns         col-names
+               :ns              ns
+               :table           table
+               :row-marker      (pgs/row-marker-attr table)
+               :rows-committed  0
+               :pending-rows    []
+               :batch-size      1000
+               :error           nil})
+      ;; Return QueryResult signalling COPY-IN with the column count.
+      (let [r (PgWireServer$QueryResult/empty "COPY 0")]
+        (.withCopyInMode r (count col-names))
+        r))))
+
+(defn- copy-flush-batch!
+  "Transact a batch of rows from the copy-state's pending buffer.
+   Mutates the session: clears pending, adds row-count, and on
+   error sets :error so future chunks no-op until copyComplete /
+   copyAbort surfaces it."
+  [ctx]
+  (let [{:keys [conn copy-state]} ctx
+        s @copy-state
+        rows (:pending-rows s)]
+    (when (and (seq rows) (nil? (:error s)))
+      (try
+        (let [tx-data' (-> rows
+                           (auto-populate-identity (:table s) (d/db conn))
+                           (apply-column-constraints (:table s) (:ns s) (d/db conn)))]
+          (d/transact conn tx-data')
+          (swap! copy-state #(-> %
+                                 (assoc :pending-rows [])
+                                 (update :rows-committed + (count rows)))))
+        (catch Throwable e
+          (swap! copy-state assoc :error (.getMessage e))
+          (throw e))))))
+
+(defn- copy-process-rows!
+  "Fold a batch of decoded rows into the session: build entity maps
+   via `copy/row->entity-map`, append to pending, and flush whenever
+   we cross batch-size."
+  [ctx rows]
+  (let [{:keys [copy-state schema]} ctx
+        {:keys [columns ns row-marker batch-size]} @copy-state]
+    (doseq [row rows]
+      (let [next-idx (-> @copy-state :rows-committed (+ (count (:pending-rows @copy-state))))
+            entity (datahike.pg.sql.copy/row->entity-map
+                    row columns ns row-marker schema next-idx)]
+        (swap! copy-state update :pending-rows conj entity)))
+    (when (>= (count (:pending-rows @copy-state)) batch-size)
+      (copy-flush-batch! ctx))))
+
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
 
@@ -4126,7 +4708,33 @@
         ;; DECLARE and hand out slices on FETCH. Good enough for the
         ;; small-result-set ORM usage pattern — streaming cursors would
         ;; need a deeper refactor.
-        cursors (atom {})]
+        cursors (atom {})
+        ;; COPY-IN session state. Set when exec-copy-from-stdin returns
+        ;; a copyInMode QueryResult; the wire layer then routes
+        ;; CopyData / CopyDone / CopyFail messages here. Holds:
+        ;;   {:decoder format-decoder
+        ;;    :decode-step-fn   fn taking [decoder chunk] → [d' rows eod?]
+        ;;    :decode-finalize-fn  fn taking [decoder] → [rows eod?]
+        ;;    :columns ["id" "name" ...]
+        ;;    :ns "users"  :table "users"
+        ;;    :rows-committed long
+        ;;    :pending-rows  vec of partial-batch rows
+        ;;    :batch-size    long}
+        copy-state (atom nil)
+        ;; Deferred-CC INSERT batching state (see exec-insert's batchable
+        ;; branch). Set by beginBatchScope to a per-handler atom; nil when
+        ;; the handler isn't being driven by a wire layer that supports
+        ;; batching. The scope flag is also the signal that we're allowed
+        ;; to return `(.withBatchable r)` results — direct .execute callers
+        ;; never call beginBatchScope, so they always get synchronous
+        ;; commits.
+        ;;
+        ;; Holds: {:spec-db <speculative-db>}  — the speculative-db built
+        ;; up by sequential dc/with calls across batchable INSERTs. The
+        ;; wire layer keeps the parallel tx-data list and CC tags; we
+        ;; only need the running spec-db so the next dc/with sees prior
+        ;; rows in the same scope.
+        batch-state (atom nil)]
     (reify PgWireServer$QueryHandler
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
@@ -4134,9 +4742,101 @@
         ;; session, and clear transaction state.
         (release-session-locks! session-id)
         (release-advisory-locks! session-id)
+        (reset! copy-state nil)
         (reset! tx-state {:in-tx? false :aborted? false
                           :session-id session-id
                           :owned-locks #{}}))
+
+      ;; --- COPY-IN sub-protocol callbacks --------------------------------
+      ;; The wire layer in PgWireServer.java routes CopyData / CopyDone /
+      ;; CopyFail messages here while the connection is in COPY-IN state
+      ;; (entered when a previous execute() returned a copyInMode-flagged
+      ;; QueryResult). The session lives on the :copy-state atom; ctx is
+      ;; built fresh per call from this reify's closures (we don't have
+      ;; the per-execute ctx available here because we're not inside an
+      ;; execute() call — we're a separate Java callback).
+
+      (copyChunk [_ chunk-bytes]
+        (when-let [s @copy-state]
+          (let [chunk (String. ^bytes chunk-bytes java.nio.charset.StandardCharsets/UTF_8)
+                step-fn (:decode-step-fn s)
+                [d' rows _eod?] (step-fn (:decoder s) chunk)
+                ctx-fresh {:conn conn
+                           :schema (:schema (d/db conn))
+                           :copy-state copy-state}]
+            (swap! copy-state assoc :decoder d')
+            (when (seq rows)
+              (copy-process-rows! ctx-fresh rows)))))
+
+      (copyComplete [_]
+        (let [s @copy-state]
+          (if (nil? s)
+            (PgWireServer$QueryResult/empty "COPY 0")
+            (let [ctx-fresh {:conn conn
+                             :schema (:schema (d/db conn))
+                             :copy-state copy-state}
+                  finalize-fn (:decode-finalize-fn s)
+                  [final-rows _eod?] (finalize-fn (:decoder s))]
+              (when (seq final-rows)
+                (copy-process-rows! ctx-fresh final-rows))
+              (try
+                ;; Drain remaining pending rows
+                (copy-flush-batch! ctx-fresh)
+                (let [committed (:rows-committed @copy-state)]
+                  (reset! copy-state nil)
+                  (PgWireServer$QueryResult/empty (str "COPY " committed)))
+                (catch Throwable e
+                  (let [committed (:rows-committed @copy-state)]
+                    (reset! copy-state nil)
+                    (-> (PgWireServer$QueryResult.
+                         (str "COPY failed after " committed " rows: "
+                              (.getMessage e)))
+                        (.withSqlstate
+                         (or (some-> e ex-data :sqlstate)
+                             "XX000"))))))))))
+
+      (copyAbort [_ _reason]
+        (reset! copy-state nil))
+
+      ;; --- Deferred-CC INSERT batching ---------------------------------
+      ;; The wire layer calls beginBatchScope once per connection; that
+      ;; flips the per-handler batch-state atom from nil to
+      ;; {:spec-db nil}. exec-insert keys on that scalar to decide
+      ;; whether to take the batchable path. Direct .execute callers
+      ;; (test fixtures, embedded use) never call beginBatchScope, so
+      ;; batch-state stays nil and every INSERT commits synchronously
+      ;; via execute-insert.
+      (beginBatchScope [_]
+        ;; Idempotent: only the first call activates scope; subsequent
+        ;; calls leave a running spec-db (if any) intact.
+        (compare-and-set! batch-state nil {:spec-db nil}))
+
+      ;; flushBatch is called by the wire layer when it must drain
+      ;; the per-connection buffer (Sync, end-of-Q, or before a non-
+      ;; batchable statement). The argument is the in-arrival-order
+      ;; list of tx-data payloads we returned via withBatchable.
+      ;;
+      ;; dc/with at append time already validated each row against
+      ;; the running spec-db, so the only failure modes we can hit
+      ;; here are system-level (konserve I/O) or cross-connection
+      ;; races (another connection's commit landed between our
+      ;; dc/with and this transact and invalidated the row's
+      ;; uniqueness). Both are documented PG situations where an
+      ;; Error at COMMIT is acceptable.
+      (flushBatch [_ tx-data-list]
+        ;; Clear the running spec-db so the next batchable INSERT
+        ;; (after this flush) re-anchors on the now-committed live
+        ;; db. Scope itself stays open until the connection closes.
+        (when @batch-state
+          (swap! batch-state assoc :spec-db nil))
+        (when (and tx-data-list (pos? (.size tx-data-list)))
+          (try
+            (let [combined (vec (mapcat identity tx-data-list))]
+              (when (seq combined)
+                (d/transact conn combined)))
+            nil
+            (catch Exception e
+              (classified-error "INSERT (batched) error: " e)))))
 
       ;; --- Extended Query protocol methods -------------------------------
 
@@ -4366,7 +5066,12 @@
                                      cached)
                                    (let [p (sql/parse-sql sql schema db)]
                                      (when bump-dispatch! (bump-dispatch! p))
-                                     p))]
+                                     p))
+                          ;; Sibling pass to ParamRef substitution: any
+                          ;; `nextval('s')` markers left in tx-data/in-args
+                          ;; resolve here against the live conn (PG's
+                          ;; non-transactional nextval semantics).
+                          parsed (resolve-nextval-markers parsed conn)]
                       ;; ctx is the dispatch context shared across every
                       ;; per-type executor. Keys:
                       ;;   :conn           — Datahike conn for THIS db
@@ -4385,12 +5090,19 @@
                       ;;                     CREATE/DROP DATABASE; nil → 0A000
                       ;;   :registry-atom  — server-level {name → conn} atom; CREATE/DROP
                       ;;                     DATABASE swap! through it
+                      ;;   :copy-state     — atom holding the COPY-IN session
+                      ;;                     (decoder, decoder fns, target table, batch
+                      ;;                     accumulator, rows-committed counter); set
+                      ;;                     by exec-copy-from-stdin, mutated by
+                      ;;                     copyChunk/copyComplete/copyAbort callbacks
                       (let [ctx {:conn conn
                                  :session-id session-id
                                  :session-state session-state
                                  :tx-state tx-state
                                  :sql-prepared sql-prepared
                                  :cursors cursors
+                                 :copy-state copy-state
+                                 :batch-state batch-state
                                  :silently-accept silently-accept
                                  :handler this
                                  :sql sql
@@ -4406,15 +5118,30 @@
                           :update-with-recursive (exec-update-with-recursive ctx parsed)
                           :update                (exec-update ctx parsed)
                           :delete                (exec-delete ctx parsed)
-                          :ddl-create            (exec-ddl-create ctx parsed)
-                          :ddl-create-sequence   (exec-ddl-create-sequence ctx parsed)
+                          ;; Every DDL exec-* invalidates the per-schema cache.
+                          ;; PG metadata (`:pg/not-null` etc.) lives on schema-
+                          ;; attribute entities but not in `(:schema db)`, so
+                          ;; identity-keyed caches can't detect a constraint
+                          ;; add via ALTER TABLE without an explicit bust.
+                          :ddl-create            (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create ctx parsed))
+                          :ddl-create-sequence   (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-sequence ctx parsed))
+                          :ddl-create-enum       (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-enum ctx parsed))
+                          :ddl-create-domain     (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-domain ctx parsed))
                           :savepoint             (exec-savepoint ctx parsed)
                           :release-savepoint     (exec-release-savepoint ctx parsed)
                           :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
-                          :ddl-create-index      (exec-ddl-create-index ctx parsed)
-                          :ddl-alter             (exec-ddl-alter ctx parsed)
-                          :ddl-drop              (exec-ddl-drop ctx parsed)
-                          :ddl-drop-sequence     (exec-ddl-drop-sequence ctx parsed)
+                          :ddl-create-index      (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-index ctx parsed))
+                          :ddl-alter             (do (invalidate-schema-cache!)
+                                                     (exec-ddl-alter ctx parsed))
+                          :ddl-drop              (do (invalidate-schema-cache!)
+                                                     (exec-ddl-drop ctx parsed))
+                          :ddl-drop-sequence     (do (invalidate-schema-cache!)
+                                                     (exec-ddl-drop-sequence ctx parsed))
                           :set-operation         (exec-set-operation ctx parsed)
                           :full-join             (exec-full-join ctx parsed)
                           :error                 (exec-error ctx parsed)

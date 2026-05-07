@@ -145,12 +145,39 @@ jobs:
           no_output_timeout: 5m
 
   unittest:
-    executor: clj-jdk21
+    # Multi-image executor: openjdk-21 primary, postgres-16 sidecar.
+    # The sidecar serves the byte-identical-roundtrip tests in
+    # `pg-chinook-roundtrip-test`, which load Chinook into both
+    # pg-datahike and a real PG and diff per-row. Without the sidecar
+    # those tests skip-but-fail on Kaocha 1.91 ("test ran without
+    # assertions"). Credentials match the test's defaults
+    # (alice / foo); override via PGWIRE_REAL_PG_* if a future test
+    # needs different ones.
+    docker:
+      - image: cimg/openjdk:21.0
+      - image: cimg/postgres:16.0
+        environment:
+          POSTGRES_USER: alice
+          POSTGRES_PASSWORD: foo
+          POSTGRES_DB: postgres
+    resource_class: medium
     steps:
       - checkout
       - attach_workspace:
           at: /home/circleci
       - install-clj-tools
+      - run:
+          name: Install netcat (for postgres wait)
+          command: sudo apt-get update && sudo apt-get install -y --no-install-recommends netcat-openbsd
+      - run:
+          name: Wait for Postgres on :5432
+          command: |
+            for i in $(seq 1 60); do
+              nc -z localhost 5432 && exit 0
+              sleep 1
+            done
+            echo "ERROR: Postgres sidecar did not come up on :5432 after 60s" >&2
+            exit 1
       - run:
           name: Compile Java sources
           command: bb prep

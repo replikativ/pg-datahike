@@ -39,6 +39,7 @@
      stmt → params (ParamRef, *from-bindings*, *parse-db*)
      stmt → jsonb, schema, types   (type coercion + jsonb ops)"
   (:require [clojure.string :as str]
+            [datahike.api :as d]
             [datahike.datom]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -496,7 +497,7 @@
           value (cond
                   (instance? LongValue right) (.getValue ^LongValue right)
                   (instance? DoubleValue right) (.getValue ^DoubleValue right)
-                  (instance? StringValue right) (.getNotExcapedValue ^StringValue right)
+                  (instance? StringValue right) (expr/string-value-text ^StringValue right)
                   :else (str right))]
       {:op op :col-idx col-idx :value value})
 
@@ -584,7 +585,7 @@
   (let [sub-alias (when-let [a (.getAlias ps)]
                     (unquote-ident (str/trim (.getName ^Alias a))))
         sub-name (or sub-alias (str "derived_" (System/nanoTime)))
-        with-fn (requiring-resolve 'datahike.api/db-with)
+        with-fn d/db-with
         inner (.getSelect ps)
         inner-ps (when (instance? PlainSelect inner) inner)
         inner-from (when inner-ps (.getFromItem ^PlainSelect inner-ps))]
@@ -636,7 +637,7 @@
    tables can't be expressed natively in Datalog — we have to flatten
    them into a single virtual table."
   [inner target-name db schema]
-  (let [with-fn (requiring-resolve 'datahike.api/db-with)
+  (let [with-fn d/db-with
         is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
         branch-parsed
         (if is-union?
@@ -668,7 +669,7 @@
         ;; pick a type then). Aligns the speculative-db's
         ;; :db/valueType with what describeResult will tell clients.
         sub-oids (:select-item-oids sub-parsed)
-        q-fn (requiring-resolve 'datahike.api/q)
+        q-fn d/q
         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
                      (let [q (cond-> query
                                (:limit p)  (assoc :limit (:limit p))
@@ -2176,14 +2177,20 @@
   "Extract a Clojure value from a JSqlParser expression for INSERT VALUES.
    Optional schema+db params enable scalar subquery evaluation.
 
-   When the expression is a JdbcParameter (prepared-statement placeholder),
-   returns a ParamRef that the wire layer resolves at Bind time against
-   the decoded client value."
+   When the expression is a JdbcParameter (prepared-statement placeholder):
+     - if `params/*bound-params*` is bound (lexical-template fast path
+       or execute-time re-translation), resolve the parameter inline
+       to the bound value — no ParamRef leaves this function;
+     - otherwise emit a ParamRef sentinel that the wire layer resolves
+       at Bind time against the decoded client value."
   ([e] (extract-value e nil nil))
   ([e schema db]
    (cond
      (instance? JdbcParameter e)
-     (->ParamRef (.getIndex ^JdbcParameter e))
+     (let [idx (.getIndex ^JdbcParameter e)]
+       (if-let [bound params/*bound-params*]
+         (nth bound (dec (long idx)))
+         (->ParamRef idx)))
 
      (instance? LongValue e)
     ;; JSqlParser stores every integer literal as LongValue, including
@@ -2196,7 +2203,7 @@
           (catch NumberFormatException _
             (java.math.BigInteger. ^String (.getStringValue ^LongValue e))))
      (instance? DoubleValue e) (.getValue ^DoubleValue e)
-     (instance? StringValue e) (.getNotExcapedValue ^StringValue e)
+     (instance? StringValue e) (expr/string-value-text ^StringValue e)
      (instance? BooleanValue e) (.getValue ^BooleanValue e)
      (instance? NullValue e) nil
      (instance? SignedExpression e)
@@ -2223,8 +2230,8 @@
                  q (:query parsed)
                  in-args (:in-args parsed)
                  results (if (seq in-args)
-                           (apply (requiring-resolve 'datahike.api/q) q db in-args)
-                           ((requiring-resolve 'datahike.api/q) q db))
+                           (apply d/q q db in-args)
+                           (d/q q db))
                  first-row (first results)]
              (if (sequential? first-row) (first first-row) first-row))
            nil))
@@ -2232,21 +2239,33 @@
      (instance? net.sf.jsqlparser.expression.Function e)
      (let [^net.sf.jsqlparser.expression.Function f e
            fname (str/lower-case (.getName f))]
-      ;; Support nextval('seq_name') in INSERT VALUES
-       (if (= fname "nextval")
+       (cond
+         ;; nextval('seq_name') in INSERT VALUES → marker resolved
+         ;; per-execute by resolve-nextval-markers.
+         (= fname "nextval")
          (let [params (.getParameters f)
                arg (first (.getExpressions params))]
            {:fn :nextval :seq-name (extract-value arg schema db)})
-         (if (= fname "now")
-           (java.util.Date.)
-           (str e))))
+
+         ;; now() and friends emit a marker too, so the parsed map
+         ;; doesn't bake in a parse-time Date — that would freeze
+         ;; the timestamp on every cache hit and make all rows of
+         ;; one INSERT shape carry the same wallclock. Resolved at
+         ;; execute time (resolve-nextval-markers).
+         (#{"now" "current_timestamp" "transaction_timestamp"
+            "statement_timestamp" "clock_timestamp"
+            "localtimestamp" "localtime" "current_date" "current_time"} fname)
+         {:fn :now}
+
+         :else (str e)))
      (instance? TimezoneExpression e)
-    ;; now() AT TIME ZONE 'UTC' → current timestamp
+    ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
+    ;; bare-function case above.
      (let [left (.getLeftExpression ^TimezoneExpression e)]
        (if (and (instance? net.sf.jsqlparser.expression.Function left)
                 (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))
-         (java.util.Date.)
-         (java.util.Date.)))  ;; any timezone expression defaults to current time
+         {:fn :now}
+         {:fn :now}))  ;; any timezone expression defaults to current time
 
     ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
     ;; Build a typed PgArray; coerce-insert-value will serialize it
@@ -2483,14 +2502,60 @@
                            ^net.sf.jsqlparser.expression.operators.relational.ExpressionList rlist)))
             hit? (boolean (and items (some #(= l %) items)))]
         (if (.isNot e) (not hit?) hit?))
-      :else
-      ;; Fallback — the operand may itself evaluate to a truthy value
-      ;; (e.g. boolean column `CHECK (active)`). Anything not-nil and
-      ;; not false counts as satisfied.
+
+      ;; `x BETWEEN lo AND hi` — symmetric, inclusive bounds, PG 3VL.
+      ;; Without this clause the :else fallback stringified the
+      ;; expression and returned a truthy "expression-text" — domains
+      ;; like `CHECK (VALUE BETWEEN 1 AND 100)` then accepted any
+      ;; value silently.
+      (instance? net.sf.jsqlparser.expression.operators.relational.Between expr)
+      (let [^net.sf.jsqlparser.expression.operators.relational.Between e expr
+            v  (operand (.getLeftExpression e))
+            lo (operand (.getBetweenExpressionStart e))
+            hi (operand (.getBetweenExpressionEnd e))]
+        (if (or (nil? v) (nil? lo) (nil? hi))
+          nil
+          (let [in? (or (when-let [[a b c] (and (number? v) (number? lo) (number? hi)
+                                                [v lo hi])]
+                          (and (>= a b) (<= a c)))
+                        (try
+                          (let [[a b c] [(Double/parseDouble (str v))
+                                         (Double/parseDouble (str lo))
+                                         (Double/parseDouble (str hi))]]
+                            (and (>= a b) (<= a c)))
+                          (catch Exception _ nil)))]
+            (cond
+              (nil? in?) nil
+              (.isNot e) (not in?)
+              :else      in?))))
+
+      ;; Leaf truthy-check — `CHECK (active)` where `active` is a
+      ;; boolean column lands here. We only enter this branch for
+      ;; shapes whose `operand` result is genuinely a stored value
+      ;; (Column ref, scalar literal). Other AST shapes (Function,
+      ;; LikeExpression, RegExp, IS DISTINCT FROM, …) return `nil`
+      ;; below to honestly admit "unknown" — better to leave a
+      ;; row uncommitted-as-validated than to silently mark every
+      ;; row as passing because the operand stringified to a non-
+      ;; empty SQL fragment.
+      (or (instance? Column expr)
+          (instance? LongValue expr)
+          (instance? DoubleValue expr)
+          (instance? StringValue expr)
+          (instance? BooleanValue expr)
+          (instance? NullValue expr))
       (let [v (operand expr)]
         (cond (nil? v) nil
               (false? v) false
-              :else true)))))
+              :else true))
+
+      ;; Unrecognised shape — return nil (PG 3VL unknown). This
+      ;; matches the conservative "we couldn't evaluate, treat as
+      ;; satisfied" stance for CHECK constraints, but distinct from
+      ;; the explicit `true` we emit when we DID evaluate to a
+      ;; satisfied predicate. A future LIKE / regex / function-call
+      ;; clause should land above this `:else`.
+      :else nil)))
 
 (defn eval-update-expr
   "Evaluate an UPDATE SET expression for a specific entity.
@@ -2511,7 +2576,7 @@
     (.getValue ^DoubleValue value-expr)
 
     (instance? StringValue value-expr)
-    (.getNotExcapedValue ^StringValue value-expr)
+    (expr/string-value-text ^StringValue value-expr)
 
     (instance? BooleanValue value-expr)
     (.getValue ^BooleanValue value-expr)
@@ -2645,33 +2710,52 @@
         :*
         (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
 
+;; Per-schema cache for enriched-schema. The enrichment is a pure
+;; function of the schema (the db is just a query source). Schema is
+;; immutable until DDL transacts. CREATE TABLE adds new attrs which
+;; mints a new schema-map (new identity → new cache key), so no
+;; explicit invalidator is needed — the only writer of
+;; `:pg/array-elem` is `translate-create-table`, in the same tx that
+;; mints the new schema. ALTER TABLE adding new columns does the
+;; same.
+(def ^:private enriched-schema-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- compute-array-meta-enriched [schema db]
+  (let [pg-meta (try
+                  (into {}
+                        (map (fn [[ident elem ndim]]
+                               [ident (cond-> {}
+                                        elem (assoc :pg/array-elem elem)
+                                        ndim (assoc :pg/array-ndim ndim))]))
+                        (d/q
+                         '{:find  [?ident ?elem ?ndim]
+                           :where [[?e :db/ident ?ident]
+                                   [?e :pg/array-elem ?elem]
+                                   [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
+                         db))
+                  (catch Throwable _ {}))]
+    (reduce-kv (fn [s ident more] (update s ident merge more))
+               schema pg-meta)))
+
 (defn- enrich-schema-with-pg-array-meta
   "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
    metadata like `:pg/array-elem` lives as ident-entity facts. For
    array column INSERTs we need that metadata available via
    `(get-in schema [attr :pg/array-elem])`, so this helper queries
    db for every ident's array-elem/ndim and merges the results into
-   the schema map. Called once per INSERT/UPDATE translation; the
-   query is small (one row per array column in the entire DB)."
+   the schema map. Memoised per schema-identity — was ~0.7 ms/row of
+   pure recomputation on the Pagila pg_dump replay before caching."
   [schema db]
   (if (nil? db)
     schema
-    (let [pg-meta (try
-                    (into {}
-                          (map (fn [[ident elem ndim]]
-                                 [ident (cond-> {}
-                                          elem (assoc :pg/array-elem elem)
-                                          ndim (assoc :pg/array-ndim ndim))]))
-                          ((requiring-resolve 'datahike.api/q)
-                           '{:find  [?ident ?elem ?ndim]
-                             :where [[?e :db/ident ?ident]
-                                     [?e :pg/array-elem ?elem]
-                                     [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
-                           db))
-                    (catch Throwable _ {}))]
-      (reduce-kv (fn [s ident more]
-                   (update s ident merge more))
-                 schema pg-meta))))
+    (let [^java.util.Map outer enriched-schema-cache]
+      (or (.get outer schema)
+          (locking outer
+            (or (.get outer schema)
+                (let [enriched (compute-array-meta-enriched schema db)]
+                  (.put outer schema enriched)
+                  enriched)))))))
 
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
@@ -2721,7 +2805,7 @@
             inner-parsed (params/*parse-sql* (str inner-select) schema db)
             inner-query (:query inner-parsed)
             inner-in-args (:in-args inner-parsed)
-            q-fn (requiring-resolve 'datahike.api/q)
+            q-fn d/q
             inner-results (if (seq inner-in-args)
                             (apply q-fn inner-query db inner-in-args)
                             (q-fn inner-query db))
@@ -2781,7 +2865,7 @@
                      :tx-data
                      [[:db.fn/call
                        (fn [txdb]
-                         (let [q (requiring-resolve 'datahike.api/q)]
+                         (let [q d/q]
                            (vec
                             (mapcat
                              (fn [attrs]
@@ -2881,7 +2965,7 @@
                         row-attrs)
         ;; For INHERITS: also add parent's row-marker so parent queries find this entity
             parent-table (when db
-                           (ffirst ((requiring-resolve 'datahike.api/q)
+                           (ffirst (d/q
                                     '{:find [?p]
                                       :where [[?e :__inherit__/child ?c]
                                               [?e :__inherit__/parent ?p]]
@@ -2920,20 +3004,29 @@
                      (fn [txdb]
                  ;; Pre-fetch sequence state for identity column auto-population.
                  ;; Sequences are named <table>_<col>_seq.
-                       (let [q-fn (requiring-resolve 'datahike.api/q)
+                       (let [q-fn d/q
                              seq-prefix (str table-name "_")
                              seq-results (q-fn '{:find [?name] :where [[?e :__seq__/name ?name]]
                                                  :in [$ ?prefix]}
                                                txdb seq-prefix)
                              identity-cols
                              (vec (keep (fn [[sname]]
-                                          (when (and (str/starts-with? sname seq-prefix)
-                                                     (str/ends-with? sname "_seq"))
-                                            (let [col-name (subs sname (count seq-prefix)
-                                                                 (- (count sname) 4))
-                                                  attr (keyword table-name col-name)]
-                                              (when (get (:schema txdb) attr)
-                                                {:col col-name :attr attr :seq-name sname}))))
+                                          ;; PG's auto-generated SERIAL/IDENTITY sequences
+                                          ;; are named `<table>_<col>_seq` — require a
+                                          ;; non-empty `<col>` between prefix and suffix
+                                          ;; or we'll false-match a sequence the user
+                                          ;; happens to have named `<table>_seq`
+                                          ;; (no col), e.g. an `ord_seq` next to an
+                                          ;; `ord` table.
+                                          (let [pref-len (count seq-prefix)
+                                                tail-end (- (count sname) 4)]
+                                            (when (and (str/starts-with? sname seq-prefix)
+                                                       (str/ends-with? sname "_seq")
+                                                       (< pref-len tail-end))
+                                              (let [col-name (subs sname pref-len tail-end)
+                                                    attr (keyword table-name col-name)]
+                                                (when (get (:schema txdb) attr)
+                                                  {:col col-name :attr attr :seq-name sname})))))
                                         seq-results))
                              seq-state (atom
                                         (into {}
@@ -2992,7 +3085,7 @@
                                                 ;; Evaluate using server's eval-update-expr
                                                          :else
                                                          (let [;; Build entity map with current values + EXCLUDED values
-                                                               old-datoms ((requiring-resolve 'datahike.api/datoms) txdb :eavt existing)
+                                                               old-datoms (d/datoms txdb :eavt existing)
                                                                old-map (into {} (map (fn [^Datom d]
                                                                                        [(.-a d) (.-v d)])
                                                                                      old-datoms))
@@ -3051,10 +3144,24 @@
               {:type :insert
                :tx-data
                (into
+                ;; Pass row-attrs as an explicit `:db.fn/call` arg AND
+                ;; keep entity-maps in outer tx-data. The arg form is
+                ;; reachable by substitute-params (which can't peek
+                ;; into a Clojure closure), enabling the templater's
+                ;; result-cache fast path. The outer entity-maps stay
+                ;; visible to apply-column-constraints / auto-populate-
+                ;; identity, which expect to walk maps in the outer
+                ;; tx-data shape and would no-op if we hid them.
+                ;;
+                ;; Identity preservation: substitute-params and
+                ;; resolve-nextvals! both keep nextval-marker objects
+                ;; intact across walks, so the same marker appearing
+                ;; in BOTH the args and the outer entity-maps gets
+                ;; resolved exactly once (see datahike.pg.sql.params).
                 [[:db.fn/call
-                  (fn [txdb]
+                  (fn unique-check [txdb row-attrs]
                     (let [schema (:schema txdb)
-                          q-fn (requiring-resolve 'datahike.api/q)
+                          q-fn d/q
                       ;; Partition identity attrs by shape.
                       ;;   scalar-ids → {:attr constraint-name}
                       ;;   tuple-ids  → [{:attr :cols [component-attrs] :name c}]
@@ -3121,7 +3228,8 @@
                           (when (contains? (get @seen attr) tuple-val)
                             (raise! attr tuple-val cname))
                           (vswap! seen update attr (fnil conj #{}) tuple-val)))
-                      []))]]
+                      []))
+                  row-attrs]]
                 (vec (mapcat
                       (fn [attrs]
                         (when (seq attrs)

@@ -21,6 +21,8 @@
        (pgjdbc's field-metadata, Hibernate's feature detection) into
        fast paths before JSqlParser even runs."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
+            [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.shape :as shape]
@@ -479,7 +481,7 @@
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
           ;; column. Returns {attr-ident → typmod-int}.
-          q-fn (requiring-resolve 'datahike.api/q)
+          q-fn d/q
           typmods (when cte-db
                     (into {}
                           (q-fn '{:find [?ident ?typmod]
@@ -673,7 +675,7 @@
           ;; floating-point columns. For NUMERIC(p, s) columns we
           ;; decode the per-attr typmod (set at DDL time) so users see
           ;; their declared (10, 2) etc., not unconstrained NULL.
-          q-fn (requiring-resolve 'datahike.api/q)
+          q-fn d/q
           typmods (when cte-db
                     (into {}
                           (q-fn '{:find [?ident ?tm]
@@ -757,7 +759,7 @@
              (pgs/row-marker-attr "information_schema_tables") true})
           (pgs/table-names user-schema))
     "information_schema_sequences"
-    (let [q-fn (requiring-resolve 'datahike.api/q)
+    (let [q-fn d/q
           seq-results (q-fn '{:find [?n ?v ?i]
                               :where [[?e :__seq__/name ?n]
                                       [?e :__seq__/value ?v]
@@ -862,7 +864,7 @@
     ;; PG-side oids stay stable for the life of a constraint.
     "pg_constraint"
     (let [tables  (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
-          q-fn    (requiring-resolve 'datahike.api/q)
+          q-fn    d/q
           ;; CHECK constraints persisted via :pg/check-* attrs.
           checks  (try
                     (q-fn '{:find  [?n ?t ?x]
@@ -960,7 +962,7 @@
                                    (Math/abs (.hashCode ^String parent)))
                     parse-cols (fn [s]
                                  (try
-                                   (let [v ((requiring-resolve 'datahike.pg.jsonb/parse-jsonb) s)]
+                                   (let [v (jb/parse-jsonb s)]
                                      (cond (vector? v)     v
                                            (sequential? v) (vec v)
                                            :else           [v]))
@@ -1211,6 +1213,16 @@
     :comment-on :lock-table :create-view :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database
+    ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
+    ;; (which can't / won't parse them) and run our own parsers.
+    :create-type-enum :create-domain
+    ;; pg_dump-emitted utility statements we silently accept
+    :owner-noop :psql-meta :set-config
+    ;; COPY-IN routes through the wire-protocol sub-protocol; the
+    ;; exec-system handler is just a thin trampoline that returns a
+    ;; QueryResult with copyInMode set, so the Java wire layer
+    ;; emits CopyInResponse and transitions to COPY-IN.
+    :copy-from-stdin
     ;; datahike.* branching / versioning functions
     :dh-branches :dh-current-branch :dh-commit-id :dh-parent-commits
     :dh-create-branch :dh-delete-branch})

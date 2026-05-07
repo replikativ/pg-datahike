@@ -26,6 +26,8 @@
    db snapshot so OID inference can consult :pg/type metadata that
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
+            [datahike.api :as d]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -100,6 +102,8 @@
 ;; ---------------------------------------------------------------------------
 ;; ParamRef substitution
 
+(declare nextval-marker? call-marker?)
+
 (defn substitute-params
   "Walk `x` replacing every ParamRef with the corresponding bound value
    from `bound` (1-indexed: `(->ParamRef 1)` → `(bound 1)` ... so `bound`
@@ -116,25 +120,185 @@
    but the correct PG behaviour for a nullable column is to simply
    not assert the attribute. The translate-time row-builder already
    drops nil literals (NullValue), but those land as ParamRef sentinels
-   at parse time and only resolve to nil here."
+   at parse time and only resolve to nil here.
+
+   Identity preservation: deferred call-markers (`{:fn :nextval ...}`,
+   `{:fn :now}`) pass through unchanged — same Clojure object in,
+   same object out. Otherwise reduce-kv would mint new marker maps
+   and resolve-nextvals! would call the underlying function multiple
+   times when the same logical use appears in multiple parts of
+   tx-data (e.g. a `:db.fn/call` arg AND an outer entity-map via
+   `assoc`)."
   [x bound]
   (let [fetch (if (fn? bound) bound #(nth bound (dec (long %))))]
     (letfn [(walk [v]
               (cond
-                (param-ref? v)  (fetch (:idx v))
-                (map? v)        (reduce-kv (fn [m k x]
-                                             (let [v' (walk x)]
-                                               (if (nil? v')
-                                                 m
-                                                 (assoc m k v'))))
-                                           {} v)
-                (vector? v)     (mapv walk v)
-                (seq? v)        (map walk v)
-                :else           v))]
+                (param-ref? v)   (fetch (:idx v))
+                (call-marker? v) v
+                (map? v)         (reduce-kv (fn [m k x]
+                                              (let [v' (walk x)]
+                                                (if (nil? v')
+                                                  m
+                                                  (assoc m k v'))))
+                                            {} v)
+                (vector? v)      (mapv walk v)
+                (seq? v)         (map walk v)
+                :else            v))]
+      (walk x))))
+
+;; ---------------------------------------------------------------------------
+;; nextval() marker + resolution
+;;
+;; Translators emit `{:fn :nextval :seq-name "s"}` for `nextval('s')`
+;; expressions in INSERT VALUES / UPDATE SET. These markers can't be
+;; resolved at Parse or Bind time — they need a live conn to advance
+;; the sequence entity. So they survive substitute-params and are
+;; resolved in a sibling pass right before transact, with the same
+;; CAS-retry path SELECT nextval(...) uses (PG semantics: nextval is
+;; non-transactional — advances stick even if the surrounding tx
+;; rolls back, and concurrent advances yield distinct values).
+
+(def ^:private call-fns
+  "Function markers translate-* may emit for SQL constructs that must
+   be re-evaluated per execute (i.e. NOT cacheable as a parse-time
+   value). Resolved by `resolve-nextvals!` against a per-fn resolver."
+  #{:nextval :now})
+
+(defn call-marker?
+  "True if v is a deferred function-call marker emitted by translate-*
+   (currently `:nextval` and `:now`). These must survive the result-
+   cache intact and be resolved per execute."
+  [v]
+  (and (map? v) (contains? call-fns (:fn v))))
+
+(defn nextval-marker?
+  "Back-compat alias: true only for the nextval flavour of call-marker."
+  [v]
+  (and (map? v) (= :nextval (:fn v)) (string? (:seq-name v))))
+
+(defn resolve-nextvals!
+  "Walk `x` replacing every `{:fn :nextval :seq-name S}` marker with the
+   long produced by an actual `nextval('S')` against the live conn.
+   Each call commits independently via CAS-retry — same path
+   `handle-nextval` uses for `SELECT nextval(...)`. PG semantics:
+   non-transactional advances; concurrent callers get distinct values.
+
+   `nextval-fn` is `(fn [seq-name] long-or-throw)`. Decoupling the
+   resolver from the conn lets server.clj wire `handle-nextval` in
+   without `params.clj` taking a server.clj dependency.
+
+   Sibling shape to `substitute-params`: leaves functions, records,
+   and other opaque values alone, recurses into map values / vectors /
+   seqs."
+  [x nextval-fn]
+  ;; Identity-track: the same marker object can appear in multiple
+  ;; parts of tx-data (e.g. inside a `:db.fn/call` arg AND in an
+  ;; outer entity-map via `assoc`). Resolving it twice would advance
+  ;; the sequence twice per logical use, or call now() twice and get
+  ;; out-of-sync timestamps within one row. The IdentityHashMap
+  ;; keeps marker identity → resolved-value through one walk, so
+  ;; each unique marker resolves exactly once.
+  ;;
+  ;; The function table here is intentionally minimal — extend by
+  ;; adding to call-fns above and a clause here.
+  (let [seen (java.util.IdentityHashMap.)
+        resolve-marker
+        (fn [v]
+          (or (.get seen v)
+              (let [resolved
+                    (case (:fn v)
+                      :nextval (nextval-fn (:seq-name v))
+                      :now     (java.util.Date.))]
+                (.put seen v resolved)
+                resolved)))]
+    (letfn [(walk [v]
+              (cond
+                (call-marker? v) (resolve-marker v)
+                (map? v)         (reduce-kv (fn [m k x] (assoc m k (walk x)))
+                                            {} v)
+                (vector? v)      (mapv walk v)
+                (seq? v)         (map walk v)
+                :else            v))]
       (walk x))))
 
 ;; ---------------------------------------------------------------------------
 ;; AST parameter-index walker
+
+(defn has-param-marker?
+  "Fast scan: does SQL contain a `?` or `$N` placeholder OUTSIDE a
+   quoted string, dollar-quoted body, or comment? When false, the
+   parser doesn't need to walk the AST for parameter indices — a
+   real win for pg_dump-style INSERTs (literal-only) where the
+   reflection-based AST walk dominated parse time.
+
+   pgjdbc rewrites `?` to numbered `$N` before sending Parse, so the
+   on-wire SQL never has `?` from a JDBC client — must detect both
+   forms."
+  [^String sql]
+  (let [n (long (.length sql))]
+    (loop [i (long 0), in-sq false, in-dq false, in-dollar false, dollar-tag nil]
+      (if (>= i n)
+        false
+        (let [c (.charAt sql i)]
+          (cond
+            ;; Found `?` in non-quoted, non-comment context.
+            (and (not in-sq) (not in-dq) (not in-dollar) (= c \?))
+            true
+
+            ;; Found `$N` (digit follows `$`) in non-quoted, non-
+            ;; comment context. Plain `$$...$$` (no digit, no tag)
+            ;; is the dollar-quote case, handled below.
+            (and (not in-sq) (not in-dq) (not in-dollar)
+                 (= c \$) (< (inc i) n)
+                 (Character/isDigit (.charAt sql (unchecked-inc i))))
+            true
+
+            ;; Dollar-quoted string body.
+            (and (not in-sq) (not in-dq) in-dollar)
+            (let [taglen (long (.length ^String dollar-tag))]
+              (if (and (= c \$) (<= (+ i taglen) n)
+                       (= dollar-tag (subs sql i (+ i taglen))))
+                (recur (+ i taglen) in-sq in-dq false nil)
+                (recur (unchecked-inc i) in-sq in-dq in-dollar dollar-tag)))
+
+            ;; Potential dollar-quote start.
+            (and (not in-sq) (not in-dq) (= c \$))
+            (let [tag-end (long (loop [j (unchecked-inc i)]
+                                  (if (>= j n) j
+                                      (let [c2 (.charAt sql j)]
+                                        (if (or (Character/isLetterOrDigit c2) (= c2 \_))
+                                          (recur (unchecked-inc j)) j)))))]
+              (if (and (< tag-end n) (= \$ (.charAt sql tag-end)))
+                (recur (unchecked-inc tag-end) in-sq in-dq true (subs sql i (unchecked-inc tag-end)))
+                (recur (unchecked-inc i) in-sq in-dq in-dollar dollar-tag)))
+
+            ;; '...'
+            (and (not in-dq) (= c \'))
+            (recur (unchecked-inc i) (not in-sq) in-dq in-dollar dollar-tag)
+
+            ;; "..."
+            (and (not in-sq) (= c \"))
+            (recur (unchecked-inc i) in-sq (not in-dq) in-dollar dollar-tag)
+
+            ;; -- line comment
+            (and (not in-sq) (not in-dq) (not in-dollar)
+                 (= c \-) (< (inc i) n) (= \- (.charAt sql (unchecked-inc i))))
+            (let [eol (long (.indexOf sql (int \newline) (int i)))]
+              (recur (if (neg? eol) n (unchecked-inc eol)) in-sq in-dq in-dollar dollar-tag))
+
+            ;; /* block comment */
+            (and (not in-sq) (not in-dq) (not in-dollar)
+                 (= c \/) (< (inc i) n) (= \* (.charAt sql (unchecked-inc i))))
+            (let [end (long (loop [j (+ i 2)]
+                              (cond
+                                (>= (inc j) n) n
+                                (and (= \* (.charAt sql j)) (= \/ (.charAt sql (unchecked-inc j))))
+                                (+ j 2)
+                                :else (recur (unchecked-inc j)))))]
+              (recur end in-sq in-dq in-dollar dollar-tag))
+
+            :else
+            (recur (unchecked-inc i) in-sq in-dq in-dollar dollar-tag)))))))
 
 (defn ast-param-indices
   "Recursively walk a JSqlParser AST, returning a sorted set of
@@ -190,7 +354,7 @@
    *parse-db* when nil."
   [db attr]
   (when-let [d (or db *parse-db*)]
-    (ffirst ((requiring-resolve 'datahike.api/q)
+    (ffirst (d/q
              '{:find [?pt]
                :in [$ ?ident]
                :where [[?e :db/ident ?ident]
@@ -240,29 +404,50 @@
    column i → attribute type → PG OID. Returns a map {param-index → oid}.
 
    Only covers the flat single-row / multi-row VALUES case — which is
-   what JDBC setObject/setString produces for the common ORM path."
-  [^Insert insert schema]
-  (try
-    (let [table-ns (when-let [^Table t (.getTable insert)]
-                     (unquote-ident (.getName t)))
-          cols (some-> (.getColumns insert)
-                       (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
-          select (.getSelect insert)
-          col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))]
-      (when (and table-ns (seq cols)
-                 (instance? net.sf.jsqlparser.statement.select.Values select))
-        (let [rows (.getExpressions ^net.sf.jsqlparser.statement.select.Values select)
-              result (java.util.HashMap.)]
-          (doseq [row (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList rows)
-                             [rows] rows))]
-            (let [exprs (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList row)
-                               row [row]))]
-              (doseq [[i e] (map vector (range) exprs)]
-                (when (and (instance? JdbcParameter e) (< i (count cols)))
-                  (when-let [oid (col-oid (nth cols i))]
-                    (.put result (.getIndex ^JdbcParameter e) oid))))))
-          (when (pos? (.size result)) (into {} result)))))
-    (catch Throwable _ nil)))
+   what JDBC setObject/setString produces for the common ORM path.
+
+   When the INSERT omits the explicit column list (`INSERT INTO t
+   VALUES (?, ?, ?)`), falls back to the table's declared column order
+   from `pgs/column-info` (which honours both schema entity-ID order and
+   the `:datahike.pg/column-order` hint). This is what pgjdbc's
+   `executeBatch` needs: setLong(1, …) wants param 1's OID at Describe
+   time, and without inferred OIDs pgjdbc's resolved-type tracker
+   raises `Can't change resolved type for param: N from <oid> to 0`."
+  ([^Insert insert schema] (insert-param-oids insert schema nil))
+  ([^Insert insert schema db]
+   (try
+     (let [table-ns (when-let [^Table t (.getTable insert)]
+                      (unquote-ident (.getName t)))
+           explicit-cols (some-> (.getColumns insert)
+                                 (->> (mapv #(unquote-ident (.getColumnName ^Column %)))))
+           cols (if (seq explicit-cols)
+                  explicit-cols
+                 ;; No column list: derive from schema. Drop the
+                 ;; synthetic db_id prepended by column-info — INSERT
+                 ;; VALUES is positional against user-declared columns.
+                  (when table-ns
+                    (let [info (pgs/column-info schema table-ns db)]
+                      (when (seq info)
+                        (vec (keep (fn [c]
+                                     (when (not= :db/id (:attr c))
+                                       (name (:attr c))))
+                                   info))))))
+           select (.getSelect insert)
+           col-oid (fn [col] (infer-param-oid-for-column schema table-ns col))]
+       (when (and table-ns (seq cols)
+                  (instance? net.sf.jsqlparser.statement.select.Values select))
+         (let [rows (.getExpressions ^net.sf.jsqlparser.statement.select.Values select)
+               result (java.util.HashMap.)]
+           (doseq [row (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList rows)
+                              [rows] rows))]
+             (let [exprs (seq (if (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList row)
+                                row [row]))]
+               (doseq [[i e] (map vector (range) exprs)]
+                 (when (and (instance? JdbcParameter e) (< i (count cols)))
+                   (when-let [oid (col-oid (nth cols i))]
+                     (.put result (.getIndex ^JdbcParameter e) oid))))))
+           (when (pos? (.size result)) (into {} result)))))
+     (catch Throwable _ nil))))
 
 (defn update-param-oids
   "Walk an UPDATE AST: for each SET col = ?, map param index to the
