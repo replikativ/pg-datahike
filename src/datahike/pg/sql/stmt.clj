@@ -2371,12 +2371,32 @@
         ;; through unchanged. Convention-based target resolution
         ;; (hints aren't visible here without db access — see
         ;; coerce-insert-value-with-hints for the hint-aware path).
+        ;;
+        ;; Wrap into `[pk-attr val]` ONLY when val's runtime type
+        ;; matches the target PK's `:db/valueType`. If it doesn't
+        ;; (e.g. user wrote `account=143` against an account whose
+        ;; PK is `:db.type/string`), pass val through as a direct
+        ;; entity-id reference. The read-side surfaces ref columns
+        ;; as raw entity-ids when no PK target is resolvable, so this
+        ;; symmetric write path keeps round-trips honest.
         (and (= vtype :db.type/ref)
              (not (vector? val))
              (some? val))
-        (if-let [target-pk-attr (get (pgs/derive-ref-targets schema {}) attr)]
-          [target-pk-attr val]
-          val)
+        (let [target-entry (get (pgs/derive-ref-targets schema {}) attr)
+              target-pk-attr (if (vector? target-entry) (first target-entry) target-entry)
+              target-vtype (when target-pk-attr
+                             (get-in schema [target-pk-attr :db/valueType]))
+              val-matches-pk?
+              (case target-vtype
+                :db.type/string  (string? val)
+                :db.type/long    (integer? val)
+                :db.type/uuid    (or (instance? java.util.UUID val) (string? val))
+                :db.type/keyword (or (keyword? val) (string? val))
+                ;; No target or unknown PK type: treat as entity-id.
+                false)]
+          (if (and target-pk-attr val-matches-pk?)
+            [target-pk-attr val]
+            val))
         ;; BigInteger / BigInt lands here when a SQL literal overflows
         ;; Long; routed through `coerce/coerce-numeric` so :db.type/long
         ;; raises 22003 instead of silently wrapping via .longValue,

@@ -966,6 +966,64 @@
     (let [r (.execute *handler* "SELECT count(*) FROM person")]
       (is (= [["3"]] (rows r)) "current head sees 3 people"))))
 
+(deftest test-ref-column-insert-accepts-bigint-entity-id
+  (testing "A ref column read via SELECT projects as the parent's PK
+            value when one is resolvable, OR as the raw entity-id
+            (bigint) when there's no PK target. INSERT must accept
+            *both* forms symmetrically:
+              - A string matching the target PK's value-type → wrap
+                into a lookup-ref `[pk-attr v]` so datahike resolves
+                by PK.
+              - A bigint matching no PK type → pass through as a
+                direct entity-id reference.
+
+            Previously coerce-insert-value unconditionally wrapped the
+            value in `[pk-attr val]`, which broke entity-id INSERTs:
+              `INSERT … account=143` → `[:account/path 143]` →
+              datahike: \"Nothing found for entity id\" because path
+              is a string and 143 is a long."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :account/code
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :posting/account
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/one}
+               {:db/ident :posting/amount
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one}])
+          {:keys [tempids]}
+          (d/transact conn [{:db/id "acct" :account/code "1200"}])
+          acct-eid (get tempids "acct")
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; Form 1: string PK value — datahike resolves via lookup-ref.
+        (let [r (.execute handler
+                  (str "INSERT INTO posting (account, amount) "
+                       "VALUES ('1200', 100)"))]
+          (is (nil? (err r))
+              (str "string-PK INSERT errored: " (err r))))
+        ;; Form 2: raw entity-id (bigint).
+        (let [r (.execute handler
+                  (str "INSERT INTO posting (account, amount) "
+                       "VALUES (" acct-eid ", 200)"))]
+          (is (nil? (err r))
+              (str "entity-id INSERT errored: " (err r))))
+        ;; Both forms should have landed on the same account.
+        (let [r (.execute handler
+                  "SELECT count(*) FROM posting WHERE account IS NOT NULL")
+              data (rows r)]
+          (is (= [["2"]] data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-keyword-column-insert-and-select-via-string
   (testing "Columns typed :db.type/keyword should accept string values
             on INSERT (`'draft'` → `:draft`) and surface them as their
