@@ -115,7 +115,13 @@
    this for tests, REPL work, or applications that embed Datahike
    directly without a TCP boundary. See server/make-query-handler for
    options (:compat, :silently-accept, :on-query, :db-name,
-   :registered-databases)."
+   :registered-databases, :tx-wrap).
+
+   The `:tx-wrap` option is `(fn [tx-data] -> tx-data)`. Called
+   immediately before every INSERT/UPDATE/DELETE's `d/transact`. Lets
+   framework consumers inject `[:db.fn/call validate tx-data]` so
+   transactor-side validators fire for SQL writes too. Default is
+   `identity` (no wrap)."
   server/make-query-handler)
 
 (def make-query-handler-factory

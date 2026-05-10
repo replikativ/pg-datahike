@@ -1821,13 +1821,14 @@
               (enforce-fk-on-insert! txdb table-name ns filled-entities))
             result))]])))
 
-(defn- execute-insert [conn parsed]
+(defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [table-name (:table parsed)
           db (d/db conn)
           tx-data (-> (:tx-data parsed)
                       (auto-populate-identity table-name db)
-                      (apply-column-constraints table-name (:ns parsed) db))
+                      (apply-column-constraints table-name (:ns parsed) db)
+                      tx-wrap)
           tx-report (d/transact conn tx-data)]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
@@ -1886,7 +1887,7 @@
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
-(defn- execute-delete [conn parsed schema]
+(defn- execute-delete [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
@@ -1900,7 +1901,8 @@
           cascade-eids (collect-fk-cascade-retractions! db table eids)
           cascade-tx (when (seq cascade-eids)
                        (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
-          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))]
+          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
+          full-tx (tx-wrap full-tx)]
       (when (seq full-tx)
         (d/transact conn full-tx))
       (or returning-result
@@ -2135,7 +2137,7 @@
           (when fks?
             (enforce-fk-on-insert! db table-name ns [post])))))))
 
-(defn- execute-update [conn parsed schema]
+(defn- execute-update [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
@@ -2145,6 +2147,7 @@
           _ (check-updates-against-row-constraints!
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
+          tx-data (tx-wrap tx-data)
           tx-report (when (seq tx-data) (d/transact conn tx-data))
           returning (:returning parsed)]
       (if returning
@@ -4154,7 +4157,7 @@
       (exec-batchable-insert ctx parsed batch-state)
 
       :else
-      (execute-insert conn parsed))))
+      (execute-insert conn parsed :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-update-with-recursive
   [ctx parsed]
@@ -4212,7 +4215,7 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
-      (execute-update conn parsed schema))))
+      (execute-update conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-delete
   [ctx parsed]
@@ -4236,7 +4239,7 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
-      (execute-delete conn parsed schema))))
+      (execute-delete conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-ddl-create
   [ctx parsed]
@@ -4699,7 +4702,8 @@
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
                                               dispatch-stats
                                               on-create-database on-delete-database
-                                              registry-atom]
+                                              registry-atom
+                                              tx-wrap]
                                        :as opts}]]
   (ensure-pg-schema! conn)
   (let [silently-accept (resolve-silently-accept opts)
@@ -5158,7 +5162,16 @@
                                  :schema schema
                                  :on-create-database on-create-database
                                  :on-delete-database on-delete-database
-                                 :registry-atom registry-atom}]
+                                 :registry-atom registry-atom
+                                 ;; Optional `(fn [tx-data] -> tx-data)`
+                                 ;; called BEFORE every INSERT/UPDATE/
+                                 ;; DELETE's d/transact. Lets framework
+                                 ;; consumers (e.g. datahike-accounting)
+                                 ;; inject [:db.fn/call validate tx-data]
+                                 ;; so their transactor-side validators
+                                 ;; fire for SQL writes too. Default:
+                                 ;; identity (no wrap).
+                                 :tx-wrap (or tx-wrap identity)}]
                         (case (:type parsed)
                           :system                (exec-system ctx parsed)
                           :select                (exec-select ctx parsed)

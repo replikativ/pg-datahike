@@ -1319,6 +1319,109 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
+(deftest test-tx-wrap-config-fires-for-sql-writes
+  (testing "make-query-handler accepts a :tx-wrap option that runs
+            on every INSERT/UPDATE/DELETE's tx-data before
+            d/transact. Frameworks (e.g. datahike-accounting) use
+            this to inject [:db.fn/call validate tx-data] so their
+            transactor-side validators fire for SQL writes too.
+
+            This test uses a simple Clojure-side wrap that throws
+            on negative `widget/qty` values, demonstrating the hook
+            is reached by INSERT, UPDATE, and DELETE paths."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :widget/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/qty
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one}])
+          calls (atom [])
+          neg-qty? (fn [v] (and (number? v) (neg? v)))
+          tx-wrap (fn [tx-data]
+                    (swap! calls conj (vec tx-data))
+                    ;; Reject any tx-data entry asserting a negative
+                    ;; qty. Handles both shapes:
+                    ;;   {:widget/qty -7}            (entity map, INSERT)
+                    ;;   [:db/add eid :widget/qty -7] (tuple, UPDATE)
+                    (doseq [entry tx-data]
+                      (cond
+                        (and (map? entry)
+                             (neg-qty? (:widget/qty entry)))
+                        (throw (ex-info "negative qty rejected by tx-wrap"
+                                        {:entry entry}))
+                        (and (vector? entry) (= 4 (count entry))
+                             (= :db/add (first entry))
+                             (= :widget/qty (nth entry 2))
+                             (neg-qty? (nth entry 3)))
+                        (throw (ex-info "negative qty rejected by tx-wrap"
+                                        {:entry entry}))))
+                    tx-data)
+          handler (pg/make-query-handler conn {:tx-wrap tx-wrap})]
+      (try
+        ;; Valid INSERT goes through.
+        (let [r (.execute handler "INSERT INTO widget (sku, qty) VALUES ('A', 5)")]
+          (is (nil? (err r)) (str "valid INSERT errored: " (err r))))
+
+        ;; Invalid INSERT (qty = -1) is rejected by the wrap.
+        (let [r (.execute handler "INSERT INTO widget (sku, qty) VALUES ('B', -1)")]
+          (is (some? (err r)) "negative-qty INSERT should fail")
+          (is (clojure.string/includes? (err r) "negative qty rejected")
+              (str "expected wrap message; got: " (err r))))
+
+        ;; Confirm only A landed.
+        (let [r (.execute handler "SELECT sku FROM widget ORDER BY sku")]
+          (is (= [["A"]] (rows r))))
+
+        ;; UPDATE through the wrap: positive update succeeds.
+        (let [r (.execute handler "UPDATE widget SET qty = 10 WHERE sku = 'A'")]
+          (is (nil? (err r))))
+
+        ;; UPDATE through the wrap: negative update rejected.
+        (let [r (.execute handler "UPDATE widget SET qty = -7 WHERE sku = 'A'")]
+          (is (some? (err r))
+              "UPDATE that would set qty=-7 should fail"))
+
+        ;; A's qty should still be 10 (last successful update).
+        (let [r (.execute handler "SELECT qty FROM widget WHERE sku = 'A'")]
+          (is (= [["10"]] (rows r))))
+
+        ;; The wrap was called multiple times — confirm.
+        (is (>= (count @calls) 3)
+            (str "expected wrap called >=3 times; got " (count @calls)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-tx-wrap-default-identity-no-op
+  (testing "Without :tx-wrap, the handler behaves identically — the
+            default is identity and adds no overhead."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :w/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler "INSERT INTO w (sku) VALUES ('A')")]
+          (is (nil? (err r))))
+        (let [r (.execute handler "SELECT sku FROM w")]
+          (is (= [["A"]] (rows r))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-m2m-join-via-any-array
   (testing "JOIN through a :db.cardinality/many ref using
             `JOIN <table> <alias> ON <alias>.db_id = ANY(<src>.<m2m_col>)`.
