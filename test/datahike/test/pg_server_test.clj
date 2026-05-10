@@ -1319,6 +1319,76 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
+(deftest test-m2m-join-via-any-array
+  (testing "JOIN through a :db.cardinality/many ref using
+            `JOIN <table> <alias> ON <alias>.db_id = ANY(<src>.<m2m_col>)`.
+            Common SQL idiom for tag-aggregated reports (e.g. UStVA via
+            account-tag aggregation). Datalog-side is naturally a plain
+            data pattern over the M2M ref attr — translator just needs
+            to recognize the SQL form and emit the right pattern."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :tag/name
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/tags
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/many}])
+          _ (d/transact conn
+              [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
+          _ (d/transact conn
+              [{:widget/sku "A"
+                :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
+               {:widget/sku "B"
+                :widget/tags [[:tag/name "red"] [:tag/name "small"]]}
+               {:widget/sku "C"
+                :widget/tags [[:tag/name "round"]]}])
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; M2M JOIN: list every (widget, tag) pair
+        (let [r (.execute handler
+                  (str "SELECT w.sku, t.name FROM widget w "
+                       "JOIN tag t ON t.db_id = ANY(w.tags) "
+                       "ORDER BY w.sku, t.name"))]
+          (is (nil? (err r)) (str "M2M JOIN errored: " (err r)))
+          (is (= [["A" "red"] ["A" "round"]
+                  ["B" "red"] ["B" "small"]
+                  ["C" "round"]]
+                 (rows r))))
+        ;; M2M JOIN with WHERE filter on tag side
+        (let [r (.execute handler
+                  (str "SELECT w.sku FROM widget w "
+                       "JOIN tag t ON t.db_id = ANY(w.tags) "
+                       "WHERE t.name = 'red' "
+                       "ORDER BY w.sku"))]
+          (is (nil? (err r)))
+          (is (= [["A"] ["B"]] (rows r))))
+        ;; M2M JOIN with aggregation grouped by tag
+        (let [r (.execute handler
+                  (str "SELECT t.name, count(w.db_id) AS n "
+                       "FROM widget w "
+                       "JOIN tag t ON t.db_id = ANY(w.tags) "
+                       "GROUP BY t.name "
+                       "ORDER BY t.name"))]
+          (is (nil? (err r)))
+          (let [data (rows r)
+                by-name (into {} (map (juxt first second) data))]
+            (is (= "2" (get by-name "red")))
+            (is (= "2" (get by-name "round")))
+            (is (= "1" (get by-name "small")))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-aliased-many-ref-projection-works-with-where
   (testing "Aliased projection of an M2M ref column with a WHERE
             clause was erroring with 'Bad format for attribute in

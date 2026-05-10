@@ -190,6 +190,77 @@
                      (.get ^ParenthesedExpressionList raw-expr 0)
                      raw-expr)]
           (cond
+          ;; M2M JOIN: ON <col> = ANY(<m2m-array-col>) or symmetric.
+          ;; Recognises the SQL idiom `JOIN tag t ON t.db_id = ANY(a.tags)`
+          ;; where `a.tags` is a :db.cardinality/many :db.type/ref column.
+          ;; Datahike-side, M2M refs are stored as N datoms — one per
+          ;; element. So the natural data pattern is
+          ;;   [?a-eid :account/tags ?t-eid]
+          ;; which iterates per (source, target) pair, exactly the SQL
+          ;; semantics. Emit that pattern; no entity-var swap needed.
+            (let [is-any-fn? (fn [e]
+                               (and (instance? net.sf.jsqlparser.expression.Function e)
+                                    (= "any" (clojure.string/lower-case
+                                              (.getName ^net.sf.jsqlparser.expression.Function e)))))
+                  any-arg (fn [^net.sf.jsqlparser.expression.Function f]
+                            (let [params (.getParameters f)
+                                  exprs (when params (.getExpressions params))]
+                              (when (and exprs (= 1 (.size exprs)))
+                                (.get exprs 0))))
+                  any-form (when (instance? EqualsTo expr)
+                             (let [^EqualsTo eq expr
+                                   l (.getLeftExpression eq)
+                                   r (.getRightExpression eq)]
+                               (cond
+                                 (and (instance? Column l) (is-any-fn? r)
+                                      (instance? Column (any-arg r)))
+                                 {:scalar l :array (any-arg r)}
+                                 (and (instance? Column r) (is-any-fn? l)
+                                      (instance? Column (any-arg l)))
+                                 {:scalar r :array (any-arg l)}
+                                 :else nil)))]
+              (when any-form
+                (let [{:keys [scalar array]} any-form
+                      scalar-resolved (ctx/resolve-column ^Column scalar
+                                                          (:table-aliases ctx)
+                                                          (:default-table ctx)
+                                                          (:col-overrides ctx)
+                                                          (:derived-aliases ctx))
+                      array-resolved (ctx/resolve-column ^Column array
+                                                         (:table-aliases ctx)
+                                                         (:default-table ctx)
+                                                         (:col-overrides ctx)
+                                                         (:derived-aliases ctx))
+                      bare-attr (fn [r] (if (vector? r) (nth r 2) r))
+                      schema (:schema ctx)
+                      m2m-attr (when-not (and (vector? array-resolved)
+                                              (= :db-id (first array-resolved)))
+                                 (bare-attr array-resolved))
+                      ;; Confirm m2m-attr is :db.cardinality/many ref
+                      m2m? (and (keyword? m2m-attr)
+                                (= :db.type/ref
+                                   (get-in schema [m2m-attr :db/valueType]))
+                                (= :db.cardinality/many
+                                   (get-in schema [m2m-attr :db/cardinality])))
+                      ;; The scalar side must be db_id (entity-id of the
+                      ;; target table). Otherwise this isn't an M2M JOIN.
+                      scalar-db-id? (and (vector? scalar-resolved)
+                                         (= :db-id (first scalar-resolved)))]
+                  (when (and m2m? scalar-db-id?)
+                    (let [;; Source alias — the table that OWNS the M2M attr.
+                          src-alias (if (vector? array-resolved)
+                                      (second array-resolved)
+                                      (namespace array-resolved))
+                          ;; Target alias — the table whose db_id appears.
+                          tgt-alias (second scalar-resolved)
+                          src-evar (ctx/entity-var! ctx src-alias)
+                          tgt-evar (ctx/entity-var! ctx tgt-alias)]
+                      (ctx/add-clause! ctx [src-evar m2m-attr tgt-evar])
+                      true)))))
+            ;; M2M-JOIN branch consumed the ON clause; nothing else to do.
+            ;; Fall through to other ON conjuncts via the outer doseq.
+            nil
+
           ;; Ref-unification for EqualsTo with db_id
             (and (instance? EqualsTo expr)
                  (let [^EqualsTo eq expr
