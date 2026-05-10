@@ -998,11 +998,11 @@
             not the left). Filed as a separate task; this test only
             covers the unknown-vars regression."
     (let [r (.execute *handler*
-              (str "SELECT d.name, count(p.db_id) "
-                   "FROM department d "
-                   "LEFT JOIN person p ON p.department = d.db_id "
-                   "GROUP BY d.name "
-                   "ORDER BY d.name"))]
+                      (str "SELECT d.name, count(p.db_id) "
+                           "FROM department d "
+                           "LEFT JOIN person p ON p.department = d.db_id "
+                           "GROUP BY d.name "
+                           "ORDER BY d.name"))]
       (is (nil? (err r))
           (str "LEFT JOIN + count(p.db_id) errored: " (err r)))
       (let [data (rows r)
@@ -1025,23 +1025,23 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :acct/code
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :tx/id
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :post/transaction
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/one}
-               {:db/ident :post/account
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/one}
-               {:db/ident :post/amount
-                :db/valueType :db.type/bigdec
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :acct/code
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :tx/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :post/transaction
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :post/account
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :post/amount
+                          :db/valueType :db.type/bigdec
+                          :db/cardinality :db.cardinality/one}])
           {:keys [tempids]}
           (d/transact conn [{:db/id "a" :acct/code "1400"}
                             {:db/id "t" :tx/id "TX-1"}])
@@ -1051,14 +1051,14 @@
       (try
         ;; Form 1: INSERT … VALUES — sanity check, should land
         (let [r (.execute handler
-                  (str "INSERT INTO post (transaction, account, amount) "
-                       "VALUES (" tx-eid ", " acct-eid ", 100.00)"))]
+                          (str "INSERT INTO post (transaction, account, amount) "
+                               "VALUES (" tx-eid ", " acct-eid ", 100.00)"))]
           (is (nil? (err r)) (str "VALUES INSERT errored: " (err r))))
 
         ;; Form 2: INSERT … SELECT with literal-only projection (no FROM)
         (let [r (.execute handler
-                  (str "INSERT INTO post (transaction, account, amount) "
-                       "SELECT " tx-eid ", " acct-eid ", 200.00"))]
+                          (str "INSERT INTO post (transaction, account, amount) "
+                               "SELECT " tx-eid ", " acct-eid ", 200.00"))]
           (is (nil? (err r)) (str "SELECT-no-FROM INSERT errored: " (err r))))
 
         ;; Form 3: INSERT … SELECT FROM <table> LIMIT 1 — drives the
@@ -1066,9 +1066,9 @@
         ;; accounting psql session: result reported INSERT 0 1 but no
         ;; row landed.
         (let [r (.execute handler
-                  (str "INSERT INTO post (transaction, account, amount) "
-                       "SELECT " tx-eid ", " acct-eid ", 300.00 "
-                       "FROM acct LIMIT 1"))]
+                          (str "INSERT INTO post (transaction, account, amount) "
+                               "SELECT " tx-eid ", " acct-eid ", 300.00 "
+                               "FROM acct LIMIT 1"))]
           (is (nil? (err r)) (str "SELECT-FROM INSERT errored: " (err r))))
 
         ;; All three should have landed. Read them back via SQL.
@@ -1109,16 +1109,16 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :account/code
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :posting/account
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/one}
-               {:db/ident :posting/amount
-                :db/valueType :db.type/long
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :account/code
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :posting/account
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :posting/amount
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}])
           {:keys [tempids]}
           (d/transact conn [{:db/id "acct" :account/code "1200"}])
           acct-eid (get tempids "acct")
@@ -1126,19 +1126,19 @@
       (try
         ;; Form 1: string PK value — datahike resolves via lookup-ref.
         (let [r (.execute handler
-                  (str "INSERT INTO posting (account, amount) "
-                       "VALUES ('1200', 100)"))]
+                          (str "INSERT INTO posting (account, amount) "
+                               "VALUES ('1200', 100)"))]
           (is (nil? (err r))
               (str "string-PK INSERT errored: " (err r))))
         ;; Form 2: raw entity-id (bigint).
         (let [r (.execute handler
-                  (str "INSERT INTO posting (account, amount) "
-                       "VALUES (" acct-eid ", 200)"))]
+                          (str "INSERT INTO posting (account, amount) "
+                               "VALUES (" acct-eid ", 200)"))]
           (is (nil? (err r))
               (str "entity-id INSERT errored: " (err r))))
         ;; Both forms should have landed on the same account.
         (let [r (.execute handler
-                  "SELECT count(*) FROM posting WHERE account IS NOT NULL")
+                          "SELECT count(*) FROM posting WHERE account IS NOT NULL")
               data (rows r)]
           (is (= [["2"]] data)))
         (finally
@@ -1158,22 +1158,22 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :evt/id
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :evt/at
-                :db/valueType :db.type/instant
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :evt/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :evt/at
+                          :db/valueType :db.type/instant
+                          :db/cardinality :db.cardinality/one}])
           handler (pg/make-query-handler conn)]
       (try
         ;; SQL '::date' cast → LocalDate path
         (let [r (.execute handler
-                  "INSERT INTO evt (id, at) VALUES ('LD', '2026-04-01'::date)")]
+                          "INSERT INTO evt (id, at) VALUES ('LD', '2026-04-01'::date)")]
           (is (nil? (err r)) (str "::date cast errored: " (err r))))
         ;; SQL '::timestamp' cast → java.util.Date path (already worked)
         (let [r (.execute handler
-                  "INSERT INTO evt (id, at) VALUES ('TS', '2026-04-02 12:30:00'::timestamp)")]
+                          "INSERT INTO evt (id, at) VALUES ('TS', '2026-04-02 12:30:00'::timestamp)")]
           (is (nil? (err r)) (str "::timestamp cast errored: " (err r))))
         ;; Both rows should be readable
         (let [r (.execute handler "SELECT count(*) FROM evt")
@@ -1195,23 +1195,23 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :w/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :w/state
-                :db/valueType :db.type/keyword
-                :db/cardinality :db.cardinality/one}
-               {:db/ident :w/uid
-                :db/valueType :db.type/uuid
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :w/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :w/state
+                          :db/valueType :db.type/keyword
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :w/uid
+                          :db/valueType :db.type/uuid
+                          :db/cardinality :db.cardinality/one}])
           handler (pg/make-query-handler conn)
           uid     "12345678-1234-1234-1234-123456789012"]
       (try
         ;; UUID via string literal — typed-input path
         (let [r (.execute handler
-                  (str "INSERT INTO w (sku, state, uid) "
-                       "VALUES ('A', 'draft', '" uid "')"))]
+                          (str "INSERT INTO w (sku, state, uid) "
+                               "VALUES ('A', 'draft', '" uid "')"))]
           (is (nil? (err r)) (str "INSERT errored: " (err r))))
         (let [r (.execute handler "SELECT state, uid FROM w WHERE sku = 'A'")
               [[s u]] (rows r)]
@@ -1233,13 +1233,13 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :doc/id
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :doc/state
-                :db/valueType :db.type/keyword
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :doc/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :doc/state
+                          :db/valueType :db.type/keyword
+                          :db/cardinality :db.cardinality/one}])
           handler (pg/make-query-handler conn)]
       (try
         (let [r (.execute handler "INSERT INTO doc (id, state) VALUES ('A', 'draft')")]
@@ -1282,17 +1282,17 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :dept/id
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :emp/id
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :emp/department
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :dept/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :emp/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :emp/department
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}])
           {:keys [tempids]}
           (d/transact conn [{:db/id "d1" :dept/id "Engineering"}
                             {:db/id "d2" :dept/id "Empty"}])
@@ -1301,11 +1301,11 @@
           handler (pg/make-query-handler conn)]
       (try
         (let [r (.execute handler
-                  (str "SELECT d.id, count(e.db_id) AS n_emps "
-                       "FROM dept d "
-                       "LEFT JOIN emp e ON e.department = d.db_id "
-                       "GROUP BY d.id "
-                       "ORDER BY d.id"))]
+                          (str "SELECT d.id, count(e.db_id) AS n_emps "
+                               "FROM dept d "
+                               "LEFT JOIN emp e ON e.department = d.db_id "
+                               "GROUP BY d.id "
+                               "ORDER BY d.id"))]
           (is (nil? (err r)) (str "errored: " (err r)))
           (let [data (rows r)
                 by-id (into {} (map (juxt first second) data))]
@@ -1335,13 +1335,13 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :widget/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/qty
-                :db/valueType :db.type/long
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/qty
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}])
           calls (atom [])
           neg-qty? (fn [v] (and (number? v) (neg? v)))
           tx-wrap (fn [tx-data]
@@ -1411,18 +1411,18 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :w/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :w/qty
-                :db/valueType :db.type/long
-                :db/cardinality :db.cardinality/one}])
+                        [{:db/ident :w/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :w/qty
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}])
           calls (atom 0)
           handler (pg/make-query-handler conn
-                    {:tx-wrap (fn [tx-data]
-                                (swap! calls inc)
-                                tx-data)})]
+                                         {:tx-wrap (fn [tx-data]
+                                                     (swap! calls inc)
+                                                     tx-data)})]
       (try
         ;; Plain literal-VALUES INSERT — flows through the batchable
         ;; path when no RETURNING / ON CONFLICT is in play.
@@ -1447,10 +1447,10 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :w/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}])
+                        [{:db/ident :w/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}])
           handler (pg/make-query-handler conn)]
       (try
         (let [r (.execute handler "INSERT INTO w (sku) VALUES ('A')")]
@@ -1474,33 +1474,33 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :tag/name
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/tags
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/many}])
+                        [{:db/ident :tag/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/tags
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}])
           _ (d/transact conn
-              [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
+                        [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
           _ (d/transact conn
-              [{:widget/sku "A"
-                :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
-               {:widget/sku "B"
-                :widget/tags [[:tag/name "red"] [:tag/name "small"]]}
-               {:widget/sku "C"
-                :widget/tags [[:tag/name "round"]]}])
+                        [{:widget/sku "A"
+                          :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
+                         {:widget/sku "B"
+                          :widget/tags [[:tag/name "red"] [:tag/name "small"]]}
+                         {:widget/sku "C"
+                          :widget/tags [[:tag/name "round"]]}])
           handler (pg/make-query-handler conn)]
       (try
         ;; M2M JOIN: list every (widget, tag) pair
         (let [r (.execute handler
-                  (str "SELECT w.sku, t.name FROM widget w "
-                       "JOIN tag t ON t.db_id = ANY(w.tags) "
-                       "ORDER BY w.sku, t.name"))]
+                          (str "SELECT w.sku, t.name FROM widget w "
+                               "JOIN tag t ON t.db_id = ANY(w.tags) "
+                               "ORDER BY w.sku, t.name"))]
           (is (nil? (err r)) (str "M2M JOIN errored: " (err r)))
           (is (= [["A" "red"] ["A" "round"]
                   ["B" "red"] ["B" "small"]
@@ -1508,19 +1508,19 @@
                  (rows r))))
         ;; M2M JOIN with WHERE filter on tag side
         (let [r (.execute handler
-                  (str "SELECT w.sku FROM widget w "
-                       "JOIN tag t ON t.db_id = ANY(w.tags) "
-                       "WHERE t.name = 'red' "
-                       "ORDER BY w.sku"))]
+                          (str "SELECT w.sku FROM widget w "
+                               "JOIN tag t ON t.db_id = ANY(w.tags) "
+                               "WHERE t.name = 'red' "
+                               "ORDER BY w.sku"))]
           (is (nil? (err r)))
           (is (= [["A"] ["B"]] (rows r))))
         ;; M2M JOIN with aggregation grouped by tag
         (let [r (.execute handler
-                  (str "SELECT t.name, count(w.db_id) AS n "
-                       "FROM widget w "
-                       "JOIN tag t ON t.db_id = ANY(w.tags) "
-                       "GROUP BY t.name "
-                       "ORDER BY t.name"))]
+                          (str "SELECT t.name, count(w.db_id) AS n "
+                               "FROM widget w "
+                               "JOIN tag t ON t.db_id = ANY(w.tags) "
+                               "GROUP BY t.name "
+                               "ORDER BY t.name"))]
           (is (nil? (err r)))
           (let [data (rows r)
                 by-name (into {} (map (juxt first second) data))]
@@ -1545,17 +1545,17 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :tag/name
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/tags
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/many}])
+                        [{:db/ident :tag/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/tags
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}])
           _ (d/transact conn [{:tag/name "red"} {:tag/name "small"}])
           _ (d/transact conn [{:widget/sku "A"
                                :widget/tags [[:tag/name "red"] [:tag/name "small"]]}])
@@ -1598,24 +1598,24 @@
           _ (d/create-database cfg)
           conn (d/connect cfg)
           _ (d/transact conn
-              [{:db/ident :tag/name
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/sku
-                :db/valueType :db.type/string
-                :db/cardinality :db.cardinality/one
-                :db/unique :db.unique/identity}
-               {:db/ident :widget/tags
-                :db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/many}])
+                        [{:db/ident :tag/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/tags
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}])
           _ (d/transact conn
-              [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
+                        [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
           _ (d/transact conn
-              [{:widget/sku "A"
-                :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
-               {:widget/sku "B"
-                :widget/tags [[:tag/name "small"]]}])
+                        [{:widget/sku "A"
+                          :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
+                         {:widget/sku "B"
+                          :widget/tags [[:tag/name "small"]]}])
           handler (pg/make-query-handler conn)]
       (try
         (let [r (.execute handler "SELECT sku, tags FROM widget ORDER BY sku")]
