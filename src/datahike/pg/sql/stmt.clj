@@ -2466,6 +2466,21 @@
         ;; rejection still surfaces (an empty keyword `:` is invalid).
         (and (= vtype :db.type/keyword) (string? val))
         (if (clojure.string/blank? val) val (keyword val))
+        ;; Already-keyword passes through. Symbols coerce to keywords.
+        (and (= vtype :db.type/keyword) (keyword? val)) val
+        (and (= vtype :db.type/keyword) (symbol? val)) (keyword val)
+        ;; :db.type/symbol — analogous to keyword, no SQL literal.
+        (and (= vtype :db.type/symbol) (string? val))
+        (if (clojure.string/blank? val) val (symbol val))
+        (and (= vtype :db.type/symbol) (symbol? val)) val
+        (and (= vtype :db.type/symbol) (keyword? val))
+        (symbol (namespace val) (name val))
+        ;; :db.type/uuid — accept already-UUID values (param-bound or
+        ;; from CAST) directly. String parse handled below by
+        ;; falling through to coerce-unknown.
+        (and (= vtype :db.type/uuid) (instance? java.util.UUID val)) val
+        (and (= vtype :db.type/uuid) (string? val))
+        (try (java.util.UUID/fromString val) (catch Exception _ val))
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
         (and (= vtype :db.type/string) (or (map? val) (sequential? val)))
         (jb/serialize-jsonb val)
@@ -2482,6 +2497,24 @@
         (and (= vtype :db.type/instant) (string? val))
         (expr/parse-timestamp-string val)
         (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
+        ;; java.time.* — produced by SQL casts (`::date`, `::timestamp`)
+        ;; and by parameterized queries when the wire layer decodes
+        ;; PG's date/timestamp/timestamptz types. Datahike's
+        ;; :db.type/instant requires java.util.Date specifically.
+        (and (= vtype :db.type/instant) (instance? java.time.Instant val))
+        (java.util.Date/from ^java.time.Instant val)
+        (and (= vtype :db.type/instant) (instance? java.time.LocalDate val))
+        (java.util.Date/from
+         (.toInstant (.atStartOfDay ^java.time.LocalDate val
+                                    (java.time.ZoneOffset/UTC))))
+        (and (= vtype :db.type/instant) (instance? java.time.LocalDateTime val))
+        (java.util.Date/from
+         (.toInstant ^java.time.LocalDateTime val
+                     (java.time.ZoneOffset/UTC)))
+        (and (= vtype :db.type/instant) (instance? java.time.OffsetDateTime val))
+        (java.util.Date/from (.toInstant ^java.time.OffsetDateTime val))
+        (and (= vtype :db.type/instant) (instance? java.time.ZonedDateTime val))
+        (java.util.Date/from (.toInstant ^java.time.ZonedDateTime val))
         :else val))))
 
 (declare eval-update-expr)

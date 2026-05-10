@@ -228,7 +228,8 @@
    ;; string. `(keyword "draft") → :draft`, `(keyword "foo/bar") →
    ;; :foo/bar`. Blank strings stay as nil so the surrounding
    ;; comparison falls through to text equality and matches nothing.
-   :db.type/keyword (fn [^String s] (when-not (clojure.string/blank? s) (keyword s)))})
+   :db.type/keyword (fn [^String s] (when-not (clojure.string/blank? s) (keyword s)))
+   :db.type/symbol  (fn [^String s] (when-not (clojure.string/blank? s) (symbol s)))})
 
 (defn coerce-unknown
   "PG-style typinput dispatch: coerce an unknown-type string literal to

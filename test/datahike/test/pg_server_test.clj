@@ -1145,6 +1145,83 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
+(deftest test-jvm-time-types-coerce-to-instant
+  (testing "Every java.time.* type that pgwire / wire-layer / casts
+            can produce should coerce cleanly into :db.type/instant
+            on INSERT. Without this, a parameterized SQL prepared
+            statement bound to a java.time.LocalDate (the usual
+            jdbc default for `:date` columns) errors with cryptic
+            'value does not match schema definition'."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :evt/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :evt/at
+                :db/valueType :db.type/instant
+                :db/cardinality :db.cardinality/one}])
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; SQL '::date' cast → LocalDate path
+        (let [r (.execute handler
+                  "INSERT INTO evt (id, at) VALUES ('LD', '2026-04-01'::date)")]
+          (is (nil? (err r)) (str "::date cast errored: " (err r))))
+        ;; SQL '::timestamp' cast → java.util.Date path (already worked)
+        (let [r (.execute handler
+                  "INSERT INTO evt (id, at) VALUES ('TS', '2026-04-02 12:30:00'::timestamp)")]
+          (is (nil? (err r)) (str "::timestamp cast errored: " (err r))))
+        ;; Both rows should be readable
+        (let [r (.execute handler "SELECT count(*) FROM evt")
+              data (rows r)]
+          (is (= [["2"]] data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-keyword-and-symbol-and-uuid-pass-through-typed-input
+  (testing "When a value already has the target JVM type (Keyword,
+            Symbol, UUID), coerce-insert-value should pass it through
+            instead of rejecting. This matters for parameterized
+            INSERTs where the wire layer decoded a typed literal, and
+            for INSERT … SELECT pulling already-typed datahike values."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :w/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :w/state
+                :db/valueType :db.type/keyword
+                :db/cardinality :db.cardinality/one}
+               {:db/ident :w/uid
+                :db/valueType :db.type/uuid
+                :db/cardinality :db.cardinality/one}])
+          handler (pg/make-query-handler conn)
+          uid     "12345678-1234-1234-1234-123456789012"]
+      (try
+        ;; UUID via string literal — typed-input path
+        (let [r (.execute handler
+                  (str "INSERT INTO w (sku, state, uid) "
+                       "VALUES ('A', 'draft', '" uid "')"))]
+          (is (nil? (err r)) (str "INSERT errored: " (err r))))
+        (let [r (.execute handler "SELECT state, uid FROM w WHERE sku = 'A'")
+              [[s u]] (rows r)]
+          (is (nil? (err r)))
+          (is (= "draft" s))
+          (is (= uid u)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-keyword-column-insert-and-select-via-string
   (testing "Columns typed :db.type/keyword should accept string values
             on INSERT (`'draft'` → `:draft`) and surface them as their
