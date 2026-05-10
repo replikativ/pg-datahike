@@ -17,6 +17,7 @@
             [clojure.set]
             [datahike.api :as d]
             [datahike.core :as dc]
+            [datahike.db.interface :as dbi]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
@@ -4880,7 +4881,7 @@
         ;; this server's actual registry instead of the legacy fallback.
         (binding [catalog/*registered-databases* registered-databases]
           (let [db (apply-temporal (d/db conn) session-state)
-                parsed (sql/parse-sql sql (:schema db) db)
+                parsed (sql/parse-sql sql (dbi/-schema db) db)
                 ;; Attach the original SQL so downstream code that reads
                 ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                 ;; working even though parse-sql may not have set it for
@@ -5081,7 +5082,26 @@
                           db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
                                (or (:speculative-db @tx-state) real-db)
                                real-db)
-                          schema (:schema db)
+                          ;; Use the IDB protocol method, not keyword
+                          ;; access. AsOfDB / SinceDB / HistoricalDB are
+                          ;; defrecords with only [origin-db time-point]
+                          ;; fields; `(:schema wrapper)` returns nil
+                          ;; because defrecord ILookup never reaches the
+                          ;; protocol. `(dbi/-schema wrapper)` correctly
+                          ;; delegates to origin-db's schema (datahike's
+                          ;; `db.cljc:553`). Without this, SELECT under
+                          ;; `SET datahike.as_of = …` collapses to errors
+                          ;; like \"Query for unknown vars\" because
+                          ;; column-info / derive-virtual-tables receive
+                          ;; an empty schema map. Note: the schema
+                          ;; returned is the *current* schema cached on
+                          ;; the origin-db, not a true historical schema —
+                          ;; columns added after the as-of timestamp are
+                          ;; visible to the translator but contain no
+                          ;; data at that time. A real historical schema
+                          ;; would require a `schema-as-of` upstream in
+                          ;; datahike (see TODO).
+                          schema (dbi/-schema db)
                     ;; Prepared-statement path: reuse the Parse-time result
                     ;; and resolve ParamRef placeholders against the bound
                     ;; values decoded by the wire layer. Simple Query and

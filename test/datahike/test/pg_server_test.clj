@@ -940,6 +940,42 @@
   (testing "Cleanup"
     (.execute *handler* "DELETE FROM department WHERE name = 'Research'")))
 
+(deftest test-as-of-count-star-survives-pre-schema-timestamp
+  (testing "Regression for the column-info empty-fallback bug:
+            SET datahike.as_of to a point BEFORE the schema attrs were
+            transacted, then SELECT count(*) — the translator must not
+            error with 'Query for unknown vars: [?<table>_eid]'.
+
+            Root cause was column-order-from-db returning [] under
+            as-of (the schema-ident query saw zero entities at the
+            past tx), and the column-info if-let treating empty vec
+            as truthy — yielding a single-column [{db_id}] result.
+            COUNT(*)'s entity-binder fallback then found no second
+            column, never bound the entity-var, and the translator
+            emitted an unbound :find."
+    (.execute *handler* "SET datahike.as_of = '1970-01-01T00:00:00Z'")
+    (let [r (.execute *handler* "SELECT count(*) FROM person")]
+      (is (nil? (err r))
+          (str "as-of-pre-schema count(*) errored: " (err r)))
+      ;; At epoch the table is empty (datoms didn't exist yet).
+      (is (= [["0"]] (rows r))))
+    (let [r (.execute *handler* "SELECT count(*) FROM department")]
+      (is (nil? (err r)))
+      (is (= [["0"]] (rows r))))
+    (.execute *handler* "RESET datahike.as_of")
+    (let [r (.execute *handler* "SELECT count(*) FROM person")]
+      (is (= [["3"]] (rows r)) "current head sees 3 people"))))
+
+(deftest test-as-of-select-star-survives-pre-schema-timestamp
+  (testing "SELECT * under the same as-of-pre-schema condition must
+            also work — exercises the same column-info fallback path
+            via a different translator entry point."
+    (.execute *handler* "SET datahike.as_of = '1970-01-01T00:00:00Z'")
+    (let [r (.execute *handler* "SELECT * FROM person LIMIT 1")]
+      (is (nil? (err r)) (str "as-of-pre-schema SELECT * errored: " (err r)))
+      (is (= [] (rows r)) "no rows visible at epoch"))
+    (.execute *handler* "RESET datahike.as_of")))
+
 ;; ============================================================================
 ;; Privilege-check functions + boolean-valued WHERE
 ;; ============================================================================

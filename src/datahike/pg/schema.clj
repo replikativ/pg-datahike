@@ -673,7 +673,15 @@
              ;; attr's local name (always the original, independent of
              ;; any :datahike.pg/column rename) so column-order-from-db's
              ;; original-name-based output still reconciles.
-             ordered (if-let [col-order (when db (column-order-from-db db table-name))]
+             ;; Under `as-of` (or `since`/`history`) into a window that
+             ;; predates the schema-attr transactions, `column-order-from-db`
+             ;; queries the wrapped db and gets `[]` (no schema-ident
+             ;; entities visible at that time-point). `(seq …)` makes that
+             ;; fall back to the live `columns` ordering rather than
+             ;; collapsing the table to db_id only — which would cause
+             ;; COUNT(*) under as-of to emit a `:find` containing the
+             ;; entity var with no `:where` binding it.
+             ordered (if-let [col-order (when db (seq (column-order-from-db db table-name)))]
                        (let [col-map (into {} (map (fn [c] [(name (:attr c)) c]) columns))]
                          (vec (keep col-map col-order)))
                        columns)]
