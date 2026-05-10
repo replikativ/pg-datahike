@@ -966,6 +966,82 @@
     (let [r (.execute *handler* "SELECT count(*) FROM person")]
       (is (= [["3"]] (rows r)) "current head sees 3 people"))))
 
+(deftest test-insert-select-with-ref-columns-actually-lands
+  (testing "INSERT INTO posting (...) SELECT ... lands the row in
+            datahike. Bug observed in the wild: pg-datahike returned
+            INSERT 0 1 (success) but no row appeared, even when the
+            inner SELECT clearly returned a row. Suspected loss path:
+            either coerce-insert-value silently drops the columns, or
+            the ref-target FK projection on the INSERT … SELECT path
+            consumes its arg and returns nil for the ref column."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :acct/code
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :tx/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :post/transaction
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/one}
+               {:db/ident :post/account
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/one}
+               {:db/ident :post/amount
+                :db/valueType :db.type/bigdec
+                :db/cardinality :db.cardinality/one}])
+          {:keys [tempids]}
+          (d/transact conn [{:db/id "a" :acct/code "1400"}
+                            {:db/id "t" :tx/id "TX-1"}])
+          acct-eid (get tempids "a")
+          tx-eid   (get tempids "t")
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; Form 1: INSERT … VALUES — sanity check, should land
+        (let [r (.execute handler
+                  (str "INSERT INTO post (transaction, account, amount) "
+                       "VALUES (" tx-eid ", " acct-eid ", 100.00)"))]
+          (is (nil? (err r)) (str "VALUES INSERT errored: " (err r))))
+
+        ;; Form 2: INSERT … SELECT with literal-only projection (no FROM)
+        (let [r (.execute handler
+                  (str "INSERT INTO post (transaction, account, amount) "
+                       "SELECT " tx-eid ", " acct-eid ", 200.00"))]
+          (is (nil? (err r)) (str "SELECT-no-FROM INSERT errored: " (err r))))
+
+        ;; Form 3: INSERT … SELECT FROM <table> LIMIT 1 — drives the
+        ;; canonical INSERT…SELECT branch. Was the failing form in the
+        ;; accounting psql session: result reported INSERT 0 1 but no
+        ;; row landed.
+        (let [r (.execute handler
+                  (str "INSERT INTO post (transaction, account, amount) "
+                       "SELECT " tx-eid ", " acct-eid ", 300.00 "
+                       "FROM acct LIMIT 1"))]
+          (is (nil? (err r)) (str "SELECT-FROM INSERT errored: " (err r))))
+
+        ;; All three should have landed. Read them back via SQL.
+        (let [r (.execute handler "SELECT amount FROM post ORDER BY amount")
+              data (rows r)]
+          (is (nil? (err r)))
+          (is (= 3 (count data))
+              (str "expected 3 rows; got: " data))
+          ;; Tolerate bigdec display variants (100.0 vs 100.00) — what
+          ;; matters is the row landed at all. The pre-fix bug was the
+          ;; row vanishing entirely.
+          (is (= [100.0M 200.0M 300.0M]
+                 (map (fn [[s]] (bigdec s)) data))
+              (str "expected amounts 100/200/300; got: " data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-ref-column-insert-accepts-bigint-entity-id
   (testing "A ref column read via SELECT projects as the parent's PK
             value when one is resolvable, OR as the raw entity-id

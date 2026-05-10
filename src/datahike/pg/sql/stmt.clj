@@ -2889,9 +2889,19 @@
             inner-query (:query inner-parsed)
             inner-in-args (:in-args inner-parsed)
             q-fn d/q
-            inner-results (if (seq inner-in-args)
+            ;; Table-free SELECT (`SELECT 1, 2, 3` — no FROM clause) is
+            ;; produced by translate-select with `:literal-row` /
+            ;; `:literal-rows` set and `:query {:find [] :where []}`.
+            ;; The execute-select path handles this via a literal-row
+            ;; short-circuit; we mirror it here so INSERT … SELECT
+            ;; routes the same data, otherwise running d/q on the
+            ;; empty query returns `[[]]` and silently drops the row.
+            inner-results (cond
+                            (:literal-rows inner-parsed) (:literal-rows inner-parsed)
+                            (:literal-row  inner-parsed) [(:literal-row inner-parsed)]
+                            (seq inner-in-args)
                             (apply q-fn inner-query db inner-in-args)
-                            (q-fn inner-query db))
+                            :else (q-fn inner-query db))
             rows (mapv (fn [row]
                          (if (sequential? row) (vec row) [row]))
                        inner-results)
