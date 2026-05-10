@@ -2402,6 +2402,13 @@
         (coerce/coerce-numeric val :float)
         (and (= vtype :db.type/boolean) (string? val))
         (Boolean/parseBoolean val)
+        ;; :db.type/keyword: SQL has no keyword literal, so clients
+        ;; send the bare name as a string. Coerce 'draft' → :draft and
+        ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
+        ;; forms). Empty / blank strings stay as-is so datahike's
+        ;; rejection still surfaces (an empty keyword `:` is invalid).
+        (and (= vtype :db.type/keyword) (string? val))
+        (if (clojure.string/blank? val) val (keyword val))
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
         (and (= vtype :db.type/string) (or (map? val) (sequential? val)))
         (jb/serialize-jsonb val)

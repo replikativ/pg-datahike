@@ -966,6 +966,48 @@
     (let [r (.execute *handler* "SELECT count(*) FROM person")]
       (is (= [["3"]] (rows r)) "current head sees 3 people"))))
 
+(deftest test-keyword-column-insert-and-select-via-string
+  (testing "Columns typed :db.type/keyword should accept string values
+            on INSERT (`'draft'` → `:draft`) and surface them as their
+            string form on SELECT. SQL clients have no keyword literal,
+            so the string ↔ keyword bridge belongs in the wire layer."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :doc/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :doc/state
+                :db/valueType :db.type/keyword
+                :db/cardinality :db.cardinality/one}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler "INSERT INTO doc (id, state) VALUES ('A', 'draft')")]
+          (is (nil? (err r)) (str "INSERT errored: " (err r))))
+        (let [r (.execute handler "INSERT INTO doc (id, state) VALUES ('B', 'posted')")]
+          (is (nil? (err r)) (str "INSERT errored: " (err r))))
+        ;; SELECT should expose the keyword as a string (clients have
+        ;; no datahike keyword type to receive).
+        (let [r (.execute handler "SELECT id, state FROM doc ORDER BY id")
+              data (rows r)]
+          (is (nil? (err r)))
+          (is (= 2 (count data)))
+          (is (= "draft"  (-> data first  second)))
+          (is (= "posted" (-> data second second))))
+        ;; WHERE-clause comparison on a keyword column with a string
+        ;; literal should ALSO work — symmetric with INSERT.
+        (let [r (.execute handler "SELECT id FROM doc WHERE state = 'draft'")
+              data (rows r)]
+          (is (nil? (err r)))
+          (is (= [["A"]] data) (str "WHERE state='draft' returned: " data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-many-ref-projects-as-int8-array-via-data-inference
   (testing "A :db.cardinality/many ref attr whose local name does NOT
             match the target namespace (e.g. `:account/tags` →
