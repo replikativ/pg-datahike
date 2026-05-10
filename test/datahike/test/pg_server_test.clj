@@ -940,6 +940,720 @@
   (testing "Cleanup"
     (.execute *handler* "DELETE FROM department WHERE name = 'Research'")))
 
+(deftest test-as-of-count-star-survives-pre-schema-timestamp
+  (testing "Regression for the column-info empty-fallback bug:
+            SET datahike.as_of to a point BEFORE the schema attrs were
+            transacted, then SELECT count(*) — the translator must not
+            error with 'Query for unknown vars: [?<table>_eid]'.
+
+            Root cause was column-order-from-db returning [] under
+            as-of (the schema-ident query saw zero entities at the
+            past tx), and the column-info if-let treating empty vec
+            as truthy — yielding a single-column [{db_id}] result.
+            COUNT(*)'s entity-binder fallback then found no second
+            column, never bound the entity-var, and the translator
+            emitted an unbound :find."
+    (.execute *handler* "SET datahike.as_of = '1970-01-01T00:00:00Z'")
+    (let [r (.execute *handler* "SELECT count(*) FROM person")]
+      (is (nil? (err r))
+          (str "as-of-pre-schema count(*) errored: " (err r)))
+      ;; At epoch the table is empty (datoms didn't exist yet).
+      (is (= [["0"]] (rows r))))
+    (let [r (.execute *handler* "SELECT count(*) FROM department")]
+      (is (nil? (err r)))
+      (is (= [["0"]] (rows r))))
+    (.execute *handler* "RESET datahike.as_of")
+    (let [r (.execute *handler* "SELECT count(*) FROM person")]
+      (is (= [["3"]] (rows r)) "current head sees 3 people"))))
+
+(deftest test-left-join-count-of-right-side-eid-binds-without-error
+  (testing "LEFT JOIN <r> ON … then SELECT count(r.db_id) — the
+            right-side entity var must be bound somewhere or the
+            translator rejects with 'Query for unknown vars:
+            [?<r>_eid]'.
+
+            Root cause was twofold:
+              (a) the ref-based LEFT JOIN post-processor used
+                  `left-evar` (default-table's evar) as the get-else
+                  input, but the entity-var swap in translate-join
+                  had already corrupted that var to point at ref-var
+                  itself — producing a self-referential
+                  `(get-else $ ?ref :attr :__null__) ?ref`.
+              (b) the right-side entity-var (?p_eid) was never bound:
+                  no right-side data pattern existed when only
+                  `count(p.db_id)` was projected, so it landed in
+                  :find with no :where binding.
+
+            Fixed by:
+              (a) computing `owner-evar` from the JOIN's literal
+                  right-alias (`p`) instead of trusting the ref-info's
+                  potentially-corrupted `:left-evar`.
+              (b) including owner-evar in shared-vars and binding it
+                  in matched (data pattern) + unmatched (:__null__)
+                  branches.
+
+            Note: a deeper LEFT JOIN iteration bug remains where
+            empty-right-side rows on the LEFT table aren't surfaced
+            (the outer get-else drives iteration from the right table,
+            not the left). Filed as a separate task; this test only
+            covers the unknown-vars regression."
+    (let [r (.execute *handler*
+                      (str "SELECT d.name, count(p.db_id) "
+                           "FROM department d "
+                           "LEFT JOIN person p ON p.department = d.db_id "
+                           "GROUP BY d.name "
+                           "ORDER BY d.name"))]
+      (is (nil? (err r))
+          (str "LEFT JOIN + count(p.db_id) errored: " (err r)))
+      (let [data (rows r)
+            by-name (into {} (map (juxt first second) data))]
+        ;; Sales has 1 person (Charlie), Engineering has 2 (Alice, Bob).
+        (is (= "1" (get by-name "Sales")))
+        (is (= "2" (get by-name "Engineering")))))))
+
+(deftest test-insert-select-with-ref-columns-actually-lands
+  (testing "INSERT INTO posting (...) SELECT ... lands the row in
+            datahike. Bug observed in the wild: pg-datahike returned
+            INSERT 0 1 (success) but no row appeared, even when the
+            inner SELECT clearly returned a row. Suspected loss path:
+            either coerce-insert-value silently drops the columns, or
+            the ref-target FK projection on the INSERT … SELECT path
+            consumes its arg and returns nil for the ref column."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :acct/code
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :tx/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :post/transaction
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :post/account
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :post/amount
+                          :db/valueType :db.type/bigdec
+                          :db/cardinality :db.cardinality/one}])
+          {:keys [tempids]}
+          (d/transact conn [{:db/id "a" :acct/code "1400"}
+                            {:db/id "t" :tx/id "TX-1"}])
+          acct-eid (get tempids "a")
+          tx-eid   (get tempids "t")
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; Form 1: INSERT … VALUES — sanity check, should land
+        (let [r (.execute handler
+                          (str "INSERT INTO post (transaction, account, amount) "
+                               "VALUES (" tx-eid ", " acct-eid ", 100.00)"))]
+          (is (nil? (err r)) (str "VALUES INSERT errored: " (err r))))
+
+        ;; Form 2: INSERT … SELECT with literal-only projection (no FROM)
+        (let [r (.execute handler
+                          (str "INSERT INTO post (transaction, account, amount) "
+                               "SELECT " tx-eid ", " acct-eid ", 200.00"))]
+          (is (nil? (err r)) (str "SELECT-no-FROM INSERT errored: " (err r))))
+
+        ;; Form 3: INSERT … SELECT FROM <table> LIMIT 1 — drives the
+        ;; canonical INSERT…SELECT branch. Was the failing form in the
+        ;; accounting psql session: result reported INSERT 0 1 but no
+        ;; row landed.
+        (let [r (.execute handler
+                          (str "INSERT INTO post (transaction, account, amount) "
+                               "SELECT " tx-eid ", " acct-eid ", 300.00 "
+                               "FROM acct LIMIT 1"))]
+          (is (nil? (err r)) (str "SELECT-FROM INSERT errored: " (err r))))
+
+        ;; All three should have landed. Read them back via SQL.
+        (let [r (.execute handler "SELECT amount FROM post ORDER BY amount")
+              data (rows r)]
+          (is (nil? (err r)))
+          (is (= 3 (count data))
+              (str "expected 3 rows; got: " data))
+          ;; Tolerate bigdec display variants (100.0 vs 100.00) — what
+          ;; matters is the row landed at all. The pre-fix bug was the
+          ;; row vanishing entirely.
+          (is (= [100.0M 200.0M 300.0M]
+                 (map (fn [[s]] (bigdec s)) data))
+              (str "expected amounts 100/200/300; got: " data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-ref-column-insert-accepts-bigint-entity-id
+  (testing "A ref column read via SELECT projects as the parent's PK
+            value when one is resolvable, OR as the raw entity-id
+            (bigint) when there's no PK target. INSERT must accept
+            *both* forms symmetrically:
+              - A string matching the target PK's value-type → wrap
+                into a lookup-ref `[pk-attr v]` so datahike resolves
+                by PK.
+              - A bigint matching no PK type → pass through as a
+                direct entity-id reference.
+
+            Previously coerce-insert-value unconditionally wrapped the
+            value in `[pk-attr val]`, which broke entity-id INSERTs:
+              `INSERT … account=143` → `[:account/path 143]` →
+              datahike: \"Nothing found for entity id\" because path
+              is a string and 143 is a long."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :account/code
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :posting/account
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :posting/amount
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}])
+          {:keys [tempids]}
+          (d/transact conn [{:db/id "acct" :account/code "1200"}])
+          acct-eid (get tempids "acct")
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; Form 1: string PK value — datahike resolves via lookup-ref.
+        (let [r (.execute handler
+                          (str "INSERT INTO posting (account, amount) "
+                               "VALUES ('1200', 100)"))]
+          (is (nil? (err r))
+              (str "string-PK INSERT errored: " (err r))))
+        ;; Form 2: raw entity-id (bigint).
+        (let [r (.execute handler
+                          (str "INSERT INTO posting (account, amount) "
+                               "VALUES (" acct-eid ", 200)"))]
+          (is (nil? (err r))
+              (str "entity-id INSERT errored: " (err r))))
+        ;; Both forms should have landed on the same account.
+        (let [r (.execute handler
+                          "SELECT count(*) FROM posting WHERE account IS NOT NULL")
+              data (rows r)]
+          (is (= [["2"]] data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-jvm-time-types-coerce-to-instant
+  (testing "Every java.time.* type that pgwire / wire-layer / casts
+            can produce should coerce cleanly into :db.type/instant
+            on INSERT. Without this, a parameterized SQL prepared
+            statement bound to a java.time.LocalDate (the usual
+            jdbc default for `:date` columns) errors with cryptic
+            'value does not match schema definition'."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :evt/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :evt/at
+                          :db/valueType :db.type/instant
+                          :db/cardinality :db.cardinality/one}])
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; SQL '::date' cast → LocalDate path
+        (let [r (.execute handler
+                          "INSERT INTO evt (id, at) VALUES ('LD', '2026-04-01'::date)")]
+          (is (nil? (err r)) (str "::date cast errored: " (err r))))
+        ;; SQL '::timestamp' cast → java.util.Date path (already worked)
+        (let [r (.execute handler
+                          "INSERT INTO evt (id, at) VALUES ('TS', '2026-04-02 12:30:00'::timestamp)")]
+          (is (nil? (err r)) (str "::timestamp cast errored: " (err r))))
+        ;; Both rows should be readable
+        (let [r (.execute handler "SELECT count(*) FROM evt")
+              data (rows r)]
+          (is (= [["2"]] data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-keyword-and-symbol-and-uuid-pass-through-typed-input
+  (testing "When a value already has the target JVM type (Keyword,
+            Symbol, UUID), coerce-insert-value should pass it through
+            instead of rejecting. This matters for parameterized
+            INSERTs where the wire layer decoded a typed literal, and
+            for INSERT … SELECT pulling already-typed datahike values."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :w/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :w/state
+                          :db/valueType :db.type/keyword
+                          :db/cardinality :db.cardinality/one}
+                         {:db/ident :w/uid
+                          :db/valueType :db.type/uuid
+                          :db/cardinality :db.cardinality/one}])
+          handler (pg/make-query-handler conn)
+          uid     "12345678-1234-1234-1234-123456789012"]
+      (try
+        ;; UUID via string literal — typed-input path
+        (let [r (.execute handler
+                          (str "INSERT INTO w (sku, state, uid) "
+                               "VALUES ('A', 'draft', '" uid "')"))]
+          (is (nil? (err r)) (str "INSERT errored: " (err r))))
+        (let [r (.execute handler "SELECT state, uid FROM w WHERE sku = 'A'")
+              [[s u]] (rows r)]
+          (is (nil? (err r)))
+          (is (= "draft" s))
+          (is (= uid u)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-keyword-column-insert-and-select-via-string
+  (testing "Columns typed :db.type/keyword should accept string values
+            on INSERT (`'draft'` → `:draft`) and surface them as their
+            string form on SELECT. SQL clients have no keyword literal,
+            so the string ↔ keyword bridge belongs in the wire layer."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :doc/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :doc/state
+                          :db/valueType :db.type/keyword
+                          :db/cardinality :db.cardinality/one}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler "INSERT INTO doc (id, state) VALUES ('A', 'draft')")]
+          (is (nil? (err r)) (str "INSERT errored: " (err r))))
+        (let [r (.execute handler "INSERT INTO doc (id, state) VALUES ('B', 'posted')")]
+          (is (nil? (err r)) (str "INSERT errored: " (err r))))
+        ;; SELECT should expose the keyword as a string (clients have
+        ;; no datahike keyword type to receive).
+        (let [r (.execute handler "SELECT id, state FROM doc ORDER BY id")
+              data (rows r)]
+          (is (nil? (err r)))
+          (is (= 2 (count data)))
+          (is (= "draft"  (-> data first  second)))
+          (is (= "posted" (-> data second second))))
+        ;; WHERE-clause comparison on a keyword column with a string
+        ;; literal should ALSO work — symmetric with INSERT.
+        (let [r (.execute handler "SELECT id FROM doc WHERE state = 'draft'")
+              data (rows r)]
+          (is (nil? (err r)))
+          (is (= [["A"]] data) (str "WHERE state='draft' returned: " data)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-left-join-empty-right-side-rows-appear
+  (testing "LEFT JOIN <r> ON r.fk = l.db_id should surface rows from
+            the LEFT table even when no RIGHT row matches. Standard
+            SQL LEFT JOIN semantics. The translator currently drives
+            iteration from the right table (a get-else over the right
+            entity), so left rows with no match get dropped — they
+            never appear in the result.
+
+            Reproduces with a fresh fixture: 2 departments, only one
+            has a person. The empty department should surface with
+            count(p.db_id) = 0. Pre-fix: the empty department row is
+            absent from the result entirely."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :dept/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :emp/id
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :emp/department
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}])
+          {:keys [tempids]}
+          (d/transact conn [{:db/id "d1" :dept/id "Engineering"}
+                            {:db/id "d2" :dept/id "Empty"}])
+          eng (get tempids "d1")
+          _ (d/transact conn [{:emp/id "alice" :emp/department eng}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler
+                          (str "SELECT d.id, count(e.db_id) AS n_emps "
+                               "FROM dept d "
+                               "LEFT JOIN emp e ON e.department = d.db_id "
+                               "GROUP BY d.id "
+                               "ORDER BY d.id"))]
+          (is (nil? (err r)) (str "errored: " (err r)))
+          (let [data (rows r)
+                by-id (into {} (map (juxt first second) data))]
+            (is (= 2 (count data))
+                (str "expected 2 rows (one per dept); got: " data))
+            (is (= "0" (get by-id "Empty"))
+                (str "Empty dept should have count=0; got: "
+                     (pr-str by-id)))
+            (is (= "1" (get by-id "Engineering")))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-tx-wrap-config-fires-for-sql-writes
+  (testing "make-query-handler accepts a :tx-wrap option that runs
+            on every INSERT/UPDATE/DELETE's tx-data before
+            d/transact. Frameworks (e.g. datahike-accounting) use
+            this to inject [:db.fn/call validate tx-data] so their
+            transactor-side validators fire for SQL writes too.
+
+            This test uses a simple Clojure-side wrap that throws
+            on negative `widget/qty` values, demonstrating the hook
+            is reached by INSERT, UPDATE, and DELETE paths."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/qty
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}])
+          calls (atom [])
+          neg-qty? (fn [v] (and (number? v) (neg? v)))
+          tx-wrap (fn [tx-data]
+                    (swap! calls conj (vec tx-data))
+                    ;; Reject any tx-data entry asserting a negative
+                    ;; qty. Handles both shapes:
+                    ;;   {:widget/qty -7}            (entity map, INSERT)
+                    ;;   [:db/add eid :widget/qty -7] (tuple, UPDATE)
+                    (doseq [entry tx-data]
+                      (cond
+                        (and (map? entry)
+                             (neg-qty? (:widget/qty entry)))
+                        (throw (ex-info "negative qty rejected by tx-wrap"
+                                        {:entry entry}))
+                        (and (vector? entry) (= 4 (count entry))
+                             (= :db/add (first entry))
+                             (= :widget/qty (nth entry 2))
+                             (neg-qty? (nth entry 3)))
+                        (throw (ex-info "negative qty rejected by tx-wrap"
+                                        {:entry entry}))))
+                    tx-data)
+          handler (pg/make-query-handler conn {:tx-wrap tx-wrap})]
+      (try
+        ;; Valid INSERT goes through.
+        (let [r (.execute handler "INSERT INTO widget (sku, qty) VALUES ('A', 5)")]
+          (is (nil? (err r)) (str "valid INSERT errored: " (err r))))
+
+        ;; Invalid INSERT (qty = -1) is rejected by the wrap.
+        (let [r (.execute handler "INSERT INTO widget (sku, qty) VALUES ('B', -1)")]
+          (is (some? (err r)) "negative-qty INSERT should fail")
+          (is (clojure.string/includes? (err r) "negative qty rejected")
+              (str "expected wrap message; got: " (err r))))
+
+        ;; Confirm only A landed.
+        (let [r (.execute handler "SELECT sku FROM widget ORDER BY sku")]
+          (is (= [["A"]] (rows r))))
+
+        ;; UPDATE through the wrap: positive update succeeds.
+        (let [r (.execute handler "UPDATE widget SET qty = 10 WHERE sku = 'A'")]
+          (is (nil? (err r))))
+
+        ;; UPDATE through the wrap: negative update rejected.
+        (let [r (.execute handler "UPDATE widget SET qty = -7 WHERE sku = 'A'")]
+          (is (some? (err r))
+              "UPDATE that would set qty=-7 should fail"))
+
+        ;; A's qty should still be 10 (last successful update).
+        (let [r (.execute handler "SELECT qty FROM widget WHERE sku = 'A'")]
+          (is (= [["10"]] (rows r))))
+
+        ;; The wrap was called multiple times — confirm.
+        (is (>= (count @calls) 3)
+            (str "expected wrap called >=3 times; got " (count @calls)))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-tx-wrap-fires-via-batchable-insert-path
+  (testing "psql Simple Query INSERTs (the typical flow) go through
+            exec-batchable-insert, not execute-insert. The :tx-wrap
+            hook must fire on this path too — otherwise framework-
+            installed validators see only the slower / RETURNING /
+            ON CONFLICT inserts, missing the bulk of writes."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :w/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :w/qty
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}])
+          calls (atom 0)
+          handler (pg/make-query-handler conn
+                                         {:tx-wrap (fn [tx-data]
+                                                     (swap! calls inc)
+                                                     tx-data)})]
+      (try
+        ;; Plain literal-VALUES INSERT — flows through the batchable
+        ;; path when no RETURNING / ON CONFLICT is in play.
+        (let [r (.execute handler "INSERT INTO w (sku, qty) VALUES ('A', 1)")]
+          (is (nil? (err r))))
+        (let [r (.execute handler "INSERT INTO w (sku, qty) VALUES ('B', 2)")]
+          (is (nil? (err r))))
+        ;; Each call should have invoked the wrap.
+        (is (= 2 @calls)
+            (str "expected 2 wrap calls; got " @calls
+                 " (batchable path may be skipping :tx-wrap)"))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-tx-wrap-default-identity-no-op
+  (testing "Without :tx-wrap, the handler behaves identically — the
+            default is identity and adds no overhead."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :w/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler "INSERT INTO w (sku) VALUES ('A')")]
+          (is (nil? (err r))))
+        (let [r (.execute handler "SELECT sku FROM w")]
+          (is (= [["A"]] (rows r))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-m2m-join-via-any-array
+  (testing "JOIN through a :db.cardinality/many ref using
+            `JOIN <table> <alias> ON <alias>.db_id = ANY(<src>.<m2m_col>)`.
+            Common SQL idiom for tag-aggregated reports (e.g. UStVA via
+            account-tag aggregation). Datalog-side is naturally a plain
+            data pattern over the M2M ref attr — translator just needs
+            to recognize the SQL form and emit the right pattern."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :tag/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/tags
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}])
+          _ (d/transact conn
+                        [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
+          _ (d/transact conn
+                        [{:widget/sku "A"
+                          :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
+                         {:widget/sku "B"
+                          :widget/tags [[:tag/name "red"] [:tag/name "small"]]}
+                         {:widget/sku "C"
+                          :widget/tags [[:tag/name "round"]]}])
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; M2M JOIN: list every (widget, tag) pair
+        (let [r (.execute handler
+                          (str "SELECT w.sku, t.name FROM widget w "
+                               "JOIN tag t ON t.db_id = ANY(w.tags) "
+                               "ORDER BY w.sku, t.name"))]
+          (is (nil? (err r)) (str "M2M JOIN errored: " (err r)))
+          (is (= [["A" "red"] ["A" "round"]
+                  ["B" "red"] ["B" "small"]
+                  ["C" "round"]]
+                 (rows r))))
+        ;; M2M JOIN with WHERE filter on tag side
+        (let [r (.execute handler
+                          (str "SELECT w.sku FROM widget w "
+                               "JOIN tag t ON t.db_id = ANY(w.tags) "
+                               "WHERE t.name = 'red' "
+                               "ORDER BY w.sku"))]
+          (is (nil? (err r)))
+          (is (= [["A"] ["B"]] (rows r))))
+        ;; M2M JOIN with aggregation grouped by tag
+        (let [r (.execute handler
+                          (str "SELECT t.name, count(w.db_id) AS n "
+                               "FROM widget w "
+                               "JOIN tag t ON t.db_id = ANY(w.tags) "
+                               "GROUP BY t.name "
+                               "ORDER BY t.name"))]
+          (is (nil? (err r)))
+          (let [data (rows r)
+                by-name (into {} (map (juxt first second) data))]
+            (is (= "2" (get by-name "red")))
+            (is (= "2" (get by-name "round")))
+            (is (= "1" (get by-name "small")))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-aliased-many-ref-projection-works-with-where
+  (testing "Aliased projection of an M2M ref column with a WHERE
+            clause was erroring with 'Bad format for attribute in
+            pattern'. Triggered by the entity-var split: col-var!
+            for :account/tags created entity-var ?account_eid for
+            namespace `account`, while the rest of the query was
+            using ?a_eid for the alias `a`. Two ungrounded eids;
+            the M2M emitter's source-eid arg landed unbound."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :tag/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/tags
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}])
+          _ (d/transact conn [{:tag/name "red"} {:tag/name "small"}])
+          _ (d/transact conn [{:widget/sku "A"
+                               :widget/tags [[:tag/name "red"] [:tag/name "small"]]}])
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; Bare unaliased — known to work
+        (let [r (.execute handler "SELECT tags FROM widget")]
+          (is (nil? (err r)))
+          (is (= 1 (count (rows r)))))
+        ;; Aliased — was erroring
+        (let [r (.execute handler "SELECT w.tags FROM widget w")]
+          (is (nil? (err r)) (str "aliased SELECT errored: " (err r)))
+          (is (= 1 (count (rows r)))))
+        ;; Aliased + WHERE — was the original failing pattern
+        (let [r (.execute handler "SELECT w.tags FROM widget w WHERE w.sku = 'A'")]
+          (is (nil? (err r)) (str "aliased+WHERE errored: " (err r)))
+          (is (= 1 (count (rows r)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-many-ref-projects-as-int8-array-via-data-inference
+  (testing "A :db.cardinality/many ref attr whose local name does NOT
+            match the target namespace (e.g. `:account/tags` →
+            `:account-tag`) should still project as int8[] of target
+            entity-ids, NOT as a single bigint. Previously the
+            convention `(name ref-attr) → namespace` only matched
+            singular-named refs (`:order/customer` → customer),
+            silently dropping every plural / hyphen-named M2M.
+
+            Resolution: when the schema-only convention finds no
+            target, validate-ref-targets! probes the actual data via
+            bulk-ref-target-namespaces. If exactly one target
+            namespace appears AND that namespace has a
+            :db.unique/identity attr, use it. The cardinality marker
+            keeps the [pk :many] shape for many-refs."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+                        [{:db/ident :tag/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/sku
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident :widget/tags
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}])
+          _ (d/transact conn
+                        [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
+          _ (d/transact conn
+                        [{:widget/sku "A"
+                          :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
+                         {:widget/sku "B"
+                          :widget/tags [[:tag/name "small"]]}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler "SELECT sku, tags FROM widget ORDER BY sku")]
+          (is (nil? (err r)) (str "errored: " (err r)))
+          (let [data (rows r)]
+            (is (= 2 (count data)))
+            ;; Both rows should have non-nil tags column. Element type
+            ;; is int8[], not a single bigint — the array form means
+            ;; clients can WHERE … = ANY(tags), array_agg, etc.
+            (is (every? (fn [[_ t]] (.startsWith ^String (str t) "{")) data)
+                (str "expected int8[] form like '{1,2}', got: " data))
+            ;; A's tags should be 2-element, B's 1-element.
+            (let [a-tags (second (first data))
+                  b-tags (second (second data))
+                  count-elems (fn [^String s]
+                                (->> (-> s
+                                         (.replaceAll "[\\{\\}]" "")
+                                         (.split ","))
+                                     (remove empty?)
+                                     count))]
+              (is (= 2 (count-elems a-tags))
+                  (str "widget A should have 2 tags, got: " a-tags))
+              (is (= 1 (count-elems b-tags))
+                  (str "widget B should have 1 tag, got: " b-tags)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-as-of-select-star-survives-pre-schema-timestamp
+  (testing "SELECT * under the same as-of-pre-schema condition must
+            also work — exercises the same column-info fallback path
+            via a different translator entry point."
+    (.execute *handler* "SET datahike.as_of = '1970-01-01T00:00:00Z'")
+    (let [r (.execute *handler* "SELECT * FROM person LIMIT 1")]
+      (is (nil? (err r)) (str "as-of-pre-schema SELECT * errored: " (err r)))
+      (is (= [] (rows r)) "no rows visible at epoch"))
+    (.execute *handler* "RESET datahike.as_of")))
+
 ;; ============================================================================
 ;; Privilege-check functions + boolean-valued WHERE
 ;; ============================================================================

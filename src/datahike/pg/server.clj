@@ -17,6 +17,7 @@
             [clojure.set]
             [datahike.api :as d]
             [datahike.core :as dc]
+            [datahike.db.interface :as dbi]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
@@ -1820,13 +1821,14 @@
               (enforce-fk-on-insert! txdb table-name ns filled-entities))
             result))]])))
 
-(defn- execute-insert [conn parsed]
+(defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [table-name (:table parsed)
           db (d/db conn)
           tx-data (-> (:tx-data parsed)
                       (auto-populate-identity table-name db)
-                      (apply-column-constraints table-name (:ns parsed) db))
+                      (apply-column-constraints table-name (:ns parsed) db)
+                      tx-wrap)
           tx-report (d/transact conn tx-data)]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
@@ -1885,7 +1887,7 @@
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
-(defn- execute-delete [conn parsed schema]
+(defn- execute-delete [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
@@ -1899,7 +1901,8 @@
           cascade-eids (collect-fk-cascade-retractions! db table eids)
           cascade-tx (when (seq cascade-eids)
                        (mapv (fn [e] [:db/retractEntity e]) cascade-eids))
-          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))]
+          full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
+          full-tx (tx-wrap full-tx)]
       (when (seq full-tx)
         (d/transact conn full-tx))
       (or returning-result
@@ -2134,7 +2137,7 @@
           (when fks?
             (enforce-fk-on-insert! db table-name ns [post])))))))
 
-(defn- execute-update [conn parsed schema]
+(defn- execute-update [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
@@ -2144,6 +2147,7 @@
           _ (check-updates-against-row-constraints!
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
+          tx-data (tx-wrap tx-data)
           tx-report (when (seq tx-data) (d/transact conn tx-data))
           returning (:returning parsed)]
       (if returning
@@ -4050,9 +4054,11 @@
         ;; uniqueness, FKs to siblings). First call in a scope reads
         ;; live db.
         anchor-db (or (:spec-db @batch-state) (d/db conn))
+        tx-wrap (or (:tx-wrap ctx) identity)
         tx-data (-> (:tx-data parsed)
                     (auto-populate-identity table-name anchor-db)
-                    (apply-column-constraints table-name (:ns parsed) anchor-db))]
+                    (apply-column-constraints table-name (:ns parsed) anchor-db)
+                    tx-wrap)]
     (try
       (let [spec-report (dc/with anchor-db tx-data)]
         ;; Update the running spec-db so the next batchable INSERT
@@ -4153,7 +4159,7 @@
       (exec-batchable-insert ctx parsed batch-state)
 
       :else
-      (execute-insert conn parsed))))
+      (execute-insert conn parsed :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-update-with-recursive
   [ctx parsed]
@@ -4211,7 +4217,7 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
-      (execute-update conn parsed schema))))
+      (execute-update conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-delete
   [ctx parsed]
@@ -4235,7 +4241,7 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
-      (execute-delete conn parsed schema))))
+      (execute-delete conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-ddl-create
   [ctx parsed]
@@ -4698,7 +4704,8 @@
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
                                               dispatch-stats
                                               on-create-database on-delete-database
-                                              registry-atom]
+                                              registry-atom
+                                              tx-wrap]
                                        :as opts}]]
   (ensure-pg-schema! conn)
   (let [silently-accept (resolve-silently-accept opts)
@@ -4880,7 +4887,7 @@
         ;; this server's actual registry instead of the legacy fallback.
         (binding [catalog/*registered-databases* registered-databases]
           (let [db (apply-temporal (d/db conn) session-state)
-                parsed (sql/parse-sql sql (:schema db) db)
+                parsed (sql/parse-sql sql (dbi/-schema db) db)
                 ;; Attach the original SQL so downstream code that reads
                 ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                 ;; working even though parse-sql may not have set it for
@@ -5081,7 +5088,26 @@
                           db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
                                (or (:speculative-db @tx-state) real-db)
                                real-db)
-                          schema (:schema db)
+                          ;; Use the IDB protocol method, not keyword
+                          ;; access. AsOfDB / SinceDB / HistoricalDB are
+                          ;; defrecords with only [origin-db time-point]
+                          ;; fields; `(:schema wrapper)` returns nil
+                          ;; because defrecord ILookup never reaches the
+                          ;; protocol. `(dbi/-schema wrapper)` correctly
+                          ;; delegates to origin-db's schema (datahike's
+                          ;; `db.cljc:553`). Without this, SELECT under
+                          ;; `SET datahike.as_of = …` collapses to errors
+                          ;; like \"Query for unknown vars\" because
+                          ;; column-info / derive-virtual-tables receive
+                          ;; an empty schema map. Note: the schema
+                          ;; returned is the *current* schema cached on
+                          ;; the origin-db, not a true historical schema —
+                          ;; columns added after the as-of timestamp are
+                          ;; visible to the translator but contain no
+                          ;; data at that time. A real historical schema
+                          ;; would require a `schema-as-of` upstream in
+                          ;; datahike (see TODO).
+                          schema (dbi/-schema db)
                     ;; Prepared-statement path: reuse the Parse-time result
                     ;; and resolve ParamRef placeholders against the bound
                     ;; values decoded by the wire layer. Simple Query and
@@ -5138,7 +5164,27 @@
                                  :schema schema
                                  :on-create-database on-create-database
                                  :on-delete-database on-delete-database
-                                 :registry-atom registry-atom}]
+                                 :registry-atom registry-atom
+                                 ;; Optional `(fn [tx-data] -> tx-data)`
+                                 ;; called BEFORE every INSERT/UPDATE/
+                                 ;; DELETE's d/transact. Lets framework
+                                 ;; consumers (e.g. datahike-accounting)
+                                 ;; inject [:db.fn/call validate tx-data]
+                                 ;; so their transactor-side validators
+                                 ;; fire for SQL writes too. Default:
+                                 ;; identity (no wrap).
+                                 ;;
+                                 ;; SCOPE: fires on auto-commit paths
+                                 ;; (typical psql Simple Query) — both
+                                 ;; the regular and batchable INSERT
+                                 ;; flows. NOT yet wrapping in-tx
+                                 ;; (BEGIN/COMMIT) writes, which buffer
+                                 ;; via dc/with against a speculative
+                                 ;; db and flush at commit; that path
+                                 ;; would need wrap firing both
+                                 ;; speculatively per-statement and at
+                                 ;; commit. Track-issue follow-up.
+                                 :tx-wrap (or tx-wrap identity)}]
                         (case (:type parsed)
                           :system                (exec-system ctx parsed)
                           :select                (exec-select ctx parsed)
@@ -5362,7 +5408,7 @@
                         ((resolve 'datahike.pg.sql.database/db-delete-from-template)
                          database-template)))
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
-                                            :dispatch-stats])
+                                            :dispatch-stats :tx-wrap])
                          (cond-> on-create (assoc :on-create-database on-create)
                                  on-delete (assoc :on-delete-database on-delete)))
         factory  (make-query-handler-factory registry-atom factory-opts)
