@@ -1209,7 +1209,7 @@
     :pg-keywords :nextval :currval :setval
     :try-advisory-xact-lock :try-advisory-lock
     :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
-    :pg-backend-pid :txid-current :pg-sleep
+    :pg-backend-pid :txid-current :pg-sleep :pg-notify
     :comment-on :lock-table :create-view :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database

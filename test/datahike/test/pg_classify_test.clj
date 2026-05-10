@@ -171,6 +171,28 @@
   ;; :pg-sleep so the handler runs.
   (is (= :pg-sleep (kind "SELECT pg_sleep(0.5)"))))
 
+(deftest classify-pg-notify
+  ;; Odoo's bus issues `SELECT pg_notify(channel, payload)` from a
+  ;; post-commit hook on every model write. We classify it as a void
+  ;; no-op so it doesn't fall through to the JSqlParser path (which
+  ;; would route it to datalog and fail on the unknown function).
+  ;;
+  ;; psycopg2's SQL.identifier() always double-quotes the function
+  ;; name, so the load-bearing form is the quoted variant; the bare
+  ;; form is included for parity.
+  (is (= :pg-notify (kind "SELECT pg_notify('imbus', '{}')")))
+  (is (= :pg-notify (kind "SELECT \"pg_notify\"('imbus', '{}')"))))
+
+(deftest classify-quoted-system-fns
+  ;; Regression: psycopg2 quotes EVERY system function it composes via
+  ;; SQL.identifier (Odoo's bus uses pg_notify; future modules could
+  ;; quote pg_advisory_lock etc.). Make sure the function-name
+  ;; dispatch in classify-select accepts both bare and quoted forms.
+  (is (= :advisory-lock (kind "SELECT \"pg_advisory_lock\"(42)")))
+  (is (= :pg-sleep      (kind "SELECT \"pg_sleep\"(0)")))
+  (is (= :now           (kind "SELECT \"now\"()")))
+  (is (= :current-database (kind "SELECT \"current_database\"()"))))
+
 (deftest classify-cursors
   (is (= :declare-cursor (kind "DECLARE c1 CURSOR FOR SELECT 1")))
   (is (= :declare-cursor (kind "DECLARE c1 NO SCROLL CURSOR FOR SELECT 1")))

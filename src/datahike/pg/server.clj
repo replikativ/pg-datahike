@@ -25,6 +25,7 @@
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
+            [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.types :as types]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
@@ -1960,15 +1961,31 @@
                             (nth bound (:idx v))
                             v))
                         identity)
+        ;; Build {outer-alias-or-table → {col-string → value}} for each
+        ;; eid so SET assignments containing scalar subqueries with
+        ;; correlated outer-row references (Odoo's _parent_store_create
+        ;; UPDATE: `concat((SELECT … WHERE id = node.parent_id), node.id,
+        ;; '/')`) can resolve those references. The binding rides on
+        ;; *from-bindings*, which expr.clj's Column branch already
+        ;; consults for UPDATE…FROM(VALUES) bindings; we extend the
+        ;; same map with the outer row keyed by alias-or-table.
+        outer-key (or alias table)
         tx-data (vec (keep identity
                            (mapcat
                             (fn [eid]
                               (let [entity-map (into {} (map (fn [^datahike.datom.Datom d]
                                                                [(.-a d) (.-v d)])
-                                                             (d/datoms db :eavt eid)))]
+                                                             (d/datoms db :eavt eid)))
+                                    outer-binding (when outer-key
+                                                    {outer-key
+                                                     (into {}
+                                                           (map (fn [[k v]] [(name k) v]))
+                                                           entity-map)})
+                                    eff-from-bindings (merge from-bindings outer-binding)]
                                 (for [{:keys [column value-expr]} assignments
                                       :let [attr (keyword ns column)
-                                            raw-val (binding [params/*from-bindings* from-bindings]
+                                            raw-val (binding [params/*from-bindings* eff-from-bindings
+                                                              stmt/*eval-update-db* db]
                                                       (sql/eval-update-expr value-expr entity-map ns schema))
                                             resolved (resolve-param raw-val)
                                             val (when (some? resolved)
@@ -2684,6 +2701,7 @@
     :advisory-xact-lock     {:names ["pg_advisory_xact_lock"]      :oids [OID_VOID]}
     :advisory-unlock-all    {:names ["pg_advisory_unlock_all"]     :oids [OID_VOID]}
     :pg-sleep               {:names ["pg_sleep"]                   :oids [OID_VOID]}
+    :pg-notify              {:names ["pg_notify"]                  :oids [OID_VOID]}
     :try-advisory-lock      {:names ["pg_try_advisory_lock"]       :oids [PgWireServer/OID_BOOL]}
     :try-advisory-xact-lock {:names ["pg_try_advisory_xact_lock"]  :oids [PgWireServer/OID_BOOL]}
     :advisory-unlock        {:names ["pg_advisory_unlock"]         :oids [PgWireServer/OID_BOOL]}
@@ -3129,6 +3147,15 @@
         ms (long (min 60000 (Math/round (* 1000.0 secs))))]
     (when (pos? ms) (Thread/sleep ms))
     (void-result "pg_sleep")))
+
+(defn- handle-pg-notify
+  "No-op: pg-datahike has no LISTEN/NOTIFY delivery, so a NOTIFY with no
+   subscribers is observably the same as a delivered NOTIFY ignored.
+   Keeps Odoo's bus post-commit hook (addons/bus/models/bus.py) from
+   tripping the registry build during --init=mail (and transitively
+   --init=account)."
+  [_ctx _parsed]
+  (void-result "pg_notify"))
 
 (defn- handle-now [_ctx _parsed]
   (single-row-result "now"
@@ -3697,6 +3724,7 @@
       :pg-backend-pid          (handle-pg-backend-pid ctx parsed)
       :txid-current            (handle-txid-current ctx parsed)
       :pg-sleep                (handle-pg-sleep ctx parsed)
+      :pg-notify               (handle-pg-notify ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
       :empty-catalog      (handle-empty-catalog ctx parsed)
       :create-view        (empty-result "CREATE VIEW")

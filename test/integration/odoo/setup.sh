@@ -34,8 +34,15 @@ else
   python -m pip install -r "${ODOO_ROOT}/requirements.txt" --quiet
 fi
 
-# Verify the minimum surface run.sh needs:
-python -c "import psycopg2, lxml, babel, dateutil, werkzeug; print('[setup] minimum py deps OK')" \
-  || { echo "ERROR: install psycopg2, lxml, babel, dateutil, werkzeug" >&2; exit 1; }
+# Verify the minimum surface run.sh needs.
+# - psycopg2/lxml/babel/dateutil/werkzeug: required to boot Odoo at all.
+# - stdnum: imported by addons/account/tools/structured_reference.py at
+#   module load — `--init=account` (and any module depending on it)
+#   breaks with `ImportError: Could not load the module 'stdnum' to
+#   patch` if missing. Cheaper to fail here than ~5 min into module
+#   loading. The optimistic "odoo-bin --help works" branch above skips
+#   the full requirements install when only base was previously used.
+python -c "import psycopg2, lxml, babel, dateutil, werkzeug, stdnum; print('[setup] minimum py deps OK')" \
+  || { echo "ERROR: install psycopg2 lxml babel dateutil werkzeug python-stdnum" >&2; exit 1; }
 
 echo "[setup] done. Run ./run.sh to execute the TestORM suite."
