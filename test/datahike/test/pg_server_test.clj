@@ -1264,6 +1264,52 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
+(deftest test-aliased-many-ref-projection-works-with-where
+  (testing "Aliased projection of an M2M ref column with a WHERE
+            clause was erroring with 'Bad format for attribute in
+            pattern'. Triggered by the entity-var split: col-var!
+            for :account/tags created entity-var ?account_eid for
+            namespace `account`, while the rest of the query was
+            using ?a_eid for the alias `a`. Two ungrounded eids;
+            the M2M emitter's source-eid arg landed unbound."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :tag/name
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/tags
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/many}])
+          _ (d/transact conn [{:tag/name "red"} {:tag/name "small"}])
+          _ (d/transact conn [{:widget/sku "A"
+                               :widget/tags [[:tag/name "red"] [:tag/name "small"]]}])
+          handler (pg/make-query-handler conn)]
+      (try
+        ;; Bare unaliased — known to work
+        (let [r (.execute handler "SELECT tags FROM widget")]
+          (is (nil? (err r)))
+          (is (= 1 (count (rows r)))))
+        ;; Aliased — was erroring
+        (let [r (.execute handler "SELECT w.tags FROM widget w")]
+          (is (nil? (err r)) (str "aliased SELECT errored: " (err r)))
+          (is (= 1 (count (rows r)))))
+        ;; Aliased + WHERE — was the original failing pattern
+        (let [r (.execute handler "SELECT w.tags FROM widget w WHERE w.sku = 'A'")]
+          (is (nil? (err r)) (str "aliased+WHERE errored: " (err r)))
+          (is (= 1 (count (rows r)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-many-ref-projects-as-int8-array-via-data-inference
   (testing "A :db.cardinality/many ref attr whose local name does NOT
             match the target namespace (e.g. `:account/tags` →

@@ -364,29 +364,49 @@
     (entity-var! ctx (second attr))
 
     ;; [:aliased alias-key :ns/col] → aliased column for self-joins
+    ;; Mirrors the regular keyword branch below: must unpack the
+    ;; ref-targets entry's `[target-attr :many]` shape into a (target,
+    ;; many?) pair, otherwise an aliased projection of an M2M ref
+    ;; column passes the raw vector as a datalog attr and crashes
+    ;; with "Bad format for attribute in pattern".
     (and (vector? attr) (= :aliased (first attr)))
     (let [alias-key (nth attr 1)
           kw (nth attr 2)
           cache-key [alias-key kw]
           cvars (:col->var ctx)
-          ref-target (get (:ref-targets ctx) kw)]
+          ref-target-entry (get (:ref-targets ctx) kw)
+          [ref-target many?] (cond
+                               (vector? ref-target-entry) [(first ref-target-entry) true]
+                               (some? ref-target-entry)   [ref-target-entry false]
+                               :else                       [nil false])]
       (or (get @cvars cache-key)
           (do
             (check-agg-alias-collision! ctx attr)
-            (let [v (symbol (str "?" alias-key "_" (name kw)))
-                  evar (entity-var! ctx alias-key)
-                  lj? (contains? @(:left-join-evars ctx) evar)]
-              (if lj?
-                (add-clause! ctx [evar kw v])
-                (add-clause! ctx [(list 'get-else '$ evar kw :__null__) v]))
-              (swap! (:nullable-vars ctx) conj v)
-              (if ref-target
-                (let [pk-v (symbol (str "?" alias-key "_" (name kw) "_pk"))]
-                  (emit-ref-deref! ctx v pk-v ref-target)
-                  (swap! (:nullable-vars ctx) conj pk-v)
-                  (swap! cvars assoc cache-key pk-v)
-                  pk-v)
-                (do (swap! cvars assoc cache-key v) v))))))
+            (cond
+              ;; M2M ref → emit array-projection fn (same as the
+              ;; non-aliased branch).
+              many?
+              (let [arr-v (symbol (str "?" alias-key "_" (name kw) "_arr"))
+                    evar (entity-var! ctx alias-key)]
+                (emit-many-ref-array! ctx evar kw ref-target arr-v)
+                (swap! cvars assoc cache-key arr-v)
+                arr-v)
+
+              :else
+              (let [v (symbol (str "?" alias-key "_" (name kw)))
+                    evar (entity-var! ctx alias-key)
+                    lj? (contains? @(:left-join-evars ctx) evar)]
+                (if lj?
+                  (add-clause! ctx [evar kw v])
+                  (add-clause! ctx [(list 'get-else '$ evar kw :__null__) v]))
+                (swap! (:nullable-vars ctx) conj v)
+                (if ref-target
+                  (let [pk-v (symbol (str "?" alias-key "_" (name kw) "_pk"))]
+                    (emit-ref-deref! ctx v pk-v ref-target)
+                    (swap! (:nullable-vars ctx) conj pk-v)
+                    (swap! cvars assoc cache-key pk-v)
+                    pk-v)
+                  (do (swap! cvars assoc cache-key v) v)))))))
 
     ;; Regular keyword :ns/col
     :else
