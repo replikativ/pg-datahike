@@ -966,6 +966,51 @@
     (let [r (.execute *handler* "SELECT count(*) FROM person")]
       (is (= [["3"]] (rows r)) "current head sees 3 people"))))
 
+(deftest test-left-join-count-of-right-side-eid-binds-without-error
+  (testing "LEFT JOIN <r> ON … then SELECT count(r.db_id) — the
+            right-side entity var must be bound somewhere or the
+            translator rejects with 'Query for unknown vars:
+            [?<r>_eid]'.
+
+            Root cause was twofold:
+              (a) the ref-based LEFT JOIN post-processor used
+                  `left-evar` (default-table's evar) as the get-else
+                  input, but the entity-var swap in translate-join
+                  had already corrupted that var to point at ref-var
+                  itself — producing a self-referential
+                  `(get-else $ ?ref :attr :__null__) ?ref`.
+              (b) the right-side entity-var (?p_eid) was never bound:
+                  no right-side data pattern existed when only
+                  `count(p.db_id)` was projected, so it landed in
+                  :find with no :where binding.
+
+            Fixed by:
+              (a) computing `owner-evar` from the JOIN's literal
+                  right-alias (`p`) instead of trusting the ref-info's
+                  potentially-corrupted `:left-evar`.
+              (b) including owner-evar in shared-vars and binding it
+                  in matched (data pattern) + unmatched (:__null__)
+                  branches.
+
+            Note: a deeper LEFT JOIN iteration bug remains where
+            empty-right-side rows on the LEFT table aren't surfaced
+            (the outer get-else drives iteration from the right table,
+            not the left). Filed as a separate task; this test only
+            covers the unknown-vars regression."
+    (let [r (.execute *handler*
+              (str "SELECT d.name, count(p.db_id) "
+                   "FROM department d "
+                   "LEFT JOIN person p ON p.department = d.db_id "
+                   "GROUP BY d.name "
+                   "ORDER BY d.name"))]
+      (is (nil? (err r))
+          (str "LEFT JOIN + count(p.db_id) errored: " (err r)))
+      (let [data (rows r)
+            by-name (into {} (map (juxt first second) data))]
+        ;; Sales has 1 person (Charlie), Engineering has 2 (Alice, Bob).
+        (is (= "1" (get by-name "Sales")))
+        (is (= "2" (get by-name "Engineering")))))))
+
 (deftest test-insert-select-with-ref-columns-actually-lands
   (testing "INSERT INTO posting (...) SELECT ... lands the row in
             datahike. Bug observed in the wild: pg-datahike returned

@@ -1690,7 +1690,25 @@
                   (reset! (:where-clauses ctx) (conj left-clauses oj-clause)))
 
                 ;; REF-BASED LEFT JOIN: ON p.dept = d.db_id
-                (let [{:keys [ref-var ref-attr left-evar]} ref-info
+                ;;
+                ;; The RIGHT side of the JOIN is the alias whose ref
+                ;; column appears on one side of the ON equals (e.g.
+                ;; `p.department`). The translate-join entity-var
+                ;; swap (line ~309) re-aliases the LEFT side
+                ;; (`d`) to the ref-var, making it look like the ref
+                ;; value IS the left entity. The ORIGINAL right-alias
+                ;; (`p`) keeps its own entity-var (e.g. `?p_eid`),
+                ;; which still owns the ref-attr. We resolve it here
+                ;; via `alias` from the join-info — the JOIN's literal
+                ;; right-side alias as parsed.
+                (let [{:keys [ref-var ref-attr]} ref-info
+                      ;; The entity that owns ref-attr. NOT
+                      ;; `left-evar` from ref-info — that field is set
+                      ;; to default-table's evar, which the entity-var
+                      ;; swap may have already corrupted to point at
+                      ;; ref-var itself, producing a self-referential
+                      ;; `(get-else $ ?ref :attr :__null__) ?ref`.
+                      owner-evar (ctx/entity-var! ctx alias)
                       all-clauses @(:where-clauses ctx)
                       right-clause? (fn [clause]
                                       (and (vector? clause) (= 3 (count clause))
@@ -1705,7 +1723,7 @@
                       ;; Convert ref pattern to get-else so entities with NULL ref are included
                       left-clauses (mapv (fn [c]
                                            (if (ref-binding? c)
-                                             [(list 'get-else '$ left-evar ref-attr :__null__) ref-var]
+                                             [(list 'get-else '$ owner-evar ref-attr :__null__) ref-var]
                                              c))
                                          other-clauses)
                       right-vars (vec (distinct
@@ -1713,16 +1731,35 @@
                                                (when (and (vector? clause) (= 3 (count clause)))
                                                  (nth clause 2)))
                                              right-clauses)))
-                      shared-vars (vec (distinct (concat [ref-var] right-vars)))
+                      ;; The right-side entity-var (?p_eid) needs binding too
+                      ;; — without it, count(p.db_id) and similar projections
+                      ;; that don't reference any other p.* column see an
+                      ;; unbound var. Include in shared-vars + bind in both
+                      ;; branches (matched: data pattern; unmatched: ground
+                      ;; :__null__).
+                      include-owner? (and owner-evar (not (some #(= owner-evar %) right-vars)))
+                      shared-vars (vec (distinct (concat [ref-var]
+                                                         (when include-owner? [owner-evar])
+                                                         right-vars)))
                       ;; Matched: ref is not :__null__ → look up right entity using ref-var as eid
                       matched-non-key (mapv (fn [[_re a v]]
                                               [(list 'get-else '$ ref-var a :__null__) v])
                                             right-clauses)
+                      ;; Bind the right-side entity-var in matched. The
+                      ;; original ref data pattern `[?p_eid :person/department
+                      ;; ?dept_eid]` was rewritten to `get-else` outside the
+                      ;; or-join (so left-side iteration drives), so we need
+                      ;; an explicit pattern in matched to ground ?p_eid.
+                      matched-owner-bind (when include-owner?
+                                           [[owner-evar ref-attr ref-var]])
                       matched (apply list 'and
                                      (into [[(list 'not= ref-var :__null__)]]
-                                           matched-non-key))
+                                           (concat (or matched-owner-bind [])
+                                                   matched-non-key)))
                       ;; Unmatched: ref is :__null__ → all right-side vars are NULL
-                      null-bindings (mapv (fn [v] [(list 'ground :__null__) v]) right-vars)
+                      null-bindings (mapv (fn [v] [(list 'ground :__null__) v])
+                                          (cond-> right-vars
+                                            include-owner? (conj owner-evar)))
                       unmatched (apply list 'and
                                        (into [[(list '= ref-var :__null__)]]
                                              null-bindings))
