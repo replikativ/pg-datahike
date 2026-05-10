@@ -966,6 +966,73 @@
     (let [r (.execute *handler* "SELECT count(*) FROM person")]
       (is (= [["3"]] (rows r)) "current head sees 3 people"))))
 
+(deftest test-many-ref-projects-as-int8-array-via-data-inference
+  (testing "A :db.cardinality/many ref attr whose local name does NOT
+            match the target namespace (e.g. `:account/tags` →
+            `:account-tag`) should still project as int8[] of target
+            entity-ids, NOT as a single bigint. Previously the
+            convention `(name ref-attr) → namespace` only matched
+            singular-named refs (`:order/customer` → customer),
+            silently dropping every plural / hyphen-named M2M.
+
+            Resolution: when the schema-only convention finds no
+            target, validate-ref-targets! probes the actual data via
+            bulk-ref-target-namespaces. If exactly one target
+            namespace appears AND that namespace has a
+            :db.unique/identity attr, use it. The cardinality marker
+            keeps the [pk :many] shape for many-refs."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :tag/name
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :widget/tags
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/many}])
+          _ (d/transact conn
+              [{:tag/name "red"} {:tag/name "round"} {:tag/name "small"}])
+          _ (d/transact conn
+              [{:widget/sku "A"
+                :widget/tags [[:tag/name "red"] [:tag/name "round"]]}
+               {:widget/sku "B"
+                :widget/tags [[:tag/name "small"]]}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler "SELECT sku, tags FROM widget ORDER BY sku")]
+          (is (nil? (err r)) (str "errored: " (err r)))
+          (let [data (rows r)]
+            (is (= 2 (count data)))
+            ;; Both rows should have non-nil tags column. Element type
+            ;; is int8[], not a single bigint — the array form means
+            ;; clients can WHERE … = ANY(tags), array_agg, etc.
+            (is (every? (fn [[_ t]] (.startsWith ^String (str t) "{")) data)
+                (str "expected int8[] form like '{1,2}', got: " data))
+            ;; A's tags should be 2-element, B's 1-element.
+            (let [a-tags (second (first data))
+                  b-tags (second (second data))
+                  count-elems (fn [^String s]
+                                (->> (-> s
+                                         (.replaceAll "[\\{\\}]" "")
+                                         (.split ","))
+                                     (remove empty?)
+                                     count))]
+              (is (= 2 (count-elems a-tags))
+                  (str "widget A should have 2 tags, got: " a-tags))
+              (is (= 1 (count-elems b-tags))
+                  (str "widget B should have 1 tag, got: " b-tags)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-as-of-select-star-survives-pre-schema-timestamp
   (testing "SELECT * under the same as-of-pre-schema condition must
             also work — exercises the same column-info fallback path

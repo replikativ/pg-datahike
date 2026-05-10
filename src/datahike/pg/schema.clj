@@ -143,6 +143,35 @@
             k))
         schema))
 
+(defn ref-attrs-from-schema-all-cards
+  "Like `ref-attrs-from-schema` but returns BOTH cardinality/one and
+   cardinality/many ref attrs as `{ref-attr cardinality-keyword}`.
+   Used by `validate-ref-targets!` to infer M2M projection targets
+   from data when the schema-only convention misses (e.g.
+   `:account/tags` → `:account-tag` — local name `tags` doesn't
+   match the hyphenated target namespace)."
+  [schema]
+  (into {}
+        (keep (fn [[k v]]
+                (when (and (keyword? k)
+                           (namespace k)
+                           (not (contains? internal-ns-prefixes (namespace k)))
+                           (= :db.type/ref (:db/valueType v)))
+                  [k (:db/cardinality v)])))
+        schema))
+
+(defn- find-unique-identity-in-ns
+  "Look up the `:db.unique/identity` attr in the given namespace.
+   Returns the attr ident (e.g. `:tag/name`) or nil. Used by the
+   data-inference fallback in `validate-ref-targets!`."
+  [schema ns-str]
+  (some (fn [[k v]]
+          (when (and (keyword? k)
+                     (= ns-str (namespace k))
+                     (= :db.unique/identity (:db/unique v)))
+            k))
+        schema))
+
 ;; Per-(schema, hints) warn dedup: the warning set is keyed on the
 ;; schema map's identity so two different schemas (e.g. across tests)
 ;; warn independently, and the same schema doesn't re-warn every
@@ -339,7 +368,10 @@
 
 (defn validate-ref-targets!
   "Cross-check `ref-targets` (from `derive-ref-targets`) against the
-   actual data in `db`. Drops:
+   actual data in `db`, AND infer targets for ref attrs that the
+   schema-only convention missed.
+
+   Validation drops:
    - polymorphic refs — entities span multiple namespaces; convention
      can't pick a single target safely. User must add an explicit
      `:datahike.pg/references` hint per polymorphic ref.
@@ -348,15 +380,24 @@
      named the ref attr after a different concept (`:order/buyer` ref
      to `customer`). Hint should override.
 
-   Each drop emits a one-shot stderr warning. Returns the validated
-   subset of `ref-targets`. Refs with no current data (empty set)
-   pass through unchanged — the convention is the best guess until
-   data appears.
+   Inference (for ref attrs *not* in the input ref-targets, both card
+   one and card many):
+   - If the data points to exactly one namespace AND that namespace
+     has a `:db.unique/identity` attr, use it as the target. This
+     catches plural / hyphen-named M2M cases the convention misses
+     (e.g. `:account/tags` → `:account-tag/name`, where local name
+     `tags` doesn't equal the target namespace `account-tag`).
+   - Cardinality is preserved: many-refs get the `[target :many]`
+     marker so the translator emits a PgArray projection.
 
-   Also warns about ref attrs that have NO ref-targets entry at all
-   (no hint, no namespace match) so the user knows to set a hint
-   if they want SQL-FK projection on that column."
+   Each drop emits a one-shot stderr warning. Returns the validated +
+   inferred ref-targets. Refs with no current data and no convention
+   match warn the user to set a hint."
   [db schema ref-targets]
+  (when-not (and db schema)
+    ;; No db (parse-only path) — we can't probe data; just return as-is
+    ;; but still keep the warn-once for unmapped one-card refs.
+    )
   (when (and db schema)
     (doseq [ref-attr (ref-attrs-from-schema schema)
             :when (not (contains? ref-targets ref-attr))]
@@ -365,45 +406,85 @@
                        "set :datahike.pg/references hint to enable "
                        "FK-style projection (otherwise it projects as "
                        "the raw entity-id)."))))
-  (if-not (and db (seq ref-targets))
+  (if-not db
     ref-targets
-    (let [;; One bulk query for every ref attr in ref-targets. Replaces
-          ;; the old per-attr Datalog round-trip — for a schema with
-          ;; N ref attrs, drops translate-time cost from O(N) round-
-          ;; trips to 1.
-          ns-by-ref (bulk-ref-target-namespaces db (keys ref-targets))]
+    (let [all-cards (ref-attrs-from-schema-all-cards schema)
+          ;; Bulk-probe data for every ref attr — both ones already in
+          ;; ref-targets (validation) and ones missing (inference).
+          ns-by-ref (bulk-ref-target-namespaces db (keys all-cards))
+          ;; Pass 1 — validate existing ref-targets entries. Track
+          ;; refs that we explicitly DROPPED (mismatch / polymorphic)
+          ;; so pass 2 doesn't re-infer them. The user's convention
+          ;; or hint was wrong about that ref; falling back to a data-
+          ;; inferred target would silently \"fix\" what the user
+          ;; should be made aware of.
+          dropped (volatile! #{})
+          validated
+          (reduce-kv
+           (fn [acc ref-attr target-entry]
+             (let [target-pk (if (vector? target-entry) (first target-entry) target-entry)
+                   actual-ns (get ns-by-ref ref-attr #{})
+                   expected-ns (namespace target-pk)]
+               (cond
+                 ;; No data yet — trust the convention/hint.
+                 (zero? (count actual-ns)) (assoc acc ref-attr target-entry)
+
+                 (= 1 (count actual-ns))
+                 (if (= (first actual-ns) expected-ns)
+                   (assoc acc ref-attr target-entry)
+                   (do (warn-once! schema [::namespace-mismatch ref-attr]
+                                   (str "ref attr " ref-attr " resolves to target "
+                                        target-pk " (namespace " expected-ns ")"
+                                        " but data points to namespace "
+                                        (first actual-ns)
+                                        ". SQL projection will fall back to the "
+                                        "raw entity-id; set :datahike.pg/references "
+                                        "to override."))
+                       (vswap! dropped conj ref-attr)
+                       acc))
+
+                 :else
+                 (do (warn-once! schema [::polymorphic-ref ref-attr]
+                                 (str "ref attr " ref-attr " is polymorphic — "
+                                      "entities span namespaces " (sort actual-ns)
+                                      ". SQL projection falls back to the raw "
+                                      "entity-id; set :datahike.pg/references to "
+                                      "force a single target."))
+                     (vswap! dropped conj ref-attr)
+                     acc))))
+           {}
+           ref-targets)
+          dropped @dropped]
+      ;; Pass 2 — infer targets for ref attrs the convention missed.
+      ;; Only fires when data unambiguously points to a single
+      ;; namespace AND that namespace has a :db.unique/identity attr.
+      ;; SKIPS attrs that pass 1 deliberately dropped (mismatch /
+      ;; polymorphic) — those need explicit user resolution.
       (reduce-kv
-       (fn [acc ref-attr target-entry]
-         (let [target-pk (if (vector? target-entry) (first target-entry) target-entry)
-               actual-ns (get ns-by-ref ref-attr #{})
-               expected-ns (namespace target-pk)]
-           (cond
-             ;; No data yet — trust the convention/hint.
-             (zero? (count actual-ns)) (assoc acc ref-attr target-entry)
-
-             (= 1 (count actual-ns))
-             (if (= (first actual-ns) expected-ns)
-               (assoc acc ref-attr target-entry)
-               (do (warn-once! schema [::namespace-mismatch ref-attr]
-                               (str "ref attr " ref-attr " resolves to target "
-                                    target-pk " (namespace " expected-ns ")"
-                                    " but data points to namespace "
-                                    (first actual-ns)
-                                    ". SQL projection will fall back to the "
-                                    "raw entity-id; set :datahike.pg/references "
-                                    "to override."))
-                   acc))
-
-             :else
-             (do (warn-once! schema [::polymorphic-ref ref-attr]
-                             (str "ref attr " ref-attr " is polymorphic — "
-                                  "entities span namespaces " (sort actual-ns)
-                                  ". SQL projection falls back to the raw "
-                                  "entity-id; set :datahike.pg/references to "
-                                  "force a single target."))
-                 acc))))
-       {}
-       ref-targets))))
+       (fn [acc ref-attr cardinality]
+         (if (or (contains? acc ref-attr)
+                 (contains? dropped ref-attr))
+           acc
+           (let [actual-ns (get ns-by-ref ref-attr #{})]
+             (if-not (= 1 (count actual-ns))
+               acc
+               (let [target-ns (first actual-ns)
+                     target-pk (find-unique-identity-in-ns schema target-ns)]
+                 (if-not target-pk
+                   acc
+                   (do
+                     (warn-once! schema [::data-inferred-target ref-attr]
+                                 (str "inferred SQL FK target for ref attr "
+                                      ref-attr " → " target-pk " (from data). "
+                                      "Set :datahike.pg/references " target-pk
+                                      " on " ref-attr " to make this explicit "
+                                      "and skip the per-translate inference."))
+                     (assoc acc ref-attr
+                            (if (= :db.cardinality/many cardinality)
+                              [target-pk :many]
+                              target-pk)))))))))
+       validated
+       all-cards))))
 
 (defn- schema-hints*
   [db]
