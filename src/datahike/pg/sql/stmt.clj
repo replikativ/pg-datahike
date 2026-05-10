@@ -287,12 +287,21 @@
                 ;; target's unique column then resolves via the bound
                 ;; entity.
                 (let [{:keys [ref-resolved ref-attr target-alias]} fk-via-ref
-                      ref-var (ctx/ref-eid-var! ctx ref-resolved)]
-                  (swap! (:entity-vars ctx) assoc target-alias ref-var)
+                      ref-var (ctx/ref-eid-var! ctx ref-resolved)
+                      ;; Capture the LEFT alias's ORIGINAL entity-var
+                      ;; before any potential swap; needed by the
+                      ;; LEFT JOIN post-processor to drive iteration
+                      ;; from the LEFT (so empty-right rows surface).
+                      original-left-evar (ctx/entity-var! ctx target-alias)]
+                  ;; INNER joins: unify entity vars. OUTER joins keep
+                  ;; the LEFT alias's own entity-var (skip the swap).
+                  (when-not (#{:left :right :full} jtype)
+                    (swap! (:entity-vars ctx) assoc target-alias ref-var))
                   (when (#{:left :right :full} jtype)
                     (reset! ref-info {:ref-var ref-var
                                       :ref-attr ref-attr
                                       :right-alias target-alias
+                                      :left-table-evar original-left-evar
                                       :left-evar (ctx/entity-var! ctx (:default-table ctx))})
                     (swap! (:left-join-evars ctx) conj ref-var)))
 
@@ -304,14 +313,36 @@
                   ;; for ref-targeted attrs, which is the wrong thing to
                   ;; rebind a target alias's entity-var to.
                   (let [ref-var (ctx/ref-eid-var! ctx ref-side)
-                        db-id-alias (second db-id-side)]
-                  ;; Always unify entity vars (the right-table entity IS the ref value)
-                    (swap! (:entity-vars ctx) assoc db-id-alias ref-var)
+                        db-id-alias (second db-id-side)
+                        ;; Capture the LEFT alias's ORIGINAL entity-var
+                        ;; before any potential swap. The post-processor
+                        ;; needs it to drive LEFT iteration from the
+                        ;; LEFT table (the proper LEFT JOIN semantics)
+                        ;; rather than from the right table via get-else.
+                        original-left-evar (ctx/entity-var! ctx db-id-alias)]
+                    ;; INNER joins: unify entity vars for the
+                    ;; optimization "the right-table entity IS the ref
+                    ;; value". OUTER joins (left/right/full): keep the
+                    ;; LEFT alias's own entity-var so the LEFT iteration
+                    ;; can drive the or-join. Without this, an empty-
+                    ;; right-side row gets dropped because the get-else
+                    ;; has no entity to iterate over.
+                    (when-not (#{:left :right :full} jtype)
+                      (swap! (:entity-vars ctx) assoc db-id-alias ref-var))
                   ;; For outer joins: also record ref-info for or-join wrapping
                     (when (#{:left :right :full} jtype)
                       (reset! ref-info {:ref-var ref-var
                                         :ref-attr (if (vector? ref-side) (nth ref-side 2) ref-side)
                                         :right-alias db-id-alias
+                                        ;; Original LEFT entity-var
+                                        ;; (the one OUR alias points to,
+                                        ;; e.g. ?t_eid for "t"). Used by
+                                        ;; the post-processor to bind the
+                                        ;; LEFT iteration in matched.
+                                        :left-table-evar original-left-evar
+                                        ;; Default-table evar for
+                                        ;; backward compat with code that
+                                        ;; reads :left-evar
                                         :left-evar (ctx/entity-var! ctx (:default-table ctx))})
                     ;; Record right entity var so ctx/make-columns-optional! skips it
                       (swap! (:left-join-evars ctx) conj ref-var))))
@@ -1691,78 +1722,120 @@
 
                 ;; REF-BASED LEFT JOIN: ON p.dept = d.db_id
                 ;;
-                ;; The RIGHT side of the JOIN is the alias whose ref
-                ;; column appears on one side of the ON equals (e.g.
-                ;; `p.department`). The translate-join entity-var
-                ;; swap (line ~309) re-aliases the LEFT side
-                ;; (`d`) to the ref-var, making it look like the ref
-                ;; value IS the left entity. The ORIGINAL right-alias
-                ;; (`p`) keeps its own entity-var (e.g. `?p_eid`),
-                ;; which still owns the ref-attr. We resolve it here
-                ;; via `alias` from the join-info — the JOIN's literal
-                ;; right-side alias as parsed.
-                (let [{:keys [ref-var ref-attr]} ref-info
-                      ;; The entity that owns ref-attr. NOT
-                      ;; `left-evar` from ref-info — that field is set
-                      ;; to default-table's evar, which the entity-var
-                      ;; swap may have already corrupted to point at
-                      ;; ref-var itself, producing a self-referential
-                      ;; `(get-else $ ?ref :attr :__null__) ?ref`.
+                ;; LEFT iteration semantics: surface every LEFT row,
+                ;; even those without a matching RIGHT row, with the
+                ;; right side bound to :__null__. This requires:
+                ;;   - the LEFT entity-var (?d_eid) drives the outer
+                ;;     iteration (anchored elsewhere in the query —
+                ;;     usually the default-table anchor pass);
+                ;;   - the original ref data pattern is REMOVED from
+                ;;     the outer where (so it doesn't filter LEFT
+                ;;     rows) and goes into the matched branch;
+                ;;   - the unmatched branch uses `not-join` to assert
+                ;;     "no right row points at this LEFT" and grounds
+                ;;     the right-side vars to :__null__.
+                ;;
+                ;; The translate-join code conditionally skips the
+                ;; entity-var swap for LEFT joins (see line ~309), so
+                ;; the LEFT alias's entity-var (e.g. ?t_eid) is still
+                ;; intact here. We pull it from ref-info's
+                ;; :left-table-evar field.
+                (let [{:keys [ref-var ref-attr left-table-evar]} ref-info
                       owner-evar (ctx/entity-var! ctx alias)
                       all-clauses @(:where-clauses ctx)
+                      ;; The original ref pattern from the ON clause:
+                      ;; `[?p_eid :posting/transaction ?ref-var]`. We
+                      ;; strip it from the outer where (so it doesn't
+                      ;; force iteration over postings) and re-emit
+                      ;; into the matched branch.
+                      ref-binding? (fn [clause]
+                                     (and (vector? clause) (= 3 (count clause))
+                                          (= ref-attr (second clause))
+                                          (= ref-var (nth clause 2))))
+                      ;; Right-side data patterns on ref-var (used to
+                      ;; project right-side columns via the ref's
+                      ;; deref'd identity).
                       right-clause? (fn [clause]
                                       (and (vector? clause) (= 3 (count clause))
                                            (= ref-var (first clause))
                                            (keyword? (second clause))))
                       right-clauses (vec (filter right-clause? all-clauses))
-                      other-clauses (vec (remove right-clause? all-clauses))
-                      ref-binding? (fn [clause]
-                                     (and (vector? clause) (= 3 (count clause))
-                                          (= ref-attr (second clause))
-                                          (= ref-var (nth clause 2))))
-                      ;; Convert ref pattern to get-else so entities with NULL ref are included
-                      left-clauses (mapv (fn [c]
-                                           (if (ref-binding? c)
-                                             [(list 'get-else '$ owner-evar ref-attr :__null__) ref-var]
-                                             c))
-                                         other-clauses)
+                      ;; Outer (LEFT-driving) clauses: drop the ref-binding
+                      ;; (moves into matched) and any right-clauses (those
+                      ;; only make sense when matched).
+                      left-clauses (vec (remove (fn [c]
+                                                  (or (ref-binding? c)
+                                                      (right-clause? c)))
+                                                all-clauses))
+                      ;; Vars introduced by right-side patterns; needed in
+                      ;; shared-vars and as :__null__ bindings in unmatched.
                       right-vars (vec (distinct
                                        (keep (fn [clause]
                                                (when (and (vector? clause) (= 3 (count clause)))
                                                  (nth clause 2)))
                                              right-clauses)))
-                      ;; The right-side entity-var (?p_eid) needs binding too
-                      ;; — without it, count(p.db_id) and similar projections
-                      ;; that don't reference any other p.* column see an
-                      ;; unbound var. Include in shared-vars + bind in both
-                      ;; branches (matched: data pattern; unmatched: ground
-                      ;; :__null__).
+                      ;; If the LEFT alias was swapped in translate-join
+                      ;; (legacy / non-LEFT path that leaked here), we
+                      ;; might not have left-table-evar. Fall back to
+                      ;; the post-swap value, which works for
+                      ;; LEFT-without-empty-rows but loses null-side
+                      ;; semantics. The translate-join change above
+                      ;; keeps left-table-evar populated for LEFT.
+                      left-evar (or left-table-evar
+                                    (when (and ref-var (not= ref-var owner-evar))
+                                      ref-var))
+                      ;; ?owner-evar (the right-side entity-var) needs
+                      ;; binding in both branches: matched via the ref
+                      ;; data pattern; unmatched via ground :__null__.
                       include-owner? (and owner-evar (not (some #(= owner-evar %) right-vars)))
-                      shared-vars (vec (distinct (concat [ref-var]
-                                                         (when include-owner? [owner-evar])
-                                                         right-vars)))
-                      ;; Matched: ref is not :__null__ → look up right entity using ref-var as eid
-                      matched-non-key (mapv (fn [[_re a v]]
-                                              [(list 'get-else '$ ref-var a :__null__) v])
-                                            right-clauses)
-                      ;; Bind the right-side entity-var in matched. The
-                      ;; original ref data pattern `[?p_eid :person/department
-                      ;; ?dept_eid]` was rewritten to `get-else` outside the
-                      ;; or-join (so left-side iteration drives), so we need
-                      ;; an explicit pattern in matched to ground ?p_eid.
-                      matched-owner-bind (when include-owner?
-                                           [[owner-evar ref-attr ref-var]])
+                      shared-vars (vec (distinct
+                                        (concat
+                                         (when left-evar [left-evar])
+                                         [ref-var]
+                                         (when include-owner? [owner-evar])
+                                         right-vars)))
+                      ;; Matched branch:
+                      ;;   - the ref data pattern `[?p_eid ref-attr ?t_eid]`
+                      ;;     binds owner-evar (?p_eid) and unifies its
+                      ;;     value with the LEFT entity-var (?t_eid).
+                      ;;   - we ALSO bind ref-var (the original ref's
+                      ;;     value var) to left-evar via identity, so
+                      ;;     downstream clauses that reference ref-var
+                      ;;     (right-clauses, shared-vars exposure) keep
+                      ;;     working. `[(= a b)]` is a predicate (a&b
+                      ;;     must be bound); `[(identity left-evar)
+                      ;;     ref-var]` is a function-binding (binds
+                      ;;     ref-var to left-evar's value).
+                      matched-ref-bind (cond
+                                         (and include-owner? left-evar)
+                                         [[owner-evar ref-attr left-evar]
+                                          [(list 'identity left-evar) ref-var]]
+                                         include-owner?
+                                         [[owner-evar ref-attr ref-var]]
+                                         left-evar
+                                         [[(list 'identity left-evar) ref-var]]
+                                         :else [])
                       matched (apply list 'and
-                                     (into [[(list 'not= ref-var :__null__)]]
-                                           (concat (or matched-owner-bind [])
-                                                   matched-non-key)))
-                      ;; Unmatched: ref is :__null__ → all right-side vars are NULL
+                                     (concat matched-ref-bind right-clauses))
+                      ;; Unmatched branch: assert no right row points at
+                      ;; this LEFT, and ground all right-side + owner vars
+                      ;; to :__null__. Without the LEFT entity-var we
+                      ;; can't express "no right matches THIS row", so
+                      ;; degrade to ref-var = :__null__ (legacy behavior).
                       null-bindings (mapv (fn [v] [(list 'ground :__null__) v])
-                                          (cond-> right-vars
-                                            include-owner? (conj owner-evar)))
+                                          (cond-> (vec right-vars)
+                                            include-owner? (conj owner-evar)
+                                            true           (conj ref-var)))
+                      not-match-guard
+                      (if left-evar
+                        ;; "no posting points at this transaction"
+                        (let [inner-eid (gensym "?lj-inner-")]
+                          [(list 'not-join [left-evar]
+                                 [inner-eid ref-attr left-evar])])
+                        ;; legacy: ref-var = :__null__
+                        [[(list '= ref-var :__null__)]])
                       unmatched (apply list 'and
-                                       (into [[(list '= ref-var :__null__)]]
-                                             null-bindings))
+                                       (concat not-match-guard null-bindings))
                       oj-clause (list* 'or-join shared-vars matched unmatched nil)]
                   (reset! (:where-clauses ctx)
                           (conj left-clauses oj-clause))))))

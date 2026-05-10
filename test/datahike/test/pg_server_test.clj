@@ -1264,6 +1264,61 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
+(deftest test-left-join-empty-right-side-rows-appear
+  (testing "LEFT JOIN <r> ON r.fk = l.db_id should surface rows from
+            the LEFT table even when no RIGHT row matches. Standard
+            SQL LEFT JOIN semantics. The translator currently drives
+            iteration from the right table (a get-else over the right
+            entity), so left rows with no match get dropped — they
+            never appear in the result.
+
+            Reproduces with a fresh fixture: 2 departments, only one
+            has a person. The empty department should surface with
+            count(p.db_id) = 0. Pre-fix: the empty department row is
+            absent from the result entirely."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :dept/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :emp/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :emp/department
+                :db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/one}])
+          {:keys [tempids]}
+          (d/transact conn [{:db/id "d1" :dept/id "Engineering"}
+                            {:db/id "d2" :dept/id "Empty"}])
+          eng (get tempids "d1")
+          _ (d/transact conn [{:emp/id "alice" :emp/department eng}])
+          handler (pg/make-query-handler conn)]
+      (try
+        (let [r (.execute handler
+                  (str "SELECT d.id, count(e.db_id) AS n_emps "
+                       "FROM dept d "
+                       "LEFT JOIN emp e ON e.department = d.db_id "
+                       "GROUP BY d.id "
+                       "ORDER BY d.id"))]
+          (is (nil? (err r)) (str "errored: " (err r)))
+          (let [data (rows r)
+                by-id (into {} (map (juxt first second) data))]
+            (is (= 2 (count data))
+                (str "expected 2 rows (one per dept); got: " data))
+            (is (= "0" (get by-id "Empty"))
+                (str "Empty dept should have count=0; got: "
+                     (pr-str by-id)))
+            (is (= "1" (get by-id "Engineering")))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-aliased-many-ref-projection-works-with-where
   (testing "Aliased projection of an M2M ref column with a WHERE
             clause was erroring with 'Bad format for attribute in
