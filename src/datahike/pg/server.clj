@@ -4054,9 +4054,11 @@
         ;; uniqueness, FKs to siblings). First call in a scope reads
         ;; live db.
         anchor-db (or (:spec-db @batch-state) (d/db conn))
+        tx-wrap (or (:tx-wrap ctx) identity)
         tx-data (-> (:tx-data parsed)
                     (auto-populate-identity table-name anchor-db)
-                    (apply-column-constraints table-name (:ns parsed) anchor-db))]
+                    (apply-column-constraints table-name (:ns parsed) anchor-db)
+                    tx-wrap)]
     (try
       (let [spec-report (dc/with anchor-db tx-data)]
         ;; Update the running spec-db so the next batchable INSERT
@@ -5395,7 +5397,7 @@
                         ((resolve 'datahike.pg.sql.database/db-delete-from-template)
                          database-template)))
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
-                                            :dispatch-stats])
+                                            :dispatch-stats :tx-wrap])
                          (cond-> on-create (assoc :on-create-database on-create)
                                  on-delete (assoc :on-delete-database on-delete)))
         factory  (make-query-handler-factory registry-atom factory-opts)

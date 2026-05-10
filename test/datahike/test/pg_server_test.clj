@@ -1399,6 +1399,45 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
+(deftest test-tx-wrap-fires-via-batchable-insert-path
+  (testing "psql Simple Query INSERTs (the typical flow) go through
+            exec-batchable-insert, not execute-insert. The :tx-wrap
+            hook must fire on this path too — otherwise framework-
+            installed validators see only the slower / RETURNING /
+            ON CONFLICT inserts, missing the bulk of writes."
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+               :schema-flexibility :write
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn
+              [{:db/ident :w/sku
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+               {:db/ident :w/qty
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one}])
+          calls (atom 0)
+          handler (pg/make-query-handler conn
+                    {:tx-wrap (fn [tx-data]
+                                (swap! calls inc)
+                                tx-data)})]
+      (try
+        ;; Plain literal-VALUES INSERT — flows through the batchable
+        ;; path when no RETURNING / ON CONFLICT is in play.
+        (let [r (.execute handler "INSERT INTO w (sku, qty) VALUES ('A', 1)")]
+          (is (nil? (err r))))
+        (let [r (.execute handler "INSERT INTO w (sku, qty) VALUES ('B', 2)")]
+          (is (nil? (err r))))
+        ;; Each call should have invoked the wrap.
+        (is (= 2 @calls)
+            (str "expected 2 wrap calls; got " @calls
+                 " (batchable path may be skipping :tx-wrap)"))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 (deftest test-tx-wrap-default-identity-no-op
   (testing "Without :tx-wrap, the handler behaves identically — the
             default is identity and adds no overhead."
