@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
-# Boot pg-datahike on :15432, point Odoo at it, run --init=base
-# --test-tags=:TestORM, parse the log, assert PASS_FLOOR.
+# Boot pg-datahike on :15432, point Odoo at it, run --init=$INIT_MODULE
+# (default: base), optionally with --test-tags=$TEST_TAGS, parse the log,
+# assert PASS_FLOOR.
+#
+# Env vars:
+#   INIT_MODULE  — module(s) to init. Default `base`. Comma-separated for
+#                  multi-module loads, e.g. `base,account`.
+#   TEST_TAGS    — value for --test-tags. Default `:TestORM`. Set empty
+#                  ("") to run --init only and skip the test-runner phase
+#                  entirely (PASS_FLOOR enforcement is then skipped too).
+#   PGWIRE_PORT  — port pgwire binds to. Default 15432.
+#   PASS_FLOOR   — minimum PASS_COUNT (only enforced when TEST_TAGS != "").
+#                  Default 9.
 #
 # Exit 0 on success; non-zero on:
 #   - pgwire failed to boot
-#   - Odoo failed to init the base module
-#   - fewer than $PASS_FLOOR (default 9) TestORM cases passed
+#   - Odoo failed to init the requested module(s)
+#   - (only when TEST_TAGS is non-empty) fewer than $PASS_FLOOR cases passed
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +24,8 @@ REPO_ROOT="$(cd "${HERE}/../../.." && pwd)"
 ODOO_ROOT="${ODOO_ROOT:-/home/christian-weilbach/Development/odoo}"
 ODOO_VENV="${ODOO_VENV:-${ODOO_ROOT}/.venv}"
 PGWIRE_PORT="${PGWIRE_PORT:-15432}"
+INIT_MODULE="${INIT_MODULE:-base}"
+TEST_TAGS="${TEST_TAGS-:TestORM}"   # default ":TestORM"; empty means "no tests"
 PASS_FLOOR="${PASS_FLOOR:-9}"
 
 LOG="${HERE}/last-run.log"
@@ -86,24 +99,55 @@ for _ in $(seq 1 90); do
   fi
 done
 
-# ---- run Odoo init + TestORM ----------------------------------------------
+# ---- run Odoo init [+ tests] ----------------------------------------------
 # `--stop-after-init` is the test-runner mode: run --init=<modules>,
-# run --test-tags=<filter>, then exit. Odoo writes per-test PASS/FAIL
-# to the log under the `odoo.tests` logger.
-echo "[run] running odoo --init=base --test-tags=:TestORM"
+# (optionally) run --test-tags=<filter>, then exit. Odoo writes per-test
+# PASS/FAIL to the log under the `odoo.tests` logger.
+ODOO_ARGS=(
+  -c "${CONF}"
+  --init="${INIT_MODULE}"
+  --stop-after-init
+)
+if [[ -n "${TEST_TAGS}" ]]; then
+  ODOO_ARGS+=(--test-tags="${TEST_TAGS}")
+  echo "[run] running odoo --init=${INIT_MODULE} --test-tags=${TEST_TAGS}"
+else
+  echo "[run] running odoo --init=${INIT_MODULE} (no tests; init-only)"
+fi
 # shellcheck disable=SC1091
 source "${ODOO_VENV}/bin/activate"
 PYTHONPATH="${ODOO_ROOT}:${PYTHONPATH:-}" \
   python "${ODOO_ROOT}/odoo-bin" \
-    -c "${CONF}" \
-    --init=base \
-    --test-tags=:TestORM \
-    --stop-after-init \
+    "${ODOO_ARGS[@]}" \
     >>"${LOG}" 2>&1 || true   # don't trip set -e — we parse the log
 ODOO_RC=$?
 
 # ---- parse the log --------------------------------------------------------
-# Odoo 18+ emits a single result line:
+# Init-only mode: skip the test parser entirely. Success criterion is
+# Odoo exited 0 and the log shows the "Modules loaded." marker that
+# odoo.modules.loading emits at the end of a successful registry build.
+if [[ -z "${TEST_TAGS}" ]]; then
+  echo
+  echo "[run] odoo exit code: ${ODOO_RC}"
+  if [[ "${ODOO_RC}" -ne 0 ]]; then
+    echo
+    echo "ERROR: odoo exited ${ODOO_RC} during --init=${INIT_MODULE}." >&2
+    echo "Tail of ${LOG}:" >&2
+    tail -120 "${LOG}" >&2
+    exit 1
+  fi
+  if ! grep -qE 'odoo\.modules\.loading.*Modules loaded\.' "${LOG}"; then
+    echo
+    echo "ERROR: 'Modules loaded.' not found in ${LOG} — init incomplete." >&2
+    echo "Tail of ${LOG}:" >&2
+    tail -120 "${LOG}" >&2
+    exit 1
+  fi
+  echo "[run] PASS — --init=${INIT_MODULE} completed (Modules loaded.)"
+  exit 0
+fi
+
+# Test mode. Odoo 18+ emits a single result line:
 #   `odoo.tests.result: <F> failed, <E> error(s) of <N> tests when loading database`
 # Older Odoo (≤17) emitted `Ran N tests in T s` + per-test PASS/FAIL.
 # Try the modern form first; fall back to the legacy one if missing.

@@ -2206,6 +2206,24 @@
      (instance? StringValue e) (expr/string-value-text ^StringValue e)
      (instance? BooleanValue e) (.getValue ^BooleanValue e)
      (instance? NullValue e) nil
+     ;; `DEFAULT` keyword in a VALUES position. JSqlParser 5.x parses
+     ;; this as a bare Column named "DEFAULT" with no table qualifier
+     ;; (verified by probing parse output — see commit message). Real
+     ;; PG semantics: substitute the column's DEFAULT clause, or NULL
+     ;; if none. For pg-datahike, returning nil is sufficient — the
+     ;; row-attrs builder drops nil values via `(when (some? coerced)
+     ;; ...)`, so the column ends up absent from the transacted entity
+     ;; and datahike's missing-attr semantics take over (read as NULL).
+     ;; Columns with stored DEFAULTs like nextval()/now() are handled
+     ;; by the auto-populate-identity path further downstream — but
+     ;; Odoo writes those values explicitly in its INSERTs, so this
+     ;; fallback covers the load-bearing case (Odoo's
+     ;; ir_act_window_view multi-row INSERTs that use DEFAULT for
+     ;; nullable FK columns like view_id).
+     (and (instance? Column e)
+          (nil? (.getTable ^Column e))
+          (= "default" (str/lower-case (unquote-ident (.getColumnName ^Column e)))))
+     nil
      (instance? SignedExpression e)
      (let [^SignedExpression se e
            inner (extract-value (.getExpression se) schema db)]
@@ -2403,6 +2421,15 @@
         :else val))))
 
 (declare eval-update-expr)
+
+(def ^:dynamic *eval-update-db*
+  "Bound by build-update-tx-for-bindings to the live db when evaluating
+   per-row UPDATE SET expressions. Read by the Function (`concat`,
+   etc.) and ParenthesedSelect (scalar subquery) branches of
+   `eval-update-expr` — which need a db handle to dispatch to
+   translate-select for inner subqueries. nil when an UPDATE has no
+   subquery / function-call assignments, which is the common case."
+  nil)
 
 (defn eval-check-predicate
   "Evaluate a CHECK-style JSqlParser Expression against an entity map
@@ -2675,13 +2702,42 @@
     (eval-update-expr (.getLeftExpression ^net.sf.jsqlparser.expression.TimezoneExpression value-expr)
                       entity-map ns-str schema)
 
-    ;; Function call — currently only now()/current_timestamp → current Date.
+    ;; Function call.
     (instance? net.sf.jsqlparser.expression.Function value-expr)
-    (let [fname (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function value-expr))]
+    (let [^net.sf.jsqlparser.expression.Function f value-expr
+          fname (str/lower-case (.getName f))
+          args (some-> (.getParameters f) .getExpressions)]
       (case fname
         ("now" "current_timestamp" "localtimestamp") (java.util.Date.)
         ("current_date") (java.util.Date.)
+        ;; concat(...) — PG's NULL-safe string concatenation. Required
+        ;; by Odoo's _parent_store_create UPDATE that builds parent_path
+        ;; from a correlated scalar subquery + node.id + literal '/'.
+        "concat"
+        (apply str (map #(let [v (eval-update-expr % entity-map ns-str schema)]
+                           (if (some? v) (str v) ""))
+                        args))
         (str value-expr)))
+
+    ;; Scalar subquery: (SELECT col FROM tbl WHERE ...). Used inside
+    ;; concat()/etc. arguments for correlated reads. Requires a live db
+    ;; (bound by the server-side caller as *eval-update-db*); without
+    ;; one we have no db to query, so fall through with nil.
+    ;;
+    ;; Outer-row correlation rides on `*from-bindings*`: the caller
+    ;; binds {outer-alias → {col-string → entity-value}} so the inner
+    ;; SELECT's WHERE references like `node.parent_id` resolve via
+    ;; expr.clj's existing from-bindings Column branch.
+    (instance? ParenthesedSelect value-expr)
+    (when-let [db *eval-update-db*]
+      (let [inner (.getSelect ^ParenthesedSelect value-expr)]
+        (when (instance? PlainSelect inner)
+          (let [parsed (translate-select ^PlainSelect inner schema db)
+                q (:query parsed)
+                in-args (:in-args parsed)
+                results (if (seq in-args) (apply d/q q db in-args) (d/q q db))
+                first-row (first results)]
+            (if (sequential? first-row) (first first-row) first-row)))))
 
     ;; Cast expression: evaluate inner and cast
     (instance? CastExpression value-expr)

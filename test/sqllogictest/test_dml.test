@@ -82,3 +82,30 @@ SELECT sku FROM inventory
 AAA
 BBB
 DDD
+
+# ============================================================
+# VALUES with DEFAULT keyword in nullable columns
+# ----------------------------------------------------------------
+# Odoo's ir_act_window_view multi-row INSERT writes DEFAULT for
+# unset nullable FK columns. PG semantics: substitute the column's
+# DEFAULT clause, or NULL if none. JSqlParser parses DEFAULT as a
+# bare Column named "DEFAULT"; extract-value lowers it to nil so
+# the row-attrs builder drops the entry and the column ends up
+# absent (read as NULL).
+# ============================================================
+
+statement ok
+CREATE TABLE def_test (id INTEGER, label TEXT, ref_id INTEGER)
+
+statement ok
+INSERT INTO def_test (id, label, ref_id) VALUES (1, 'one', 100), (2, 'two', DEFAULT)
+
+query T rowsort
+SELECT label FROM def_test WHERE ref_id IS NULL
+----
+two
+
+query I rowsort
+SELECT ref_id FROM def_test WHERE label = 'one'
+----
+100

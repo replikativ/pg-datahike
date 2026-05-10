@@ -365,6 +365,21 @@
        (= :ident (:type tok))
        (= (str/lower-case (:text tok)) kw)))
 
+(defn- fn-name=?
+  "Like kw=? but also accepts PG-quoted identifiers, since
+   `SELECT pg_notify(...)` and `SELECT \"pg_notify\"(...)` resolve to the
+   same function in PG (function lookup case-folds regardless of
+   quoting). Used inside `classify-system-call` because the entries
+   there are PG function/schema names — clients like psycopg2's
+   `SQL.identifier()` always emit the quoted form, and Odoo's bus relies
+   on that path."
+  [tok ^String fname]
+  (and tok
+       (case (:type tok)
+         :ident  (= (str/lower-case (:text tok)) fname)
+         :quoted (= (str/lower-case (or (:value tok) (:text tok))) fname)
+         false)))
+
 (defn- kw-in?
   "Matches a lowercase string against a set of kw names."
   [tok ^clojure.lang.IPersistentSet kws]
@@ -443,6 +458,12 @@
    {:kind :generic-sql} for anything that should flow through to
    JSqlParser. Called with the tokens AFTER the leading SELECT."
   [toks]
+  ;; Function-name dispatch uses fn-name=?, which accepts both bare and
+  ;; double-quoted identifiers — psycopg2's SQL.identifier() always
+  ;; quotes the function name, so Odoo emits `SELECT "pg_notify"(...)`,
+  ;; `SELECT "pg_advisory_lock"(...)`, etc. PG resolves these to the
+  ;; same system functions as the unquoted form (function lookup
+  ;; case-folds regardless of quoting), so we must too.
   (let [[t1 _t2 & _] (skip-leading-paren toks)
         ;; When SELECT is followed by `pg_catalog.` prefix, skip it so
         ;; `pg_catalog.current_database()` classifies the same as the
@@ -451,10 +472,10 @@
         ;; cond we route datahike.X specifically (so a bare `branches()`
         ;; or `current_branch()` without the prefix stays generic-SQL).
         [t1 rest-args dh?] (cond
-                             (and (kw=? t1 "pg_catalog")
+                             (and (fn-name=? t1 "pg_catalog")
                                   (= "." (:text (second toks))))
                              [(nth toks 2 nil) (drop 3 toks) false]
-                             (and (kw=? t1 "datahike")
+                             (and (fn-name=? t1 "datahike")
                                   (= "." (:text (second toks))))
                              [(nth toks 2 nil) (drop 3 toks) true]
                              :else
@@ -462,52 +483,59 @@
     (cond
       (nil? t1) {:kind :generic-sql}
       ;; datahike.* branching / versioning functions
-      (and dh? (kw=? t1 "branches"))       {:kind :dh-branches}
-      (and dh? (kw=? t1 "current_branch")) {:kind :dh-current-branch}
-      (and dh? (kw=? t1 "commit_id"))      {:kind :dh-commit-id}
-      (and dh? (kw=? t1 "parent_commits")) {:kind :dh-parent-commits}
-      (and dh? (kw=? t1 "create_branch"))
+      (and dh? (fn-name=? t1 "branches"))       {:kind :dh-branches}
+      (and dh? (fn-name=? t1 "current_branch")) {:kind :dh-current-branch}
+      (and dh? (fn-name=? t1 "commit_id"))      {:kind :dh-commit-id}
+      (and dh? (fn-name=? t1 "parent_commits")) {:kind :dh-parent-commits}
+      (and dh? (fn-name=? t1 "create_branch"))
       {:kind :dh-create-branch :args (extract-fn-string-args rest-args)}
-      (and dh? (kw=? t1 "delete_branch"))
+      (and dh? (fn-name=? t1 "delete_branch"))
       {:kind :dh-delete-branch :args (extract-fn-string-args rest-args)}
-      (kw=? t1 "version")       {:kind :version}
-      (kw=? t1 "now")           {:kind :now}
-      (kw=? t1 "current_schema") {:kind :current-schema}
-      (kw=? t1 "current_database") {:kind :current-database}
+      (fn-name=? t1 "version")       {:kind :version}
+      (fn-name=? t1 "now")           {:kind :now}
+      (fn-name=? t1 "current_schema") {:kind :current-schema}
+      (fn-name=? t1 "current_database") {:kind :current-database}
       ;; SQL-spec equivalents — both are bare-keyword expressions, not
       ;; function calls. Tokeniser treats them as :ident, no parens.
-      (kw=? t1 "current_catalog") {:kind :current-database}
+      (fn-name=? t1 "current_catalog") {:kind :current-database}
       ;; pg_dump session-prelude function — sets a GUC. We don't honor
       ;; the side-effect (the GUC has no Datahike equivalent), but we
       ;; need to silently accept the call so the dump replays.
       ;; The 3-arg form is `set_config(name, value, is_local)`; we
       ;; accept any args.
-      (kw=? t1 "set_config") {:kind :set-config}
-      (kw=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
-      (kw=? t1 "txid_current")  {:kind :txid-current}
-      (kw=? t1 "pg_sleep")
+      (fn-name=? t1 "set_config") {:kind :set-config}
+      (fn-name=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
+      (fn-name=? t1 "txid_current")  {:kind :txid-current}
+      (fn-name=? t1 "pg_sleep")
       {:kind :pg-sleep :args (extract-fn-numeric-args rest-args)}
-      (kw=? t1 "pg_advisory_lock")
+      ;; pg_notify(channel, payload) — Odoo's bus uses this from a
+      ;; post-commit hook (addons/bus/models/bus.py) on every model
+      ;; write. We accept it as a void no-op: there is no LISTEN
+      ;; delivery in pg-datahike, so the sender path is observably
+      ;; equivalent to delivering to zero subscribers.
+      (fn-name=? t1 "pg_notify")
+      {:kind :pg-notify}
+      (fn-name=? t1 "pg_advisory_lock")
       {:kind :advisory-lock :args (extract-fn-numeric-args rest-args)}
-      (kw=? t1 "pg_try_advisory_lock")
+      (fn-name=? t1 "pg_try_advisory_lock")
       {:kind :try-advisory-lock :args (extract-fn-numeric-args rest-args)}
-      (kw=? t1 "pg_advisory_xact_lock")
+      (fn-name=? t1 "pg_advisory_xact_lock")
       {:kind :advisory-xact-lock :args (extract-fn-numeric-args rest-args)}
-      (kw=? t1 "pg_try_advisory_xact_lock")
+      (fn-name=? t1 "pg_try_advisory_xact_lock")
       {:kind :try-advisory-xact-lock :args (extract-fn-numeric-args rest-args)}
-      (kw=? t1 "pg_advisory_unlock")
+      (fn-name=? t1 "pg_advisory_unlock")
       {:kind :advisory-unlock :args (extract-fn-numeric-args rest-args)}
-      (kw=? t1 "pg_advisory_unlock_all")
+      (fn-name=? t1 "pg_advisory_unlock_all")
       {:kind :advisory-unlock-all}
-      (kw=? t1 "nextval")
+      (fn-name=? t1 "nextval")
       {:kind :nextval :seq-name (first (extract-fn-string-args rest-args))}
-      (kw=? t1 "currval")
+      (fn-name=? t1 "currval")
       {:kind :currval :seq-name (first (extract-fn-string-args rest-args))}
-      (kw=? t1 "setval")
+      (fn-name=? t1 "setval")
       {:kind :setval
        :seq-name (first (extract-fn-string-args rest-args))
        :new-value (first (extract-fn-numeric-args rest-args))}
-      (kw=? t1 "pg_get_keywords") {:kind :pg-keywords}
+      (fn-name=? t1 "pg_get_keywords") {:kind :pg-keywords}
       :else {:kind :generic-sql})))
 
 (defn- next-ident-after
