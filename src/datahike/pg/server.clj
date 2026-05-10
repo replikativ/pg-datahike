@@ -5173,6 +5173,17 @@
                                  ;; so their transactor-side validators
                                  ;; fire for SQL writes too. Default:
                                  ;; identity (no wrap).
+                                 ;;
+                                 ;; SCOPE: fires on auto-commit paths
+                                 ;; (typical psql Simple Query) — both
+                                 ;; the regular and batchable INSERT
+                                 ;; flows. NOT yet wrapping in-tx
+                                 ;; (BEGIN/COMMIT) writes, which buffer
+                                 ;; via dc/with against a speculative
+                                 ;; db and flush at commit; that path
+                                 ;; would need wrap firing both
+                                 ;; speculatively per-statement and at
+                                 ;; commit. Track-issue follow-up.
                                  :tx-wrap (or tx-wrap identity)}]
                         (case (:type parsed)
                           :system                (exec-system ctx parsed)
