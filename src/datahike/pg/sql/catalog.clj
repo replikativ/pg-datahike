@@ -1116,7 +1116,22 @@
      (instance? PlainSelect stmt)
      (let [^PlainSelect ps stmt
            acc (reduce (fn [a ^net.sf.jsqlparser.statement.select.WithItem wi]
-                         (collect-in-stmt! a (.getSelect wi)))
+                         ;; .getSelect unsafely casts the underlying
+                         ;; ParenthesedStatement to ParenthesedSelect —
+                         ;; it bombs on DML-bodied CTEs (INSERT/UPDATE/
+                         ;; DELETE inside WITH …). Drop through
+                         ;; .getParenthesedStatement instead and only
+                         ;; recurse when the body is actually a
+                         ;; select-shaped node.
+                         (let [body (try (.getParenthesedStatement wi)
+                                         (catch Throwable _ nil))
+                               inner (cond
+                                       (instance? PlainSelect body) body
+                                       (instance? SetOperationList body) body
+                                       (instance? ParenthesedSelect body)
+                                       (.getSelect ^ParenthesedSelect body)
+                                       :else nil)]
+                           (if inner (collect-in-stmt! a inner) a)))
                        acc
                        (or (.getWithItemsList ps) []))]
        (collect-in-plain! acc ps))

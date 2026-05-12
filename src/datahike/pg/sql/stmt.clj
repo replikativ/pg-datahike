@@ -41,6 +41,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.datom]
+            [datahike.query :as dq]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.coerce :as coerce]
@@ -1608,7 +1609,13 @@
         ;; evar preserves per-entity rows (SQL's default ALL behavior).
         ;; This is independent of the anchor above — anchor gives us a
         ;; binding for evar; :with preserves row multiplicity.
-        _ (when (and (not @has-aggregates?) (not has-distinct?) default-table)
+        ;;
+        ;; Skipped when GROUP BY is present without an aggregate: the user
+        ;; asked for distinct groups, so preserving entity-level multiplicity
+        ;; would defeat the dedup the :find tuple is supposed to produce.
+        _ (when (and (not @has-aggregates?) (not has-distinct?)
+                     (not (seq group-by))
+                     default-table)
             (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
 
         ;; ORDER BY — resolve aliases to find-elements before creating patterns
@@ -2101,7 +2108,111 @@
             (when (and (seq data-patterns) (seq other-clauses))
               (reset! (:where-clauses ctx) (into data-patterns other-clauses))))
 
-        ;; Build the Datalog query map
+        ;; HAVING-only aggregates: if the HAVING expression references an
+        ;; aggregate that isn't already in the SELECT projection, the
+        ;; aggregate needs to be computed all the same — otherwise
+        ;; `match-aggregate-index` can't resolve it and the server's
+        ;; `apply-having` drops the predicate silently.
+        ;;
+        ;; Walk HAVING's JSqlParser tree, collect every Function whose
+        ;; name is an aggregate, and append each one to find-elements as
+        ;; a hidden column. Reuses the same translation shape as the
+        ;; SELECT-item aggregate branch (`(agg-sym ?inner-var)`), so
+        ;; downstream `match-aggregate-index` resolution and the
+        ;; server's HAVING post-filter work without further changes.
+        ;; The wire layer strips trailing :hidden-count columns from
+        ;; results, so HAVING-only aggregates never reach the client.
+        having-agg-fns (when having-expr
+                         (let [found (atom [])
+                               walk (fn walk [^net.sf.jsqlparser.expression.Expression e]
+                                      (when e
+                                        (cond
+                                          (instance? Function e)
+                                          (let [^Function f e
+                                                fname (str/lower-case (.getName f))]
+                                            (when (fns/aggregate-function? fname)
+                                              (swap! found conj f)))
+                                          (instance? AndExpression e)
+                                          (do (walk (.getLeftExpression ^AndExpression e))
+                                              (walk (.getRightExpression ^AndExpression e)))
+                                          (instance? OrExpression e)
+                                          (do (walk (.getLeftExpression ^OrExpression e))
+                                              (walk (.getRightExpression ^OrExpression e)))
+                                          (instance? GreaterThan e)         (do (walk (.getLeftExpression ^GreaterThan e))         (walk (.getRightExpression ^GreaterThan e)))
+                                          (instance? GreaterThanEquals e)   (do (walk (.getLeftExpression ^GreaterThanEquals e))   (walk (.getRightExpression ^GreaterThanEquals e)))
+                                          (instance? MinorThan e)           (do (walk (.getLeftExpression ^MinorThan e))           (walk (.getRightExpression ^MinorThan e)))
+                                          (instance? MinorThanEquals e)     (do (walk (.getLeftExpression ^MinorThanEquals e))     (walk (.getRightExpression ^MinorThanEquals e)))
+                                          (instance? EqualsTo e)            (do (walk (.getLeftExpression ^EqualsTo e))            (walk (.getRightExpression ^EqualsTo e)))
+                                          (instance? NotEqualsTo e)         (do (walk (.getLeftExpression ^NotEqualsTo e))         (walk (.getRightExpression ^NotEqualsTo e)))
+                                          (instance? IsNullExpression e)    (walk (.getLeftExpression ^IsNullExpression e)))))]
+                           (walk having-expr)
+                           @found))
+        ;; Append each HAVING-only aggregate as a hidden find element.
+        ;; `find-aliases` gets a sentinel "__having_agg_<i>" so its
+        ;; length keeps matching find-elements; the hidden-count below
+        ;; trims them from the visible projection.
+        having-hidden
+        (let [existing-agg-shapes
+              (into #{}
+                    (filter (fn [el] (and (seq? el) (symbol? (first el)))))
+                    @find-elements)
+              ;; Translate a Function into the same `(agg-sym ?v)` shape
+              ;; the SELECT-item aggregate branch emits. Returns nil for
+              ;; shapes we don't synthesize (COUNT(*), CORR, ordered-set
+              ;; aggregates with WITHIN GROUP, …) — those are rare in a
+              ;; HAVING-only position and can be added if needed.
+              translate-agg
+              (fn [^Function f]
+                (let [fname (str/lower-case (.getName f))
+                      params (.getParameters f)
+                      is-count-star? (or (nil? params)
+                                         (zero? (count params))
+                                         (and (= 1 (count params))
+                                              (instance? AllColumns (first params))))]
+                  (cond
+                    (and (= fname "count") is-count-star? default-table)
+                    (let [evar (ctx/entity-var! ctx default-table)
+                          table-name (get (:table-aliases ctx) default-table default-table)
+                          marker-attr (pgs/row-marker-attr table-name)]
+                      (when (empty? @(:where-clauses ctx))
+                        (if (get schema marker-attr)
+                          (ctx/add-clause! ctx [evar marker-attr true])
+                          (when-let [cols (pgs/column-info schema table-name db)]
+                            (when-let [first-col (second cols)]
+                              (ctx/col-var! ctx (:attr first-col))))))
+                      (list 'count evar))
+                    (and params (= 1 (count params)) (not is-count-star?))
+                    (let [agg-sym (get fns/sql-aggregate->datalog fname)
+                          v (expr/translate-expr ctx (first params))
+                          v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                          precision-variant (pick-precision-variant
+                                             fname
+                                             (oid/expr-oid (first params) agg-oid-env))]
+                      (when agg-sym
+                        (when-not (= fname "count")
+                          (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
+                        (list (or precision-variant agg-sym) v))))))]
+          (->> having-agg-fns
+               (keep (fn [f]
+                       (when-let [elem (translate-agg f)]
+                         (when-not (contains? existing-agg-shapes elem)
+                           (reset! has-aggregates? true)
+                           (swap! find-elements conj elem)
+                           ;; Intentionally NOT extending find-aliases:
+                           ;; aliases track the visible projection. The
+                           ;; resulting (count find-elements) >
+                           ;; (count find-aliases) — the gap rides on
+                           ;; :hidden-count so the wire layer strips
+                           ;; these columns before emitting rows, and
+                           ;; describeResult / RowDescription stay
+                           ;; aligned with find-aliases.
+                           elem))))
+               count))
+        ;; Snapshot where-clauses AFTER the HAVING-aggregate translation
+        ;; has had a chance to add column bindings via col-var!. If we
+        ;; snapshot before, the aggregate's input var (e.g. ?sales_amount)
+        ;; references no `:where` clause and Datahike rejects it as
+        ;; "Query for unknown vars".
         where-clauses @(:where-clauses ctx)
         find-elems @find-elements
 
@@ -2128,22 +2239,30 @@
                          (fn [[v dir]]
                            (let [idx (.indexOf ^java.util.List extended-find v)]
                              (when (>= idx 0) [idx dir])))
-                         order-by-spec))]
+                         order-by-spec))
+                hidden (+ (count missing) having-hidden)]
             (if has-nullable-order?
               ;; Nullable ORDER BY → server-side sort (don't emit :order-by to Datahike)
-              [extended-find (count missing) nil ob]
+              [extended-find hidden nil ob]
               ;; Non-nullable → Datahike handles it
-              [extended-find (count missing) ob nil]))
+              [extended-find hidden ob nil]))
           ;; No explicit SQL ORDER BY: default to a deterministic order on
           ;; the primary FROM table's entity var. Entity ids are issued
           ;; monotonically by d/transact, so this matches insertion order —
           ;; the behavior every heap-scanning PG client (pgjdbc, Odoo,
           ;; Hibernate) implicitly relies on when no ORDER BY is given.
-          ;; Skipped for aggregates/DISTINCT (their shape is
-          ;; projection-defined, not row-defined) and for queries with no
-          ;; single default table (subqueries, joins handled separately).
+          ;; Skipped for:
+          ;;   - aggregates / DISTINCT (their shape is projection-defined,
+          ;;     not row-defined),
+          ;;   - GROUP BY without an aggregate (the user asked for distinct
+          ;;     groups; adding the eid var to :find would prevent the
+          ;;     dedup since Datahike's set semantics keys on the full
+          ;;     :find tuple), and
+          ;;   - queries with no single default table (subqueries, joins
+          ;;     handled separately).
           (if-let [evar (and (not @has-aggregates?)
                              (not has-distinct?)
+                             (not (seq group-by))
                              default-table
                              (ctx/entity-var! ctx default-table))]
             (let [already (.indexOf ^java.util.List find-elems-vec evar)
@@ -2151,9 +2270,9 @@
                                   (conj find-elems-vec evar)
                                   find-elems-vec)
                   idx (if (neg? already) (dec (count extended-find)) already)
-                  hidden (if (neg? already) 1 0)]
+                  hidden (+ (if (neg? already) 1 0) having-hidden)]
               [extended-find hidden [idx :asc] nil])
-            [find-elems-vec 0 nil nil]))
+            [find-elems-vec having-hidden nil nil]))
 
         in-params @(:in-params ctx)
         in-args @(:in-args ctx)
@@ -3835,69 +3954,28 @@
                                          non-cte-clauses)]
               ;; Order: data patterns → rule calls → other clauses (preds, fn bindings)
               (vec (concat data-patterns @rule-calls other-clauses)))))]
-    ;; Datahike's recursive rule evaluator can't handle get-else clauses
-    ;; (causes infinite loops). Convert them back to plain data patterns or
-    ;; missing? checks. NULL synthesis isn't needed inside rule bodies
-    ;; because rule outputs are bound directly by renaming find vars.
-    ;; Also drop row-marker anchors (db-row-exists) which cause infinite loops
-    ;; in recursive rule evaluation — the data patterns suffice as anchors.
-    (let [;; Apply var renaming so find-vars become rule output vars
-          renamed-clauses (mapv rename-form rewritten-clauses)
-          ;; Drop row-marker patterns: [?e :ns/db-row-exists true]
+    ;; Rename the SELECT find-vars to the rule head's output vars and
+    ;; drop row-marker anchors. The rest of the body — including
+    ;; `[(get-else $ ?e :ns/col :__null__) ?v]` clauses and
+    ;; `[(= ?v :__null__)]` NULL checks — passes through unchanged.
+    ;; Datahike's planner (post PR #826) recognises get-else in rule
+    ;; bodies the same way it does at top level (LOptionalScan), so the
+    ;; `?e` entity var is bound via the synthetic attribute scan.
+    ;;
+    ;; Row-marker patterns `[?e :ns/db-row-exists true]` come from
+    ;; translate-select's entity-anchor injection. CTE-namespace markers
+    ;; have already been swapped to rule calls upstream in
+    ;; `rewritten-clauses`; real-table markers are dropped here because
+    ;; the get-else clauses bind the entity var via LOptionalScan,
+    ;; making the marker an extra unused scan.
+    (let [renamed-clauses (mapv rename-form rewritten-clauses)
           marker-free-clauses (filterv (fn [c]
                                          (not (and (vector? c) (= 3 (count c))
                                                    (keyword? (second c))
                                                    (= "db-row-exists" (name (second c))))))
                                        renamed-clauses)
-          final-clauses (into (vec marker-free-clauses) bind-clauses)
-          ;; First pass: identify (get-else ?e :attr :__null__) ?v patterns
-          ;; and check if ?v is used in [(= ?v :__null__)] check.
-          getelse-vars (into {}
-                             (keep (fn [c]
-                                     (when (and (vector? c) (= 2 (count c))
-                                                (seq? (first c))
-                                                (= 'get-else (ffirst c)))
-                                       (let [[_ _ evar attr _default] (first c)
-                                             val-var (second c)]
-                                         [val-var {:evar evar :attr attr}])))
-                                   final-clauses))
-          null-check-vars (into #{}
-                                (keep (fn [c]
-                                        (when (and (vector? c) (= 1 (count c))
-                                                   (seq? (first c))
-                                                   (= '= (ffirst c))
-                                                   (= :__null__ (last (first c))))
-                                      ;; [(= ?v :__null__)] → ?v
-                                          (second (first c))))
-                                      final-clauses))
-          rule-bound-vars (set rule-vars)
-          transformed-clauses
-          (vec (keep
-                (fn [c]
-                  (cond
-                     ;; get-else clause
-                    (and (vector? c) (= 2 (count c))
-                         (seq? (first c))
-                         (= 'get-else (ffirst c)))
-                    (let [[_ _ evar attr _default] (first c)
-                          val-var (second c)]
-                      (cond
-                         ;; If used in NULL check → use missing? + drop val-var
-                        (contains? null-check-vars val-var)
-                        [(list 'missing? '$ evar attr)]
-                         ;; Otherwise → plain data pattern
-                        :else
-                        [evar attr val-var]))
-                     ;; NULL check that we converted to missing? — drop it
-                    (and (vector? c) (= 1 (count c))
-                         (seq? (first c))
-                         (= '= (ffirst c))
-                         (= :__null__ (last (first c)))
-                         (contains? getelse-vars (second (first c))))
-                    nil
-                    :else c))
-                final-clauses))]
-      {:clauses transformed-clauses
+          final-clauses (into (vec marker-free-clauses) bind-clauses)]
+      {:clauses final-clauses
        :in-params in-params
        :in-args in-args})))
 
@@ -3960,4 +4038,108 @@
      :rule-vars rule-vars
      :in-params all-in-params
      :in-args all-in-args}))
+
+(defn- infer-recursive-vtype
+  "Minimal value-type detector for rows produced by a recursive CTE
+   rule. Rule output values come from the SELECT items inside the CTE
+   branches (Long arithmetic, literal strings, etc.) — far narrower
+   than the cross-table UNION shapes materialize-set-op! has to handle,
+   so a small per-value classifier suffices."
+  [v]
+  (cond
+    (nil? v)                                    :db.type/string
+    (instance? Long v)                          :db.type/long
+    (instance? Integer v)                       :db.type/long
+    (instance? Double v)                        :db.type/double
+    (instance? Float v)                         :db.type/double
+    (instance? java.math.BigDecimal v)          :db.type/bigdec
+    (instance? java.math.BigInteger v)          :db.type/bigdec
+    (instance? Boolean v)                       :db.type/boolean
+    (instance? java.util.UUID v)                :db.type/uuid
+    (instance? java.util.Date v)                :db.type/instant
+    :else                                       :db.type/string))
+
+(defn materialize-recursive-cte!
+  "Run a WITH RECURSIVE CTE rule to a fixed point and materialize the
+   resulting rows into a speculative db under `:<target-name>/<col>`
+   virtual attrs. Mirrors the result shape of `materialize-set-op!`
+   so callers (parse-sql) can swap implementations based on
+   `(.isRecursive wi)`.
+
+   Reuses `translate-recursive-cte` for the rule construction; rule
+   eval here is the SELECT counterpart of `build-update-with-recursive-tx`
+   in the server."
+  [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
+  (let [{:keys [rule rule-name col-names rule-vars in-params in-args]}
+        (translate-recursive-cte wi schema db)
+        rule-call (apply list rule-name rule-vars)
+        q {:find  rule-vars
+           :in    (into '[$ %] in-params)
+           :where [rule-call]}
+        ;; Force the query planner on regardless of caller context.
+        ;; Datahike's legacy engine can't evaluate the recursive bodies
+        ;; that `translate-recursive-cte` emits (head var bound through
+        ;; a function op then filtered by a predicate — see datahike PR
+        ;; #825). Server.execute already binds *force-legacy* false,
+        ;; but parse-sql is also reachable from the REPL and tests, so
+        ;; we re-establish the binding locally to keep the recursive
+        ;; CTE path correct under any caller.
+        ;;
+        ;; `db` is the snapshot the caller already passed in
+        ;; (parse-sql captures it at handler entry); we never re-deref
+        ;; the connection here, so the rule sees a consistent state.
+        rows (binding [dq/*force-legacy* false]
+               (apply d/q q db rule in-args))
+        with-fn d/db-with
+        row-marker (pgs/row-marker-attr target-name)
+        col-types (mapv (fn [i]
+                          (let [samples (keep #(nth (vec %) i nil) rows)
+                                vtypes  (into #{} (map infer-recursive-vtype) samples)]
+                            (cond
+                              (empty? vtypes)         :db.type/string
+                              (= 1 (count vtypes))    (first vtypes)
+                              ;; Mixed numerics → bigdec; anything else → string.
+                              (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes)
+                              :db.type/bigdec
+                              :else :db.type/string)))
+                        (range (count col-names)))
+        coerce (fn [vtype]
+                 (case vtype
+                   :db.type/long   (fn [v] (if (instance? Long v) v (long v)))
+                   :db.type/double (fn [v] (if (instance? Double v) v (double v)))
+                   :db.type/bigdec (fn [v]
+                                     (cond
+                                       (instance? java.math.BigDecimal v) v
+                                       (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                       (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                       (float? v)   (java.math.BigDecimal/valueOf (double v))
+                                       :else (java.math.BigDecimal. (str v))))
+                   :db.type/string str
+                   identity))
+        coercions (mapv coerce col-types)
+        schema-tx (conj
+                   (vec (for [[i c] (map-indexed vector col-names)]
+                          {:db/ident       (keyword target-name c)
+                           :db/valueType   (nth col-types i)
+                           :db/cardinality :db.cardinality/one}))
+                   {:db/ident       row-marker
+                    :db/valueType   :db.type/boolean
+                    :db/cardinality :db.cardinality/one})
+        spec-db (with-fn db schema-tx)
+        data-tx (vec (for [row rows]
+                       (let [vs (vec row)
+                             cols (into {} (keep-indexed
+                                            (fn [i c]
+                                              (let [v (nth vs i nil)]
+                                                (when (some? v)
+                                                  [(keyword target-name c)
+                                                   ((nth coercions i) v)])))
+                                            col-names))]
+                         (assoc cols row-marker true))))
+        spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
+    {:db      spec-db2
+     :schema  (:schema spec-db2)
+     :name    target-name
+     :alias   target-name
+     :aliases col-names}))
 
