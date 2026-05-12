@@ -1866,14 +1866,24 @@
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
-   that need speculative tempid remapping should remap afterward."
+   that need speculative tempid remapping should remap afterward.
+
+   When `parsed` carries an `:enriched-db` (CTEs were materialised at
+   parse-sql time), the WHERE-clause query runs against it and the
+   ctx sees its extended schema so virtual `:<cte>/<col>` attrs
+   resolve. Returned eids are still real entity-ids in the live db
+   because the speculative overlay never reassigns ids for existing
+   entities."
   [db schema parsed]
-  (let [{:keys [table alias where-expr]} parsed
+  (let [{:keys [table alias where-expr enriched-db]} parsed
+        query-db (or enriched-db db)
+        query-schema (or (:schema enriched-db) schema)
         ;; Build alias map: {alias → table, table → table}
         default-key (or alias table)
         table-aliases (cond-> {table table}
                         alias (assoc alias table))
-        ctx (#'sql/make-ctx schema table-aliases default-key)
+        ctx (#'sql/make-ctx query-schema table-aliases default-key
+                            {:db query-db :parse-sql sql/parse-sql})
         _ (when where-expr
             (let [preds (#'sql/translate-predicate ctx where-expr)]
               (swap! (:where-clauses ctx) into preds)))
@@ -1883,7 +1893,7 @@
               (when-let [first-col (second cols)]
                 (#'sql/col-var! ctx (:attr first-col)))))
         q {:find [evar] :where (vec @(:where-clauses ctx))}
-        eids (mapv first (d/q q db))]
+        eids (mapv first (d/q q query-db))]
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
@@ -1917,13 +1927,21 @@
 
 (defn- build-update-tx-for-bindings
   "Build tx-data for a single UPDATE row, optionally with from-bindings for
-   UPDATE ... FROM (VALUES ...) substitution. Returns {:eids [...] :tx-data [...]}."
+   UPDATE ... FROM (VALUES ...) substitution. Returns {:eids [...] :tx-data [...]}.
+
+   When `parsed` carries `:enriched-db` (CTEs materialised at parse-sql
+   time), the row-matching query and translate-predicate ctx use that
+   db/schema so virtual `:<cte>/<col>` attrs resolve. Resulting eids
+   are still real entity-ids in the live db."
   [db schema parsed from-bindings]
-  (let [{:keys [table alias ns assignments where-expr]} parsed
+  (let [{:keys [table alias ns assignments where-expr enriched-db]} parsed
+        query-db (or enriched-db db)
+        query-schema (or (:schema enriched-db) schema)
         default-key (or alias table)
         table-aliases (cond-> {table table}
                         alias (assoc alias table))
-        ctx (#'sql/make-ctx schema table-aliases default-key)
+        ctx (#'sql/make-ctx query-schema table-aliases default-key
+                            {:db query-db :parse-sql sql/parse-sql})
         _ (when where-expr
             (binding [params/*from-bindings* from-bindings]
               (let [preds (#'sql/translate-predicate ctx where-expr)]
@@ -1951,8 +1969,8 @@
             (seq in-params) (assoc :in (into ['$] in-params)))
         eids (mapv first
                    (if (seq in-args)
-                     (apply d/q q db in-args)
-                     (d/q q db)))
+                     (apply d/q q query-db in-args)
+                     (d/q q query-db)))
         ;; For prepared UPDATE, resolve ParamRef values BEFORE
         ;; coerce-insert-value — otherwise the coercion fires on a
         ;; placeholder record (no-op passthrough), then the bound
@@ -3925,7 +3943,15 @@
                             sql-offset (drop sql-offset)
                             sql-limit  (take sql-limit))))
                       results)
-            ;; Strip hidden ORDER BY columns from results and aliases
+            ;; Apply HAVING filter BEFORE trimming hidden columns:
+            ;; HAVING can reference an aggregate that wasn't in the SELECT
+            ;; projection — translate-select appends such aggregates as
+            ;; hidden find-elements, and the HAVING :col-idx points at
+            ;; them. Trimming first would strip the column the filter
+            ;; needs and silently drop every row.
+            results (apply-having results find-aliases having)
+            ;; Strip hidden ORDER BY / HAVING-aggregate columns from
+            ;; results and aliases.
             [results find-aliases]
             (if (pos? hidden-count)
               (let [visible (- (count (:find query)) hidden-count)]
@@ -3962,8 +3988,6 @@
                     final-aliases (mapv #(nth new-aliases %) visible-indices)]
                 [final-results final-aliases])
               [results find-aliases])
-            ;; Apply HAVING filter when present
-            results (apply-having results find-aliases having)
             ;; Apply compound aggregate expressions: MAX(a) - MIN(a)
             ;; Each compound-expr has {:alias :op :l-idx :r-idx}.
             ;; We compute the derived value and replace the hidden agg columns.

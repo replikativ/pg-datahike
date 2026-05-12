@@ -67,11 +67,19 @@ east	350.000000
 west	700.000000
 
 # ============================================================
-# CTE used in WHERE — skipped: CTE reference in subquery not yet supported
+# CTE used in WHERE — single-pass CTE feeds an IN-subquery filter
 # ============================================================
+# Note: the HAVING variant (`WITH high_regions AS (SELECT region FROM
+# sales GROUP BY region HAVING SUM(amount) > 500) …`) is still blocked
+# by a pre-existing GROUP BY + HAVING translator gap unrelated to the
+# CTE lift; this simpler shape exercises the same WITH-on-SELECT
+# materialisation + IN-subquery resolution against the speculative db.
 
-# query TR rowsort
-# WITH high_regions AS (SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 500) SELECT region, amount FROM sales WHERE region IN (SELECT region FROM high_regions)
+query TR rowsort
+WITH big_regions AS (SELECT region FROM sales WHERE amount > 200) SELECT region, amount FROM sales WHERE region IN (SELECT region FROM big_regions)
+----
+west	300.000000
+west	400.000000
 
 # ============================================================
 # Subquery in FROM (derived table)

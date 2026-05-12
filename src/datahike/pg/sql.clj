@@ -322,6 +322,78 @@
   [^String sql]
   (rw/rewrite sql rw/default-rules))
 
+(defn- stmt-with-items
+  "Statement-agnostic WITH-list accessor. JSqlParser exposes
+   `.getWithItemsList` separately on PlainSelect / SetOperationList /
+   Insert / Update / Delete; everything else (DDL, COPY, …) has no
+   WITH list. Returns the (possibly empty) Java List, or nil when the
+   statement type doesn't carry one."
+  [stmt]
+  (cond
+    (instance? PlainSelect stmt)       (.getWithItemsList ^PlainSelect stmt)
+    (instance? SetOperationList stmt)  (.getWithItemsList ^SetOperationList stmt)
+    (instance? Insert stmt)            (.getWithItemsList ^Insert stmt)
+    (instance? Update stmt)            (.getWithItemsList ^Update stmt)
+    (instance? Delete stmt)            (.getWithItemsList ^Delete stmt)
+    :else                              nil))
+
+(defn- materialize-withs!
+  "Run the WITH-list fold for any statement type. Returns [enriched-db
+   enriched-schema] with the speculative db carrying `:<cte>/<col>`
+   virtual attrs for each materialised CTE. When `stmt` has no WITH
+   list (or it's empty), returns [db schema] unchanged.
+
+   - Non-recursive WITH items with a SELECT body go through
+     `materialize-set-op!`.
+   - Recursive WITH items in SELECT/INSERT/DELETE go through
+     `materialize-recursive-cte!` (run the Datalog rule, persist rows).
+     Recursive items in UPDATE are skipped here so translate-update's
+     existing `:update-with-recursive` path keeps owning that case.
+   - Data-modifying CTE bodies (`WITH x AS (INSERT … RETURNING …)`) are
+     skipped — JSqlParser's `WithItem.getSelect()` casts to
+     ParenthesedSelect and crashes on them, and the feature is not
+     implemented end-to-end yet."
+  [stmt db schema]
+  (let [withs (stmt-with-items stmt)]
+    (if (and db (seq withs))
+      (reduce
+       (fn [[curr-db curr-schema] ^net.sf.jsqlparser.statement.select.WithItem wi]
+         (let [cte-name   (str/trim (str (.getAlias wi)))
+               recursive? (.isRecursive wi)
+               body       (try (.getParenthesedStatement wi)
+                               (catch Throwable _ nil))
+               inner      (cond
+                            (instance? PlainSelect body)      body
+                            (instance? SetOperationList body) body
+                            (instance? ParenthesedSelect body)
+                            (.getSelect ^ParenthesedSelect body)
+                            :else nil)]
+           (cond
+             ;; Recursive WITH on UPDATE — leave to translate-update.
+             (and recursive? (instance? Update stmt))
+             [curr-db curr-schema]
+
+             recursive?
+             (if-let [m (try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
+                             (catch Throwable _ nil))]
+               [(:db m) (:schema m)]
+               [curr-db curr-schema])
+
+             (some? inner)
+             (if-let [m (stmt/materialize-set-op! inner cte-name curr-db curr-schema)]
+               [(:db m) (:schema m)]
+               [curr-db curr-schema])
+
+             ;; Data-modifying CTE body or shape we don't recognise —
+             ;; skip rather than crash. The outer translate-* will
+             ;; surface a clearer error if the body's results are
+             ;; actually needed.
+             :else
+             [curr-db curr-schema])))
+       [db schema]
+       withs)
+      [db schema])))
+
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
    parse-sql wraps this with the LRU result cache."
@@ -495,6 +567,16 @@
                                   (cache-put! cache cache-key built)))]
                         [enriched (:schema enriched)])))
                   [db schema])
+            ;; Top-level WITH-fold. Materialise every CTE body into a
+            ;; speculative db (virtual `:<cte>/<col>` attrs) so all four
+            ;; DML paths plus SELECT see the enriched db/schema before
+            ;; their translator runs. Previously the fold lived inside
+            ;; the PlainSelect branch only, so `WITH x AS (…)
+            ;; UPDATE/DELETE/INSERT … FROM x` silently dropped the WITH
+            ;; list and then surfaced an opaque "Cannot resolve any
+            ;; more clauses" at execute time.
+                pre-cte-db db
+                [db schema] (materialize-withs! stmt db schema)
             ;; Count prepared-statement placeholders once at the AST
             ;; level — reused for INSERT/UPDATE/DELETE which don't
             ;; accumulate placeholders in a ctx (unlike translate-select).
@@ -599,39 +681,14 @@
                                                  (.setLeft j true)
                                                  (.setFull j false))))
                                            has-full?))
-                ;; Handle CTEs: execute each, transact into speculative db.
-                ;; Both PlainSelect and SetOperationList (UNION/INTERSECT/
-                ;; EXCEPT) inner shapes go through the shared
-                ;; `materialize-set-op!` helper so a CTE built from a UNION
-                ;; over heterogeneous tables (e.g. Metabase's
-                ;; build_privilege_map across pg_tables / pg_views /
-                ;; pg_matviews) materialises into one virtual relation.
-                        withs (.getWithItemsList ^PlainSelect stmt)
-                        [cte-db cte-schema]
-                        (if (and db (seq withs))
-                          (reduce
-                           (fn [[curr-db curr-schema] ^net.sf.jsqlparser.statement.select.WithItem wi]
-                             (let [cte-name (str/trim (str (.getAlias wi)))
-                                   cte-select (.getSelect wi)
-                                   inner (if (instance? ParenthesedSelect cte-select)
-                                           (.getSelect ^ParenthesedSelect cte-select)
-                                           cte-select)
-                                   materialised
-                                   (when (or (instance? PlainSelect inner)
-                                             (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
-                                     (stmt/materialize-set-op! inner cte-name curr-db curr-schema))]
-                               (if materialised
-                                 [(:db materialised) (:schema materialised)]
-                                 [curr-db curr-schema])))
-                           [db schema]
-                           withs)
-                          [db schema])
-                ;; Catalog materialisation already happened at the outer
-                ;; parse-sql scope (see the `[db schema]` binding at the
-                ;; top of the JSqlParser branch). CTEs above use the
-                ;; enriched cte-db; nothing more to do here.
-                        [cte-db cte-schema]
-                        [cte-db cte-schema]
+                ;; CTE materialisation already happened at parse-sql*'s
+                ;; outer scope (see `materialize-withs!` below the
+                ;; catalog enrichment block). `db`/`schema` here are the
+                ;; enriched values; the local `cte-db`/`cte-schema`
+                ;; names are kept for the downstream references that
+                ;; still use them.
+                        cte-db db
+                        cte-schema schema
 
 ;; Table-free SELECT (e.g. SELECT 1+2, SELECT CASE WHEN 1>2 THEN 3 END)
                 ;; Evaluate expressions directly without going through the query engine.
@@ -690,7 +747,7 @@
                 ;; constant forms (no FROM, no params); the general
                 ;; table-function path is a follow-up.
                         [unnest-val unnest-count unnest-alias unnest-elts?]
-                        (when (and table-free? (nil? (seq withs)))
+                        (when (and table-free? (identical? db pre-cte-db))
                           (let [items (.getSelectItems ^PlainSelect stmt)]
                             (when (= 1 (count items))
                               (let [^SelectItem it (first items)
@@ -799,7 +856,7 @@
                                     :hidden-count 0
                                     :literal-rows (vec (repeat n [v]))})
 
-                                 (and table-free? (nil? (seq withs)))
+                                 (and table-free? (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression
                                  (let [select-items (.getSelectItems ^PlainSelect stmt)
                                        fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})
@@ -1037,15 +1094,18 @@
 
           ;; INSERT
                   (instance? Insert stmt)
-                  (translate-insert ^Insert stmt schema db)
+                  (cond-> (translate-insert ^Insert stmt schema db)
+                    (not (identical? db orig-db)) (assoc :enriched-db db))
 
           ;; UPDATE
                   (instance? Update stmt)
-                  (translate-update ^Update stmt schema db)
+                  (cond-> (translate-update ^Update stmt schema db)
+                    (not (identical? db orig-db)) (assoc :enriched-db db))
 
           ;; DELETE
                   (instance? Delete stmt)
-                  (translate-delete ^Delete stmt schema)
+                  (cond-> (translate-delete ^Delete stmt schema)
+                    (not (identical? db orig-db)) (assoc :enriched-db db))
 
           ;; CREATE TABLE
                   (instance? CreateTable stmt)
