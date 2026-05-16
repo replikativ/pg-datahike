@@ -2407,10 +2407,12 @@
 ;; ============================================================================
 
 (defn- parse-temporal-set
-  "Parse `SET datahike.{as_of,since,history,branch,commit_id} = '…'` and
-   their RESET forms. Returns [key value] where key is :as-of | :since |
-   :history | :branch | :commit-id and value is the string (or nil for
-   reset/clear), or nil if the SQL isn't a recognized session-var op.
+  "Parse `SET datahike.{as_of,since,history,branch,commit_id,valid_at,
+   valid_from,valid_to} = '…'` and their RESET forms. Returns [key value]
+   where key is :as-of | :since | :history | :branch | :commit-id |
+   :valid-at | :valid-from | :valid-to and value is the string (or nil
+   for reset/clear), or nil if the SQL isn't a recognized session-var
+   op.
 
    Implemented on top of datahike.pg.sql.classify — the classifier gives
    us {:kind :set :var \"…\" :value \"…\"} or {:kind :reset :var \"…\"}
@@ -2418,11 +2420,14 @@
   [^String sql]
   (let [{:keys [kind var value]} (cls/classify sql)
         key (case var
-              "datahike.as_of"     :as-of
-              "datahike.since"     :since
-              "datahike.history"   :history
-              "datahike.branch"    :branch
-              "datahike.commit_id" :commit-id
+              "datahike.as_of"      :as-of
+              "datahike.since"      :since
+              "datahike.history"    :history
+              "datahike.branch"     :branch
+              "datahike.commit_id"  :commit-id
+              "datahike.valid_at"   :valid-at
+              "datahike.valid_from" :valid-from
+              "datahike.valid_to"   :valid-to
               nil)]
     (cond
       (nil? key) nil
@@ -2478,12 +2483,19 @@
    a client can, e.g., `SET datahike.branch = 'feature'` and then
    `SET datahike.as_of = '…'` to view that branch at a past point.
 
+   `valid-at` is a separate (valid-time) axis routed through vt-aware
+   secondary indices. It's composable with the tx-time axes — e.g.,
+   `SET datahike.as_of = ... ; SET datahike.valid_at = ...` views the
+   db at the tx-time of the first and filters secondary-index reads
+   by the second.
+
    `branch` / `commit-id` are looked up via datahike.versioning's
    branch-as-db / commit-as-db. The input `db` param is the caller's
    starting point (usually `(d/db conn)`); when branch or commit-id is
    bound, we ignore that and read from the store instead."
   [db session-state]
-  (let [{:keys [as-of since history branch commit-id]} @session-state
+  (let [{:keys [as-of since history branch commit-id valid-at]}
+        @session-state
         ;; branch / commit-id: route via datahike.versioning at the store
         ;; level. The conn's current :db is replaced if either is set.
         base (cond
@@ -2491,9 +2503,10 @@
                branch    (versioning/branch-as-db (:store db) branch)
                :else     db)]
     (cond-> base
-      history (d/history)
-      as-of   (d/as-of as-of)
-      since   (d/since since))))
+      history  (d/history)
+      as-of    (d/as-of as-of)
+      since    (d/since since)
+      valid-at (d/valid-at valid-at))))
 
 (defn- parse-instant
   "Parse a timestamp string to a java.util.Date for temporal queries.
