@@ -35,6 +35,7 @@
    clients."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.types :as types]))
 
@@ -272,7 +273,7 @@
         ;; Element type from the target PK attr's :db/valueType, NOT
         ;; from the first sample value (which would mistype an empty
         ;; array as :text). Defaults to :int8 — most FK PKs are bigint.
-        schema (:schema db)
+        schema (dbi/-schema db)
         target-vtype (get-in schema [target-pk-attr :db/valueType])
         elem-type (case target-vtype
                     :db.type/long    :int8

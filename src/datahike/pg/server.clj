@@ -413,7 +413,7 @@
     (let [aliases (:find-aliases parsed)
           find-vars (:find (:query parsed))
           var->attr (find-var->attr parsed)
-          schema (:schema db)
+          schema (dbi/-schema db)
           ;; Bulk-fetch typmods for the schema attrs we'll need; falls
           ;; back to -1 per column when the attr has none. One Datalog
           ;; query per RowDescription emission instead of N point lookups.
@@ -462,7 +462,7 @@
         query        (:query parsed)
         where-clauses (:where query)
         find-vars    (:find query)
-        schema       (:schema db)
+        schema       (dbi/-schema db)
         var->attr (into {}
                         (keep (fn [clause]
                                 (cond
@@ -1017,7 +1017,7 @@
 ;;
 ;; PG-side metadata (`:pg/not-null`, `:pg/check-*`, `:pg/fk-*`,
 ;; `:pg/default-*`, `:pg/array-elem`) is stored on the schema-
-;; attribute entity but does NOT appear in `(:schema db)` — only
+;; attribute entity but does NOT appear in `(dbi/-schema db)` — only
 ;; `:db/valueType` / `:db/cardinality` / `:db/unique` do. A DDL
 ;; that adds NOT NULL to an existing column therefore doesn't change
 ;; schema-map identity, and the identity-keyed cache would return
@@ -1057,7 +1057,7 @@
   [db cache-key produce]
   (if-not *schema-cache-enabled?*
     (produce)
-    (let [schema (:schema db)
+    (let [schema (dbi/-schema db)
           ^java.util.Map outer schema-deriv-cache
           ^java.util.concurrent.ConcurrentHashMap inner
           (or (.get outer schema)
@@ -1086,7 +1086,7 @@
                                     :in [$ ?c]}
                                   db table-name))
         tables-to-check (if parent-table [table-name parent-table] [table-name])
-        schema (:schema db)]
+        schema (dbi/-schema db)]
     (vec (mapcat
           (fn [tbl]
             (let [seq-prefix (str tbl "_")
@@ -1247,7 +1247,7 @@
   [db table-name ns entity-map]
   (let [checks (seq (read-check-constraints db table-name))]
     (when checks
-      (let [schema (:schema db)]
+      (let [schema (dbi/-schema db)]
         (doseq [{:keys [name expr]} checks]
           (let [ast (parse-check-expression expr)
                 val (try
@@ -1344,7 +1344,7 @@
   [db table-name ns entity-maps]
   (let [specs (read-domain-enum-checks db table-name)]
     (when (seq specs)
-      (let [schema (:schema db)]
+      (let [schema (dbi/-schema db)]
         (doseq [em entity-maps
                 [col-name spec] specs
                 :let [attr (:attr spec)
@@ -1836,7 +1836,7 @@
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
         (let [tempids (:tempids tx-report)
               db (:db-after tx-report)
-              schema (:schema db)
+              schema (dbi/-schema db)
               ns-prefix (str table-name "/")
               has-row? (fn [eid]
                          (some (fn [^datahike.datom.Datom d]
@@ -2288,7 +2288,7 @@
    with the db — matches PG's catalog semantics)."
   [conn]
   (let [db (d/db conn)
-        schema (:schema db)
+        schema (dbi/-schema db)
         long1 {:db/valueType :db.type/long :db/cardinality :db.cardinality/one}
         str1  {:db/valueType :db.type/string :db/cardinality :db.cardinality/one}
         bool1 {:db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -2344,7 +2344,7 @@
    column attrs, which may have been ALTER TABLE-added separately."
   [db table-name]
   (let [marker (pgs/row-marker-attr table-name)]
-    (boolean (get (:schema db) marker))))
+    (boolean (get (dbi/-schema db) marker))))
 
 (defn- execute-ddl-in-tx
   "Execute DDL inside a transaction by applying schema changes to the
@@ -3401,7 +3401,7 @@
                                 :where [[?e :pg/table-oid ?oid]
                                         [?e :db/ident ?marker]]}
                               db))
-        schema (:schema db)
+        schema (dbi/-schema db)
         virtual (pgs/derive-virtual-tables schema (pgs/schema-hints db))
         rows (into []
                    (for [[toid anum] pairs
@@ -4467,7 +4467,7 @@
     (try
       (let [table (:table parsed)
             db (d/db conn)
-            db-schema (:schema db)
+            db-schema (dbi/-schema db)
             ;; Find all entity IDs that have at least one attribute in this table's namespace
             ns-prefix (str table "/")
             table-attrs (into []
@@ -5205,7 +5205,7 @@
                       ;;   :handler        — the QueryHandler reify (for re-entrancy)
                       ;;   :sql            — the original SQL string
                       ;;   :db             — speculative or live Datahike db value
-                      ;;   :schema         — (:schema db); cached to avoid repeated reach-in
+                      ;;   :schema         — (dbi/-schema db); cached to avoid repeated reach-in
                       ;;   :on-create-database / :on-delete-database
                       ;;                   — operator-supplied provisioning hooks for SQL
                       ;;                     CREATE/DROP DATABASE; nil → 0A000
@@ -5261,7 +5261,7 @@
                           :delete                (exec-delete ctx parsed)
                           ;; Every DDL exec-* invalidates the per-schema cache.
                           ;; PG metadata (`:pg/not-null` etc.) lives on schema-
-                          ;; attribute entities but not in `(:schema db)`, so
+                          ;; attribute entities but not in `(dbi/-schema db)`, so
                           ;; identity-keyed caches can't detect a constraint
                           ;; add via ALTER TABLE without an explicit bust.
                           :ddl-create            (do (invalidate-schema-cache!)

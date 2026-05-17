@@ -122,3 +122,22 @@
     (let [r (.execute *handler* "SELECT name FROM person ORDER BY name")]
       (is (nil? (err r)))
       (is (= [["Alice"] ["Bob"]] (rows r))))))
+
+;; ============================================================================
+;; Per-statement FOR VALID_TIME (the SELECT-side grammar from sql/temporal.clj)
+
+(deftest for-valid-time-as-of-survives-roundtrip
+  (testing "SELECT ... FOR VALID_TIME AS OF '<inst>' runs without throwing"
+    ;; Regression lock for PG-1: pre-fix, this threw
+    ;; `UnsupportedOperationException: getLookupThunk is not supported on
+    ;; FilteredDB` because compute-schema-oids did (:schema db) on the
+    ;; valid-at-wrapped FilteredDB. Post-fix it uses dbi/-schema.
+    (let [r (.execute *handler*
+                      "SELECT name, age FROM person FOR VALID_TIME AS OF '2024-04-15T00:00:00Z' ORDER BY age")]
+      (is (nil? (err r)))
+      (is (= 2 (count (rows r))))))
+  (testing "SELECT ... FOR VALID_TIME ALL runs without throwing"
+    (let [r (.execute *handler*
+                      "SELECT name FROM person FOR VALID_TIME ALL ORDER BY name")]
+      (is (nil? (err r)))
+      (is (= [["Alice"] ["Bob"]] (rows r))))))
