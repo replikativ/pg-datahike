@@ -27,6 +27,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
+            [datahike.pg.sql.temporal :as sql-temporal]
             [datahike.pg.types :as types]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
@@ -2492,21 +2493,42 @@
    `branch` / `commit-id` are looked up via datahike.versioning's
    branch-as-db / commit-as-db. The input `db` param is the caller's
    starting point (usually `(d/db conn)`); when branch or commit-id is
-   bound, we ignore that and read from the store instead."
-  [db session-state]
-  (let [{:keys [as-of since history branch commit-id valid-at]}
-        @session-state
-        ;; branch / commit-id: route via datahike.versioning at the store
-        ;; level. The conn's current :db is replaced if either is set.
-        base (cond
-               commit-id (versioning/commit-as-db (:store db) commit-id)
-               branch    (versioning/branch-as-db (:store db) branch)
-               :else     db)]
-    (cond-> base
-      history  (d/history)
-      as-of    (d/as-of as-of)
-      since    (d/since since)
-      valid-at (d/valid-at valid-at))))
+   bound, we ignore that and read from the store instead.
+
+   `per-stmt-override` (optional) is a map with the same shape as the
+   relevant session-state keys, set by the SQL preprocessor when a
+   statement carries an inline `FOR VALID_TIME ...` clause. Override
+   values shadow session-state for the duration of this call only;
+   session-state is unmodified. Supported override keys:
+     `:valid-at <Date>`       — single-point pin (equivalent to
+                                a session `SET datahike.valid_at`).
+     `:valid-at :all`         — clear any session-scoped pin
+                                (equivalent to `RESET datahike.valid_at`
+                                for this statement).
+     `:valid-between [a b]`   — interval pin (`d/valid-between`)."
+  ([db session-state]
+   (apply-temporal db session-state nil))
+  ([db session-state per-stmt-override]
+   (let [base-state @session-state
+         ;; Per-statement override shadows session-state. Special case:
+         ;; `:valid-at :all` explicitly clears the marker for this stmt.
+         effective (cond-> base-state
+                     per-stmt-override
+                     (merge per-stmt-override)
+                     (= :all (:valid-at per-stmt-override))
+                     (dissoc :valid-at))
+         {:keys [as-of since history branch commit-id valid-at valid-between]}
+         effective
+         base (cond
+                commit-id (versioning/commit-as-db (:store db) commit-id)
+                branch    (versioning/branch-as-db (:store db) branch)
+                :else     db)]
+     (cond-> base
+       history       (d/history)
+       as-of         (d/as-of as-of)
+       since         (d/since since)
+       valid-at      (d/valid-at valid-at)
+       valid-between (d/valid-between (first valid-between) (second valid-between))))))
 
 (defn- parse-instant
   "Parse a timestamp string to a java.util.Date for temporal queries.
@@ -5116,12 +5138,20 @@
                           (swap! session-state assoc :statement-timeout timeout-ms))
                         (empty-result "SET"))
                     :else
-                    (let [;; FETCH from a cursor binds *snapshot-db* so the
+                    (let [;; SQL:2011 `FOR VALID_TIME …` per-statement
+                          ;; preprocessor: strip the clause and apply its
+                          ;; override to apply-temporal for this query only.
+                          ;; Session-state is untouched. See
+                          ;; `datahike.pg.sql.temporal/preprocess`.
+                          {stripped-sql :sql per-stmt-override :override}
+                          (sql-temporal/preprocess sql)
+                          sql stripped-sql
+                          ;; FETCH from a cursor binds *snapshot-db* so the
                     ;; SELECT sees the state captured at DECLARE, not
                     ;; whatever committed since. Non-cursor paths get
                     ;; the normal live db.
                           real-db (or *snapshot-db*
-                                      (apply-temporal (d/db conn) session-state))
+                                      (apply-temporal (d/db conn) session-state per-stmt-override))
                           db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
                                (or (:speculative-db @tx-state) real-db)
                                real-db)
