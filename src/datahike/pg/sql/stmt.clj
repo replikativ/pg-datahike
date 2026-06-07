@@ -965,6 +965,34 @@
      :alias   target-name
      :aliases sub-aliases}))
 
+(defn- agg-cast-inner
+  "If `expr` is a CAST (or parenthesised CAST) wrapping an aggregate —
+   `count(*)::int4`, `sum(x)::numeric`, an aggregate AnalyticExpression —
+   return that inner aggregate so the select-item dispatch registers it as
+   an aggregate instead of routing the whole CAST through the scalar-
+   expression path (which feeds the aggregate's spec map into the cast
+   coercer → \"cannot coerce PersistentArrayMap to bigint\").
+
+   The wrapping cast's result OID is computed independently by
+   `select-item-oids` (which walks the original CAST via oid-infer), and an
+   integer-width cast over count/sum/min/max doesn't change the value, so
+   dropping the runtime cast here is correct for those. A value-changing
+   cast over an aggregate (e.g. `avg(x)::int` truncation) loses the
+   truncation — acceptable for now, and strictly better than the previous
+   hard error. Returns nil when `expr` is not a cast-over-aggregate."
+  [expr]
+  (letfn [(peel [e]
+            (cond
+              (instance? CastExpression e) (peel (.getLeftExpression ^CastExpression e))
+              (instance? Parenthesis e)    (peel (.getExpression ^Parenthesis e))
+              :else e))]
+    (when (instance? CastExpression expr)
+      (let [i (peel expr)]
+        (when (or (and (instance? Function i)
+                       (fns/aggregate-function? (str/lower-case (.getName ^Function i))))
+                  (instance? net.sf.jsqlparser.expression.AnalyticExpression i))
+          i)))))
+
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
@@ -1139,7 +1167,11 @@
                 nil))))
 
         _ (doseq [^SelectItem item select-items]
-            (let [expr (.getExpression item)
+            (let [raw-expr (.getExpression item)
+                  ;; A CAST over an aggregate (count(*)::int4) dispatches as
+                  ;; the inner aggregate; the cast only re-types the result
+                  ;; (handled by select-item-oids). See agg-cast-inner.
+                  expr (or (agg-cast-inner raw-expr) raw-expr)
                   alias-str (select-item-alias item)]
               (cond
                 ;; SELECT t.* — table-qualified wildcard. JSqlParser
