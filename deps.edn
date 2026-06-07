@@ -2,10 +2,7 @@
 
  :deps
  {org.clojure/clojure               {:mvn/version "1.12.4"}
-  ;; Local datahike checkout while feature/bitemporal-v1 (d/valid-at +
-  ;; search-with-vt routing) is in flight. Revert to :mvn/version once
-  ;; datahike cuts a release with these.
-  org.replikativ/datahike           {:local/root "../datahike-bitemporal-v1"}
+  org.replikativ/datahike           {:mvn/version "0.8.1699"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
   com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}}
 
