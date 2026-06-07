@@ -1,28 +1,44 @@
 (ns datahike.pg.sql.temporal
   "SQL:2011 SELECT-side temporal clause preprocessor.
 
-   Recognises `FOR VALID_TIME <spec>` / `FOR ALL VALID_TIME` clauses
-   on SELECT statements, strips them from the SQL string, and returns
-   a side-channel override map the handler threads into
-   `apply-temporal` for THIS statement only — equivalent to a
-   per-statement `SET datahike.valid_at = …` that auto-resets after
-   the query.
+   Recognises `FOR <AXIS> <spec>` / `FOR ALL <AXIS>` clauses on SELECT
+   statements, strips them from the SQL string, and returns a
+   side-channel override map the handler threads into `apply-temporal`
+   for THIS statement only — equivalent to a per-statement `SET
+   datahike.{valid_at,system_at} = …` that auto-resets after the query.
 
-   Specs supported:
+   Two axes supported:
+
+   VALID_TIME — the application-domain time axis. Routed through
+   `d/valid-at` / `d/valid-between` (vt-aware secondary index when
+   present; predicate fallback otherwise).
      - `FOR VALID_TIME AS OF <expr>`        → {:valid-at <Date>}
      - `FOR VALID_TIME BETWEEN <a> AND <b>` → {:valid-between [a b]}
      - `FOR VALID_TIME FROM <a> TO <b>`     → {:valid-between [a b]}
      - `FOR ALL VALID_TIME` (or `FOR VALID_TIME ALL`) → {:valid-at :all}
 
-   `:valid-at :all` instructs `apply-temporal` to clear any
-   session-scoped marker for the duration of this query — useful when
-   the connection has `SET datahike.valid_at` pinned and a single
-   query wants the full history view.
+   SYSTEM_TIME — the transaction-time axis. Routed through `d/as-of`.
+     - `FOR SYSTEM_TIME AS OF <expr>`       → {:as-of <Date>}
+     - `FOR ALL SYSTEM_TIME` (or `FOR SYSTEM_TIME ALL`) → {:as-of :all}
+   BETWEEN / FROM-TO on SYSTEM_TIME is rejected — datahike's
+   `d/as-of` takes a single time-point; range tx-time reads would
+   need a primitive that doesn't currently exist.
+
+   The two axes compose: `SELECT … FROM t FOR SYSTEM_TIME AS OF '…'
+   FOR VALID_TIME AS OF '…'` produces `{:as-of <Date> :valid-at
+   <Date>}`. `apply-temporal` wraps `d/as-of` first, then tags
+   `:datahike/valid-at` on the result — matching the composition
+   order documented on `d/as-of`.
+
+   `:{valid-at,as-of} :all` instructs `apply-temporal` to clear any
+   session-scoped marker on that axis for the duration of this query
+   — useful when the connection has `SET datahike.{valid_at,as_of}`
+   pinned and a single query wants the unfiltered view.
 
    The preprocessor is char-based (not token-based) because it runs
    BEFORE the main SQL tokenization + rewrite pipeline; it operates
    on the raw SQL string so the downstream parser never sees the
-   non-standard `FOR VALID_TIME` keywords."
+   non-standard `FOR <AXIS>` keywords."
   (:require [clojure.string :as str]))
 
 ;; ===========================================================================
@@ -153,12 +169,12 @@
                           e)))))))
 
 ;; ===========================================================================
-;; FOR VALID_TIME clause finder
+;; FOR <AXIS> clause finder
 ;; ===========================================================================
 
 (defn- skip-non-temporal
-  "Walk past content the FOR VALID_TIME scanner shouldn't peek into:
-   string literals, quoted identifiers, line comments, block comments.
+  "Walk past content the FOR-axis scanner shouldn't peek into: string
+   literals, quoted identifiers, line comments, block comments.
    Returns next index, or `i` if nothing to skip."
   ^long [^String s ^long i]
   (let [n (.length s)
@@ -180,35 +196,40 @@
               :else (recur (inc j))))
       :else i)))
 
-(defn- parse-for-valid-time-spec
+(defn- parse-for-axis-spec
   "At index `start` (positioned at `FOR`), try to recognise a `FOR
-   VALID_TIME <spec>` or `FOR ALL VALID_TIME` clause. Returns
-   `[end-index spec]` on success — `end-index` is just past the spec,
-   `spec` is one of `{:kind :all}`, `{:kind :as-of :at <expr>}`,
+   <AXIS> <spec>` or `FOR ALL <AXIS>` clause for the given `axis`
+   (`\"valid_time\"` or `\"system_time\"`). Returns `[end-index spec]`
+   on success — `end-index` is just past the spec, `spec` is one of
+   `{:kind :all}`, `{:kind :as-of :at <expr>}`,
    `{:kind :between :from <expr> :to <expr>}`, or
    `{:kind :from-to :from <expr> :to <expr>}` — or `nil` if the
-   sequence at `start` is not a recognised temporal clause."
-  [^String sql ^long start]
+   sequence at `start` is not a recognised temporal clause.
+
+   The parser is grammar-only; the caller decides which kinds are
+   semantically meaningful for the axis (SYSTEM_TIME accepts only
+   `:all` and `:as-of`)."
+  [^String sql ^long start ^String axis]
   (let [[wend* w1] (read-word sql start)]
     (when (= w1 "for")
       (let [[k1end* k1] (next-keyword sql (long wend*))
             k1end (long k1end*)]
         (cond
-          ;; FOR ALL VALID_TIME
+          ;; FOR ALL <AXIS>
           (= k1 "all")
           (let [[k2end* k2] (next-keyword sql k1end)]
-            (when (= k2 "valid_time")
+            (when (= k2 axis)
               [(long k2end*) {:kind :all}]))
 
-          ;; FOR VALID_TIME <spec>
-          (= k1 "valid_time")
+          ;; FOR <AXIS> <spec>
+          (= k1 axis)
           (let [[k2end* k2] (next-keyword sql k1end)
                 k2end (long k2end*)]
             (cond
-              ;; FOR VALID_TIME ALL
+              ;; FOR <AXIS> ALL
               (= k2 "all") [k2end {:kind :all}]
 
-              ;; FOR VALID_TIME AS OF <expr>
+              ;; FOR <AXIS> AS OF <expr>
               (= k2 "as")
               (let [[ofend* of] (next-keyword sql k2end)]
                 (when (= of "of")
@@ -216,7 +237,7 @@
                         expr (str/trim (subs sql (long ofend*) end))]
                     [end {:kind :as-of :at (parse-temporal-literal expr)}])))
 
-              ;; FOR VALID_TIME BETWEEN <a> AND <b>
+              ;; FOR <AXIS> BETWEEN <a> AND <b>
               (= k2 "between")
               (let [from-end (long (find-balanced-end sql k2end #{"and"}))
                     from-expr (subs sql k2end from-end)
@@ -228,7 +249,7 @@
                          :from (parse-temporal-literal from-expr)
                          :to   (parse-temporal-literal to-expr)}])
 
-              ;; FOR VALID_TIME FROM <a> TO <b>
+              ;; FOR <AXIS> FROM <a> TO <b>
               (= k2 "from")
               (let [from-end (long (find-balanced-end sql k2end #{"to"}))
                     from-expr (subs sql k2end from-end)
@@ -242,13 +263,38 @@
 
               :else nil)))))))
 
-(defn- find-for-valid-time
-  "Scan `sql` from the start for the next `FOR VALID_TIME …` or `FOR
-   ALL VALID_TIME` clause. Returns `[start end spec]` on first match
-   or `nil` if none found. `start` is the position of the `FOR`
+(defn- parse-for-valid-time-spec [^String sql ^long start]
+  (parse-for-axis-spec sql start "valid_time"))
+
+(defn- parse-for-system-time-spec
+  "SYSTEM_TIME axis: only `AS OF` and `ALL` are supported. Datahike's
+   `d/as-of` takes a single time-point; range tx-time reads would
+   need a primitive that doesn't currently exist. We reject
+   `BETWEEN` / `FROM-TO` at preprocess time with a clear error so
+   the failure points at the SQL clause rather than at a downstream
+   adapter."
+  [^String sql ^long start]
+  (when-let [[end spec] (parse-for-axis-spec sql start "system_time")]
+    (when (contains? #{:between :from-to} (:kind spec))
+      (throw (ex-info (str "FOR SYSTEM_TIME "
+                           (str/upper-case (str/replace (name (:kind spec)) #"-" " "))
+                           " is not yet supported. Datahike's `d/as-of` "
+                           "takes a single time-point; range tx-time reads "
+                           "would need a range primitive that does not "
+                           "currently exist. Use `FOR SYSTEM_TIME AS OF "
+                           "<single-point>` or split into separate queries.")
+                      {:error :sql/system-time-range-unsupported
+                       :kind (:kind spec)})))
+    [end spec]))
+
+(defn- find-for-axis
+  "Scan `sql` from the start for the next clause matched by `parse-fn`.
+   `parse-fn` is one of `parse-for-valid-time-spec` /
+   `parse-for-system-time-spec`. Returns `[start end spec]` on first
+   match or `nil` if none found. `start` is the position of the `FOR`
    keyword; `end` is just past the spec; `spec` is the parsed-spec
    map."
-  [^String sql]
+  [^String sql parse-fn]
   (let [n (.length sql)]
     (loop [i 0]
       (cond
@@ -261,40 +307,79 @@
               (and (or (Character/isLetter (.charAt sql i)) (= \_ (.charAt sql i)))
                    ;; Word-boundary on the left
                    (or (zero? i) (not (word-char? (.charAt sql (dec i))))))
-              (if-let [[end spec] (parse-for-valid-time-spec sql i)]
+              (if-let [[end spec] (parse-fn sql i)]
                 [i end spec]
                 (let [[wend _] (read-word sql i)]
                   (recur (long wend))))
               :else (recur (inc i)))))))))
 
+(defn- find-for-valid-time [^String sql]
+  (find-for-axis sql parse-for-valid-time-spec))
+
+(defn- find-for-system-time [^String sql]
+  (find-for-axis sql parse-for-system-time-spec))
+
 ;; ===========================================================================
 ;; Public preprocessor
 ;; ===========================================================================
 
-(defn preprocess
-  "Strip every `FOR VALID_TIME <spec>` / `FOR ALL VALID_TIME` clause
-   from `sql`. Returns `{:sql <stripped-sql> :override <map-or-nil>}`.
-
-   The override map shape:
-     `{:valid-at <Date>}`                — single AS OF
-     `{:valid-between [<Date> <Date>]}`  — single BETWEEN or FROM-TO
-     `{:valid-at :all}`                  — explicit `FOR ALL` (clears
-                                           any session-scoped pin for
-                                           this statement)
-     `nil`                                — no clause present
-
-   Multiple FOR VALID_TIME clauses in one SELECT (one per joined
-   table) is rejected at preprocess time — without qualifier-aware
-   column resolution the resulting predicates would be ambiguous.
-   Use explicit per-column predicates with `<table>.col` qualifiers
-   for the multi-table case."
-  [^String sql]
+(defn- strip-axis
+  "Strip every `FOR <AXIS> <spec>` clause matched by `find-fn` from
+   `sql`. Returns `{:sql <stripped-sql> :spec <spec-or-nil>}`. At
+   most one clause per axis is allowed (multi-table reads with one
+   clause per joined table are ambiguous without qualifier-aware
+   resolution); a second match throws `axis-err-data`."
+  [^String sql find-fn axis-err-data]
   (loop [sql sql, specs []]
-    (if-let [[start end spec] (find-for-valid-time sql)]
+    (if-let [[start end spec] (find-fn sql)]
       (do
         (when (seq specs)
-          ;; A second clause is a hard error — see docstring.
-          (throw (ex-info (str "Multi-table SELECT with more than one "
+          (throw (ex-info (:msg axis-err-data) (dissoc axis-err-data :msg))))
+        (recur (str (subs sql 0 start) " " (subs sql end))
+               (conj specs spec)))
+      {:sql sql :spec (first specs)})))
+
+(defn- valid-time-override [spec]
+  (case (:kind spec)
+    nil      nil
+    :all     {:valid-at :all}
+    :as-of   {:valid-at (:at spec)}
+    :between {:valid-between [(:from spec) (:to spec)]}
+    :from-to {:valid-between [(:from spec) (:to spec)]}))
+
+(defn- system-time-override [spec]
+  (case (:kind spec)
+    nil    nil
+    :all   {:as-of :all}
+    :as-of {:as-of (:at spec)}))
+
+(defn preprocess
+  "Strip every `FOR VALID_TIME` / `FOR SYSTEM_TIME` clause from `sql`.
+   Returns `{:sql <stripped-sql> :override <map-or-nil>}`.
+
+   The override map can carry any combination of:
+     `:valid-at <Date>`                — VALID_TIME AS OF
+     `:valid-between [<Date> <Date>]`  — VALID_TIME BETWEEN / FROM-TO
+     `:valid-at :all`                  — FOR ALL VALID_TIME (clears any
+                                         session-scoped pin for this stmt)
+     `:as-of   <Date>`                 — SYSTEM_TIME AS OF
+     `:as-of :all`                     — FOR ALL SYSTEM_TIME
+
+   `nil` when no clause is present.
+
+   Multiple FOR-clauses on the SAME axis (e.g. two `FOR VALID_TIME`s
+   for two joined tables) is rejected — the per-statement override
+   applies one pin to the whole query. Use explicit per-column
+   predicates (`<table>._valid_from`/`._valid_to`) for the
+   multi-table case, or split into separate queries.
+
+   Mixing the two axes in one statement is supported: `FOR
+   SYSTEM_TIME AS OF '…' FOR VALID_TIME AS OF '…'` produces
+   `{:as-of <Date> :valid-at <Date>}`."
+  [^String sql]
+  (let [{vt-sql :sql vt-spec :spec}
+        (strip-axis sql find-for-valid-time
+                    {:msg (str "Multi-table SELECT with more than one "
                                "FOR VALID_TIME clause is not yet supported "
                                "— the per-statement override applies one "
                                "valid-time pin to the whole query. Use "
@@ -302,14 +387,16 @@
                                "(`<table>._valid_from`/`._valid_to`) for "
                                "the multi-table case, or split into "
                                "separate queries.")
-                          {:error :sql/multi-for-valid-time-unsupported})))
-        (recur (str (subs sql 0 start) " " (subs sql end))
-               (conj specs spec)))
-      (let [spec (first specs)
-            override (case (:kind spec)
-                       nil       nil
-                       :all      {:valid-at :all}
-                       :as-of    {:valid-at (:at spec)}
-                       :between  {:valid-between [(:from spec) (:to spec)]}
-                       :from-to  {:valid-between [(:from spec) (:to spec)]})]
-        {:sql sql :override override}))))
+                     :error :sql/multi-for-valid-time-unsupported})
+        {st-sql :sql st-spec :spec}
+        (strip-axis vt-sql find-for-system-time
+                    {:msg (str "More than one FOR SYSTEM_TIME clause in "
+                               "one statement is not supported — pin "
+                               "tx-time once per query. Use a session-"
+                               "level `SET datahike.as_of` or split into "
+                               "separate queries.")
+                     :error :sql/multi-for-system-time-unsupported})
+        override (not-empty
+                  (merge (valid-time-override vt-spec)
+                         (system-time-override st-spec)))]
+    {:sql st-sql :override override}))

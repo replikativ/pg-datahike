@@ -2408,12 +2408,15 @@
 ;; ============================================================================
 
 (defn- parse-temporal-set
-  "Parse `SET datahike.{as_of,since,history,branch,commit_id,valid_at,
-   valid_from,valid_to} = '…'` and their RESET forms. Returns [key value]
-   where key is :as-of | :since | :history | :branch | :commit-id |
-   :valid-at | :valid-from | :valid-to and value is the string (or nil
-   for reset/clear), or nil if the SQL isn't a recognized session-var
-   op.
+  "Parse `SET datahike.{as_of,system_at,since,history,branch,commit_id,
+   valid_at,valid_from,valid_to} = '…'` and their RESET forms. Returns
+   [key value] where key is :as-of | :since | :history | :branch |
+   :commit-id | :valid-at | :valid-from | :valid-to and value is the
+   string (or nil for reset/clear), or nil if the SQL isn't a
+   recognized session-var op.
+
+   `datahike.system_at` is a SQL:2011-compliant alias for
+   `datahike.as_of` — both pin tx-time via `d/as-of`.
 
    Implemented on top of datahike.pg.sql.classify — the classifier gives
    us {:kind :set :var \"…\" :value \"…\"} or {:kind :reset :var \"…\"}
@@ -2422,6 +2425,7 @@
   (let [{:keys [kind var value]} (cls/classify sql)
         key (case var
               "datahike.as_of"      :as-of
+              "datahike.system_at"  :as-of
               "datahike.since"      :since
               "datahike.history"    :history
               "datahike.branch"     :branch
@@ -2497,26 +2501,35 @@
 
    `per-stmt-override` (optional) is a map with the same shape as the
    relevant session-state keys, set by the SQL preprocessor when a
-   statement carries an inline `FOR VALID_TIME ...` clause. Override
-   values shadow session-state for the duration of this call only;
-   session-state is unmodified. Supported override keys:
+   statement carries an inline `FOR VALID_TIME …` or `FOR SYSTEM_TIME …`
+   clause. Override values shadow session-state for the duration of
+   this call only; session-state is unmodified. Supported override
+   keys:
      `:valid-at <Date>`       — single-point pin (equivalent to
                                 a session `SET datahike.valid_at`).
      `:valid-at :all`         — clear any session-scoped pin
                                 (equivalent to `RESET datahike.valid_at`
                                 for this statement).
-     `:valid-between [a b]`   — interval pin (`d/valid-between`)."
+     `:valid-between [a b]`   — interval pin (`d/valid-between`).
+     `:as-of <Date>`          — tx-time pin (equivalent to a session
+                                `SET datahike.as_of` / `system_at`).
+     `:as-of :all`            — clear any session-scoped as-of
+                                (equivalent to `RESET datahike.as_of`
+                                for this statement)."
   ([db session-state]
    (apply-temporal db session-state nil))
   ([db session-state per-stmt-override]
    (let [base-state @session-state
          ;; Per-statement override shadows session-state. Special case:
-         ;; `:valid-at :all` explicitly clears the marker for this stmt.
+         ;; `:{valid-at,as-of} :all` explicitly clears the marker for
+         ;; this stmt.
          effective (cond-> base-state
                      per-stmt-override
                      (merge per-stmt-override)
                      (= :all (:valid-at per-stmt-override))
-                     (dissoc :valid-at))
+                     (dissoc :valid-at)
+                     (= :all (:as-of per-stmt-override))
+                     (dissoc :as-of))
          {:keys [as-of since history branch commit-id valid-at valid-between]}
          effective
          base (cond
