@@ -40,9 +40,9 @@
 (deftest parse-temporal-literal-rejects-garbage
   (testing "Unparseable input throws :sql/bad-temporal-literal"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"Cannot parse temporal literal"
-          (temporal/parse-temporal-literal "'not-a-date'")))))
+         clojure.lang.ExceptionInfo
+         #"Cannot parse temporal literal"
+         (temporal/parse-temporal-literal "'not-a-date'")))))
 
 ;; ===========================================================================
 ;; SELECT-side FOR VALID_TIME preprocessor
@@ -59,7 +59,7 @@
   (testing "AS OF clause stripped + override carries the parsed Date"
     (let [{:keys [sql override]}
           (temporal/preprocess
-            "SELECT * FROM person FOR VALID_TIME AS OF '2024-04-15' WHERE name = 'Bob'")]
+           "SELECT * FROM person FOR VALID_TIME AS OF '2024-04-15' WHERE name = 'Bob'")]
       (testing "FOR VALID_TIME stripped from SQL"
         (is (re-find #"^SELECT \* FROM person\s+WHERE name = 'Bob'$" sql))
         (is (not (re-find #"(?i)FOR\s+VALID_TIME" sql))))
@@ -72,7 +72,7 @@
   (testing "BETWEEN clause → :valid-between [from to]"
     (let [{:keys [override]}
           (temporal/preprocess
-            "SELECT * FROM person FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-12-31'")]
+           "SELECT * FROM person FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-12-31'")]
       (is (contains? override :valid-between))
       (let [[from to] (:valid-between override)]
         (is (instance? Date from))
@@ -84,7 +84,7 @@
   (testing "FROM x TO y → :valid-between [from to]"
     (let [{:keys [override]}
           (temporal/preprocess
-            "SELECT * FROM person FOR VALID_TIME FROM '2024-01-01' TO '2024-12-31'")]
+           "SELECT * FROM person FOR VALID_TIME FROM '2024-01-01' TO '2024-12-31'")]
       (is (contains? override :valid-between))
       (let [[from to] (:valid-between override)]
         (is (= 1704067200000 (.getTime ^Date from)))
@@ -107,7 +107,7 @@
   (testing "FOR VALID_TIME extracted when followed by WHERE"
     (let [{:keys [sql override]}
           (temporal/preprocess
-            "SELECT name FROM person FOR VALID_TIME AS OF '2024-04-15' WHERE age > 25")]
+           "SELECT name FROM person FOR VALID_TIME AS OF '2024-04-15' WHERE age > 25")]
       (is (re-find #"WHERE age > 25" sql))
       (is (not (re-find #"(?i)FOR\s+VALID_TIME" sql)))
       (is (instance? Date (:valid-at override))))))
@@ -116,24 +116,24 @@
   (testing "FOR VALID_TIME extracted when followed by ORDER BY"
     (let [{:keys [sql override]}
           (temporal/preprocess
-            "SELECT name FROM person FOR VALID_TIME AS OF '2024-04-15' ORDER BY name")]
+           "SELECT name FROM person FOR VALID_TIME AS OF '2024-04-15' ORDER BY name")]
       (is (re-find #"ORDER BY name" sql))
       (is (instance? Date (:valid-at override))))))
 
 (deftest preprocess-rejects-multi-clause
   (testing "Two FOR VALID_TIME clauses on a joined SELECT → throws"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"Multi-table SELECT with more than one FOR VALID_TIME"
-          (temporal/preprocess
-            (str "SELECT a.id, b.id FROM a FOR VALID_TIME AS OF '2024-04-15' "
-                 "JOIN b FOR VALID_TIME AS OF '2024-04-15' ON a.id = b.id"))))))
+         clojure.lang.ExceptionInfo
+         #"Multi-table SELECT with more than one FOR VALID_TIME"
+         (temporal/preprocess
+          (str "SELECT a.id, b.id FROM a FOR VALID_TIME AS OF '2024-04-15' "
+               "JOIN b FOR VALID_TIME AS OF '2024-04-15' ON a.id = b.id"))))))
 
 (deftest preprocess-ignores-clause-inside-string-literal
   (testing "FOR VALID_TIME inside a string literal is NOT stripped"
     (let [{:keys [sql override]}
           (temporal/preprocess
-            "SELECT * FROM person WHERE comment = 'FOR VALID_TIME AS OF X'")]
+           "SELECT * FROM person WHERE comment = 'FOR VALID_TIME AS OF X'")]
       (is (= "SELECT * FROM person WHERE comment = 'FOR VALID_TIME AS OF X'" sql))
       (is (nil? override)))))
 
@@ -141,14 +141,14 @@
   (testing "Numeric epoch-millis as a temporal bound parses"
     (let [{:keys [override]}
           (temporal/preprocess
-            "SELECT * FROM person FOR VALID_TIME AS OF 1713139200000")]
+           "SELECT * FROM person FOR VALID_TIME AS OF 1713139200000")]
       (is (= 1713139200000 (.getTime ^Date (:valid-at override)))))))
 
 (deftest preprocess-allows-max-value-sentinel
   (testing "MAX_VALUE / MIN_VALUE sentinels in BETWEEN"
     (let [{:keys [override]}
           (temporal/preprocess
-            "SELECT * FROM person FOR VALID_TIME BETWEEN MIN_VALUE AND MAX_VALUE")]
+           "SELECT * FROM person FOR VALID_TIME BETWEEN MIN_VALUE AND MAX_VALUE")]
       (is (= [Long/MIN_VALUE Long/MAX_VALUE] (:valid-between override))))))
 
 ;; ===========================================================================
@@ -242,7 +242,7 @@
   (testing "preprocess output threads cleanly into apply-temporal"
     (let [{:keys [sql override]}
           (temporal/preprocess
-            "SELECT * FROM person FOR VALID_TIME AS OF '2024-04-15' WHERE name = 'Bob'")
+           "SELECT * FROM person FOR VALID_TIME AS OF '2024-04-15' WHERE name = 'Bob'")
           session (atom {})
           db (@apply-temporal (d/db *db-conn*) session override)]
       (is (not (re-find #"(?i)FOR\s+VALID_TIME" sql))
