@@ -1233,6 +1233,35 @@ public final class PgWireServer {
                 break;
             }
 
+            // Read-after-write within a multi-statement Simple Query. PG
+            // runs the batch as one implicit transaction where each
+            // statement sees the effects of those before it. Our INSERTs
+            // are deferred into `batch` for commit-coalescing, so a
+            // following reader (SELECT / UPDATE / DELETE / DDL) executed
+            // here would otherwise read a (d/db conn) snapshot predating
+            // them — the post-execute flush below happens too late. Flush
+            // the pending batch BEFORE executing any non-INSERT statement
+            // so its snapshot includes those rows. Consecutive bare
+            // INSERTs (the bulk-load fast path) keep batching. (An
+            // INSERT…SELECT that reads a just-batched table is the one
+            // residual gap — it starts with "insert" so isn't pre-flushed;
+            // rare in a multi-statement batch.)
+            if (!batch.isEmpty()) {
+                String head = stmt.stripLeading();
+                head = head.substring(0, Math.min(6, head.length())).toLowerCase();
+                if (!head.startsWith("insert")) {
+                    QueryResult preFlushErr = flushBatch(out, handler, batch);
+                    if (preFlushErr != null) {
+                        sendError(out, "ERROR",
+                                preFlushErr.sqlstate != null ? preFlushErr.sqlstate : "XX000",
+                                preFlushErr.error, preFlushErr.errorFields);
+                        if (txStatus[0] == 'T') txStatus[0] = 'E';
+                        errored = true;
+                        break;
+                    }
+                }
+            }
+
             try {
                 QueryResult result = handler.execute(stmt);
                 // Clear any pending interrupt bit left by the safety-net
