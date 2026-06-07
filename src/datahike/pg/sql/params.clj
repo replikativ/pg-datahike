@@ -31,7 +31,9 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            CastExpression JdbcParameter Parenthesis NotExpression]
+            CastExpression JdbcParameter Parenthesis NotExpression
+            LongValue StringValue DoubleValue DateValue TimestampValue
+            SignedExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between InExpression ExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
@@ -529,6 +531,20 @@
                            (let [[tns cn] (col-ns-name c)]
                              (when-let [oid (infer-param-oid-for-column schema tns cn)]
                                (.put result (.getIndex p) oid))))
+           ;; OID of a literal comparand, so `? OP <literal>` (e.g.
+           ;; `$1 = 1`, with no column to borrow a type from) still
+           ;; resolves the param's type. SignedExpression wraps a
+           ;; negative numeric literal (`-1` → SignedExpression[LongValue]).
+           literal-oid (fn literal-oid [n]
+                         (cond
+                           (instance? SignedExpression n)
+                           (recur (.getExpression ^SignedExpression n))
+                           (instance? LongValue n)      types/oid-int8
+                           (instance? DoubleValue n)    types/oid-float8
+                           (instance? StringValue n)    types/oid-text
+                           (instance? DateValue n)      types/oid-date
+                           (instance? TimestampValue n) types/oid-timestamp
+                           :else nil))
            ;; Strip CAST/Parenthesis wrappers so we can see the
            ;; Column / JdbcParameter inside. Returns the inner node.
            unwrap (fn unwrap [n]
@@ -560,11 +576,17 @@
                        (get types/elem-kw->oid kw))))))
            ;; Bind a param against (a) an explicit cast target on its
            ;; own side, or (b) the comparand column on the other side.
-           bind-param! (fn [^JdbcParameter p side-with-cast comparand-col]
+           bind-param! (fn [^JdbcParameter p side-with-cast comparand]
                          (if-let [oid (cast-target-oid side-with-cast)]
                            (.put result (.getIndex p) oid)
-                           (when (instance? Column comparand-col)
-                             (record-param! p ^Column comparand-col))))
+                           (cond
+                             (instance? Column comparand)
+                             (record-param! p ^Column comparand)
+                             ;; `? OP <literal>` — borrow the literal's type
+                             ;; when there's no column comparand.
+                             :else
+                             (when-let [oid (literal-oid comparand)]
+                               (.put result (.getIndex p) oid)))))
            walk (fn walk [n]
                   (cond
                     (nil? n) nil
@@ -581,11 +603,14 @@
                                 r (.getRightExpression
                                    ^net.sf.jsqlparser.expression.operators.relational.ComparisonOperator n)
                                 lb (unwrap l) rb (unwrap r)]
+                            ;; Fire whenever a side is a parameter — the
+                            ;; comparand may be a Column (borrow its type)
+                            ;; or a literal (`$1 = 1`; borrow the literal's
+                            ;; type). bind-param! also honors a CAST on the
+                            ;; param's own side first.
                             (cond
-                              (and (instance? Column lb) (instance? JdbcParameter rb))
-                              (bind-param! rb r lb)
-                              (and (instance? Column rb) (instance? JdbcParameter lb))
-                              (bind-param! lb l rb))
+                              (instance? JdbcParameter lb) (bind-param! lb l rb)
+                              (instance? JdbcParameter rb) (bind-param! rb r lb))
                             (walk l) (walk r))
 
                          ;; col IN (?, ?, ...) — RHS items may also be

@@ -1561,7 +1561,30 @@ public final class PgWireServer {
         // a PreparedStmt with parsed=null and emit EmptyQueryResponse
         // at Execute time.
         Object parsed = query.isEmpty() ? null : handler.parse(query, paramOids);
-        statements.put(stmtName, new PreparedStmt(query, paramOids, parsed));
+
+        // Resolve parameter types the way PostgreSQL does at Parse time:
+        // the client may declare some/none, and the server infers the rest
+        // from context (INSERT column, WHERE comparand, CAST target — see
+        // datahike.pg.sql.params). A client-declared non-zero OID always
+        // wins; we only fill the 0 ("unknown") slots with the inferred
+        // type. This must happen here, not just in describeParams, so Bind
+        // decodes untyped text parameters to the right runtime type even
+        // when the client never sends Describe (node-postgres binds text
+        // params with zero declared types and skips ParameterDescription).
+        int[] effectiveOids = paramOids;
+        if (parsed != null) {
+            int[] inferred = handler.describeParams(parsed);
+            if (inferred != null && inferred.length > 0) {
+                int n = Math.max(paramOids.length, inferred.length);
+                effectiveOids = new int[n];
+                for (int i = 0; i < n; i++) {
+                    int declared = (i < paramOids.length) ? paramOids[i] : 0;
+                    int inf = (i < inferred.length) ? inferred[i] : 0;
+                    effectiveOids[i] = (declared != 0) ? declared : inf;
+                }
+            }
+        }
+        statements.put(stmtName, new PreparedStmt(query, effectiveOids, parsed));
 
         out.writeByte('1'); // ParseComplete
         out.writeInt(4);
