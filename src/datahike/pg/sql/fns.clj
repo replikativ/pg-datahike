@@ -35,6 +35,7 @@
    clients."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.types :as types]))
 
@@ -272,7 +273,7 @@
         ;; Element type from the target PK attr's :db/valueType, NOT
         ;; from the first sample value (which would mistype an empty
         ;; array as :text). Defaults to :int8 — most FK PKs are bigint.
-        schema (:schema db)
+        schema (dbi/-schema db)
         target-vtype (get-in schema [target-pk-attr :db/valueType])
         elem-type (case target-vtype
                     :db.type/long    :int8
@@ -673,4 +674,30 @@
    "pg_get_replica_identity_index" pg-get-replica-identity-index
    "pg_get_replica_identity"       pg-get-replica-identity
    "format_type"          pg-format-type
-   "pg_get_expr"          pg-get-expr})
+   "pg_get_expr"          pg-get-expr
+
+   ;; --- SQL:2011 Allen interval predicates ------------------------------
+   ;;
+   ;; 4-arg pure functions on half-open intervals `[from, to)`. Two
+   ;; intervals are compared by their endpoints (longs or longs-encoded
+   ;; instants). The 10 verbs cover the full Allen relation set plus
+   ;; the SQL:2011-style boundary distinctions (`STRICTLY_*` excludes
+   ;; touching boundaries; `IMMEDIATELY_*` requires exact touch).
+   ;;
+   ;; Signature: `(fn [a-from a-to b-from b-to] boolean)`
+   ;; All endpoints must be the same orderable type; the planner does
+   ;; not coerce. Usage:
+   ;;   SELECT * FROM events
+   ;;     WHERE OVERLAPS(a_start, a_end, b_start, b_end);
+   "overlaps"               (fn [af at bf bt] (and (< af bt) (< bf at)))
+   "equals_period"          (fn [af at bf bt] (and (= af bf) (= at bt)))
+   "contains_period"        (fn [af at bf bt] (and (<= af bf) (>= at bt)))
+   "strictly_contains_period" (fn [af at bf bt] (and (< af bf) (> at bt)))
+   "precedes"               (fn [af at bf _bt] (<= at bf))
+   "strictly_precedes"      (fn [af at bf _bt] (< at bf))
+   "immediately_precedes"   (fn [_af at bf _bt] (= at bf))
+   "succeeds"               (fn [af _at _bf bt] (>= af bt))
+   "strictly_succeeds"      (fn [af _at _bf bt] (> af bt))
+   "immediately_succeeds"   (fn [af _at _bf bt] (= af bt))
+   ;; MEETS is the standard alias for IMMEDIATELY_PRECEDES (A.end == B.start)
+   "meets"                  (fn [_af at bf _bt] (= at bf))})

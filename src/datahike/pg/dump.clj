@@ -68,6 +68,7 @@
      (dump conn {:exclude-tables #{\"x\"}})  ; skip these table namespaces"
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.schema :as pgs]))
 
 ;; ----------------------------------------------------------------------------
@@ -123,7 +124,7 @@
    attributes. They aren't actual SQL columns; emitting them would
    produce a phantom `<table>_pkey` column on the target."
   [db]
-  (let [schema (:schema db)
+  (let [schema (dbi/-schema db)
         by-ns (->> schema
                    keys
                    (filter keyword?)
@@ -387,7 +388,7 @@
    schema."
   [db table cols]
   (let [marker-attr (keyword table "db-row-exists")
-        marker-present? (contains? (:schema db) marker-attr)
+        marker-present? (contains? (dbi/-schema db) marker-attr)
         col-idents (mapv :ident cols)
         eids (if marker-present?
                (mapv first

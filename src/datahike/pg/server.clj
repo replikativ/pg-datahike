@@ -27,6 +27,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
+            [datahike.pg.sql.temporal :as sql-temporal]
             [datahike.pg.types :as types]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
@@ -412,7 +413,7 @@
     (let [aliases (:find-aliases parsed)
           find-vars (:find (:query parsed))
           var->attr (find-var->attr parsed)
-          schema (:schema db)
+          schema (dbi/-schema db)
           ;; Bulk-fetch typmods for the schema attrs we'll need; falls
           ;; back to -1 per column when the attr has none. One Datalog
           ;; query per RowDescription emission instead of N point lookups.
@@ -461,7 +462,7 @@
         query        (:query parsed)
         where-clauses (:where query)
         find-vars    (:find query)
-        schema       (:schema db)
+        schema       (dbi/-schema db)
         var->attr (into {}
                         (keep (fn [clause]
                                 (cond
@@ -1016,7 +1017,7 @@
 ;;
 ;; PG-side metadata (`:pg/not-null`, `:pg/check-*`, `:pg/fk-*`,
 ;; `:pg/default-*`, `:pg/array-elem`) is stored on the schema-
-;; attribute entity but does NOT appear in `(:schema db)` — only
+;; attribute entity but does NOT appear in `(dbi/-schema db)` — only
 ;; `:db/valueType` / `:db/cardinality` / `:db/unique` do. A DDL
 ;; that adds NOT NULL to an existing column therefore doesn't change
 ;; schema-map identity, and the identity-keyed cache would return
@@ -1056,7 +1057,7 @@
   [db cache-key produce]
   (if-not *schema-cache-enabled?*
     (produce)
-    (let [schema (:schema db)
+    (let [schema (dbi/-schema db)
           ^java.util.Map outer schema-deriv-cache
           ^java.util.concurrent.ConcurrentHashMap inner
           (or (.get outer schema)
@@ -1085,7 +1086,7 @@
                                     :in [$ ?c]}
                                   db table-name))
         tables-to-check (if parent-table [table-name parent-table] [table-name])
-        schema (:schema db)]
+        schema (dbi/-schema db)]
     (vec (mapcat
           (fn [tbl]
             (let [seq-prefix (str tbl "_")
@@ -1246,7 +1247,7 @@
   [db table-name ns entity-map]
   (let [checks (seq (read-check-constraints db table-name))]
     (when checks
-      (let [schema (:schema db)]
+      (let [schema (dbi/-schema db)]
         (doseq [{:keys [name expr]} checks]
           (let [ast (parse-check-expression expr)
                 val (try
@@ -1343,7 +1344,7 @@
   [db table-name ns entity-maps]
   (let [specs (read-domain-enum-checks db table-name)]
     (when (seq specs)
-      (let [schema (:schema db)]
+      (let [schema (dbi/-schema db)]
         (doseq [em entity-maps
                 [col-name spec] specs
                 :let [attr (:attr spec)
@@ -1835,7 +1836,7 @@
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
         (let [tempids (:tempids tx-report)
               db (:db-after tx-report)
-              schema (:schema db)
+              schema (dbi/-schema db)
               ns-prefix (str table-name "/")
               has-row? (fn [eid]
                          (some (fn [^datahike.datom.Datom d]
@@ -2287,7 +2288,7 @@
    with the db — matches PG's catalog semantics)."
   [conn]
   (let [db (d/db conn)
-        schema (:schema db)
+        schema (dbi/-schema db)
         long1 {:db/valueType :db.type/long :db/cardinality :db.cardinality/one}
         str1  {:db/valueType :db.type/string :db/cardinality :db.cardinality/one}
         bool1 {:db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -2343,7 +2344,7 @@
    column attrs, which may have been ALTER TABLE-added separately."
   [db table-name]
   (let [marker (pgs/row-marker-attr table-name)]
-    (boolean (get (:schema db) marker))))
+    (boolean (get (dbi/-schema db) marker))))
 
 (defn- execute-ddl-in-tx
   "Execute DDL inside a transaction by applying schema changes to the
@@ -2407,10 +2408,15 @@
 ;; ============================================================================
 
 (defn- parse-temporal-set
-  "Parse `SET datahike.{as_of,since,history,branch,commit_id} = '…'` and
-   their RESET forms. Returns [key value] where key is :as-of | :since |
-   :history | :branch | :commit-id and value is the string (or nil for
-   reset/clear), or nil if the SQL isn't a recognized session-var op.
+  "Parse `SET datahike.{as_of,system_at,since,history,branch,commit_id,
+   valid_at,valid_from,valid_to} = '…'` and their RESET forms. Returns
+   [key value] where key is :as-of | :since | :history | :branch |
+   :commit-id | :valid-at | :valid-from | :valid-to and value is the
+   string (or nil for reset/clear), or nil if the SQL isn't a
+   recognized session-var op.
+
+   `datahike.system_at` is a SQL:2011-compliant alias for
+   `datahike.as_of` — both pin tx-time via `d/as-of`.
 
    Implemented on top of datahike.pg.sql.classify — the classifier gives
    us {:kind :set :var \"…\" :value \"…\"} or {:kind :reset :var \"…\"}
@@ -2418,11 +2424,15 @@
   [^String sql]
   (let [{:keys [kind var value]} (cls/classify sql)
         key (case var
-              "datahike.as_of"     :as-of
-              "datahike.since"     :since
-              "datahike.history"   :history
-              "datahike.branch"    :branch
-              "datahike.commit_id" :commit-id
+              "datahike.as_of"      :as-of
+              "datahike.system_at"  :as-of
+              "datahike.since"      :since
+              "datahike.history"    :history
+              "datahike.branch"     :branch
+              "datahike.commit_id"  :commit-id
+              "datahike.valid_at"   :valid-at
+              "datahike.valid_from" :valid-from
+              "datahike.valid_to"   :valid-to
               nil)]
     (cond
       (nil? key) nil
@@ -2478,22 +2488,60 @@
    a client can, e.g., `SET datahike.branch = 'feature'` and then
    `SET datahike.as_of = '…'` to view that branch at a past point.
 
+   `valid-at` is a separate (valid-time) axis routed through vt-aware
+   secondary indices. It's composable with the tx-time axes — e.g.,
+   `SET datahike.as_of = ... ; SET datahike.valid_at = ...` views the
+   db at the tx-time of the first and filters secondary-index reads
+   by the second.
+
    `branch` / `commit-id` are looked up via datahike.versioning's
    branch-as-db / commit-as-db. The input `db` param is the caller's
    starting point (usually `(d/db conn)`); when branch or commit-id is
-   bound, we ignore that and read from the store instead."
-  [db session-state]
-  (let [{:keys [as-of since history branch commit-id]} @session-state
-        ;; branch / commit-id: route via datahike.versioning at the store
-        ;; level. The conn's current :db is replaced if either is set.
-        base (cond
-               commit-id (versioning/commit-as-db (:store db) commit-id)
-               branch    (versioning/branch-as-db (:store db) branch)
-               :else     db)]
-    (cond-> base
-      history (d/history)
-      as-of   (d/as-of as-of)
-      since   (d/since since))))
+   bound, we ignore that and read from the store instead.
+
+   `per-stmt-override` (optional) is a map with the same shape as the
+   relevant session-state keys, set by the SQL preprocessor when a
+   statement carries an inline `FOR VALID_TIME …` or `FOR SYSTEM_TIME …`
+   clause. Override values shadow session-state for the duration of
+   this call only; session-state is unmodified. Supported override
+   keys:
+     `:valid-at <Date>`       — single-point pin (equivalent to
+                                a session `SET datahike.valid_at`).
+     `:valid-at :all`         — clear any session-scoped pin
+                                (equivalent to `RESET datahike.valid_at`
+                                for this statement).
+     `:valid-between [a b]`   — interval pin (`d/valid-between`).
+     `:as-of <Date>`          — tx-time pin (equivalent to a session
+                                `SET datahike.as_of` / `system_at`).
+     `:as-of :all`            — clear any session-scoped as-of
+                                (equivalent to `RESET datahike.as_of`
+                                for this statement)."
+  ([db session-state]
+   (apply-temporal db session-state nil))
+  ([db session-state per-stmt-override]
+   (let [base-state @session-state
+         ;; Per-statement override shadows session-state. Special case:
+         ;; `:{valid-at,as-of} :all` explicitly clears the marker for
+         ;; this stmt.
+         effective (cond-> base-state
+                     per-stmt-override
+                     (merge per-stmt-override)
+                     (= :all (:valid-at per-stmt-override))
+                     (dissoc :valid-at)
+                     (= :all (:as-of per-stmt-override))
+                     (dissoc :as-of))
+         {:keys [as-of since history branch commit-id valid-at valid-between]}
+         effective
+         base (cond
+                commit-id (versioning/commit-as-db (:store db) commit-id)
+                branch    (versioning/branch-as-db (:store db) branch)
+                :else     db)]
+     (cond-> base
+       history       (d/history)
+       as-of         (d/as-of as-of)
+       since         (d/since since)
+       valid-at      (d/valid-at valid-at)
+       valid-between (d/valid-between (first valid-between) (second valid-between))))))
 
 (defn- parse-instant
   "Parse a timestamp string to a java.util.Date for temporal queries.
@@ -3366,7 +3414,7 @@
                                 :where [[?e :pg/table-oid ?oid]
                                         [?e :db/ident ?marker]]}
                               db))
-        schema (:schema db)
+        schema (dbi/-schema db)
         virtual (pgs/derive-virtual-tables schema (pgs/schema-hints db))
         rows (into []
                    (for [[toid anum] pairs
@@ -4432,7 +4480,7 @@
     (try
       (let [table (:table parsed)
             db (d/db conn)
-            db-schema (:schema db)
+            db-schema (dbi/-schema db)
             ;; Find all entity IDs that have at least one attribute in this table's namespace
             ns-prefix (str table "/")
             table-attrs (into []
@@ -5103,12 +5151,20 @@
                           (swap! session-state assoc :statement-timeout timeout-ms))
                         (empty-result "SET"))
                     :else
-                    (let [;; FETCH from a cursor binds *snapshot-db* so the
+                    (let [;; SQL:2011 `FOR VALID_TIME …` per-statement
+                          ;; preprocessor: strip the clause and apply its
+                          ;; override to apply-temporal for this query only.
+                          ;; Session-state is untouched. See
+                          ;; `datahike.pg.sql.temporal/preprocess`.
+                          {stripped-sql :sql per-stmt-override :override}
+                          (sql-temporal/preprocess sql)
+                          sql stripped-sql
+                          ;; FETCH from a cursor binds *snapshot-db* so the
                     ;; SELECT sees the state captured at DECLARE, not
                     ;; whatever committed since. Non-cursor paths get
                     ;; the normal live db.
                           real-db (or *snapshot-db*
-                                      (apply-temporal (d/db conn) session-state))
+                                      (apply-temporal (d/db conn) session-state per-stmt-override))
                           db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
                                (or (:speculative-db @tx-state) real-db)
                                real-db)
@@ -5162,7 +5218,7 @@
                       ;;   :handler        — the QueryHandler reify (for re-entrancy)
                       ;;   :sql            — the original SQL string
                       ;;   :db             — speculative or live Datahike db value
-                      ;;   :schema         — (:schema db); cached to avoid repeated reach-in
+                      ;;   :schema         — (dbi/-schema db); cached to avoid repeated reach-in
                       ;;   :on-create-database / :on-delete-database
                       ;;                   — operator-supplied provisioning hooks for SQL
                       ;;                     CREATE/DROP DATABASE; nil → 0A000
@@ -5218,7 +5274,7 @@
                           :delete                (exec-delete ctx parsed)
                           ;; Every DDL exec-* invalidates the per-schema cache.
                           ;; PG metadata (`:pg/not-null` etc.) lives on schema-
-                          ;; attribute entities but not in `(:schema db)`, so
+                          ;; attribute entities but not in `(dbi/-schema db)`, so
                           ;; identity-keyed caches can't detect a constraint
                           ;; add via ALTER TABLE without an explicit bust.
                           :ddl-create            (do (invalidate-schema-cache!)

@@ -15,6 +15,7 @@
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
@@ -552,7 +553,7 @@
                       (let [with-fn d/db-with
                             sorted-names (sort used-catalogs)
                             cache *catalog-cache*
-                            cache-key [(hash (:schema db)) sorted-names]
+                            cache-key [(hash (dbi/-schema db)) sorted-names]
                             cached (cache-get cache cache-key)
                             enriched
                             (or cached
