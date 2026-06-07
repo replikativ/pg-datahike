@@ -4123,7 +4123,12 @@
         ;; Derive schema-based OIDs for proper type metadata.
         ;; Shared with describeResult; see compute-schema-oids.
         (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
-              schema-oids (compute-schema-oids parsed-with-shape db)
+              ;; Resolve column OIDs against the same db the query ran on:
+              ;; when a derived table / SRF-in-FROM materialised a virtual
+              ;; table (:enriched-db), its columns' :pg/type markers (e.g.
+              ;; generate_series → int4) only live there, not on the base
+              ;; conn db.
+              schema-oids (compute-schema-oids parsed-with-shape query-db)
               ;; Blend parse-time OIDs (oid-infer)
               ;; over the -1 sentinel so empty
               ;; result sets and aggregate /

@@ -626,51 +626,142 @@
 (declare translate-select)
 (declare extract-value)
 
+(defn- srf-const-eval
+  "Evaluate a table-function argument expression to a constant value at
+   translate time. Handles the literal forms a constant-arg SRF uses
+   (`generate_series(2,4)`, `unnest(ARRAY[…])`). Returns `::corr` for a
+   non-constant (correlated) argument — e.g. a Column reference in
+   `LATERAL generate_series(1, t.n)`. The LATERAL path (future) will pass
+   `materialize-table-function` a different eval-fn that resolves such
+   references per outer row from `*from-bindings*`; this is the seam that
+   lets the same materialiser serve both callers without a rewrite."
+  [expr]
+  (cond
+    (instance? LongValue expr)   (.getValue ^LongValue expr)
+    (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+    (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
+    (instance? SignedExpression expr)
+    (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
+      (if (number? v) (- v) ::corr))
+    (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
+    :else ::corr))
+
 (defn materialize-table-function
-  "Produce rows for a `TableFunction` FROM item. Currently supports
-   `unnest(ARRAY[…])` with optional `WITH ORDINALITY`.
+  "Produce rows for a `TableFunction` FROM item. Supports the common
+   constant-arg set-returning functions:
+     - `unnest(ARRAY[…])`            (+ WITH ORDINALITY)
+     - `generate_series(start,stop[,step])` over integers (+ WITH ORDINALITY)
+     - `now()` / `current_timestamp` / `{statement,transaction,clock}_timestamp`
+       (one row, current time)
 
    Returns {:aliases [col-names] :rows [[v1 v2 …] …] :vtypes [kw kw …]}
-   or nil if the function isn't one we know how to expand.
+   or nil if the function isn't one we expand.
 
-   For `unnest(ARRAY[v1, v2, v3]) WITH ORDINALITY`:
-     :aliases = [\"unnest\" \"ordinality\"]
-     :rows    = [[v1 1] [v2 2] [v3 3]]
-     :vtypes  = inferred per value"
-  [^net.sf.jsqlparser.statement.select.TableFunction tf]
-  (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
-        fname (str/lower-case (or (.getName f) ""))
-        with-ord? (some-> (.getWithClause tf) str
-                          (->> (= "ORDINALITY")))
-        vtype-of (fn [v]
-                   (cond
-                     (instance? Long v)    :db.type/long
-                     (instance? Double v)  :db.type/double
-                     (instance? Boolean v) :db.type/boolean
-                     :else                 :db.type/string))]
-    (when (= fname "unnest")
-      (let [params (.getParameters f)
-            first-p (when (and params (pos? (count params)))
-                      (.get params 0))]
-        (when (instance? ArrayConstructor first-p)
-          ;; PG `unnest` flattens ALL dimensions into one row per leaf
-          ;; (`arrayfuncs.c:6255`, uses ArrayGetNItems(ndim, dims) to
-          ;; iterate every leaf). For multi-dim literals like
-          ;; `ARRAY[[1,2],[3,4]]` we must produce 4 rows (1, 2, 3, 4),
-          ;; not 2 rows of sub-arrays. Build the typed PgArray via
-          ;; extract-value (which recurses through nested
-          ;; ArrayConstructors), then flatten to leaves.
-          (let [pa (extract-value ^ArrayConstructor first-p)
-                vals (if (pg-arr/array? pa)
-                       (vec (pg-arr/flat-elements pa))
-                       (vec pa))]
-            (if with-ord?
-              {:aliases ["unnest" "ordinality"]
-               :rows    (vec (map-indexed (fn [i v] [v (long (inc i))]) vals))
-               :vtypes  [(vtype-of (first vals)) :db.type/long]}
-              {:aliases ["unnest"]
-               :rows    (mapv vector vals)
-               :vtypes  [(vtype-of (first vals))]})))))))
+   `eval-fn` resolves an argument expression to a value; it defaults to
+   `srf-const-eval` (literals only). The LATERAL nested-loop will pass an
+   eval-fn that resolves correlated arguments per outer row — see
+   srf-const-eval's note. That is why arguments flow through eval-fn here
+   rather than being pattern-matched as literals inline."
+  ([tf] (materialize-table-function tf srf-const-eval))
+  ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn]
+   (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
+         fname (str/lower-case (or (.getName f) ""))
+         params (vec (or (.getParameters f) []))
+         with-ord? (some-> (.getWithClause tf) str
+                           (->> (= "ORDINALITY")))
+         vtype-of (fn [v]
+                    (cond
+                      (instance? Long v)    :db.type/long
+                      (instance? Double v)  :db.type/double
+                      (instance? Boolean v) :db.type/boolean
+                      (inst? v)             :db.type/instant
+                      :else                 :db.type/string))
+         ;; pg-types: optional per-column :pg/type override (e.g. "int4")
+         ;; so the virtual-table column advertises the PG width even though
+         ;; Datahike stores a long. nil entry = use the :db/valueType OID.
+         with-ordinality (fn [aliases rows vtypes pg-types]
+                           (if with-ord?
+                             {:aliases (conj aliases "ordinality")
+                              :rows    (vec (map-indexed (fn [i r] (conj (vec r) (long (inc i)))) rows))
+                              :vtypes  (conj vtypes :db.type/long)
+                              ;; PG numbers ordinality as bigint (int8) — no override
+                              :pg-types (conj (vec pg-types) nil)}
+                             {:aliases aliases :rows rows :vtypes vtypes
+                              :pg-types (vec pg-types)}))]
+     (cond
+       (= fname "unnest")
+       ;; PG `unnest` flattens ALL dimensions into one row per leaf
+       ;; (`arrayfuncs.c`, ArrayGetNItems over ndim) — `ARRAY[[1,2],[3,4]]`
+       ;; yields 4 rows, not 2 sub-arrays.
+       (let [pa (when (seq params) (eval-fn (first params)))
+             vals (cond
+                    (pg-arr/array? pa) (vec (pg-arr/flat-elements pa))
+                    (sequential? pa)   (vec pa)
+                    :else              nil)]
+         (when vals
+           (with-ordinality ["unnest"] (mapv vector vals) [(vtype-of (first vals))] [nil])))
+
+       (= fname "generate_series")
+       ;; Integer series (inclusive of stop, like PG). Numeric/timestamp
+       ;; variants are future work; non-integer args fall through to nil.
+       (let [args (mapv eval-fn params)]
+         (when (and (>= (count args) 2)
+                    (every? integer? (take 3 args)))
+           (let [[start stop step] args
+                 step (long (or step 1))]
+             (when-not (zero? step)
+               (let [vals (vec (range start
+                                      (if (pos? step) (inc stop) (dec stop))
+                                      step))]
+                 ;; PG types integer generate_series as int4 — advertise
+                 ;; that so clients parse the values as numbers, not int8
+                 ;; strings.
+                 (with-ordinality ["generate_series"]
+                   (mapv (fn [v] [(long v)]) vals)
+                   [:db.type/long] ["int4"]))))))
+
+       (contains? #{"now" "current_timestamp" "transaction_timestamp"
+                    "statement_timestamp" "clock_timestamp"} fname)
+       ;; Scalar function used as a one-row table. The timestamp is
+       ;; captured at translate time (good enough — the value is "recent";
+       ;; sub-statement clock precision isn't meaningful here).
+       (with-ordinality [fname] [[(java.util.Date.)]] [:db.type/instant] [nil])
+
+       :else nil))))
+
+(defn- table-fn->virtual-table
+  "Materialise a constant-arg `TableFunction` FROM item into a virtual
+   table in a speculative db, so the outer query can scan/join it like a
+   real relation. Returns {:db :schema :name :alias :aliases} or nil.
+
+   The FROM alias becomes the table name; for a single-column SRF the
+   alias also names the column, matching PG (`generate_series(2,4) AS foo`
+   projects a column named `foo`)."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf db]
+  (let [talias (when-let [a (.getAlias tf)]
+                 (unquote-ident (str/trim (.getName ^Alias a))))
+        fname  (str/lower-case (or (.getName (.getFunction tf)) "tf"))
+        sub-name (or talias (str fname "_" (System/nanoTime)))]
+    (when-let [{:keys [aliases rows vtypes pg-types]} (materialize-table-function tf)]
+      (let [aliases (if (and talias (= 1 (count aliases))) [talias] aliases)
+            schema-tx (mapv (fn [a vt pt]
+                              (cond-> {:db/ident       (keyword sub-name a)
+                                       :db/valueType   vt
+                                       :db/cardinality :db.cardinality/one}
+                                pt (assoc :pg/type pt)))
+                            aliases vtypes (concat (or pg-types []) (repeat nil)))
+            spec-db (d/db-with db schema-tx)
+            data-tx (mapv (fn [row]
+                            (into {}
+                                  (keep-indexed
+                                   (fn [i a]
+                                     (let [v (nth row i nil)]
+                                       (when (some? v) [(keyword sub-name a) v])))
+                                   aliases)))
+                          rows)
+            spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+        {:db spec-db2 :schema (:schema spec-db2)
+         :name sub-name :alias sub-name :aliases aliases}))))
 
 (defn materialize-derived-select!
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
@@ -1003,14 +1094,29 @@
         ;; table-function forms like (SELECT * FROM unnest(ARRAY[…])
         ;; WITH ORDINALITY) AS sub.
         [db schema name alias]
-        (if (and db (instance? ParenthesedSelect from-item))
+        (cond
+          (and db (instance? ParenthesedSelect from-item))
           (if-let [{sub-db :db sub-schema :schema
                     sub-name :name sub-alias :alias}
                    (materialize-derived-select!
                     ^ParenthesedSelect from-item db schema)]
             [sub-db sub-schema sub-name sub-alias]
             [db schema nil nil])
+
+          ;; Bare set-returning function in FROM: `FROM generate_series(2,4)`,
+          ;; `FROM now()`. Materialise the (constant-arg) function into a
+          ;; virtual table the rest of the query scans normally. Correlated
+          ;; (LATERAL) table functions are future work — see
+          ;; doc/design-alignment.md.
+          (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
+          (if-let [{vdb :db vschema :schema vname :name valias :alias}
+                   (table-fn->virtual-table
+                    ^net.sf.jsqlparser.statement.select.TableFunction from-item db)]
+            [vdb vschema vname valias]
+            [db schema nil nil])
+
           ;; Regular table
+          :else
           (let [{tname :name talias :alias} (when (instance? Table from-item)
                                               (ctx/extract-table-info ^Table from-item))]
             [db schema tname talias]))
@@ -2394,6 +2500,9 @@
              ;; Pass enriched db when derived tables or derived-table-joins
              ;; created speculative data (FROM (…) AS sub or JOIN (…) AS sub).
              :enriched-db     (when (or (instance? ParenthesedSelect from-item)
+                                        ;; bare SRF in FROM materialised into
+                                        ;; a virtual table (table-fn->virtual-table)
+                                        (instance? net.sf.jsqlparser.statement.select.TableFunction from-item)
                                         (seq derived-joins))
                                 db)
              ;; Server-side sort for nullable ORDER BY columns
