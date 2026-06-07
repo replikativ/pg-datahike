@@ -599,6 +599,25 @@
                                    "time with time zone"} base-type) "time"
                                 :else base-type))
 
+                       ;; Narrow integer columns. Datahike stores every
+                       ;; integer as :db.type/long, which would otherwise
+                       ;; advertise int8 (OID 20) for a column the user
+                       ;; declared `smallint`/`integer`. Record the width
+                       ;; so RowDescription / ParameterDescription report
+                       ;; int2 / int4 like PG — clients pick int4 vs int8
+                       ;; parsers off the OID (node-postgres returns int8
+                       ;; as a string, int4 as a number). bigint needs no
+                       ;; hint: :db.type/long already → int8.
+                       ;; Guard on (not array-spec): an `int[]` column has
+                       ;; base-type "int" too, and already set :pg/type to
+                       ;; its array name ("_int4") above — must not clobber.
+                       (and (not array-spec)
+                            (#{"smallint" "int2" "smallserial" "serial2"} base-type))
+                       (assoc :pg/type "int2")
+                       (and (not array-spec)
+                            (#{"integer" "int" "int4" "serial" "serial4"} base-type))
+                       (assoc :pg/type "int4")
+
                        ;; ENUM-typed column: remember the enum's name so
                        ;; the dump can re-emit the column as `<enum>`
                        ;; (not `text`). Membership constraints could be

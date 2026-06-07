@@ -2393,6 +2393,16 @@
                                   :table table-name
                                   :constraint table-name}))
 
+      ;; CREATE TABLE IF NOT EXISTS on an already-existing table: PG emits
+      ;; a notice and makes no change. Returning success WITHOUT
+      ;; re-transacting matters beyond efficiency — re-asserting an
+      ;; existing schema attr that carries a :pg/type marker trips
+      ;; Datahike's schema-update guard ("Update not supported … :pg/type
+      ;; [nil int4]"), because the guard compares against the schema view,
+      ;; which doesn't surface custom :pg/* attrs.
+      (and table-name (table-exists? current-db table-name) if-not-exists?)
+      (empty-result "CREATE TABLE")
+
       (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TABLE")
 
