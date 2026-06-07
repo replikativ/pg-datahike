@@ -341,6 +341,17 @@
   (let [table (.getTable ct)
         table-name (params/unquote-ident (.getName ^Table table))
         ns table-name
+        ;; CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE — JSqlParser keeps the
+        ;; leading keywords in getCreateOptionsStrings. We track temp
+        ;; tables per session and drop them when the connection closes
+        ;; (see make-query-handler's :temp-tables / close). Not full
+        ;; per-session isolation — Datahike has one shared schema, so a
+        ;; temp table is visible to other live connections and concurrent
+        ;; CREATEs of the same name still collide — but it matches PG's
+        ;; default session lifetime for the sequential single-connection
+        ;; usage the conformance suites exercise.
+        temp? (boolean (some #(#{"temp" "temporary"} (str/lower-case %))
+                             (.getCreateOptionsStrings ct)))
         columns (.getColumnDefinitions ct)
         ;; Detect INHERITS (parent_table) — either from this CREATE TABLE
         ;; directly, or from prior registration (some clients issue CREATE
@@ -700,6 +711,7 @@
                             identity-cols))]
     (cond-> {:type :ddl-create
              :table-name table-name
+             :temp? temp?
              :if-not-exists? (.isIfNotExists ct)
              :column-order col-names
              :identity-cols identity-cols

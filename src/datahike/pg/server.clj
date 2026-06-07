@@ -4352,8 +4352,15 @@
 
 (defn- exec-ddl-create
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx]
-    (execute-ddl-create conn parsed tx-state)))
+  (let [{:keys [conn tx-state temp-tables]} ctx
+        ^PgWireServer$QueryResult result (execute-ddl-create conn parsed tx-state)]
+    ;; Record CREATE TEMP/TEMPORARY TABLE so the connection-close hook can
+    ;; drop it (PG temp tables live for the session, not forever). Only
+    ;; track on a non-error result so a failed/duplicate create doesn't
+    ;; schedule a spurious drop.
+    (when (and temp-tables (:temp? parsed) (nil? (.-error result)))
+      (swap! temp-tables conj (:table-name parsed)))
+    result))
 
 (defn- exec-ddl-create-sequence
   [ctx parsed]
@@ -4509,48 +4516,59 @@
       (catch Exception e
         (classified-error "ALTER TABLE error: " e)))))
 
+(defn- drop-table-tx!
+  "Retract every data entity and schema attribute belonging to `table`'s
+   namespace, committing against `conn`. Shared by the DROP TABLE handler
+   and the connection-close temp-table cleanup. Returns the tx-report (or
+   nil when the table had nothing to retract). Throws on transact failure
+   — callers decide whether to surface or swallow."
+  [conn table]
+  (let [db (d/db conn)
+        db-schema (dbi/-schema db)
+        ;; All schema attributes in this table's namespace.
+        table-attrs (into []
+                          (keep (fn [[attr-kw _]]
+                                  (when (and (keyword? attr-kw)
+                                             (= (namespace attr-kw) table))
+                                    attr-kw)))
+                          db-schema)
+        ;; Collect all entity IDs for this table. An earlier
+        ;; version queried only the FIRST attr, which missed
+        ;; rows where that attr was null (pgjdbc's boolfloat
+        ;; inserts (i, a, NULL) — if first-attr was `b`, the
+        ;; row was never retracted and accumulated across
+        ;; DROP/CREATE cycles). Union across every attr to
+        ;; catch all rows.
+        data-eids (when (seq table-attrs)
+                    (into #{}
+                          (mapcat (fn [attr]
+                                    (map first
+                                         (d/q {:find '[?e]
+                                               :where [['?e attr]]}
+                                              db))))
+                          table-attrs))
+        ;; Retract all data entities
+        data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
+        ;; Retract the schema attribute definitions themselves
+        schema-tx-data (mapv (fn [attr-kw]
+                               (let [attr-eid (ffirst (d/q {:find ['?e]
+                                                            :where [['?e :db/ident attr-kw]]}
+                                                           db))]
+                                 (when attr-eid [:db/retractEntity attr-eid])))
+                             table-attrs)
+        all-tx-data (into data-tx-data (filter some? schema-tx-data))]
+    (when (seq all-tx-data)
+      (d/transact conn all-tx-data))))
+
 (defn- exec-ddl-drop
   [ctx parsed]
-  (let [{:keys [conn]} ctx]
+  (let [{:keys [conn temp-tables]} ctx]
     (try
-      (let [table (:table parsed)
-            db (d/db conn)
-            db-schema (dbi/-schema db)
-            ;; Find all entity IDs that have at least one attribute in this table's namespace
-            ns-prefix (str table "/")
-            table-attrs (into []
-                              (keep (fn [[attr-kw _]]
-                                      (when (and (keyword? attr-kw)
-                                                 (= (namespace attr-kw) table))
-                                        attr-kw)))
-                              db-schema)
-            ;; Collect all entity IDs for this table. An earlier
-            ;; version queried only the FIRST attr, which missed
-            ;; rows where that attr was null (pgjdbc's boolfloat
-            ;; inserts (i, a, NULL) — if first-attr was `b`, the
-            ;; row was never retracted and accumulated across
-            ;; DROP/CREATE cycles). Union across every attr to
-            ;; catch all rows.
-            data-eids (when (seq table-attrs)
-                        (into #{}
-                              (mapcat (fn [attr]
-                                        (map first
-                                             (d/q {:find '[?e]
-                                                   :where [['?e attr]]}
-                                                  db))))
-                              table-attrs))
-            ;; Retract all data entities
-            data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
-            ;; Retract the schema attribute definitions themselves
-            schema-tx-data (mapv (fn [attr-kw]
-                                   (let [attr-eid (ffirst (d/q {:find ['?e]
-                                                                :where [['?e :db/ident attr-kw]]}
-                                                               db))]
-                                     (when attr-eid [:db/retractEntity attr-eid])))
-                                 table-attrs)
-            all-tx-data (into data-tx-data (filter some? schema-tx-data))]
-        (when (seq all-tx-data)
-          (d/transact conn all-tx-data))
+      (let [table (:table parsed)]
+        (drop-table-tx! conn table)
+        ;; A DROP TABLE on a tracked temp table means close() must not
+        ;; try to drop it again.
+        (when temp-tables (swap! temp-tables disj table))
         (empty-result "DROP TABLE"))
       (catch Exception e
         (classified-error "DROP TABLE error: " e)))))
@@ -4863,6 +4881,14 @@
         ;;    :pending-rows  vec of partial-batch rows
         ;;    :batch-size    long}
         copy-state (atom nil)
+        ;; Names of CREATE TEMP/TEMPORARY tables created on this session.
+        ;; Dropped in close() so they don't outlive the connection (PG
+        ;; temp tables are session-scoped). See exec-ddl-create /
+        ;; exec-ddl-drop. Not true per-session isolation — Datahike has a
+        ;; single shared schema — but matches PG's session lifetime for
+        ;; the sequential single-connection usage the conformance suites
+        ;; exercise.
+        temp-tables (atom #{})
         ;; Deferred-CC INSERT batching state (see exec-insert's batchable
         ;; branch). Set by beginBatchScope to a per-handler atom; nil when
         ;; the handler isn't being driven by a wire layer that supports
@@ -4881,9 +4907,17 @@
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
         ;; terminating. Release all row locks, advisory locks held by this
-        ;; session, and clear transaction state.
+        ;; session, drop session-scoped temp tables, and clear transaction
+        ;; state.
         (release-session-locks! session-id)
         (release-advisory-locks! session-id)
+        ;; Drop CREATE TEMP tables — they live only for the session.
+        ;; Best-effort: a table already dropped by hand, or one whose
+        ;; create rolled back, simply has nothing to retract.
+        (doseq [t @temp-tables]
+          (try (drop-table-tx! conn t)
+               (catch Exception _ nil)))
+        (reset! temp-tables #{})
         (reset! copy-state nil)
         (reset! tx-state {:in-tx? false :aborted? false
                           :session-id session-id
@@ -5276,6 +5310,7 @@
                                  :sql-prepared sql-prepared
                                  :cursors cursors
                                  :copy-state copy-state
+                                 :temp-tables temp-tables
                                  :batch-state batch-state
                                  :silently-accept silently-accept
                                  :handler this
