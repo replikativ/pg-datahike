@@ -191,7 +191,7 @@
 ;; literal through this table when the column resolves to a Datahike
 ;; valueType we recognise.
 
-(defn- parse-bool-token
+(defn parse-bool-token
   "Mirror PG's `boolin`: accept t/true/y/yes/on/1 and f/false/n/no/off/0
    (case-insensitive, leading/trailing whitespace ignored). Returns
    nil for unrecognised input."

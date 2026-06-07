@@ -84,6 +84,22 @@ FILES=(
 cd "${PG_DIR}"
 : > "${LOG}"
 
+# --- seed test dataset -------------------------------------------------------
+#
+# Upstream's `make test-integration` depends on `test-connection`, which runs
+# `node script/create-test-tables.js` to (re)create the `person` table seeded
+# with 26 rows (Aaron..Zanzabar). Several test files (simple-query,
+# big-simple-query, prepared-statement, parse-int-8, query-error-handling)
+# SELECT from `person` and assert on those exact 26 rows. Without this step
+# they fail with "0 == 26". The script reads the PG* env vars exported above
+# and is idempotent (DROP TABLE IF EXISTS person; CREATE TABLE …; INSERT …).
+echo "[run] seeding test dataset (person)"
+echo "---- seed: script/create-test-tables.js ----" >> "${LOG}"
+if ! node "${PG_DIR}/script/create-test-tables.js" >> "${LOG}" 2>&1; then
+  echo "ERROR: create-test-tables.js failed; see ${LOG}" >&2
+  exit 2
+fi
+
 PASS=0
 FAIL=0
 FAILED_FILES=()

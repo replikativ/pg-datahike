@@ -1656,8 +1656,29 @@
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
               result-var)
 
+            ;; Numeric / boolean casts on a runtime value. The value may
+            ;; arrive as a String — e.g. an extended-protocol parameter
+            ;; (`$1::INTEGER`) is sent in text format, so inner-val is the
+            ;; String "0". A bare `(long "0")` raises a ClassCastException
+            ;; ("String cannot be cast to Number"), so route through the
+            ;; string-tolerant coerce helpers via an in-param fn, the same
+            ;; way the date/ts/uuid branches above do.
+            (or is-int? is-float? is-bool?)
+            (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
+                  cast-fn (cond
+                            is-int?   (fn [v] (when (and (some? v) (not= :__null__ v))
+                                                (coerce/coerce-numeric v :long)))
+                            is-float? (fn [v] (when (and (some? v) (not= :__null__ v))
+                                                (coerce/coerce-numeric v :double)))
+                            :else     (fn [v] (when (and (some? v) (not= :__null__ v))
+                                                (if (boolean? v) v
+                                                    (coerce/parse-bool-token (str v))))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
+
             :else
-            (let [cast-fn (cond is-int? 'long is-float? 'double is-text? 'str is-bool? 'boolean :else 'str)]
+            (let [cast-fn (if is-text? 'str 'str)]
               (swap! (:where-clauses ctx) conj [(list cast-fn inner-val) result-var])))
           result-var)))))
 

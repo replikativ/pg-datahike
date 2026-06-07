@@ -2616,6 +2616,41 @@
                           (update :in-args sql/substitute-params fetch)))
                       subs))))))
 
+(defn- coerce-insert-tx-data
+  "After ParamRef substitution, an INSERT's `:tx-data` entity maps may
+   still hold the raw wire value for any parameter the client sent
+   untyped (text format) — e.g. node-postgres binds `$1` = the string
+   \"270\" for an integer column. translate-insert ran coerce-insert-value
+   at parse time, but a ParamRef placeholder passes through unchanged, so
+   the string was never narrowed to the column's `:db/valueType` and
+   Datahike rejects it (\"invalid input syntax for column …\"). Re-run
+   coerce-insert-value now that the concrete value is known.
+
+   coerce-insert-value is idempotent on already-typed values (literals
+   coerced at parse time stay put), so this is safe to apply to every
+   attribute. A parameter that resolved to SQL NULL drops out of the
+   entity map — matching translate-insert's own `keep` semantics, where a
+   nil column value means \"don't assert this attribute\" (EAV null)."
+  [parsed schema]
+  (if (and (= :insert (:type parsed)) (seq (:tx-data parsed)))
+    (update parsed :tx-data
+            (fn [tx]
+              (mapv (fn [entry]
+                      (if (map? entry)
+                        (reduce-kv
+                         (fn [m attr v]
+                           (cond
+                             (= :db/id attr)   (assoc m attr v)
+                             (not (keyword? attr)) (assoc m attr v)
+                             (nil? v)          m
+                             :else (if-let [c (#'sql/coerce-insert-value v attr schema)]
+                                     (assoc m attr c)
+                                     m)))
+                         {} entry)
+                        entry))
+                    tx)))
+    parsed))
+
 (declare nextval!)
 
 (defn- resolve-nextval-markers
@@ -5196,7 +5231,12 @@
                     ;; (Extended-Query Parse already counted at this.parse).
                           parsed (if-let [cached *cached-parsed*]
                                    (if-let [bound *cached-bound*]
-                                     (resolve-param-refs cached bound)
+                                     ;; Re-coerce INSERT values after ParamRef
+                                     ;; substitution so untyped text params
+                                     ;; (e.g. node-postgres "270" → int column)
+                                     ;; narrow to the column's :db/valueType.
+                                     (coerce-insert-tx-data
+                                      (resolve-param-refs cached bound) schema)
                                      cached)
                                    (let [p (sql/parse-sql sql schema db)]
                                      (when bump-dispatch! (bump-dispatch! p))

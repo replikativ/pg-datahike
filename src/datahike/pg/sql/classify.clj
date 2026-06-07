@@ -453,6 +453,33 @@
       (recur (rest ts) (conj acc (:value (first ts))) depth)
       :else (recur (rest ts) acc depth))))
 
+(defn- sole-fn-projection?
+  "Given the tokens that FOLLOW a leading function-name token in a SELECT
+   projection (an optional balanced `(...)` arg list, an optional alias,
+   then whatever else the statement contains), decide whether that
+   function call is the SOLE select item with no further clauses. Returns
+   false as soon as a paren-depth-0 comma or SQL clause keyword
+   (FROM/WHERE/GROUP/…) appears — that means the SELECT has additional
+   projection columns or a real query body and must flow through
+   JSqlParser, not a single-value hijack. Guards e.g.
+   `SELECT now() AS now, 1 AS num` from collapsing to a one-column
+   `now()` result (the hijack would otherwise swallow `1 AS num`)."
+  [toks]
+  (let [clause #{"from" "where" "group" "having" "order"
+                 "limit" "offset" "union" "except" "intersect"
+                 "join" "window" "fetch" "for"}]
+    (loop [ts toks, depth 0]
+      (if (empty? ts)
+        true
+        (let [t (first ts), tx (:text t)]
+          (cond
+            (= "(" tx) (recur (rest ts) (inc depth))
+            (= ")" tx) (recur (rest ts) (max 0 (dec depth)))
+            (pos? depth) (recur (rest ts) depth)
+            (= "," tx) false
+            (kw-in? t clause) false
+            :else (recur (rest ts) depth)))))))
+
 (defn- classify-select
   "Classify a SELECT: either one of our hijack patterns, or
    {:kind :generic-sql} for anything that should flow through to
@@ -479,9 +506,17 @@
                                   (= "." (:text (second toks))))
                              [(nth toks 2 nil) (drop 3 toks) true]
                              :else
-                             [t1 (rest toks) false])]
+                             [t1 (rest toks) false])
+        ;; All branches below hijack a SELECT whose projection is a single
+        ;; system/scalar function call (now(), version(), nextval(…), …).
+        ;; They only stay correct when that call IS the whole projection —
+        ;; otherwise extra columns / a FROM body get silently dropped. When
+        ;; the function is not the sole select item, fall through to
+        ;; JSqlParser, which handles arbitrary projections.
+        sole? (sole-fn-projection? rest-args)]
     (cond
       (nil? t1) {:kind :generic-sql}
+      (not sole?) {:kind :generic-sql}
       ;; datahike.* branching / versioning functions
       (and dh? (fn-name=? t1 "branches"))       {:kind :dh-branches}
       (and dh? (fn-name=? t1 "current_branch")) {:kind :dh-current-branch}

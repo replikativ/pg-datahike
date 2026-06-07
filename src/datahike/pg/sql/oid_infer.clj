@@ -376,7 +376,16 @@
   [^CastExpression c]
   (let [type-str (some-> (.getColDataType c) .getDataType str str/lower-case)]
     (case (types/cast-category type-str)
-      :integer   types/oid-int8
+      ;; Datahike stores every integer as a Clojure long, but an explicit
+      ;; CAST asserts a specific PG width — report the matching OID so
+      ;; clients parse the column correctly (e.g. node-postgres returns
+      ;; int4 as a JS number but int8 as a string). The wire bytes are
+      ;; identical in text mode; encodeBinary narrows the long to the
+      ;; declared width for binary clients.
+      :integer   (cond
+                   (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
+                   (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
+                   :else                                                    types/oid-int4)
       :float     types/oid-float8
       :text      types/oid-text
       :boolean   types/oid-bool
