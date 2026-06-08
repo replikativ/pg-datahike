@@ -66,8 +66,16 @@ echo "[run] full output -> ${LOG}"
 # `-p no:cacheprovider` avoids creating .pytest_cache inside the upstream tree.
 # tee so CircleCI sees progress (a plain redirect starves its
 # no_output_timeout during the 10m+ run).
+#
+# --timeout: a per-test wall-clock cap so a server-side hang (e.g. the
+# order-dependent test_cursor_iterable_02 stall) aborts that one test
+# instead of blocking the whole job until CI's no_output_timeout kills it.
+# --timeout-method=signal interrupts the asyncio event loop on the main
+# thread (the default `thread` method can't unstick an asyncio wait).
+# The hung test is reported as a failure; the suite still completes.
 set -o pipefail
 python -m pytest -v --tb=short -p no:cacheprovider \
+  --timeout=60 --timeout-method=signal \
   "${MODULES[@]}" 2>&1 | tee "${LOG}"
 RC=${PIPESTATUS[0]}
 

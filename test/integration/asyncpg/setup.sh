@@ -88,6 +88,7 @@ else
   # which `pip install -e .` does not pick up. Install it explicitly.
   python -m pip install --quiet \
     pytest \
+    pytest-timeout \
     uvloop \
     distro
 fi

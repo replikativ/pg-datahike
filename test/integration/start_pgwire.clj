@@ -13,6 +13,7 @@
 
 (require '[datahike.api :as d]
          '[datahike.pg.server :as pg]
+         '[datahike.pg.dev :as dev]
          '[nrepl.server :as nrepl])
 
 (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
@@ -33,13 +34,19 @@
         :database-template {:store {:backend :memory}
                             :schema-flexibility :write
                             :keep-history? false}
+        ;; dev/on-query records per-connection in-flight SQL (always on, cheap)
+        ;; so a REPL session can see what each connection is running and which
+        ;; query is stuck during a hang. DATAHIKE_SQL_DEBUG=true also prints.
         :on-query (fn [sql]
+                    (dev/on-query sql)
                     (when (System/getenv "DATAHIKE_SQL_DEBUG")
                       (println "SQL:" sql)))})]
-  ;; Expose conn / registry as global vars for REPL access
+  (when (System/getenv "DATAHIKE_SQL_DEBUG") (dev/set-trace! true))
+  ;; Expose conn / registry + dev helpers as global vars for REPL access
   (intern 'user 'conn conn)
   (intern 'user 'cfg cfg)
   (intern 'user 'registry-atom registry-atom)
+  (intern 'user 'srv srv)
   (let [nrepl-server (nrepl/start-server :port nrepl-port :bind "0.0.0.0")]
     (println (str "nREPL server listening on port " nrepl-port))
     (println "  Connect: clj-nrepl-eval -p" nrepl-port "\"(d/q '{:find [?e ?a ?v] :where [[?e ?a ?v]]} (d/db conn))\"")
