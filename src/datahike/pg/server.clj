@@ -232,9 +232,17 @@
 ;; ============================================================================
 
 (defn- value->string
-  "Convert a Datahike value to a PostgreSQL text-format string."
-  [v]
-  (cond
+  "Convert a Datahike value to a PostgreSQL text-format string.
+
+   `oid` (optional) is the column's wire type. It only matters for
+   instants: a `timestamptz` column (OID 1184) must carry a timezone so
+   clients reconstruct the absolute instant — without it, drivers read the
+   offset-less text as *local* time and shift the value by the session's
+   UTC offset. We store instants as UTC, so emit `+00`. A plain
+   `timestamp` (1114) stays offset-less, matching PG."
+  ([v] (value->string v nil))
+  ([v oid]
+   (cond
     (nil? v)           nil
     (= :__null__ v)    nil  ;; LEFT JOIN sentinel → SQL NULL
     ;; PgArray → PG canonical array text format `{…}` (see
@@ -282,14 +290,15 @@
                        s (str inst)]
                    (-> s
                        (str/replace "T" " ")
-                       (str/replace "Z" "")))
+                       ;; timestamptz keeps a UTC offset; timestamp drops it.
+                       (str/replace "Z" (if (= oid PgWireServer/OID_TIMESTAMPTZ) "+00" ""))))
     (uuid? v)    (str v)
     (symbol? v)  (str v)
     (bytes? v)   "<bytes>"
     ;; Maps and vectors (jsonb values) → serialize as JSON
     (map? v)     (jb/serialize-jsonb v)
     (vector? v)  (jb/serialize-jsonb v)
-    :else        (str v)))
+    :else        (str v))))
 
 (defn- infer-oid
   "Infer a PostgreSQL type OID from a Clojure value.
@@ -565,8 +574,14 @@
                             (for [row result-seq]
                               (into-array String
                                           (if (sequential? row)
-                                            (map value->string row)
-                                            [(value->string row)]))))
+                                            (map-indexed
+                                             (fn [i v]
+                                               (value->string
+                                                v (when (< i (alength ^ints oids))
+                                                    (aget ^ints oids i))))
+                                             row)
+                                            [(value->string row (when (pos? (alength ^ints oids))
+                                                                   (aget ^ints oids 0)))]))))
                 (into-array (Class/forName "[Ljava.lang.String;")
                             (make-array String 0 0)))]
      (PgWireServer$QueryResult.
