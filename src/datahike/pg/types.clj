@@ -22,6 +22,7 @@
 
 (def oid-bool      16)
 (def oid-bytea      17)
+(def oid-char       18)   ;; PG internal "char" (1 byte) — pg_type.typtype etc.
 (def oid-int8       20)
 (def oid-int2       21)
 (def oid-int4       23)
@@ -308,6 +309,7 @@
     "json"        oid-json
     "jsonb"       oid-jsonb
     "oid"         oid-oid
+    "char"        oid-char
     "bytea"       oid-bytea}
    ;; Array entries: "_T" → array OID. Generated from elem-kw->oid
    ;; so adding a new scalar type only needs three rows
@@ -502,6 +504,7 @@
   "Map OID to type size for RowDescription's typlen field.
    Positive = fixed size in bytes, -1 = variable length."
   {oid-bool       1
+   oid-char       1
    oid-int2       2
    oid-int4       4
    oid-int8       8

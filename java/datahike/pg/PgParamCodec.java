@@ -661,6 +661,14 @@ public final class PgParamCodec {
                 case PgWireServer.OID_BOOL ->
                     new byte[] { (byte) (parseBool(value) ? 1 : 0) };
 
+                // PG "char" (OID 18): a single byte (charsend / pq_sendbyte).
+                // pg_type.typtype/typcategory are this type; asyncpg
+                // binary-decodes it to bytes for its is_scalar_type check.
+                case PgWireServer.OID_CHAR -> {
+                    String s = value.toString();
+                    yield s.isEmpty() ? new byte[0] : new byte[] { (byte) s.charAt(0) };
+                }
+
                 case PgWireServer.OID_INT2 ->
                     ByteBuffer.allocate(2).order(ByteOrder.BIG_ENDIAN)
                         .putShort((short) parseLong(value)).array();

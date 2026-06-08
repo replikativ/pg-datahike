@@ -201,7 +201,9 @@
     [{:db/ident :pg_type/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typlen :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_type/typtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; typtype is PG's "char" (OID 18): clients (asyncpg's is_scalar_type)
+     ;; binary-decode it to a single byte, so advertise OID 18 not text.
+     {:db/ident :pg_type/typtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      ;; typelem: element type OID for array types (0 for scalars). Clients
      ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
      {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}

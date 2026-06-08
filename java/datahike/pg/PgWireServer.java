@@ -58,6 +58,7 @@ public final class PgWireServer {
     // PostgreSQL type OIDs (authoritative: src/include/catalog/pg_type.dat)
     public static final int OID_BOOL        = 16;
     public static final int OID_BYTEA       = 17;
+    public static final int OID_CHAR        = 18;  // PG internal "char" (1 byte)
     public static final int OID_NAME        = 19;
     public static final int OID_INT8        = 20;   // bigint
     public static final int OID_INT2        = 21;   // smallint
@@ -2311,6 +2312,7 @@ public final class PgWireServer {
     private static short typeSize(int oid) {
         return switch (oid) {
             case OID_BOOL -> 1;
+            case OID_CHAR -> 1;
             case OID_INT4 -> 4;
             case OID_INT8 -> 8;
             case OID_FLOAT4 -> 4;
