@@ -577,6 +577,14 @@
             ;; list and then surfaced an opaque "Cannot resolve any
             ;; more clauses" at execute time.
                 pre-cte-db db
+                ;; CTE names in scope (lowercased) — even those not
+                ;; materialised (skipped data-modifying CTE bodies) — so the
+                ;; undefined-table 42P01 check in translate-select exempts
+                ;; `FROM <cte>`. See stmt/*cte-relations*.
+                cte-relations (into #{}
+                                    (keep (fn [^net.sf.jsqlparser.statement.select.WithItem wi]
+                                            (some-> (.getAlias wi) str str/trim str/lower-case not-empty)))
+                                    (stmt-with-items stmt))
                 [db schema] (materialize-withs! stmt db schema)
             ;; Count prepared-statement placeholders once at the AST
             ;; level — reused for INSERT/UPDATE/DELETE which don't
@@ -658,7 +666,11 @@
                 attach-params #(cond-> (assoc % :param-count param-count)
                                  (seq inferred-oids) (assoc :param-oids inferred-oids))
                 result
-                (cond
+                ;; Expose CTE names to translate-select's undefined-table
+                ;; (42P01) check so `FROM <cte>` is never mistaken for a
+                ;; missing relation — including skipped data-modifying CTEs.
+                (binding [stmt/*cte-relations* cte-relations]
+                 (cond
           ;; SELECT (may have CTEs — WITH ... AS)
                   (instance? PlainSelect stmt)
                   (let [;; Rewrite RIGHT JOIN → LEFT JOIN by swapping FROM and JOIN items
@@ -1169,8 +1181,8 @@
                     {:type :ddl-alter :table table-name :operations ops})
 
                   :else
-                  {:type :error :message (str "Unsupported SQL statement: " (type stmt))})]
-            (if (map? result) (attach-params result) result)))) ; close :else let, cond, outer let
+                  {:type :error :message (str "Unsupported SQL statement: " (type stmt))}))]
+            (if (map? result) (attach-params result) result)))) ; close :else let, binding, cond, outer let
       (catch Exception e
          ;; Resolve the exception structurally: throw sites may carry
          ;; either :sqlstate (legacy / explicit override) or :error

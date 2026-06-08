@@ -1084,6 +1084,35 @@
                   (instance? net.sf.jsqlparser.expression.AnalyticExpression i))
           i)))))
 
+(def ^:dynamic *cte-relations*
+  "Lowercased names of CTEs (WITH items) in scope for the statement being
+   translated. Bound by parse-sql* so the undefined-table 42P01 check
+   exempts CTE references that aren't materialised into the schema — most
+   notably data-modifying CTE bodies (`WITH x AS (INSERT … RETURNING …)`),
+   which are skipped during WITH-fold."
+  #{})
+
+(defn- relation-known?
+  "True when `tname` names something a query can scan: a user table / CTE
+   / derived table whose columns live in `schema` (any attribute in that
+   namespace — every pgwire table carries at least its row-marker), a CTE
+   in scope (`*cte-relations*`), or a catalog relation the catalog layer
+   synthesises (`pg_*`, `information_schema`, or any schema-qualified
+   name). Used to raise a clean 42P01 for a genuinely-absent relation
+   instead of the cryptic 'Query for unknown vars' failure (SELECT *) or a
+   silently-empty result (SELECT col). Column-level EAV permissiveness is
+   intentionally NOT touched — an existing table's missing column still
+   reads as NULL."
+  [schema tname]
+  (or (nil? tname)
+      (let [t (str/lower-case tname)]
+        (or (str/starts-with? t "pg_")
+            (str/starts-with? t "information_schema")
+            (str/includes? t ".")            ; schema-qualified catalog ref
+            (contains? *cte-relations* t)
+            (some (fn [[k _]] (and (keyword? k) (= (namespace k) tname)))
+                  schema)))))
+
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
@@ -1122,6 +1151,20 @@
             [db schema tname talias]))
         ;; default-table is the alias key used for entity-var lookup.
         default-table (or alias name)
+
+        ;; A genuinely-absent user relation in FROM raises 42P01 (PG's
+        ;; undefined_table) instead of failing later with a cryptic
+        ;; "Query for unknown vars" (SELECT *) or returning a silent empty
+        ;; result (SELECT col). Catalog tables (pg_*/information_schema),
+        ;; CTEs, derived tables and table functions are exempt — see
+        ;; relation-known?. Column-level EAV permissiveness is unchanged:
+        ;; an *existing* table's unknown column still reads as NULL.
+        _ (when (and (instance? Table from-item)
+                     (not (relation-known? schema name)))
+            (throw (ex-info (str "relation \"" name "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table name})))
 
         ;; Build table aliases: {alias → real-table-name}
         ;; For self-joins, the alias is the key; for regular usage, table name is the key too.
