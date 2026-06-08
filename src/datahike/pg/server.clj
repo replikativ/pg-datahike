@@ -5132,8 +5132,16 @@
                               item-oid (when item-oids
                                          (nth item-oids i nil))]
                           (cond
-                            (not= schema-oid -1) schema-oid
+                            ;; A statically-inferred item OID (only set for
+                            ;; literals / casts — see oid-infer) is
+                            ;; authoritative and must win over compute-schema-
+                            ;; oids' alias-NAME fallback, which would otherwise
+                            ;; match e.g. `SELECT 1 AS a` to an unrelated table
+                            ;; column named "a" — making Describe disagree
+                            ;; with Execute (Execute uses item-oids) and
+                            ;; corrupting binary-format decoding on the client.
                             (some? item-oid)     item-oid
+                            (not= schema-oid -1) schema-oid
                             :else                PgWireServer/OID_TEXT))))
                 sources (compute-column-sources parsed db)
                 qr (PgWireServer$QueryResult.
@@ -5169,8 +5177,10 @@
                                 item-oid (when item-oids
                                            (nth item-oids i nil))]
                             (cond
-                              (not= schema-oid -1) schema-oid
+                              ;; item-oid (literals/casts) wins over the
+                              ;; alias-name fallback — see the :select branch.
                               (some? item-oid)     item-oid
+                              (not= schema-oid -1) schema-oid
                               :else                PgWireServer/OID_TEXT))))]
               (PgWireServer$QueryResult.
                (into-array String aliases)
