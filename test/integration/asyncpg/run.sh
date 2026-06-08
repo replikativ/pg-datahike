@@ -62,46 +62,54 @@ cd "${CLONE_DIR}"
 echo "[run] python -m pytest -v ${MODULES[*]}"
 echo "[run] full output -> ${LOG}"
 
-# Use pytest-style output (asyncpg uses unittest but pytest runs it fine).
-# `-p no:cacheprovider` avoids creating .pytest_cache inside the upstream tree.
-# tee so CircleCI sees progress (a plain redirect starves its
-# no_output_timeout during the 10m+ run).
-#
-# --timeout: a per-test wall-clock cap so a server-side hang (e.g. the
-# order-dependent test_cursor_iterable_02 stall) aborts that one test
-# instead of blocking the whole job until CI's no_output_timeout kills it.
-# --timeout-method=signal interrupts the asyncio event loop on the main
-# thread (the default `thread` method can't unstick an asyncio wait).
-# The hung test is reported as a failure; the suite still completes.
-set -o pipefail
-python -m pytest -v --tb=short -p no:cacheprovider \
-  --timeout=60 --timeout-method=signal \
-  "${MODULES[@]}" 2>&1 | tee "${LOG}"
-RC=${PIPESTATUS[0]}
-
-# --- summarize ---------------------------------------------------------------
-#
-# pytest's final line is of the form:
-#   === 123 passed, 4 failed, 5 skipped, 1 error in 12.34s ===
-LAST_SUMMARY="$(grep -E '^=+ .* (passed|failed|error|skipped).* =+$' "${LOG}" | tail -1)"
-
-P=0; F=0; S=0; E=0
-if [[ -n "${LAST_SUMMARY}" ]]; then
-  P=$(  sed -n 's/.*[^0-9]\([0-9]*\) passed.*/\1/p'  <<<"${LAST_SUMMARY}" | head -1)
-  F=$(  sed -n 's/.*[^0-9]\([0-9]*\) failed.*/\1/p'  <<<"${LAST_SUMMARY}" | head -1)
-  S=$(  sed -n 's/.*[^0-9]\([0-9]*\) skipped.*/\1/p' <<<"${LAST_SUMMARY}" | head -1)
-  E=$(  sed -n 's/.*[^0-9]\([0-9]*\) error.*/\1/p'   <<<"${LAST_SUMMARY}" | head -1)
-fi
-P=${P:-0}; F=${F:-0}; S=${S:-0}; E=${E:-0}
+# Run each module as its OWN pytest invocation wrapped in a hard wall-clock
+# `timeout`. A single combined run can hang indefinitely: a server-side
+# protocol desync (e.g. the order-dependent test_cursor_iterable_02 stall)
+# leaves asyncpg blocked inside its C-extension socket read, which neither
+# pytest-timeout (signal can't interrupt the C select) nor a soft cap can
+# unstick — only an external SIGKILL. Per-module + `timeout` means a hung
+# module is killed and counted, and the remaining modules still run, so the
+# suite always completes and reports. Per-module invocation also gives each
+# module a clean interpreter (less cross-module state bleed).
+PER_MODULE_TIMEOUT="${ASYNCPG_MODULE_TIMEOUT:-120}"
+P=0; F=0; S=0; E=0; TIMED_OUT=()
+set +e
+: > "${LOG}"
+for m in "${MODULES[@]}"; do
+  echo "[run] ${m} (timeout ${PER_MODULE_TIMEOUT}s)"
+  echo "==================== ${m} ====================" >> "${LOG}"
+  timeout --signal=KILL "${PER_MODULE_TIMEOUT}" \
+    python -m pytest -v --tb=short -p no:cacheprovider "${m}" >> "${LOG}" 2>&1
+  rc=$?
+  if [[ ${rc} -eq 137 ]]; then
+    # SIGKILL from `timeout` — the module hung.
+    echo "[run] TIMEOUT ${m}" | tee -a "${LOG}"
+    TIMED_OUT+=("${m}")
+    F=$(( F + 1 ))   # count a hung module as one failure
+    continue
+  fi
+  # Parse this module's per-run summary line.
+  ms="$(grep -E '^=+ .* (passed|failed|error|skipped).* =+$' "${LOG}" | tail -1)"
+  if [[ -n "${ms}" ]]; then
+    mp=$(sed -n 's/.*[^0-9]\([0-9]*\) passed.*/\1/p'  <<<"${ms}" | head -1)
+    mf=$(sed -n 's/.*[^0-9]\([0-9]*\) failed.*/\1/p'  <<<"${ms}" | head -1)
+    msk=$(sed -n 's/.*[^0-9]\([0-9]*\) skipped.*/\1/p' <<<"${ms}" | head -1)
+    me=$(sed -n 's/.*[^0-9]\([0-9]*\) error.*/\1/p'   <<<"${ms}" | head -1)
+    P=$(( P + ${mp:-0} )); F=$(( F + ${mf:-0} )); S=$(( S + ${msk:-0} )); E=$(( E + ${me:-0} ))
+  fi
+done
+set -e
 FAIL_TOTAL=$(( F + E ))
 
 echo
-echo "SUMMARY: ${P} passed, ${FAIL_TOTAL} failed, ${S} skipped   (pytest rc=${RC})"
+echo "SUMMARY: ${P} passed, ${FAIL_TOTAL} failed, ${S} skipped"
+if [[ ${#TIMED_OUT[@]} -gt 0 ]]; then
+  echo "Timed-out modules (hung, SIGKILLed): ${TIMED_OUT[*]}"
+fi
 
-if [[ ${RC} -ne 0 ]] || [[ ${FAIL_TOTAL} -gt 0 ]]; then
+if [[ ${FAIL_TOTAL} -gt 0 ]]; then
   echo
-  echo "--- last 80 lines of ${LOG} ---"
-  tail -n 80 "${LOG}" || true
+  echo "Full output in ${LOG}"
   exit 1
 fi
 exit 0

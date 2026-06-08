@@ -202,6 +202,9 @@
      {:db/ident :pg_type/typname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typlen :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; typelem: element type OID for array types (0 for scalars). Clients
+     ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
+     {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
     [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -469,14 +472,22 @@
   [table-name user-schema cte-db]
   (case table-name
     "pg_type"
-    (mapv (fn [[oid tname tlen ttype]]
-            {:pg_type/oid (Long/parseLong oid) :pg_type/typname tname
-             :pg_type/typlen (Long/parseLong tlen) :pg_type/typtype ttype
-             (pgs/row-marker-attr "pg_type") true})
-          [["16" "bool" "1" "b"] ["20" "int8" "8" "b"] ["23" "int4" "4" "b"]
-           ["25" "text" "-1" "b"] ["700" "float4" "4" "b"] ["701" "float8" "8" "b"]
-           ["1043" "varchar" "-1" "b"] ["1082" "date" "4" "b"]
-           ["1114" "timestamp" "8" "b"] ["2950" "uuid" "16" "b"]])
+    ;; Full base + array type set from the central registry (types/pg-type-
+    ;; catalog) — including oid 26 (oid), name, numeric, json/jsonb, time/
+    ;; interval and the _T[] array types. The previous hardcoded 10-row list
+    ;; omitted most, so client type-introspection (e.g. asyncpg's
+    ;; set_type_codec → TYPE_BY_OID) failed with "unknown type pg_catalog.X".
+    ;; typelem is the element OID for array types (typname "_int4" → int4's
+    ;; oid), 0 for scalars.
+    (let [name->oid (into {} (map (fn [[o n _ _]] [n o])) types/pg-type-catalog)]
+      (mapv (fn [[oid tname tlen ttype]]
+              (let [elem (when (str/starts-with? tname "_")
+                           (name->oid (subs tname 1)))]
+                {:pg_type/oid (long oid) :pg_type/typname tname
+                 :pg_type/typlen (long tlen) :pg_type/typtype ttype
+                 :pg_type/typelem (long (or elem 0))
+                 (pgs/row-marker-attr "pg_type") true}))
+            types/pg-type-catalog))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
