@@ -449,7 +449,16 @@ public final class PgWireServer {
          * skipped.
          */
         public java.util.Map<String, String> errorFields;
-        /** Transaction status: 'I' = idle, 'T' = in transaction, 'E' = error in transaction. */
+        /**
+         * Transaction status: 'I' = idle, 'T' = in transaction,
+         * 'E' = error in transaction. The default '\0' is a sentinel
+         * meaning "this result expresses no opinion — leave the wire-level
+         * status unchanged". Only the transaction-control handlers
+         * (BEGIN/COMMIT/ROLLBACK/SAVEPOINT, via tag-tx-status) set a real
+         * 'I'/'T'/'E'. This lets a COMMIT explicitly return to 'I' while a
+         * plain statement inside a transaction (which leaves it '\0')
+         * preserves the ongoing 'T'.
+         */
         public char txStatus;
 
         /**
@@ -501,7 +510,7 @@ public final class PgWireServer {
             this.commandTag = commandTag;
             this.error = null;
             this.sqlstate = null;
-            this.txStatus = 'I';
+            this.txStatus = '\0';  // no opinion — see field doc
         }
 
         /** Error result with default XX000 SQLSTATE. */
@@ -517,7 +526,7 @@ public final class PgWireServer {
             this.commandTag = null;
             this.error = error;
             this.sqlstate = sqlstate;
-            this.txStatus = 'I';
+            this.txStatus = '\0';  // no opinion — see field doc
         }
 
         /** Empty result (e.g., SET command). */
@@ -1269,11 +1278,12 @@ public final class PgWireServer {
                 // statement's socket read on this thread.
                 Thread.interrupted();
 
-                // The handler uses 'I' as "don't change wire-level tx status"
-                // (most non-tx results default to 'I'). Only T/E from the
-                // handler represent explicit transitions (BEGIN/COMMIT/
-                // ROLLBACK/SAVEPOINT ops).
-                if (result.txStatus != 'I') {
+                // The handler uses '\0' as "don't change wire-level tx
+                // status" (most non-tx results leave it unset). Only the
+                // transaction-control ops set a real 'I'/'T'/'E' (BEGIN,
+                // COMMIT, ROLLBACK, SAVEPOINT, aborted-tx), and those must
+                // be adopted — including a COMMIT/ROLLBACK returning to 'I'.
+                if (result.txStatus != '\0') {
                     txStatus[0] = result.txStatus;
                 }
 
@@ -1819,7 +1829,7 @@ public final class PgWireServer {
         // Clear any interrupt bit left by the safety-net cancel path.
         Thread.interrupted();
 
-        if (result != null && result.txStatus != 'I') {
+        if (result != null && result.txStatus != '\0') {
             txStatus[0] = result.txStatus;
         }
 
