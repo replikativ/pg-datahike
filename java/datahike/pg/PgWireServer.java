@@ -1585,6 +1585,24 @@ public final class PgWireServer {
                   + (query.length() > 80 ? query.substring(0, 80) + "..." : query));
         }
 
+        // A prepared statement holds exactly one command. PG rejects a
+        // multi-statement string in the extended protocol with 42601
+        // ("cannot insert multiple commands into a prepared statement").
+        // The simple Query path still allows multiple statements; only
+        // Parse is restricted. node-postgres's queryMode:"extended" relies
+        // on this.
+        if (!query.isEmpty()) {
+            int n = 0;
+            for (String s : splitStatements(query)) {
+                if (!stripComments(s).trim().isEmpty()) n++;
+                if (n > 1) break;
+            }
+            if (n > 1) {
+                throw new PgProtocolException("42601",
+                    "cannot insert multiple commands into a prepared statement");
+            }
+        }
+
         // Empty query: pgJDBC's Connection.isValid sends an empty-SQL
         // prepared statement as a ping. Don't try to translate — store
         // a PreparedStmt with parsed=null and emit EmptyQueryResponse
