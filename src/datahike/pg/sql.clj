@@ -747,12 +747,24 @@
                           (let [e (.getExpression item)]
                             (and (instance? Function e)
                                  (= "unnest" (str/lower-case (.getName ^Function e))))))
+                        gs-single-item?
+                        (fn [^SelectItem item]
+                           ;; SELECT generate_series(a,b[,c]) — a set-returning
+                           ;; function in the target list (PG's legacy SRF-in-
+                           ;; projection idiom, e.g. asyncpg's
+                           ;; `SELECT generate_series(0, 20)`). Table-free,
+                           ;; constant-arg forms expand into literal-rows via
+                           ;; the same materialiser the FROM-clause SRF uses.
+                          (let [e (.getExpression item)]
+                            (and (instance? Function e)
+                                 (= "generate_series" (str/lower-case (.getName ^Function e))))))
                         table-free? (and (nil? (.getFromItem ^PlainSelect stmt))
                                          (nil? (.getWhere ^PlainSelect stmt))
                                          (let [items (.getSelectItems ^PlainSelect stmt)]
                                            (or (every? trivial-table-free-item? items)
                                                (and (= 1 (count items))
-                                                    (unnest-single-item? (first items))))))
+                                                    (or (unnest-single-item? (first items))
+                                                        (gs-single-item? (first items)))))))
                 ;; Narrow support for PG's set-returning-function idiom
                 ;;   SELECT unnest(array_fill(expr, ARRAY[count]))  — N rows of expr
                 ;;   SELECT unnest(ARRAY[e1,e2,e3])                 — N distinct rows
@@ -792,6 +804,23 @@
                                        nil
                                        (or alias-str "unnest")
                                        true])))))))
+                        ;; SELECT generate_series(...) in the target list:
+                        ;; materialise the (constant-arg) SRF into literal rows
+                        ;; via the shared FROM-clause table-function expander.
+                        ;; nil when args aren't constant — falls through to the
+                        ;; normal translator (which today errors, as before).
+                        gs-materialized
+                        (when (and table-free? (identical? db pre-cte-db))
+                          (let [items (.getSelectItems ^PlainSelect stmt)]
+                            (when (= 1 (count items))
+                              (let [^SelectItem it (first items)
+                                    e (.getExpression it)]
+                                (when (and (instance? Function e)
+                                           (= "generate_series" (str/lower-case (.getName ^Function e))))
+                                  (when-let [m (stmt/materialize-table-function
+                                                (net.sf.jsqlparser.statement.select.TableFunction. ^Function e))]
+                                    (assoc m :alias (or (select-item-alias it)
+                                                        (first (:aliases m))))))))))
                         literal-eval (fn [e]
                                        (cond
                                          (instance? LongValue e)    (.getValue ^LongValue e)
@@ -868,6 +897,20 @@
                                     :in-args []
                                     :hidden-count 0
                                     :literal-rows (vec (repeat n [v]))})
+
+                                 gs-materialized
+                                 (let [{:keys [rows pg-types alias]} gs-materialized]
+                                   {:type :select
+                                    :query {:find [] :where []}
+                                    :find-aliases [alias]
+                                    :has-aggregates? false
+                                    :has-distinct? false
+                                    :in-args []
+                                    :hidden-count 0
+                                    :select-item-oids [(or (some-> ^String (first pg-types)
+                                                                   types/pg-name->oid)
+                                                           -1)]
+                                    :literal-rows (mapv vec rows)})
 
                                  (and table-free? (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression
