@@ -2653,9 +2653,12 @@
                              (= :db/id attr)   (assoc m attr v)
                              (not (keyword? attr)) (assoc m attr v)
                              (nil? v)          m
-                             :else (if-let [c (#'sql/coerce-insert-value v attr schema)]
-                                     (assoc m attr c)
-                                     m)))
+                             ;; Only a nil coercion means "SQL NULL → omit";
+                             ;; a coerced `false`/`0`/empty is a real value.
+                             ;; (if-let here would wrongly drop a boolean
+                             ;; false, reading back as NULL.)
+                             :else (let [c (#'sql/coerce-insert-value v attr schema)]
+                                     (if (nil? c) m (assoc m attr c)))))
                          {} entry)
                         entry))
                     tx)))

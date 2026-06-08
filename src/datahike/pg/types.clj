@@ -168,9 +168,13 @@
    "timestamp with time zone"    :db.type/instant
    "timestamptz"       :db.type/instant
    "date"              :db.type/instant
-   "time"              :db.type/instant
-   "time without time zone"      :db.type/instant
-   "time with time zone"         :db.type/instant
+   ;; time-of-day: store the normalized text (a bare time can't be a
+   ;; java.util.Date/Instant, and parse-timestamp-string rejects it).
+   ;; Consistent with `timetz`, which already falls through to string.
+   ;; The :pg/type "time" hint still drives the wire OID (1083/1266).
+   "time"              :db.type/string
+   "time without time zone"      :db.type/string
+   "time with time zone"         :db.type/string
    ;; Binary
    "bytea"             :db.type/bytes
    ;; UUID
@@ -303,6 +307,7 @@
     "uuid"        oid-uuid
     "json"        oid-json
     "jsonb"       oid-jsonb
+    "oid"         oid-oid
     "bytea"       oid-bytea}
    ;; Array entries: "_T" → array OID. Generated from elem-kw->oid
    ;; so adding a new scalar type only needs three rows

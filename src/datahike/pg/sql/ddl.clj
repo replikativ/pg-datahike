@@ -618,6 +618,12 @@
                             (#{"integer" "int" "int4" "serial" "serial4"} base-type))
                        (assoc :pg/type "int4")
 
+                       ;; oid columns: stored as a long, but advertise the
+                       ;; PG `oid` type (26) so clients parse it as a number
+                       ;; rather than an int8 string.
+                       (and (not array-spec) (= "oid" base-type))
+                       (assoc :pg/type "oid")
+
                        ;; ENUM-typed column: remember the enum's name so
                        ;; the dump can re-emit the column as `<enum>`
                        ;; (not `text`). Membership constraints could be
