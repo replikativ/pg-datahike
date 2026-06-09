@@ -396,7 +396,12 @@
 (def cast-integer-types
   "SQL type names that cast to integer (Clojure long)."
   #{"integer" "int" "int2" "int4" "int8" "bigint" "smallint"
-    "serial" "serial2" "serial4" "serial8" "bigserial" "smallserial"})
+    "serial" "serial2" "serial4" "serial8" "bigserial" "smallserial"
+    ;; `oid` is an unsigned-32 integer value-wise — `$1::oid` / `$1::oid[]`
+    ;; must coerce to long(s), not text (asyncpg's introspection binds
+    ;; `oid = any($1::oid[])`). The reg* alias types are oid-backed but
+    ;; TEXT-displayed (regtype → 'int4'), so they are deliberately excluded.
+    "oid"})
 
 (def cast-float-types
   "SQL type names that cast to floating point (Clojure double)."

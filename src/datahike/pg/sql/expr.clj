@@ -1535,7 +1535,15 @@
                         (= :__null__ v)       :__null__
                         (pg-arr/array? v)     (pg-arr/array (or target-elem (:elem-type v))
                                                             (:elements v))
-                        :else                 :__null__))
+                        ;; A bound array param arrives as canonical PG text
+                        ;; ("{16384}") or a Clojure collection — reconstruct it
+                        ;; (e.g. asyncpg sends `$1::oid[]` as binary oid[] which
+                        ;; the wire layer decodes to "{…}"). Without this the
+                        ;; cast returned NULL and `col = any($1)` matched nothing.
+                        :else                 (if-let [a (coerce-pg-array v target-elem)]
+                                                (pg-arr/array (or target-elem (:elem-type a))
+                                                              (:elements a))
+                                                :__null__)))
             result-var (ctx/fresh-var! ctx)
             inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
         (swap! (:in-params ctx) conj fn-param)
