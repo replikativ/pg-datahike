@@ -207,6 +207,9 @@
      ;; typelem: element type OID for array types (0 for scalars). Clients
      ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
      {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; typnamespace: asyncpg's type-introspection INNER JOINs pg_namespace
+     ;; on it, so every type must carry one (all in `public` = 2200).
+     {:db/ident :pg_type/typnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
     [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -226,6 +229,9 @@
      ;; reports for plain `NUMERIC` or `TEXT` columns. Drives
      ;; information_schema.columns.numeric_precision / numeric_scale.
      {:db/ident :pg_attribute/atttypmod :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; attisdropped: asyncpg's composite-field introspection filters
+     ;; `NOT ia.attisdropped`, so the column must exist (always false here).
+     {:db/ident :pg_attribute/attisdropped :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attribute") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_namespace"
     [{:db/ident :pg_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -251,6 +257,9 @@
      {:db/ident :pg_class/relname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_class/relnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_class/relkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; reltype: the pg_type OID of this relation's composite row-type.
+     ;; asyncpg joins composite pg_type → pg_class on `c.reltype = t.oid`.
+     {:db/ident :pg_class/reltype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_class") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_index"
@@ -481,15 +490,25 @@
     ;; set_type_codec → TYPE_BY_OID) failed with "unknown type pg_catalog.X".
     ;; typelem is the element OID for array types (typname "_int4" → int4's
     ;; oid), 0 for scalars.
-    (let [name->oid (into {} (map (fn [[o n _ _]] [n o])) types/pg-type-catalog)]
-      (mapv (fn [[oid tname tlen ttype]]
-              (let [elem (when (str/starts-with? tname "_")
-                           (name->oid (subs tname 1)))]
-                {:pg_type/oid (long oid) :pg_type/typname tname
-                 :pg_type/typlen (long tlen) :pg_type/typtype ttype
-                 :pg_type/typelem (long (or elem 0))
-                 (pgs/row-marker-attr "pg_type") true}))
-            types/pg-type-catalog))
+    (let [name->oid (into {} (map (fn [[o n _ _]] [n o])) types/pg-type-catalog)
+          base (mapv (fn [[oid tname tlen ttype]]
+                       (let [elem (when (str/starts-with? tname "_")
+                                    (name->oid (subs tname 1)))]
+                         {:pg_type/oid (long oid) :pg_type/typname tname
+                          :pg_type/typlen (long tlen) :pg_type/typtype ttype
+                          :pg_type/typelem (long (or elem 0))
+                          :pg_type/typnamespace 2200
+                          (pgs/row-marker-attr "pg_type") true}))
+                     types/pg-type-catalog)
+          ;; User composite types (CREATE TYPE … AS (..)) — typtype 'c',
+          ;; variable length, namespace public.
+          composites (mapv (fn [{:keys [name oid]}]
+                             {:pg_type/oid oid :pg_type/typname name
+                              :pg_type/typlen -1 :pg_type/typtype "c"
+                              :pg_type/typelem 0 :pg_type/typnamespace 2200
+                              (pgs/row-marker-attr "pg_type") true})
+                           (pgs/composite-types cte-db))]
+      (into base composites))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
@@ -501,7 +520,21 @@
                                   :where [[?e :db/ident ?ident]
                                           [?e :pg/typmod ?typmod]]}
                                 cte-db)))]
-      (vec (for [[tname {:keys [columns]}] (sort-by key tables)
+      (into
+       ;; composite-type fields: attrelid = the composite's pg_class oid
+       ;; (= its type oid here); atttypid = each field's PG type OID.
+       (vec (for [{:keys [oid fields]} (pgs/composite-types cte-db)
+                  [idx f] (map-indexed vector fields)]
+              {:pg_attribute/attname (:field-name f)
+               :pg_attribute/atttypid (long (:oid f))
+               :pg_attribute/attnum (long (inc idx))
+               :pg_attribute/attrelid (long oid)
+               :pg_attribute/attnotnull false
+               :pg_attribute/attidentity ""
+               :pg_attribute/atttypmod -1
+               :pg_attribute/attisdropped false
+               (pgs/row-marker-attr "pg_attribute") true}))
+       (for [[tname {:keys [columns]}] (sort-by key tables)
                  [idx col] (map-indexed vector columns)
                  :let [tbl-oid (or (pgs/table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
@@ -531,6 +564,7 @@
               :pg_attribute/attnotnull pk?
               :pg_attribute/attidentity ""
               :pg_attribute/atttypmod typmod
+              :pg_attribute/attisdropped false
               (pgs/row-marker-attr "pg_attribute") true})))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
@@ -640,15 +674,27 @@
            ["pg_database_size" "v" 1 20 "19"]
            ["pg_table_size" "v" 1 20 "26"]])
     "pg_class"
-    (mapv (fn [t]
-            (let [tbl-oid (or (pgs/table-oid cte-db t)
-                              (Math/abs (.hashCode ^String t)))]
-              {:pg_class/oid (long tbl-oid)
-               :pg_class/relname t
-               :pg_class/relnamespace 2200
-               :pg_class/relkind "r"
-               (pgs/row-marker-attr "pg_class") true}))
-          (pgs/table-names user-schema))
+    (into
+     (mapv (fn [t]
+             (let [tbl-oid (or (pgs/table-oid cte-db t)
+                               (Math/abs (.hashCode ^String t)))]
+               {:pg_class/oid (long tbl-oid)
+                :pg_class/relname t
+                :pg_class/relnamespace 2200
+                :pg_class/relkind "r"
+                (pgs/row-marker-attr "pg_class") true}))
+           (pgs/table-names user-schema))
+     ;; composite types get a pg_class row (relkind 'c'); asyncpg joins
+     ;; pg_type → pg_class on `reltype = type-oid`, and pg_attribute on
+     ;; `attrelid = pg_class.oid`. We use the type OID for both.
+     (mapv (fn [{:keys [name oid]}]
+             {:pg_class/oid oid
+              :pg_class/relname name
+              :pg_class/relnamespace 2200
+              :pg_class/relkind "c"
+              :pg_class/reltype oid
+              (pgs/row-marker-attr "pg_class") true})
+           (pgs/composite-types cte-db)))
     "pg_tables"
     (mapv (fn [t]
             {:pg_tables/schemaname "public"
