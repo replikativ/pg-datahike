@@ -374,6 +374,44 @@
     (instance? Delete stmt)            (.getWithItemsList ^Delete stmt)
     :else                              nil))
 
+(defn- plain-selects-in
+  "All PlainSelects reachable from a SELECT body, descending
+   ParenthesedSelect wrappers and SetOperationList (UNION/…) parts.
+   Used to walk WITH-CTE bodies for nested bind-param OIDs — asyncpg's
+   type introspection puts `$1::oid[]` inside a WITH RECURSIVE anchor,
+   which the top-level WHERE walk never sees."
+  [body]
+  (cond
+    (instance? PlainSelect body)       [body]
+    (instance? ParenthesedSelect body) (plain-selects-in (.getSelect ^ParenthesedSelect body))
+    (instance? SetOperationList body)  (vec (mapcat plain-selects-in (.getSelects ^SetOperationList body)))
+    :else                              []))
+
+(defn- cte-body-param-oids
+  "Walk every WITH-CTE body of `stmt` for bind-param OIDs (WHERE / JOIN-ON /
+   SELECT-list of each contained PlainSelect). Merged into the statement's
+   param-oids so a param nested in a CTE (e.g. asyncpg's
+   `WITH RECURSIVE … WHERE oid = ANY($1::oid[])`) is typed for
+   ParameterDescription. Best-effort."
+  [stmt schema]
+  (try
+    (apply merge
+           (for [^net.sf.jsqlparser.statement.select.WithItem wi (or (stmt-with-items stmt) [])
+                 :let [body (try (.getParenthesedStatement wi) (catch Throwable _ nil))]
+                 ^PlainSelect ps (plain-selects-in
+                                  (if (instance? ParenthesedSelect body)
+                                    (.getSelect ^ParenthesedSelect body)
+                                    body))
+                 :let [from-item (.getFromItem ps)
+                       tns (when (instance? Table from-item)
+                             (unquote-ident (.getName ^Table from-item)))
+                       aliases (params/collect-table-aliases from-item (.getJoins ps))]]
+             (merge (params/where-param-oids (.getWhere ps) schema tns aliases)
+                    (apply merge
+                           (for [^SelectItem si (or (.getSelectItems ps) [])]
+                             (params/where-param-oids (.getExpression si) schema tns aliases))))))
+    (catch Throwable _ nil)))
+
 (defn- materialize-withs!
   "Run the WITH-list fold for any statement type. Returns [enriched-db
    enriched-schema] with the speculative db carrying `:<cte>/<col>`
@@ -719,8 +757,11 @@
                                                    (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
                                                      (params/where-param-oids (.getExpression si)
                                                                               schema tns aliases)))
-                                            (catch Throwable _ nil))]
-                          (merge select-oids where-oids join-oids))))
+                                            (catch Throwable _ nil))
+                              ;; params nested in WITH-CTE bodies (asyncpg's
+                              ;; `WITH RECURSIVE … oid = ANY($1::oid[])`)
+                              cte-oids (cte-body-param-oids stmt schema)]
+                          (merge cte-oids select-oids where-oids join-oids))))
                 attach-params #(cond-> (assoc % :param-count param-count)
                                  (seq inferred-oids) (assoc :param-oids inferred-oids))
                 result
