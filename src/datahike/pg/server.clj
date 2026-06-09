@@ -21,6 +21,7 @@
             [datahike.db.interface :as dbi]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.records :as pg-rec]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql :as sql]
@@ -256,6 +257,9 @@
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
      (pg-arr/array? v) (pg-arr/to-pg-text v)
+    ;; PgRecord → PG canonical record_out text `(f1,f2,…)`. Checked before
+    ;; string?/vector? for the same defrecord reason as PgArray.
+     (pg-rec/record? v) (pg-rec/to-pg-text v)
      (string? v)  v
      (keyword? v) (if-let [ns (namespace v)]
                     (str ns "/" (name v))

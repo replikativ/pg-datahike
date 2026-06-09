@@ -364,6 +364,10 @@
         rule (or (get sql-aggregate->return-oid fname)
                  (get sql-fn->return-oid fname))]
     (cond
+      ;; ROW(...) — anonymous composite constructor → record OID (2249).
+      ;; A ::type cast wrapping it overrides via cast-oid.
+      (= fname "row") 2249
+
       ;; Aggregate rule (registered in sql-aggregate->return-oid) —
       ;; delegate to the shared resolver so runtime variant selection
       ;; (in stmt.clj) doesn't have to recompute the same logic.

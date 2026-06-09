@@ -45,6 +45,7 @@
             [datahike.pg.sql.oid-infer :as oid-infer]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.records :as pg-rec]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.coerce :as coerce]
@@ -172,6 +173,20 @@
                (mapv #(ctx/materialize-arg! ctx %) raw-args))
         result-var (ctx/fresh-var! ctx)]
     (cond
+      ;; ROW(a, b, …) — anonymous composite constructor. JSqlParser parses
+      ;; it as a Function named "row". Build a PgRecord at runtime from the
+      ;; field values, inferring each field's OID from its value (nested
+      ;; ROW → another PgRecord → record OID 2249). A ::type cast wrapping
+      ;; the ROW retypes it to the named composite; here it stays anonymous.
+      (= fname "row")
+      (let [fn-param (symbol (str "?row" (swap! (:var-counter ctx) inc)))
+            row-fn   (fn [& vals] (pg-rec/make-record types/infer-oid-from-value (vec vals)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj row-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; PG privilege-check functions (has_*_privilege). We run without
       ;; a privilege model — one user, one schema, all granted — so
       ;; return `true` unconditionally. Metabase's describe-database

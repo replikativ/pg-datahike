@@ -726,6 +726,12 @@
     (get element-oid->array-oid
          (get elem-kw->oid (:elem-type v))
          oid-text-array)
+    ;; PgRecord → its own type-oid (2249 for an anonymous ROW, else the
+    ;; named composite OID). Class-name check avoids a require-loop, as
+    ;; for PgArray above.
+    (and (some? v)
+         (= "datahike.pg.records.PgRecord" (.getName (class v))))
+    (or (:type-oid v) 2249)
     (instance? clojure.lang.Ratio v) oid-float8
     (instance? Long v)    oid-int8
     (instance? Integer v) oid-int4
