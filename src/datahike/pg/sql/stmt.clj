@@ -1113,6 +1113,31 @@
             (some (fn [[k _]] (and (keyword? k) (= (namespace k) tname)))
                   schema)))))
 
+(defn correlated-subquery-refs
+  "Given a scalar-subquery `inner` (a JSqlParser Select) and the set of
+   `outer-aliases` (lowercased outer FROM aliases/table names), return the
+   set of [outer-alias col] correlation references the inner makes, or nil
+   when uncorrelated.
+
+   Detection is lexical — it finds `alias.col` occurrences of an OUTER alias
+   in the inner SQL (negative-lookbehind so `xt.` doesn't match alias `t`).
+   Robust enough for catalog / introspection shapes; AST-precise detection
+   (which would also respect inner shadowing) is a later refinement. This is
+   the first slice of the correlated-subquery / LATERAL executor — see
+   doc/correlated-lateral-plan.md."
+  [inner outer-aliases]
+  (when (seq outer-aliases)
+    (let [sql (str inner)
+          refs (for [a outer-aliases
+                     [_ col] (re-seq
+                              (re-pattern
+                               (str "(?i)(?<![\\w.])"
+                                    (java.util.regex.Pattern/quote a)
+                                    "\\.([A-Za-z_][A-Za-z0-9_]*)"))
+                              sql)]
+                 [a (str/lower-case col)])]
+      (not-empty (set refs)))))
+
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
