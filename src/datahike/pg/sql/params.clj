@@ -600,6 +600,14 @@
                            (cond
                              (instance? Column comparand)
                              (record-param! p ^Column comparand)
+                             ;; `(a, b, …) OP $n` — the comparand is a row
+                             ;; constructor (multi-element ExpressionList), so
+                             ;; the param is an anonymous record (OID 2249).
+                             ;; PG / asyncpg use this to detect & reject
+                             ;; anonymous-composite param input.
+                             (and (instance? ExpressionList comparand)
+                                  (> (.size ^ExpressionList comparand) 1))
+                             (.put result (.getIndex p) 2249)
                              ;; `? OP <literal>` — borrow the literal's type
                              ;; when there's no column comparand.
                              :else
