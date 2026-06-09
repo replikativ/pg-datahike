@@ -654,6 +654,45 @@ public final class PgParamCodec {
         return out;
     }
 
+    /** PG numeric NaN sign word. */
+    private static final int NUMERIC_NAN = 0xC000;
+
+    /**
+     * Decode PG numeric_recv (the inverse of {@link #encodeNumeric}) to a
+     * BigDecimal. asyncpg sends numeric parameters in this binary form, so
+     * we must decode it (the text path alone left OID 1700 unsupported).
+     *   int16 ndigits, int16 weight, int16 sign, int16 dscale,
+     *   then ndigits base-10000 digits (each 0..9999).
+     */
+    private static BigDecimal decodeNumeric(ByteBuffer buf) {
+        int ndigits = buf.getShort() & 0xFFFF;
+        int weight  = buf.getShort();           // signed base-10000 position
+        int sign    = buf.getShort() & 0xFFFF;
+        int dscale  = buf.getShort() & 0xFFFF;
+        if (sign == NUMERIC_NAN) {
+            // BigDecimal has no NaN; surface clearly instead of corrupting.
+            throw new PgWireServer.PgProtocolException("0A000",
+                "NUMERIC 'NaN' is not supported as a binary parameter");
+        }
+        BigInteger unscaled = BigInteger.ZERO;
+        for (int i = 0; i < ndigits; i++) {
+            int d = buf.getShort() & 0xFFFF;    // base-10000 digit
+            unscaled = unscaled.multiply(BI_TEN_THOUSAND).add(BigInteger.valueOf(d));
+        }
+        // The least-significant digit sits at base-10000 position
+        // (weight - ndigits + 1); shift the concatenated integer there.
+        int exp = weight - ndigits + 1;
+        BigDecimal value = (exp >= 0)
+            ? new BigDecimal(unscaled.multiply(BI_TEN_THOUSAND.pow(exp)))
+            : new BigDecimal(unscaled, -exp * 4);   // 10000 = 10^4
+        if ((sign & 0xFFFF) == (NUMERIC_NEG & 0xFFFF)) value = value.negate();
+        // Honour PG's display scale (so 1.50 keeps two fractional digits).
+        if (dscale != value.scale()) {
+            value = value.setScale(dscale, java.math.RoundingMode.HALF_UP);
+        }
+        return value;
+    }
+
     public static byte[] encodeBinary(int oid, Object value) {
         if (value == null) return null;
         try {
@@ -799,6 +838,10 @@ public final class PgParamCodec {
                 (double) Float.intBitsToFloat(buf.getInt());
             case PgWireServer.OID_FLOAT8 ->
                 Double.longBitsToDouble(buf.getLong());
+
+            // numeric_recv — base-10000 digit vector (see decodeNumeric).
+            case PgWireServer.OID_NUMERIC ->
+                decodeNumeric(buf);
 
             // uuid_recv — 16 raw bytes (big-endian msb/lsb long pair).
             case PgWireServer.OID_UUID ->

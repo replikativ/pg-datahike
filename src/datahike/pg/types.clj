@@ -401,7 +401,14 @@
 (def cast-float-types
   "SQL type names that cast to floating point (Clojure double)."
   #{"double precision" "double" "float" "float4" "float8"
-    "real" "numeric" "decimal" "dec"})
+    "real"})
+
+(def cast-numeric-types
+  "SQL type names that cast to arbitrary-precision decimal (Clojure
+   bigdec / java.math.BigDecimal). Kept distinct from floats so a
+   `::numeric` cast preserves scale and precision (e.g. 0.001000) and
+   reports OID 1700 — asyncpg uses binary numeric, not float8."
+  #{"numeric" "decimal" "dec"})
 
 (def cast-text-types
   "SQL type names that cast to text (Clojure string)."
@@ -667,6 +674,7 @@
       (cond
         (clojure.string/ends-with? base "[]") :array
         (contains? cast-integer-types base)   :integer
+        (contains? cast-numeric-types base)   :numeric
         (contains? cast-float-types base)     :float
         (contains? cast-text-types base)      :text
         (contains? cast-boolean-types base)   :boolean
@@ -691,6 +699,7 @@
           (case cat
             :integer :int8
             :float   :float8
+            :numeric :numeric
             :text    :text
             :boolean :bool
             :date    :date

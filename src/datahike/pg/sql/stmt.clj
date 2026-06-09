@@ -2803,6 +2803,15 @@
 
      :else (str e))))
 
+(defn- apply-numeric-scale
+  "PG NUMERIC(p,s) rounds/pads a value to scale `s` on input (e.g. 1 →
+   1.00, 1.239 → 1.24). `scale` nil (unconstrained NUMERIC) leaves the
+   value's own scale untouched. Only acts on BigDecimals."
+  [v scale]
+  (if (and scale (instance? java.math.BigDecimal v))
+    (.setScale ^java.math.BigDecimal v (int scale) java.math.RoundingMode/HALF_UP)
+    v))
+
 (defn coerce-insert-value
   "Coerce a value to match the schema type for an attribute.
 
@@ -2818,7 +2827,8 @@
   [val attr schema]
   (when (some? val)
     (let [vtype     (get-in schema [attr :db/valueType])
-          elem-kw   (get-in schema [attr :pg/array-elem])]
+          elem-kw   (get-in schema [attr :pg/array-elem])
+          num-scale (get-in schema [attr :pg/numeric-scale])]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
@@ -2891,7 +2901,7 @@
         (case vtype
           :db.type/float  (coerce/coerce-numeric val :float)
           :db.type/double (coerce/coerce-numeric val :double)
-          :db.type/bigdec (coerce/coerce-numeric val :bigdec)
+          :db.type/bigdec (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
           :db.type/long   (coerce/coerce-numeric val :long)
           val)
         ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
@@ -2940,7 +2950,7 @@
         ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
         ;; bad-syntax strings instead of silently keeping the original.
         (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
-        (coerce/coerce-numeric val :bigdec)
+        (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
         (and (= vtype :db.type/instant) (string? val))
         (expr/parse-timestamp-string val)
         (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
@@ -3334,11 +3344,26 @@
                                    [?e :pg/array-elem ?elem]
                                    [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
                          db))
-                  (catch Throwable _ {}))]
+                  (catch Throwable _ {}))
+        ;; NUMERIC(p,s): surface the declared scale so INSERT coercion can
+        ;; round/pad values to it (PG numeric(p,s) input semantics). Only
+        ;; constrained columns carry :pg/typmod; unconstrained `numeric`
+        ;; has none, so its scale is left intact.
+        scale-meta (try
+                     (into {}
+                           (keep (fn [[ident typmod]]
+                                   (let [[_p s] (types/decode-numeric-typmod typmod)]
+                                     (when s [ident {:pg/numeric-scale s}]))))
+                           (d/q
+                            '{:find  [?ident ?typmod]
+                              :where [[?e :db/ident ?ident]
+                                      [?e :pg/typmod ?typmod]]}
+                            db))
+                     (catch Throwable _ {}))]
     (reduce-kv (fn [s ident more] (update s ident merge more))
-               schema pg-meta)))
+               schema (merge-with merge pg-meta scale-meta))))
 
-(defn- enrich-schema-with-pg-array-meta
+(defn enrich-schema-with-pg-array-meta
   "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
    metadata like `:pg/array-elem` lives as ident-entity facts. For
    array column INSERTs we need that metadata available via

@@ -941,17 +941,35 @@
                                      (= :quoted (:type t1))))
              (str/lower-case (ident-text t1)))}))
 
-(defn- classify-set
-  "SET name = value / SET TIME ZONE '…' / SET SESSION AUTHORIZATION …
-
-   Returns {:kind :set :var \"fullname\" :value \"raw text\"}. Known
-   temporal vars (datahike.as_of/.since/.history) are pre-extracted so
-   the server can look at :value without re-parsing."
+(defn- isolation-level-after
+  "Scan `toks` for `ISOLATION LEVEL <level>` and return the level as a
+   PG-canonical lowercased, space-separated string (\"read committed\",
+   \"read uncommitted\", \"repeatable read\", \"serializable\"), or nil if
+   the phrase isn't present. Used by SET SESSION CHARACTERISTICS, SET
+   TRANSACTION, and BEGIN/START TRANSACTION."
   [toks]
-  (let [;; Skip optional LOCAL/SESSION modifier
-        toks (if (kw-in? (first toks) #{"local" "session"})
-               (rest toks) toks)
-        [var-name after-var] (read-dotted-name toks)
+  (let [v (vec toks)
+        n (count v)]
+    (loop [i 0]
+      (cond
+        (>= i (dec n)) nil
+        (and (kw=? (nth v i) "isolation") (kw=? (nth v (inc i) nil) "level"))
+        (let [a (nth v (+ i 2) nil)
+              b (nth v (+ i 3) nil)
+              w1 (when (ident-tok? a) (str/lower-case (ident-text a)))
+              w2 (when (ident-tok? b) (str/lower-case (ident-text b)))]
+          (cond
+            (nil? w1) nil
+            (= w1 "serializable") "serializable"
+            (and (= w1 "read") w2)       (str "read " w2)
+            (and (= w1 "repeatable") w2) (str "repeatable " w2)
+            :else w1))
+        :else (recur (inc i))))))
+
+(defn- classify-set*
+  "Generic SET name = value branch (no isolation special-casing)."
+  [toks]
+  (let [[var-name after-var] (read-dotted-name toks)
         ;; Skip optional = or TO
         after-eq (if (or (= "=" (:text (first after-var)))
                          (kw=? (first after-var) "to"))
@@ -964,6 +982,37 @@
                     (ident-tok? first-val) (ident-text first-val)
                     :else nil)]
     {:kind :set :var var-name :value value-str}))
+
+(defn- classify-set
+  "SET name = value / SET TIME ZONE '…' / SET SESSION AUTHORIZATION …
+   / SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …
+   / SET [LOCAL] TRANSACTION ISOLATION LEVEL …
+
+   Returns {:kind :set :var \"fullname\" :value \"raw text\"}. Known
+   temporal vars (datahike.as_of/.since/.history) are pre-extracted so
+   the server can look at :value without re-parsing. Isolation-level
+   forms get their own kinds so the server can track the session/tx
+   isolation that `SHOW transaction_isolation` must reflect."
+  [toks]
+  (let [;; Skip optional LOCAL/SESSION modifier
+        toks (if (kw-in? (first toks) #{"local" "session"})
+               (rest toks) toks)]
+    (cond
+      ;; SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <lvl>
+      ;; (and/or READ ONLY|WRITE — the READ-only part is a no-op for us).
+      (kw=? (first toks) "characteristics")
+      (if-let [lvl (isolation-level-after toks)]
+        {:kind :set-session-isolation :value lvl}
+        {:kind :set :var "session_characteristics"})
+
+      ;; SET [LOCAL] TRANSACTION ISOLATION LEVEL <lvl> (per-tx override).
+      (kw=? (first toks) "transaction")
+      (if-let [lvl (isolation-level-after toks)]
+        {:kind :set-transaction-isolation :value lvl}
+        {:kind :set :var "transaction"})
+
+      :else
+      (classify-set* toks))))
 
 (def ^:private psql-metacommand-names
   "Lower-case psql metacommand names that pg_dump emits unprefixed
@@ -1034,9 +1083,13 @@
           "copy"    {:kind :copy-from-stdin :tag "COPY"}
 
           ;; --- Transaction control
-          "begin"   {:kind :begin}
+          "begin"   (cond-> {:kind :begin}
+                      (isolation-level-after rest-toks)
+                      (assoc :isolation (isolation-level-after rest-toks)))
           "start"   (if (kw=? (first rest-toks) "transaction")
-                      {:kind :begin}
+                      (cond-> {:kind :begin}
+                        (isolation-level-after rest-toks)
+                        (assoc :isolation (isolation-level-after rest-toks)))
                       {:kind :generic-sql})
           "commit"  {:kind :commit}
           "end"     (if (or (nil? (first rest-toks))
@@ -1072,6 +1125,17 @@
           "set"     (classify-set rest-toks)
           "reset"   {:kind :reset :var (first (read-dotted-name rest-toks))}
           "show"    {:kind :show  :var (first (read-dotted-name rest-toks))}
+
+          ;; --- LISTEN / UNLISTEN / NOTIFY (async notification channels).
+          ;; pg-datahike has no notification delivery, so these are
+          ;; observably no-ops (a NOTIFY with zero subscribers ==
+          ;; delivered-and-ignored). JSqlParser can't parse UNLISTEN at
+          ;; all, so they MUST be intercepted here. asyncpg's pool reset
+          ;; query (`get_reset_query`) sends `UNLISTEN *` on every
+          ;; connection release.
+          "listen"   {:kind :listen-noop   :tag "LISTEN"}
+          "unlisten" {:kind :unlisten-noop :tag "UNLISTEN"}
+          "notify"   {:kind :notify-noop   :tag "NOTIFY"}
 
           ;; --- No-op DDL and maintenance
           "comment" {:kind :comment-on}

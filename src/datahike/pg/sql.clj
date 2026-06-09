@@ -661,8 +661,22 @@
                                                  (for [^Join j (or joins [])]
                                                    (params/where-param-oids (.getOnExpression j)
                                                                             schema tns aliases)))
-                                          (catch Throwable _ nil))]
-                          (merge where-oids join-oids))))
+                                          (catch Throwable _ nil))
+                              ;; SELECT-list expressions can carry params too
+                              ;; (e.g. `SELECT 1 = $1`, `SELECT $1::int`,
+                              ;; `SELECT col = $1`). where-param-oids walks an
+                              ;; arbitrary expression for `… OP $n` / CAST and
+                              ;; borrows the comparand/literal/cast type, so
+                              ;; reuse it per select item. Without this the
+                              ;; param stays undetermined → TEXT, and a client
+                              ;; binding e.g. an int fails to encode.
+                              select-oids (try
+                                            (apply merge
+                                                   (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
+                                                     (params/where-param-oids (.getExpression si)
+                                                                              schema tns aliases)))
+                                            (catch Throwable _ nil))]
+                          (merge select-oids where-oids join-oids))))
                 attach-params #(cond-> (assoc % :param-count param-count)
                                  (seq inferred-oids) (assoc :param-oids inferred-oids))
                 result
@@ -1296,10 +1310,14 @@
                   (when (and placeholder-parsed
                              (= :insert (:type placeholder-parsed))
                              (vector? (:tx-data placeholder-parsed)))
+                    ;; Enrich the schema with pg metadata (NUMERIC(p,s)
+                    ;; scale, array-elem) so the fast-path literal coercion
+                    ;; rounds/pads numerics to their declared scale — same as
+                    ;; translate-insert's slow path. Memoised per schema.
                     (when-let [substituted (template/typed-substitute
                                             placeholder-parsed
                                             (:literals tem)
-                                            schema)]
+                                            (stmt/enrich-schema-with-pg-array-meta schema db))]
                       ;; Reset placeholder counts on the substituted result
                       ;; — pgjdbc parsed the ORIGINAL SQL (no `?`) and pre-
                       ;; sized its SimpleParameterList for that. If we

@@ -1233,6 +1233,16 @@
     :declare-cursor :fetch-cursor :close-cursor :move-cursor
     :begin :commit :savepoint :release-savepoint :rollback-to-savepoint
     :discard-all :discard-scoped
+    ;; RESET ALL / RESET <var> (datahike.* + statement_timeout RESETs are
+    ;; intercepted earlier in the simple-query path; everything else
+    ;; lands on the :reset handler). LISTEN/UNLISTEN/NOTIFY are no-ops
+    ;; (no notification delivery) — UNLISTEN especially must bypass
+    ;; JSqlParser, which can't parse it. All hit asyncpg's pool reset.
+    :reset :listen-noop :unlisten-noop :notify-noop
+    ;; Transaction isolation level: SET SESSION CHARACTERISTICS … and
+    ;; SET [LOCAL] TRANSACTION ISOLATION LEVEL … track the session/tx
+    ;; isolation that SHOW transaction_isolation must report back.
+    :set-session-isolation :set-transaction-isolation
     :version :now :current-schema :current-database
     :pg-keywords :nextval :currval :setval
     :try-advisory-xact-lock :try-advisory-lock

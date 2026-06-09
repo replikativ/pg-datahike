@@ -15,6 +15,7 @@
      (pg/stop-server server)"
   (:require [clojure.string :as str]
             [clojure.set]
+            [clojure.walk :as walk]
             [datahike.api :as d]
             [datahike.core :as dc]
             [datahike.db.interface :as dbi]
@@ -32,7 +33,7 @@
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
-            PgWireServer$QueryHandlerFactory]
+            PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select PlainSelect Limit Offset]
            [net.sf.jsqlparser.expression LongValue]))
@@ -91,11 +92,17 @@
   (reset! lock-registry {}))
 
 (defn- release-session-locks!
-  "Remove all entries in the global lock registry owned by `session-id`."
+  "Remove all entries in the global lock registry owned by `session-id`.
+   Hot path: end-tx! calls this on every transaction (now including every
+   autocommit write, which opens an implicit tx). Skip the global-atom
+   rebuild + write when this session holds no row locks — a cheap read of
+   a usually-empty map instead of a swap! that contends with every other
+   connection."
   [session-id]
-  (swap! lock-registry
-         (fn [reg]
-           (into {} (remove (fn [[_ sid]] (= sid session-id)) reg)))))
+  (when (some (fn [[_ sid]] (= sid session-id)) @lock-registry)
+    (swap! lock-registry
+           (fn [reg]
+             (into {} (remove (fn [[_ sid]] (= sid session-id)) reg))))))
 
 ;; ============================================================================
 ;; Advisory locks (pg_advisory_lock / pg_try_advisory_lock / …).
@@ -188,13 +195,13 @@
    release all (called from session close and DISCARD ALL)."
   ([session-id] (release-advisory-locks! session-id false))
   ([session-id xact-only?]
-   (swap! advisory-locks
-          (fn [m]
-            (into {}
-                  (remove (fn [[_k v]]
-                            (and (= (:session-id v) session-id)
-                                 (or (not xact-only?) (:xact? v)))))
-                  m)))))
+   ;; Hot path (end-tx! on every implicit-tx commit): skip the global
+   ;; rebuild + write when this session holds no matching advisory lock.
+   (let [match? (fn [v] (and (= (:session-id v) session-id)
+                             (or (not xact-only?) (:xact? v))))]
+     (when (some match? (vals @advisory-locks))
+       (swap! advisory-locks
+              (fn [m] (into {} (remove (fn [[_k v]] (match? v))) m)))))))
 
 (defn- parse-advisory-key
   "Extract the advisory-lock key from a parsed pg_advisory_lock* map.
@@ -243,18 +250,18 @@
   ([v] (value->string v nil))
   ([v oid]
    (cond
-    (nil? v)           nil
-    (= :__null__ v)    nil  ;; LEFT JOIN sentinel → SQL NULL
+     (nil? v)           nil
+     (= :__null__ v)    nil  ;; LEFT JOIN sentinel → SQL NULL
     ;; PgArray → PG canonical array text format `{…}` (see
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
-    (pg-arr/array? v) (pg-arr/to-pg-text v)
-    (string? v)  v
-    (keyword? v) (if-let [ns (namespace v)]
-                   (str ns "/" (name v))
-                   (name v))
-    (boolean? v) (if v "t" "f")
-    (instance? clojure.lang.Ratio v) (str (double v))
+     (pg-arr/array? v) (pg-arr/to-pg-text v)
+     (string? v)  v
+     (keyword? v) (if-let [ns (namespace v)]
+                    (str ns "/" (name v))
+                    (name v))
+     (boolean? v) (if v "t" "f")
+     (instance? clojure.lang.Ratio v) (str (double v))
     ;; PG float text format emits the shortest round-trip representation,
     ;; so 1.0/-2.0/0.0 come across as "1"/"-2"/"0" (no ".0" suffix).
     ;; Java's Double/Float toString always appends ".0" for whole-valued
@@ -262,43 +269,43 @@
     ;; normalization. pgjdbc's getBoolean on a float column routes
     ;; through string parsing in text protocol and only accepts
     ;; "0"/"1"/"true"/... — never "0.0"/"1.0".
-    (and (or (instance? Float v) (instance? Double v))
-         (let [d (double v)]
-           (and (Double/isFinite d)
-                (== d (Math/rint d))
-                (< (Math/abs d) 1e15))))
-    (let [d (double v)
+     (and (or (instance? Float v) (instance? Double v))
+          (let [d (double v)]
+            (and (Double/isFinite d)
+                 (== d (Math/rint d))
+                 (< (Math/abs d) 1e15))))
+     (let [d (double v)
           ;; Normalize -0.0 to 0.0 for both Float and Double (pgjdbc's
           ;; boolean/number parsers accept "0" but not "-0").
-          v (if (zero? d) 0.0 v)
-          s (str v)]
-      (if (str/ends-with? s ".0") (subs s 0 (- (count s) 2)) s))
+           v (if (zero? d) 0.0 v)
+           s (str v)]
+       (if (str/ends-with? s ".0") (subs s 0 (- (count s) 2)) s))
     ;; CAST results carry a Java type that encodes the source SQL type,
     ;; so we can emit the PG-correct text form without dragging the
     ;; timestamp through a lossy date-only conversion.
-    (instance? java.time.LocalDate v) (str v)       ;; "2017-03-13"
-    (instance? java.time.LocalTime v) (str v)       ;; "14:25:48.130861"
-    (instance? java.time.LocalDateTime v)           ;; "2017-03-13 14:25:48.130861"
-    (-> (str v) (str/replace "T" " "))
-    (inst? v)    (let [^java.time.Instant inst
-                       (if (instance? java.util.Date v)
-                         (.toInstant ^java.util.Date v)
-                         (if (instance? java.time.Instant v)
-                           v
-                           (.toInstant ^java.util.Date v)))
+     (instance? java.time.LocalDate v) (str v)       ;; "2017-03-13"
+     (instance? java.time.LocalTime v) (str v)       ;; "14:25:48.130861"
+     (instance? java.time.LocalDateTime v)           ;; "2017-03-13 14:25:48.130861"
+     (-> (str v) (str/replace "T" " "))
+     (inst? v)    (let [^java.time.Instant inst
+                        (if (instance? java.util.Date v)
+                          (.toInstant ^java.util.Date v)
+                          (if (instance? java.time.Instant v)
+                            v
+                            (.toInstant ^java.util.Date v)))
                         ;; ISO-8601 format: 2024-01-15T10:30:00Z → 2024-01-15 10:30:00
-                       s (str inst)]
-                   (-> s
-                       (str/replace "T" " ")
+                        s (str inst)]
+                    (-> s
+                        (str/replace "T" " ")
                        ;; timestamptz keeps a UTC offset; timestamp drops it.
-                       (str/replace "Z" (if (= oid PgWireServer/OID_TIMESTAMPTZ) "+00" ""))))
-    (uuid? v)    (str v)
-    (symbol? v)  (str v)
-    (bytes? v)   "<bytes>"
+                        (str/replace "Z" (if (= oid PgWireServer/OID_TIMESTAMPTZ) "+00" ""))))
+     (uuid? v)    (str v)
+     (symbol? v)  (str v)
+     (bytes? v)   "<bytes>"
     ;; Maps and vectors (jsonb values) → serialize as JSON
-    (map? v)     (jb/serialize-jsonb v)
-    (vector? v)  (jb/serialize-jsonb v)
-    :else        (str v))))
+     (map? v)     (jb/serialize-jsonb v)
+     (vector? v)  (jb/serialize-jsonb v)
+     :else        (str v))))
 
 (defn- infer-oid
   "Infer a PostgreSQL type OID from a Clojure value.
@@ -581,7 +588,7 @@
                                                     (aget ^ints oids i))))
                                              row)
                                             [(value->string row (when (pos? (alength ^ints oids))
-                                                                   (aget ^ints oids 0)))]))))
+                                                                  (aget ^ints oids 0)))]))))
                 (into-array (Class/forName "[Ljava.lang.String;")
                             (make-array String 0 0)))]
      (PgWireServer$QueryResult.
@@ -905,10 +912,24 @@
                [(into-array String [(or value "")])])
    "SHOW"))
 
+(def ^:private default-isolation
+  "PostgreSQL's out-of-the-box default_transaction_isolation."
+  "read committed")
+
+(defn- effective-isolation
+  "The isolation level SHOW transaction_isolation must report: the
+   active transaction's level when one was set via BEGIN/SET TRANSACTION,
+   otherwise the session default (SET SESSION CHARACTERISTICS), otherwise
+   PG's built-in default."
+  [tx-state session-state]
+  (or (when (and tx-state (:in-tx? @tx-state)) (:isolation @tx-state))
+      (when session-state (:isolation @session-state))
+      default-isolation))
+
 (defn- handle-show
   "Returns the value of a session setting. `setting-name` is already
    lowercased (classify supplies it via :var)."
-  [^String setting-name schema session-state]
+  [^String setting-name schema session-state tx-state]
   (let [setting-name (or setting-name "")]
     (cond
       (= setting-name "tables")
@@ -922,8 +943,19 @@
          rows
          (str "SELECT " (count tables))))
 
+      ;; SET SESSION CHARACTERISTICS sets this; it's the per-session
+      ;; default a transaction inherits when it doesn't override.
+      (= setting-name "default_transaction_isolation")
+      (show-setting "default_transaction_isolation"
+                    (or (when session-state (:isolation @session-state))
+                        default-isolation))
+
+      ;; `SHOW transaction_isolation` and `SHOW TRANSACTION ISOLATION
+      ;; LEVEL` (classify yields :var "transaction" for the latter) report
+      ;; the *effective* level for the current (possibly implicit) tx.
       (str/starts-with? setting-name "transaction")
-      (show-setting "transaction_isolation" "read committed")
+      (show-setting "transaction_isolation"
+                    (effective-isolation tx-state session-state))
 
       ;; statement_timeout: report the session-local value (ms) or 0.
       (= setting-name "statement_timeout")
@@ -999,12 +1031,20 @@
                                (for [row rows]
                                  (into-array String (map value->string row))))
         col-name-array (into-array String col-names)
-        ;; Derive OIDs from schema types for proper client-side type mapping
-        oids (int-array (map (fn [attr]
-                               (if-let [vtype (get-in schema [attr :db/valueType])]
-                                 (pgs/oid-for-valuetype vtype)
-                                 PgWireServer/OID_TEXT))
-                             attrs))]
+        ;; Derive OIDs from column-info so the declared :pg/type wins
+        ;; (e.g. int4 columns report 23, not the storage type int8/20).
+        ;; This MUST match what the extended-protocol Describe advertises
+        ;; for the same RETURNING shape — otherwise a binary-format client
+        ;; (asyncpg) decodes the row against the wrong width. Fall back to
+        ;; the storage valueType, then text, for anything column-info
+        ;; doesn't surface (expressions, inherited renames).
+        by-name (into {} (map (juxt :name :oid)) (pgs/column-info schema table-name db))
+        oids (int-array (map (fn [cn attr]
+                               (int (or (get by-name cn)
+                                        (when-let [vtype (get-in schema [attr :db/valueType])]
+                                          (pgs/oid-for-valuetype vtype))
+                                        PgWireServer/OID_TEXT)))
+                             col-names attrs))]
     (PgWireServer$QueryResult.
      col-name-array oids row-arrays
      (str "INSERT 0 " (count eids)))))
@@ -2613,6 +2653,19 @@
    the normal Simple / Extended Query paths."
   nil)
 
+(def ^:private ^:dynamic *implicit-tx-allowed*
+  "When true (bound by executePrepared for the extended-query path), a
+   write executed outside an explicit BEGIN block opens an *implicit*
+   transaction in tx-state instead of auto-committing. PostgreSQL runs
+   every extended-query message group (the messages up to the next Sync)
+   as one implicit transaction; we mirror that by accumulating the
+   group's writes speculatively and committing them at Sync
+   (commitImplicit), so the whole group is atomic and a trailing
+   ROLLBACK / mid-group error rolls it back. The simple-query path leaves
+   this false until that path is unified too (see
+   doc/implicit-transaction-plan.md)."
+  false)
+
 (defn- resolve-param-refs
   "Given a parsed result from sql/parse-sql and a 1-indexed `bound`
    vector (element 0 unused), return a parsed result with all
@@ -3049,12 +3102,16 @@
 ;; --- Transaction handlers ---------------------------------------------------
 
 (defn- handle-begin
-  [{:keys [conn tx-state session-state]} _parsed]
+  [{:keys [conn tx-state session-state]} parsed]
   (if (:in-tx? @tx-state)
     (tag-tx-status (empty-result "BEGIN") tx-state)
     (let [real-db (d/db conn)]
       (swap! tx-state assoc
              :in-tx? true :aborted? false :tx-buffer []
+             ;; `BEGIN ISOLATION LEVEL X` pins the tx's level (classify
+             ;; supplies :isolation); nil means inherit the session
+             ;; default — effective-isolation handles the fallback.
+             :isolation (:isolation parsed)
              :speculative-db (apply-temporal real-db session-state)
              ;; Snapshot :max-tx at BEGIN so COMMIT can detect concurrent
              ;; writes by other sessions (emits 40001 serialization_failure
@@ -3062,6 +3119,21 @@
              :begin-max-tx (:max-tx real-db)
              :eid->tempid {} :savepoints [])
       (tag-tx-status (empty-result "BEGIN") tx-state))))
+
+(defn- open-implicit-tx!
+  "Open an IMPLICIT transaction (no client BEGIN) for a write that lands
+   outside an explicit block, so the rest of its message group runs in
+   the same speculative transaction and commits/rolls-back atomically at
+   the group boundary (commitImplicit). Same shape as handle-begin but
+   tagged :implicit? — the difference is who commits it (the wire layer
+   at Sync, not a client COMMIT). See doc/implicit-transaction-plan.md."
+  [{:keys [conn tx-state session-state]}]
+  (let [real-db (d/db conn)]
+    (swap! tx-state assoc
+           :in-tx? true :implicit? true :aborted? false :tx-buffer []
+           :speculative-db (apply-temporal real-db session-state)
+           :begin-max-tx (:max-tx real-db)
+           :eid->tempid {} :savepoints [])))
 
 (defn- handle-savepoint
   "Savepoint names are unique within a tx but may be reused after RELEASE.
@@ -3100,59 +3172,76 @@
       (do (swap! tx-state update :savepoints subvec 0 idx)
           (empty-result "RELEASE SAVEPOINT")))))
 
+(defn- transact-tx-buffer!
+  "Commit the accumulated transaction buffer to `conn`, with the same
+   concurrent-write (40001 serialization_failure) detection as an
+   explicit COMMIT. Throws on conflict or transact failure; the caller
+   resets tx-state. Shared by explicit COMMIT and the implicit-group
+   commit so both behave identically."
+  [conn tx-state]
+  (let [buf (:tx-buffer @tx-state)
+        begin-max-tx (:begin-max-tx @tx-state)
+        real-db (d/db conn)
+        current-max-tx (when begin-max-tx (:max-tx real-db))
+        advanced? (and begin-max-tx current-max-tx
+                       (> current-max-tx begin-max-tx))]
+    ;; Concurrent-write detection: fire 40001 only when our write set
+    ;; overlaps a concurrent committer's. Wildcard case (retractEntity)
+    ;; falls back to the pessimistic "any concurrent write conflicts".
+    (when (and (seq buf) advanced?)
+      (let [our-attrs   (tx-buffer-attrs buf)
+            wildcard?   (contains? our-attrs ::wildcard)
+            their-attrs (concurrent-write-attrs real-db begin-max-tx)
+            conflict?   (or wildcard?
+                            (= their-attrs ::any)
+                            (some their-attrs our-attrs))]
+        (when conflict?
+          (throw (ex-info "could not serialize access due to concurrent update"
+                          {:error  :serialization-failure
+                           :detail (str "base=" begin-max-tx
+                                        ", current=" current-max-tx
+                                        ", overlap="
+                                        (cond wildcard? "wildcard (retractEntity)"
+                                              (= their-attrs ::any) "query-failed"
+                                              :else (pr-str
+                                                     (filter their-attrs our-attrs))))})))))
+    (when (seq buf) (d/transact conn buf))))
+
+(defn- end-tx!
+  "Release this session's locks and reset tx-state to not-in-tx. Used at
+   the end of every transaction (explicit or implicit, commit or abort)."
+  [session-id tx-state]
+  (release-session-locks! session-id)
+  (release-advisory-locks! session-id true)
+  (swap! tx-state assoc
+         :in-tx? false :implicit? false :aborted? false
+         :owned-locks #{}))
+
+(def ^:private write-parse-types
+  "Parsed :type values that mutate the database. A write executed in an
+   extended-query group outside an explicit BEGIN opens an implicit
+   transaction (see open-implicit-tx! / *implicit-tx-allowed*) so the
+   whole group is atomic. COPY is excluded — it runs its own sub-protocol
+   and commits separately."
+  #{:insert :update :update-with-recursive :delete
+    :ddl-create :ddl-create-sequence :ddl-create-enum :ddl-create-domain
+    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-sequence})
+
 (defn- handle-commit
   [{:keys [conn session-id tx-state]} _parsed]
   (if (:in-tx? @tx-state)
     (try
-      (let [buf (:tx-buffer @tx-state)
-            begin-max-tx (:begin-max-tx @tx-state)
-            real-db (d/db conn)
-            current-max-tx (when begin-max-tx (:max-tx real-db))
-            advanced? (and begin-max-tx current-max-tx
-                           (> current-max-tx begin-max-tx))]
-        ;; Concurrent-write detection: fire 40001 only when our write set
-        ;; overlaps a concurrent committer's. Wildcard case (retractEntity)
-        ;; falls back to the pessimistic "any concurrent write conflicts".
-        (when (and (seq buf) advanced?)
-          (let [our-attrs   (tx-buffer-attrs buf)
-                wildcard?   (contains? our-attrs ::wildcard)
-                their-attrs (concurrent-write-attrs real-db begin-max-tx)
-                conflict?   (or wildcard?
-                                (= their-attrs ::any)
-                                (some their-attrs our-attrs))]
-            (when conflict?
-              (throw (ex-info "could not serialize access due to concurrent update"
-                              {:error  :serialization-failure
-                               :detail (str "base=" begin-max-tx
-                                            ", current=" current-max-tx
-                                            ", overlap="
-                                            (cond wildcard? "wildcard (retractEntity)"
-                                                  (= their-attrs ::any) "query-failed"
-                                                  :else (pr-str
-                                                         (filter their-attrs our-attrs))))})))))
-        (when (seq buf) (d/transact conn buf))
-        (release-session-locks! session-id)
-        (release-advisory-locks! session-id true)
-        (swap! tx-state assoc
-               :in-tx? false :aborted? false
-               :owned-locks #{})
-        (tag-tx-status (empty-result "COMMIT") tx-state))
+      (transact-tx-buffer! conn tx-state)
+      (end-tx! session-id tx-state)
+      (tag-tx-status (empty-result "COMMIT") tx-state)
       (catch Exception e
-        (release-session-locks! session-id)
-        (release-advisory-locks! session-id true)
-        (swap! tx-state assoc
-               :in-tx? false :aborted? false
-               :owned-locks #{})
+        (end-tx! session-id tx-state)
         (classified-error "COMMIT failed: " e)))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
   [{:keys [session-id tx-state]} _parsed]
-  (release-session-locks! session-id)
-  (release-advisory-locks! session-id true)
-  (swap! tx-state assoc
-         :in-tx? false :aborted? false
-         :owned-locks #{})
+  (end-tx! session-id tx-state)
   (tag-tx-status (empty-result "ROLLBACK") tx-state))
 
 (defn- handle-rollback-to-savepoint
@@ -3212,6 +3301,25 @@
   (reset! sql-prepared {})
   (reset! cursors {})
   (empty-result "DISCARD ALL"))
+
+(def ^:private session-guc-keys
+  "Session-state keys that behave as resettable GUCs. RESET ALL clears
+   these but preserves connection-identity keys (e.g. :db-name)."
+  [:as-of :since :history :branch :commit-id
+   :valid-at :valid-from :valid-to :statement-timeout :isolation])
+
+(defn- handle-reset
+  "RESET ALL / RESET <var>. The datahike.* temporal vars and
+   statement_timeout RESETs are intercepted earlier in the simple-query
+   path (parse-temporal-set / parse-statement-timeout), so by the time a
+   RESET reaches here it is either `RESET ALL` (clear every session GUC,
+   keeping connection identity) or an unknown single var. Real PG
+   silently accepts RESET of any settable GUC, so the single-var case is
+   a no-op. asyncpg's pool reset sends `RESET ALL` on every release."
+  [{:keys [session-state]} parsed]
+  (when (= "all" (some-> (:var parsed) str/lower-case))
+    (swap! session-state #(apply dissoc % session-guc-keys)))
+  (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
 
@@ -3710,6 +3818,14 @@
       ;; report the actual variant in the command tag. classify
       ;; exposes the lowercased scope.
       (empty-result (str "DISCARD " (str/upper-case (:scope parsed))))
+
+      :reset         (handle-reset ctx parsed)
+      ;; LISTEN / UNLISTEN / NOTIFY — no notification delivery, so these
+      ;; are observable no-ops. classify carries the original verb as
+      ;; :tag. asyncpg's pool reset sends `UNLISTEN *` on every release.
+      :listen-noop   (empty-result (:tag parsed))
+      :unlisten-noop (empty-result (:tag parsed))
+      :notify-noop   (empty-result (:tag parsed))
       :comment-on (empty-result "COMMENT")
       :lock-table (empty-result "LOCK TABLE")
       :maintenance-noop
@@ -3866,8 +3982,22 @@
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
       :get-field-metadata (handle-get-field-metadata ctx parsed)
 
+      ;; Transaction isolation level. SET SESSION CHARACTERISTICS sets the
+      ;; session default; SET [LOCAL] TRANSACTION sets the current tx's
+      ;; level (PG: only valid inside a tx block — we accept it as a
+      ;; session default when outside, which is harmless). classify
+      ;; supplies the canonical lowercased level in :value.
+      :set-session-isolation
+      (do (swap! session-state assoc :isolation (:value parsed))
+          (empty-result "SET"))
+      :set-transaction-isolation
+      (do (if (:in-tx? @tx-state)
+            (swap! tx-state assoc :isolation (:value parsed))
+            (swap! session-state assoc :isolation (:value parsed)))
+          (empty-result "SET"))
+
       ;; Simple info queries
-      :show              (handle-show (:var parsed) schema session-state)
+      :show              (handle-show (:var parsed) schema session-state tx-state)
       :version           (handle-version)
       :pg-keywords       (handle-pg-keywords ctx parsed)
       :current-schema    (handle-current-schema)
@@ -4173,46 +4303,41 @@
                 (.withColumnTypmods (nth sources 2)))
             result))))))
 
-(defn- exec-batchable-insert
-  "Append-time half of deferred-CC batching. Builds the same tx-data
-   as `execute-insert` (auto-populate-identity + apply-column-
-   constraints), validates it via `dc/with` against the running
-   speculative-db, and — on success — returns a `withBatchable`
-   QueryResult so the wire layer holds the CommandComplete and parks
-   the tx-data into its per-connection buffer.
+(defn- remap-tempids
+  "Rewrite every string tempid in `form` (any string sitting in a
+   `:db/id` position, plus every other occurrence of that same string —
+   datahike resolves such strings as tempid references) by appending
+   `suffix`. Returns `form` unchanged when it carries no tempids.
 
-   Constraint violations (NOT NULL, CHECK, FK, etc.) fire here via
-   `dc/with` and surface synchronously: matches PG's IMMEDIATE
-   constraint behaviour for auto-commit. Only system-level errors
-   (konserve I/O) and cross-connection races against another
-   connection's commit can land at flush time."
-  [ctx parsed batch-state]
-  (let [{:keys [conn]} ctx
-        table-name (:table parsed)
-        ;; Anchor on the spec-db when present so consecutive batched
-        ;; INSERTs see each other's effects (sequence increments,
-        ;; uniqueness, FKs to siblings). First call in a scope reads
-        ;; live db.
-        anchor-db (or (:spec-db @batch-state) (d/db conn))
-        tx-wrap (or (:tx-wrap ctx) identity)
-        tx-data (-> (:tx-data parsed)
-                    (auto-populate-identity table-name anchor-db)
-                    (apply-column-constraints table-name (:ns parsed) anchor-db)
-                    tx-wrap)]
-    (try
-      (let [spec-report (dc/with anchor-db tx-data)]
-        ;; Update the running spec-db so the next batchable INSERT
-        ;; sees this row. The wire layer keeps the parallel tx-data
-        ;; list and CommandComplete tags.
-        (swap! batch-state assoc :spec-db (:db-after spec-report))
-        (.withBatchable ^PgWireServer$QueryResult
-         (empty-result (str "INSERT 0 " (:count parsed)))
-                        tx-data))
-      (catch Exception e
-        ;; Synchronous validation failure — return a normal error
-        ;; result. The batch state isn't updated, so subsequent
-        ;; statements continue from the prior spec-db / live db.
-        (classified-error "INSERT error: " e)))))
+   Why this exists: a prepared INSERT bakes a single `(gensym \"new-…\")`
+   tempid into its parsed `:tx-data`, and parse-sql results are LRU-
+   cached / prepared statements are reused — so the SAME tempid string
+   recurs on every execution of one statement. Committing several such
+   executions in ONE `d/transact` (an implicit-tx group / executemany)
+   would make datahike resolve the repeated tempid to a single entity and
+   collapse the rows (last-writer-wins). Giving each execution a distinct
+   tempid keeps every row its own entity."
+  [form suffix]
+  (let [tempids (volatile! #{})]
+    (walk/postwalk
+     (fn [x] (when (and (map? x) (string? (:db/id x)))
+               (vswap! tempids conj (:db/id x)))
+       x)
+     form)
+    (if (empty? @tempids)
+      form
+      (let [remap (into {} (map (fn [t] [t (str t suffix)])) @tempids)]
+        (walk/postwalk (fn [x] (if (string? x) (get remap x x) x)) form)))))
+
+(defn- freshen-tx-tempids
+  "Give an INSERT's `:tx-data` fresh, execution-unique tempids (see
+   remap-tempids). Applied once per Execute so a reused prepared
+   statement / LRU-cached parse can't share a tempid across the rows that
+   land in the same implicit-tx commit."
+  [parsed]
+  (if (and (= :insert (:type parsed)) (:tx-data parsed))
+    (assoc parsed :tx-data (remap-tempids (:tx-data parsed) (str "-" (gensym))))
+    parsed))
 
 (defn- exec-insert
   [ctx parsed]
@@ -4277,27 +4402,12 @@
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
 
-      ;; Auto-commit + wire-layer-driven batching scope. Only INSERTs
-      ;; whose tx-data is a vector (i.e. ordinary INSERT VALUES /
-      ;; INSERT … SELECT) and that don't need RETURNING (which would
-      ;; have to read db-after row-by-row to build the response) take
-      ;; the batchable path. ON CONFLICT wraps tx-data in :db.fn/call
-      ;; and writes through a row-refs atom — that's incompatible
-      ;; with held-CC semantics, so it falls through.
-      ;;
-      ;; The Java wire layer handles deferral for both protocol modes:
-      ;; for Simple Query 'Q' it holds CommandComplete strings; for
-      ;; Extended Query (P/B/D/E) it holds the full per-statement
-      ;; response byte chunks (ParseComplete + BindComplete +
-      ;; NoData/RowDescription + CC) so the relative wire-message
-      ;; order matches what default PG would emit.
-      (and batch-state
-           @batch-state
-           (vector? (:tx-data parsed))
-           (not (:returning parsed))
-           (not *snapshot-db*))
-      (exec-batchable-insert ctx parsed batch-state)
-
+      ;; Autocommit on a non-wire path (direct .execute / run-sql, where
+      ;; no implicit transaction was opened): commit the single statement
+      ;; directly. Wire writes never reach here — the dispatch opens an
+      ;; implicit transaction first, so they take the :in-tx? branch. The
+      ;; former deferred-CC "batchable" path was retired once implicit-tx
+      ;; took over grouping (see doc/implicit-transaction-plan.md).
       :else
       (execute-insert conn parsed :tx-wrap (:tx-wrap ctx)))))
 
@@ -5040,12 +5150,51 @@
           (swap! batch-state assoc :spec-db nil))
         (when (and tx-data-list (pos? (.size tx-data-list)))
           (try
+            ;; Each chunk's tempids were already freshened per-Execute
+            ;; (freshen-tx-tempids), so concatenating is collision-free.
             (let [combined (vec (mapcat identity tx-data-list))]
               (when (seq combined)
                 (d/transact conn combined)))
             nil
             (catch Exception e
               (classified-error "INSERT (batched) error: " e)))))
+
+      ;; Discard the running batch (no commit). Called by the wire layer
+      ;; when an error aborts the extended-query message group, so the
+      ;; held rows roll back and the next batch re-anchors on the live db.
+      (discardBatch [_]
+        (when @batch-state
+          (swap! batch-state assoc :spec-db nil)))
+
+      ;; Commit (or, if the group errored, roll back) the implicit
+      ;; transaction opened by writes in an extended-query message group.
+      ;; Called by the wire layer at Sync. An EXPLICIT transaction
+      ;; (:implicit? false) is left untouched — it spans Syncs until the
+      ;; client's COMMIT/ROLLBACK. Returns nil on success / no-op, or an
+      ;; error QueryResult if the commit's transact fails (e.g. 40001
+      ;; serialization_failure, deferred constraint). See
+      ;; doc/implicit-transaction-plan.md.
+      (commitImplicit [_]
+        (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
+          (if (:aborted? @tx-state)
+            (do (end-tx! session-id tx-state) nil)
+            (try
+              (transact-tx-buffer! conn tx-state)
+              (end-tx! session-id tx-state)
+              nil
+              (catch Exception e
+                (end-tx! session-id tx-state)
+                (classified-error "COMMIT (implicit) failed: " e))))))
+
+      ;; Roll back the implicit transaction WITHOUT committing — called by
+      ;; the wire layer when a statement in the group failed, so the whole
+      ;; group rolls back as a unit (PG implicit-transaction semantics). No
+      ;; effect on an explicit BEGIN block, which the client's own
+      ;; COMMIT/ROLLBACK governs.
+      (rollbackImplicit [_]
+        (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
+          (end-tx! session-id tx-state))
+        nil)
 
       ;; --- Extended Query protocol methods -------------------------------
 
@@ -5060,37 +5209,68 @@
         ;; `pg_database` that lands during parse materialization sees
         ;; this server's actual registry instead of the legacy fallback.
         (binding [catalog/*registered-databases* registered-databases]
-          (let [db (apply-temporal (d/db conn) session-state)
-                parsed (sql/parse-sql sql (dbi/-schema db) db)
-                ;; Attach the original SQL so downstream code that reads
-                ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
-                ;; working even though parse-sql may not have set it for
-                ;; non-system types.
-                parsed (assoc parsed :sql sql)]
-            (when bump-dispatch! (bump-dispatch! parsed))
+          (let [base-db (apply-temporal (d/db conn) session-state)
+                ;; In an open transaction, parse/validate against the
+                ;; speculative-db so a statement referencing a table
+                ;; created earlier in the SAME uncommitted transaction
+                ;; (e.g. `BEGIN; CREATE TABLE t; PREPARE … SELECT FROM t`)
+                ;; resolves it. Mirrors the dispatch's db selection.
+                db (if (:in-tx? @tx-state)
+                     (or (:speculative-db @tx-state) base-db)
+                     base-db)
+                parsed (sql/parse-sql sql (dbi/-schema db) db)]
+            ;; Surface parse-time errors (undefined relation/column,
+            ;; syntax errors) as a Parse-message failure, matching
+            ;; PostgreSQL: it validates the statement at Parse and raises
+            ;; immediately, so `PREPARE`/`conn.prepare()` fails up front
+            ;; rather than only when the portal is Executed. The wire
+            ;; layer (handleParse's caller) turns a PgProtocolException
+            ;; into an ErrorResponse + extended-query error-skip until
+            ;; Sync. Without this, a client (e.g. asyncpg) that prepares
+            ;; a SELECT on a nonexistent table sees a spurious success.
+            (when (= :error (:type parsed))
+              (throw (PgWireServer$PgProtocolException.
+                      (or (:sqlstate parsed) "42601")
+                      (or (:message parsed) "statement could not be parsed"))))
+            (let [;; Attach the original SQL so downstream code that reads
+                  ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
+                  ;; working even though parse-sql may not have set it for
+                  ;; non-system types.
+                  parsed (assoc parsed :sql sql)]
+              (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
             ;; under Extended Query mode. Pure dispatch — no side
             ;; effects — so safe even for nextval / advisory-lock / etc.
-            (if (and (= :system (:type parsed))
-                     (:system-type parsed))
-              (if-let [md (system-result-metadata parsed)]
-                (assoc parsed :metadata md)
-                parsed)
-              parsed))))
+              (if (and (= :system (:type parsed))
+                       (:system-type parsed))
+                (if-let [md (system-result-metadata parsed)]
+                  (assoc parsed :metadata md)
+                  parsed)
+                parsed)))))
 
       (describeParams [_ parsed]
         ;; Return a Java int[] of parameter OIDs so Describe('S', …)
         ;; emits a useful ParameterDescription. parse-sql infers OIDs
         ;; for the common INSERT VALUES / UPDATE SET / WHERE col OP ?
-        ;; shapes; anything we can't infer falls back to 0 (unknown),
-        ;; which drivers treat as 'any type' and bind as text.
+        ;; shapes; anything we can't infer falls back to TEXT.
+        ;;
+        ;; CRITICAL: never advertise OID 0 here. Real PostgreSQL always
+        ;; resolves an otherwise-undetermined parameter to a concrete type
+        ;; (text) and never returns 0 in a ParameterDescription. asyncpg
+        ;; treats a 0 it sees as "an unknown custom type" and tries to
+        ;; introspect it — but the introspection query's own `$1::oid[]`
+        ;; param also comes back 0, so it introspects 0 again, recursing
+        ;; until Python's RecursionError. Defaulting to TEXT matches PG and
+        ;; the bind path (an oid-0 param was already decoded as a text
+        ;; string), so binding behaviour is unchanged.
         (let [n (or (:param-count parsed) 0)
               hints (:param-oids parsed)
               arr (int-array n)]
           (when (pos? n)
             (dotimes [i n]
-              (aset arr i (int (or (get hints (inc i)) 0)))))
+              (aset arr i (int (let [o (get hints (inc i))]
+                                 (if (and o (pos? o)) o PgWireServer/OID_TEXT))))))
           arr))
 
       (describeResult [_ parsed]
@@ -5115,9 +5295,49 @@
         ;; inside updatable-ResultSet metadata lookups for pgjdbc's PK
         ;; probe, which queries pg_index via that join).
         (cond
+          ;; INSERT/UPDATE/DELETE … RETURNING produces rows, so its
+          ;; prepared form must Describe the RETURNING column shape —
+          ;; otherwise a client that Describes before Execute (asyncpg
+          ;; fetchmany/executemany-with-RETURNING) gets NoData and then
+          ;; chokes when Execute streams DataRows ("number of columns in
+          ;; the result row != what was described"). Resolve each
+          ;; RETURNING column's OID from the table's schema; `*` expands
+          ;; to all user columns; anything unresolved falls back to text.
+          (and (#{:insert :update :delete} (:type parsed))
+               (seq (:returning parsed)))
+          (let [db (if (:in-tx? @tx-state)
+                     (or (:speculative-db @tx-state) (d/db conn))
+                     (d/db conn))
+                schema (dbi/-schema db)
+                table-ns (or (:ns parsed) (:table parsed))
+                cols (pgs/column-info schema table-ns db)
+                by-name (into {} (map (juxt :name identity)) cols)
+                ret (:returning parsed)
+                names (vec (if (= ret ["*"])
+                             (remove #(= "db_id" %) (map :name cols))
+                             ret))
+                oids (int-array
+                      (for [c names]
+                        (int (or (:oid (get by-name c)) PgWireServer/OID_TEXT))))]
+            (PgWireServer$QueryResult.
+             (into-array String names)
+             oids
+             (into-array (Class/forName "[Ljava.lang.String;")
+                         (make-array String 0 0))
+             "SELECT 0"))
+
           (= :select (:type parsed))
           (let [aliases (:find-aliases parsed)
-                db (d/db conn)
+                ;; Use the in-tx speculative-db when a transaction is
+                ;; open so OIDs for tables created in the uncommitted
+                ;; transaction resolve correctly — otherwise Describe
+                ;; advertises an OID derived from the committed schema
+                ;; (or the alias-name fallback), which can disagree with
+                ;; the int4/int8 width the Execute path actually sends,
+                ;; corrupting binary-format decoding on the client.
+                db (if (:in-tx? @tx-state)
+                     (or (:speculative-db @tx-state) (d/db conn))
+                     (d/db conn))
                 resolved (compute-schema-oids parsed db)
                 ;; Parse-time OIDs from oid-infer (one per find-alias,
                 ;; nil for entries we can't statically type). Prefer
@@ -5168,7 +5388,9 @@
           (= :set-operation (:type parsed))
           (when-let [sub (first (:sub-results parsed))]
             (let [aliases (:find-aliases sub)
-                  db (d/db conn)
+                  db (if (:in-tx? @tx-state)
+                       (or (:speculative-db @tx-state) (d/db conn))
+                       (d/db conn))
                   resolved (compute-schema-oids sub db)
                   item-oids (:select-item-oids sub)
                   oids (int-array
@@ -5203,9 +5425,21 @@
         ;; bound-params is a 1-indexed Object[] (element 0 unused). We
         ;; thread it through via dynamic bindings so the existing
         ;; `execute` dispatch body handles everything else unchanged.
+        ;; *implicit-tx-allowed* true: this is the extended-query path,
+        ;; where a write outside an explicit BEGIN opens an implicit
+        ;; transaction committed at Sync (commitImplicit) — making a
+        ;; pipelined group (executemany / JDBC batch) atomic.
         (binding [*cached-parsed* parsed
-                  *cached-bound* (vec bound-params)]
+                  *cached-bound* (vec bound-params)
+                  *implicit-tx-allowed* true]
           (.execute this (or (:sql parsed) ""))))
+
+      (executeInGroup [this sql]
+        ;; Simple-query group member: a write opens/joins the 'Q''s
+        ;; implicit transaction (committed at end-of-'Q' via
+        ;; commitImplicit) so a multi-statement Simple Query is atomic.
+        (binding [*implicit-tx-allowed* true]
+          (.execute this sql)))
 
       (execute [this sql]
         ;; Use the query planner for SQL execution.
@@ -5318,6 +5552,14 @@
                                    (let [p (sql/parse-sql sql schema db)]
                                      (when bump-dispatch! (bump-dispatch! p))
                                      p))
+                          ;; Give a reused INSERT a fresh tempid per
+                          ;; execution. parse-sql is LRU-cached and
+                          ;; prepared statements are reused, so the cached
+                          ;; gensym tempid would otherwise repeat across
+                          ;; rows committed together in one implicit-tx
+                          ;; group (executemany) and collapse them onto a
+                          ;; single entity. See freshen-tx-tempids.
+                          parsed (freshen-tx-tempids parsed)
                           ;; Sibling pass to ParamRef substitution: any
                           ;; `nextval('s')` markers left in tx-data/in-args
                           ;; resolve here against the live conn (PG's
@@ -5383,6 +5625,17 @@
                                  ;; speculatively per-statement and at
                                  ;; commit. Track-issue follow-up.
                                  :tx-wrap (or tx-wrap identity)}]
+                        ;; Implicit-transaction (extended-query groups):
+                        ;; a write outside an explicit BEGIN opens an
+                        ;; implicit tx so the rest of its message group
+                        ;; (up to Sync) commits/rolls-back atomically.
+                        ;; See open-implicit-tx! / commitImplicit and
+                        ;; doc/implicit-transaction-plan.md.
+                        (when (and *implicit-tx-allowed*
+                                   (not *snapshot-db*)
+                                   (not (:in-tx? @tx-state))
+                                   (contains? write-parse-types (:type parsed)))
+                          (open-implicit-tx! ctx))
                         (case (:type parsed)
                           :system                (exec-system ctx parsed)
                           :select                (exec-select ctx parsed)

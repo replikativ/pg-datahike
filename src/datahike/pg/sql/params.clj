@@ -33,7 +33,7 @@
            [net.sf.jsqlparser.expression
             CastExpression JdbcParameter Parenthesis NotExpression
             LongValue StringValue DoubleValue DateValue TimestampValue
-            SignedExpression]
+            SignedExpression BinaryExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between InExpression ExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
@@ -649,7 +649,24 @@
                           (instance? NotExpression n)
                           (walk (.getExpression ^NotExpression n))
                           (instance? CastExpression n)
-                          (walk (.getLeftExpression ^CastExpression n))))))]
+                          (do
+                            ;; A standalone `CAST($n AS T)` / `$n::T` types
+                            ;; the param directly from the cast target —
+                            ;; e.g. `SELECT $1::int4`. (The comparison cases
+                            ;; already honour a cast via bind-param!.)
+                            (let [inner (unwrap (.getLeftExpression ^CastExpression n))]
+                              (when (instance? JdbcParameter inner)
+                                (when-let [oid (cast-target-oid n)]
+                                  (.put result (.getIndex ^JdbcParameter inner) oid))))
+                            (walk (.getLeftExpression ^CastExpression n)))
+                         ;; Arithmetic / concatenation / etc. — any other
+                         ;; BinaryExpression (Addition, Subtraction, …). Recurse
+                         ;; both sides so a nested `$n::T` or `col OP $n` deeper
+                         ;; in the expression is still typed. (Comparisons,
+                         ;; AND/OR are matched above; this is the fallback.)
+                          (instance? BinaryExpression n)
+                          (do (walk (.getLeftExpression ^BinaryExpression n))
+                              (walk (.getRightExpression ^BinaryExpression n)))))))]
        (walk expr)
        (when (pos? (.size result)) (into {} result)))
      (catch Throwable _ nil))))

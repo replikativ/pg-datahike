@@ -112,6 +112,19 @@ public final class PgWireServer {
         QueryResult execute(String sql);
 
         /**
+         * Like {@link #execute}, but signals that this statement is part
+         * of a simple-query message group (a possibly multi-statement
+         * 'Q'). A write here opens / joins the group's implicit
+         * transaction instead of auto-committing, so the whole 'Q' is one
+         * transaction — committed at end-of-'Q' via {@link
+         * #commitImplicit}, rolled back as a unit on any statement error.
+         * Matches PostgreSQL's implicit-transaction semantics for a
+         * multi-statement Simple Query. Default: same as execute (no
+         * grouping), so embedded/direct callers keep auto-commit.
+         */
+        default QueryResult executeInGroup(String sql) { return execute(sql); }
+
+        /**
          * Extended Query protocol Parse phase. Translate the SQL once
          * and return an opaque state object that subsequent Bind/
          * Describe/Execute calls on the same statement reuse. Must
@@ -234,6 +247,43 @@ public final class PgWireServer {
          * receive a non-empty list, so the default is safe.
          */
         default QueryResult flushBatch(java.util.List<Object> batchTxData) { return null; }
+
+        /**
+         * Discard the pending INSERT batch WITHOUT committing it. Called
+         * when an error aborts the current extended-query message group:
+         * PostgreSQL runs every message between two Syncs as a single
+         * implicit transaction, so any error rolls the whole group back
+         * (this is what makes a client's executemany atomic). The wire
+         * layer drops its held bytes/tx-data via {@link ExtBatchBuffer#clear};
+         * this lets the handler drop any running speculative-db it
+         * accumulated so the NEXT batch re-anchors on the live committed db.
+         *
+         * Default: no-op.
+         */
+        default void discardBatch() { /* default: no-op */ }
+
+        /**
+         * Commit (or, if the group errored, roll back) the implicit
+         * transaction a write opened in the current extended-query
+         * message group. Called by the wire layer at Sync — the boundary
+         * of the implicit transaction in PostgreSQL. An explicit
+         * transaction (opened by a client BEGIN) is left untouched; it
+         * spans Syncs until the client's COMMIT/ROLLBACK.
+         *
+         * Returns null on success or no-op, or a {@link QueryResult}
+         * carrying an error if the commit fails (e.g. 40001
+         * serialization_failure). Default: no-op.
+         */
+        default QueryResult commitImplicit() { return null; }
+
+        /**
+         * Roll back the implicit transaction the current group opened,
+         * WITHOUT committing — called when a statement in the group fails,
+         * so the whole group rolls back as a unit (PostgreSQL implicit-
+         * transaction semantics). No effect on an explicit BEGIN block.
+         * Default: no-op.
+         */
+        default void rollbackImplicit() { /* default: no-op */ }
     }
 
     /**
@@ -879,8 +929,14 @@ public final class PgWireServer {
                         // and no Parse/Bind/Describe responses for any
                         // pre-Execute messages still in the cur buffer,
                         // so dropping them keeps the wire response and
-                        // the persisted state in sync.
+                        // the persisted state in sync. Also drop the
+                        // handler's running speculative-db so the next
+                        // batch re-anchors on the live committed db.
                         extBatch.clear();
+                        try { handler.discardBatch(); } catch (Exception ignore) {}
+                        // The group errored — roll back the implicit
+                        // transaction it opened (if any).
+                        try { handler.rollbackImplicit(); } catch (Exception ignore) {}
                         sendReadyForQuery(out, txStatus[0]);
                         out.flush();
                         inError[0] = false;
@@ -1273,7 +1329,10 @@ public final class PgWireServer {
             }
 
             try {
-                QueryResult result = handler.execute(stmt);
+                // executeInGroup: a write opens/joins this 'Q''s implicit
+                // transaction (committed at end-of-'Q' below) so a
+                // multi-statement Simple Query is atomic — PG semantics.
+                QueryResult result = handler.executeInGroup(stmt);
                 // Clear any pending interrupt bit left by the safety-net
                 // cancel path so it doesn't bleed into the next
                 // statement's socket read on this thread.
@@ -1369,6 +1428,9 @@ public final class PgWireServer {
         // RFQ.
         if (errored) {
             batch.clear();
+            // The 'Q' errored → roll back its implicit transaction so the
+            // whole multi-statement Q rolls back as a unit (PG).
+            try { handler.rollbackImplicit(); } catch (Exception ignore) {}
         } else {
             QueryResult flushErr = flushBatch(out, handler, batch);
             if (flushErr != null) {
@@ -1376,6 +1438,18 @@ public final class PgWireServer {
                         flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
                         flushErr.error, flushErr.errorFields);
                 if (txStatus[0] == 'T') txStatus[0] = 'E';
+            } else {
+                // End-of-'Q' is the boundary of the implicit transaction
+                // this Simple Query opened — commit it (no-op for an
+                // explicit BEGIN block left open, or a read-only Q). A
+                // commit failure (e.g. 40001) becomes an ErrorResponse.
+                QueryResult implErr = handler.commitImplicit();
+                if (implErr != null && implErr.error != null) {
+                    sendError(out, "ERROR",
+                            implErr.sqlstate != null ? implErr.sqlstate : "XX000",
+                            implErr.error, implErr.errorFields);
+                    if (txStatus[0] == 'T') txStatus[0] = 'E';
+                }
             }
         }
 
@@ -1848,24 +1922,17 @@ public final class PgWireServer {
             extBatch.resetCur();
             sendCommandComplete(out, "SELECT 0");
         } else if (result.error != null) {
-            // Best-effort commit of any held INSERTs (their dc/with
-            // already validated; the failing stmt is independent).
-            // Successful held responses go to wire so JDBC sees per-
-            // row counts. The current statement's pre-Execute bytes
-            // are dropped — they're never wire-acknowledged. Then we
-            // throw, the connection loop sends ErrorResponse, and
-            // extended-query error-skip drains the rest until Sync.
-            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
-            extBatch.resetCur();
-            if (flushErr != null) {
-                // Held flush failed AND current stmt errored. Report
-                // the held-flush error (it happened first); the per-
-                // stmt error gets dropped — its CC was never going
-                // to land anyway.
-                throw new PgProtocolException(
-                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
-                    flushErr.error, flushErr.errorFields);
-            }
+            // Implicit-transaction semantics: an error anywhere in an
+            // extended-query message group (every message up to the next
+            // Sync) rolls the WHOLE group back, matching PostgreSQL. So
+            // we must NOT commit the held INSERTs — discard them (and the
+            // running speculative-db) and throw. The connection loop sends
+            // ErrorResponse and enters extended-query error-skip; the
+            // group-terminating Sync clears any remaining state. This is
+            // what makes a client's executemany atomic: one bad row rolls
+            // back every row in the batch.
+            extBatch.clear();
+            try { handler.discardBatch(); } catch (Exception ignore) {}
             throw new PgProtocolException(
                 result.sqlstate != null ? result.sqlstate : "XX000",
                 result.error,
@@ -1971,6 +2038,21 @@ public final class PgWireServer {
             extBatch.cur.writeTo(out);
         }
         extBatch.resetCur();
+        // Commit the implicit transaction this message group opened (if a
+        // write ran outside an explicit block). Sync is the implicit-tx
+        // boundary in PostgreSQL. A failure here (e.g. 40001) becomes a
+        // single ErrorResponse before RFQ; the handler has already rolled
+        // the group back. No-op for explicit transactions and read-only
+        // groups.
+        if (flushErr == null) {
+            QueryResult implErr = handler.commitImplicit();
+            if (implErr != null && implErr.error != null) {
+                sendError(out, "ERROR",
+                          implErr.sqlstate != null ? implErr.sqlstate : "XX000",
+                          implErr.error, implErr.errorFields);
+                if (txStatus[0] == 'T') txStatus[0] = 'E';
+            }
+        }
         sendReadyForQuery(out, txStatus[0]);
         out.flush();
     }

@@ -496,22 +496,40 @@
         rows (q-fn '{:find [?for-ident ?e]
                      :where [[?e :datahike.pg/for-ident ?for-ident]]}
                    db)
-        pull-fn d/pull]
-    (into {}
-          (keep (fn [[for-ident e]]
-                  (let [p (pull-fn db
-                                   '[:datahike.pg/column
-                                     :datahike.pg/hidden
-                                     :datahike.pg/references
-                                     :datahike.pg/table]
-                                   e)
-                        h (cond-> {}
-                            (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
-                            (:datahike.pg/hidden p)     (assoc :hidden true)
-                            (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
-                            (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
-                    (when (seq h) [for-ident h]))))
-          rows)))
+        pull-fn d/pull
+        ident-hints
+        (into {}
+              (keep (fn [[for-ident e]]
+                      (let [p (pull-fn db
+                                       '[:datahike.pg/column
+                                         :datahike.pg/hidden
+                                         :datahike.pg/references
+                                         :datahike.pg/table]
+                                       e)
+                            h (cond-> {}
+                                (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
+                                (:datahike.pg/hidden p)     (assoc :hidden true)
+                                (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
+                                (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
+                        (when (seq h) [for-ident h]))))
+              rows)
+        ;; The declared PG type (`:pg/type`) lives on the column-
+        ;; attribute entity itself, NOT on a :datahike.pg/for-ident hint
+        ;; entity, and the `(:schema db)` view doesn't surface custom
+        ;; attrs — so collect it via Datalog and fold it into the hint
+        ;; map keyed by the column attr. derive-virtual-tables* uses it
+        ;; to report the *declared* OID (e.g. int4) instead of the
+        ;; storage-type OID (int8 for :db.type/long). Without this, every
+        ;; int2/int4 column is advertised as int8, which breaks binary-
+        ;; format result decoding (asyncpg) and read-back typing.
+        pg-types (q-fn '{:find [?ident ?pt]
+                         :where [[?e :db/ident ?ident]
+                                 [?e :pg/type ?pt]]}
+                       db)]
+    (reduce (fn [acc [ident pt]]
+              (update acc ident assoc :pg-type pt))
+            ident-hints
+            pg-types)))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -608,6 +626,18 @@
   (when-let [ns (namespace ident)]
     [ns (name ident)]))
 
+(defn- declared-col-oid
+  "OID a column should advertise. When the schema records an explicit
+   `:pg/type` for the attribute (threaded in via the hint map's
+   :pg-type), that declared type is authoritative — e.g. an int4 column
+   stored as :db.type/long must report int4 (23), not the storage type
+   int8 (20). Covers jsonb/json and native array types (`_int4` → 1007)
+   too, since they all resolve through the pg-name registry. Falls back
+   to the storage valueType's OID when no :pg/type is recorded."
+  [pg-type vtype]
+  (or (when pg-type (get types/pg-name->oid pg-type))
+      (oid-for-valuetype vtype)))
+
 (defn- derive-virtual-tables*
   [schema hints]
   (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
@@ -623,7 +653,7 @@
                                    vtype (:db/valueType props)
                                    col {:name        col-name
                                         :attr        ident
-                                        :oid         (oid-for-valuetype vtype)
+                                        :oid         (declared-col-oid (:pg-type h) vtype)
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
                                         :unique      (:db/unique props)

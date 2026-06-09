@@ -387,6 +387,7 @@
                    (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
                    :else                                                    types/oid-int4)
       :float     types/oid-float8
+      :numeric   types/oid-numeric
       :text      types/oid-text
       :boolean   types/oid-bool
       :date      types/oid-date

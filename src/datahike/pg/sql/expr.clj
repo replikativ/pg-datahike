@@ -1509,6 +1509,7 @@
         cast-cat (types/cast-category type-str)
         is-int? (= :integer cast-cat)
         is-float? (= :float cast-cat)
+        is-numeric? (= :numeric cast-cat)
         is-text? (= :text cast-cat)
         is-bool? (= :boolean cast-cat)
         is-date? (= :date cast-cat)
@@ -1547,6 +1548,11 @@
         (cond
           is-int?  (coerce/coerce-numeric inner-raw :long)
           is-float? (coerce/coerce-numeric inner-raw :double)
+          ;; ::numeric keeps arbitrary precision — parse via the string
+          ;; form so a literal's scale survives (0.001000 → scale 6),
+          ;; never via double (which would drop trailing zeros).
+          is-numeric? (try (java.math.BigDecimal. (str/trim (str inner-raw)))
+                           (catch Exception _ inner-raw))
           is-text? (str inner-raw)
           is-bool? (Boolean/parseBoolean (str inner-raw))
         ;; ::date — extract the LocalDate so serialization can omit the
@@ -1663,6 +1669,24 @@
             ;; ("String cannot be cast to Number"), so route through the
             ;; string-tolerant coerce helpers via an in-param fn, the same
             ;; way the date/ts/uuid branches above do.
+            ;; ::numeric — preserve arbitrary precision / scale. The value
+            ;; may already be a BigDecimal (asyncpg sends numeric params in
+            ;; binary, decoded to BigDecimal) — keep it; a text param
+            ;; (node) parses via the string form so its scale survives.
+            ;; Never route through double, which drops precision.
+            is-numeric?
+            (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
+                  cast-fn (fn [v]
+                            (when (and (some? v) (not= :__null__ v))
+                              (cond
+                                (instance? java.math.BigDecimal v) v
+                                (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                :else (java.math.BigDecimal. (str/trim (str v))))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
+
             (or is-int? is-float? is-bool?)
             (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
                   cast-fn (cond
