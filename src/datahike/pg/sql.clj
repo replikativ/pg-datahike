@@ -86,6 +86,8 @@
 (def filter-stddev-samp    fns/filter-stddev-samp)
 (def filter-corr           fns/filter-corr)
 (def filter-array-agg      fns/filter-array-agg)
+(def filter-array-agg-ordered      fns/filter-array-agg-ordered)
+(def filter-array-agg-ordered-desc fns/filter-array-agg-ordered-desc)
 (def filter-percentile-cont fns/filter-percentile-cont)
 (def filter-percentile-disc fns/filter-percentile-disc)
 (def filter-mode            fns/filter-mode)

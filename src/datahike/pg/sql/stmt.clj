@@ -1784,7 +1784,31 @@
                           ;; adding the entity var to :with preserves duplicate rows.
                           (when-not is-dh-distinct?
                             (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
-                          (swap! find-elements conj (list agg-sym v))
+                          ;; array_agg(expr ORDER BY …): collect [sort-key value]
+                          ;; pairs and sort in the agg fn so element order honors
+                          ;; the in-aggregate ORDER BY (composite field order in
+                          ;; asyncpg's introspection depends on this). Direction
+                          ;; is taken uniformly from the keys (all-DESC → desc).
+                          (let [order-els (when (= fname "array_agg")
+                                            (seq (.getOrderByElements f)))]
+                            (if order-els
+                              (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                     (let [kv (expr/translate-expr ctx (.getExpression o))]
+                                                       (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                                   order-els)
+                                    sort-key (if (= 1 (count key-vars))
+                                               (first key-vars)
+                                               (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
+                                    pair-var (ctx/fresh-var! ctx)
+                                    all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                        (not (.isAsc o)))
+                                                      order-els)
+                                    ord-sym (if all-desc?
+                                              'datahike.pg.sql/filter-array-agg-ordered-desc
+                                              'datahike.pg.sql/filter-array-agg-ordered)]
+                                (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
+                                (swap! find-elements conj (list ord-sym pair-var)))
+                              (swap! find-elements conj (list agg-sym v))))
                           (swap! find-aliases conj (or alias-str fname)))))))
 
                 ;; Regular column or expression
