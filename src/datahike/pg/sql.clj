@@ -198,6 +198,31 @@
   (when cache (.put cache k v))
   v)
 
+(defn enrich-db-with-catalogs
+  "Materialise the given catalog tables' schema + data on top of `db`,
+   returning the enriched db (its `:schema` carries the catalog attrs).
+   Returns `db` unchanged when `catalog-names` is empty.
+
+   Cached in the server-wide LRU by [user-schema-hash sorted-names]; the
+   cache is DDL-invalidated (invalidate-catalog-cache!). Callable at BOTH
+   parse time (to translate against the catalog schema) and execute time
+   (so a prepared catalog statement re-resolves fresh catalog rows against
+   the current db instead of a stale parse-time snapshot — real PG re-plans
+   on catalog change). `schema` is `db`'s user schema."
+  [db schema catalog-names]
+  (if (empty? catalog-names)
+    db
+    (let [sorted-names (sort catalog-names)
+          cache *catalog-cache*
+          cache-key [(hash (dbi/-schema db)) sorted-names]]
+      (or (cache-get cache cache-key)
+          (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
+                combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
+                                           sorted-names))
+                spec-db (d/db-with db combined-schema)
+                built (if (seq combined-data) (d/db-with spec-db combined-data) spec-db)]
+            (cache-put! cache cache-key built))))))
+
 ;; ============================================================================
 ;; parse-sql result cache
 ;; ============================================================================
@@ -568,29 +593,18 @@
             ;; hits, so a 600-table Odoo startup paid for 5k catalog
             ;; rebuilds per probe regardless of memoisation.
                 orig-db db
-                [db schema]
+                ;; catalog-names-used: recorded on the parsed result so the
+                ;; server can RE-RESOLVE the catalog enriched-db at execute
+                ;; (prepared statements would otherwise reuse a stale
+                ;; parse-time snapshot across a DDL).
+                [db schema catalog-names-used]
                 (if db
                   (let [used-catalogs (catalog/catalog-tables-in-stmt stmt)]
                     (if (empty? used-catalogs)
-                      [db schema]
-                      (let [with-fn d/db-with
-                            sorted-names (sort used-catalogs)
-                            cache *catalog-cache*
-                            cache-key [(hash (dbi/-schema db)) sorted-names]
-                            cached (cache-get cache cache-key)
-                            enriched
-                            (or cached
-                                (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
-                                      combined-data (vec (mapcat #(catalog/catalog-data-for
-                                                                   % schema db)
-                                                                 sorted-names))
-                                      spec-db (with-fn db combined-schema)
-                                      built (if (seq combined-data)
-                                              (with-fn spec-db combined-data)
-                                              spec-db)]
-                                  (cache-put! cache cache-key built)))]
-                        [enriched (:schema enriched)])))
-                  [db schema])
+                      [db schema nil]
+                      (let [enriched (enrich-db-with-catalogs db schema used-catalogs)]
+                        [enriched (:schema enriched) (sort used-catalogs)])))
+                  [db schema nil])
             ;; Top-level WITH-fold. Materialise every CTE body into a
             ;; speculative db (virtual `:<cte>/<col>` attrs) so all four
             ;; DML paths plus SELECT see the enriched db/schema before
@@ -609,6 +623,13 @@
                                             (some-> (.getAlias wi) str str/trim str/lower-case not-empty)))
                                     (stmt-with-items stmt))
                 [db schema] (materialize-withs! stmt db schema)
+                ;; Did the CTE fold materialise anything? If not, the only
+                ;; enrichment is catalog data — which the server can safely
+                ;; re-resolve at execute (stale-prepared-statement fix). With
+                ;; a CTE, the baked enriched-db carries query-scoped
+                ;; `:<cte>/*` attrs we can't rebuild from catalog names alone,
+                ;; so we keep the parse-time snapshot.
+                cte-materialized? (not (identical? pre-cte-db db))
             ;; Count prepared-statement placeholders once at the AST
             ;; level — reused for INSERT/UPDATE/DELETE which don't
             ;; accumulate placeholders in a ctx (unlike translate-select).
@@ -1123,6 +1144,13 @@
                         result (if (and (nil? (:enriched-db result))
                                         (not (identical? cte-db orig-db)))
                                  (assoc result :enriched-db cte-db)
+                                 result)
+                        ;; Record the catalog tables so the server can
+                        ;; re-resolve the enriched-db at execute (stale-
+                        ;; prepared-statement fix) — but only when the
+                        ;; enrichment is catalog-only (no CTE attrs to lose).
+                        result (if (and (seq catalog-names-used) (not cte-materialized?))
+                                 (assoc result :catalog-tables (vec catalog-names-used))
                                  result)]
                     (if has-full-join?
               ;; FULL JOIN: return two LEFT JOIN queries for server to combine

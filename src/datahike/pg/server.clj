@@ -4065,8 +4065,14 @@
         (format-query-result (or literal-rows [literal-row])
                              find-aliases
                              schema-oids))
-      (let [;; Use enriched db when CTEs/derived tables created speculative data
-            query-db (or enriched-db db)
+      (let [;; Catalog-only SELECT: re-resolve the enriched-db against the
+            ;; CURRENT db so a reused prepared statement reflects catalog
+            ;; changes (CREATE TYPE etc.) since Parse — the cache makes this
+            ;; a lookup, and it's DDL-invalidated. CTE/derived enrichment
+            ;; (no :catalog-tables) keeps its query-scoped parse-time snapshot.
+            query-db (if-let [cats (:catalog-tables parsed)]
+                       (sql/enrich-db-with-catalogs db (dbi/-schema db) cats)
+                       (or enriched-db db))
             hidden-count (or hidden-count 0)
             q-input (cond-> query
                       limit  (assoc :limit limit)
