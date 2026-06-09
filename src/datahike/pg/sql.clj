@@ -489,6 +489,18 @@
                    :message (.getMessage e)
                    :sqlstate "42601"}))
 
+              :create-type-composite
+              (try
+                (let [parsed (user-types/parse-create-type-composite sql)]
+                  (assoc base :type :ddl-create-composite
+                         :type-name (:type-name parsed)
+                         :fields (:fields parsed)
+                         :original-sql sql))
+                (catch Throwable e
+                  {:type :error
+                   :message (.getMessage e)
+                   :sqlstate "42601"}))
+
               :create-domain
               (try
                 (let [toks (database/tokenize sql)

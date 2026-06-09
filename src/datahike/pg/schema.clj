@@ -590,6 +590,19 @@
         mx (if (seq used) (apply max used) (dec first-user-oid))]
     (inc mx)))
 
+(defn next-composite-oid
+  "Next unused OID for a user composite type. Shares the user-OID space
+   with tables (PG OIDs are global) so a composite and a table never
+   collide."
+  [db]
+  (let [used (into #{}
+                   (map first)
+                   (concat
+                    (d/q '{:find [?o] :where [[?e :datahike.pg.composite/oid ?o]]} db)
+                    (d/q '{:find [?o] :where [[?e :pg/table-oid ?o]]} db)))
+        mx (if (seq used) (apply max used) (dec first-user-oid))]
+    (inc mx)))
+
 (declare derive-virtual-tables)
 
 (defn column-attnum

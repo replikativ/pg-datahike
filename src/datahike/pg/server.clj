@@ -4555,6 +4555,43 @@
         (catch Exception e
           (classified-error "CREATE TYPE error: " e))))))
 
+(defn- composite-tx-data
+  "Build the registry tx-data for a `CREATE TYPE … AS (..)` composite,
+   stored as one entity under `:datahike.pg.composite/*`:
+
+   - `:datahike.pg.composite/name`   — unique by identity
+   - `:datahike.pg.composite/oid`    — dynamically-assigned type OID
+   - `:datahike.pg.composite/fields` — declaration-order field defs,
+     serialised one-per-line as `name\\ttype` (e.g. `a\\tint`)."
+  [type-name oid fields]
+  [{:db/ident :datahike.pg.composite/name
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :datahike.pg.composite/oid
+    :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.composite/fields
+    :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:datahike.pg.composite/name type-name
+    :datahike.pg.composite/oid oid
+    :datahike.pg.composite/fields
+    (clojure.string/join "\n"
+                         (map (fn [{:keys [field-name pg-type]}]
+                                (str field-name "\t" pg-type))
+                              fields))}])
+
+(defn- exec-ddl-create-composite
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        oid (pgs/next-composite-oid (d/db conn))
+        tx-data (composite-tx-data (:type-name parsed) oid (:fields parsed))]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
+      (try
+        (d/transact conn tx-data)
+        (empty-result "CREATE TYPE")
+        (catch Exception e
+          (classified-error "CREATE TYPE error: " e))))))
+
 (defn- domain-tx-data
   "Build the registry tx-data for a CREATE DOMAIN. Stored as a single
    entity under `:datahike.pg.domain/*`. Optional attrs (check-name,
@@ -5654,6 +5691,8 @@
                                                      (exec-ddl-create-sequence ctx parsed))
                           :ddl-create-enum       (do (invalidate-schema-cache!)
                                                      (exec-ddl-create-enum ctx parsed))
+                          :ddl-create-composite  (do (invalidate-schema-cache!)
+                                                     (exec-ddl-create-composite ctx parsed))
                           :ddl-create-domain     (do (invalidate-schema-cache!)
                                                      (exec-ddl-create-domain ctx parsed))
                           :savepoint             (exec-savepoint ctx parsed)

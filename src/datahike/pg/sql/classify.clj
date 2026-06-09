@@ -630,10 +630,16 @@
                                           (kw=? t "is")))))
                   after-type)
             after-as (rest scan)]
-        (if (kw=? (first after-as) "enum")
+        (cond
+          (kw=? (first after-as) "enum")
           {:kind :create-type-enum :system? true
            :tag "CREATE TYPE … AS ENUM"}
-          ;; non-ENUM CREATE TYPE — silently accept
+          ;; CREATE TYPE name AS (field type, …) — composite type.
+          (= "(" (:text (first after-as)))
+          {:kind :create-type-composite :system? true
+           :tag "CREATE TYPE … AS (...)"}
+          ;; other non-ENUM CREATE TYPE (range, base) — silently accept
+          :else
           {:kind :create-type :reject-kind :type :tag "CREATE TYPE"}))
 
       (kw=? t1 "domain")
