@@ -570,10 +570,19 @@
                (let [ce ^CastExpression n
                      dt (.getColDataType ce)
                      type-str (when dt
-                                (str/lower-case (str (.getDataType dt))))]
-                 (or (get types/pg-name->oid type-str)
-                     (when-let [kw (get types/sql-name->elem-kw type-str)]
-                       (get types/elem-kw->oid kw))))))
+                                (str/lower-case (str (.getDataType dt))))
+                     elem-oid (or (get types/pg-name->oid type-str)
+                                  (when-let [kw (get types/sql-name->elem-kw type-str)]
+                                    (get types/elem-kw->oid kw)))
+                     ;; `T[]` — ColDataType carries array dimensions; map the
+                     ;; element OID to its array OID (e.g. oid → oid[] 1028).
+                     array? (when dt
+                              (let [ad (.getArrayData dt)]
+                                (and ad (pos? (.size ^java.util.List ad)))))]
+                 (when elem-oid
+                   (if array?
+                     (get types/element-oid->array-oid elem-oid types/oid-text-array)
+                     elem-oid)))))
            ;; Bind a param against (a) an explicit cast target on its
            ;; own side, or (b) the comparand column on the other side.
            bind-param! (fn [^JdbcParameter p side-with-cast comparand]
@@ -587,6 +596,35 @@
                              :else
                              (when-let [oid (literal-oid comparand)]
                                (.put result (.getIndex p) oid)))))
+           ;; `col = ANY($n)` / `= ALL($n)` — JSqlParser parses the RHS as a
+           ;; Function named any/all/some wrapping the parameter. Return that
+           ;; JdbcParameter so the caller can type it as an ARRAY of col's
+           ;; type. asyncpg's type-introspection (`oid = ANY($1::oid[])`)
+           ;; depends on this.
+           ;; The single arg expression inside ANY(...)/ALL(...)/SOME(...),
+           ;; or nil. May itself be a CAST (`$1::oid[]`) — kept un-unwrapped
+           ;; so the caller can honour the cast target before the column.
+           any-all-arg (fn [n]
+                         (when (instance? net.sf.jsqlparser.expression.Function n)
+                           (let [f ^net.sf.jsqlparser.expression.Function n
+                                 nm (str/lower-case (.getName f))]
+                             (when (#{"any" "all" "some"} nm)
+                               (let [exprs (some-> (.getParameters f) .getExpressions)]
+                                 (when (= 1 (count exprs)) (first exprs)))))))
+           ;; Bind `$n` in `col OP ANY($n)`: prefer an explicit cast on the
+           ;; param (`$1::oid[]` → oid[]); otherwise the array OID of col's
+           ;; type. Honouring the cast is what makes asyncpg's
+           ;; `oid = ANY($1::oid[])` introspection work even though `oid` is
+           ;; a catalog column with no schema-derived type.
+           bind-any-arg! (fn [arg ^Column c]
+                           (let [p (unwrap arg)]
+                             (when (instance? JdbcParameter p)
+                               (if-let [oid (cast-target-oid arg)]
+                                 (.put result (.getIndex ^JdbcParameter p) oid)
+                                 (let [[tns cn] (col-ns-name c)]
+                                   (when-let [coid (infer-param-oid-for-column schema tns cn)]
+                                     (.put result (.getIndex ^JdbcParameter p)
+                                           (get types/element-oid->array-oid coid types/oid-text-array))))))))
            walk (fn walk [n]
                   (cond
                     (nil? n) nil
@@ -610,7 +648,13 @@
                             ;; param's own side first.
                             (cond
                               (instance? JdbcParameter lb) (bind-param! lb l rb)
-                              (instance? JdbcParameter rb) (bind-param! rb r lb))
+                              (instance? JdbcParameter rb) (bind-param! rb r lb)
+                              ;; col = ANY($n) — $n is an array (cast target,
+                              ;; else array of col's type)
+                              (and (instance? Column lb) (any-all-arg rb))
+                              (bind-any-arg! (any-all-arg rb) lb)
+                              (and (instance? Column rb) (any-all-arg lb))
+                              (bind-any-arg! (any-all-arg lb) rb))
                             (walk l) (walk r))
 
                          ;; col IN (?, ?, ...) — RHS items may also be
