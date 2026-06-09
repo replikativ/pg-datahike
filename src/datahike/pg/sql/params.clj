@@ -573,7 +573,16 @@
                                 (str/lower-case (str (.getDataType dt))))
                      elem-oid (or (get types/pg-name->oid type-str)
                                   (when-let [kw (get types/sql-name->elem-kw type-str)]
-                                    (get types/elem-kw->oid kw)))
+                                    (get types/elem-kw->oid kw))
+                                  ;; User-defined composite type: report its
+                                  ;; OID so the client (asyncpg) introspects it
+                                  ;; and builds a composite codec instead of a
+                                  ;; text one for `$1::my_composite`.
+                                  (when-let [d *parse-db*]
+                                    (some (fn [c]
+                                            (when (= type-str (str/lower-case (:name c)))
+                                              (:oid c)))
+                                          (try (pgs/composite-types d) (catch Throwable _ nil)))))
                      ;; `T[]` — ColDataType carries array dimensions; map the
                      ;; element OID to its array OID (e.g. oid → oid[] 1028).
                      array? (when dt
