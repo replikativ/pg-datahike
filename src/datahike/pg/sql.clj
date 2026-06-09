@@ -180,6 +180,17 @@
    caching entirely. Defaults to the server-wide cache."
   global-catalog-cache)
 
+(defn invalidate-catalog-cache!
+  "Clear the server-wide enriched-db catalog cache. Called from every DDL
+   exec branch (via invalidate-schema-cache!). The cache key is only the
+   user-schema hash + catalog-table-names, which does NOT change when a
+   CREATE TYPE / ENUM / DOMAIN adds a registry *entity* (new datoms under
+   pre-existing idents) or when ALTER changes a column's typmod — so those
+   would otherwise serve stale catalog rows (e.g. a 2nd composite invisible
+   in pg_type). DDL is rare, so a full clear is the simplest correct fix."
+  []
+  (.clear ^java.util.Map global-catalog-cache))
+
 (defn- cache-get [^java.util.Map cache k]
   (when cache (.get cache k)))
 

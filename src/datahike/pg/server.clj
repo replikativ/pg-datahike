@@ -1102,9 +1102,13 @@
   (atom {:hit 0 :miss 0}))
 
 (defn invalidate-schema-cache!
-  "Clear the per-schema cache. Called from every DDL exec branch."
+  "Clear the per-schema cache. Called from every DDL exec branch. Also
+   clears the enriched-db catalog cache, whose schema-hash key is blind to
+   registry-entity additions (CREATE TYPE/ENUM/DOMAIN) and ALTER typmod
+   changes — see sql/invalidate-catalog-cache!."
   []
-  (.clear ^java.util.Map schema-deriv-cache))
+  (.clear ^java.util.Map schema-deriv-cache)
+  (sql/invalidate-catalog-cache!))
 
 (defn- schema-cached
   "`(schema-cached db cache-key produce)` — memoise `(produce)`
