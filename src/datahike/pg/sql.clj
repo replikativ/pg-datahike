@@ -467,22 +467,26 @@
              [curr-db curr-schema deferred]
 
              recursive?
-             (if-let [m (or
-                         ;; Primary: single-Datalog-rule materialisation
-                         ;; (simple bodies + parameterised CTEs via the
-                         ;; Execute-time deferral / ground-rule-params).
-                         (try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
-                              (catch Throwable _ nil))
-                         ;; Fallback (B1): semi-naive iteration for bodies the
-                         ;; rule encoding can't represent (LEFT JOIN, correlated
-                         ;; subqueries, nested recursion — asyncpg's typeinfo).
-                         (try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
-                              (catch Throwable _ nil)))]
-               ;; A parameterised recursive CTE enriches only the schema
-               ;; now and carries a `:deferred` spec for Execute-time data.
-               [(:db m) (:schema m)
-                (cond-> deferred (:deferred m) (conj (:deferred m)))]
-               [curr-db curr-schema deferred])
+             (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
+                               (catch Throwable _ nil))
+                   iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
+                               (catch Throwable _ nil))
+                   ;; Parameterised CTEs: prefer the iterative evaluator (it
+                   ;; defers a table-full param anchor to Execute and handles
+                   ;; complex bodies — asyncpg's typeinfo_tree); it bails (nil)
+                   ;; on a table-free param anchor so the rule path's B2
+                   ;; ground-rule-params owns that. Non-parameterised: keep the
+                   ;; proven single-rule path first, iteration as the fallback
+                   ;; for bodies the rule can't represent (LEFT JOIN, etc.).
+                   paramy? (boolean (seq (try (params/ast-param-indices wi)
+                                              (catch Throwable _ nil))))
+                   m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
+               (if m
+                 ;; A parameterised recursive CTE enriches only the schema
+                 ;; now and carries a `:deferred` spec for Execute-time data.
+                 [(:db m) (:schema m)
+                  (cond-> deferred (:deferred m) (conj (:deferred m)))]
+                 [curr-db curr-schema deferred]))
 
              (some? inner)
              (if-let [m (stmt/materialize-set-op! inner cte-name curr-db curr-schema)]

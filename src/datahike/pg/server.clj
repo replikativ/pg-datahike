@@ -2705,9 +2705,15 @@
       (update :deferred-recursive-ctes
               (fn [specs]
                 (mapv (fn [spec]
-                        (cond-> spec
-                          (contains? spec :in-args)
-                          (update :in-args sql/substitute-params fetch)))
+                        (if (= :iterative (:kind spec))
+                          ;; Iterative spec: params live in the anchor/recursive
+                          ;; branches' :in-args.
+                          (-> spec
+                              (update-in [:anchor :in-args] #(when % (sql/substitute-params % fetch)))
+                              (update-in [:recursive :in-args] #(when % (sql/substitute-params % fetch))))
+                          (cond-> spec
+                            (contains? spec :in-args)
+                            (update :in-args sql/substitute-params fetch))))
                       specs))))))
 
 (defn- coerce-insert-tx-data
@@ -4139,7 +4145,9 @@
             ;; data into query-db before the outer SELECT runs.
             query-db (if-let [specs (seq (:deferred-recursive-ctes parsed))]
                        (reduce (fn [d spec]
-                                 (stmt/materialize-recursive-rows! spec d))
+                                 (if (= :iterative (:kind spec))
+                                   (stmt/materialize-recursive-iterative-rows! spec d)
+                                   (stmt/materialize-recursive-rows! spec d)))
                                query-db specs)
                        query-db)
             hidden-count (or hidden-count 0)

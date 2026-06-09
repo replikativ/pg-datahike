@@ -4845,9 +4845,16 @@
    once against the seeded virtual table — folding NOVEL rows back in until a
    fixed point. Each iteration is a plain query the engine already handles.
 
-   Returns the standard {:db :schema :name :alias :aliases} map, or nil when
-   it can't apply: a non-`UNION` shape, a parameterised branch (the committed
-   rule path / B2 owns params for now), or any translation/eval failure."
+   Parameterised CTEs are DEFERRED to Execute (B2-style): when the anchor has
+   a `$n` and a real FROM clause (asyncpg's `FROM {typeinfo} ti WHERE
+   ti.oid = any($1)`), only the schema is enriched at parse and a `:deferred`
+   {:kind :iterative …} spec is returned; the server runs the anchor with the
+   bound params and iterates at Execute (materialize-recursive-iterative-rows!).
+
+   Returns the standard {:db :schema :name :alias :aliases [:deferred]} map, or
+   nil when it can't apply: a non-`UNION` shape, a parameterised TABLE-FREE
+   anchor (`SELECT $1::int` — the param constant-folds in translation, so the
+   rule path / B2 must own it), or any translation/eval failure."
   [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
   (try
     (when-let [[anchor recursive] (recursive-cte-branches wi)]
@@ -4860,17 +4867,56 @@
                                    (str expr)))))
                             col-list)
             row-marker (pgs/row-marker-attr target-name)
-            anchor-parsed (translate-select anchor schema db)
-            ;; Params are owned by the rule path (B2); bail so the caller's
-            ;; rule materialisation keeps deferring them.
-            anchor-params? (some params/param-ref? (:in-args anchor-parsed))]
-        (when-not anchor-params?
-          (let [anchor-edb  (or (:enriched-db anchor-parsed) db)
+            ;; AST-level param detection (robust to translation constant-folding
+            ;; a table-free `$n` cast). A parameterised CTE can't run its anchor
+            ;; at parse, so we defer — unless the anchor has no FROM (table-free
+            ;; `SELECT $1::int`), where the param folds away and the rule/B2
+            ;; path resolves it correctly; bail to that.
+            anchor-param? (boolean (seq (params/ast-param-indices anchor)))
+            param? (or anchor-param?
+                       (boolean (seq (params/ast-param-indices recursive))))
+            anchor-from (.getFromItem ^PlainSelect anchor)
+            mk-data-tx (fn [coercions rows]
+                         (vec (for [row rows]
+                                (assoc (into {} (keep-indexed
+                                                 (fn [i c]
+                                                   (let [v (nth row i nil)]
+                                                     (when (and (some? v) (not= :__null__ v))
+                                                       [(keyword target-name c) ((nth coercions i) v)])))
+                                                 col-names))
+                                       row-marker true))))]
+        (cond
+          ;; Table-free parameterised anchor → rule/B2 owns it.
+          (and param? anchor-param? (nil? anchor-from))
+          nil
+
+          ;; Parameterised (table-full) → defer data to Execute. Enrich only the
+          ;; schema now; column types come from the anchor's inferred OIDs.
+          param?
+          (let [anchor-parsed (translate-select anchor schema db)
+                anchor-oids (:select-item-oids anchor-parsed)
+                col-types (mapv (fn [i]
+                                  (or (some-> (nth anchor-oids i nil) types/dh-type-for-oid)
+                                      :db.type/string))
+                                (range (count col-names)))
+                schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+                spec0 (d/db-with db schema-tx)
+                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
+                             (translate-select recursive (:schema spec0) spec0))]
+            {:db spec0 :schema (:schema spec0) :name target-name
+             :alias target-name :aliases col-names
+             :deferred {:kind :iterative
+                        :target-name target-name :row-marker row-marker
+                        :col-names col-names :col-types col-types
+                        :anchor (select-keys anchor-parsed [:query :in-args :hidden-count :enriched-db])
+                        :recursive (select-keys rec-parsed [:query :in-args :hidden-count :enriched-db])}})
+
+          ;; No params — materialise now.
+          :else
+          (let [anchor-parsed (translate-select anchor schema db)
+                anchor-edb  (or (:enriched-db anchor-parsed) db)
                 anchor-rows (visible-query-rows anchor-parsed anchor-edb)
                 anchor-oids (:select-item-oids anchor-parsed)
-                ;; Column value-types: prefer sampled rows, fall back to the
-                ;; anchor's inferred OIDs (SQL takes a recursive CTE's column
-                ;; types from the anchor branch).
                 col-types (mapv (fn [i]
                                   (let [samples (keep #(nth % i nil) anchor-rows)
                                         vtypes  (into #{} (map infer-recursive-vtype) samples)]
@@ -4884,31 +4930,68 @@
                                                 :db.type/string))))
                                 (range (count col-names)))
                 coercions (mapv recursive-coercion col-types)
-                mk-data-tx (fn [rows]
-                             (vec (for [row rows]
-                                    (assoc (into {} (keep-indexed
-                                                     (fn [i c]
-                                                       (let [v (nth row i nil)]
-                                                         (when (and (some? v) (not= :__null__ v))
-                                                           [(keyword target-name c) ((nth coercions i) v)])))
-                                                     col-names))
-                                           row-marker true))))
                 schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
-                spec0 (d/db-with (d/db-with db schema-tx) (mk-data-tx anchor-rows))
+                spec0 (d/db-with (d/db-with db schema-tx) (mk-data-tx coercions anchor-rows))
                 rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
                              (translate-select recursive (:schema spec0) spec0))]
-            ;; A parameterised recursive branch also bows out to the rule path.
-            (when-not (some params/param-ref? (:in-args rec-parsed))
-              (loop [cur spec0, seen (set anchor-rows), i 0]
-                (if (> i 100000)
-                  {:db cur :schema (:schema cur) :name target-name
-                   :alias target-name :aliases col-names}
-                  (let [rows  (visible-query-rows rec-parsed cur)
-                        novel (vec (remove seen rows))]
-                    (if (empty? novel)
-                      {:db cur :schema (:schema cur) :name target-name
-                       :alias target-name :aliases col-names}
-                      (recur (d/db-with cur (mk-data-tx novel))
-                             (into seen novel) (inc i)))))))))))
+            (loop [cur spec0, seen (set anchor-rows), i 0]
+              (if (> i 100000)
+                {:db cur :schema (:schema cur) :name target-name
+                 :alias target-name :aliases col-names}
+                (let [rows  (visible-query-rows rec-parsed cur)
+                      novel (vec (remove seen rows))]
+                  (if (empty? novel)
+                    {:db cur :schema (:schema cur) :name target-name
+                     :alias target-name :aliases col-names}
+                    (recur (d/db-with cur (mk-data-tx coercions novel))
+                           (into seen novel) (inc i))))))))))
     (catch Throwable _ nil)))
+
+(defn materialize-recursive-iterative-rows!
+  "Execute-time materialisation for a DEFERRED iterative recursive CTE (see
+   materialize-recursive-iterative!). `spec` is the :deferred map with its
+   anchor/recursive :in-args already param-substituted by resolve-param-refs.
+   Runs the anchor against its parse-time enriched-db, folds the rows into the
+   recursive branch's enriched-db (which carries the CTE schema + any derived
+   tables it referenced), and iterates to a fixed point. The recursive step is
+   TOLERANT — if an iteration throws (e.g. an array-membership join the engine
+   can't resolve), we stop and keep what we have (asyncpg needs only the anchor
+   rows for a composite of core-typed fields). Returns the data-enriched db
+   (the caller's query-db, whose schema already has the CTE attrs); on anchor
+   failure returns `db` unchanged."
+  [{:keys [anchor recursive col-names col-types target-name row-marker]} db]
+  (try
+    (let [coercions (mapv recursive-coercion col-types)
+          mk-data-tx (fn [rows]
+                       (vec (for [row rows]
+                              (assoc (into {} (keep-indexed
+                                              (fn [i c]
+                                                (let [v (nth row i nil)]
+                                                  (when (and (some? v) (not= :__null__ v))
+                                                    [(keyword target-name c) ((nth coercions i) v)])))
+                                              col-names))
+                                     row-marker true))))
+          anchor-edb  (or (:enriched-db anchor) db)
+          anchor-rows (visible-query-rows anchor anchor-edb)
+          ;; The recursive branch was translated against a schema-only spec
+          ;; whose :enriched-db carries the CTE attrs + any derived tables it
+          ;; referenced; seed it with the (param-bound) anchor rows.
+          rec-base    (or (:enriched-db recursive) db)
+          base        (d/db-with rec-base (mk-data-tx anchor-rows))]
+      ;; Bounded recursion: a type-dependency chain is shallow, and a result
+      ;; column like typeinfo_tree.depth makes a type re-derived via a longer
+      ;; path a DISTINCT row, so a deep/correlated body can keep producing
+      ;; "novel" rows over the whole catalog. The cap keeps Execute responsive;
+      ;; for asyncpg the ANCHOR rows are what build the codec (dependent
+      ;; core-type rows are resolved from its builtin codecs), so a partial
+      ;; recursion is still correct for the cases that matter.
+      (loop [cur base, seen (set anchor-rows), i 0]
+        (if (>= i 64)
+          cur
+          (let [rows  (try (visible-query-rows recursive cur) (catch Throwable _ :stop))
+                novel (when (not= rows :stop) (vec (remove seen rows)))]
+            (if (or (= rows :stop) (empty? novel))
+              cur
+              (recur (d/db-with cur (mk-data-tx novel)) (into seen novel) (inc i)))))))
+    (catch Throwable _ db)))
 
