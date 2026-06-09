@@ -1340,7 +1340,50 @@
                 "avg" 'datahike.pg.sql/filter-avg-numeric
                 nil))))
 
-        _ (doseq [^SelectItem item select-items]
+        ;; --- Correlated scalar subqueries in the SELECT list (slice A of the
+        ;; per-row / LATERAL executor — doc/correlated-lateral-plan.md). A
+        ;; scalar subquery that references an OUTER FROM alias is DEFERRED:
+        ;; the item loop skips it (so it isn't evaluated-once → NULL), the
+        ;; outer-correlation columns it reads are threaded into :find as
+        ;; hidden cols, and exec-select runs the inner per outer row. When
+        ;; none are present, `correlated-subqs` is empty and the SELECT path
+        ;; below is unchanged.
+        outer-aliases (into #{}
+                            (comp cat (remove nil?) (map str/lower-case))
+                            [(keys table-aliases) (vals table-aliases) [default-table]])
+        correlated-subqs
+        (when db
+          (into []
+                (keep-indexed
+                 (fn [i ^SelectItem item]
+                   (let [e (.getExpression item)
+                         inner (cond (instance? ParenthesedSelect e) (.getSelect ^ParenthesedSelect e)
+                                     (instance? PlainSelect e) e
+                                     :else nil)]
+                     (when (instance? PlainSelect inner)
+                       (when-let [refs (correlated-subquery-refs inner outer-aliases)]
+                         {:out-pos i
+                          :inner-sql (str inner)
+                          :corr-refs (vec refs)
+                          :alias (or (select-item-alias item) "?column?")
+                          ;; result OID of the inner's first projection, for
+                          ;; the extended-protocol RowDescription (count→int8,
+                          ;; array_agg→array, …). Use the full parse-sql so the
+                          ;; inner is catalog-enriched (array_agg over catalog
+                          ;; columns types correctly). Best-effort; nil → text.
+                          :oid (try
+                                 (when-let [pf (:parse-sql ctx)]
+                                   (first (:select-item-oids (pf (str inner) schema db))))
+                                 (catch Throwable _ nil))}))))
+                 select-items)))
+        corr-out-positions (into #{} (map :out-pos) correlated-subqs)
+        ;; distinct [alias col] correlation columns, in stable order
+        corr-cols-needed (vec (distinct (mapcat :corr-refs correlated-subqs)))
+        ;; the item loop processes everything EXCEPT the deferred subqueries
+        loop-items (into [] (keep-indexed (fn [i it] (when-not (corr-out-positions i) it))
+                                          select-items))
+
+        _ (doseq [^SelectItem item loop-items]
             (let [raw-expr (.getExpression item)
                   ;; A CAST over an aggregate (count(*)::int4) dispatches as
                   ;; the inner aggregate; the cast only re-types the result
@@ -1715,6 +1758,25 @@
                                                      (subs (str v) 1))
                                                    (str v)))))))))
 
+        ;; Thread each distinct correlation column (e.g. t.oid) into :find
+        ;; as a trailing hidden column so every outer row carries the value
+        ;; exec-select binds into *from-bindings* before running the inner.
+        ;; Returns {[alias col] → index-in-find}.
+        corr-col->idx
+        (when (seq corr-cols-needed)
+          (into {}
+                (map-indexed
+                 (fn [n [alias col]]
+                   (let [colexpr (doto (net.sf.jsqlparser.schema.Column.)
+                                   (.setColumnName col)
+                                   (.setTable (net.sf.jsqlparser.schema.Table. ^String alias)))
+                         v (expr/translate-expr ctx colexpr)
+                         idx (count @find-elements)]
+                     (swap! find-elements conj v)
+                     (swap! find-aliases conj (str "__corr_" n))
+                     [[alias col] idx]))
+                 corr-cols-needed)))
+
         ;; Parse-time OID inference for each select-item expression.
         ;; Walks the JSqlParser AST to produce a result OID per element
         ;; of :find-aliases, mirroring PG's exprType (see
@@ -1764,7 +1826,10 @@
                          :else
                          (conj v (oid/expr-oid expr oid-env)))))
                    []
-                   select-items)
+                   ;; loop-items excludes deferred correlated subqueries, so
+                   ;; these OIDs line up with the non-subquery part of
+                   ;; find-aliases (the __corr_ tail pads to nil below).
+                   loop-items)
                 ;; find-aliases may be longer than acc when SELECT
                 ;; contains JOIN-driven entity vars added to :find
                 ;; for :with semantics. Pad with nil so the vector
@@ -2581,6 +2646,14 @@
              :compound-exprs  (when (seq @compound-exprs) @compound-exprs)
              ;; Window function specs for server-side post-processing
              :window-specs    (when (seq @window-specs) @window-specs)
+             ;; Correlated scalar subqueries (slice A): each is run per outer
+             ;; row by exec-select, which binds the correlation columns
+             ;; (whose Datalog result indices are in :corr-col->idx) into
+             ;; *from-bindings*, then splices the value at :out-pos.
+             :correlated-subqueries (when (seq correlated-subqs)
+                                      {:subqueries correlated-subqs
+                                       :corr-col->idx corr-col->idx
+                                       :n-output (count select-items)})
              ;; FOR UPDATE row-locking (SKIP LOCKED / NOWAIT / blocking)
              :for-update      for-update
              ;; Prepared-statement param placeholders {index → ?var}.

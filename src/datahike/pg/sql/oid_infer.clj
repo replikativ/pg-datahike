@@ -223,7 +223,10 @@
    ;; returns the input type. mode also returns the input type.
    "percentile_cont" types/oid-float8
    "percentile_disc" :arg-type
-   "mode"            :arg-type})
+   "mode"            :arg-type
+   ;; array_agg(x) → x's array OID; string_agg(x, sep) → text.
+   "array_agg"       :arg-array
+   "string_agg"      types/oid-text})
 
 ;; ---------------------------------------------------------------------------
 ;; Inference
@@ -330,6 +333,9 @@
     (cond
       (integer? rule)    rule
       (= rule :arg-type) input-oid
+      ;; array_agg(x) → x's array OID (text→text[], int4→int4[], …).
+      (= rule :arg-array) (when input-oid
+                            (get types/element-oid->array-oid input-oid types/oid-text-array))
       (map? rule)        (let [r (or (get rule input-oid)
                                      (get rule :default))]
                            (cond

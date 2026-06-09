@@ -4018,6 +4018,20 @@
       :dh-delete-branch  (handle-dh-delete-branch conn parsed)
       (empty-result "OK"))))
 
+(defn- splice-correlated
+  "Assemble `n-output` columns from `visible` (non-correlation columns in
+   order) and `out-pos->val` (subquery output-position → value). Shared by
+   exec-select (row values) and describeResult (aliases / OIDs) so the
+   correlated-subquery output layout is computed identically — see
+   doc/correlated-lateral-plan.md."
+  [visible out-pos->val n-output]
+  (loop [p 0, v (seq visible), out []]
+    (if (= p n-output)
+      out
+      (if (contains? out-pos->val p)
+        (recur (inc p) v (conj out (get out-pos->val p)))
+        (recur (inc p) (next v) (conj out (first v)))))))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -4264,6 +4278,48 @@
                     final-aliases (mapv #(nth new-aliases %) visible-indices)]
                 [final-results final-aliases])
               [results find-aliases])
+            ;; Correlated scalar subqueries (slice A — doc/correlated-lateral-
+            ;; plan.md): run each inner SELECT per outer row with the
+            ;; correlation columns bound into *from-bindings*, splice the
+            ;; resulting value at its out-pos, and drop the hidden __corr_
+            ;; columns. No-op when the query has no correlated subqueries.
+            [results find-aliases]
+            (if-let [cs (:correlated-subqueries parsed)]
+              (let [{:keys [subqueries corr-col->idx n-output]} cs
+                    inner-schema (dbi/-schema query-db)
+                    corr-idx-set (set (vals corr-col->idx))
+                    visible-idxs (vec (remove corr-idx-set (range (count find-aliases))))
+                    out-pos->subq (into {} (map (juxt :out-pos identity)) subqueries)
+                    run-subq
+                    (fn [subq rv]
+                      (let [fb (reduce (fn [m [a c]]
+                                         (assoc-in m [a c] (nth rv (get corr-col->idx [a c]) nil)))
+                                       {} (:corr-refs subq))]
+                        (binding [params/*from-bindings* fb
+                                  stmt/*eval-update-db* query-db]
+                          (try
+                            (let [p   (sql/parse-sql (:inner-sql subq) inner-schema query-db)
+                                  q   (:query p) ia (:in-args p)
+                                  qdb (or (:enriched-db p) query-db)
+                                  res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+                                  fr  (first res)]
+                              (if (sequential? fr) (first fr) fr))
+                            (catch Throwable _ nil)))))
+                    new-results
+                    (mapv (fn [row]
+                            (let [rv (if (sequential? row) (vec row) [row])
+                                  vis (mapv #(nth rv % nil) visible-idxs)
+                                  subq-vals (into {} (map (fn [[op sq]] [op (run-subq sq rv)]))
+                                                  out-pos->subq)]
+                              (splice-correlated vis subq-vals n-output)))
+                          results)
+                    visible-aliases (mapv #(nth find-aliases %) visible-idxs)
+                    new-aliases (splice-correlated
+                                 visible-aliases
+                                 (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
+                                 n-output)]
+                [new-results new-aliases])
+              [results find-aliases])
             ;; Apply DISTINCT deduplication for aggregate queries
             results (if (and has-distinct? has-aggregates?)
                       (distinct results)
@@ -4293,6 +4349,18 @@
                                            (nth item-oids i))]
                                   (aset out i
                                         (int (if (and (= so -1) io) io so)))))
+                              out)
+                            schema-oids)
+              ;; Correlated subqueries: the spliced columns aren't schema/
+              ;; item columns, so force each one's advertised OID (its
+              ;; inner-projection :oid) at its out-pos — keeping the
+              ;; execute-path encoding consistent with the RowDescription
+              ;; describeResult sent (e.g. array_agg → text[] binary).
+              schema-oids (if-let [cs (:correlated-subqueries parsed)]
+                            (let [out (aclone ^ints schema-oids)]
+                              (doseq [{:keys [out-pos oid]} (:subqueries cs)]
+                                (when (< out-pos (alength out))
+                                  (aset out out-pos (int (or oid PgWireServer/OID_TEXT)))))
                               out)
                             schema-oids)
               sources (compute-column-sources parsed-with-shape db)
@@ -5400,6 +5468,29 @@
                             (some? item-oid)     item-oid
                             (not= schema-oid -1) schema-oid
                             :else                PgWireServer/OID_TEXT))))
+                ;; Correlated scalar subqueries (slice A): the parsed
+                ;; find-aliases/oids describe the non-subquery + hidden
+                ;; __corr_ columns. Re-shape to the actual output —
+                ;; splice each subquery's alias/OID at its out-pos and drop
+                ;; the __corr_ columns — so RowDescription matches what
+                ;; exec-select streams.
+                [aliases oids]
+                (if-let [cs (:correlated-subqueries parsed)]
+                  (let [{:keys [subqueries corr-col->idx n-output]} cs
+                        corr-idx-set (set (vals corr-col->idx))
+                        vis-idxs (vec (remove corr-idx-set (range (count aliases))))
+                        vis-aliases (mapv #(nth aliases %) vis-idxs)
+                        vis-oids (mapv #(aget ^ints oids %) vis-idxs)
+                        a (splice-correlated vis-aliases
+                                             (into {} (map (fn [s] [(:out-pos s) (:alias s)])) subqueries)
+                                             n-output)
+                        o (splice-correlated vis-oids
+                                             (into {} (map (fn [s] [(:out-pos s)
+                                                                    (int (or (:oid s) PgWireServer/OID_TEXT))]))
+                                                   subqueries)
+                                             n-output)]
+                    [a (int-array (map int o))])
+                  [aliases oids])
                 sources (compute-column-sources parsed db)
                 qr (PgWireServer$QueryResult.
                     (into-array String aliases)
