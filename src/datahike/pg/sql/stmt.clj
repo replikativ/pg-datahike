@@ -4601,3 +4601,106 @@
          :alias   target-name
          :aliases col-names}))))
 
+(defn- recursive-cte-branches
+  "Split a WITH RECURSIVE item into [anchor recursive] PlainSelects, or nil
+   if it isn't the expected `<anchor> UNION [ALL] <recursive>` shape."
+  [^net.sf.jsqlparser.statement.select.WithItem wi]
+  (let [select (let [s (.getSelect wi)]
+                 (if (instance? ParenthesedSelect s)
+                   (.getSelect ^ParenthesedSelect s) s))]
+    (when (instance? SetOperationList select)
+      (let [selects (.getSelects ^SetOperationList select)]
+        (when (and (= 2 (count selects))
+                   (instance? PlainSelect (first selects))
+                   (instance? PlainSelect (second selects)))
+          [(first selects) (second selects)])))))
+
+(defn- visible-query-rows
+  "Run a translate-select result's :query against `exec-db`, dropping any
+   hidden trailing columns (entity/order-by vars), and return row vectors."
+  [{:keys [query in-args hidden-count]} exec-db]
+  (let [vis (- (count (:find query)) (or hidden-count 0))
+        raw (if (seq in-args)
+              (apply d/q query exec-db in-args)
+              (d/q query exec-db))]
+    (mapv (fn [r] (let [v (if (sequential? r) (vec r) [r])] (vec (take vis v))))
+          raw)))
+
+(defn materialize-recursive-iterative!
+  "FALLBACK recursive-CTE evaluator (B1): semi-naive iteration instead of a
+   single Datalog rule. Used when materialize-recursive-cte!'s rule encoding
+   can't represent the body (LEFT JOIN → not-join, correlated subqueries,
+   nested recursion — e.g. asyncpg's typeinfo introspection).
+
+   Runs the anchor as an ordinary SELECT, materialises its rows under
+   `:<target>/<col>`, then repeatedly runs the recursive branch — translated
+   once against the seeded virtual table — folding NOVEL rows back in until a
+   fixed point. Each iteration is a plain query the engine already handles.
+
+   Returns the standard {:db :schema :name :alias :aliases} map, or nil when
+   it can't apply: a non-`UNION` shape, a parameterised branch (the committed
+   rule path / B2 owns params for now), or any translation/eval failure."
+  [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
+  (try
+    (when-let [[anchor recursive] (recursive-cte-branches wi)]
+      (let [col-list  (.getWithItemList wi)
+            col-names (mapv (fn [item]
+                              (let [expr (.getExpression ^SelectItem item)]
+                                (unquote-ident
+                                 (if (instance? Column expr)
+                                   (.getColumnName ^Column expr)
+                                   (str expr)))))
+                            col-list)
+            row-marker (pgs/row-marker-attr target-name)
+            anchor-parsed (translate-select anchor schema db)
+            ;; Params are owned by the rule path (B2); bail so the caller's
+            ;; rule materialisation keeps deferring them.
+            anchor-params? (some params/param-ref? (:in-args anchor-parsed))]
+        (when-not anchor-params?
+          (let [anchor-edb  (or (:enriched-db anchor-parsed) db)
+                anchor-rows (visible-query-rows anchor-parsed anchor-edb)
+                anchor-oids (:select-item-oids anchor-parsed)
+                ;; Column value-types: prefer sampled rows, fall back to the
+                ;; anchor's inferred OIDs (SQL takes a recursive CTE's column
+                ;; types from the anchor branch).
+                col-types (mapv (fn [i]
+                                  (let [samples (keep #(nth % i nil) anchor-rows)
+                                        vtypes  (into #{} (map infer-recursive-vtype) samples)]
+                                    (cond
+                                      (= 1 (count vtypes)) (first vtypes)
+                                      (and (seq vtypes)
+                                           (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes))
+                                      :db.type/bigdec
+                                      (seq vtypes) :db.type/string
+                                      :else (or (some-> (nth anchor-oids i nil) types/dh-type-for-oid)
+                                                :db.type/string))))
+                                (range (count col-names)))
+                coercions (mapv recursive-coercion col-types)
+                mk-data-tx (fn [rows]
+                             (vec (for [row rows]
+                                    (assoc (into {} (keep-indexed
+                                                     (fn [i c]
+                                                       (let [v (nth row i nil)]
+                                                         (when (and (some? v) (not= :__null__ v))
+                                                           [(keyword target-name c) ((nth coercions i) v)])))
+                                                     col-names))
+                                           row-marker true))))
+                schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+                spec0 (d/db-with (d/db-with db schema-tx) (mk-data-tx anchor-rows))
+                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
+                             (translate-select recursive (:schema spec0) spec0))]
+            ;; A parameterised recursive branch also bows out to the rule path.
+            (when-not (some params/param-ref? (:in-args rec-parsed))
+              (loop [cur spec0, seen (set anchor-rows), i 0]
+                (if (> i 100000)
+                  {:db cur :schema (:schema cur) :name target-name
+                   :alias target-name :aliases col-names}
+                  (let [rows  (visible-query-rows rec-parsed cur)
+                        novel (vec (remove seen rows))]
+                    (if (empty? novel)
+                      {:db cur :schema (:schema cur) :name target-name
+                       :alias target-name :aliases col-names}
+                      (recur (d/db-with cur (mk-data-tx novel))
+                             (into seen novel) (inc i)))))))))))
+    (catch Throwable _ nil)))
+

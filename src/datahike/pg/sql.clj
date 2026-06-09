@@ -453,8 +453,17 @@
              [curr-db curr-schema deferred]
 
              recursive?
-             (if-let [m (try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
-                             (catch Throwable _ nil))]
+             (if-let [m (or
+                         ;; Primary: single-Datalog-rule materialisation
+                         ;; (simple bodies + parameterised CTEs via the
+                         ;; Execute-time deferral / ground-rule-params).
+                         (try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
+                              (catch Throwable _ nil))
+                         ;; Fallback (B1): semi-naive iteration for bodies the
+                         ;; rule encoding can't represent (LEFT JOIN, correlated
+                         ;; subqueries, nested recursion — asyncpg's typeinfo).
+                         (try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
+                              (catch Throwable _ nil)))]
                ;; A parameterised recursive CTE enriches only the schema
                ;; now and carries a `:deferred` spec for Execute-time data.
                [(:db m) (:schema m)
