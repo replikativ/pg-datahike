@@ -1476,7 +1476,14 @@
        hits JSqlParser, repeated or not."
   ([^String sql schema] (parse-sql sql schema nil))
   ([^String sql schema db]
-   (let [cache *parse-cache*
+   (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
+         ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
+         ;; so it must neither be served from nor written to the shared result
+         ;; cache (whose key is only [sql schema]). Bypass caching entirely in
+         ;; that case — otherwise the binding-free version (e.g. the parse done
+         ;; for result-OID inference) poisons the entry and the correlated ref
+         ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
+         cache (when (empty? params/*from-bindings*) *parse-cache*)
          schema-key (when cache (hash schema))
          cache-key (when cache [sql schema-key])
          cached (when cache (cache-get cache cache-key))]

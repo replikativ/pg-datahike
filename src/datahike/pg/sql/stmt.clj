@@ -1138,6 +1138,100 @@
                  [a (str/lower-case col)])]
       (not-empty (set refs)))))
 
+(defn- unwrap-parens
+  "Peel redundant Parenthesis / single-element ParenthesedExpressionList
+   wrappers so `(CASE … END)` and `((expr))` reach their inner node. A
+   ParenthesedSelect (a scalar subquery) is NOT unwrapped — it's a leaf here."
+  [^net.sf.jsqlparser.expression.Expression e]
+  (cond
+    (instance? net.sf.jsqlparser.expression.Parenthesis e)
+    (recur (.getExpression ^net.sf.jsqlparser.expression.Parenthesis e))
+    (and (instance? net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList e)
+         (= 1 (.size ^net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList e)))
+    (recur (.get ^net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList e 0))
+    :else e))
+
+(defn- subquery-expr?
+  "True if a JSqlParser expression is a scalar subquery node."
+  [e]
+  (or (instance? ParenthesedSelect e) (instance? PlainSelect e)))
+
+(defn- subquery-inner
+  "The PlainSelect/SetOp inside a (Parenthesed)Select expression."
+  [e]
+  (if (instance? ParenthesedSelect e) (.getSelect ^ParenthesedSelect e) e))
+
+(defn correlated-select-item-spec
+  "Detect a correlated scalar subquery in a SELECT-list item expression `e`,
+   returning a deferral spec (without :out-pos/:alias/:oid, which the caller
+   adds) or nil. Two shapes:
+
+   - `:scalar` — the item IS a scalar subquery `(SELECT … <outer ref> …)`.
+   - `:case`   — the item is a CASE whose THEN/ELSE contains a correlated
+     subquery (asyncpg's `CASE WHEN typtype='c' THEN (SELECT array_agg(…)
+     WHERE c.reltype = t.oid) END`). The single-rule CASE compiler would
+     pre-evaluate the subquery once at parse (→ NULL); instead we defer and
+     let exec-select evaluate the whole CASE per outer row.
+
+   `:corr-refs` is the set of [outer-alias col] references threaded into
+   :find as hidden columns so exec-select can bind *from-bindings* per row."
+  [^net.sf.jsqlparser.expression.Expression e0 outer-aliases]
+  (let [e (unwrap-parens e0)]
+   (cond
+    (subquery-expr? e)
+    (let [inner (subquery-inner e)]
+      (when (instance? PlainSelect inner)
+        (when-let [refs (correlated-subquery-refs inner outer-aliases)]
+          {:kind :scalar :inner-sql (str inner) :corr-refs (vec refs)})))
+
+    (instance? net.sf.jsqlparser.expression.CaseExpression e)
+    (let [ce ^net.sf.jsqlparser.expression.CaseExpression e
+          when-clauses (.getWhenClauses ce)
+          else-expr (.getElseExpression ce)
+          then->spec (fn [^net.sf.jsqlparser.expression.Expression t]
+                       (when t
+                         (if (subquery-expr? t)
+                           {:subquery-sql (str (subquery-inner t))}
+                           {:expr-sql (str t)})))
+          ;; THEN/ELSE branches that are subqueries
+          subqs (concat
+                 (keep (fn [^net.sf.jsqlparser.expression.WhenClause wc]
+                         (let [t (.getThenExpression wc)] (when (subquery-expr? t) t)))
+                       when-clauses)
+                 (when (subquery-expr? else-expr) [else-expr]))
+          ;; Only defer when some THEN/ELSE subquery is itself correlated; an
+          ;; uncorrelated subquery (or a plain CASE) needs no per-row eval.
+          correlated? (some (fn [s]
+                              (let [inner (subquery-inner s)]
+                                (and (instance? PlainSelect inner)
+                                     (seq (correlated-subquery-refs inner outer-aliases)))))
+                            subqs)]
+      (when correlated?
+        {:kind :case
+         :branches (mapv (fn [^net.sf.jsqlparser.expression.WhenClause wc]
+                           {:when-sql (str (.getWhenExpression wc))
+                            :then (then->spec (.getThenExpression wc))})
+                         when-clauses)
+         :else (then->spec else-expr)
+         ;; All outer refs across the whole CASE (WHEN conditions + subqueries).
+         :corr-refs (vec (or (correlated-subquery-refs ce outer-aliases) []))}))
+
+    :else nil)))
+
+(defn- correlated-item-oid
+  "Best-effort result OID for a deferred correlated item, for the extended-
+   protocol RowDescription. Uses the inner subquery's first-projection OID
+   (count→int8, array_agg→array, …) via the full parse-sql so catalog
+   columns type correctly. nil → caller defaults to text."
+  [spec schema db parse-fn]
+  (try
+    (when parse-fn
+      (let [sql (case (:kind spec)
+                  :scalar (:inner-sql spec)
+                  :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))]
+        (when sql (first (:select-item-oids (parse-fn sql schema db))))))
+    (catch Throwable _ nil)))
+
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
@@ -1356,25 +1450,11 @@
           (into []
                 (keep-indexed
                  (fn [i ^SelectItem item]
-                   (let [e (.getExpression item)
-                         inner (cond (instance? ParenthesedSelect e) (.getSelect ^ParenthesedSelect e)
-                                     (instance? PlainSelect e) e
-                                     :else nil)]
-                     (when (instance? PlainSelect inner)
-                       (when-let [refs (correlated-subquery-refs inner outer-aliases)]
-                         {:out-pos i
-                          :inner-sql (str inner)
-                          :corr-refs (vec refs)
-                          :alias (or (select-item-alias item) "?column?")
-                          ;; result OID of the inner's first projection, for
-                          ;; the extended-protocol RowDescription (count→int8,
-                          ;; array_agg→array, …). Use the full parse-sql so the
-                          ;; inner is catalog-enriched (array_agg over catalog
-                          ;; columns types correctly). Best-effort; nil → text.
-                          :oid (try
-                                 (when-let [pf (:parse-sql ctx)]
-                                   (first (:select-item-oids (pf (str inner) schema db))))
-                                 (catch Throwable _ nil))}))))
+                   (when-let [spec (correlated-select-item-spec (.getExpression item) outer-aliases)]
+                     (assoc spec
+                            :out-pos i
+                            :alias (or (select-item-alias item) "?column?")
+                            :oid (correlated-item-oid spec schema db (:parse-sql ctx)))))
                  select-items)))
         corr-out-positions (into #{} (map :out-pos) correlated-subqs)
         ;; distinct [alias col] correlation columns, in stable order

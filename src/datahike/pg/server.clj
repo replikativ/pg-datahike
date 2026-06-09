@@ -4048,6 +4048,54 @@
         (recur (inc p) v (conj out (get out-pos->val p)))
         (recur (inc p) (next v) (conj out (first v)))))))
 
+(defn- eval-corr-scalar
+  "Evaluate one SQL fragment for a deferred correlated item against `query-db`
+   with `*from-bindings*` already bound (caller sets it). `subquery?` true →
+   `sql` is a full SELECT (run as-is); false → `sql` is a bare scalar/predicate
+   expression, wrapped as `SELECT (<sql>)`. Returns the first cell, or nil on
+   error / empty."
+  [sql subquery? inner-schema query-db]
+  (try
+    (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
+          p   (sql/parse-sql run-sql inner-schema query-db)
+          q   (:query p)
+          ia  (:in-args p)
+          qdb (or (:enriched-db p) query-db)]
+      (if (nil? q)
+        ;; table-free literal collapsed to a literal row
+        (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
+        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+              fr  (first res)]
+          (if (sequential? fr) (first fr) fr))))
+    (catch Throwable _ nil)))
+
+(defn- eval-corr-then
+  "Evaluate a CASE branch's THEN/ELSE spec ({:subquery-sql …} | {:expr-sql …}
+   | nil → SQL NULL) with *from-bindings* bound."
+  [then-spec inner-schema query-db]
+  (cond
+    (nil? then-spec)               :__null__
+    (:subquery-sql then-spec)      (eval-corr-scalar (:subquery-sql then-spec) true inner-schema query-db)
+    :else                          (eval-corr-scalar (:expr-sql then-spec) false inner-schema query-db)))
+
+(defn- run-correlated-spec
+  "Compute the value of a deferred correlated SELECT item for one outer row.
+   `fb` is the per-row *from-bindings* the caller has built. Dispatches on the
+   spec :kind — :scalar runs the subquery directly; :case walks the branches,
+   evaluating each WHEN against fb and the first matching THEN (or ELSE)."
+  [spec fb inner-schema query-db]
+  (binding [params/*from-bindings* fb
+            stmt/*eval-update-db* query-db]
+    (case (:kind spec)
+      :case
+      (let [hit (some (fn [{:keys [when-sql then]}]
+                        (when (true? (eval-corr-scalar when-sql false inner-schema query-db))
+                          [(eval-corr-then then inner-schema query-db)]))
+                      (:branches spec))]
+        (if hit (first hit) (eval-corr-then (:else spec) inner-schema query-db)))
+      ;; :scalar (and default): run the inner subquery, take first cell.
+      (eval-corr-scalar (:inner-sql spec) true inner-schema query-db))))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -4326,16 +4374,7 @@
                       (let [fb (reduce (fn [m [a c]]
                                          (assoc-in m [a c] (nth rv (get corr-col->idx [a c]) nil)))
                                        {} (:corr-refs subq))]
-                        (binding [params/*from-bindings* fb
-                                  stmt/*eval-update-db* query-db]
-                          (try
-                            (let [p   (sql/parse-sql (:inner-sql subq) inner-schema query-db)
-                                  q   (:query p) ia (:in-args p)
-                                  qdb (or (:enriched-db p) query-db)
-                                  res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
-                                  fr  (first res)]
-                              (if (sequential? fr) (first fr) fr))
-                            (catch Throwable _ nil)))))
+                        (run-correlated-spec subq fb inner-schema query-db)))
                     new-results
                     (mapv (fn [row]
                             (let [rv (if (sequential? row) (vec row) [row])
