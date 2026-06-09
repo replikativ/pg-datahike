@@ -4344,7 +4344,13 @@
      :col-names col-names
      :rule-vars rule-vars
      :in-params all-in-params
-     :in-args all-in-args}))
+     :in-args all-in-args
+     ;; The anchor PlainSelect (UNION's non-recursive branch) — used by
+     ;; materialize-recursive-cte! to infer column value-types from the
+     ;; anchor's SELECT expressions when data can't be materialised at
+     ;; parse time (B2: a parameterised anchor whose `$n` is unbound until
+     ;; Bind). SQL gives a recursive CTE its column types from the anchor.
+     :anchor anchor}))
 
 (defn- infer-recursive-vtype
   "Minimal value-type detector for rows produced by a recursive CTE
@@ -4366,6 +4372,175 @@
     (instance? java.util.Date v)                :db.type/instant
     :else                                       :db.type/string))
 
+(defn- recursive-coercion
+  "Per-value coercion fn for a recursive-CTE column's datahike value type.
+   Idempotent on already-typed values."
+  [vtype]
+  (case vtype
+    :db.type/long   (fn [v] (if (instance? Long v) v (long v)))
+    :db.type/double (fn [v] (if (instance? Double v) v (double v)))
+    :db.type/bigdec (fn [v]
+                      (cond
+                        (instance? java.math.BigDecimal v) v
+                        (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                        (integer? v) (java.math.BigDecimal/valueOf (long v))
+                        (float? v)   (java.math.BigDecimal/valueOf (double v))
+                        :else (java.math.BigDecimal. (str v))))
+    :db.type/string str
+    identity))
+
+(defn- recursive-schema-tx
+  "Datahike schema tx for a materialised recursive CTE: one
+   `:<target-name>/<col>` attr per column plus the row-existence marker."
+  [target-name col-names col-types row-marker]
+  (conj
+   (vec (for [[i c] (map-indexed vector col-names)]
+          {:db/ident       (keyword target-name c)
+           :db/valueType   (nth col-types i)
+           :db/cardinality :db.cardinality/one}))
+   {:db/ident       row-marker
+    :db/valueType   :db.type/boolean
+    :db/cardinality :db.cardinality/one}))
+
+(defn- recursive-data-tx
+  "Entity maps for the rows a recursive CTE produced, coercing each value
+   to its column's datahike type and tagging every row with `row-marker`."
+  [rows col-names col-types target-name row-marker]
+  (let [coercions (mapv recursive-coercion col-types)]
+    (vec (for [row rows]
+           (let [vs (vec row)
+                 cols (into {} (keep-indexed
+                                (fn [i c]
+                                  (let [v (nth vs i nil)]
+                                    (when (some? v)
+                                      [(keyword target-name c)
+                                       ((nth coercions i) v)])))
+                                col-names))]
+             (assoc cols row-marker true))))))
+
+(defn run-recursive-rule
+  "Evaluate a recursive-CTE Datalog rule to a fixed point and return the
+   raw result rows. `in-args` must already be free of ParamRef sentinels
+   (substituted at Bind for the parameterised path).
+
+   Forces the query planner on regardless of caller context — Datahike's
+   legacy engine can't evaluate the recursive bodies translate-recursive-cte
+   emits (head var bound through a function op then filtered by a predicate,
+   datahike PR #825)."
+  [db rule rule-name rule-vars in-params in-args]
+  (let [rule-call (apply list rule-name rule-vars)
+        q {:find  rule-vars
+           :in    (into '[$ %] in-params)
+           :where [rule-call]}]
+    (binding [dq/*force-legacy* false]
+      (apply d/q q db rule in-args))))
+
+(defn- anchor-col-vtypes
+  "Best-effort per-column datahike value-types for a recursive CTE,
+   inferred from the anchor (non-recursive) branch's SELECT expressions
+   via oid/expr-oid — used when rows can't be materialised at parse time
+   (parameterised anchor). Columns we can't infer default to string; under
+   :read schema-flexibility this only affects RowDescription OID accuracy,
+   never data insertion (db-with does not enforce valueType)."
+  [^PlainSelect anchor col-names schema db]
+  (let [n (count col-names)
+        oids (try
+               (let [from-item     (.getFromItem anchor)
+                     joins         (.getJoins anchor)
+                     default-table (when (instance? Table from-item)
+                                     (unquote-ident (.getName ^Table from-item)))
+                     table-aliases (params/collect-table-aliases from-item joins)
+                     oid-env {:db db :schema schema
+                              :table-aliases table-aliases
+                              :default-table default-table
+                              :hints (pgs/schema-hints db)}]
+                 (mapv (fn [^SelectItem si]
+                         (try (oid/expr-oid (.getExpression si) oid-env)
+                              (catch Throwable _ nil)))
+                       (.getSelectItems anchor)))
+               (catch Throwable _ nil))
+        oids (vec (take n (concat (or oids []) (repeat nil))))]
+    (mapv (fn [oid]
+            (condp = oid
+              types/oid-bool        :db.type/boolean
+              types/oid-int8        :db.type/long
+              types/oid-int4        :db.type/long
+              types/oid-int2        :db.type/long
+              26                    :db.type/long      ; oid
+              types/oid-float8      :db.type/double
+              700                   :db.type/double    ; float4
+              types/oid-numeric     :db.type/bigdec
+              types/oid-uuid        :db.type/uuid
+              types/oid-date        :db.type/instant
+              types/oid-timestamp   :db.type/instant
+              types/oid-timestamptz :db.type/instant
+              :db.type/string))
+          oids)))
+
+(defn- ground-rule-params
+  "Inline now-bound prepared-statement params into a recursive-CTE rule.
+
+   A Datalog rule body cannot see the outer query's `:in` vars, so a
+   parameterised anchor like `SELECT $1::int` — compiled to
+   `[(?cast-fn ?p1) ?out]` with `?p1`/`?cast-fn` supplied via `:in` —
+   fails at rule eval (\"Unknown function ?cast-fn\"). At Execute the
+   params are concrete, so we fold them directly into the rule:
+
+   - plain value params (`?p1` → 1) are substituted as literal constants;
+   - a clause whose FUNCTION position is a fn-valued param (the compiled
+     CAST/coercion closure) with all-ground args is pre-evaluated and
+     rewritten to `[(ground <result>) ?out]`.
+
+   Returns the grounded rule. Params that remain referenced (e.g. a fn
+   param applied to a rule var we can't pre-evaluate) are left in place;
+   the caller passes only those through `:in`."
+  [rule in-params in-args]
+  (let [pmap    (zipmap in-params in-args)
+        fn-vars (set (keep (fn [[k v]] (when (fn? v) k)) pmap))
+        subst   (fn subst [form]
+                  (cond
+                    (and (symbol? form) (contains? pmap form) (not (fn-vars form)))
+                    (get pmap form)
+                    (vector? form) (mapv subst form)
+                    (seq? form)    (apply list (map subst form))
+                    :else form))
+        eval-clause (fn [clause]
+                      (if (and (vector? clause) (= 2 (count clause)) (seq? (first clause)))
+                        (let [call  (first clause)
+                              f-sym (first call)
+                              cargs (rest call)]
+                          (if (and (symbol? f-sym) (fn-vars f-sym)
+                                   (every? (complement symbol?) cargs))
+                            [(list 'ground (apply (get pmap f-sym) cargs)) (second clause)]
+                            clause))
+                        clause))]
+    (mapv (fn [branch]
+            (into [(first branch)]
+                  (map (comp eval-clause subst) (rest branch))))
+          rule)))
+
+(defn materialize-recursive-rows!
+  "Execute-time counterpart for a DEFERRED recursive CTE (see
+   materialize-recursive-cte!): ground the now-bound params into the rule
+   (in-args already substituted by resolve-param-refs), run it to a fixed
+   point, coerce the rows to the parse-time `col-types`, and db-with the
+   data into `db` (whose schema already carries the CTE attrs from parse).
+   Returns the data-enriched db; on rule-eval failure returns `db` unchanged
+   so the outer query degrades to an empty CTE rather than crashing."
+  [{:keys [rule rule-name rule-vars col-names col-types in-params in-args
+           target-name row-marker]} db]
+  (try
+    (let [grounded   (ground-rule-params rule in-params in-args)
+          ;; Keep only params still referenced after grounding.
+          referenced (set (filter symbol? (tree-seq coll? seq grounded)))
+          pmap       (zipmap in-params in-args)
+          rem-params (filterv referenced in-params)
+          rem-args   (mapv pmap rem-params)
+          rows (run-recursive-rule db grounded rule-name rule-vars rem-params rem-args)
+          data-tx (recursive-data-tx rows col-names col-types target-name row-marker)]
+      (if (seq data-tx) (d/db-with db data-tx) db))
+    (catch Throwable _ db)))
+
 (defn materialize-recursive-cte!
   "Run a WITH RECURSIVE CTE rule to a fixed point and materialize the
    resulting rows into a speculative db under `:<target-name>/<col>`
@@ -4373,80 +4548,56 @@
    so callers (parse-sql) can swap implementations based on
    `(.isRecursive wi)`.
 
+   When the CTE is parameterised (a `$n` appears in its body, so `in-args`
+   carries ParamRef sentinels that aren't bound until Bind), DATA can't be
+   produced at parse time. We then enrich only the SCHEMA (column attrs,
+   with value-types inferred from the anchor branch) and return a
+   `:deferred` spec; the server re-runs the rule at Execute via
+   materialize-recursive-rows! once the params are bound.
+
    Reuses `translate-recursive-cte` for the rule construction; rule
    eval here is the SELECT counterpart of `build-update-with-recursive-tx`
    in the server."
   [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
-  (let [{:keys [rule rule-name col-names rule-vars in-params in-args]}
+  (let [{:keys [rule rule-name col-names rule-vars in-params in-args anchor]}
         (translate-recursive-cte wi schema db)
-        rule-call (apply list rule-name rule-vars)
-        q {:find  rule-vars
-           :in    (into '[$ %] in-params)
-           :where [rule-call]}
-        ;; Force the query planner on regardless of caller context.
-        ;; Datahike's legacy engine can't evaluate the recursive bodies
-        ;; that `translate-recursive-cte` emits (head var bound through
-        ;; a function op then filtered by a predicate — see datahike PR
-        ;; #825). Server.execute already binds *force-legacy* false,
-        ;; but parse-sql is also reachable from the REPL and tests, so
-        ;; we re-establish the binding locally to keep the recursive
-        ;; CTE path correct under any caller.
-        ;;
-        ;; `db` is the snapshot the caller already passed in
-        ;; (parse-sql captures it at handler entry); we never re-deref
-        ;; the connection here, so the rule sees a consistent state.
-        rows (binding [dq/*force-legacy* false]
-               (apply d/q q db rule in-args))
-        with-fn d/db-with
         row-marker (pgs/row-marker-attr target-name)
-        col-types (mapv (fn [i]
-                          (let [samples (keep #(nth (vec %) i nil) rows)
-                                vtypes  (into #{} (map infer-recursive-vtype) samples)]
-                            (cond
-                              (empty? vtypes)         :db.type/string
-                              (= 1 (count vtypes))    (first vtypes)
-                              ;; Mixed numerics → bigdec; anything else → string.
-                              (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes)
-                              :db.type/bigdec
-                              :else :db.type/string)))
-                        (range (count col-names)))
-        coerce (fn [vtype]
-                 (case vtype
-                   :db.type/long   (fn [v] (if (instance? Long v) v (long v)))
-                   :db.type/double (fn [v] (if (instance? Double v) v (double v)))
-                   :db.type/bigdec (fn [v]
-                                     (cond
-                                       (instance? java.math.BigDecimal v) v
-                                       (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                                       (integer? v) (java.math.BigDecimal/valueOf (long v))
-                                       (float? v)   (java.math.BigDecimal/valueOf (double v))
-                                       :else (java.math.BigDecimal. (str v))))
-                   :db.type/string str
-                   identity))
-        coercions (mapv coerce col-types)
-        schema-tx (conj
-                   (vec (for [[i c] (map-indexed vector col-names)]
-                          {:db/ident       (keyword target-name c)
-                           :db/valueType   (nth col-types i)
-                           :db/cardinality :db.cardinality/one}))
-                   {:db/ident       row-marker
-                    :db/valueType   :db.type/boolean
-                    :db/cardinality :db.cardinality/one})
-        spec-db (with-fn db schema-tx)
-        data-tx (vec (for [row rows]
-                       (let [vs (vec row)
-                             cols (into {} (keep-indexed
-                                            (fn [i c]
-                                              (let [v (nth vs i nil)]
-                                                (when (some? v)
-                                                  [(keyword target-name c)
-                                                   ((nth coercions i) v)])))
-                                            col-names))]
-                         (assoc cols row-marker true))))
-        spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
-    {:db      spec-db2
-     :schema  (:schema spec-db2)
-     :name    target-name
-     :alias   target-name
-     :aliases col-names}))
+        ;; ParamRef sentinels in in-args ⇒ the anchor/recursive body
+        ;; references a `$n` not bound until Bind. Defer data to Execute.
+        deferred? (boolean (some params/param-ref? in-args))]
+    (if deferred?
+      (let [col-types (anchor-col-vtypes anchor col-names schema db)
+            schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+            spec-db   (d/db-with db schema-tx)]
+        {:db      spec-db
+         :schema  (:schema spec-db)
+         :name    target-name
+         :alias   target-name
+         :aliases col-names
+         :deferred {:rule rule :rule-name rule-name :rule-vars rule-vars
+                    :col-names col-names :col-types col-types
+                    :in-params in-params :in-args in-args
+                    :target-name target-name :row-marker row-marker}})
+      ;; No params — materialise data now (column types from the rows).
+      (let [rows (run-recursive-rule db rule rule-name rule-vars in-params in-args)
+            col-types (mapv (fn [i]
+                              (let [samples (keep #(nth (vec %) i nil) rows)
+                                    vtypes  (into #{} (map infer-recursive-vtype) samples)]
+                                (cond
+                                  (empty? vtypes)         :db.type/string
+                                  (= 1 (count vtypes))    (first vtypes)
+                                  ;; Mixed numerics → bigdec; anything else → string.
+                                  (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes)
+                                  :db.type/bigdec
+                                  :else :db.type/string)))
+                            (range (count col-names)))
+            schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+            spec-db (d/db-with db schema-tx)
+            data-tx (recursive-data-tx rows col-names col-types target-name row-marker)
+            spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+        {:db      spec-db2
+         :schema  (:schema spec-db2)
+         :name    target-name
+         :alias   target-name
+         :aliases col-names}))))
 

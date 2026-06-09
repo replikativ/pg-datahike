@@ -413,10 +413,14 @@
     (catch Throwable _ nil)))
 
 (defn- materialize-withs!
-  "Run the WITH-list fold for any statement type. Returns [enriched-db
-   enriched-schema] with the speculative db carrying `:<cte>/<col>`
-   virtual attrs for each materialised CTE. When `stmt` has no WITH
-   list (or it's empty), returns [db schema] unchanged.
+  "Run the WITH-list fold for any statement type. Returns
+   [enriched-db enriched-schema deferred-recursive-ctes] with the
+   speculative db carrying `:<cte>/<col>` virtual attrs for each
+   materialised CTE. `deferred-recursive-ctes` is a (possibly empty)
+   vector of specs for parameterised recursive CTEs whose DATA must be
+   materialised at Execute (after Bind) — see
+   stmt/materialize-recursive-cte! and stmt/materialize-recursive-rows!.
+   When `stmt` has no WITH list (or it's empty), returns [db schema []].
 
    - Non-recursive WITH items with a SELECT body go through
      `materialize-set-op!`.
@@ -432,7 +436,7 @@
   (let [withs (stmt-with-items stmt)]
     (if (and db (seq withs))
       (reduce
-       (fn [[curr-db curr-schema] ^net.sf.jsqlparser.statement.select.WithItem wi]
+       (fn [[curr-db curr-schema deferred] ^net.sf.jsqlparser.statement.select.WithItem wi]
          (let [cte-name   (str/trim (str (.getAlias wi)))
                recursive? (.isRecursive wi)
                body       (try (.getParenthesedStatement wi)
@@ -446,28 +450,31 @@
            (cond
              ;; Recursive WITH on UPDATE — leave to translate-update.
              (and recursive? (instance? Update stmt))
-             [curr-db curr-schema]
+             [curr-db curr-schema deferred]
 
              recursive?
              (if-let [m (try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
                              (catch Throwable _ nil))]
-               [(:db m) (:schema m)]
-               [curr-db curr-schema])
+               ;; A parameterised recursive CTE enriches only the schema
+               ;; now and carries a `:deferred` spec for Execute-time data.
+               [(:db m) (:schema m)
+                (cond-> deferred (:deferred m) (conj (:deferred m)))]
+               [curr-db curr-schema deferred])
 
              (some? inner)
              (if-let [m (stmt/materialize-set-op! inner cte-name curr-db curr-schema)]
-               [(:db m) (:schema m)]
-               [curr-db curr-schema])
+               [(:db m) (:schema m) deferred]
+               [curr-db curr-schema deferred])
 
              ;; Data-modifying CTE body or shape we don't recognise —
              ;; skip rather than crash. The outer translate-* will
              ;; surface a clearer error if the body's results are
              ;; actually needed.
              :else
-             [curr-db curr-schema])))
-       [db schema]
+             [curr-db curr-schema deferred])))
+       [db schema []]
        withs)
-      [db schema])))
+      [db schema []])))
 
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
@@ -660,7 +667,7 @@
                                     (keep (fn [^net.sf.jsqlparser.statement.select.WithItem wi]
                                             (some-> (.getAlias wi) str str/trim str/lower-case not-empty)))
                                     (stmt-with-items stmt))
-                [db schema] (materialize-withs! stmt db schema)
+                [db schema deferred-rec-ctes] (materialize-withs! stmt db schema)
                 ;; Did the CTE fold materialise anything? If not, the only
                 ;; enrichment is catalog data — which the server can safely
                 ;; re-resolve at execute (stale-prepared-statement fix). With
@@ -1192,6 +1199,13 @@
                         ;; enrichment is catalog-only (no CTE attrs to lose).
                         result (if (and (seq catalog-names-used) (not cte-materialized?))
                                  (assoc result :catalog-tables (vec catalog-names-used))
+                                 result)
+                        ;; Parameterised recursive CTEs: schema enriched at
+                        ;; parse (above), but DATA must be materialised at
+                        ;; Execute once `$n` is bound. Carry the specs so the
+                        ;; server re-runs the rule with real params.
+                        result (if (seq deferred-rec-ctes)
+                                 (assoc result :deferred-recursive-ctes deferred-rec-ctes)
                                  result)]
                     (if has-full-join?
               ;; FULL JOIN: return two LEFT JOIN queries for server to combine

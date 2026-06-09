@@ -2696,7 +2696,19 @@
                         (cond-> sub
                           (contains? sub :in-args)
                           (update :in-args sql/substitute-params fetch)))
-                      subs))))))
+                      subs)))
+      ;; Parameterised recursive CTEs: each spec's :in-args carries the
+      ;; ParamRef sentinels for the `$n` in its anchor/recursive body.
+      ;; Substitute now so exec-select can re-run the rule with real values
+      ;; (stmt/materialize-recursive-rows!).
+      (contains? parsed :deferred-recursive-ctes)
+      (update :deferred-recursive-ctes
+              (fn [specs]
+                (mapv (fn [spec]
+                        (cond-> spec
+                          (contains? spec :in-args)
+                          (update :in-args sql/substitute-params fetch)))
+                      specs))))))
 
 (defn- coerce-insert-tx-data
   "After ParamRef substitution, an INSERT's `:tx-data` entity maps may
@@ -4073,6 +4085,15 @@
             query-db (if-let [cats (:catalog-tables parsed)]
                        (sql/enrich-db-with-catalogs db (dbi/-schema db) cats)
                        (or enriched-db db))
+            ;; Parameterised recursive CTEs: enriched-db carries the CTE
+            ;; schema from parse, but the rows depend on `$n` (bound only
+            ;; now). Re-run each rule with the resolved in-args and fold the
+            ;; data into query-db before the outer SELECT runs.
+            query-db (if-let [specs (seq (:deferred-recursive-ctes parsed))]
+                       (reduce (fn [d spec]
+                                 (stmt/materialize-recursive-rows! spec d))
+                               query-db specs)
+                       query-db)
             hidden-count (or hidden-count 0)
             q-input (cond-> query
                       limit  (assoc :limit limit)
