@@ -15,6 +15,7 @@
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.query :as dq]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
@@ -509,6 +510,19 @@
   [^String sql schema db]
   (binding [params/*parse-db* db
             params/*parse-sql* parse-sql
+            ;; Use datahike's query PLANNER (not the legacy engine) for all
+            ;; parse-time materialisation (derived tables / set-ops / CTEs /
+            ;; correlated-subquery per-row eval). The legacy engine
+            ;; cross-products multiple or-join relations (SQL LEFT JOINs),
+            ;; which made asyncpg's {typeinfo} introspection derived table
+            ;; (3 LEFT JOINs over pg_type/pg_range) take ~3s and the full
+            ;; recursive introspection hang; the planner runs the same query
+            ;; in <10ms. server.execute already binds this false for the
+            ;; execute-time path — this extends it to parse-time so the two
+            ;; phases use the same (fast) engine. datahike default is legacy
+            ;; (planner opt-in via DATAHIKE_QUERY_PLANNER), so we set it
+            ;; explicitly per parse.
+            dq/*force-legacy* false
              ;; Per-query memoisation for `schema-hints` /
              ;; `derive-virtual-tables`. Both are called by every
              ;; `catalog-data-for*` invocation against the same db /
