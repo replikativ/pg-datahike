@@ -34,7 +34,7 @@
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
-            PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException]
+            PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException PgParamCodec]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select PlainSelect Limit Offset]
            [net.sf.jsqlparser.expression LongValue]))
@@ -4729,6 +4729,15 @@
                                 (str field-name "\t" pg-type))
                               fields))}])
 
+(defn sync-composites-to-codec!
+  "Push every known composite type's ordered field OIDs into PgParamCodec's
+   registry so the binary record codec can encode `record_out` text as a PG
+   binary record. Cheap (one query); called on CREATE TYPE and lazily when a
+   query's result/params reference a composite OID."
+  [db]
+  (doseq [{:keys [oid fields]} (pgs/composite-types db)]
+    (PgParamCodec/registerComposite (int oid) (int-array (map :oid fields)))))
+
 (defn- exec-ddl-create-composite
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
@@ -4738,6 +4747,7 @@
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
         (d/transact conn tx-data)
+        (sync-composites-to-codec! (d/db conn))
         (empty-result "CREATE TYPE")
         (catch Exception e
           (classified-error "CREATE TYPE error: " e))))))

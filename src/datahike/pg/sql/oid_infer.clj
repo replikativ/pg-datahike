@@ -380,12 +380,21 @@
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
       :else nil)))
 
+(defn- composite-name->oid
+  "Resolve a named composite type → its OID via the registry, or nil."
+  [type-str db]
+  (when (and type-str db)
+    (some (fn [{:keys [name oid]}] (when (= name type-str) oid))
+          (pgs/composite-types db))))
+
 (defn- cast-oid
   "Map a SQL CAST target type-name to an OID. Uses `types/cast-category`
    so the set of recognised target types stays in one place."
-  [^CastExpression c]
+  [^CastExpression c env]
   (let [type-str (some-> (.getColDataType c) .getDataType str str/lower-case)]
-    (case (types/cast-category type-str)
+    (or
+     (composite-name->oid type-str (:db env))
+     (case (types/cast-category type-str)
       ;; Datahike stores every integer as a Clojure long, but an explicit
       ;; CAST asserts a specific PG width — report the matching OID so
       ;; clients parse the column correctly (e.g. node-postgres returns
@@ -409,7 +418,7 @@
       :uuid      types/oid-uuid
       :bytes     types/oid-bytea
       :bit       types/oid-text
-      nil)))
+      nil))))
 
 (defn- case-oid
   "CASE expression returns the type of its first non-nil branch. PG
@@ -531,7 +540,7 @@
           :else (get types/array-oid->element-oid container-oid types/oid-text)))
 
       ;; --- CAST ---------------------------------------------------------
-      (instance? CastExpression expr) (cast-oid expr)
+      (instance? CastExpression expr) (cast-oid expr env)
 
       ;; --- CASE ---------------------------------------------------------
       (instance? CaseExpression expr) (case-oid expr env)

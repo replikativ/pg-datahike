@@ -73,6 +73,97 @@ public final class PgParamCodec {
         return ARRAY_TO_ELEM.containsKey(oid);
     }
 
+    // ========================================================================
+    // Composite (named row type) field-OID registry. Populated from Clojure
+    // (datahike.pg.composite/*) on CREATE TYPE and lazily at describe time so
+    // the binary record codec knows each field's OID — PG's record wire format
+    // is [int32 nfields][per field: int32 field-oid, int32 len(-1=NULL), bytes].
+    // The canonical record_out text we already produce carries the VALUES but
+    // not the per-field OIDs; this map supplies them.
+    // ========================================================================
+
+    private static final java.util.Map<Integer, int[]> COMPOSITE_FIELDS =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Register (or update) a composite type's ordered field OIDs. */
+    public static void registerComposite(int oid, int[] fieldOids) {
+        COMPOSITE_FIELDS.put(oid, fieldOids);
+    }
+
+    /** Ordered field OIDs for a registered composite, or null if unknown. */
+    public static int[] compositeFields(int oid) {
+        return COMPOSITE_FIELDS.get(oid);
+    }
+
+    /**
+     * Split a PG record_out text — `(f1,f2,...)` — into its field cells.
+     * A bare-empty field (nothing between the delimiters) is SQL NULL
+     * (returned as java null); a quoted field (even `""`) is a present value
+     * with its surrounding quotes removed and `""`/`\x` unescaped. Nested
+     * records/arrays arrive quoted and come back as their raw inner text
+     * (`(42,42)`, `{9,NULL,11}`) ready to recurse through encodeBinary.
+     * Returns null if the text isn't a parenthesised record.
+     */
+    static String[] parseRecordFields(String text) {
+        if (text == null) return null;
+        String s = text.trim();
+        if (s.length() < 2 || s.charAt(0) != '(' || s.charAt(s.length() - 1) != ')') return null;
+        s = s.substring(1, s.length() - 1);
+        java.util.List<String> fields = new java.util.ArrayList<>();
+        if (s.isEmpty()) return new String[0];
+        StringBuilder cur = new StringBuilder();
+        boolean inQuote = false, escape = false, quoted = false, hasContent = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (escape) { cur.append(c); escape = false; continue; }
+            if (inQuote) {
+                if (c == '\\') { escape = true; continue; }
+                if (c == '"') {
+                    if (i + 1 < s.length() && s.charAt(i + 1) == '"') { cur.append('"'); i++; continue; }
+                    inQuote = false; continue;
+                }
+                cur.append(c); continue;
+            }
+            if (c == '"') { inQuote = true; quoted = true; hasContent = true; continue; }
+            if (c == ',') {
+                fields.add((quoted || hasContent) ? cur.toString() : null);
+                cur.setLength(0); quoted = false; hasContent = false; continue;
+            }
+            cur.append(c); hasContent = true;
+        }
+        fields.add((quoted || hasContent) ? cur.toString() : null);
+        return fields.toArray(new String[0]);
+    }
+
+    /**
+     * Encode a record/composite to PG's binary wire format from its
+     * record_out text and the ordered field OIDs. Each non-NULL field is
+     * encoded by recursing into {@link #encodeBinary} (so nested records,
+     * arrays and scalars all work). Returns null on any field-count mismatch
+     * or unsupported field type — the caller then falls back to text.
+     */
+    static byte[] encodeRecordBinary(int[] fieldOids, String text) {
+        String[] cells = parseRecordFields(text);
+        if (cells == null || cells.length != fieldOids.length) return null;
+        byte[][] fb = new byte[cells.length][];
+        for (int i = 0; i < cells.length; i++) {
+            if (cells[i] == null) { fb[i] = null; continue; }
+            byte[] enc = encodeBinary(fieldOids[i], cells[i]);
+            if (enc == null) return null;   // unsupported field type
+            fb[i] = enc;
+        }
+        int total = 4;
+        for (byte[] b : fb) total += 4 + 4 + (b == null ? 0 : b.length);
+        ByteBuffer buf = ByteBuffer.allocate(total).order(ByteOrder.BIG_ENDIAN);
+        buf.putInt(fieldOids.length);
+        for (int i = 0; i < fb.length; i++) {
+            buf.putInt(fieldOids[i]);
+            if (fb[i] == null) buf.putInt(-1);
+            else { buf.putInt(fb[i].length); buf.put(fb[i]); }
+        }
+        return buf.array();
+    }
+
     /** Returns the scalar T element OID for `_T`, or -1 if not an array OID. */
     public static int elementOidOf(int arrayOid) {
         Integer e = ARRAY_TO_ELEM.get(arrayOid);
@@ -803,6 +894,12 @@ public final class PgParamCodec {
                     // leaf via encodeBinary(elemOid, leaf).
                     if (isArrayOid(oid)) {
                         yield encodeArrayBinary(oid, value.toString());
+                    }
+                    // Composite (named row type): encode the record_out text
+                    // as a binary record using the registered field OIDs.
+                    int[] cf = COMPOSITE_FIELDS.get(oid);
+                    if (cf != null) {
+                        yield encodeRecordBinary(cf, value.toString());
                     }
                     yield null;   // caller falls back to text encoding
                 }

@@ -207,6 +207,11 @@
      ;; typelem: element type OID for array types (0 for scalars). Clients
      ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
      {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; typdelim: element delimiter (',' for all but a few types). asyncpg's
+     ;; typeinfo reads elem_t.typdelim and does `elemdelim[0]` while BUILDING an
+     ;; array codec — a null there throws and the whole composite fails to
+     ;; resolve. PG "char" (OID 18), like typtype.
+     {:db/ident :pg_type/typdelim :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
      ;; typnamespace: asyncpg's type-introspection INNER JOINs pg_namespace
      ;; on it, so every type must carry one (all in `public` = 2200).
      {:db/ident :pg_type/typnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -501,6 +506,7 @@
                          {:pg_type/oid (long oid) :pg_type/typname tname
                           :pg_type/typlen (long tlen) :pg_type/typtype ttype
                           :pg_type/typelem (long (or elem 0))
+                          :pg_type/typdelim ","
                           :pg_type/typnamespace 2200
                           (pgs/row-marker-attr "pg_type") true}))
                      types/pg-type-catalog)
@@ -509,7 +515,8 @@
           composites (mapv (fn [{:keys [name oid]}]
                              {:pg_type/oid oid :pg_type/typname name
                               :pg_type/typlen -1 :pg_type/typtype "c"
-                              :pg_type/typelem 0 :pg_type/typnamespace 2200
+                              :pg_type/typelem 0 :pg_type/typdelim ","
+                              :pg_type/typnamespace 2200
                               (pgs/row-marker-attr "pg_type") true})
                            (pgs/composite-types cte-db))]
       (into base composites))
