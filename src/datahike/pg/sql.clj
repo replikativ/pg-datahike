@@ -214,16 +214,28 @@
   [db schema catalog-names]
   (if (empty? catalog-names)
     db
-    (let [sorted-names (sort catalog-names)
+    (let [existing (dbi/-schema db)
+          ;; Skip catalogs already materialised on `db` (its row-marker attr
+          ;; is present). Re-asserting a catalog's schema would fail — datahike
+          ;; rejects "updating" an existing schema attr's custom metadata
+          ;; (e.g. :pg/type on :pg_type/typtype) — and re-asserting its data
+          ;; would duplicate rows. This makes nested enrichment idempotent:
+          ;; a derived table / correlated subquery over pg_* runs against a db
+          ;; whose outer scope already enriched the same catalogs.
+          sorted-names (sort (remove #(contains? existing (pgs/row-marker-attr %))
+                                     catalog-names))
           cache *catalog-cache*
-          cache-key [(hash (dbi/-schema db)) sorted-names]]
-      (or (cache-get cache cache-key)
+          cache-key [(hash existing) sorted-names]]
+      (cond
+        (empty? sorted-names) db
+        :else
+        (or (cache-get cache cache-key)
           (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
                 combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
                                            sorted-names))
                 spec-db (d/db-with db combined-schema)
                 built (if (seq combined-data) (d/db-with spec-db combined-data) spec-db)]
-            (cache-put! cache cache-key built))))))
+            (cache-put! cache cache-key built)))))))
 
 ;; ============================================================================
 ;; parse-sql result cache
@@ -1200,6 +1212,12 @@
                 ;; is the right check against `orig-db` — Datahike's
                 ;; `=` returns true on structurally equal DB snapshots
                 ;; and would mask the distinction.
+                        ;; Did translate-select tag a derived-table enriched-db
+                        ;; (FROM (…) AS sub / table-fn / derived JOIN)? Captured
+                        ;; BEFORE the catalog-only fallback below sets one, so we
+                        ;; can tell "derived-table materialised" from "catalog
+                        ;; enrichment only".
+                        derived-table-edb? (some? (:enriched-db result))
                         result (if (and (nil? (:enriched-db result))
                                         (not (identical? cte-db orig-db)))
                                  (assoc result :enriched-db cte-db)
@@ -1207,8 +1225,13 @@
                         ;; Record the catalog tables so the server can
                         ;; re-resolve the enriched-db at execute (stale-
                         ;; prepared-statement fix) — but only when the
-                        ;; enrichment is catalog-only (no CTE attrs to lose).
-                        result (if (and (seq catalog-names-used) (not cte-materialized?))
+                        ;; enrichment is catalog-only. A CTE (cte-materialized?)
+                        ;; or derived table (derived-table-edb?) carries
+                        ;; query-scoped `:<alias>/*` attrs in :enriched-db that
+                        ;; catalog re-resolution would discard, so skip those.
+                        result (if (and (seq catalog-names-used)
+                                        (not cte-materialized?)
+                                        (not derived-table-edb?))
                                  (assoc result :catalog-tables (vec catalog-names-used))
                                  result)
                         ;; Parameterised recursive CTEs: schema enriched at

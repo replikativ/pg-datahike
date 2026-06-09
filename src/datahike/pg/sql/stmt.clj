@@ -625,6 +625,7 @@
 
 (declare translate-select)
 (declare extract-value)
+(declare ^:dynamic *eval-update-db*)
 
 (defn- srf-const-eval
   "Evaluate a table-function argument expression to a constant value at
@@ -820,6 +821,94 @@
 
       :else nil)))
 
+;; ── Correlated-subquery resolution (shared by exec-select + derived-table
+;;    materialisation). A SELECT item that defers a correlated subquery
+;;    (Slice A / Layer 1) threads hidden `__corr_N` columns into :find and
+;;    omits the subquery's own output position; these helpers run the subquery
+;;    per outer row, splice its value at the out-pos, and drop the __corr_
+;;    columns. `parse-fn` parses the inner SQL per row (sql/parse-sql at
+;;    Execute, *parse-sql* at parse-time materialisation).
+
+(defn correlated-splice
+  "Assemble `n-output` columns from `visible` (non-correlation columns in
+   order) and `out-pos->val` (subquery output-position → value)."
+  [visible out-pos->val n-output]
+  (loop [p 0, v (seq visible), out []]
+    (if (= p n-output)
+      out
+      (if (contains? out-pos->val p)
+        (recur (inc p) v (conj out (get out-pos->val p)))
+        (recur (inc p) (next v) (conj out (first v)))))))
+
+(defn- eval-corr-scalar
+  "Evaluate one SQL fragment for a deferred correlated item against `query-db`
+   with *from-bindings* already bound. `subquery?` true → run `sql` as-is;
+   false → wrap as `SELECT (<sql>)`. First cell, or nil on error/empty."
+  [parse-fn sql subquery? inner-schema query-db]
+  (try
+    (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
+          p   (parse-fn run-sql inner-schema query-db)
+          q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
+      (if (nil? q)
+        (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
+        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb)) fr (first res)]
+          (if (sequential? fr) (first fr) fr))))
+    (catch Throwable _ nil)))
+
+(defn- eval-corr-then
+  "Evaluate a CASE branch THEN/ELSE spec with *from-bindings* bound."
+  [parse-fn then-spec inner-schema query-db]
+  (cond
+    (nil? then-spec)          :__null__
+    (:subquery-sql then-spec) (eval-corr-scalar parse-fn (:subquery-sql then-spec) true inner-schema query-db)
+    :else                     (eval-corr-scalar parse-fn (:expr-sql then-spec) false inner-schema query-db)))
+
+(defn- run-correlated-spec
+  "Value of a deferred correlated SELECT item for one outer row. `fb` is the
+   per-row *from-bindings*. :scalar runs the subquery; :case walks branches."
+  [parse-fn spec fb inner-schema query-db]
+  (binding [params/*from-bindings* fb
+            *eval-update-db* query-db]
+    (case (:kind spec)
+      :case
+      (let [hit (some (fn [{:keys [when-sql then]}]
+                        (when (true? (eval-corr-scalar parse-fn when-sql false inner-schema query-db))
+                          [(eval-corr-then parse-fn then inner-schema query-db)]))
+                      (:branches spec))]
+        (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
+      (eval-corr-scalar parse-fn (:inner-sql spec) true inner-schema query-db))))
+
+(defn resolve-correlated-rows
+  "Resolve a parsed SELECT's deferred correlated subqueries against raw result
+   `rows`: per outer row, run each subquery with the correlation columns bound
+   into *from-bindings*, splice the value at its out-pos, and drop the hidden
+   __corr_ columns. Returns [resolved-rows resolved-aliases]. No-op (returns
+   [rows find-aliases]) when there are no correlated subqueries."
+  [parse-fn parsed rows query-db inner-schema]
+  (if-let [cs (:correlated-subqueries parsed)]
+    (let [{:keys [subqueries corr-col->idx n-output]} cs
+          find-aliases  (:find-aliases parsed)
+          corr-idx-set  (set (vals corr-col->idx))
+          visible-idxs  (vec (remove corr-idx-set (range (count find-aliases))))
+          out-pos->subq (into {} (map (juxt :out-pos identity)) subqueries)
+          run-1 (fn [subq rv]
+                  (let [fb (reduce (fn [m [a c]]
+                                     (assoc-in m [a c] (nth rv (get corr-col->idx [a c]) nil)))
+                                   {} (:corr-refs subq))]
+                    (run-correlated-spec parse-fn subq fb inner-schema query-db)))
+          new-rows (mapv (fn [row]
+                           (let [rv  (if (sequential? row) (vec row) [row])
+                                 vis (mapv #(nth rv % nil) visible-idxs)
+                                 sv  (into {} (map (fn [[op sq]] [op (run-1 sq rv)])) out-pos->subq)]
+                             (correlated-splice vis sv n-output)))
+                         rows)
+          vis-aliases (mapv #(nth find-aliases %) visible-idxs)
+          new-aliases (correlated-splice vis-aliases
+                                         (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
+                                         n-output)]
+      [new-rows new-aliases])
+    [rows (:find-aliases parsed)]))
+
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect or SetOperationList) and persist its rows
    under `target-name/<col>` in a speculative db. Returns the same
@@ -901,6 +990,21 @@
         sub-results (cond->> sub-results
                       (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
                       (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
+        ;; Resolve deferred correlated subqueries (Slice A / Layer 1) so a
+        ;; derived table whose SELECT contains a correlated CASE subquery
+        ;; (asyncpg's {typeinfo} attrtypoids/attrnames) materialises the
+        ;; subquery values and drops the hidden __corr_ columns — otherwise
+        ;; they'd be persisted as bogus `:<alias>/__corr_N` attrs. No-op when
+        ;; the branch has no correlated subqueries. (Single-branch only; the
+        ;; UNION branches keep their raw shape — correlated subqueries inside
+        ;; a set-op branch are not a shape we materialise.)
+        corr-resolved (when (and (nil? (:op branch-parsed))
+                                 (:correlated-subqueries sub-parsed))
+                        (resolve-correlated-rows params/*parse-sql* sub-parsed
+                                                 sub-results db schema))
+        sub-results (if corr-resolved (first corr-resolved) sub-results)
+        sub-aliases (if corr-resolved (second corr-resolved) sub-aliases)
+        sub-oids    (if corr-resolved nil sub-oids)
         ;; Walk every row rather than just the first — UNION across
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have
