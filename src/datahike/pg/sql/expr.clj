@@ -1725,8 +1725,22 @@
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
             :else
-            (let [cast-fn (if is-text? 'str 'str)]
-              (swap! (:where-clauses ctx) conj [(list cast-fn inner-val) result-var])))
+            ;; Text / unknown scalar cast → stringify. EXCEPT a PgRecord (a
+            ;; ROW(...) being cast to a named composite, e.g.
+            ;; `ROW(..)::test_composite`): keep the record so value->string
+            ;; emits canonical record_out text and the column's composite OID
+            ;; (from cast-oid) drives the binary codec. `str`-ing it would
+            ;; corrupt it to "…PgRecord@hash".
+            (let [fn-param (symbol (str "?cast-s" (swap! (:var-counter ctx) inc)))
+                  cast-fn  (fn [v]
+                             (cond
+                               (nil? v)           nil
+                               (= :__null__ v)    :__null__
+                               (pg-rec/record? v) v
+                               :else              (str v)))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])))
           result-var)))))
 
 (def ^:private arith-op->null-safe

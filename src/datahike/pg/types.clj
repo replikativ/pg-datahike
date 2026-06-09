@@ -121,6 +121,14 @@
   "Inverse of elem-kw->oid."
   (into {} (map (fn [[k v]] [v k])) elem-kw->oid))
 
+(def oid-preserving-pg-name
+  "OIDs whose datahike valueType (string/long) would report a DIFFERENT OID on
+   read-back. A materialised column with one of these inferred OIDs carries
+   :pg/type = this name so oid-infer round-trips the original OID rather than the
+   storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
+   binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
+  {18 "char", 26 "oid"})
+
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
 ;; ============================================================================

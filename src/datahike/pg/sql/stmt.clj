@@ -910,7 +910,13 @@
           new-aliases (correlated-splice vis-aliases
                                          (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
                                          n-output)
-          new-oids    (correlated-splice (vec (repeat (count visible-idxs) nil))
+          ;; Carry the VISIBLE columns' inferred OIDs (not nil) so a caller
+          ;; materialising the result can preserve their read-back OID (e.g.
+          ;; {typeinfo}.typtype is char(18); without this it'd be typed text and
+          ;; asyncpg's `kind == b'c'` check would fail). Spliced positions get
+          ;; the correlated subquery's declared OID.
+          item-oids   (:select-item-oids parsed)
+          new-oids    (correlated-splice (mapv #(nth item-oids % nil) visible-idxs)
                                          (into {} (map (fn [[op sq]] [op (:oid sq)])) out-pos->subq)
                                          n-output)]
       [new-rows new-aliases new-oids])
@@ -1157,6 +1163,17 @@
                                            types/oid->elem-kw)
                                    (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)))
                              (range (count sub-aliases)))
+        ;; :pg/type to preserve the read-back OID for types whose datahike
+        ;; valueType would otherwise report the wrong OID: arrays ("_T"), and
+        ;; the OID-preserving scalars char(18)/oid(26) (dh-type-for-oid → string/
+        ;; long → would report text/int8). asyncpg's typeinfo decodes typtype as
+        ;; "char" → bytes b'c'; if we send it as text it sees the str 'c' and
+        ;; `kind == b'c'` fails, so it never builds the composite codec.
+        col-pg-type (mapv (fn [i]
+                            (if-let [ae (nth col-array-elem i)]
+                              (str "_" (name ae))
+                              (get types/oid-preserving-pg-name (nth sub-oids i nil))))
+                          (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
         col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))
                         (range (count sub-aliases)))
@@ -1173,12 +1190,11 @@
                           (cond-> {:db/ident (keyword target-name a)
                                    :db/valueType (nth col-types i)
                                    :db/cardinality :db.cardinality/one}
-                            (nth col-array-elem i)
-                            (assoc :pg/array-elem (nth col-array-elem i)
-                                   ;; :pg/type "_T" is what oid-infer reads to
-                                   ;; report the array OID (T[]); :pg/array-elem
-                                   ;; drives canonical-text decoding.
-                                   :pg/type (str "_" (name (nth col-array-elem i)))))))
+                            ;; :pg/type drives oid-infer's read-back OID (array
+                            ;; "_T" or OID-preserving scalar char/oid).
+                            (nth col-pg-type i)   (assoc :pg/type (nth col-pg-type i))
+                            ;; :pg/array-elem drives canonical-text array decode.
+                            (nth col-array-elem i) (assoc :pg/array-elem (nth col-array-elem i)))))
                    {:db/ident       row-marker
                     :db/valueType   :db.type/boolean
                     :db/cardinality :db.cardinality/one})
@@ -4648,16 +4664,22 @@
    the column's read-back OID is T[] (mirrors real array columns; the value
    is canonical PG text in a :db.type/string column)."
   ([target-name col-names col-types row-marker]
-   (recursive-schema-tx target-name col-names col-types row-marker nil))
+   (recursive-schema-tx target-name col-names col-types row-marker nil nil))
   ([target-name col-names col-types row-marker col-array-elems]
+   (recursive-schema-tx target-name col-names col-types row-marker col-array-elems nil))
+  ([target-name col-names col-types row-marker col-array-elems col-pg-types]
    (conj
     (vec (for [[i c] (map-indexed vector col-names)]
            (cond-> {:db/ident       (keyword target-name c)
                     :db/valueType   (nth col-types i)
                     :db/cardinality :db.cardinality/one}
+             ;; :pg/type round-trips the column's OID (array "_T" or the
+             ;; OID-preserving scalars char/oid); :pg/array-elem drives the
+             ;; canonical-text array decode.
+             (and col-pg-types (nth col-pg-types i nil))
+             (assoc :pg/type (nth col-pg-types i))
              (and col-array-elems (nth col-array-elems i nil))
-             (assoc :pg/array-elem (nth col-array-elems i)
-                    :pg/type (str "_" (name (nth col-array-elems i)))))))
+             (assoc :pg/array-elem (nth col-array-elems i)))))
     {:db/ident       row-marker
      :db/valueType   :db.type/boolean
      :db/cardinality :db.cardinality/one})))
@@ -4959,7 +4981,16 @@
                                                 types/array-oid->element-oid
                                                 types/oid->elem-kw))
                                       (range (count col-names)))
-                schema-tx (recursive-schema-tx target-name col-names col-types row-marker col-array-elems)
+                ;; :pg/type per column to round-trip the OID: array "_T", or the
+                ;; OID-preserving scalars char/oid (e.g. typeinfo_tree.kind =
+                ;; typtype is char — asyncpg needs it decoded as bytes b'c' to
+                ;; recognise the composite, not the str 'c').
+                col-pg-types (mapv (fn [i]
+                                     (if-let [ae (nth col-array-elems i)]
+                                       (str "_" (name ae))
+                                       (get types/oid-preserving-pg-name (nth anchor-oids i nil))))
+                                   (range (count col-names)))
+                schema-tx (recursive-schema-tx target-name col-names col-types row-marker col-array-elems col-pg-types)
                 spec0 (d/db-with db schema-tx)
                 rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
                              (translate-select recursive (:schema spec0) spec0))]

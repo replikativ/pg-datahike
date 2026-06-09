@@ -909,6 +909,40 @@ public final class PgParamCodec {
         }
     }
 
+    /** Quote a record field cell for record_out text (see records.clj). */
+    private static String quoteRecordCell(String raw) {
+        if (raw.isEmpty() || raw.matches("(?s).*[(),\"\\\\\\s].*"))
+            return "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        return raw;
+    }
+
+    /**
+     * Decode a PG binary record — [int32 nfields][per field: int32 oid,
+     * int32 len(-1=NULL), bytes] — to its canonical record_out text, decoding
+     * each field via decodeBinary by the inline field OID (so composite and
+     * anonymous records both work without a registry). The text then flows
+     * through the normal value path and re-encodes via encodeRecordBinary.
+     */
+    static String decodeRecordBinary(byte[] bytes) {
+        ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        int n = buf.getInt();
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(',');
+            int foid = buf.getInt();
+            int len = buf.getInt();
+            if (len < 0) continue;            // NULL → empty cell
+            byte[] fb = new byte[len];
+            buf.get(fb);
+            Object v = decodeBinary(foid, fb);
+            if (v == null) continue;
+            String t = (v instanceof Boolean b) ? (b ? "t" : "f") : v.toString();
+            sb.append(quoteRecordCell(t));
+        }
+        sb.append(')');
+        return sb.toString();
+    }
+
     // ========================================================================
     // Binary format — PG's typreceive wire encoding. See pg_type.dat plus the
     // *_recv functions in src/backend/utils/adt/*.c for the canonical spec.
@@ -998,6 +1032,13 @@ public final class PgParamCodec {
             default -> {
                 if (isArrayOid(oid)) {
                     String s = decodeArrayBinary(oid, bytes);
+                    if (s != null) yield s;
+                }
+                // Composite (registered) or anonymous record (2249): decode the
+                // binary record to canonical record_out text. Field OIDs are
+                // inline in the wire bytes, so no registry lookup is needed.
+                if (oid == 2249 || compositeFields(oid) != null) {
+                    String s = decodeRecordBinary(bytes);
                     if (s != null) yield s;
                 }
                 throw new PgWireServer.PgProtocolException("0A000",
