@@ -5456,8 +5456,7 @@
                                  (if (and o (pos? o)) o PgWireServer/OID_TEXT))))))
           arr))
 
-      (describeResult [_ parsed]
-        ;; Return the column metadata for a prepared SELECT without
+      (describeResult [_ parsed]        ;; Return the column metadata for a prepared SELECT without
         ;; executing. DML returns nil (NoData).
         ;;
         ;; The OID advertised here drives pgjdbc's client-side typing
@@ -5627,8 +5626,7 @@
           (and (= :system (:type parsed)) (:metadata parsed))
           (describe-from-metadata (:metadata parsed))))
 
-      (executePrepared [this parsed bound-params]
-        ;; bound-params is a 1-indexed Object[] (element 0 unused). We
+      (executePrepared [this parsed bound-params]        ;; bound-params is a 1-indexed Object[] (element 0 unused). We
         ;; thread it through via dynamic bindings so the existing
         ;; `execute` dispatch body handles everything else unchanged.
         ;; *implicit-tx-allowed* true: this is the extended-query path,

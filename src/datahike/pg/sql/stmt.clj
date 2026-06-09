@@ -882,8 +882,12 @@
   "Resolve a parsed SELECT's deferred correlated subqueries against raw result
    `rows`: per outer row, run each subquery with the correlation columns bound
    into *from-bindings*, splice the value at its out-pos, and drop the hidden
-   __corr_ columns. Returns [resolved-rows resolved-aliases]. No-op (returns
-   [rows find-aliases]) when there are no correlated subqueries."
+   __corr_ columns. Returns [resolved-rows resolved-aliases resolved-oids],
+   where resolved-oids carries each subquery's declared OID at its spliced
+   position (nil for visible columns) so a caller materialising the result can
+   type array columns from the subquery's OID rather than the runtime value
+   class (e.g. array_agg(atttypid) → oid[] not int8[]). No-op (returns
+   [rows find-aliases nil]) when there are no correlated subqueries."
   [parse-fn parsed rows query-db inner-schema]
   (if-let [cs (:correlated-subqueries parsed)]
     (let [{:keys [subqueries corr-col->idx n-output]} cs
@@ -905,9 +909,12 @@
           vis-aliases (mapv #(nth find-aliases %) visible-idxs)
           new-aliases (correlated-splice vis-aliases
                                          (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
+                                         n-output)
+          new-oids    (correlated-splice (vec (repeat (count visible-idxs) nil))
+                                         (into {} (map (fn [[op sq]] [op (:oid sq)])) out-pos->subq)
                                          n-output)]
-      [new-rows new-aliases])
-    [rows (:find-aliases parsed)]))
+      [new-rows new-aliases new-oids])
+    [rows (:find-aliases parsed) nil]))
 
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect or SetOperationList) and persist its rows
@@ -1004,7 +1011,10 @@
                                                  sub-results db schema))
         sub-results (if corr-resolved (first corr-resolved) sub-results)
         sub-aliases (if corr-resolved (second corr-resolved) sub-aliases)
-        sub-oids    (if corr-resolved nil sub-oids)
+        ;; Correlated-subquery columns carry their declared OID (e.g. oid[] for
+        ;; array_agg(atttypid)); use it to type array columns instead of the
+        ;; runtime value class. Visible columns stay nil (value-sampled).
+        sub-oids    (if corr-resolved (nth corr-resolved 2) sub-oids)
         ;; Walk every row rather than just the first — UNION across
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have
@@ -1136,11 +1146,16 @@
         ;; the column typed as text (asyncpg's introspection then mis-decoded
         ;; attrtypoids/attrnames as a string). Element kw drives both the
         ;; value coercion (to-pg-text) and the array OID.
+        ;; Prefer the inner select-item's array OID hint (authoritative — it
+        ;; reflects the column's DECLARED element type, e.g. array_agg(atttypid)
+        ;; → oid[]) over the value-sampled element type (which can only see the
+        ;; runtime class, e.g. Long → int8, losing the oid distinction asyncpg
+        ;; relies on). Fall back to the sample when oid-infer can't decide.
         col-array-elem (mapv (fn [i]
-                               (or (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)
-                                   (some-> (nth sub-oids i nil)
+                               (or (some-> (nth sub-oids i nil)
                                            types/array-oid->element-oid
-                                           types/oid->elem-kw)))
+                                           types/oid->elem-kw)
+                                   (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)))
                              (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
         col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))

@@ -213,7 +213,11 @@
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
     [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_attribute/atttypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; atttypid is PG's `oid` type — declare it so `array_agg(atttypid)`
+     ;; (asyncpg's typeinfo attrtypoids) infers oid[] (1028), the array type
+     ;; asyncpg core-registers. Reporting int8[] (1016) made asyncpg loop
+     ;; forever re-introspecting the unregistered array codec.
+     {:db/ident :pg_attribute/atttypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_attribute/attnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      ;; Integer OID matching pg_class.oid so pgjdbc's
      ;; `pg_class c JOIN pg_attribute a ON c.oid = a.attrelid` works.
