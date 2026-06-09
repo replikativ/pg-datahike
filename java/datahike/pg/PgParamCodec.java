@@ -95,6 +95,19 @@ public final class PgParamCodec {
         return COMPOSITE_FIELDS.get(oid);
     }
 
+    // Per-value field-OID layout for ANONYMOUS records (record OID 2249), which
+    // have no composite registry. value->string registers a PgRecord's field
+    // OIDs keyed by its canonical record_out text (recursively for nested
+    // records) right before emitting it; encodeBinary(2249, text) looks it up.
+    // The canonical text uniquely determines the layout for a given ROW(...).
+    private static final java.util.Map<String, int[]> RECORD_LAYOUTS =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Register an anonymous record's field OIDs, keyed by its record_out text. */
+    public static void registerRecordLayout(String recordText, int[] fieldOids) {
+        RECORD_LAYOUTS.put(recordText, fieldOids);
+    }
+
     /**
      * Split a PG record_out text — `(f1,f2,...)` — into its field cells.
      * A bare-empty field (nothing between the delimiters) is SQL NULL
@@ -895,9 +908,12 @@ public final class PgParamCodec {
                     if (isArrayOid(oid)) {
                         yield encodeArrayBinary(oid, value.toString());
                     }
-                    // Composite (named row type): encode the record_out text
-                    // as a binary record using the registered field OIDs.
+                    // Composite (named row type) or anonymous record (2249):
+                    // encode the record_out text as a binary record. Field OIDs
+                    // come from the composite registry, or for an anonymous
+                    // record from the per-value layout registered by value->string.
                     int[] cf = COMPOSITE_FIELDS.get(oid);
+                    if (cf == null) cf = RECORD_LAYOUTS.get(value.toString());
                     if (cf != null) {
                         yield encodeRecordBinary(cf, value.toString());
                     }

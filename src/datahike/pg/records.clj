@@ -56,3 +56,13 @@
   "Render a PgRecord to PG's canonical `record_out` text: `(f1,f2,...)`."
   [^PgRecord r]
   (str "(" (str/join "," (map (comp field-cell :value) (:fields r))) ")"))
+
+(defn register-layouts!
+  "Recursively register each PgRecord's field OIDs (via `reg-fn` — a 2-arg fn
+   [record-text int-array-of-field-oids], i.e. PgParamCodec/registerRecordLayout)
+   keyed by its canonical record_out text. Lets the anonymous-record binary
+   encoder recover the per-field OIDs the text alone can't carry."
+  [reg-fn ^PgRecord r]
+  (reg-fn (to-pg-text r) (int-array (map :oid (:fields r))))
+  (doseq [f (:fields r) :when (record? (:value f))]
+    (register-layouts! reg-fn (:value f))))

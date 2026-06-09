@@ -259,7 +259,9 @@
      (pg-arr/array? v) (pg-arr/to-pg-text v)
     ;; PgRecord → PG canonical record_out text `(f1,f2,…)`. Checked before
     ;; string?/vector? for the same defrecord reason as PgArray.
-     (pg-rec/record? v) (pg-rec/to-pg-text v)
+     (pg-rec/record? v) (do (pg-rec/register-layouts!
+                             (fn [t oids] (PgParamCodec/registerRecordLayout t oids)) v)
+                            (pg-rec/to-pg-text v))
      (string? v)  v
      (keyword? v) (if-let [ns (namespace v)]
                     (str ns "/" (name v))
