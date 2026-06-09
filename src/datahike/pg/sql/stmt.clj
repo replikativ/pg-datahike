@@ -1128,14 +1128,42 @@
         ;; non-marker column is NULL on a given row (e.g. Metabase's
         ;; `NULL as role` projection in build_privilege_map).
         row-marker (pgs/row-marker-attr target-name)
+        ;; Per-column array element kw. A column whose samples are PgArrays
+        ;; (or whose OID hint is a T[] OID) is materialised the way a real
+        ;; array column is: :db.type/string holding canonical PG text
+        ;; ("{1,2,3}") + a :pg/array-elem datom so its read-back OID is T[].
+        ;; Without this the PgArray was Java-`str`'d to "…PgArray@hash" and
+        ;; the column typed as text (asyncpg's introspection then mis-decoded
+        ;; attrtypoids/attrnames as a string). Element kw drives both the
+        ;; value coercion (to-pg-text) and the array OID.
+        col-array-elem (mapv (fn [i]
+                               (or (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)
+                                   (some-> (nth sub-oids i nil)
+                                           types/array-oid->element-oid
+                                           types/oid->elem-kw)))
+                             (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
-        col-types (mapv (fn [i] (col-vtype i)) (range (count sub-aliases)))
-        col-coercions (mapv col-coerce col-types)
+        col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))
+                        (range (count sub-aliases)))
+        col-coercions (mapv (fn [i]
+                              (if (nth col-array-elem i)
+                                (fn [v] (cond
+                                          (pg-arr/array? v) (pg-arr/to-pg-text v)
+                                          (string? v)       v
+                                          :else             (str v)))
+                                (col-coerce (nth col-types i))))
+                            (range (count sub-aliases)))
         schema-tx (conj
                    (vec (for [[i a] (map-indexed vector sub-aliases)]
-                          {:db/ident (keyword target-name a)
-                           :db/valueType (nth col-types i)
-                           :db/cardinality :db.cardinality/one}))
+                          (cond-> {:db/ident (keyword target-name a)
+                                   :db/valueType (nth col-types i)
+                                   :db/cardinality :db.cardinality/one}
+                            (nth col-array-elem i)
+                            (assoc :pg/array-elem (nth col-array-elem i)
+                                   ;; :pg/type "_T" is what oid-infer reads to
+                                   ;; report the array OID (T[]); :pg/array-elem
+                                   ;; drives canonical-text decoding.
+                                   :pg/type (str "_" (name (nth col-array-elem i)))))))
                    {:db/ident       row-marker
                     :db/valueType   :db.type/boolean
                     :db/cardinality :db.cardinality/one})
@@ -4599,16 +4627,25 @@
 
 (defn- recursive-schema-tx
   "Datahike schema tx for a materialised recursive CTE: one
-   `:<target-name>/<col>` attr per column plus the row-existence marker."
-  [target-name col-names col-types row-marker]
-  (conj
-   (vec (for [[i c] (map-indexed vector col-names)]
-          {:db/ident       (keyword target-name c)
-           :db/valueType   (nth col-types i)
-           :db/cardinality :db.cardinality/one}))
-   {:db/ident       row-marker
-    :db/valueType   :db.type/boolean
-    :db/cardinality :db.cardinality/one}))
+   `:<target-name>/<col>` attr per column plus the row-existence marker.
+   `col-array-elems` (optional, nil-padded) carries each column's array
+   element kw for array-valued columns — stored as a :pg/array-elem datom so
+   the column's read-back OID is T[] (mirrors real array columns; the value
+   is canonical PG text in a :db.type/string column)."
+  ([target-name col-names col-types row-marker]
+   (recursive-schema-tx target-name col-names col-types row-marker nil))
+  ([target-name col-names col-types row-marker col-array-elems]
+   (conj
+    (vec (for [[i c] (map-indexed vector col-names)]
+           (cond-> {:db/ident       (keyword target-name c)
+                    :db/valueType   (nth col-types i)
+                    :db/cardinality :db.cardinality/one}
+             (and col-array-elems (nth col-array-elems i nil))
+             (assoc :pg/array-elem (nth col-array-elems i)
+                    :pg/type (str "_" (name (nth col-array-elems i)))))))
+    {:db/ident       row-marker
+     :db/valueType   :db.type/boolean
+     :db/cardinality :db.cardinality/one})))
 
 (defn- recursive-data-tx
   "Entity maps for the rows a recursive CTE produced, coercing each value
@@ -4899,7 +4936,15 @@
                                   (or (some-> (nth anchor-oids i nil) types/dh-type-for-oid)
                                       :db.type/string))
                                 (range (count col-names)))
-                schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+                ;; Array columns (e.g. typeinfo_tree.attrtypoids from the
+                ;; {typeinfo} array_agg) carry their element kw so the CTE
+                ;; column's OID is T[] — the values arrive as canonical PG text.
+                col-array-elems (mapv (fn [i]
+                                        (some-> (nth anchor-oids i nil)
+                                                types/array-oid->element-oid
+                                                types/oid->elem-kw))
+                                      (range (count col-names)))
+                schema-tx (recursive-schema-tx target-name col-names col-types row-marker col-array-elems)
                 spec0 (d/db-with db schema-tx)
                 rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
                              (translate-select recursive (:schema spec0) spec0))]
