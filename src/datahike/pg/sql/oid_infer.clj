@@ -391,10 +391,18 @@
   "Map a SQL CAST target type-name to an OID. Uses `types/cast-category`
    so the set of recognised target types stays in one place."
   [^CastExpression c env]
-  (let [type-str (some-> (.getColDataType c) .getDataType str str/lower-case)]
-    (or
-     (composite-name->oid type-str (:db env))
-     (case (types/cast-category type-str)
+  (let [cdt      (.getColDataType c)
+        ;; .getDataType returns the BASE name ("int") and exposes the `[]`
+        ;; only via .getArrayData — so an array cast like `::int[]` must be
+        ;; detected here and wrapped to the element's array OID, else it
+        ;; reports the scalar (int4) and the binary array value mis-decodes.
+        type-str (some-> cdt .getDataType str str/lower-case)
+        ad       (when cdt (.getArrayData cdt))
+        array?   (and ad (pos? (.size ^java.util.List ad)))
+        scalar-oid
+        (or
+         (composite-name->oid type-str (:db env))
+         (case (types/cast-category type-str)
       ;; Datahike stores every integer as a Clojure long, but an explicit
       ;; CAST asserts a specific PG width — report the matching OID so
       ;; clients parse the column correctly (e.g. node-postgres returns
@@ -418,7 +426,11 @@
       :uuid      types/oid-uuid
       :bytes     types/oid-bytea
       :bit       types/oid-text
-      nil))))
+      nil))]
+    (cond
+      (nil? scalar-oid) nil
+      array? (get types/element-oid->array-oid scalar-oid types/oid-text-array)
+      :else scalar-oid)))
 
 (defn- case-oid
   "CASE expression returns the type of its first non-nil branch. PG
