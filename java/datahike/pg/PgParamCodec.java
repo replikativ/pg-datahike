@@ -228,8 +228,11 @@ public final class PgParamCodec {
         // Parse the body. We track depth and per-level element counts to
         // derive dims; leaves accumulate in row-major order.
         java.util.List<String> leaves = new java.util.ArrayList<>();
-        // Per-depth current-element count, taken at the close of each level.
-        java.util.List<Integer> dimsList = new java.util.ArrayList<>();
+        // Size of each depth, recorded ONCE on that depth's first close
+        // (PG arrays are rectangular). Keyed by depth so depth 1 = outermost
+        // sorts first — fixes the prior logic that double-recorded the inner
+        // dim and dropped the outer (2-D `{{1,2},{4,5},{6,7}}` → [2,2] not [3,2]).
+        java.util.TreeMap<Integer, Integer> dimByDepth = new java.util.TreeMap<>();
         StringBuilder cur = new StringBuilder();
         boolean inQuote = false, escape = false, hasContent = false;
         int depth = 0;
@@ -271,12 +274,8 @@ public final class PgParamCodec {
                     hasContent = false;
                 }
                 int closedCount = levelCounts.pop();
-                // Record this dim only on the deepest close (first time
-                // we close a level). On subsequent closes at the same
-                // depth, the count should be the same — PG validates this.
-                if (dimsList.size() < depth) {
-                    dimsList.add(0, closedCount);
-                }
+                // Record each depth's size once, on its first close.
+                dimByDepth.putIfAbsent(depth, closedCount);
                 if (!levelCounts.isEmpty()) {
                     levelCounts.push(levelCounts.pop() + 1);
                 }
@@ -297,8 +296,9 @@ public final class PgParamCodec {
             if (!Character.isWhitespace(c)) hasContent = true;
         }
 
-        int[] dims = new int[dimsList.size()];
-        for (int i = 0; i < dims.length; i++) dims[i] = dimsList.get(i);
+        int[] dims = new int[dimByDepth.size()];
+        int di = 0;
+        for (int v : dimByDepth.values()) dims[di++] = v;  // ascending depth = outer→inner
         if (dims.length == 0) {
             dims = new int[]{0};
         }

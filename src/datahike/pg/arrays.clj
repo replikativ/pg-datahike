@@ -475,7 +475,8 @@
     (loop [s   s
            lbs []]
       (if (str/starts-with? s "[")
-        (if-let [m (re-find #"^\[(\d+):(\d+)\](.*)$" s)]
+        ;; PG array bounds may be negative (e.g. `[-1:0]`), so allow a sign.
+        (if-let [m (re-find #"^\[(-?\d+):(-?\d+)\](.*)$" s)]
           (let [lo (Long/parseLong (nth m 1))
                 rest-s (nth m 3)]
             (recur rest-s (conj lbs lo)))

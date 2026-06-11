@@ -1095,14 +1095,31 @@
                                                              (if fn-val (fn-val) :__null__))
                                                    ;; CAST / :: syntax
                                                            (instance? CastExpression expr)
-                                                           (let [inner (.getLeftExpression ^CastExpression expr)
-                                                                 type-str (str/lower-case (str (.getDataType (.getColDataType ^CastExpression expr))))
+                                                           (let [cdt (.getColDataType ^CastExpression expr)
+                                                                 inner (.getLeftExpression ^CastExpression expr)
+                                                                 ;; .getDataType is the BASE name ("int"); the `[]` is in
+                                                                 ;; .getArrayData. (str cdt) carries the full "int[]".
+                                                                 type-str (str/lower-case (str (.getDataType cdt)))
+                                                                 full-str (str/lower-case (str cdt))
+                                                                 ad (.getArrayData cdt)
+                                                                 array? (and ad (pos? (.size ^java.util.List ad)))
                                                                  raw (cond
                                                                        (instance? LongValue inner) (.getValue ^LongValue inner)
                                                                        (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
                                                                        (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
                                                                        :else (str inner))]
-                                                             (case (types/cast-category type-str)
+                                                             (cond
+                                                              ;; Array-target cast: parse the canonical array text
+                                                              ;; (incl. `[lo:hi]=` bounds + multi-dim) into a PgArray
+                                                              ;; instead of numeric-coercing the whole string. Without
+                                                              ;; this `'{1,2}'::int[]` / `'[1:3][-1:0]={{..}}'::int[]`
+                                                              ;; threw "For input string".
+                                                              array?
+                                                              (if (or (nil? raw) (= :__null__ raw))
+                                                                :__null__
+                                                                (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
+                                                              :else
+                                                              (case (types/cast-category type-str)
                                                                 ;; CAST('1' AS BIGINT): inner was a
                                                                 ;; StringValue, so raw is a String —
                                                                 ;; (long "1") throws. Parse numerically.
@@ -1159,7 +1176,7 @@
                                                                  (if (pos? pad)
                                                                    (str (apply str (repeat pad \0)) s)
                                                                    s))
-                                                               raw))
+                                                               raw)))
                                                    ;; Scalar subquery in projection —
                                                    ;; execute and take first value
                                                            (instance? ParenthesedSelect expr)
