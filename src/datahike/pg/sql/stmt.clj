@@ -1287,7 +1287,7 @@
    Robust enough for catalog / introspection shapes; AST-precise detection
    (which would also respect inner shadowing) is a later refinement. This is
    the first slice of the correlated-subquery / LATERAL executor — see
-   doc/correlated-lateral-plan.md."
+   doc/design-alignment.md."
   [inner outer-aliases]
   (when (seq outer-aliases)
     (let [sql (str inner)
@@ -1598,7 +1598,7 @@
                 nil))))
 
         ;; --- Correlated scalar subqueries in the SELECT list (slice A of the
-        ;; per-row / LATERAL executor — doc/correlated-lateral-plan.md). A
+        ;; per-row / LATERAL executor — doc/design-alignment.md). A
         ;; scalar subquery that references an OUTER FROM alias is DEFERRED:
         ;; the item loop skips it (so it isn't evaluated-once → NULL), the
         ;; outer-correlation columns it reads are threaded into :find as

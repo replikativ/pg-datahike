@@ -2673,7 +2673,7 @@
    (commitImplicit), so the whole group is atomic and a trailing
    ROLLBACK / mid-group error rolls it back. The simple-query path leaves
    this false until that path is unified too (see
-   doc/implicit-transaction-plan.md)."
+   doc/design-alignment.md)."
   false)
 
 (defn- resolve-param-refs
@@ -3154,7 +3154,7 @@
    the same speculative transaction and commits/rolls-back atomically at
    the group boundary (commitImplicit). Same shape as handle-begin but
    tagged :implicit? — the difference is who commits it (the wire layer
-   at Sync, not a client COMMIT). See doc/implicit-transaction-plan.md."
+   at Sync, not a client COMMIT). See doc/design-alignment.md."
   [{:keys [conn tx-state session-state]}]
   (let [real-db (d/db conn)]
     (swap! tx-state assoc
@@ -4051,7 +4051,7 @@
    order) and `out-pos->val` (subquery output-position → value). Shared by
    exec-select (row values) and describeResult (aliases / OIDs) so the
    correlated-subquery output layout is computed identically — see
-   doc/correlated-lateral-plan.md."
+   doc/design-alignment.md."
   [visible out-pos->val n-output]
   (loop [p 0, v (seq visible), out []]
     (if (= p n-output)
@@ -4559,7 +4559,7 @@
       ;; directly. Wire writes never reach here — the dispatch opens an
       ;; implicit transaction first, so they take the :in-tx? branch. The
       ;; former deferred-CC "batchable" path was retired once implicit-tx
-      ;; took over grouping (see doc/implicit-transaction-plan.md).
+      ;; took over grouping (see doc/design-alignment.md).
       :else
       (execute-insert conn parsed :tx-wrap (:tx-wrap ctx)))))
 
@@ -5372,7 +5372,7 @@
       ;; client's COMMIT/ROLLBACK. Returns nil on success / no-op, or an
       ;; error QueryResult if the commit's transact fails (e.g. 40001
       ;; serialization_failure, deferred constraint). See
-      ;; doc/implicit-transaction-plan.md.
+      ;; doc/design-alignment.md.
       (commitImplicit [_]
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
           (if (:aborted? @tx-state)
@@ -5850,7 +5850,7 @@
                         ;; implicit tx so the rest of its message group
                         ;; (up to Sync) commits/rolls-back atomically.
                         ;; See open-implicit-tx! / commitImplicit and
-                        ;; doc/implicit-transaction-plan.md.
+                        ;; doc/design-alignment.md.
                         (when (and *implicit-tx-allowed*
                                    (not *snapshot-db*)
                                    (not (:in-tx? @tx-state))
