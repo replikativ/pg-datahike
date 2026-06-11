@@ -307,7 +307,7 @@
                         (str/replace "Z" (if (= oid PgWireServer/OID_TIMESTAMPTZ) "+00" ""))))
      (uuid? v)    (str v)
      (symbol? v)  (str v)
-     (bytes? v)   "<bytes>"
+     (bytes? v)   (str "\\x" (apply str (map #(format "%02x" (bit-and % 0xff)) v)))
     ;; Maps and vectors (jsonb values) → serialize as JSON
      (map? v)     (jb/serialize-jsonb v)
      (vector? v)  (jb/serialize-jsonb v)

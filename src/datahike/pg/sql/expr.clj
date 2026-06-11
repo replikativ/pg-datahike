@@ -1737,6 +1737,9 @@
                                (nil? v)           nil
                                (= :__null__ v)    :__null__
                                (pg-rec/record? v) v
+                               ;; bytea: keep the byte[] so value->string emits
+                               ;; PG hex `\x…` rather than the Java array toString.
+                               (bytes? v)         v
                                :else              (str v)))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj cast-fn)

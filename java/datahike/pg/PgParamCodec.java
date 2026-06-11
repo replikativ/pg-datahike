@@ -183,6 +183,16 @@ public final class PgParamCodec {
         return e == null ? -1 : e.intValue();
     }
 
+    /** Decode a PG hex string (the part after `\x`) to raw bytes. */
+    static byte[] hexToBytes(String hex) {
+        int n = hex.length() / 2;
+        byte[] out = new byte[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(2 * i, 2 * i + 2), 16);
+        }
+        return out;
+    }
+
     // ------------------------------------------------------------------------
     // Canonical-text array parser
     //
@@ -890,8 +900,15 @@ public final class PgParamCodec {
                      PgWireServer.OID_JSON ->
                     value.toString().getBytes(StandardCharsets.UTF_8);
 
-                case PgWireServer.OID_BYTEA ->
-                    (value instanceof byte[] b) ? b : value.toString().getBytes(StandardCharsets.UTF_8);
+                case PgWireServer.OID_BYTEA -> {
+                    if (value instanceof byte[] b) yield b;
+                    String s = value.toString();
+                    // value->string renders bytea as PG hex text `\x<hex>`;
+                    // decode it back to raw bytes. (Plain strings fall through
+                    // as their UTF-8 bytes.)
+                    yield (s.startsWith("\\x")) ? hexToBytes(s.substring(2))
+                                                : s.getBytes(StandardCharsets.UTF_8);
+                }
 
                 case PgWireServer.OID_JSONB -> {
                     byte[] text = value.toString().getBytes(StandardCharsets.UTF_8);
