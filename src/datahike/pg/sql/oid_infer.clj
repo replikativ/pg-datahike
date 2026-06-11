@@ -426,7 +426,12 @@
       :uuid      types/oid-uuid
       :bytes     types/oid-bytea
       :bit       types/oid-text
-      nil))]
+      nil)
+         ;; Fallback for types cast-category doesn't width-classify (jsonb,
+         ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
+         ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
+         ;; and the binary value mis-decoded.
+         (get types/pg-name->oid type-str))]
     (cond
       (nil? scalar-oid) nil
       array? (get types/element-oid->array-oid scalar-oid types/oid-text-array)
