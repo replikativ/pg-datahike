@@ -546,37 +546,37 @@
                :pg_attribute/attisdropped false
                (pgs/row-marker-attr "pg_attribute") true}))
        (for [[tname {:keys [columns]}] (sort-by key tables)
-                 [idx col] (map-indexed vector columns)
-                 :let [tbl-oid (or (pgs/table-oid cte-db tname)
+             [idx col] (map-indexed vector columns)
+             :let [tbl-oid (or (pgs/table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
                                    ;; started tracking :pg/table-oid — fall
                                    ;; back to the attnum-derived composite
                                    ;; key convention (name → hash) so stale
                                    ;; data still has a stable attrelid.
-                                   (Math/abs (.hashCode ^String tname)))
-                       pk? (= :db.unique/identity (:unique col))
+                               (Math/abs (.hashCode ^String tname)))
+                   pk? (= :db.unique/identity (:unique col))
                        ;; -1 = unconstrained (real PG's default for
                        ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
                        ;; columns get a positive value via DDL.
-                       typmod (long (or (get typmods (:attr col)) -1))]]
-             {:pg_attribute/attname (:name col)
+                   typmod (long (or (get typmods (:attr col)) -1))]]
+         {:pg_attribute/attname (:name col)
               ;; Cardinality-many columns project as PG arrays, so
               ;; their atttypid must be the array OID — pgjdbc reads
               ;; this for ResultSetMetaData and the field-metadata
               ;; cache key. Mirrors the OID inference in
               ;; oid-infer/column-oid.
-              :pg_attribute/atttypid
-              (long (let [base (pgs/oid-for-valuetype (:valuetype col))]
-                      (if (= :db.cardinality/many (:cardinality col))
-                        (get types/element-oid->array-oid base types/oid-text-array)
-                        base)))
-              :pg_attribute/attnum (long (inc idx))
-              :pg_attribute/attrelid (long tbl-oid)
-              :pg_attribute/attnotnull pk?
-              :pg_attribute/attidentity ""
-              :pg_attribute/atttypmod typmod
-              :pg_attribute/attisdropped false
-              (pgs/row-marker-attr "pg_attribute") true})))
+          :pg_attribute/atttypid
+          (long (let [base (pgs/oid-for-valuetype (:valuetype col))]
+                  (if (= :db.cardinality/many (:cardinality col))
+                    (get types/element-oid->array-oid base types/oid-text-array)
+                    base)))
+          :pg_attribute/attnum (long (inc idx))
+          :pg_attribute/attrelid (long tbl-oid)
+          :pg_attribute/attnotnull pk?
+          :pg_attribute/attidentity ""
+          :pg_attribute/atttypmod typmod
+          :pg_attribute/attisdropped false
+          (pgs/row-marker-attr "pg_attribute") true})))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
       (pgs/row-marker-attr "pg_namespace") true}]

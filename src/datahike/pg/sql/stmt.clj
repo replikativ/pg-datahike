@@ -1340,46 +1340,46 @@
    :find as hidden columns so exec-select can bind *from-bindings* per row."
   [^net.sf.jsqlparser.expression.Expression e0 outer-aliases]
   (let [e (unwrap-parens e0)]
-   (cond
-    (subquery-expr? e)
-    (let [inner (subquery-inner e)]
-      (when (instance? PlainSelect inner)
-        (when-let [refs (correlated-subquery-refs inner outer-aliases)]
-          {:kind :scalar :inner-sql (str inner) :corr-refs (vec refs)})))
+    (cond
+      (subquery-expr? e)
+      (let [inner (subquery-inner e)]
+        (when (instance? PlainSelect inner)
+          (when-let [refs (correlated-subquery-refs inner outer-aliases)]
+            {:kind :scalar :inner-sql (str inner) :corr-refs (vec refs)})))
 
-    (instance? net.sf.jsqlparser.expression.CaseExpression e)
-    (let [ce ^net.sf.jsqlparser.expression.CaseExpression e
-          when-clauses (.getWhenClauses ce)
-          else-expr (.getElseExpression ce)
-          then->spec (fn [^net.sf.jsqlparser.expression.Expression t]
-                       (when t
-                         (if (subquery-expr? t)
-                           {:subquery-sql (str (subquery-inner t))}
-                           {:expr-sql (str t)})))
+      (instance? net.sf.jsqlparser.expression.CaseExpression e)
+      (let [ce ^net.sf.jsqlparser.expression.CaseExpression e
+            when-clauses (.getWhenClauses ce)
+            else-expr (.getElseExpression ce)
+            then->spec (fn [^net.sf.jsqlparser.expression.Expression t]
+                         (when t
+                           (if (subquery-expr? t)
+                             {:subquery-sql (str (subquery-inner t))}
+                             {:expr-sql (str t)})))
           ;; THEN/ELSE branches that are subqueries
-          subqs (concat
-                 (keep (fn [^net.sf.jsqlparser.expression.WhenClause wc]
-                         (let [t (.getThenExpression wc)] (when (subquery-expr? t) t)))
-                       when-clauses)
-                 (when (subquery-expr? else-expr) [else-expr]))
+            subqs (concat
+                   (keep (fn [^net.sf.jsqlparser.expression.WhenClause wc]
+                           (let [t (.getThenExpression wc)] (when (subquery-expr? t) t)))
+                         when-clauses)
+                   (when (subquery-expr? else-expr) [else-expr]))
           ;; Only defer when some THEN/ELSE subquery is itself correlated; an
           ;; uncorrelated subquery (or a plain CASE) needs no per-row eval.
-          correlated? (some (fn [s]
-                              (let [inner (subquery-inner s)]
-                                (and (instance? PlainSelect inner)
-                                     (seq (correlated-subquery-refs inner outer-aliases)))))
-                            subqs)]
-      (when correlated?
-        {:kind :case
-         :branches (mapv (fn [^net.sf.jsqlparser.expression.WhenClause wc]
-                           {:when-sql (str (.getWhenExpression wc))
-                            :then (then->spec (.getThenExpression wc))})
-                         when-clauses)
-         :else (then->spec else-expr)
+            correlated? (some (fn [s]
+                                (let [inner (subquery-inner s)]
+                                  (and (instance? PlainSelect inner)
+                                       (seq (correlated-subquery-refs inner outer-aliases)))))
+                              subqs)]
+        (when correlated?
+          {:kind :case
+           :branches (mapv (fn [^net.sf.jsqlparser.expression.WhenClause wc]
+                             {:when-sql (str (.getWhenExpression wc))
+                              :then (then->spec (.getThenExpression wc))})
+                           when-clauses)
+           :else (then->spec else-expr)
          ;; All outer refs across the whole CASE (WHEN conditions + subqueries).
-         :corr-refs (vec (or (correlated-subquery-refs ce outer-aliases) []))}))
+           :corr-refs (vec (or (correlated-subquery-refs ce outer-aliases) []))}))
 
-    :else nil)))
+      :else nil)))
 
 (defn- correlated-item-oid
   "Best-effort result OID for a deferred correlated item, for the extended-
@@ -5056,11 +5056,11 @@
           mk-data-tx (fn [rows]
                        (vec (for [row rows]
                               (assoc (into {} (keep-indexed
-                                              (fn [i c]
-                                                (let [v (nth row i nil)]
-                                                  (when (and (some? v) (not= :__null__ v))
-                                                    [(keyword target-name c) ((nth coercions i) v)])))
-                                              col-names))
+                                               (fn [i c]
+                                                 (let [v (nth row i nil)]
+                                                   (when (and (some? v) (not= :__null__ v))
+                                                     [(keyword target-name c) ((nth coercions i) v)])))
+                                               col-names))
                                      row-marker true))))
           anchor-edb  (or (:enriched-db anchor) db)
           anchor-rows (visible-query-rows anchor anchor-edb)

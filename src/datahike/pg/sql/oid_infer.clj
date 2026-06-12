@@ -409,24 +409,24 @@
       ;; int4 as a JS number but int8 as a string). The wire bytes are
       ;; identical in text mode; encodeBinary narrows the long to the
       ;; declared width for binary clients.
-      :integer   (cond
-                   (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
-                   (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
-                   :else                                                    types/oid-int4)
-      :float     types/oid-float8
-      :numeric   types/oid-numeric
-      :text      types/oid-text
-      :boolean   types/oid-bool
-      :date      types/oid-date
-      :time      types/oid-time
-      :timestamp (cond
-                   (re-find #"with time zone|timestamptz" type-str)
-                   types/oid-timestamptz
-                   :else types/oid-timestamp)
-      :uuid      types/oid-uuid
-      :bytes     types/oid-bytea
-      :bit       types/oid-text
-      nil)
+           :integer   (cond
+                        (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
+                        (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
+                        :else                                                    types/oid-int4)
+           :float     types/oid-float8
+           :numeric   types/oid-numeric
+           :text      types/oid-text
+           :boolean   types/oid-bool
+           :date      types/oid-date
+           :time      types/oid-time
+           :timestamp (cond
+                        (re-find #"with time zone|timestamptz" type-str)
+                        types/oid-timestamptz
+                        :else types/oid-timestamp)
+           :uuid      types/oid-uuid
+           :bytes     types/oid-bytea
+           :bit       types/oid-text
+           nil)
          ;; Fallback for types cast-category doesn't width-classify (jsonb,
          ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
          ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
