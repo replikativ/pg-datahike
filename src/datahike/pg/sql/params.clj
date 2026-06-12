@@ -199,7 +199,9 @@
   ;; the sequence twice per logical use, or call now() twice and get
   ;; out-of-sync timestamps within one row. The IdentityHashMap
   ;; keeps marker identity → resolved-value through one walk, so
-  ;; each unique marker resolves exactly once.
+  ;; each unique marker resolves exactly once. (Callers must resolve
+  ;; before any postwalk-based rebuild that would clone — and thus
+  ;; un-share — the marker objects; see server.clj's dispatch order.)
   ;;
   ;; The function table here is intentionally minimal — extend by
   ;; adding to call-fns above and a clause here.

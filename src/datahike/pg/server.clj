@@ -5772,6 +5772,21 @@
                                    (let [p (sql/parse-sql sql schema db)]
                                      (when bump-dispatch! (bump-dispatch! p))
                                      p))
+                          ;; Sibling pass to ParamRef substitution: any
+                          ;; `nextval('s')` markers left in tx-data/in-args
+                          ;; resolve here against the live conn (PG's
+                          ;; non-transactional nextval semantics).
+                          ;;
+                          ;; MUST run before freshen-tx-tempids: translate-
+                          ;; insert puts the SAME marker object in both the
+                          ;; `:db.fn/call` unique-check arg and the outer
+                          ;; entity-map, and resolve-nextvals! dedups by
+                          ;; object identity so one textual `nextval(...)`
+                          ;; advances the sequence once. freshen-tx-tempids
+                          ;; postwalk-rebuilds tx-data, which clones the
+                          ;; marker into two distinct objects — running it
+                          ;; first would defeat the dedup and double-bump.
+                          parsed (resolve-nextval-markers parsed conn)
                           ;; Give a reused INSERT a fresh tempid per
                           ;; execution. parse-sql is LRU-cached and
                           ;; prepared statements are reused, so the cached
@@ -5779,12 +5794,7 @@
                           ;; rows committed together in one implicit-tx
                           ;; group (executemany) and collapse them onto a
                           ;; single entity. See freshen-tx-tempids.
-                          parsed (freshen-tx-tempids parsed)
-                          ;; Sibling pass to ParamRef substitution: any
-                          ;; `nextval('s')` markers left in tx-data/in-args
-                          ;; resolve here against the live conn (PG's
-                          ;; non-transactional nextval semantics).
-                          parsed (resolve-nextval-markers parsed conn)]
+                          parsed (freshen-tx-tempids parsed)]
                       ;; ctx is the dispatch context shared across every
                       ;; per-type executor. Keys:
                       ;;   :conn           — Datahike conn for THIS db
