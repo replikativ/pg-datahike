@@ -15,6 +15,7 @@
                               | {:type :error :message str}"
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.query :as dq]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
@@ -86,6 +87,8 @@
 (def filter-stddev-samp    fns/filter-stddev-samp)
 (def filter-corr           fns/filter-corr)
 (def filter-array-agg      fns/filter-array-agg)
+(def filter-array-agg-ordered      fns/filter-array-agg-ordered)
+(def filter-array-agg-ordered-desc fns/filter-array-agg-ordered-desc)
 (def filter-percentile-cont fns/filter-percentile-cont)
 (def filter-percentile-disc fns/filter-percentile-disc)
 (def filter-mode            fns/filter-mode)
@@ -180,12 +183,60 @@
    caching entirely. Defaults to the server-wide cache."
   global-catalog-cache)
 
+(defn invalidate-catalog-cache!
+  "Clear the server-wide enriched-db catalog cache. Called from every DDL
+   exec branch (via invalidate-schema-cache!). The cache key is only the
+   user-schema hash + catalog-table-names, which does NOT change when a
+   CREATE TYPE / ENUM / DOMAIN adds a registry *entity* (new datoms under
+   pre-existing idents) or when ALTER changes a column's typmod — so those
+   would otherwise serve stale catalog rows (e.g. a 2nd composite invisible
+   in pg_type). DDL is rare, so a full clear is the simplest correct fix."
+  []
+  (.clear ^java.util.Map global-catalog-cache))
+
 (defn- cache-get [^java.util.Map cache k]
   (when cache (.get cache k)))
 
 (defn- cache-put! [^java.util.Map cache k v]
   (when cache (.put cache k v))
   v)
+
+(defn enrich-db-with-catalogs
+  "Materialise the given catalog tables' schema + data on top of `db`,
+   returning the enriched db (its `:schema` carries the catalog attrs).
+   Returns `db` unchanged when `catalog-names` is empty.
+
+   Cached in the server-wide LRU by [user-schema-hash sorted-names]; the
+   cache is DDL-invalidated (invalidate-catalog-cache!). Callable at BOTH
+   parse time (to translate against the catalog schema) and execute time
+   (so a prepared catalog statement re-resolves fresh catalog rows against
+   the current db instead of a stale parse-time snapshot — real PG re-plans
+   on catalog change). `schema` is `db`'s user schema."
+  [db schema catalog-names]
+  (if (empty? catalog-names)
+    db
+    (let [existing (dbi/-schema db)
+          ;; Skip catalogs already materialised on `db` (its row-marker attr
+          ;; is present). Re-asserting a catalog's schema would fail — datahike
+          ;; rejects "updating" an existing schema attr's custom metadata
+          ;; (e.g. :pg/type on :pg_type/typtype) — and re-asserting its data
+          ;; would duplicate rows. This makes nested enrichment idempotent:
+          ;; a derived table / correlated subquery over pg_* runs against a db
+          ;; whose outer scope already enriched the same catalogs.
+          sorted-names (sort (remove #(contains? existing (pgs/row-marker-attr %))
+                                     catalog-names))
+          cache *catalog-cache*
+          cache-key [(hash existing) sorted-names]]
+      (cond
+        (empty? sorted-names) db
+        :else
+        (or (cache-get cache cache-key)
+            (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
+                  combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
+                                             sorted-names))
+                  spec-db (d/db-with db combined-schema)
+                  built (if (seq combined-data) (d/db-with spec-db combined-data) spec-db)]
+              (cache-put! cache cache-key built)))))))
 
 ;; ============================================================================
 ;; parse-sql result cache
@@ -338,11 +389,53 @@
     (instance? Delete stmt)            (.getWithItemsList ^Delete stmt)
     :else                              nil))
 
+(defn- plain-selects-in
+  "All PlainSelects reachable from a SELECT body, descending
+   ParenthesedSelect wrappers and SetOperationList (UNION/…) parts.
+   Used to walk WITH-CTE bodies for nested bind-param OIDs — asyncpg's
+   type introspection puts `$1::oid[]` inside a WITH RECURSIVE anchor,
+   which the top-level WHERE walk never sees."
+  [body]
+  (cond
+    (instance? PlainSelect body)       [body]
+    (instance? ParenthesedSelect body) (plain-selects-in (.getSelect ^ParenthesedSelect body))
+    (instance? SetOperationList body)  (vec (mapcat plain-selects-in (.getSelects ^SetOperationList body)))
+    :else                              []))
+
+(defn- cte-body-param-oids
+  "Walk every WITH-CTE body of `stmt` for bind-param OIDs (WHERE / JOIN-ON /
+   SELECT-list of each contained PlainSelect). Merged into the statement's
+   param-oids so a param nested in a CTE (e.g. asyncpg's
+   `WITH RECURSIVE … WHERE oid = ANY($1::oid[])`) is typed for
+   ParameterDescription. Best-effort."
+  [stmt schema]
+  (try
+    (apply merge
+           (for [^net.sf.jsqlparser.statement.select.WithItem wi (or (stmt-with-items stmt) [])
+                 :let [body (try (.getParenthesedStatement wi) (catch Throwable _ nil))]
+                 ^PlainSelect ps (plain-selects-in
+                                  (if (instance? ParenthesedSelect body)
+                                    (.getSelect ^ParenthesedSelect body)
+                                    body))
+                 :let [from-item (.getFromItem ps)
+                       tns (when (instance? Table from-item)
+                             (unquote-ident (.getName ^Table from-item)))
+                       aliases (params/collect-table-aliases from-item (.getJoins ps))]]
+             (merge (params/where-param-oids (.getWhere ps) schema tns aliases)
+                    (apply merge
+                           (for [^SelectItem si (or (.getSelectItems ps) [])]
+                             (params/where-param-oids (.getExpression si) schema tns aliases))))))
+    (catch Throwable _ nil)))
+
 (defn- materialize-withs!
-  "Run the WITH-list fold for any statement type. Returns [enriched-db
-   enriched-schema] with the speculative db carrying `:<cte>/<col>`
-   virtual attrs for each materialised CTE. When `stmt` has no WITH
-   list (or it's empty), returns [db schema] unchanged.
+  "Run the WITH-list fold for any statement type. Returns
+   [enriched-db enriched-schema deferred-recursive-ctes] with the
+   speculative db carrying `:<cte>/<col>` virtual attrs for each
+   materialised CTE. `deferred-recursive-ctes` is a (possibly empty)
+   vector of specs for parameterised recursive CTEs whose DATA must be
+   materialised at Execute (after Bind) — see
+   stmt/materialize-recursive-cte! and stmt/materialize-recursive-rows!.
+   When `stmt` has no WITH list (or it's empty), returns [db schema []].
 
    - Non-recursive WITH items with a SELECT body go through
      `materialize-set-op!`.
@@ -358,7 +451,7 @@
   (let [withs (stmt-with-items stmt)]
     (if (and db (seq withs))
       (reduce
-       (fn [[curr-db curr-schema] ^net.sf.jsqlparser.statement.select.WithItem wi]
+       (fn [[curr-db curr-schema deferred] ^net.sf.jsqlparser.statement.select.WithItem wi]
          (let [cte-name   (str/trim (str (.getAlias wi)))
                recursive? (.isRecursive wi)
                body       (try (.getParenthesedStatement wi)
@@ -372,28 +465,44 @@
            (cond
              ;; Recursive WITH on UPDATE — leave to translate-update.
              (and recursive? (instance? Update stmt))
-             [curr-db curr-schema]
+             [curr-db curr-schema deferred]
 
              recursive?
-             (if-let [m (try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
-                             (catch Throwable _ nil))]
-               [(:db m) (:schema m)]
-               [curr-db curr-schema])
+             (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
+                               (catch Throwable _ nil))
+                   iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
+                               (catch Throwable _ nil))
+                   ;; Parameterised CTEs: prefer the iterative evaluator (it
+                   ;; defers a table-full param anchor to Execute and handles
+                   ;; complex bodies — asyncpg's typeinfo_tree); it bails (nil)
+                   ;; on a table-free param anchor so the rule path's B2
+                   ;; ground-rule-params owns that. Non-parameterised: keep the
+                   ;; proven single-rule path first, iteration as the fallback
+                   ;; for bodies the rule can't represent (LEFT JOIN, etc.).
+                   paramy? (boolean (seq (try (params/ast-param-indices wi)
+                                              (catch Throwable _ nil))))
+                   m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
+               (if m
+                 ;; A parameterised recursive CTE enriches only the schema
+                 ;; now and carries a `:deferred` spec for Execute-time data.
+                 [(:db m) (:schema m)
+                  (cond-> deferred (:deferred m) (conj (:deferred m)))]
+                 [curr-db curr-schema deferred]))
 
              (some? inner)
              (if-let [m (stmt/materialize-set-op! inner cte-name curr-db curr-schema)]
-               [(:db m) (:schema m)]
-               [curr-db curr-schema])
+               [(:db m) (:schema m) deferred]
+               [curr-db curr-schema deferred])
 
              ;; Data-modifying CTE body or shape we don't recognise —
              ;; skip rather than crash. The outer translate-* will
              ;; surface a clearer error if the body's results are
              ;; actually needed.
              :else
-             [curr-db curr-schema])))
-       [db schema]
+             [curr-db curr-schema deferred])))
+       [db schema []]
        withs)
-      [db schema])))
+      [db schema []])))
 
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
@@ -401,6 +510,19 @@
   [^String sql schema db]
   (binding [params/*parse-db* db
             params/*parse-sql* parse-sql
+            ;; Use datahike's query PLANNER (not the legacy engine) for all
+            ;; parse-time materialisation (derived tables / set-ops / CTEs /
+            ;; correlated-subquery per-row eval). The legacy engine
+            ;; cross-products multiple or-join relations (SQL LEFT JOINs),
+            ;; which made asyncpg's {typeinfo} introspection derived table
+            ;; (3 LEFT JOINs over pg_type/pg_range) take ~3s and the full
+            ;; recursive introspection hang; the planner runs the same query
+            ;; in <10ms. server.execute already binds this false for the
+            ;; execute-time path — this extends it to parse-time so the two
+            ;; phases use the same (fast) engine. datahike default is legacy
+            ;; (planner opt-in via DATAHIKE_QUERY_PLANNER), so we set it
+            ;; explicitly per parse.
+            dq/*force-legacy* false
              ;; Per-query memoisation for `schema-hints` /
              ;; `derive-virtual-tables`. Both are called by every
              ;; `catalog-data-for*` invocation against the same db /
@@ -489,6 +611,18 @@
                    :message (.getMessage e)
                    :sqlstate "42601"}))
 
+              :create-type-composite
+              (try
+                (let [parsed (user-types/parse-create-type-composite sql)]
+                  (assoc base :type :ddl-create-composite
+                         :type-name (:type-name parsed)
+                         :fields (:fields parsed)
+                         :original-sql sql))
+                (catch Throwable e
+                  {:type :error
+                   :message (.getMessage e)
+                   :sqlstate "42601"}))
+
               :create-domain
               (try
                 (let [toks (database/tokenize sql)
@@ -545,29 +679,18 @@
             ;; hits, so a 600-table Odoo startup paid for 5k catalog
             ;; rebuilds per probe regardless of memoisation.
                 orig-db db
-                [db schema]
+                ;; catalog-names-used: recorded on the parsed result so the
+                ;; server can RE-RESOLVE the catalog enriched-db at execute
+                ;; (prepared statements would otherwise reuse a stale
+                ;; parse-time snapshot across a DDL).
+                [db schema catalog-names-used]
                 (if db
                   (let [used-catalogs (catalog/catalog-tables-in-stmt stmt)]
                     (if (empty? used-catalogs)
-                      [db schema]
-                      (let [with-fn d/db-with
-                            sorted-names (sort used-catalogs)
-                            cache *catalog-cache*
-                            cache-key [(hash (dbi/-schema db)) sorted-names]
-                            cached (cache-get cache cache-key)
-                            enriched
-                            (or cached
-                                (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
-                                      combined-data (vec (mapcat #(catalog/catalog-data-for
-                                                                   % schema db)
-                                                                 sorted-names))
-                                      spec-db (with-fn db combined-schema)
-                                      built (if (seq combined-data)
-                                              (with-fn spec-db combined-data)
-                                              spec-db)]
-                                  (cache-put! cache cache-key built)))]
-                        [enriched (:schema enriched)])))
-                  [db schema])
+                      [db schema nil]
+                      (let [enriched (enrich-db-with-catalogs db schema used-catalogs)]
+                        [enriched (:schema enriched) (sort used-catalogs)])))
+                  [db schema nil])
             ;; Top-level WITH-fold. Materialise every CTE body into a
             ;; speculative db (virtual `:<cte>/<col>` attrs) so all four
             ;; DML paths plus SELECT see the enriched db/schema before
@@ -577,7 +700,22 @@
             ;; list and then surfaced an opaque "Cannot resolve any
             ;; more clauses" at execute time.
                 pre-cte-db db
-                [db schema] (materialize-withs! stmt db schema)
+                ;; CTE names in scope (lowercased) — even those not
+                ;; materialised (skipped data-modifying CTE bodies) — so the
+                ;; undefined-table 42P01 check in translate-select exempts
+                ;; `FROM <cte>`. See stmt/*cte-relations*.
+                cte-relations (into #{}
+                                    (keep (fn [^net.sf.jsqlparser.statement.select.WithItem wi]
+                                            (some-> (.getAlias wi) str str/trim str/lower-case not-empty)))
+                                    (stmt-with-items stmt))
+                [db schema deferred-rec-ctes] (materialize-withs! stmt db schema)
+                ;; Did the CTE fold materialise anything? If not, the only
+                ;; enrichment is catalog data — which the server can safely
+                ;; re-resolve at execute (stale-prepared-statement fix). With
+                ;; a CTE, the baked enriched-db carries query-scoped
+                ;; `:<cte>/*` attrs we can't rebuild from catalog names alone,
+                ;; so we keep the parse-time snapshot.
+                cte-materialized? (not (identical? pre-cte-db db))
             ;; Count prepared-statement placeholders once at the AST
             ;; level — reused for INSERT/UPDATE/DELETE which don't
             ;; accumulate placeholders in a ctx (unlike translate-select).
@@ -653,141 +791,191 @@
                                                  (for [^Join j (or joins [])]
                                                    (params/where-param-oids (.getOnExpression j)
                                                                             schema tns aliases)))
-                                          (catch Throwable _ nil))]
-                          (merge where-oids join-oids))))
+                                          (catch Throwable _ nil))
+                              ;; SELECT-list expressions can carry params too
+                              ;; (e.g. `SELECT 1 = $1`, `SELECT $1::int`,
+                              ;; `SELECT col = $1`). where-param-oids walks an
+                              ;; arbitrary expression for `… OP $n` / CAST and
+                              ;; borrows the comparand/literal/cast type, so
+                              ;; reuse it per select item. Without this the
+                              ;; param stays undetermined → TEXT, and a client
+                              ;; binding e.g. an int fails to encode.
+                              select-oids (try
+                                            (apply merge
+                                                   (for [^SelectItem si (or (.getSelectItems ^PlainSelect stmt) [])]
+                                                     (params/where-param-oids (.getExpression si)
+                                                                              schema tns aliases)))
+                                            (catch Throwable _ nil))
+                              ;; params nested in WITH-CTE bodies (asyncpg's
+                              ;; `WITH RECURSIVE … oid = ANY($1::oid[])`)
+                              cte-oids (cte-body-param-oids stmt schema)]
+                          (merge cte-oids select-oids where-oids join-oids))))
                 attach-params #(cond-> (assoc % :param-count param-count)
                                  (seq inferred-oids) (assoc :param-oids inferred-oids))
                 result
-                (cond
+                ;; Expose CTE names to translate-select's undefined-table
+                ;; (42P01) check so `FROM <cte>` is never mistaken for a
+                ;; missing relation — including skipped data-modifying CTEs.
+                (binding [stmt/*cte-relations* cte-relations]
+                  (cond
           ;; SELECT (may have CTEs — WITH ... AS)
-                  (instance? PlainSelect stmt)
-                  (let [;; Rewrite RIGHT JOIN → LEFT JOIN by swapping FROM and JOIN items
+                    (instance? PlainSelect stmt)
+                    (let [;; Rewrite RIGHT JOIN → LEFT JOIN by swapping FROM and JOIN items
                 ;; This ensures the proven LEFT JOIN path handles it correctly.
-                        _ (when-let [joins (.getJoins ^PlainSelect stmt)]
-                            (doseq [^Join j joins]
-                              (when (.isRight j)
-                                (let [from-item (.getFromItem ^PlainSelect stmt)
-                                      join-item (.getRightItem j)]
-                                  (.setFromItem ^PlainSelect stmt join-item)
-                                  (.setRightItem j from-item)
-                                  (.setLeft j true)
-                                  (.setRight j false)))))
+                          _ (when-let [joins (.getJoins ^PlainSelect stmt)]
+                              (doseq [^Join j joins]
+                                (when (.isRight j)
+                                  (let [from-item (.getFromItem ^PlainSelect stmt)
+                                        join-item (.getRightItem j)]
+                                    (.setFromItem ^PlainSelect stmt join-item)
+                                    (.setRightItem j from-item)
+                                    (.setLeft j true)
+                                    (.setRight j false)))))
                 ;; Detect FULL JOIN → handled as two LEFT JOIN queries in server
                 ;; Also rewrite FULL→LEFT for the first query
-                        has-full-join? (when-let [joins (.getJoins ^PlainSelect stmt)]
-                                         (let [has-full? (some #(.isFull ^Join %) joins)]
-                                           (when has-full?
-                                             (doseq [^Join j joins]
-                                               (when (.isFull j)
-                                                 (.setLeft j true)
-                                                 (.setFull j false))))
-                                           has-full?))
+                          has-full-join? (when-let [joins (.getJoins ^PlainSelect stmt)]
+                                           (let [has-full? (some #(.isFull ^Join %) joins)]
+                                             (when has-full?
+                                               (doseq [^Join j joins]
+                                                 (when (.isFull j)
+                                                   (.setLeft j true)
+                                                   (.setFull j false))))
+                                             has-full?))
                 ;; CTE materialisation already happened at parse-sql*'s
                 ;; outer scope (see `materialize-withs!` below the
                 ;; catalog enrichment block). `db`/`schema` here are the
                 ;; enriched values; the local `cte-db`/`cte-schema`
                 ;; names are kept for the downstream references that
                 ;; still use them.
-                        cte-db db
-                        cte-schema schema
+                          cte-db db
+                          cte-schema schema
 
 ;; Table-free SELECT (e.g. SELECT 1+2, SELECT CASE WHEN 1>2 THEN 3 END)
                 ;; Evaluate expressions directly without going through the query engine.
                 ;; BUT only if there's no WHERE clause — a WHERE gate (e.g.
                 ;; SELECT 'x' WHERE EXISTS (...)) needs the full translator.
-                        trivial-table-free-item?
-                        (fn [^SelectItem item]
+                          trivial-table-free-item?
+                          (fn [^SelectItem item]
                            ;; Plain literal / NULL / CASE / simple CAST of
                            ;; literal / ParenthesedSelect are handled by
                            ;; the direct-evaluation branch below. Anything
                            ;; more (Function, ArrayExpression, nested
                            ;; ArrayConstructor-in-CAST) must flow through
                            ;; translate-select.
-                          (let [e (.getExpression item)
-                                simple-cast? (fn [^CastExpression c]
-                                               (let [inner (.getLeftExpression c)]
-                                                 (or (instance? LongValue inner)
-                                                     (instance? DoubleValue inner)
-                                                     (instance? StringValue inner)
-                                                     (instance? NullValue inner)
-                                                     (instance? net.sf.jsqlparser.expression.BooleanValue inner))))
-                                _ nil]
-                            (or (instance? LongValue e)
-                                (instance? DoubleValue e)
-                                (instance? StringValue e)
-                                (instance? NullValue e)
-                                (instance? CaseExpression e)
-                                (and (instance? CastExpression e) (simple-cast? e))
-                                (instance? net.sf.jsqlparser.statement.select.ParenthesedSelect e)
-                                (and (instance? net.sf.jsqlparser.schema.Column e)
-                                     (nil? (.getTable ^net.sf.jsqlparser.schema.Column e))
-                                     (contains? #{"true" "false"}
-                                                (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column e)
-                                                        clojure.string/lower-case)))
-                                (instance? net.sf.jsqlparser.expression.BooleanValue e))))
-                        unnest-single-item?
-                        (fn [^SelectItem item]
+                            (let [e (.getExpression item)
+                                  simple-cast? (fn [^CastExpression c]
+                                                 (let [inner (.getLeftExpression c)]
+                                                   (or (instance? LongValue inner)
+                                                       (instance? DoubleValue inner)
+                                                       (instance? StringValue inner)
+                                                       (instance? NullValue inner)
+                                                       (instance? net.sf.jsqlparser.expression.BooleanValue inner))))
+                                  _ nil]
+                              (or (instance? LongValue e)
+                                  (instance? DoubleValue e)
+                                  (instance? StringValue e)
+                                  (instance? NullValue e)
+                                  (instance? CaseExpression e)
+                                  (and (instance? CastExpression e) (simple-cast? e))
+                                  (instance? net.sf.jsqlparser.statement.select.ParenthesedSelect e)
+                                  (and (instance? net.sf.jsqlparser.schema.Column e)
+                                       (nil? (.getTable ^net.sf.jsqlparser.schema.Column e))
+                                       (contains? #{"true" "false"}
+                                                  (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column e)
+                                                          clojure.string/lower-case)))
+                                  (instance? net.sf.jsqlparser.expression.BooleanValue e))))
+                          unnest-single-item?
+                          (fn [^SelectItem item]
                            ;; SELECT unnest(...) is a set-returning function
                            ;; that the narrow table-free pattern below
                            ;; expands into literal-rows — must take the
                            ;; direct-eval branch even though Function isn't
                            ;; in the trivial set.
-                          (let [e (.getExpression item)]
-                            (and (instance? Function e)
-                                 (= "unnest" (str/lower-case (.getName ^Function e))))))
-                        table-free? (and (nil? (.getFromItem ^PlainSelect stmt))
-                                         (nil? (.getWhere ^PlainSelect stmt))
-                                         (let [items (.getSelectItems ^PlainSelect stmt)]
-                                           (or (every? trivial-table-free-item? items)
-                                               (and (= 1 (count items))
-                                                    (unnest-single-item? (first items))))))
+                            (let [e (.getExpression item)]
+                              (and (instance? Function e)
+                                   (= "unnest" (str/lower-case (.getName ^Function e))))))
+                          gs-single-item?
+                          (fn [^SelectItem item]
+                           ;; SELECT generate_series(a,b[,c]) — a set-returning
+                           ;; function in the target list (PG's legacy SRF-in-
+                           ;; projection idiom, e.g. asyncpg's
+                           ;; `SELECT generate_series(0, 20)`). Table-free,
+                           ;; constant-arg forms expand into literal-rows via
+                           ;; the same materialiser the FROM-clause SRF uses.
+                            (let [e (.getExpression item)]
+                              (and (instance? Function e)
+                                   (= "generate_series" (str/lower-case (.getName ^Function e))))))
+                          table-free? (and (nil? (.getFromItem ^PlainSelect stmt))
+                                           (nil? (.getWhere ^PlainSelect stmt))
+                                           (let [items (.getSelectItems ^PlainSelect stmt)]
+                                             (or (every? trivial-table-free-item? items)
+                                                 (and (= 1 (count items))
+                                                      (or (unnest-single-item? (first items))
+                                                          (gs-single-item? (first items)))))))
                 ;; Narrow support for PG's set-returning-function idiom
                 ;;   SELECT unnest(array_fill(expr, ARRAY[count]))  — N rows of expr
                 ;;   SELECT unnest(ARRAY[e1,e2,e3])                 — N distinct rows
                 ;; both produce `count` literal rows. Matches only fully-
                 ;; constant forms (no FROM, no params); the general
                 ;; table-function path is a follow-up.
-                        [unnest-val unnest-count unnest-alias unnest-elts?]
-                        (when (and table-free? (identical? db pre-cte-db))
-                          (let [items (.getSelectItems ^PlainSelect stmt)]
-                            (when (= 1 (count items))
-                              (let [^SelectItem it (first items)
-                                    alias-str (select-item-alias it)
-                                    expr (.getExpression it)]
-                                (when (and (instance? Function expr)
-                                           (= "unnest" (str/lower-case (.getName ^Function expr))))
-                                  (let [params (some-> (.getParameters ^Function expr) .getExpressions)
-                                        arg (when (= 1 (count params)) (first params))]
-                                    (cond
+                          [unnest-val unnest-count unnest-alias unnest-elts?]
+                          (when (and table-free? (identical? db pre-cte-db))
+                            (let [items (.getSelectItems ^PlainSelect stmt)]
+                              (when (= 1 (count items))
+                                (let [^SelectItem it (first items)
+                                      alias-str (select-item-alias it)
+                                      expr (.getExpression it)]
+                                  (when (and (instance? Function expr)
+                                             (= "unnest" (str/lower-case (.getName ^Function expr))))
+                                    (let [params (some-> (.getParameters ^Function expr) .getExpressions)
+                                          arg (when (= 1 (count params)) (first params))]
+                                      (cond
                                        ;; unnest(array_fill(v, ARRAY[n])) — one distinct value repeated N times
-                                      (and (instance? Function arg)
-                                           (= "array_fill" (str/lower-case (.getName ^Function arg))))
-                                      (let [args (some-> (.getParameters ^Function arg) .getExpressions)]
-                                        (when (= 2 (count args))
-                                          (let [val-expr (first args)
-                                                dim-expr (second args)]
-                                            (when (instance? ArrayConstructor dim-expr)
-                                              (let [dims (.getExpressions ^ArrayConstructor dim-expr)]
-                                                (when (and (= 1 (count dims))
-                                                           (instance? LongValue (first dims)))
-                                                  [val-expr
-                                                   (.getValue ^LongValue (first dims))
-                                                   (or alias-str "unnest")
-                                                   false]))))))
+                                        (and (instance? Function arg)
+                                             (= "array_fill" (str/lower-case (.getName ^Function arg))))
+                                        (let [args (some-> (.getParameters ^Function arg) .getExpressions)]
+                                          (when (= 2 (count args))
+                                            (let [val-expr (first args)
+                                                  dim-expr (second args)]
+                                              (when (instance? ArrayConstructor dim-expr)
+                                                (let [dims (.getExpressions ^ArrayConstructor dim-expr)]
+                                                  (when (and (= 1 (count dims))
+                                                             (instance? LongValue (first dims)))
+                                                    [val-expr
+                                                     (.getValue ^LongValue (first dims))
+                                                     (or alias-str "unnest")
+                                                     false]))))))
                                        ;; unnest(ARRAY[e1,e2,...]) — emit each element as its own row
-                                      (instance? ArrayConstructor arg)
-                                      [(vec (.getExpressions ^ArrayConstructor arg))
-                                       nil
-                                       (or alias-str "unnest")
-                                       true])))))))
-                        literal-eval (fn [e]
-                                       (cond
-                                         (instance? LongValue e)    (.getValue ^LongValue e)
-                                         (instance? DoubleValue e)  (.getValue ^DoubleValue e)
-                                         (instance? StringValue e)  (.getNotExcapedValue ^StringValue e)
-                                         (instance? NullValue e)    :__null__
-                                         :else (str e)))
-                        result (cond
+                                        (instance? ArrayConstructor arg)
+                                        [(vec (.getExpressions ^ArrayConstructor arg))
+                                         nil
+                                         (or alias-str "unnest")
+                                         true])))))))
+                        ;; SELECT generate_series(...) in the target list:
+                        ;; materialise the (constant-arg) SRF into literal rows
+                        ;; via the shared FROM-clause table-function expander.
+                        ;; nil when args aren't constant — falls through to the
+                        ;; normal translator (which today errors, as before).
+                          gs-materialized
+                          (when (and table-free? (identical? db pre-cte-db))
+                            (let [items (.getSelectItems ^PlainSelect stmt)]
+                              (when (= 1 (count items))
+                                (let [^SelectItem it (first items)
+                                      e (.getExpression it)]
+                                  (when (and (instance? Function e)
+                                             (= "generate_series" (str/lower-case (.getName ^Function e))))
+                                    (when-let [m (stmt/materialize-table-function
+                                                  (net.sf.jsqlparser.statement.select.TableFunction. ^Function e))]
+                                      (assoc m :alias (or (select-item-alias it)
+                                                          (first (:aliases m))))))))))
+                          literal-eval (fn [e]
+                                         (cond
+                                           (instance? LongValue e)    (.getValue ^LongValue e)
+                                           (instance? DoubleValue e)  (.getValue ^DoubleValue e)
+                                           (instance? StringValue e)  (.getNotExcapedValue ^StringValue e)
+                                           (instance? NullValue e)    :__null__
+                                           :else (str e)))
+                          result (cond
                                   ;; unnest(ARRAY[e1,e2,e3]) — N rows, one per element.
                                   ;; PG flattens ALL dimensions, so for multi-dim
                                   ;; literals we route through stmt/extract-value
@@ -796,183 +984,214 @@
                                   ;; pg-arr/flat-elements. literal-eval still
                                   ;; handles the scalar-only cases for the common
                                   ;; 1-D path.
-                                 (and unnest-val unnest-elts?)
+                                   (and unnest-val unnest-elts?)
                                   ;; Multi-dim flatten: PG `unnest` walks
                                   ;; ALL leaves (`arrayfuncs.c:6255`).
                                   ;; Recurse into nested ArrayConstructor
                                   ;; children before evaluating each leaf
                                   ;; literal.
-                                 (let [extract-leaves
-                                       (fn extract-leaves [exprs]
-                                         (mapcat (fn [e]
-                                                   (if (instance? ArrayConstructor e)
-                                                     (extract-leaves (.getExpressions ^ArrayConstructor e))
-                                                     [(literal-eval e)]))
-                                                 exprs))
-                                       vs (vec (extract-leaves unnest-val))]
-                                   {:type :select
-                                    :query {:find [] :where []}
-                                    :find-aliases [unnest-alias]
-                                    :has-aggregates? false
-                                    :has-distinct? false
-                                    :in-args []
-                                    :hidden-count 0
-                                    :literal-rows (mapv vector vs)})
+                                   (let [extract-leaves
+                                         (fn extract-leaves [exprs]
+                                           (mapcat (fn [e]
+                                                     (if (instance? ArrayConstructor e)
+                                                       (extract-leaves (.getExpressions ^ArrayConstructor e))
+                                                       [(literal-eval e)]))
+                                                   exprs))
+                                         vs (vec (extract-leaves unnest-val))]
+                                     {:type :select
+                                      :query {:find [] :where []}
+                                      :find-aliases [unnest-alias]
+                                      :has-aggregates? false
+                                      :has-distinct? false
+                                      :in-args []
+                                      :hidden-count 0
+                                      :literal-rows (mapv vector vs)})
 
-                                 unnest-val
-                                 (let [fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})
+                                   unnest-val
+                                   (let [fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})
                                ;; Evaluate the fill expression once. CAST
                                ;; is the only complex form we need here;
                                ;; other literals fall back to raw text.
-                                       v (cond
-                                           (instance? CastExpression unnest-val)
-                                           (let [c-expr ^CastExpression unnest-val
-                                                 inner (.getLeftExpression c-expr)
-                                                 type-str (str/lower-case (str (.getDataType (.getColDataType c-expr))))
-                                                 raw (cond
-                                                       (instance? LongValue inner) (.getValue ^LongValue inner)
-                                                       (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
-                                                       (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
-                                                       :else (str inner))]
-                                             (case (types/cast-category type-str)
-                                               :integer (long raw)
-                                               :float (double raw)
-                                               :text (str raw)
-                                               :boolean (Boolean/parseBoolean (str raw))
-                                               :date (expr/parse-timestamp-string (str raw))
-                                               :time (str raw)
-                                               :timestamp (expr/parse-timestamp-string (str raw))
-                                               raw))
-                                           (instance? LongValue unnest-val) (.getValue ^LongValue unnest-val)
-                                           (instance? DoubleValue unnest-val) (.getValue ^DoubleValue unnest-val)
-                                           (instance? StringValue unnest-val) (.getNotExcapedValue ^StringValue unnest-val)
-                                           :else (str unnest-val))
-                                       n (long unnest-count)]
-                                   {:type :select
-                                    :query {:find [] :where []}
-                                    :find-aliases [unnest-alias]
-                                    :has-aggregates? false
-                                    :has-distinct? false
-                                    :in-args []
-                                    :hidden-count 0
-                                    :literal-rows (vec (repeat n [v]))})
+                                         v (cond
+                                             (instance? CastExpression unnest-val)
+                                             (let [c-expr ^CastExpression unnest-val
+                                                   inner (.getLeftExpression c-expr)
+                                                   type-str (str/lower-case (str (.getDataType (.getColDataType c-expr))))
+                                                   raw (cond
+                                                         (instance? LongValue inner) (.getValue ^LongValue inner)
+                                                         (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
+                                                         (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
+                                                         :else (str inner))]
+                                               (case (types/cast-category type-str)
+                                                 :integer (long raw)
+                                                 :float (double raw)
+                                                 :text (str raw)
+                                                 :boolean (Boolean/parseBoolean (str raw))
+                                                 :date (expr/parse-timestamp-string (str raw))
+                                                 :time (str raw)
+                                                 :timestamp (expr/parse-timestamp-string (str raw))
+                                                 raw))
+                                             (instance? LongValue unnest-val) (.getValue ^LongValue unnest-val)
+                                             (instance? DoubleValue unnest-val) (.getValue ^DoubleValue unnest-val)
+                                             (instance? StringValue unnest-val) (.getNotExcapedValue ^StringValue unnest-val)
+                                             :else (str unnest-val))
+                                         n (long unnest-count)]
+                                     {:type :select
+                                      :query {:find [] :where []}
+                                      :find-aliases [unnest-alias]
+                                      :has-aggregates? false
+                                      :has-distinct? false
+                                      :in-args []
+                                      :hidden-count 0
+                                      :literal-rows (vec (repeat n [v]))})
 
-                                 (and table-free? (identical? db pre-cte-db))
+                                   gs-materialized
+                                   (let [{:keys [rows pg-types alias]} gs-materialized]
+                                     {:type :select
+                                      :query {:find [] :where []}
+                                      :find-aliases [alias]
+                                      :has-aggregates? false
+                                      :has-distinct? false
+                                      :in-args []
+                                      :hidden-count 0
+                                      :select-item-oids [(or (some-> ^String (first pg-types)
+                                                                     types/pg-name->oid)
+                                                             -1)]
+                                      :literal-rows (mapv vec rows)})
+
+                                   (and table-free? (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression
-                                 (let [select-items (.getSelectItems ^PlainSelect stmt)
-                                       fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})
-                                       vals-aliases
-                                       (mapv (fn [^SelectItem item]
-                                               (let [expr (.getExpression item)
-                                                     alias-str (select-item-alias item)
-                                                     val (cond
-                                                           (instance? LongValue expr) (.getValue ^LongValue expr)
-                                                           (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
-                                                           (instance? StringValue expr) (.getNotExcapedValue ^StringValue expr)
-                                                           (instance? NullValue expr) :__null__
+                                   (let [select-items (.getSelectItems ^PlainSelect stmt)
+                                         fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})
+                                         vals-aliases
+                                         (mapv (fn [^SelectItem item]
+                                                 (let [expr (.getExpression item)
+                                                       alias-str (select-item-alias item)
+                                                       val (cond
+                                                             (instance? LongValue expr) (.getValue ^LongValue expr)
+                                                             (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+                                                             (instance? StringValue expr) (.getNotExcapedValue ^StringValue expr)
+                                                             (instance? NullValue expr) :__null__
                                                             ;; Bare TRUE/FALSE — JSqlParser 5.x emits a
                                                             ;; BooleanValue. Older versions emitted a
                                                             ;; Column with name "true"/"false". Return an
                                                             ;; actual Boolean so value inference reports
                                                             ;; BOOL (16), not TEXT, and value->string
                                                             ;; renders the PG text form 't'/'f'.
-                                                           (instance? BooleanValue expr)
-                                                           (.getValue ^BooleanValue expr)
-                                                           (and (instance? net.sf.jsqlparser.schema.Column expr)
-                                                                (nil? (.getTable ^net.sf.jsqlparser.schema.Column expr))
-                                                                (#{"true" "false"}
-                                                                 (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column expr)
-                                                                         str/lower-case)))
-                                                           (Boolean/parseBoolean
-                                                            (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column expr)
-                                                                    str/lower-case))
-                                                           (instance? CaseExpression expr)
-                                                           (let [case-fn (expr/translate-case-expr fake-ctx ^CaseExpression expr)
-                                                                 in-args @(:in-args fake-ctx)
-                                                                 fn-val (last in-args)]
-                                                             (if fn-val (fn-val) :__null__))
+                                                             (instance? BooleanValue expr)
+                                                             (.getValue ^BooleanValue expr)
+                                                             (and (instance? net.sf.jsqlparser.schema.Column expr)
+                                                                  (nil? (.getTable ^net.sf.jsqlparser.schema.Column expr))
+                                                                  (#{"true" "false"}
+                                                                   (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column expr)
+                                                                           str/lower-case)))
+                                                             (Boolean/parseBoolean
+                                                              (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column expr)
+                                                                      str/lower-case))
+                                                             (instance? CaseExpression expr)
+                                                             (let [case-fn (expr/translate-case-expr fake-ctx ^CaseExpression expr)
+                                                                   in-args @(:in-args fake-ctx)
+                                                                   fn-val (last in-args)]
+                                                               (if fn-val (fn-val) :__null__))
                                                    ;; CAST / :: syntax
-                                                           (instance? CastExpression expr)
-                                                           (let [inner (.getLeftExpression ^CastExpression expr)
-                                                                 type-str (str/lower-case (str (.getDataType (.getColDataType ^CastExpression expr))))
-                                                                 raw (cond
-                                                                       (instance? LongValue inner) (.getValue ^LongValue inner)
-                                                                       (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
-                                                                       (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
-                                                                       :else (str inner))]
-                                                             (case (types/cast-category type-str)
+                                                             (instance? CastExpression expr)
+                                                             (let [cdt (.getColDataType ^CastExpression expr)
+                                                                   inner (.getLeftExpression ^CastExpression expr)
+                                                                 ;; .getDataType is the BASE name ("int"); the `[]` is in
+                                                                 ;; .getArrayData. (str cdt) carries the full "int[]".
+                                                                   type-str (str/lower-case (str (.getDataType cdt)))
+                                                                   full-str (str/lower-case (str cdt))
+                                                                   ad (.getArrayData cdt)
+                                                                   array? (and ad (pos? (.size ^java.util.List ad)))
+                                                                   raw (cond
+                                                                         (instance? LongValue inner) (.getValue ^LongValue inner)
+                                                                         (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
+                                                                         (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
+                                                                         :else (str inner))]
+                                                               (cond
+                                                              ;; Array-target cast: parse the canonical array text
+                                                              ;; (incl. `[lo:hi]=` bounds + multi-dim) into a PgArray
+                                                              ;; instead of numeric-coercing the whole string. Without
+                                                              ;; this `'{1,2}'::int[]` / `'[1:3][-1:0]={{..}}'::int[]`
+                                                              ;; threw "For input string".
+                                                                 array?
+                                                                 (if (or (nil? raw) (= :__null__ raw))
+                                                                   :__null__
+                                                                   (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
+                                                                 :else
+                                                                 (case (types/cast-category type-str)
                                                                 ;; CAST('1' AS BIGINT): inner was a
                                                                 ;; StringValue, so raw is a String —
                                                                 ;; (long "1") throws. Parse numerically.
-                                                               :integer (if (number? raw)
-                                                                          (long raw)
-                                                                          (Long/parseLong (str/trim (str raw))))
-                                                               :float   (if (number? raw)
-                                                                          (double raw)
-                                                                          (Double/parseDouble (str/trim (str raw))))
-                                                               :text (str raw)
-                                                               :boolean (Boolean/parseBoolean (str raw))
-                                                               :date (let [s (str/trim (str raw))]
-                                                                       (or (try (java.time.LocalDate/parse
-                                                                                 s (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                                                                                (catch Exception _ nil))
-                                                                           (let [d (expr/parse-timestamp-string s)]
-                                                                             (when (instance? java.util.Date d)
-                                                                               (-> ^java.util.Date d .toInstant
-                                                                                   (.atZone java.time.ZoneOffset/UTC)
-                                                                                   .toLocalDate)))))
-                                                               :time (let [s (str/trim (str raw))
-                                                                           time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                                                                       (try (java.time.LocalTime/parse time-only)
-                                                                            (catch Exception _ s)))
-                                                               :timestamp
+                                                                   :integer (if (number? raw)
+                                                                              (long raw)
+                                                                              (Long/parseLong (str/trim (str raw))))
+                                                                   :float   (if (number? raw)
+                                                                              (double raw)
+                                                                              (Double/parseDouble (str/trim (str raw))))
+                                                                   :text (str raw)
+                                                                   :boolean (Boolean/parseBoolean (str raw))
+                                                                   :date (let [s (str/trim (str raw))]
+                                                                           (or (try (java.time.LocalDate/parse
+                                                                                     s (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                                                                                    (catch Exception _ nil))
+                                                                               (let [d (expr/parse-timestamp-string s)]
+                                                                                 (when (instance? java.util.Date d)
+                                                                                   (-> ^java.util.Date d .toInstant
+                                                                                       (.atZone java.time.ZoneOffset/UTC)
+                                                                                       .toLocalDate)))))
+                                                                   :time (let [s (str/trim (str raw))
+                                                                               time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
+                                                                           (try (java.time.LocalTime/parse time-only)
+                                                                                (catch Exception _ s)))
+                                                                   :timestamp
                                                        ;; Preserve sub-millisecond precision for CAST
                                                        ;; results (pgjdbc tests assert full '…130861'
                                                        ;; microseconds in their error strings).
                                                        ;; expr/parse-timestamp-string routes through
                                                        ;; java.util.Date which is millisecond-only.
-                                                               (let [s (-> (str raw) str/trim
-                                                                           (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2"))]
-                                                                 (or (try (java.time.LocalDateTime/parse s)
-                                                                          (catch Exception _ nil))
-                                                                     (expr/parse-timestamp-string (str raw))))
-                                                               :uuid (java.util.UUID/fromString (str raw))
+                                                                   (let [s (-> (str raw) str/trim
+                                                                               (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2"))]
+                                                                     (or (try (java.time.LocalDateTime/parse s)
+                                                                              (catch Exception _ nil))
+                                                                         (expr/parse-timestamp-string (str raw))))
+                                                                   :uuid (java.util.UUID/fromString (str raw))
                                                        ;; `N::bit(W)` — PG's bit-string type,
                                                        ;; emitted as a W-char '0'/'1' string
                                                        ;; of the low-W bits. We extract W from
                                                        ;; the type-str pattern (cast-category
                                                        ;; strips the `(…)` so re-parse here).
-                                                               :bit
-                                                               (let [w (or (some-> (re-find #"\((\d+)\)" type-str)
-                                                                                   second
-                                                                                   Integer/parseInt)
-                                                                           1)
-                                                                     n (long (if (number? raw)
-                                                                               raw
-                                                                               (Long/parseLong (str raw))))
-                                                                     mask (if (< w 64) (dec (bit-shift-left 1 w)) -1)
-                                                                     low  (bit-and n mask)
-                                                                     s (Long/toBinaryString low)
-                                                                     pad (- w (.length ^String s))]
-                                                                 (if (pos? pad)
-                                                                   (str (apply str (repeat pad \0)) s)
-                                                                   s))
-                                                               raw))
+                                                                   :bit
+                                                                   (let [w (or (some-> (re-find #"\((\d+)\)" type-str)
+                                                                                       second
+                                                                                       Integer/parseInt)
+                                                                               1)
+                                                                         n (long (if (number? raw)
+                                                                                   raw
+                                                                                   (Long/parseLong (str raw))))
+                                                                         mask (if (< w 64) (dec (bit-shift-left 1 w)) -1)
+                                                                         low  (bit-and n mask)
+                                                                         s (Long/toBinaryString low)
+                                                                         pad (- w (.length ^String s))]
+                                                                     (if (pos? pad)
+                                                                       (str (apply str (repeat pad \0)) s)
+                                                                       s))
+                                                                   raw)))
                                                    ;; Scalar subquery in projection —
                                                    ;; execute and take first value
-                                                           (instance? ParenthesedSelect expr)
-                                                           (if cte-db
-                                                             (let [inner-parsed (parse-sql (str expr) cte-schema cte-db)
-                                                                   inner-query (:query inner-parsed)
-                                                                   inner-in-args (:in-args inner-parsed)
-                                                                   q-fn d/q
-                                                                   rows (if (seq inner-in-args)
-                                                                          (apply q-fn inner-query cte-db inner-in-args)
-                                                                          (q-fn inner-query cte-db))
-                                                                   first-row (first rows)
-                                                                   v (if (sequential? first-row) (first first-row) first-row)]
-                                                               (if (or (nil? v) (= :__null__ v)) :__null__ v))
-                                                             :__null__)
+                                                             (instance? ParenthesedSelect expr)
+                                                             (if cte-db
+                                                               (let [inner-parsed (parse-sql (str expr) cte-schema cte-db)
+                                                                     inner-query (:query inner-parsed)
+                                                                     inner-in-args (:in-args inner-parsed)
+                                                                     q-fn d/q
+                                                                     rows (if (seq inner-in-args)
+                                                                            (apply q-fn inner-query cte-db inner-in-args)
+                                                                            (q-fn inner-query cte-db))
+                                                                     first-row (first rows)
+                                                                     v (if (sequential? first-row) (first first-row) first-row)]
+                                                                 (if (or (nil? v) (= :__null__ v)) :__null__ v))
+                                                               :__null__)
                                                    ;; ARRAY[…] / ARRAY[[…],[…]] — format
                                                    ;; to PG's canonical text form {…}/{{…}}.
                                                    ;; We don't implement full array types yet,
@@ -980,45 +1199,45 @@
                                                    ;; literal assert on the text form (e.g.
                                                    ;; testgetBadBoolean expects the error to
                                                    ;; contain "{{1,0},{0,1}}").
-                                                           (instance? ArrayConstructor expr)
-                                                           (let [fmt (fn fmt [e]
-                                                                       (cond
-                                                                         (instance? ArrayConstructor e)
-                                                                         (str "{"
-                                                                              (str/join ","
-                                                                                        (map fmt (.getExpressions ^ArrayConstructor e)))
-                                                                              "}")
-                                                                         (instance? LongValue e) (str (.getValue ^LongValue e))
-                                                                         (instance? DoubleValue e) (str (.getValue ^DoubleValue e))
-                                                                         (instance? StringValue e)
-                                                                         (str "\"" (.getNotExcapedValue ^StringValue e) "\"")
-                                                                         (instance? NullValue e) "NULL"
-                                                                         :else (str e)))]
-                                                             (fmt expr))
-                                                           :else (str expr))
-                                                     alias (or alias-str (str expr))]
-                                                 [val alias]))
-                                             select-items)]
-                                   {:type :select
-                                    :query {:find [] :where []}
-                                    :find-aliases (mapv second vals-aliases)
+                                                             (instance? ArrayConstructor expr)
+                                                             (let [fmt (fn fmt [e]
+                                                                         (cond
+                                                                           (instance? ArrayConstructor e)
+                                                                           (str "{"
+                                                                                (str/join ","
+                                                                                          (map fmt (.getExpressions ^ArrayConstructor e)))
+                                                                                "}")
+                                                                           (instance? LongValue e) (str (.getValue ^LongValue e))
+                                                                           (instance? DoubleValue e) (str (.getValue ^DoubleValue e))
+                                                                           (instance? StringValue e)
+                                                                           (str "\"" (.getNotExcapedValue ^StringValue e) "\"")
+                                                                           (instance? NullValue e) "NULL"
+                                                                           :else (str e)))]
+                                                               (fmt expr))
+                                                             :else (str expr))
+                                                       alias (or alias-str (str expr))]
+                                                   [val alias]))
+                                               select-items)]
+                                     {:type :select
+                                      :query {:find [] :where []}
+                                      :find-aliases (mapv second vals-aliases)
                                      ;; Parse-time OID inference for the
                                      ;; Extended Query Describe path — see
                                      ;; datahike.pg.sql.oid-infer.
-                                    :select-item-oids
-                                    (mapv (fn [^SelectItem item]
-                                            (oid/expr-oid (.getExpression item)
-                                                          {:db cte-db
-                                                           :schema cte-schema}))
-                                          select-items)
-                                    :has-aggregates? false
-                                    :has-distinct? false
-                                    :in-args []
-                                    :hidden-count 0
-                                    :literal-row (mapv first vals-aliases)})
+                                      :select-item-oids
+                                      (mapv (fn [^SelectItem item]
+                                              (oid/expr-oid (.getExpression item)
+                                                            {:db cte-db
+                                                             :schema cte-schema}))
+                                            select-items)
+                                      :has-aggregates? false
+                                      :has-distinct? false
+                                      :in-args []
+                                      :hidden-count 0
+                                      :literal-row (mapv first vals-aliases)})
 
-                                 :else
-                                 (translate-select ^PlainSelect stmt cte-schema cte-db))
+                                   :else
+                                   (translate-select ^PlainSelect stmt cte-schema cte-db))
                 ;; Pass enriched db to server when the top-level catalog
                 ;; materialisation or CTE processing produced a different
                 ;; db from the user's original — but only if
@@ -1028,149 +1247,174 @@
                 ;; is the right check against `orig-db` — Datahike's
                 ;; `=` returns true on structurally equal DB snapshots
                 ;; and would mask the distinction.
-                        result (if (and (nil? (:enriched-db result))
-                                        (not (identical? cte-db orig-db)))
-                                 (assoc result :enriched-db cte-db)
-                                 result)]
-                    (if has-full-join?
+                        ;; Did translate-select tag a derived-table enriched-db
+                        ;; (FROM (…) AS sub / table-fn / derived JOIN)? Captured
+                        ;; BEFORE the catalog-only fallback below sets one, so we
+                        ;; can tell "derived-table materialised" from "catalog
+                        ;; enrichment only".
+                          derived-table-edb? (some? (:enriched-db result))
+                          result (if (and (nil? (:enriched-db result))
+                                          (not (identical? cte-db orig-db)))
+                                   (assoc result :enriched-db cte-db)
+                                   result)
+                        ;; Record the catalog tables so the server can
+                        ;; re-resolve the enriched-db at execute (stale-
+                        ;; prepared-statement fix) — but only when the
+                        ;; enrichment is catalog-only. A CTE (cte-materialized?)
+                        ;; or derived table (derived-table-edb?) carries
+                        ;; query-scoped `:<alias>/*` attrs in :enriched-db that
+                        ;; catalog re-resolution would discard, so skip those.
+                          result (if (and (seq catalog-names-used)
+                                          (not cte-materialized?)
+                                          (not derived-table-edb?))
+                                   (assoc result :catalog-tables (vec catalog-names-used))
+                                   result)
+                        ;; Parameterised recursive CTEs: schema enriched at
+                        ;; parse (above), but DATA must be materialised at
+                        ;; Execute once `$n` is bound. Carry the specs so the
+                        ;; server re-runs the rule with real params.
+                          result (if (seq deferred-rec-ctes)
+                                   (assoc result :deferred-recursive-ctes deferred-rec-ctes)
+                                   result)]
+                      (if has-full-join?
               ;; FULL JOIN: return two LEFT JOIN queries for server to combine
               ;; Query 1: already rewritten as LEFT JOIN above (all left + matched right)
               ;; Query 2: swap tables and do LEFT JOIN (all right + matched left)
-                      (let [left-result (assoc result :type :select)
+                        (let [left-result (assoc result :type :select)
                     ;; Clone from original SQL and swap tables for RIGHT-side query
-                            stmt2 (CCJSqlParserUtil/parse sql)
-                            _ (doseq [^Join j (.getJoins ^PlainSelect stmt2)]
-                                (when (.isFull j)
-                                  (let [from2 (.getFromItem ^PlainSelect stmt2)
-                                        join2 (.getRightItem j)]
-                                    (.setFromItem ^PlainSelect stmt2 join2)
-                                    (.setRightItem j from2)
-                                    (.setLeft j true)
-                                    (.setFull j false))))
-                            right-result (assoc (translate-select ^PlainSelect stmt2 cte-schema cte-db)
-                                                :type :select)]
-                        {:type :full-join
-                         :left-query left-result
-                         :right-query right-result
-                         :find-aliases (:find-aliases result)})
+                              stmt2 (CCJSqlParserUtil/parse sql)
+                              _ (doseq [^Join j (.getJoins ^PlainSelect stmt2)]
+                                  (when (.isFull j)
+                                    (let [from2 (.getFromItem ^PlainSelect stmt2)
+                                          join2 (.getRightItem j)]
+                                      (.setFromItem ^PlainSelect stmt2 join2)
+                                      (.setRightItem j from2)
+                                      (.setLeft j true)
+                                      (.setFull j false))))
+                              right-result (assoc (translate-select ^PlainSelect stmt2 cte-schema cte-db)
+                                                  :type :select)]
+                          {:type :full-join
+                           :left-query left-result
+                           :right-query right-result
+                           :find-aliases (:find-aliases result)})
               ;; Regular SELECT (possibly with LEFT JOIN from RIGHT rewrite)
-                      (assoc result :type :select)))
+                        (assoc result :type :select)))
 
-                  (instance? ParenthesedSelect stmt)
-                  (let [inner (.getSelect ^ParenthesedSelect stmt)]
-                    (if (instance? PlainSelect inner)
-                      (let [result (translate-select ^PlainSelect inner schema db)]
-                        (cond-> (assoc result :type :select)
-                          (not (identical? db orig-db)) (assoc :enriched-db db)))
-                      {:type :error :message (str "Unsupported nested select: " (type inner))}))
+                    (instance? ParenthesedSelect stmt)
+                    (let [inner (.getSelect ^ParenthesedSelect stmt)]
+                      (if (instance? PlainSelect inner)
+                        (let [result (translate-select ^PlainSelect inner schema db)]
+                          (cond-> (assoc result :type :select)
+                            (not (identical? db orig-db)) (assoc :enriched-db db)))
+                        {:type :error :message (str "Unsupported nested select: " (type inner))}))
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT
-                  (instance? SetOperationList stmt)
-                  (let [^SetOperationList sol stmt
-                        selects (.getSelects sol)
-                        operations (.getOperations sol)
+                    (instance? SetOperationList stmt)
+                    (let [^SetOperationList sol stmt
+                          selects (.getSelects sol)
+                          operations (.getOperations sol)
                 ;; Parse each sub-select
-                        sub-results (mapv (fn [s]
-                                            (if (instance? PlainSelect s)
-                                              (translate-select ^PlainSelect s schema db)
-                                              {:error (str "Unsupported set operation member: " (type s))}))
-                                          selects)
+                          sub-results (mapv (fn [s]
+                                              (if (instance? PlainSelect s)
+                                                (translate-select ^PlainSelect s schema db)
+                                                {:error (str "Unsupported set operation member: " (type s))}))
+                                            selects)
                 ;; Determine operation type from first operation
-                        op-type (when (seq operations)
-                                  (let [op (first operations)]
-                                    (cond
-                                      (instance? UnionOp op)
-                                      (if (.isAll ^UnionOp op) :union-all :union)
-                                      (instance? IntersectOp op) :intersect
-                                      (instance? ExceptOp op) :except
-                                      :else :union-all)))]
-                    (cond-> {:type :set-operation
-                             :op op-type
-                             :sub-results sub-results}
+                          op-type (when (seq operations)
+                                    (let [op (first operations)]
+                                      (cond
+                                        (instance? UnionOp op)
+                                        (if (.isAll ^UnionOp op) :union-all :union)
+                                        (instance? IntersectOp op) :intersect
+                                        (instance? ExceptOp op) :except
+                                        :else :union-all)))]
+                      (cond-> {:type :set-operation
+                               :op op-type
+                               :sub-results sub-results}
                        ;; Top-level catalog materialisation propagates
                        ;; to the server's set-operation executor via
                        ;; :enriched-db — each sub-query runs against it.
-                      (not (identical? db orig-db))
-                      (assoc :enriched-db db)))
+                        (not (identical? db orig-db))
+                        (assoc :enriched-db db)))
 
           ;; INSERT
-                  (instance? Insert stmt)
-                  (cond-> (translate-insert ^Insert stmt schema db)
-                    (not (identical? db orig-db)) (assoc :enriched-db db))
+                    (instance? Insert stmt)
+                    (cond-> (translate-insert ^Insert stmt schema db)
+                      (not (identical? db orig-db)) (assoc :enriched-db db))
 
           ;; UPDATE
-                  (instance? Update stmt)
-                  (cond-> (translate-update ^Update stmt schema db)
-                    (not (identical? db orig-db)) (assoc :enriched-db db))
+                    (instance? Update stmt)
+                    (cond-> (translate-update ^Update stmt schema db)
+                      (not (identical? db orig-db)) (assoc :enriched-db db))
 
           ;; DELETE
-                  (instance? Delete stmt)
-                  (cond-> (translate-delete ^Delete stmt schema)
-                    (not (identical? db orig-db)) (assoc :enriched-db db))
+                    (instance? Delete stmt)
+                    (cond-> (translate-delete ^Delete stmt schema)
+                      (not (identical? db orig-db)) (assoc :enriched-db db))
 
           ;; CREATE TABLE
-                  (instance? CreateTable stmt)
-                  (ddl/translate-create-table ^CreateTable stmt db)
+                    (instance? CreateTable stmt)
+                    (ddl/translate-create-table ^CreateTable stmt db)
 
           ;; CREATE SEQUENCE
-                  (instance? CreateSequence stmt)
-                  (ddl/translate-create-sequence ^CreateSequence stmt)
+                    (instance? CreateSequence stmt)
+                    (ddl/translate-create-sequence ^CreateSequence stmt)
 
           ;; DROP TABLE / DROP SEQUENCE
-                  (instance? Drop stmt)
-                  (let [^Drop d stmt
-                        drop-type (when-let [t (.getType d)] (str/lower-case t))
-                        obj-name (-> d .getName .getName)]
-                    (if (= drop-type "sequence")
-                      {:type :ddl-drop-sequence :seq-name obj-name}
-                      {:type :ddl-drop :table obj-name}))
+                    (instance? Drop stmt)
+                    (let [^Drop d stmt
+                          drop-type (when-let [t (.getType d)] (str/lower-case t))
+                          obj-name (-> d .getName .getName)]
+                      (if (= drop-type "sequence")
+                        {:type :ddl-drop-sequence :seq-name obj-name}
+                        {:type :ddl-drop :table obj-name}))
 
           ;; COMMIT (JSqlParser AST)
-                  (instance? Commit stmt)
-                  {:type :system :system-type :commit}
+                    (instance? Commit stmt)
+                    {:type :system :system-type :commit}
 
           ;; SAVEPOINT name
-                  (instance? SavepointStatement stmt)
-                  {:type :savepoint :name (.getSavepointName ^SavepointStatement stmt)}
+                    (instance? SavepointStatement stmt)
+                    {:type :savepoint :name (.getSavepointName ^SavepointStatement stmt)}
 
           ;; ROLLBACK [TO SAVEPOINT name] / ROLLBACK WORK
-                  (instance? RollbackStatement stmt)
-                  (if (.isUsingSavepointKeyword ^RollbackStatement stmt)
-                    {:type :rollback-to-savepoint :name (.getSavepointName ^RollbackStatement stmt)}
-                    {:type :system :system-type :rollback})
+                    (instance? RollbackStatement stmt)
+                    (if (.isUsingSavepointKeyword ^RollbackStatement stmt)
+                      {:type :rollback-to-savepoint :name (.getSavepointName ^RollbackStatement stmt)}
+                      {:type :system :system-type :rollback})
 
           ;; CREATE INDEX — accepted as no-op
-                  (instance? CreateIndex stmt)
-                  {:type :ddl-create-index}
+                    (instance? CreateIndex stmt)
+                    {:type :ddl-create-index}
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
-                  (instance? Alter stmt)
-                  (let [^Alter alter-stmt stmt
-                        table-name (unquote-ident (.getName (.getTable alter-stmt)))
-                        expressions (.getAlterExpressions alter-stmt)
-                        ops (mapv (fn [^AlterExpression exp]
-                                    (let [op (str (.getOperation exp))]
-                                      (cond
+                    (instance? Alter stmt)
+                    (let [^Alter alter-stmt stmt
+                          table-name (unquote-ident (.getName (.getTable alter-stmt)))
+                          expressions (.getAlterExpressions alter-stmt)
+                          ops (mapv (fn [^AlterExpression exp]
+                                      (let [op (str (.getOperation exp))]
+                                        (cond
                                 ;; ADD COLUMN
-                                        (and (= op "ADD") (.hasColumn exp))
-                                        (let [cdts (.getColDataTypeList exp)]
-                                          {:op :add-column
-                                           :columns (mapv (fn [^ColumnDefinition cdt]
-                                                            {:name (unquote-ident (.getColumnName cdt))
-                                                             :type (str/lower-case (str (.getDataType (.getColDataType cdt))))})
-                                                          cdts)})
+                                          (and (= op "ADD") (.hasColumn exp))
+                                          (let [cdts (.getColDataTypeList exp)]
+                                            {:op :add-column
+                                             :columns (mapv (fn [^ColumnDefinition cdt]
+                                                              {:name (unquote-ident (.getColumnName cdt))
+                                                               :type (str/lower-case (str (.getDataType (.getColDataType cdt))))})
+                                                            cdts)})
                                 ;; ADD CONSTRAINT (FK, UNIQUE, CHECK, etc.) — no-op
-                                        (= op "ADD") {:op :add-constraint}
+                                          (= op "ADD") {:op :add-constraint}
                                 ;; DROP — no-op
-                                        (= op "DROP") {:op :drop}
+                                          (= op "DROP") {:op :drop}
                                 ;; ALTER (SET NOT NULL, TYPE change, etc.) — no-op
-                                        :else {:op :other :raw (str exp)})))
-                                  expressions)]
-                    {:type :ddl-alter :table table-name :operations ops})
+                                          :else {:op :other :raw (str exp)})))
+                                    expressions)]
+                      {:type :ddl-alter :table table-name :operations ops})
 
-                  :else
-                  {:type :error :message (str "Unsupported SQL statement: " (type stmt))})]
-            (if (map? result) (attach-params result) result)))) ; close :else let, cond, outer let
+                    :else
+                    {:type :error :message (str "Unsupported SQL statement: " (type stmt))}))]
+            (if (map? result) (attach-params result) result)))) ; close :else let, binding, cond, outer let
       (catch Exception e
          ;; Resolve the exception structurally: throw sites may carry
          ;; either :sqlstate (legacy / explicit override) or :error
@@ -1241,10 +1485,14 @@
                   (when (and placeholder-parsed
                              (= :insert (:type placeholder-parsed))
                              (vector? (:tx-data placeholder-parsed)))
+                    ;; Enrich the schema with pg metadata (NUMERIC(p,s)
+                    ;; scale, array-elem) so the fast-path literal coercion
+                    ;; rounds/pads numerics to their declared scale — same as
+                    ;; translate-insert's slow path. Memoised per schema.
                     (when-let [substituted (template/typed-substitute
                                             placeholder-parsed
                                             (:literals tem)
-                                            schema)]
+                                            (stmt/enrich-schema-with-pg-array-meta schema db))]
                       ;; Reset placeholder counts on the substituted result
                       ;; — pgjdbc parsed the ORIGINAL SQL (no `?`) and pre-
                       ;; sized its SimpleParameterList for that. If we
@@ -1288,7 +1536,14 @@
        hits JSqlParser, repeated or not."
   ([^String sql schema] (parse-sql sql schema nil))
   ([^String sql schema db]
-   (let [cache *parse-cache*
+   (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
+         ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
+         ;; so it must neither be served from nor written to the shared result
+         ;; cache (whose key is only [sql schema]). Bypass caching entirely in
+         ;; that case — otherwise the binding-free version (e.g. the parse done
+         ;; for result-OID inference) poisons the entry and the correlated ref
+         ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
+         cache (when (empty? params/*from-bindings*) *parse-cache*)
          schema-key (when cache (hash schema))
          cache-key (when cache [sql schema-key])
          cached (when cache (cache-get cache cache-key))]

@@ -625,52 +625,144 @@
 
 (declare translate-select)
 (declare extract-value)
+(declare ^:dynamic *eval-update-db*)
+
+(defn- srf-const-eval
+  "Evaluate a table-function argument expression to a constant value at
+   translate time. Handles the literal forms a constant-arg SRF uses
+   (`generate_series(2,4)`, `unnest(ARRAY[…])`). Returns `::corr` for a
+   non-constant (correlated) argument — e.g. a Column reference in
+   `LATERAL generate_series(1, t.n)`. The LATERAL path (future) will pass
+   `materialize-table-function` a different eval-fn that resolves such
+   references per outer row from `*from-bindings*`; this is the seam that
+   lets the same materialiser serve both callers without a rewrite."
+  [expr]
+  (cond
+    (instance? LongValue expr)   (.getValue ^LongValue expr)
+    (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+    (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
+    (instance? SignedExpression expr)
+    (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
+      (if (number? v) (- v) ::corr))
+    (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
+    :else ::corr))
 
 (defn materialize-table-function
-  "Produce rows for a `TableFunction` FROM item. Currently supports
-   `unnest(ARRAY[…])` with optional `WITH ORDINALITY`.
+  "Produce rows for a `TableFunction` FROM item. Supports the common
+   constant-arg set-returning functions:
+     - `unnest(ARRAY[…])`            (+ WITH ORDINALITY)
+     - `generate_series(start,stop[,step])` over integers (+ WITH ORDINALITY)
+     - `now()` / `current_timestamp` / `{statement,transaction,clock}_timestamp`
+       (one row, current time)
 
    Returns {:aliases [col-names] :rows [[v1 v2 …] …] :vtypes [kw kw …]}
-   or nil if the function isn't one we know how to expand.
+   or nil if the function isn't one we expand.
 
-   For `unnest(ARRAY[v1, v2, v3]) WITH ORDINALITY`:
-     :aliases = [\"unnest\" \"ordinality\"]
-     :rows    = [[v1 1] [v2 2] [v3 3]]
-     :vtypes  = inferred per value"
-  [^net.sf.jsqlparser.statement.select.TableFunction tf]
-  (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
-        fname (str/lower-case (or (.getName f) ""))
-        with-ord? (some-> (.getWithClause tf) str
-                          (->> (= "ORDINALITY")))
-        vtype-of (fn [v]
-                   (cond
-                     (instance? Long v)    :db.type/long
-                     (instance? Double v)  :db.type/double
-                     (instance? Boolean v) :db.type/boolean
-                     :else                 :db.type/string))]
-    (when (= fname "unnest")
-      (let [params (.getParameters f)
-            first-p (when (and params (pos? (count params)))
-                      (.get params 0))]
-        (when (instance? ArrayConstructor first-p)
-          ;; PG `unnest` flattens ALL dimensions into one row per leaf
-          ;; (`arrayfuncs.c:6255`, uses ArrayGetNItems(ndim, dims) to
-          ;; iterate every leaf). For multi-dim literals like
-          ;; `ARRAY[[1,2],[3,4]]` we must produce 4 rows (1, 2, 3, 4),
-          ;; not 2 rows of sub-arrays. Build the typed PgArray via
-          ;; extract-value (which recurses through nested
-          ;; ArrayConstructors), then flatten to leaves.
-          (let [pa (extract-value ^ArrayConstructor first-p)
-                vals (if (pg-arr/array? pa)
-                       (vec (pg-arr/flat-elements pa))
-                       (vec pa))]
-            (if with-ord?
-              {:aliases ["unnest" "ordinality"]
-               :rows    (vec (map-indexed (fn [i v] [v (long (inc i))]) vals))
-               :vtypes  [(vtype-of (first vals)) :db.type/long]}
-              {:aliases ["unnest"]
-               :rows    (mapv vector vals)
-               :vtypes  [(vtype-of (first vals))]})))))))
+   `eval-fn` resolves an argument expression to a value; it defaults to
+   `srf-const-eval` (literals only). The LATERAL nested-loop will pass an
+   eval-fn that resolves correlated arguments per outer row — see
+   srf-const-eval's note. That is why arguments flow through eval-fn here
+   rather than being pattern-matched as literals inline."
+  ([tf] (materialize-table-function tf srf-const-eval))
+  ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn]
+   (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
+         fname (str/lower-case (or (.getName f) ""))
+         params (vec (or (.getParameters f) []))
+         with-ord? (some-> (.getWithClause tf) str
+                           (->> (= "ORDINALITY")))
+         vtype-of (fn [v]
+                    (cond
+                      (instance? Long v)    :db.type/long
+                      (instance? Double v)  :db.type/double
+                      (instance? Boolean v) :db.type/boolean
+                      (inst? v)             :db.type/instant
+                      :else                 :db.type/string))
+         ;; pg-types: optional per-column :pg/type override (e.g. "int4")
+         ;; so the virtual-table column advertises the PG width even though
+         ;; Datahike stores a long. nil entry = use the :db/valueType OID.
+         with-ordinality (fn [aliases rows vtypes pg-types]
+                           (if with-ord?
+                             {:aliases (conj aliases "ordinality")
+                              :rows    (vec (map-indexed (fn [i r] (conj (vec r) (long (inc i)))) rows))
+                              :vtypes  (conj vtypes :db.type/long)
+                              ;; PG numbers ordinality as bigint (int8) — no override
+                              :pg-types (conj (vec pg-types) nil)}
+                             {:aliases aliases :rows rows :vtypes vtypes
+                              :pg-types (vec pg-types)}))]
+     (cond
+       (= fname "unnest")
+       ;; PG `unnest` flattens ALL dimensions into one row per leaf
+       ;; (`arrayfuncs.c`, ArrayGetNItems over ndim) — `ARRAY[[1,2],[3,4]]`
+       ;; yields 4 rows, not 2 sub-arrays.
+       (let [pa (when (seq params) (eval-fn (first params)))
+             vals (cond
+                    (pg-arr/array? pa) (vec (pg-arr/flat-elements pa))
+                    (sequential? pa)   (vec pa)
+                    :else              nil)]
+         (when vals
+           (with-ordinality ["unnest"] (mapv vector vals) [(vtype-of (first vals))] [nil])))
+
+       (= fname "generate_series")
+       ;; Integer series (inclusive of stop, like PG). Numeric/timestamp
+       ;; variants are future work; non-integer args fall through to nil.
+       (let [args (mapv eval-fn params)]
+         (when (and (>= (count args) 2)
+                    (every? integer? (take 3 args)))
+           (let [[start stop step] args
+                 step (long (or step 1))]
+             (when-not (zero? step)
+               (let [vals (vec (range start
+                                      (if (pos? step) (inc stop) (dec stop))
+                                      step))]
+                 ;; PG types integer generate_series as int4 — advertise
+                 ;; that so clients parse the values as numbers, not int8
+                 ;; strings.
+                 (with-ordinality ["generate_series"]
+                   (mapv (fn [v] [(long v)]) vals)
+                   [:db.type/long] ["int4"]))))))
+
+       (contains? #{"now" "current_timestamp" "transaction_timestamp"
+                    "statement_timestamp" "clock_timestamp"} fname)
+       ;; Scalar function used as a one-row table. The timestamp is
+       ;; captured at translate time (good enough — the value is "recent";
+       ;; sub-statement clock precision isn't meaningful here).
+       (with-ordinality [fname] [[(java.util.Date.)]] [:db.type/instant] [nil])
+
+       :else nil))))
+
+(defn- table-fn->virtual-table
+  "Materialise a constant-arg `TableFunction` FROM item into a virtual
+   table in a speculative db, so the outer query can scan/join it like a
+   real relation. Returns {:db :schema :name :alias :aliases} or nil.
+
+   The FROM alias becomes the table name; for a single-column SRF the
+   alias also names the column, matching PG (`generate_series(2,4) AS foo`
+   projects a column named `foo`)."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf db]
+  (let [talias (when-let [a (.getAlias tf)]
+                 (unquote-ident (str/trim (.getName ^Alias a))))
+        fname  (str/lower-case (or (.getName (.getFunction tf)) "tf"))
+        sub-name (or talias (str fname "_" (System/nanoTime)))]
+    (when-let [{:keys [aliases rows vtypes pg-types]} (materialize-table-function tf)]
+      (let [aliases (if (and talias (= 1 (count aliases))) [talias] aliases)
+            schema-tx (mapv (fn [a vt pt]
+                              (cond-> {:db/ident       (keyword sub-name a)
+                                       :db/valueType   vt
+                                       :db/cardinality :db.cardinality/one}
+                                pt (assoc :pg/type pt)))
+                            aliases vtypes (concat (or pg-types []) (repeat nil)))
+            spec-db (d/db-with db schema-tx)
+            data-tx (mapv (fn [row]
+                            (into {}
+                                  (keep-indexed
+                                   (fn [i a]
+                                     (let [v (nth row i nil)]
+                                       (when (some? v) [(keyword sub-name a) v])))
+                                   aliases)))
+                          rows)
+            spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+        {:db spec-db2 :schema (:schema spec-db2)
+         :name sub-name :alias sub-name :aliases aliases}))))
 
 (defn materialize-derived-select!
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
@@ -728,6 +820,107 @@
       (materialize-set-op! inner sub-name db schema)
 
       :else nil)))
+
+;; ── Correlated-subquery resolution (shared by exec-select + derived-table
+;;    materialisation). A SELECT item that defers a correlated subquery
+;;    (Slice A / Layer 1) threads hidden `__corr_N` columns into :find and
+;;    omits the subquery's own output position; these helpers run the subquery
+;;    per outer row, splice its value at the out-pos, and drop the __corr_
+;;    columns. `parse-fn` parses the inner SQL per row (sql/parse-sql at
+;;    Execute, *parse-sql* at parse-time materialisation).
+
+(defn correlated-splice
+  "Assemble `n-output` columns from `visible` (non-correlation columns in
+   order) and `out-pos->val` (subquery output-position → value)."
+  [visible out-pos->val n-output]
+  (loop [p 0, v (seq visible), out []]
+    (if (= p n-output)
+      out
+      (if (contains? out-pos->val p)
+        (recur (inc p) v (conj out (get out-pos->val p)))
+        (recur (inc p) (next v) (conj out (first v)))))))
+
+(defn- eval-corr-scalar
+  "Evaluate one SQL fragment for a deferred correlated item against `query-db`
+   with *from-bindings* already bound. `subquery?` true → run `sql` as-is;
+   false → wrap as `SELECT (<sql>)`. First cell, or nil on error/empty."
+  [parse-fn sql subquery? inner-schema query-db]
+  (try
+    (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
+          p   (parse-fn run-sql inner-schema query-db)
+          q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
+      (if (nil? q)
+        (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
+        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb)) fr (first res)]
+          (if (sequential? fr) (first fr) fr))))
+    (catch Throwable _ nil)))
+
+(defn- eval-corr-then
+  "Evaluate a CASE branch THEN/ELSE spec with *from-bindings* bound."
+  [parse-fn then-spec inner-schema query-db]
+  (cond
+    (nil? then-spec)          :__null__
+    (:subquery-sql then-spec) (eval-corr-scalar parse-fn (:subquery-sql then-spec) true inner-schema query-db)
+    :else                     (eval-corr-scalar parse-fn (:expr-sql then-spec) false inner-schema query-db)))
+
+(defn- run-correlated-spec
+  "Value of a deferred correlated SELECT item for one outer row. `fb` is the
+   per-row *from-bindings*. :scalar runs the subquery; :case walks branches."
+  [parse-fn spec fb inner-schema query-db]
+  (binding [params/*from-bindings* fb
+            *eval-update-db* query-db]
+    (case (:kind spec)
+      :case
+      (let [hit (some (fn [{:keys [when-sql then]}]
+                        (when (true? (eval-corr-scalar parse-fn when-sql false inner-schema query-db))
+                          [(eval-corr-then parse-fn then inner-schema query-db)]))
+                      (:branches spec))]
+        (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
+      (eval-corr-scalar parse-fn (:inner-sql spec) true inner-schema query-db))))
+
+(defn resolve-correlated-rows
+  "Resolve a parsed SELECT's deferred correlated subqueries against raw result
+   `rows`: per outer row, run each subquery with the correlation columns bound
+   into *from-bindings*, splice the value at its out-pos, and drop the hidden
+   __corr_ columns. Returns [resolved-rows resolved-aliases resolved-oids],
+   where resolved-oids carries each subquery's declared OID at its spliced
+   position (nil for visible columns) so a caller materialising the result can
+   type array columns from the subquery's OID rather than the runtime value
+   class (e.g. array_agg(atttypid) → oid[] not int8[]). No-op (returns
+   [rows find-aliases nil]) when there are no correlated subqueries."
+  [parse-fn parsed rows query-db inner-schema]
+  (if-let [cs (:correlated-subqueries parsed)]
+    (let [{:keys [subqueries corr-col->idx n-output]} cs
+          find-aliases  (:find-aliases parsed)
+          corr-idx-set  (set (vals corr-col->idx))
+          visible-idxs  (vec (remove corr-idx-set (range (count find-aliases))))
+          out-pos->subq (into {} (map (juxt :out-pos identity)) subqueries)
+          run-1 (fn [subq rv]
+                  (let [fb (reduce (fn [m [a c]]
+                                     (assoc-in m [a c] (nth rv (get corr-col->idx [a c]) nil)))
+                                   {} (:corr-refs subq))]
+                    (run-correlated-spec parse-fn subq fb inner-schema query-db)))
+          new-rows (mapv (fn [row]
+                           (let [rv  (if (sequential? row) (vec row) [row])
+                                 vis (mapv #(nth rv % nil) visible-idxs)
+                                 sv  (into {} (map (fn [[op sq]] [op (run-1 sq rv)])) out-pos->subq)]
+                             (correlated-splice vis sv n-output)))
+                         rows)
+          vis-aliases (mapv #(nth find-aliases %) visible-idxs)
+          new-aliases (correlated-splice vis-aliases
+                                         (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
+                                         n-output)
+          ;; Carry the VISIBLE columns' inferred OIDs (not nil) so a caller
+          ;; materialising the result can preserve their read-back OID (e.g.
+          ;; {typeinfo}.typtype is char(18); without this it'd be typed text and
+          ;; asyncpg's `kind == b'c'` check would fail). Spliced positions get
+          ;; the correlated subquery's declared OID.
+          item-oids   (:select-item-oids parsed)
+          new-oids    (correlated-splice (mapv #(nth item-oids % nil) visible-idxs)
+                                         (into {} (map (fn [[op sq]] [op (:oid sq)])) out-pos->subq)
+                                         n-output)]
+      [new-rows new-aliases new-oids])
+    [rows (:find-aliases parsed) nil]))
 
 (defn materialize-set-op!
   "Run a SELECT (PlainSelect or SetOperationList) and persist its rows
@@ -810,6 +1003,24 @@
         sub-results (cond->> sub-results
                       (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
                       (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
+        ;; Resolve deferred correlated subqueries (Slice A / Layer 1) so a
+        ;; derived table whose SELECT contains a correlated CASE subquery
+        ;; (asyncpg's {typeinfo} attrtypoids/attrnames) materialises the
+        ;; subquery values and drops the hidden __corr_ columns — otherwise
+        ;; they'd be persisted as bogus `:<alias>/__corr_N` attrs. No-op when
+        ;; the branch has no correlated subqueries. (Single-branch only; the
+        ;; UNION branches keep their raw shape — correlated subqueries inside
+        ;; a set-op branch are not a shape we materialise.)
+        corr-resolved (when (and (nil? (:op branch-parsed))
+                                 (:correlated-subqueries sub-parsed))
+                        (resolve-correlated-rows params/*parse-sql* sub-parsed
+                                                 sub-results db schema))
+        sub-results (if corr-resolved (first corr-resolved) sub-results)
+        sub-aliases (if corr-resolved (second corr-resolved) sub-aliases)
+        ;; Correlated-subquery columns carry their declared OID (e.g. oid[] for
+        ;; array_agg(atttypid)); use it to type array columns instead of the
+        ;; runtime value class. Visible columns stay nil (value-sampled).
+        sub-oids    (if corr-resolved (nth corr-resolved 2) sub-oids)
         ;; Walk every row rather than just the first — UNION across
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have
@@ -933,14 +1144,57 @@
         ;; non-marker column is NULL on a given row (e.g. Metabase's
         ;; `NULL as role` projection in build_privilege_map).
         row-marker (pgs/row-marker-attr target-name)
+        ;; Per-column array element kw. A column whose samples are PgArrays
+        ;; (or whose OID hint is a T[] OID) is materialised the way a real
+        ;; array column is: :db.type/string holding canonical PG text
+        ;; ("{1,2,3}") + a :pg/array-elem datom so its read-back OID is T[].
+        ;; Without this the PgArray was Java-`str`'d to "…PgArray@hash" and
+        ;; the column typed as text (asyncpg's introspection then mis-decoded
+        ;; attrtypoids/attrnames as a string). Element kw drives both the
+        ;; value coercion (to-pg-text) and the array OID.
+        ;; Prefer the inner select-item's array OID hint (authoritative — it
+        ;; reflects the column's DECLARED element type, e.g. array_agg(atttypid)
+        ;; → oid[]) over the value-sampled element type (which can only see the
+        ;; runtime class, e.g. Long → int8, losing the oid distinction asyncpg
+        ;; relies on). Fall back to the sample when oid-infer can't decide.
+        col-array-elem (mapv (fn [i]
+                               (or (some-> (nth sub-oids i nil)
+                                           types/array-oid->element-oid
+                                           types/oid->elem-kw)
+                                   (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)))
+                             (range (count sub-aliases)))
+        ;; :pg/type to preserve the read-back OID for types whose datahike
+        ;; valueType would otherwise report the wrong OID: arrays ("_T"), and
+        ;; the OID-preserving scalars char(18)/oid(26) (dh-type-for-oid → string/
+        ;; long → would report text/int8). asyncpg's typeinfo decodes typtype as
+        ;; "char" → bytes b'c'; if we send it as text it sees the str 'c' and
+        ;; `kind == b'c'` fails, so it never builds the composite codec.
+        col-pg-type (mapv (fn [i]
+                            (if-let [ae (nth col-array-elem i)]
+                              (str "_" (name ae))
+                              (get types/oid-preserving-pg-name (nth sub-oids i nil))))
+                          (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
-        col-types (mapv (fn [i] (col-vtype i)) (range (count sub-aliases)))
-        col-coercions (mapv col-coerce col-types)
+        col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))
+                        (range (count sub-aliases)))
+        col-coercions (mapv (fn [i]
+                              (if (nth col-array-elem i)
+                                (fn [v] (cond
+                                          (pg-arr/array? v) (pg-arr/to-pg-text v)
+                                          (string? v)       v
+                                          :else             (str v)))
+                                (col-coerce (nth col-types i))))
+                            (range (count sub-aliases)))
         schema-tx (conj
                    (vec (for [[i a] (map-indexed vector sub-aliases)]
-                          {:db/ident (keyword target-name a)
-                           :db/valueType (nth col-types i)
-                           :db/cardinality :db.cardinality/one}))
+                          (cond-> {:db/ident (keyword target-name a)
+                                   :db/valueType (nth col-types i)
+                                   :db/cardinality :db.cardinality/one}
+                            ;; :pg/type drives oid-infer's read-back OID (array
+                            ;; "_T" or OID-preserving scalar char/oid).
+                            (nth col-pg-type i)   (assoc :pg/type (nth col-pg-type i))
+                            ;; :pg/array-elem drives canonical-text array decode.
+                            (nth col-array-elem i) (assoc :pg/array-elem (nth col-array-elem i)))))
                    {:db/ident       row-marker
                     :db/valueType   :db.type/boolean
                     :db/cardinality :db.cardinality/one})
@@ -965,6 +1219,182 @@
      :alias   target-name
      :aliases sub-aliases}))
 
+(defn- agg-cast-inner
+  "If `expr` is a CAST (or parenthesised CAST) wrapping an aggregate —
+   `count(*)::int4`, `sum(x)::numeric`, an aggregate AnalyticExpression —
+   return that inner aggregate so the select-item dispatch registers it as
+   an aggregate instead of routing the whole CAST through the scalar-
+   expression path (which feeds the aggregate's spec map into the cast
+   coercer → \"cannot coerce PersistentArrayMap to bigint\").
+
+   The wrapping cast's result OID is computed independently by
+   `select-item-oids` (which walks the original CAST via oid-infer), and an
+   integer-width cast over count/sum/min/max doesn't change the value, so
+   dropping the runtime cast here is correct for those. A value-changing
+   cast over an aggregate (e.g. `avg(x)::int` truncation) loses the
+   truncation — acceptable for now, and strictly better than the previous
+   hard error. Returns nil when `expr` is not a cast-over-aggregate."
+  [expr]
+  (letfn [(peel [e]
+            (cond
+              (instance? CastExpression e) (peel (.getLeftExpression ^CastExpression e))
+              (instance? Parenthesis e)    (peel (.getExpression ^Parenthesis e))
+              :else e))]
+    (when (instance? CastExpression expr)
+      (let [i (peel expr)]
+        (when (or (and (instance? Function i)
+                       (fns/aggregate-function? (str/lower-case (.getName ^Function i))))
+                  (instance? net.sf.jsqlparser.expression.AnalyticExpression i))
+          i)))))
+
+(def ^:dynamic *cte-relations*
+  "Lowercased names of CTEs (WITH items) in scope for the statement being
+   translated. Bound by parse-sql* so the undefined-table 42P01 check
+   exempts CTE references that aren't materialised into the schema — most
+   notably data-modifying CTE bodies (`WITH x AS (INSERT … RETURNING …)`),
+   which are skipped during WITH-fold."
+  #{})
+
+(defn- relation-known?
+  "True when `tname` names something a query can scan: a user table / CTE
+   / derived table whose columns live in `schema` (any attribute in that
+   namespace — every pgwire table carries at least its row-marker), a CTE
+   in scope (`*cte-relations*`), or a catalog relation the catalog layer
+   synthesises (`pg_*`, `information_schema`, or any schema-qualified
+   name). Used to raise a clean 42P01 for a genuinely-absent relation
+   instead of the cryptic 'Query for unknown vars' failure (SELECT *) or a
+   silently-empty result (SELECT col). Column-level EAV permissiveness is
+   intentionally NOT touched — an existing table's missing column still
+   reads as NULL."
+  [schema tname]
+  (or (nil? tname)
+      (let [t (str/lower-case tname)]
+        (or (str/starts-with? t "pg_")
+            (str/starts-with? t "information_schema")
+            (str/includes? t ".")            ; schema-qualified catalog ref
+            (contains? *cte-relations* t)
+            (some (fn [[k _]] (and (keyword? k) (= (namespace k) tname)))
+                  schema)))))
+
+(defn correlated-subquery-refs
+  "Given a scalar-subquery `inner` (a JSqlParser Select) and the set of
+   `outer-aliases` (lowercased outer FROM aliases/table names), return the
+   set of [outer-alias col] correlation references the inner makes, or nil
+   when uncorrelated.
+
+   Detection is lexical — it finds `alias.col` occurrences of an OUTER alias
+   in the inner SQL (negative-lookbehind so `xt.` doesn't match alias `t`).
+   Robust enough for catalog / introspection shapes; AST-precise detection
+   (which would also respect inner shadowing) is a later refinement. This is
+   the first slice of the correlated-subquery / LATERAL executor — see
+   doc/design-alignment.md."
+  [inner outer-aliases]
+  (when (seq outer-aliases)
+    (let [sql (str inner)
+          refs (for [a outer-aliases
+                     [_ col] (re-seq
+                              (re-pattern
+                               (str "(?i)(?<![\\w.])"
+                                    (java.util.regex.Pattern/quote a)
+                                    "\\.([A-Za-z_][A-Za-z0-9_]*)"))
+                              sql)]
+                 [a (str/lower-case col)])]
+      (not-empty (set refs)))))
+
+(defn- unwrap-parens
+  "Peel redundant Parenthesis / single-element ParenthesedExpressionList
+   wrappers so `(CASE … END)` and `((expr))` reach their inner node. A
+   ParenthesedSelect (a scalar subquery) is NOT unwrapped — it's a leaf here."
+  [^net.sf.jsqlparser.expression.Expression e]
+  (cond
+    (instance? net.sf.jsqlparser.expression.Parenthesis e)
+    (recur (.getExpression ^net.sf.jsqlparser.expression.Parenthesis e))
+    (and (instance? net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList e)
+         (= 1 (.size ^net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList e)))
+    (recur (.get ^net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList e 0))
+    :else e))
+
+(defn- subquery-expr?
+  "True if a JSqlParser expression is a scalar subquery node."
+  [e]
+  (or (instance? ParenthesedSelect e) (instance? PlainSelect e)))
+
+(defn- subquery-inner
+  "The PlainSelect/SetOp inside a (Parenthesed)Select expression."
+  [e]
+  (if (instance? ParenthesedSelect e) (.getSelect ^ParenthesedSelect e) e))
+
+(defn correlated-select-item-spec
+  "Detect a correlated scalar subquery in a SELECT-list item expression `e`,
+   returning a deferral spec (without :out-pos/:alias/:oid, which the caller
+   adds) or nil. Two shapes:
+
+   - `:scalar` — the item IS a scalar subquery `(SELECT … <outer ref> …)`.
+   - `:case`   — the item is a CASE whose THEN/ELSE contains a correlated
+     subquery (asyncpg's `CASE WHEN typtype='c' THEN (SELECT array_agg(…)
+     WHERE c.reltype = t.oid) END`). The single-rule CASE compiler would
+     pre-evaluate the subquery once at parse (→ NULL); instead we defer and
+     let exec-select evaluate the whole CASE per outer row.
+
+   `:corr-refs` is the set of [outer-alias col] references threaded into
+   :find as hidden columns so exec-select can bind *from-bindings* per row."
+  [^net.sf.jsqlparser.expression.Expression e0 outer-aliases]
+  (let [e (unwrap-parens e0)]
+    (cond
+      (subquery-expr? e)
+      (let [inner (subquery-inner e)]
+        (when (instance? PlainSelect inner)
+          (when-let [refs (correlated-subquery-refs inner outer-aliases)]
+            {:kind :scalar :inner-sql (str inner) :corr-refs (vec refs)})))
+
+      (instance? net.sf.jsqlparser.expression.CaseExpression e)
+      (let [ce ^net.sf.jsqlparser.expression.CaseExpression e
+            when-clauses (.getWhenClauses ce)
+            else-expr (.getElseExpression ce)
+            then->spec (fn [^net.sf.jsqlparser.expression.Expression t]
+                         (when t
+                           (if (subquery-expr? t)
+                             {:subquery-sql (str (subquery-inner t))}
+                             {:expr-sql (str t)})))
+          ;; THEN/ELSE branches that are subqueries
+            subqs (concat
+                   (keep (fn [^net.sf.jsqlparser.expression.WhenClause wc]
+                           (let [t (.getThenExpression wc)] (when (subquery-expr? t) t)))
+                         when-clauses)
+                   (when (subquery-expr? else-expr) [else-expr]))
+          ;; Only defer when some THEN/ELSE subquery is itself correlated; an
+          ;; uncorrelated subquery (or a plain CASE) needs no per-row eval.
+            correlated? (some (fn [s]
+                                (let [inner (subquery-inner s)]
+                                  (and (instance? PlainSelect inner)
+                                       (seq (correlated-subquery-refs inner outer-aliases)))))
+                              subqs)]
+        (when correlated?
+          {:kind :case
+           :branches (mapv (fn [^net.sf.jsqlparser.expression.WhenClause wc]
+                             {:when-sql (str (.getWhenExpression wc))
+                              :then (then->spec (.getThenExpression wc))})
+                           when-clauses)
+           :else (then->spec else-expr)
+         ;; All outer refs across the whole CASE (WHEN conditions + subqueries).
+           :corr-refs (vec (or (correlated-subquery-refs ce outer-aliases) []))}))
+
+      :else nil)))
+
+(defn- correlated-item-oid
+  "Best-effort result OID for a deferred correlated item, for the extended-
+   protocol RowDescription. Uses the inner subquery's first-projection OID
+   (count→int8, array_agg→array, …) via the full parse-sql so catalog
+   columns type correctly. nil → caller defaults to text."
+  [spec schema db parse-fn]
+  (try
+    (when parse-fn
+      (let [sql (case (:kind spec)
+                  :scalar (:inner-sql spec)
+                  :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))]
+        (when sql (first (:select-item-oids (parse-fn sql schema db))))))
+    (catch Throwable _ nil)))
+
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
@@ -975,19 +1405,48 @@
         ;; table-function forms like (SELECT * FROM unnest(ARRAY[…])
         ;; WITH ORDINALITY) AS sub.
         [db schema name alias]
-        (if (and db (instance? ParenthesedSelect from-item))
+        (cond
+          (and db (instance? ParenthesedSelect from-item))
           (if-let [{sub-db :db sub-schema :schema
                     sub-name :name sub-alias :alias}
                    (materialize-derived-select!
                     ^ParenthesedSelect from-item db schema)]
             [sub-db sub-schema sub-name sub-alias]
             [db schema nil nil])
+
+          ;; Bare set-returning function in FROM: `FROM generate_series(2,4)`,
+          ;; `FROM now()`. Materialise the (constant-arg) function into a
+          ;; virtual table the rest of the query scans normally. Correlated
+          ;; (LATERAL) table functions are future work — see
+          ;; doc/design-alignment.md.
+          (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
+          (if-let [{vdb :db vschema :schema vname :name valias :alias}
+                   (table-fn->virtual-table
+                    ^net.sf.jsqlparser.statement.select.TableFunction from-item db)]
+            [vdb vschema vname valias]
+            [db schema nil nil])
+
           ;; Regular table
+          :else
           (let [{tname :name talias :alias} (when (instance? Table from-item)
                                               (ctx/extract-table-info ^Table from-item))]
             [db schema tname talias]))
         ;; default-table is the alias key used for entity-var lookup.
         default-table (or alias name)
+
+        ;; A genuinely-absent user relation in FROM raises 42P01 (PG's
+        ;; undefined_table) instead of failing later with a cryptic
+        ;; "Query for unknown vars" (SELECT *) or returning a silent empty
+        ;; result (SELECT col). Catalog tables (pg_*/information_schema),
+        ;; CTEs, derived tables and table functions are exempt — see
+        ;; relation-known?. Column-level EAV permissiveness is unchanged:
+        ;; an *existing* table's unknown column still reads as NULL.
+        _ (when (and (instance? Table from-item)
+                     (not (relation-known? schema name)))
+            (throw (ex-info (str "relation \"" name "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table name})))
 
         ;; Build table aliases: {alias → real-table-name}
         ;; For self-joins, the alias is the key; for regular usage, table name is the key too.
@@ -1138,8 +1597,41 @@
                 "avg" 'datahike.pg.sql/filter-avg-numeric
                 nil))))
 
-        _ (doseq [^SelectItem item select-items]
-            (let [expr (.getExpression item)
+        ;; --- Correlated scalar subqueries in the SELECT list (slice A of the
+        ;; per-row / LATERAL executor — doc/design-alignment.md). A
+        ;; scalar subquery that references an OUTER FROM alias is DEFERRED:
+        ;; the item loop skips it (so it isn't evaluated-once → NULL), the
+        ;; outer-correlation columns it reads are threaded into :find as
+        ;; hidden cols, and exec-select runs the inner per outer row. When
+        ;; none are present, `correlated-subqs` is empty and the SELECT path
+        ;; below is unchanged.
+        outer-aliases (into #{}
+                            (comp cat (remove nil?) (map str/lower-case))
+                            [(keys table-aliases) (vals table-aliases) [default-table]])
+        correlated-subqs
+        (when db
+          (into []
+                (keep-indexed
+                 (fn [i ^SelectItem item]
+                   (when-let [spec (correlated-select-item-spec (.getExpression item) outer-aliases)]
+                     (assoc spec
+                            :out-pos i
+                            :alias (or (select-item-alias item) "?column?")
+                            :oid (correlated-item-oid spec schema db (:parse-sql ctx)))))
+                 select-items)))
+        corr-out-positions (into #{} (map :out-pos) correlated-subqs)
+        ;; distinct [alias col] correlation columns, in stable order
+        corr-cols-needed (vec (distinct (mapcat :corr-refs correlated-subqs)))
+        ;; the item loop processes everything EXCEPT the deferred subqueries
+        loop-items (into [] (keep-indexed (fn [i it] (when-not (corr-out-positions i) it))
+                                          select-items))
+
+        _ (doseq [^SelectItem item loop-items]
+            (let [raw-expr (.getExpression item)
+                  ;; A CAST over an aggregate (count(*)::int4) dispatches as
+                  ;; the inner aggregate; the cast only re-types the result
+                  ;; (handled by select-item-oids). See agg-cast-inner.
+                  expr (or (agg-cast-inner raw-expr) raw-expr)
                   alias-str (select-item-alias item)]
               (cond
                 ;; SELECT t.* — table-qualified wildcard. JSqlParser
@@ -1455,7 +1947,31 @@
                           ;; adding the entity var to :with preserves duplicate rows.
                           (when-not is-dh-distinct?
                             (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
-                          (swap! find-elements conj (list agg-sym v))
+                          ;; array_agg(expr ORDER BY …): collect [sort-key value]
+                          ;; pairs and sort in the agg fn so element order honors
+                          ;; the in-aggregate ORDER BY (composite field order in
+                          ;; asyncpg's introspection depends on this). Direction
+                          ;; is taken uniformly from the keys (all-DESC → desc).
+                          (let [order-els (when (= fname "array_agg")
+                                            (seq (.getOrderByElements f)))]
+                            (if order-els
+                              (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                     (let [kv (expr/translate-expr ctx (.getExpression o))]
+                                                       (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                                   order-els)
+                                    sort-key (if (= 1 (count key-vars))
+                                               (first key-vars)
+                                               (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
+                                    pair-var (ctx/fresh-var! ctx)
+                                    all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                        (not (.isAsc o)))
+                                                      order-els)
+                                    ord-sym (if all-desc?
+                                              'datahike.pg.sql/filter-array-agg-ordered-desc
+                                              'datahike.pg.sql/filter-array-agg-ordered)]
+                                (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
+                                (swap! find-elements conj (list ord-sym pair-var)))
+                              (swap! find-elements conj (list agg-sym v))))
                           (swap! find-aliases conj (or alias-str fname)))))))
 
                 ;; Regular column or expression
@@ -1509,6 +2025,25 @@
                                                      (subs (str v) 1))
                                                    (str v)))))))))
 
+        ;; Thread each distinct correlation column (e.g. t.oid) into :find
+        ;; as a trailing hidden column so every outer row carries the value
+        ;; exec-select binds into *from-bindings* before running the inner.
+        ;; Returns {[alias col] → index-in-find}.
+        corr-col->idx
+        (when (seq corr-cols-needed)
+          (into {}
+                (map-indexed
+                 (fn [n [alias col]]
+                   (let [colexpr (doto (net.sf.jsqlparser.schema.Column.)
+                                   (.setColumnName col)
+                                   (.setTable (net.sf.jsqlparser.schema.Table. ^String alias)))
+                         v (expr/translate-expr ctx colexpr)
+                         idx (count @find-elements)]
+                     (swap! find-elements conj v)
+                     (swap! find-aliases conj (str "__corr_" n))
+                     [[alias col] idx]))
+                 corr-cols-needed)))
+
         ;; Parse-time OID inference for each select-item expression.
         ;; Walks the JSqlParser AST to produce a result OID per element
         ;; of :find-aliases, mirroring PG's exprType (see
@@ -1558,7 +2093,10 @@
                          :else
                          (conj v (oid/expr-oid expr oid-env)))))
                    []
-                   select-items)
+                   ;; loop-items excludes deferred correlated subqueries, so
+                   ;; these OIDs line up with the non-subquery part of
+                   ;; find-aliases (the __corr_ tail pads to nil below).
+                   loop-items)
                 ;; find-aliases may be longer than acc when SELECT
                 ;; contains JOIN-driven entity vars added to :find
                 ;; for :with semantics. Pad with nil so the vector
@@ -2362,6 +2900,9 @@
              ;; Pass enriched db when derived tables or derived-table-joins
              ;; created speculative data (FROM (…) AS sub or JOIN (…) AS sub).
              :enriched-db     (when (or (instance? ParenthesedSelect from-item)
+                                        ;; bare SRF in FROM materialised into
+                                        ;; a virtual table (table-fn->virtual-table)
+                                        (instance? net.sf.jsqlparser.statement.select.TableFunction from-item)
                                         (seq derived-joins))
                                 db)
              ;; Server-side sort for nullable ORDER BY columns
@@ -2372,6 +2913,14 @@
              :compound-exprs  (when (seq @compound-exprs) @compound-exprs)
              ;; Window function specs for server-side post-processing
              :window-specs    (when (seq @window-specs) @window-specs)
+             ;; Correlated scalar subqueries (slice A): each is run per outer
+             ;; row by exec-select, which binds the correlation columns
+             ;; (whose Datalog result indices are in :corr-col->idx) into
+             ;; *from-bindings*, then splices the value at :out-pos.
+             :correlated-subqueries (when (seq correlated-subqs)
+                                      {:subqueries correlated-subqs
+                                       :corr-col->idx corr-col->idx
+                                       :n-output (count select-items)})
              ;; FOR UPDATE row-locking (SKIP LOCKED / NOWAIT / blocking)
              :for-update      for-update
              ;; Prepared-statement param placeholders {index → ?var}.
@@ -2619,6 +3168,15 @@
 
      :else (str e))))
 
+(defn- apply-numeric-scale
+  "PG NUMERIC(p,s) rounds/pads a value to scale `s` on input (e.g. 1 →
+   1.00, 1.239 → 1.24). `scale` nil (unconstrained NUMERIC) leaves the
+   value's own scale untouched. Only acts on BigDecimals."
+  [v scale]
+  (if (and scale (instance? java.math.BigDecimal v))
+    (.setScale ^java.math.BigDecimal v (int scale) java.math.RoundingMode/HALF_UP)
+    v))
+
 (defn coerce-insert-value
   "Coerce a value to match the schema type for an attribute.
 
@@ -2634,7 +3192,8 @@
   [val attr schema]
   (when (some? val)
     (let [vtype     (get-in schema [attr :db/valueType])
-          elem-kw   (get-in schema [attr :pg/array-elem])]
+          elem-kw   (get-in schema [attr :pg/array-elem])
+          num-scale (get-in schema [attr :pg/numeric-scale])]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
@@ -2707,7 +3266,7 @@
         (case vtype
           :db.type/float  (coerce/coerce-numeric val :float)
           :db.type/double (coerce/coerce-numeric val :double)
-          :db.type/bigdec (coerce/coerce-numeric val :bigdec)
+          :db.type/bigdec (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
           :db.type/long   (coerce/coerce-numeric val :long)
           val)
         ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
@@ -2756,7 +3315,7 @@
         ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
         ;; bad-syntax strings instead of silently keeping the original.
         (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
-        (coerce/coerce-numeric val :bigdec)
+        (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
         (and (= vtype :db.type/instant) (string? val))
         (expr/parse-timestamp-string val)
         (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
@@ -3150,11 +3709,26 @@
                                    [?e :pg/array-elem ?elem]
                                    [(get-else $ ?e :pg/array-ndim 1) ?ndim]]}
                          db))
-                  (catch Throwable _ {}))]
+                  (catch Throwable _ {}))
+        ;; NUMERIC(p,s): surface the declared scale so INSERT coercion can
+        ;; round/pad values to it (PG numeric(p,s) input semantics). Only
+        ;; constrained columns carry :pg/typmod; unconstrained `numeric`
+        ;; has none, so its scale is left intact.
+        scale-meta (try
+                     (into {}
+                           (keep (fn [[ident typmod]]
+                                   (let [[_p s] (types/decode-numeric-typmod typmod)]
+                                     (when s [ident {:pg/numeric-scale s}]))))
+                           (d/q
+                            '{:find  [?ident ?typmod]
+                              :where [[?e :db/ident ?ident]
+                                      [?e :pg/typmod ?typmod]]}
+                            db))
+                     (catch Throwable _ {}))]
     (reduce-kv (fn [s ident more] (update s ident merge more))
-               schema pg-meta)))
+               schema (merge-with merge pg-meta scale-meta))))
 
-(defn- enrich-schema-with-pg-array-meta
+(defn enrich-schema-with-pg-array-meta
   "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
    metadata like `:pg/array-elem` lives as ident-entity facts. For
    array column INSERTs we need that metadata available via
@@ -4037,7 +4611,13 @@
      :col-names col-names
      :rule-vars rule-vars
      :in-params all-in-params
-     :in-args all-in-args}))
+     :in-args all-in-args
+     ;; The anchor PlainSelect (UNION's non-recursive branch) — used by
+     ;; materialize-recursive-cte! to infer column value-types from the
+     ;; anchor's SELECT expressions when data can't be materialised at
+     ;; parse time (B2: a parameterised anchor whose `$n` is unbound until
+     ;; Bind). SQL gives a recursive CTE its column types from the anchor.
+     :anchor anchor}))
 
 (defn- infer-recursive-vtype
   "Minimal value-type detector for rows produced by a recursive CTE
@@ -4059,6 +4639,190 @@
     (instance? java.util.Date v)                :db.type/instant
     :else                                       :db.type/string))
 
+(defn- recursive-coercion
+  "Per-value coercion fn for a recursive-CTE column's datahike value type.
+   Idempotent on already-typed values."
+  [vtype]
+  (case vtype
+    :db.type/long   (fn [v] (if (instance? Long v) v (long v)))
+    :db.type/double (fn [v] (if (instance? Double v) v (double v)))
+    :db.type/bigdec (fn [v]
+                      (cond
+                        (instance? java.math.BigDecimal v) v
+                        (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                        (integer? v) (java.math.BigDecimal/valueOf (long v))
+                        (float? v)   (java.math.BigDecimal/valueOf (double v))
+                        :else (java.math.BigDecimal. (str v))))
+    :db.type/string str
+    identity))
+
+(defn- recursive-schema-tx
+  "Datahike schema tx for a materialised recursive CTE: one
+   `:<target-name>/<col>` attr per column plus the row-existence marker.
+   `col-array-elems` (optional, nil-padded) carries each column's array
+   element kw for array-valued columns — stored as a :pg/array-elem datom so
+   the column's read-back OID is T[] (mirrors real array columns; the value
+   is canonical PG text in a :db.type/string column)."
+  ([target-name col-names col-types row-marker]
+   (recursive-schema-tx target-name col-names col-types row-marker nil nil))
+  ([target-name col-names col-types row-marker col-array-elems]
+   (recursive-schema-tx target-name col-names col-types row-marker col-array-elems nil))
+  ([target-name col-names col-types row-marker col-array-elems col-pg-types]
+   (conj
+    (vec (for [[i c] (map-indexed vector col-names)]
+           (cond-> {:db/ident       (keyword target-name c)
+                    :db/valueType   (nth col-types i)
+                    :db/cardinality :db.cardinality/one}
+             ;; :pg/type round-trips the column's OID (array "_T" or the
+             ;; OID-preserving scalars char/oid); :pg/array-elem drives the
+             ;; canonical-text array decode.
+             (and col-pg-types (nth col-pg-types i nil))
+             (assoc :pg/type (nth col-pg-types i))
+             (and col-array-elems (nth col-array-elems i nil))
+             (assoc :pg/array-elem (nth col-array-elems i)))))
+    {:db/ident       row-marker
+     :db/valueType   :db.type/boolean
+     :db/cardinality :db.cardinality/one})))
+
+(defn- recursive-data-tx
+  "Entity maps for the rows a recursive CTE produced, coercing each value
+   to its column's datahike type and tagging every row with `row-marker`."
+  [rows col-names col-types target-name row-marker]
+  (let [coercions (mapv recursive-coercion col-types)]
+    (vec (for [row rows]
+           (let [vs (vec row)
+                 cols (into {} (keep-indexed
+                                (fn [i c]
+                                  (let [v (nth vs i nil)]
+                                    (when (some? v)
+                                      [(keyword target-name c)
+                                       ((nth coercions i) v)])))
+                                col-names))]
+             (assoc cols row-marker true))))))
+
+(defn run-recursive-rule
+  "Evaluate a recursive-CTE Datalog rule to a fixed point and return the
+   raw result rows. `in-args` must already be free of ParamRef sentinels
+   (substituted at Bind for the parameterised path).
+
+   Forces the query planner on regardless of caller context — Datahike's
+   legacy engine can't evaluate the recursive bodies translate-recursive-cte
+   emits (head var bound through a function op then filtered by a predicate,
+   datahike PR #825)."
+  [db rule rule-name rule-vars in-params in-args]
+  (let [rule-call (apply list rule-name rule-vars)
+        q {:find  rule-vars
+           :in    (into '[$ %] in-params)
+           :where [rule-call]}]
+    (binding [dq/*force-legacy* false]
+      (apply d/q q db rule in-args))))
+
+(defn- anchor-col-vtypes
+  "Best-effort per-column datahike value-types for a recursive CTE,
+   inferred from the anchor (non-recursive) branch's SELECT expressions
+   via oid/expr-oid — used when rows can't be materialised at parse time
+   (parameterised anchor). Columns we can't infer default to string; under
+   :read schema-flexibility this only affects RowDescription OID accuracy,
+   never data insertion (db-with does not enforce valueType)."
+  [^PlainSelect anchor col-names schema db]
+  (let [n (count col-names)
+        oids (try
+               (let [from-item     (.getFromItem anchor)
+                     joins         (.getJoins anchor)
+                     default-table (when (instance? Table from-item)
+                                     (unquote-ident (.getName ^Table from-item)))
+                     table-aliases (params/collect-table-aliases from-item joins)
+                     oid-env {:db db :schema schema
+                              :table-aliases table-aliases
+                              :default-table default-table
+                              :hints (pgs/schema-hints db)}]
+                 (mapv (fn [^SelectItem si]
+                         (try (oid/expr-oid (.getExpression si) oid-env)
+                              (catch Throwable _ nil)))
+                       (.getSelectItems anchor)))
+               (catch Throwable _ nil))
+        oids (vec (take n (concat (or oids []) (repeat nil))))]
+    (mapv (fn [oid]
+            (condp = oid
+              types/oid-bool        :db.type/boolean
+              types/oid-int8        :db.type/long
+              types/oid-int4        :db.type/long
+              types/oid-int2        :db.type/long
+              26                    :db.type/long      ; oid
+              types/oid-float8      :db.type/double
+              700                   :db.type/double    ; float4
+              types/oid-numeric     :db.type/bigdec
+              types/oid-uuid        :db.type/uuid
+              types/oid-date        :db.type/instant
+              types/oid-timestamp   :db.type/instant
+              types/oid-timestamptz :db.type/instant
+              :db.type/string))
+          oids)))
+
+(defn- ground-rule-params
+  "Inline now-bound prepared-statement params into a recursive-CTE rule.
+
+   A Datalog rule body cannot see the outer query's `:in` vars, so a
+   parameterised anchor like `SELECT $1::int` — compiled to
+   `[(?cast-fn ?p1) ?out]` with `?p1`/`?cast-fn` supplied via `:in` —
+   fails at rule eval (\"Unknown function ?cast-fn\"). At Execute the
+   params are concrete, so we fold them directly into the rule:
+
+   - plain value params (`?p1` → 1) are substituted as literal constants;
+   - a clause whose FUNCTION position is a fn-valued param (the compiled
+     CAST/coercion closure) with all-ground args is pre-evaluated and
+     rewritten to `[(ground <result>) ?out]`.
+
+   Returns the grounded rule. Params that remain referenced (e.g. a fn
+   param applied to a rule var we can't pre-evaluate) are left in place;
+   the caller passes only those through `:in`."
+  [rule in-params in-args]
+  (let [pmap    (zipmap in-params in-args)
+        fn-vars (set (keep (fn [[k v]] (when (fn? v) k)) pmap))
+        subst   (fn subst [form]
+                  (cond
+                    (and (symbol? form) (contains? pmap form) (not (fn-vars form)))
+                    (get pmap form)
+                    (vector? form) (mapv subst form)
+                    (seq? form)    (apply list (map subst form))
+                    :else form))
+        eval-clause (fn [clause]
+                      (if (and (vector? clause) (= 2 (count clause)) (seq? (first clause)))
+                        (let [call  (first clause)
+                              f-sym (first call)
+                              cargs (rest call)]
+                          (if (and (symbol? f-sym) (fn-vars f-sym)
+                                   (every? (complement symbol?) cargs))
+                            [(list 'ground (apply (get pmap f-sym) cargs)) (second clause)]
+                            clause))
+                        clause))]
+    (mapv (fn [branch]
+            (into [(first branch)]
+                  (map (comp eval-clause subst) (rest branch))))
+          rule)))
+
+(defn materialize-recursive-rows!
+  "Execute-time counterpart for a DEFERRED recursive CTE (see
+   materialize-recursive-cte!): ground the now-bound params into the rule
+   (in-args already substituted by resolve-param-refs), run it to a fixed
+   point, coerce the rows to the parse-time `col-types`, and db-with the
+   data into `db` (whose schema already carries the CTE attrs from parse).
+   Returns the data-enriched db; on rule-eval failure returns `db` unchanged
+   so the outer query degrades to an empty CTE rather than crashing."
+  [{:keys [rule rule-name rule-vars col-names col-types in-params in-args
+           target-name row-marker]} db]
+  (try
+    (let [grounded   (ground-rule-params rule in-params in-args)
+          ;; Keep only params still referenced after grounding.
+          referenced (set (filter symbol? (tree-seq coll? seq grounded)))
+          pmap       (zipmap in-params in-args)
+          rem-params (filterv referenced in-params)
+          rem-args   (mapv pmap rem-params)
+          rows (run-recursive-rule db grounded rule-name rule-vars rem-params rem-args)
+          data-tx (recursive-data-tx rows col-names col-types target-name row-marker)]
+      (if (seq data-tx) (d/db-with db data-tx) db))
+    (catch Throwable _ db)))
+
 (defn materialize-recursive-cte!
   "Run a WITH RECURSIVE CTE rule to a fixed point and materialize the
    resulting rows into a speculative db under `:<target-name>/<col>`
@@ -4066,80 +4830,259 @@
    so callers (parse-sql) can swap implementations based on
    `(.isRecursive wi)`.
 
+   When the CTE is parameterised (a `$n` appears in its body, so `in-args`
+   carries ParamRef sentinels that aren't bound until Bind), DATA can't be
+   produced at parse time. We then enrich only the SCHEMA (column attrs,
+   with value-types inferred from the anchor branch) and return a
+   `:deferred` spec; the server re-runs the rule at Execute via
+   materialize-recursive-rows! once the params are bound.
+
    Reuses `translate-recursive-cte` for the rule construction; rule
    eval here is the SELECT counterpart of `build-update-with-recursive-tx`
    in the server."
   [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
-  (let [{:keys [rule rule-name col-names rule-vars in-params in-args]}
+  (let [{:keys [rule rule-name col-names rule-vars in-params in-args anchor]}
         (translate-recursive-cte wi schema db)
-        rule-call (apply list rule-name rule-vars)
-        q {:find  rule-vars
-           :in    (into '[$ %] in-params)
-           :where [rule-call]}
-        ;; Force the query planner on regardless of caller context.
-        ;; Datahike's legacy engine can't evaluate the recursive bodies
-        ;; that `translate-recursive-cte` emits (head var bound through
-        ;; a function op then filtered by a predicate — see datahike PR
-        ;; #825). Server.execute already binds *force-legacy* false,
-        ;; but parse-sql is also reachable from the REPL and tests, so
-        ;; we re-establish the binding locally to keep the recursive
-        ;; CTE path correct under any caller.
-        ;;
-        ;; `db` is the snapshot the caller already passed in
-        ;; (parse-sql captures it at handler entry); we never re-deref
-        ;; the connection here, so the rule sees a consistent state.
-        rows (binding [dq/*force-legacy* false]
-               (apply d/q q db rule in-args))
-        with-fn d/db-with
         row-marker (pgs/row-marker-attr target-name)
-        col-types (mapv (fn [i]
-                          (let [samples (keep #(nth (vec %) i nil) rows)
-                                vtypes  (into #{} (map infer-recursive-vtype) samples)]
-                            (cond
-                              (empty? vtypes)         :db.type/string
-                              (= 1 (count vtypes))    (first vtypes)
-                              ;; Mixed numerics → bigdec; anything else → string.
-                              (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes)
-                              :db.type/bigdec
-                              :else :db.type/string)))
-                        (range (count col-names)))
-        coerce (fn [vtype]
-                 (case vtype
-                   :db.type/long   (fn [v] (if (instance? Long v) v (long v)))
-                   :db.type/double (fn [v] (if (instance? Double v) v (double v)))
-                   :db.type/bigdec (fn [v]
-                                     (cond
-                                       (instance? java.math.BigDecimal v) v
-                                       (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                                       (integer? v) (java.math.BigDecimal/valueOf (long v))
-                                       (float? v)   (java.math.BigDecimal/valueOf (double v))
-                                       :else (java.math.BigDecimal. (str v))))
-                   :db.type/string str
-                   identity))
-        coercions (mapv coerce col-types)
-        schema-tx (conj
-                   (vec (for [[i c] (map-indexed vector col-names)]
-                          {:db/ident       (keyword target-name c)
-                           :db/valueType   (nth col-types i)
-                           :db/cardinality :db.cardinality/one}))
-                   {:db/ident       row-marker
-                    :db/valueType   :db.type/boolean
-                    :db/cardinality :db.cardinality/one})
-        spec-db (with-fn db schema-tx)
-        data-tx (vec (for [row rows]
-                       (let [vs (vec row)
-                             cols (into {} (keep-indexed
-                                            (fn [i c]
-                                              (let [v (nth vs i nil)]
-                                                (when (some? v)
-                                                  [(keyword target-name c)
-                                                   ((nth coercions i) v)])))
-                                            col-names))]
-                         (assoc cols row-marker true))))
-        spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
-    {:db      spec-db2
-     :schema  (:schema spec-db2)
-     :name    target-name
-     :alias   target-name
-     :aliases col-names}))
+        ;; ParamRef sentinels in in-args ⇒ the anchor/recursive body
+        ;; references a `$n` not bound until Bind. Defer data to Execute.
+        deferred? (boolean (some params/param-ref? in-args))]
+    (if deferred?
+      (let [col-types (anchor-col-vtypes anchor col-names schema db)
+            schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+            spec-db   (d/db-with db schema-tx)]
+        {:db      spec-db
+         :schema  (:schema spec-db)
+         :name    target-name
+         :alias   target-name
+         :aliases col-names
+         :deferred {:rule rule :rule-name rule-name :rule-vars rule-vars
+                    :col-names col-names :col-types col-types
+                    :in-params in-params :in-args in-args
+                    :target-name target-name :row-marker row-marker}})
+      ;; No params — materialise data now (column types from the rows).
+      (let [rows (run-recursive-rule db rule rule-name rule-vars in-params in-args)
+            col-types (mapv (fn [i]
+                              (let [samples (keep #(nth (vec %) i nil) rows)
+                                    vtypes  (into #{} (map infer-recursive-vtype) samples)]
+                                (cond
+                                  (empty? vtypes)         :db.type/string
+                                  (= 1 (count vtypes))    (first vtypes)
+                                  ;; Mixed numerics → bigdec; anything else → string.
+                                  (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes)
+                                  :db.type/bigdec
+                                  :else :db.type/string)))
+                            (range (count col-names)))
+            schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+            spec-db (d/db-with db schema-tx)
+            data-tx (recursive-data-tx rows col-names col-types target-name row-marker)
+            spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
+        {:db      spec-db2
+         :schema  (:schema spec-db2)
+         :name    target-name
+         :alias   target-name
+         :aliases col-names}))))
+
+(defn- recursive-cte-branches
+  "Split a WITH RECURSIVE item into [anchor recursive] PlainSelects, or nil
+   if it isn't the expected `<anchor> UNION [ALL] <recursive>` shape."
+  [^net.sf.jsqlparser.statement.select.WithItem wi]
+  (let [select (let [s (.getSelect wi)]
+                 (if (instance? ParenthesedSelect s)
+                   (.getSelect ^ParenthesedSelect s) s))]
+    (when (instance? SetOperationList select)
+      (let [selects (.getSelects ^SetOperationList select)]
+        (when (and (= 2 (count selects))
+                   (instance? PlainSelect (first selects))
+                   (instance? PlainSelect (second selects)))
+          [(first selects) (second selects)])))))
+
+(defn- visible-query-rows
+  "Run a translate-select result's :query against `exec-db`, dropping any
+   hidden trailing columns (entity/order-by vars), and return row vectors."
+  [{:keys [query in-args hidden-count]} exec-db]
+  (let [vis (- (count (:find query)) (or hidden-count 0))
+        raw (if (seq in-args)
+              (apply d/q query exec-db in-args)
+              (d/q query exec-db))]
+    (mapv (fn [r] (let [v (if (sequential? r) (vec r) [r])] (vec (take vis v))))
+          raw)))
+
+(defn materialize-recursive-iterative!
+  "FALLBACK recursive-CTE evaluator (B1): semi-naive iteration instead of a
+   single Datalog rule. Used when materialize-recursive-cte!'s rule encoding
+   can't represent the body (LEFT JOIN → not-join, correlated subqueries,
+   nested recursion — e.g. asyncpg's typeinfo introspection).
+
+   Runs the anchor as an ordinary SELECT, materialises its rows under
+   `:<target>/<col>`, then repeatedly runs the recursive branch — translated
+   once against the seeded virtual table — folding NOVEL rows back in until a
+   fixed point. Each iteration is a plain query the engine already handles.
+
+   Parameterised CTEs are DEFERRED to Execute (B2-style): when the anchor has
+   a `$n` and a real FROM clause (asyncpg's `FROM {typeinfo} ti WHERE
+   ti.oid = any($1)`), only the schema is enriched at parse and a `:deferred`
+   {:kind :iterative …} spec is returned; the server runs the anchor with the
+   bound params and iterates at Execute (materialize-recursive-iterative-rows!).
+
+   Returns the standard {:db :schema :name :alias :aliases [:deferred]} map, or
+   nil when it can't apply: a non-`UNION` shape, a parameterised TABLE-FREE
+   anchor (`SELECT $1::int` — the param constant-folds in translation, so the
+   rule path / B2 must own it), or any translation/eval failure."
+  [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
+  (try
+    (when-let [[anchor recursive] (recursive-cte-branches wi)]
+      (let [col-list  (.getWithItemList wi)
+            col-names (mapv (fn [item]
+                              (let [expr (.getExpression ^SelectItem item)]
+                                (unquote-ident
+                                 (if (instance? Column expr)
+                                   (.getColumnName ^Column expr)
+                                   (str expr)))))
+                            col-list)
+            row-marker (pgs/row-marker-attr target-name)
+            ;; AST-level param detection (robust to translation constant-folding
+            ;; a table-free `$n` cast). A parameterised CTE can't run its anchor
+            ;; at parse, so we defer — unless the anchor has no FROM (table-free
+            ;; `SELECT $1::int`), where the param folds away and the rule/B2
+            ;; path resolves it correctly; bail to that.
+            anchor-param? (boolean (seq (params/ast-param-indices anchor)))
+            param? (or anchor-param?
+                       (boolean (seq (params/ast-param-indices recursive))))
+            anchor-from (.getFromItem ^PlainSelect anchor)
+            mk-data-tx (fn [coercions rows]
+                         (vec (for [row rows]
+                                (assoc (into {} (keep-indexed
+                                                 (fn [i c]
+                                                   (let [v (nth row i nil)]
+                                                     (when (and (some? v) (not= :__null__ v))
+                                                       [(keyword target-name c) ((nth coercions i) v)])))
+                                                 col-names))
+                                       row-marker true))))]
+        (cond
+          ;; Table-free parameterised anchor → rule/B2 owns it.
+          (and param? anchor-param? (nil? anchor-from))
+          nil
+
+          ;; Parameterised (table-full) → defer data to Execute. Enrich only the
+          ;; schema now; column types come from the anchor's inferred OIDs.
+          param?
+          (let [anchor-parsed (translate-select anchor schema db)
+                anchor-oids (:select-item-oids anchor-parsed)
+                col-types (mapv (fn [i]
+                                  (or (some-> (nth anchor-oids i nil) types/dh-type-for-oid)
+                                      :db.type/string))
+                                (range (count col-names)))
+                ;; Array columns (e.g. typeinfo_tree.attrtypoids from the
+                ;; {typeinfo} array_agg) carry their element kw so the CTE
+                ;; column's OID is T[] — the values arrive as canonical PG text.
+                col-array-elems (mapv (fn [i]
+                                        (some-> (nth anchor-oids i nil)
+                                                types/array-oid->element-oid
+                                                types/oid->elem-kw))
+                                      (range (count col-names)))
+                ;; :pg/type per column to round-trip the OID: array "_T", or the
+                ;; OID-preserving scalars char/oid (e.g. typeinfo_tree.kind =
+                ;; typtype is char — asyncpg needs it decoded as bytes b'c' to
+                ;; recognise the composite, not the str 'c').
+                col-pg-types (mapv (fn [i]
+                                     (if-let [ae (nth col-array-elems i)]
+                                       (str "_" (name ae))
+                                       (get types/oid-preserving-pg-name (nth anchor-oids i nil))))
+                                   (range (count col-names)))
+                schema-tx (recursive-schema-tx target-name col-names col-types row-marker col-array-elems col-pg-types)
+                spec0 (d/db-with db schema-tx)
+                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
+                             (translate-select recursive (:schema spec0) spec0))]
+            {:db spec0 :schema (:schema spec0) :name target-name
+             :alias target-name :aliases col-names
+             :deferred {:kind :iterative
+                        :target-name target-name :row-marker row-marker
+                        :col-names col-names :col-types col-types
+                        :anchor (select-keys anchor-parsed [:query :in-args :hidden-count :enriched-db])
+                        :recursive (select-keys rec-parsed [:query :in-args :hidden-count :enriched-db])}})
+
+          ;; No params — materialise now.
+          :else
+          (let [anchor-parsed (translate-select anchor schema db)
+                anchor-edb  (or (:enriched-db anchor-parsed) db)
+                anchor-rows (visible-query-rows anchor-parsed anchor-edb)
+                anchor-oids (:select-item-oids anchor-parsed)
+                col-types (mapv (fn [i]
+                                  (let [samples (keep #(nth % i nil) anchor-rows)
+                                        vtypes  (into #{} (map infer-recursive-vtype) samples)]
+                                    (cond
+                                      (= 1 (count vtypes)) (first vtypes)
+                                      (and (seq vtypes)
+                                           (every? #{:db.type/long :db.type/double :db.type/bigdec} vtypes))
+                                      :db.type/bigdec
+                                      (seq vtypes) :db.type/string
+                                      :else (or (some-> (nth anchor-oids i nil) types/dh-type-for-oid)
+                                                :db.type/string))))
+                                (range (count col-names)))
+                coercions (mapv recursive-coercion col-types)
+                schema-tx (recursive-schema-tx target-name col-names col-types row-marker)
+                spec0 (d/db-with (d/db-with db schema-tx) (mk-data-tx coercions anchor-rows))
+                rec-parsed (binding [*cte-relations* #{(str/lower-case target-name)}]
+                             (translate-select recursive (:schema spec0) spec0))]
+            (loop [cur spec0, seen (set anchor-rows), i 0]
+              (if (> i 100000)
+                {:db cur :schema (:schema cur) :name target-name
+                 :alias target-name :aliases col-names}
+                (let [rows  (visible-query-rows rec-parsed cur)
+                      novel (vec (remove seen rows))]
+                  (if (empty? novel)
+                    {:db cur :schema (:schema cur) :name target-name
+                     :alias target-name :aliases col-names}
+                    (recur (d/db-with cur (mk-data-tx coercions novel))
+                           (into seen novel) (inc i))))))))))
+    (catch Throwable _ nil)))
+
+(defn materialize-recursive-iterative-rows!
+  "Execute-time materialisation for a DEFERRED iterative recursive CTE (see
+   materialize-recursive-iterative!). `spec` is the :deferred map with its
+   anchor/recursive :in-args already param-substituted by resolve-param-refs.
+   Runs the anchor against its parse-time enriched-db, folds the rows into the
+   recursive branch's enriched-db (which carries the CTE schema + any derived
+   tables it referenced), and iterates to a fixed point. The recursive step is
+   TOLERANT — if an iteration throws (e.g. an array-membership join the engine
+   can't resolve), we stop and keep what we have (asyncpg needs only the anchor
+   rows for a composite of core-typed fields). Returns the data-enriched db
+   (the caller's query-db, whose schema already has the CTE attrs); on anchor
+   failure returns `db` unchanged."
+  [{:keys [anchor recursive col-names col-types target-name row-marker]} db]
+  (try
+    (let [coercions (mapv recursive-coercion col-types)
+          mk-data-tx (fn [rows]
+                       (vec (for [row rows]
+                              (assoc (into {} (keep-indexed
+                                               (fn [i c]
+                                                 (let [v (nth row i nil)]
+                                                   (when (and (some? v) (not= :__null__ v))
+                                                     [(keyword target-name c) ((nth coercions i) v)])))
+                                               col-names))
+                                     row-marker true))))
+          anchor-edb  (or (:enriched-db anchor) db)
+          anchor-rows (visible-query-rows anchor anchor-edb)
+          ;; The recursive branch was translated against a schema-only spec
+          ;; whose :enriched-db carries the CTE attrs + any derived tables it
+          ;; referenced; seed it with the (param-bound) anchor rows.
+          rec-base    (or (:enriched-db recursive) db)
+          base        (d/db-with rec-base (mk-data-tx anchor-rows))]
+      ;; Bounded recursion: a type-dependency chain is shallow, and a result
+      ;; column like typeinfo_tree.depth makes a type re-derived via a longer
+      ;; path a DISTINCT row, so a deep/correlated body can keep producing
+      ;; "novel" rows over the whole catalog. The cap keeps Execute responsive;
+      ;; for asyncpg the ANCHOR rows are what build the codec (dependent
+      ;; core-type rows are resolved from its builtin codecs), so a partial
+      ;; recursion is still correct for the cases that matter.
+      (loop [cur base, seen (set anchor-rows), i 0]
+        (if (>= i 64)
+          cur
+          (let [rows  (try (visible-query-rows recursive cur) (catch Throwable _ :stop))
+                novel (when (not= rows :stop) (vec (remove seen rows)))]
+            (if (or (= rows :stop) (empty? novel))
+              cur
+              (recur (d/db-with cur (mk-data-tx novel)) (into seen novel) (inc i)))))))
+    (catch Throwable _ db)))
 

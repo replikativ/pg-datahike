@@ -201,11 +201,28 @@
     [{:db/ident :pg_type/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typlen :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_type/typtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; typtype is PG's "char" (OID 18): clients (asyncpg's is_scalar_type)
+     ;; binary-decode it to a single byte, so advertise OID 18 not text.
+     {:db/ident :pg_type/typtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     ;; typelem: element type OID for array types (0 for scalars). Clients
+     ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
+     {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; typdelim: element delimiter (',' for all but a few types). asyncpg's
+     ;; typeinfo reads elem_t.typdelim and does `elemdelim[0]` while BUILDING an
+     ;; array codec — a null there throws and the whole composite fails to
+     ;; resolve. PG "char" (OID 18), like typtype.
+     {:db/ident :pg_type/typdelim :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     ;; typnamespace: asyncpg's type-introspection INNER JOINs pg_namespace
+     ;; on it, so every type must carry one (all in `public` = 2200).
+     {:db/ident :pg_type/typnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
     [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_attribute/atttypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; atttypid is PG's `oid` type — declare it so `array_agg(atttypid)`
+     ;; (asyncpg's typeinfo attrtypoids) infers oid[] (1028), the array type
+     ;; asyncpg core-registers. Reporting int8[] (1016) made asyncpg loop
+     ;; forever re-introspecting the unregistered array codec.
+     {:db/ident :pg_attribute/atttypid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident :pg_attribute/attnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      ;; Integer OID matching pg_class.oid so pgjdbc's
      ;; `pg_class c JOIN pg_attribute a ON c.oid = a.attrelid` works.
@@ -221,6 +238,9 @@
      ;; reports for plain `NUMERIC` or `TEXT` columns. Drives
      ;; information_schema.columns.numeric_precision / numeric_scale.
      {:db/ident :pg_attribute/atttypmod :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; attisdropped: asyncpg's composite-field introspection filters
+     ;; `NOT ia.attisdropped`, so the column must exist (always false here).
+     {:db/ident :pg_attribute/attisdropped :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attribute") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_namespace"
     [{:db/ident :pg_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -246,6 +266,9 @@
      {:db/ident :pg_class/relname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_class/relnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_class/relkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; reltype: the pg_type OID of this relation's composite row-type.
+     ;; asyncpg joins composite pg_type → pg_class on `c.reltype = t.oid`.
+     {:db/ident :pg_class/reltype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_class") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_index"
@@ -469,14 +492,34 @@
   [table-name user-schema cte-db]
   (case table-name
     "pg_type"
-    (mapv (fn [[oid tname tlen ttype]]
-            {:pg_type/oid (Long/parseLong oid) :pg_type/typname tname
-             :pg_type/typlen (Long/parseLong tlen) :pg_type/typtype ttype
-             (pgs/row-marker-attr "pg_type") true})
-          [["16" "bool" "1" "b"] ["20" "int8" "8" "b"] ["23" "int4" "4" "b"]
-           ["25" "text" "-1" "b"] ["700" "float4" "4" "b"] ["701" "float8" "8" "b"]
-           ["1043" "varchar" "-1" "b"] ["1082" "date" "4" "b"]
-           ["1114" "timestamp" "8" "b"] ["2950" "uuid" "16" "b"]])
+    ;; Full base + array type set from the central registry (types/pg-type-
+    ;; catalog) — including oid 26 (oid), name, numeric, json/jsonb, time/
+    ;; interval and the _T[] array types. The previous hardcoded 10-row list
+    ;; omitted most, so client type-introspection (e.g. asyncpg's
+    ;; set_type_codec → TYPE_BY_OID) failed with "unknown type pg_catalog.X".
+    ;; typelem is the element OID for array types (typname "_int4" → int4's
+    ;; oid), 0 for scalars.
+    (let [name->oid (into {} (map (fn [[o n _ _]] [n o])) types/pg-type-catalog)
+          base (mapv (fn [[oid tname tlen ttype]]
+                       (let [elem (when (str/starts-with? tname "_")
+                                    (name->oid (subs tname 1)))]
+                         {:pg_type/oid (long oid) :pg_type/typname tname
+                          :pg_type/typlen (long tlen) :pg_type/typtype ttype
+                          :pg_type/typelem (long (or elem 0))
+                          :pg_type/typdelim ","
+                          :pg_type/typnamespace 2200
+                          (pgs/row-marker-attr "pg_type") true}))
+                     types/pg-type-catalog)
+          ;; User composite types (CREATE TYPE … AS (..)) — typtype 'c',
+          ;; variable length, namespace public.
+          composites (mapv (fn [{:keys [name oid]}]
+                             {:pg_type/oid oid :pg_type/typname name
+                              :pg_type/typlen -1 :pg_type/typtype "c"
+                              :pg_type/typelem 0 :pg_type/typdelim ","
+                              :pg_type/typnamespace 2200
+                              (pgs/row-marker-attr "pg_type") true})
+                           (pgs/composite-types cte-db))]
+      (into base composites))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
@@ -488,37 +531,52 @@
                                   :where [[?e :db/ident ?ident]
                                           [?e :pg/typmod ?typmod]]}
                                 cte-db)))]
-      (vec (for [[tname {:keys [columns]}] (sort-by key tables)
-                 [idx col] (map-indexed vector columns)
-                 :let [tbl-oid (or (pgs/table-oid cte-db tname)
+      (into
+       ;; composite-type fields: attrelid = the composite's pg_class oid
+       ;; (= its type oid here); atttypid = each field's PG type OID.
+       (vec (for [{:keys [oid fields]} (pgs/composite-types cte-db)
+                  [idx f] (map-indexed vector fields)]
+              {:pg_attribute/attname (:field-name f)
+               :pg_attribute/atttypid (long (:oid f))
+               :pg_attribute/attnum (long (inc idx))
+               :pg_attribute/attrelid (long oid)
+               :pg_attribute/attnotnull false
+               :pg_attribute/attidentity ""
+               :pg_attribute/atttypmod -1
+               :pg_attribute/attisdropped false
+               (pgs/row-marker-attr "pg_attribute") true}))
+       (for [[tname {:keys [columns]}] (sort-by key tables)
+             [idx col] (map-indexed vector columns)
+             :let [tbl-oid (or (pgs/table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
                                    ;; started tracking :pg/table-oid — fall
                                    ;; back to the attnum-derived composite
                                    ;; key convention (name → hash) so stale
                                    ;; data still has a stable attrelid.
-                                   (Math/abs (.hashCode ^String tname)))
-                       pk? (= :db.unique/identity (:unique col))
+                               (Math/abs (.hashCode ^String tname)))
+                   pk? (= :db.unique/identity (:unique col))
                        ;; -1 = unconstrained (real PG's default for
                        ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
                        ;; columns get a positive value via DDL.
-                       typmod (long (or (get typmods (:attr col)) -1))]]
-             {:pg_attribute/attname (:name col)
+                   typmod (long (or (get typmods (:attr col)) -1))]]
+         {:pg_attribute/attname (:name col)
               ;; Cardinality-many columns project as PG arrays, so
               ;; their atttypid must be the array OID — pgjdbc reads
               ;; this for ResultSetMetaData and the field-metadata
               ;; cache key. Mirrors the OID inference in
               ;; oid-infer/column-oid.
-              :pg_attribute/atttypid
-              (long (let [base (pgs/oid-for-valuetype (:valuetype col))]
-                      (if (= :db.cardinality/many (:cardinality col))
-                        (get types/element-oid->array-oid base types/oid-text-array)
-                        base)))
-              :pg_attribute/attnum (long (inc idx))
-              :pg_attribute/attrelid (long tbl-oid)
-              :pg_attribute/attnotnull pk?
-              :pg_attribute/attidentity ""
-              :pg_attribute/atttypmod typmod
-              (pgs/row-marker-attr "pg_attribute") true})))
+          :pg_attribute/atttypid
+          (long (let [base (pgs/oid-for-valuetype (:valuetype col))]
+                  (if (= :db.cardinality/many (:cardinality col))
+                    (get types/element-oid->array-oid base types/oid-text-array)
+                    base)))
+          :pg_attribute/attnum (long (inc idx))
+          :pg_attribute/attrelid (long tbl-oid)
+          :pg_attribute/attnotnull pk?
+          :pg_attribute/attidentity ""
+          :pg_attribute/atttypmod typmod
+          :pg_attribute/attisdropped false
+          (pgs/row-marker-attr "pg_attribute") true})))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
       (pgs/row-marker-attr "pg_namespace") true}]
@@ -627,15 +685,27 @@
            ["pg_database_size" "v" 1 20 "19"]
            ["pg_table_size" "v" 1 20 "26"]])
     "pg_class"
-    (mapv (fn [t]
-            (let [tbl-oid (or (pgs/table-oid cte-db t)
-                              (Math/abs (.hashCode ^String t)))]
-              {:pg_class/oid (long tbl-oid)
-               :pg_class/relname t
-               :pg_class/relnamespace 2200
-               :pg_class/relkind "r"
-               (pgs/row-marker-attr "pg_class") true}))
-          (pgs/table-names user-schema))
+    (into
+     (mapv (fn [t]
+             (let [tbl-oid (or (pgs/table-oid cte-db t)
+                               (Math/abs (.hashCode ^String t)))]
+               {:pg_class/oid (long tbl-oid)
+                :pg_class/relname t
+                :pg_class/relnamespace 2200
+                :pg_class/relkind "r"
+                (pgs/row-marker-attr "pg_class") true}))
+           (pgs/table-names user-schema))
+     ;; composite types get a pg_class row (relkind 'c'); asyncpg joins
+     ;; pg_type → pg_class on `reltype = type-oid`, and pg_attribute on
+     ;; `attrelid = pg_class.oid`. We use the type OID for both.
+     (mapv (fn [{:keys [name oid]}]
+             {:pg_class/oid oid
+              :pg_class/relname name
+              :pg_class/relnamespace 2200
+              :pg_class/relkind "c"
+              :pg_class/reltype oid
+              (pgs/row-marker-attr "pg_class") true})
+           (pgs/composite-types cte-db)))
     "pg_tables"
     (mapv (fn [t]
             {:pg_tables/schemaname "public"
@@ -1220,6 +1290,16 @@
     :declare-cursor :fetch-cursor :close-cursor :move-cursor
     :begin :commit :savepoint :release-savepoint :rollback-to-savepoint
     :discard-all :discard-scoped
+    ;; RESET ALL / RESET <var> (datahike.* + statement_timeout RESETs are
+    ;; intercepted earlier in the simple-query path; everything else
+    ;; lands on the :reset handler). LISTEN/UNLISTEN/NOTIFY are no-ops
+    ;; (no notification delivery) — UNLISTEN especially must bypass
+    ;; JSqlParser, which can't parse it. All hit asyncpg's pool reset.
+    :reset :listen-noop :unlisten-noop :notify-noop
+    ;; Transaction isolation level: SET SESSION CHARACTERISTICS … and
+    ;; SET [LOCAL] TRANSACTION ISOLATION LEVEL … track the session/tx
+    ;; isolation that SHOW transaction_isolation must report back.
+    :set-session-isolation :set-transaction-isolation
     :version :now :current-schema :current-database
     :pg-keywords :nextval :currval :setval
     :try-advisory-xact-lock :try-advisory-lock
@@ -1230,7 +1310,7 @@
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.
-    :create-type-enum :create-domain
+    :create-type-enum :create-type-composite :create-domain
     ;; pg_dump-emitted utility statements we silently accept
     :owner-noop :psql-meta :set-config
     ;; COPY-IN routes through the wire-protocol sub-protocol; the

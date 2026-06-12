@@ -45,6 +45,7 @@
             [datahike.pg.sql.oid-infer :as oid-infer]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.records :as pg-rec]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.coerce :as coerce]
@@ -172,6 +173,20 @@
                (mapv #(ctx/materialize-arg! ctx %) raw-args))
         result-var (ctx/fresh-var! ctx)]
     (cond
+      ;; ROW(a, b, …) — anonymous composite constructor. JSqlParser parses
+      ;; it as a Function named "row". Build a PgRecord at runtime from the
+      ;; field values, inferring each field's OID from its value (nested
+      ;; ROW → another PgRecord → record OID 2249). A ::type cast wrapping
+      ;; the ROW retypes it to the named composite; here it stays anonymous.
+      (= fname "row")
+      (let [fn-param (symbol (str "?row" (swap! (:var-counter ctx) inc)))
+            row-fn   (fn [& vals] (pg-rec/make-record types/infer-oid-from-value (vec vals)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj row-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; PG privilege-check functions (has_*_privilege). We run without
       ;; a privilege model — one user, one schema, all granted — so
       ;; return `true` unconditionally. Metabase's describe-database
@@ -1509,6 +1524,7 @@
         cast-cat (types/cast-category type-str)
         is-int? (= :integer cast-cat)
         is-float? (= :float cast-cat)
+        is-numeric? (= :numeric cast-cat)
         is-text? (= :text cast-cat)
         is-bool? (= :boolean cast-cat)
         is-date? (= :date cast-cat)
@@ -1534,7 +1550,15 @@
                         (= :__null__ v)       :__null__
                         (pg-arr/array? v)     (pg-arr/array (or target-elem (:elem-type v))
                                                             (:elements v))
-                        :else                 :__null__))
+                        ;; A bound array param arrives as canonical PG text
+                        ;; ("{16384}") or a Clojure collection — reconstruct it
+                        ;; (e.g. asyncpg sends `$1::oid[]` as binary oid[] which
+                        ;; the wire layer decodes to "{…}"). Without this the
+                        ;; cast returned NULL and `col = any($1)` matched nothing.
+                        :else                 (if-let [a (coerce-pg-array v target-elem)]
+                                                (pg-arr/array (or target-elem (:elem-type a))
+                                                              (:elements a))
+                                                :__null__)))
             result-var (ctx/fresh-var! ctx)
             inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
         (swap! (:in-params ctx) conj fn-param)
@@ -1547,6 +1571,11 @@
         (cond
           is-int?  (coerce/coerce-numeric inner-raw :long)
           is-float? (coerce/coerce-numeric inner-raw :double)
+          ;; ::numeric keeps arbitrary precision — parse via the string
+          ;; form so a literal's scale survives (0.001000 → scale 6),
+          ;; never via double (which would drop trailing zeros).
+          is-numeric? (try (java.math.BigDecimal. (str/trim (str inner-raw)))
+                           (catch Exception _ inner-raw))
           is-text? (str inner-raw)
           is-bool? (Boolean/parseBoolean (str inner-raw))
         ;; ::date — extract the LocalDate so serialization can omit the
@@ -1656,9 +1685,65 @@
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
               result-var)
 
+            ;; Numeric / boolean casts on a runtime value. The value may
+            ;; arrive as a String — e.g. an extended-protocol parameter
+            ;; (`$1::INTEGER`) is sent in text format, so inner-val is the
+            ;; String "0". A bare `(long "0")` raises a ClassCastException
+            ;; ("String cannot be cast to Number"), so route through the
+            ;; string-tolerant coerce helpers via an in-param fn, the same
+            ;; way the date/ts/uuid branches above do.
+            ;; ::numeric — preserve arbitrary precision / scale. The value
+            ;; may already be a BigDecimal (asyncpg sends numeric params in
+            ;; binary, decoded to BigDecimal) — keep it; a text param
+            ;; (node) parses via the string form so its scale survives.
+            ;; Never route through double, which drops precision.
+            is-numeric?
+            (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
+                  cast-fn (fn [v]
+                            (when (and (some? v) (not= :__null__ v))
+                              (cond
+                                (instance? java.math.BigDecimal v) v
+                                (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                :else (java.math.BigDecimal. (str/trim (str v))))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
+
+            (or is-int? is-float? is-bool?)
+            (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
+                  cast-fn (cond
+                            is-int?   (fn [v] (when (and (some? v) (not= :__null__ v))
+                                                (coerce/coerce-numeric v :long)))
+                            is-float? (fn [v] (when (and (some? v) (not= :__null__ v))
+                                                (coerce/coerce-numeric v :double)))
+                            :else     (fn [v] (when (and (some? v) (not= :__null__ v))
+                                                (if (boolean? v) v
+                                                    (coerce/parse-bool-token (str v))))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
+
             :else
-            (let [cast-fn (cond is-int? 'long is-float? 'double is-text? 'str is-bool? 'boolean :else 'str)]
-              (swap! (:where-clauses ctx) conj [(list cast-fn inner-val) result-var])))
+            ;; Text / unknown scalar cast → stringify. EXCEPT a PgRecord (a
+            ;; ROW(...) being cast to a named composite, e.g.
+            ;; `ROW(..)::test_composite`): keep the record so value->string
+            ;; emits canonical record_out text and the column's composite OID
+            ;; (from cast-oid) drives the binary codec. `str`-ing it would
+            ;; corrupt it to "…PgRecord@hash".
+            (let [fn-param (symbol (str "?cast-s" (swap! (:var-counter ctx) inc)))
+                  cast-fn  (fn [v]
+                             (cond
+                               (nil? v)           nil
+                               (= :__null__ v)    :__null__
+                               (pg-rec/record? v) v
+                               ;; bytea: keep the byte[] so value->string emits
+                               ;; PG hex `\x…` rather than the Java array toString.
+                               (bytes? v)         v
+                               :else              (str v)))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])))
           result-var)))))
 
 (def ^:private arith-op->null-safe

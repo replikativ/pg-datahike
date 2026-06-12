@@ -131,6 +131,60 @@
      :original-sql original-sql}))
 
 ;; ============================================================================
+;; CREATE TYPE … AS (composite)
+;; ============================================================================
+
+(defn- split-top-level-commas
+  "Split `s` on commas that are not nested inside parentheses, so a field
+   type like `numeric(10,2)` stays intact."
+  [s]
+  (loop [cs (seq s), depth 0, ^StringBuilder cur (StringBuilder.), out []]
+    (if-let [c (first cs)]
+      (cond
+        (= c \()            (recur (rest cs) (inc depth) (.append cur c) out)
+        (= c \))            (recur (rest cs) (max 0 (dec depth)) (.append cur c) out)
+        (and (= c \,) (zero? depth)) (recur (rest cs) depth (StringBuilder.) (conj out (.toString cur)))
+        :else               (recur (rest cs) depth (.append cur c) out))
+      (conj out (.toString cur)))))
+
+(defn- strip-quotes [s]
+  (if (and (> (count s) 1) (str/starts-with? s "\"") (str/ends-with? s "\""))
+    (subs s 1 (dec (count s)))
+    s))
+
+(defn- unqualify [s]
+  (if-let [d (str/last-index-of s ".")] (subs s (inc d)) s))
+
+(defn parse-create-type-composite
+  "Parse `CREATE TYPE [schema.]name AS (field type, …)` from the raw SQL
+   (the tokenizer doesn't model `[]`, so we work on the text). Returns:
+
+     {:type-name string                       ; unqualified, unquoted
+      :fields    [{:field-name string :pg-type string} …]  ; declaration order
+      :original-sql string}
+
+   Throws ex-info `:error :syntax-error` on malformed input."
+  [sql]
+  (let [m (re-find #"(?is)\bcreate\s+type\s+(.+?)\s+as\s*\((.*)\)\s*;?\s*$" sql)]
+    (when-not m
+      (throw (ex-info "malformed CREATE TYPE … AS (...)" {:error :syntax-error})))
+    (let [type-name (-> (nth m 1) str/trim strip-quotes unqualify strip-quotes)
+          fields (->> (split-top-level-commas (nth m 2))
+                      (map str/trim)
+                      (remove str/blank?)
+                      (mapv (fn [fs]
+                              (let [fm (re-find #"(?s)^(\"[^\"]+\"|[^\s]+)\s+(.+)$" fs)]
+                                (when-not fm
+                                  (throw (ex-info (str "bad composite field: " fs)
+                                                  {:error :syntax-error})))
+                                {:field-name (strip-quotes (nth fm 1))
+                                 :pg-type (str/trim (nth fm 2))}))))]
+      (when (empty? fields)
+        (throw (ex-info "composite type must have at least one field"
+                        {:error :syntax-error})))
+      {:type-name type-name :fields fields :original-sql sql})))
+
+;; ============================================================================
 ;; CREATE DOMAIN
 ;; ============================================================================
 

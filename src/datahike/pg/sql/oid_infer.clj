@@ -223,7 +223,10 @@
    ;; returns the input type. mode also returns the input type.
    "percentile_cont" types/oid-float8
    "percentile_disc" :arg-type
-   "mode"            :arg-type})
+   "mode"            :arg-type
+   ;; array_agg(x) → x's array OID; string_agg(x, sep) → text.
+   "array_agg"       :arg-array
+   "string_agg"      types/oid-text})
 
 ;; ---------------------------------------------------------------------------
 ;; Inference
@@ -330,6 +333,9 @@
     (cond
       (integer? rule)    rule
       (= rule :arg-type) input-oid
+      ;; array_agg(x) → x's array OID (text→text[], int4→int4[], …).
+      (= rule :arg-array) (when input-oid
+                            (get types/element-oid->array-oid input-oid types/oid-text-array))
       (map? rule)        (let [r (or (get rule input-oid)
                                      (get rule :default))]
                            (cond
@@ -358,6 +364,10 @@
         rule (or (get sql-aggregate->return-oid fname)
                  (get sql-fn->return-oid fname))]
     (cond
+      ;; ROW(...) — anonymous composite constructor → record OID (2249).
+      ;; A ::type cast wrapping it overrides via cast-oid.
+      (= fname "row") 2249
+
       ;; Aggregate rule (registered in sql-aggregate->return-oid) —
       ;; delegate to the shared resolver so runtime variant selection
       ;; (in stmt.clj) doesn't have to recompute the same logic.
@@ -370,26 +380,62 @@
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
       :else nil)))
 
+(defn- composite-name->oid
+  "Resolve a named composite type → its OID via the registry, or nil."
+  [type-str db]
+  (when (and type-str db)
+    (some (fn [{:keys [name oid]}] (when (= name type-str) oid))
+          (pgs/composite-types db))))
+
 (defn- cast-oid
   "Map a SQL CAST target type-name to an OID. Uses `types/cast-category`
    so the set of recognised target types stays in one place."
-  [^CastExpression c]
-  (let [type-str (some-> (.getColDataType c) .getDataType str str/lower-case)]
-    (case (types/cast-category type-str)
-      :integer   types/oid-int8
-      :float     types/oid-float8
-      :text      types/oid-text
-      :boolean   types/oid-bool
-      :date      types/oid-date
-      :time      types/oid-time
-      :timestamp (cond
-                   (re-find #"with time zone|timestamptz" type-str)
-                   types/oid-timestamptz
-                   :else types/oid-timestamp)
-      :uuid      types/oid-uuid
-      :bytes     types/oid-bytea
-      :bit       types/oid-text
-      nil)))
+  [^CastExpression c env]
+  (let [cdt      (.getColDataType c)
+        ;; .getDataType returns the BASE name ("int") and exposes the `[]`
+        ;; only via .getArrayData — so an array cast like `::int[]` must be
+        ;; detected here and wrapped to the element's array OID, else it
+        ;; reports the scalar (int4) and the binary array value mis-decodes.
+        type-str (some-> cdt .getDataType str str/lower-case)
+        ad       (when cdt (.getArrayData cdt))
+        array?   (and ad (pos? (.size ^java.util.List ad)))
+        scalar-oid
+        (or
+         (composite-name->oid type-str (:db env))
+         (case (types/cast-category type-str)
+      ;; Datahike stores every integer as a Clojure long, but an explicit
+      ;; CAST asserts a specific PG width — report the matching OID so
+      ;; clients parse the column correctly (e.g. node-postgres returns
+      ;; int4 as a JS number but int8 as a string). The wire bytes are
+      ;; identical in text mode; encodeBinary narrows the long to the
+      ;; declared width for binary clients.
+           :integer   (cond
+                        (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
+                        (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
+                        :else                                                    types/oid-int4)
+           :float     types/oid-float8
+           :numeric   types/oid-numeric
+           :text      types/oid-text
+           :boolean   types/oid-bool
+           :date      types/oid-date
+           :time      types/oid-time
+           :timestamp (cond
+                        (re-find #"with time zone|timestamptz" type-str)
+                        types/oid-timestamptz
+                        :else types/oid-timestamp)
+           :uuid      types/oid-uuid
+           :bytes     types/oid-bytea
+           :bit       types/oid-text
+           nil)
+         ;; Fallback for types cast-category doesn't width-classify (jsonb,
+         ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
+         ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
+         ;; and the binary value mis-decoded.
+         (get types/pg-name->oid type-str))]
+    (cond
+      (nil? scalar-oid) nil
+      array? (get types/element-oid->array-oid scalar-oid types/oid-text-array)
+      :else scalar-oid)))
 
 (defn- case-oid
   "CASE expression returns the type of its first non-nil branch. PG
@@ -511,7 +557,7 @@
           :else (get types/array-oid->element-oid container-oid types/oid-text)))
 
       ;; --- CAST ---------------------------------------------------------
-      (instance? CastExpression expr) (cast-oid expr)
+      (instance? CastExpression expr) (cast-oid expr env)
 
       ;; --- CASE ---------------------------------------------------------
       (instance? CaseExpression expr) (case-oid expr env)

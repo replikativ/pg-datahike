@@ -496,22 +496,40 @@
         rows (q-fn '{:find [?for-ident ?e]
                      :where [[?e :datahike.pg/for-ident ?for-ident]]}
                    db)
-        pull-fn d/pull]
-    (into {}
-          (keep (fn [[for-ident e]]
-                  (let [p (pull-fn db
-                                   '[:datahike.pg/column
-                                     :datahike.pg/hidden
-                                     :datahike.pg/references
-                                     :datahike.pg/table]
-                                   e)
-                        h (cond-> {}
-                            (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
-                            (:datahike.pg/hidden p)     (assoc :hidden true)
-                            (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
-                            (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
-                    (when (seq h) [for-ident h]))))
-          rows)))
+        pull-fn d/pull
+        ident-hints
+        (into {}
+              (keep (fn [[for-ident e]]
+                      (let [p (pull-fn db
+                                       '[:datahike.pg/column
+                                         :datahike.pg/hidden
+                                         :datahike.pg/references
+                                         :datahike.pg/table]
+                                       e)
+                            h (cond-> {}
+                                (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
+                                (:datahike.pg/hidden p)     (assoc :hidden true)
+                                (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
+                                (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
+                        (when (seq h) [for-ident h]))))
+              rows)
+        ;; The declared PG type (`:pg/type`) lives on the column-
+        ;; attribute entity itself, NOT on a :datahike.pg/for-ident hint
+        ;; entity, and the `(:schema db)` view doesn't surface custom
+        ;; attrs — so collect it via Datalog and fold it into the hint
+        ;; map keyed by the column attr. derive-virtual-tables* uses it
+        ;; to report the *declared* OID (e.g. int4) instead of the
+        ;; storage-type OID (int8 for :db.type/long). Without this, every
+        ;; int2/int4 column is advertised as int8, which breaks binary-
+        ;; format result decoding (asyncpg) and read-back typing.
+        pg-types (q-fn '{:find [?ident ?pt]
+                         :where [[?e :db/ident ?ident]
+                                 [?e :pg/type ?pt]]}
+                       db)]
+    (reduce (fn [acc [ident pt]]
+              (update acc ident assoc :pg-type pt))
+            ident-hints
+            pg-types)))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -572,6 +590,70 @@
         mx (if (seq used) (apply max used) (dec first-user-oid))]
     (inc mx)))
 
+(defn next-composite-oid
+  "Next unused OID for a user composite type. Shares the user-OID space
+   with tables (PG OIDs are global) so a composite and a table never
+   collide."
+  [db]
+  (let [used (into #{}
+                   (map first)
+                   (concat
+                    (d/q '{:find [?o] :where [[?e :datahike.pg.composite/oid ?o]]} db)
+                    (d/q '{:find [?o] :where [[?e :pg/table-oid ?o]]} db)))
+        mx (if (seq used) (apply max used) (dec first-user-oid))]
+    (inc mx)))
+
+(def ^:private sql-type->pg-name
+  "Normalize a SQL field type name (as written in CREATE TYPE) to the
+   canonical pg_type name used by `types/pg-name->oid`."
+  {"int" "int4" "integer" "int4" "int4" "int4" "serial" "int4"
+   "bigint" "int8" "int8" "int8" "bigserial" "int8"
+   "smallint" "int2" "int2" "int2"
+   "text" "text" "varchar" "varchar" "character varying" "varchar"
+   "char" "bpchar" "character" "bpchar" "bpchar" "bpchar" "name" "name"
+   "bool" "bool" "boolean" "bool"
+   "real" "float4" "float4" "float4"
+   "double precision" "float8" "float8" "float8" "double" "float8" "float" "float8"
+   "numeric" "numeric" "decimal" "numeric"
+   "uuid" "uuid" "date" "date" "time" "time"
+   "timestamp" "timestamp" "timestamptz" "timestamptz"
+   "json" "json" "jsonb" "jsonb" "bytea" "bytea" "oid" "oid"})
+
+(defn field-type->oid
+  "Map a composite/field SQL type string (e.g. \"int\", \"text\", \"int[]\",
+   \"numeric(10,2)\") to its PG type OID. Arrays map to the element's
+   array OID. Unknown scalars fall back to text."
+  [pg-type]
+  (let [s    (-> pg-type str/lower-case str/trim (str/replace #"\s*\([^)]*\)" ""))
+        arr? (str/ends-with? s "[]")
+        base (if arr? (str/trim (subs s 0 (- (count s) 2))) s)
+        nm   (get sql-type->pg-name base base)
+        oid  (get types/pg-name->oid nm types/oid-text)]
+    (if arr?
+      (get types/element-oid->array-oid oid types/oid-text-array)
+      oid)))
+
+(defn composite-types
+  "Read the user composite-type registry from `db`. Returns a vector of
+   {:name string :oid long :fields [{:field-name string :pg-type string
+   :oid long} …]} in field declaration order."
+  [db]
+  (when db
+    (->> (d/q '{:find [?n ?oid ?f]
+                :where [[?e :datahike.pg.composite/name ?n]
+                        [?e :datahike.pg.composite/oid ?oid]
+                        [?e :datahike.pg.composite/fields ?f]]}
+              db)
+         (mapv (fn [[n oid fields-str]]
+                 {:name n :oid (long oid)
+                  :fields (->> (clojure.string/split-lines fields-str)
+                               (remove clojure.string/blank?)
+                               (mapv (fn [line]
+                                       (let [[fname ftype] (clojure.string/split line #"\t" 2)]
+                                         {:field-name fname
+                                          :pg-type ftype
+                                          :oid (field-type->oid ftype)}))))})))))
+
 (declare derive-virtual-tables)
 
 (defn column-attnum
@@ -608,6 +690,18 @@
   (when-let [ns (namespace ident)]
     [ns (name ident)]))
 
+(defn- declared-col-oid
+  "OID a column should advertise. When the schema records an explicit
+   `:pg/type` for the attribute (threaded in via the hint map's
+   :pg-type), that declared type is authoritative — e.g. an int4 column
+   stored as :db.type/long must report int4 (23), not the storage type
+   int8 (20). Covers jsonb/json and native array types (`_int4` → 1007)
+   too, since they all resolve through the pg-name registry. Falls back
+   to the storage valueType's OID when no :pg/type is recorded."
+  [pg-type vtype]
+  (or (when pg-type (get types/pg-name->oid pg-type))
+      (oid-for-valuetype vtype)))
+
 (defn- derive-virtual-tables*
   [schema hints]
   (let [user-attrs (remove (fn [[k _]] (or (not (keyword? k))
@@ -623,7 +717,7 @@
                                    vtype (:db/valueType props)
                                    col {:name        col-name
                                         :attr        ident
-                                        :oid         (oid-for-valuetype vtype)
+                                        :oid         (declared-col-oid (:pg-type h) vtype)
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
                                         :unique      (:db/unique props)

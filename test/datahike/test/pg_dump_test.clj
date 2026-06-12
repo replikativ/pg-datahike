@@ -60,7 +60,9 @@
 (deftest dump-emits-primary-key
   (exec-sql "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
   (let [out (dump-text)]
-    (is (str/includes? out "\"id\" bigint NOT NULL PRIMARY KEY"))))
+    ;; INTEGER columns now round-trip as `integer` (the declared width is
+    ;; tracked via :pg/type "int4"), not the previously-lossy `bigint`.
+    (is (str/includes? out "\"id\" integer NOT NULL PRIMARY KEY"))))
 
 (deftest dump-emits-unique
   (exec-sql "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")

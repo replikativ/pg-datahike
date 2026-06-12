@@ -195,7 +195,15 @@
         scalar (cond
                  enum-of    enum-of
                  domain-of  domain-of
-                 pg-type    pg-type
+                 ;; :pg/type carries the OID-registry name (e.g. "int4",
+                 ;; "int2" for narrow integer columns). Emit the canonical
+                 ;; SQL spelling pg_dump uses so the dump replays cleanly
+                 ;; and diffs byte-for-byte against a real pg_dump.
+                 pg-type    (case pg-type
+                              "int4" "integer"
+                              "int2" "smallint"
+                              "int8" "bigint"
+                              pg-type)
                  array-elem (str (scalar-vtype->sql-type array-elem) "[]")
                  :else      (scalar-vtype->sql-type vtype))]
     (if cardinality-many?

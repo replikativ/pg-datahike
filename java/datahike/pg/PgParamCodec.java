@@ -73,10 +73,124 @@ public final class PgParamCodec {
         return ARRAY_TO_ELEM.containsKey(oid);
     }
 
+    // ========================================================================
+    // Composite (named row type) field-OID registry. Populated from Clojure
+    // (datahike.pg.composite/*) on CREATE TYPE and lazily at describe time so
+    // the binary record codec knows each field's OID — PG's record wire format
+    // is [int32 nfields][per field: int32 field-oid, int32 len(-1=NULL), bytes].
+    // The canonical record_out text we already produce carries the VALUES but
+    // not the per-field OIDs; this map supplies them.
+    // ========================================================================
+
+    private static final java.util.Map<Integer, int[]> COMPOSITE_FIELDS =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Register (or update) a composite type's ordered field OIDs. */
+    public static void registerComposite(int oid, int[] fieldOids) {
+        COMPOSITE_FIELDS.put(oid, fieldOids);
+    }
+
+    /** Ordered field OIDs for a registered composite, or null if unknown. */
+    public static int[] compositeFields(int oid) {
+        return COMPOSITE_FIELDS.get(oid);
+    }
+
+    // Per-value field-OID layout for ANONYMOUS records (record OID 2249), which
+    // have no composite registry. value->string registers a PgRecord's field
+    // OIDs keyed by its canonical record_out text (recursively for nested
+    // records) right before emitting it; encodeBinary(2249, text) looks it up.
+    // The canonical text uniquely determines the layout for a given ROW(...).
+    private static final java.util.Map<String, int[]> RECORD_LAYOUTS =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Register an anonymous record's field OIDs, keyed by its record_out text. */
+    public static void registerRecordLayout(String recordText, int[] fieldOids) {
+        RECORD_LAYOUTS.put(recordText, fieldOids);
+    }
+
+    /**
+     * Split a PG record_out text — `(f1,f2,...)` — into its field cells.
+     * A bare-empty field (nothing between the delimiters) is SQL NULL
+     * (returned as java null); a quoted field (even `""`) is a present value
+     * with its surrounding quotes removed and `""`/`\x` unescaped. Nested
+     * records/arrays arrive quoted and come back as their raw inner text
+     * (`(42,42)`, `{9,NULL,11}`) ready to recurse through encodeBinary.
+     * Returns null if the text isn't a parenthesised record.
+     */
+    static String[] parseRecordFields(String text) {
+        if (text == null) return null;
+        String s = text.trim();
+        if (s.length() < 2 || s.charAt(0) != '(' || s.charAt(s.length() - 1) != ')') return null;
+        s = s.substring(1, s.length() - 1);
+        java.util.List<String> fields = new java.util.ArrayList<>();
+        if (s.isEmpty()) return new String[0];
+        StringBuilder cur = new StringBuilder();
+        boolean inQuote = false, escape = false, quoted = false, hasContent = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (escape) { cur.append(c); escape = false; continue; }
+            if (inQuote) {
+                if (c == '\\') { escape = true; continue; }
+                if (c == '"') {
+                    if (i + 1 < s.length() && s.charAt(i + 1) == '"') { cur.append('"'); i++; continue; }
+                    inQuote = false; continue;
+                }
+                cur.append(c); continue;
+            }
+            if (c == '"') { inQuote = true; quoted = true; hasContent = true; continue; }
+            if (c == ',') {
+                fields.add((quoted || hasContent) ? cur.toString() : null);
+                cur.setLength(0); quoted = false; hasContent = false; continue;
+            }
+            cur.append(c); hasContent = true;
+        }
+        fields.add((quoted || hasContent) ? cur.toString() : null);
+        return fields.toArray(new String[0]);
+    }
+
+    /**
+     * Encode a record/composite to PG's binary wire format from its
+     * record_out text and the ordered field OIDs. Each non-NULL field is
+     * encoded by recursing into {@link #encodeBinary} (so nested records,
+     * arrays and scalars all work). Returns null on any field-count mismatch
+     * or unsupported field type — the caller then falls back to text.
+     */
+    static byte[] encodeRecordBinary(int[] fieldOids, String text) {
+        String[] cells = parseRecordFields(text);
+        if (cells == null || cells.length != fieldOids.length) return null;
+        byte[][] fb = new byte[cells.length][];
+        for (int i = 0; i < cells.length; i++) {
+            if (cells[i] == null) { fb[i] = null; continue; }
+            byte[] enc = encodeBinary(fieldOids[i], cells[i]);
+            if (enc == null) return null;   // unsupported field type
+            fb[i] = enc;
+        }
+        int total = 4;
+        for (byte[] b : fb) total += 4 + 4 + (b == null ? 0 : b.length);
+        ByteBuffer buf = ByteBuffer.allocate(total).order(ByteOrder.BIG_ENDIAN);
+        buf.putInt(fieldOids.length);
+        for (int i = 0; i < fb.length; i++) {
+            buf.putInt(fieldOids[i]);
+            if (fb[i] == null) buf.putInt(-1);
+            else { buf.putInt(fb[i].length); buf.put(fb[i]); }
+        }
+        return buf.array();
+    }
+
     /** Returns the scalar T element OID for `_T`, or -1 if not an array OID. */
     public static int elementOidOf(int arrayOid) {
         Integer e = ARRAY_TO_ELEM.get(arrayOid);
         return e == null ? -1 : e.intValue();
+    }
+
+    /** Decode a PG hex string (the part after `\x`) to raw bytes. */
+    static byte[] hexToBytes(String hex) {
+        int n = hex.length() / 2;
+        byte[] out = new byte[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(2 * i, 2 * i + 2), 16);
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------------
@@ -124,8 +238,11 @@ public final class PgParamCodec {
         // Parse the body. We track depth and per-level element counts to
         // derive dims; leaves accumulate in row-major order.
         java.util.List<String> leaves = new java.util.ArrayList<>();
-        // Per-depth current-element count, taken at the close of each level.
-        java.util.List<Integer> dimsList = new java.util.ArrayList<>();
+        // Size of each depth, recorded ONCE on that depth's first close
+        // (PG arrays are rectangular). Keyed by depth so depth 1 = outermost
+        // sorts first — fixes the prior logic that double-recorded the inner
+        // dim and dropped the outer (2-D `{{1,2},{4,5},{6,7}}` → [2,2] not [3,2]).
+        java.util.TreeMap<Integer, Integer> dimByDepth = new java.util.TreeMap<>();
         StringBuilder cur = new StringBuilder();
         boolean inQuote = false, escape = false, hasContent = false;
         int depth = 0;
@@ -167,12 +284,8 @@ public final class PgParamCodec {
                     hasContent = false;
                 }
                 int closedCount = levelCounts.pop();
-                // Record this dim only on the deepest close (first time
-                // we close a level). On subsequent closes at the same
-                // depth, the count should be the same — PG validates this.
-                if (dimsList.size() < depth) {
-                    dimsList.add(0, closedCount);
-                }
+                // Record each depth's size once, on its first close.
+                dimByDepth.putIfAbsent(depth, closedCount);
                 if (!levelCounts.isEmpty()) {
                     levelCounts.push(levelCounts.pop() + 1);
                 }
@@ -193,8 +306,9 @@ public final class PgParamCodec {
             if (!Character.isWhitespace(c)) hasContent = true;
         }
 
-        int[] dims = new int[dimsList.size()];
-        for (int i = 0; i < dims.length; i++) dims[i] = dimsList.get(i);
+        int[] dims = new int[dimByDepth.size()];
+        int di = 0;
+        for (int v : dimByDepth.values()) dims[di++] = v;  // ascending depth = outer→inner
         if (dims.length == 0) {
             dims = new int[]{0};
         }
@@ -654,12 +768,59 @@ public final class PgParamCodec {
         return out;
     }
 
+    /** PG numeric NaN sign word. */
+    private static final int NUMERIC_NAN = 0xC000;
+
+    /**
+     * Decode PG numeric_recv (the inverse of {@link #encodeNumeric}) to a
+     * BigDecimal. asyncpg sends numeric parameters in this binary form, so
+     * we must decode it (the text path alone left OID 1700 unsupported).
+     *   int16 ndigits, int16 weight, int16 sign, int16 dscale,
+     *   then ndigits base-10000 digits (each 0..9999).
+     */
+    private static BigDecimal decodeNumeric(ByteBuffer buf) {
+        int ndigits = buf.getShort() & 0xFFFF;
+        int weight  = buf.getShort();           // signed base-10000 position
+        int sign    = buf.getShort() & 0xFFFF;
+        int dscale  = buf.getShort() & 0xFFFF;
+        if (sign == NUMERIC_NAN) {
+            // BigDecimal has no NaN; surface clearly instead of corrupting.
+            throw new PgWireServer.PgProtocolException("0A000",
+                "NUMERIC 'NaN' is not supported as a binary parameter");
+        }
+        BigInteger unscaled = BigInteger.ZERO;
+        for (int i = 0; i < ndigits; i++) {
+            int d = buf.getShort() & 0xFFFF;    // base-10000 digit
+            unscaled = unscaled.multiply(BI_TEN_THOUSAND).add(BigInteger.valueOf(d));
+        }
+        // The least-significant digit sits at base-10000 position
+        // (weight - ndigits + 1); shift the concatenated integer there.
+        int exp = weight - ndigits + 1;
+        BigDecimal value = (exp >= 0)
+            ? new BigDecimal(unscaled.multiply(BI_TEN_THOUSAND.pow(exp)))
+            : new BigDecimal(unscaled, -exp * 4);   // 10000 = 10^4
+        if ((sign & 0xFFFF) == (NUMERIC_NEG & 0xFFFF)) value = value.negate();
+        // Honour PG's display scale (so 1.50 keeps two fractional digits).
+        if (dscale != value.scale()) {
+            value = value.setScale(dscale, java.math.RoundingMode.HALF_UP);
+        }
+        return value;
+    }
+
     public static byte[] encodeBinary(int oid, Object value) {
         if (value == null) return null;
         try {
             return switch (oid) {
                 case PgWireServer.OID_BOOL ->
                     new byte[] { (byte) (parseBool(value) ? 1 : 0) };
+
+                // PG "char" (OID 18): a single byte (charsend / pq_sendbyte).
+                // pg_type.typtype/typcategory are this type; asyncpg
+                // binary-decodes it to bytes for its is_scalar_type check.
+                case PgWireServer.OID_CHAR -> {
+                    String s = value.toString();
+                    yield s.isEmpty() ? new byte[0] : new byte[] { (byte) s.charAt(0) };
+                }
 
                 case PgWireServer.OID_INT2 ->
                     ByteBuffer.allocate(2).order(ByteOrder.BIG_ENDIAN)
@@ -739,8 +900,15 @@ public final class PgParamCodec {
                      PgWireServer.OID_JSON ->
                     value.toString().getBytes(StandardCharsets.UTF_8);
 
-                case PgWireServer.OID_BYTEA ->
-                    (value instanceof byte[] b) ? b : value.toString().getBytes(StandardCharsets.UTF_8);
+                case PgWireServer.OID_BYTEA -> {
+                    if (value instanceof byte[] b) yield b;
+                    String s = value.toString();
+                    // value->string renders bytea as PG hex text `\x<hex>`;
+                    // decode it back to raw bytes. (Plain strings fall through
+                    // as their UTF-8 bytes.)
+                    yield (s.startsWith("\\x")) ? hexToBytes(s.substring(2))
+                                                : s.getBytes(StandardCharsets.UTF_8);
+                }
 
                 case PgWireServer.OID_JSONB -> {
                     byte[] text = value.toString().getBytes(StandardCharsets.UTF_8);
@@ -757,12 +925,55 @@ public final class PgParamCodec {
                     if (isArrayOid(oid)) {
                         yield encodeArrayBinary(oid, value.toString());
                     }
+                    // Composite (named row type) or anonymous record (2249):
+                    // encode the record_out text as a binary record. Field OIDs
+                    // come from the composite registry, or for an anonymous
+                    // record from the per-value layout registered by value->string.
+                    int[] cf = COMPOSITE_FIELDS.get(oid);
+                    if (cf == null) cf = RECORD_LAYOUTS.get(value.toString());
+                    if (cf != null) {
+                        yield encodeRecordBinary(cf, value.toString());
+                    }
                     yield null;   // caller falls back to text encoding
                 }
             };
         } catch (Exception e) {
             return null;  // fall back to text encoding
         }
+    }
+
+    /** Quote a record field cell for record_out text (see records.clj). */
+    private static String quoteRecordCell(String raw) {
+        if (raw.isEmpty() || raw.matches("(?s).*[(),\"\\\\\\s].*"))
+            return "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        return raw;
+    }
+
+    /**
+     * Decode a PG binary record — [int32 nfields][per field: int32 oid,
+     * int32 len(-1=NULL), bytes] — to its canonical record_out text, decoding
+     * each field via decodeBinary by the inline field OID (so composite and
+     * anonymous records both work without a registry). The text then flows
+     * through the normal value path and re-encodes via encodeRecordBinary.
+     */
+    static String decodeRecordBinary(byte[] bytes) {
+        ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        int n = buf.getInt();
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(',');
+            int foid = buf.getInt();
+            int len = buf.getInt();
+            if (len < 0) continue;            // NULL → empty cell
+            byte[] fb = new byte[len];
+            buf.get(fb);
+            Object v = decodeBinary(foid, fb);
+            if (v == null) continue;
+            String t = (v instanceof Boolean b) ? (b ? "t" : "f") : v.toString();
+            sb.append(quoteRecordCell(t));
+        }
+        sb.append(')');
+        return sb.toString();
     }
 
     // ========================================================================
@@ -791,6 +1002,10 @@ public final class PgParamCodec {
                 (double) Float.intBitsToFloat(buf.getInt());
             case PgWireServer.OID_FLOAT8 ->
                 Double.longBitsToDouble(buf.getLong());
+
+            // numeric_recv — base-10000 digit vector (see decodeNumeric).
+            case PgWireServer.OID_NUMERIC ->
+                decodeNumeric(buf);
 
             // uuid_recv — 16 raw bytes (big-endian msb/lsb long pair).
             case PgWireServer.OID_UUID ->
@@ -850,6 +1065,13 @@ public final class PgParamCodec {
             default -> {
                 if (isArrayOid(oid)) {
                     String s = decodeArrayBinary(oid, bytes);
+                    if (s != null) yield s;
+                }
+                // Composite (registered) or anonymous record (2249): decode the
+                // binary record to canonical record_out text. Field OIDs are
+                // inline in the wire bytes, so no registry lookup is needed.
+                if (oid == 2249 || compositeFields(oid) != null) {
+                    String s = decodeRecordBinary(bytes);
                     if (s != null) yield s;
                 }
                 throw new PgWireServer.PgProtocolException("0A000",

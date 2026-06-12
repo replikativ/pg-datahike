@@ -22,6 +22,7 @@
 
 (def oid-bool      16)
 (def oid-bytea      17)
+(def oid-char       18)   ;; PG internal "char" (1 byte) — pg_type.typtype etc.
 (def oid-int8       20)
 (def oid-int2       21)
 (def oid-int4       23)
@@ -120,6 +121,14 @@
   "Inverse of elem-kw->oid."
   (into {} (map (fn [[k v]] [v k])) elem-kw->oid))
 
+(def oid-preserving-pg-name
+  "OIDs whose datahike valueType (string/long) would report a DIFFERENT OID on
+   read-back. A materialised column with one of these inferred OIDs carries
+   :pg/type = this name so oid-infer round-trips the original OID rather than the
+   storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
+   binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
+  {18 "char", 26 "oid"})
+
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
 ;; ============================================================================
@@ -168,9 +177,13 @@
    "timestamp with time zone"    :db.type/instant
    "timestamptz"       :db.type/instant
    "date"              :db.type/instant
-   "time"              :db.type/instant
-   "time without time zone"      :db.type/instant
-   "time with time zone"         :db.type/instant
+   ;; time-of-day: store the normalized text (a bare time can't be a
+   ;; java.util.Date/Instant, and parse-timestamp-string rejects it).
+   ;; Consistent with `timetz`, which already falls through to string.
+   ;; The :pg/type "time" hint still drives the wire OID (1083/1266).
+   "time"              :db.type/string
+   "time without time zone"      :db.type/string
+   "time with time zone"         :db.type/string
    ;; Binary
    "bytea"             :db.type/bytes
    ;; UUID
@@ -303,6 +316,8 @@
     "uuid"        oid-uuid
     "json"        oid-json
     "jsonb"       oid-jsonb
+    "oid"         oid-oid
+    "char"        oid-char
     "bytea"       oid-bytea}
    ;; Array entries: "_T" → array OID. Generated from elem-kw->oid
    ;; so adding a new scalar type only needs three rows
@@ -389,12 +404,24 @@
 (def cast-integer-types
   "SQL type names that cast to integer (Clojure long)."
   #{"integer" "int" "int2" "int4" "int8" "bigint" "smallint"
-    "serial" "serial2" "serial4" "serial8" "bigserial" "smallserial"})
+    "serial" "serial2" "serial4" "serial8" "bigserial" "smallserial"
+    ;; `oid` is an unsigned-32 integer value-wise — `$1::oid` / `$1::oid[]`
+    ;; must coerce to long(s), not text (asyncpg's introspection binds
+    ;; `oid = any($1::oid[])`). The reg* alias types are oid-backed but
+    ;; TEXT-displayed (regtype → 'int4'), so they are deliberately excluded.
+    "oid"})
 
 (def cast-float-types
   "SQL type names that cast to floating point (Clojure double)."
   #{"double precision" "double" "float" "float4" "float8"
-    "real" "numeric" "decimal" "dec"})
+    "real"})
+
+(def cast-numeric-types
+  "SQL type names that cast to arbitrary-precision decimal (Clojure
+   bigdec / java.math.BigDecimal). Kept distinct from floats so a
+   `::numeric` cast preserves scale and precision (e.g. 0.001000) and
+   reports OID 1700 — asyncpg uses binary numeric, not float8."
+  #{"numeric" "decimal" "dec"})
 
 (def cast-text-types
   "SQL type names that cast to text (Clojure string)."
@@ -497,6 +524,7 @@
   "Map OID to type size for RowDescription's typlen field.
    Positive = fixed size in bytes, -1 = variable length."
   {oid-bool       1
+   oid-char       1
    oid-int2       2
    oid-int4       4
    oid-int8       8
@@ -659,6 +687,7 @@
       (cond
         (clojure.string/ends-with? base "[]") :array
         (contains? cast-integer-types base)   :integer
+        (contains? cast-numeric-types base)   :numeric
         (contains? cast-float-types base)     :float
         (contains? cast-text-types base)      :text
         (contains? cast-boolean-types base)   :boolean
@@ -683,6 +712,7 @@
           (case cat
             :integer :int8
             :float   :float8
+            :numeric :numeric
             :text    :text
             :boolean :bool
             :date    :date
@@ -704,6 +734,12 @@
     (get element-oid->array-oid
          (get elem-kw->oid (:elem-type v))
          oid-text-array)
+    ;; PgRecord → its own type-oid (2249 for an anonymous ROW, else the
+    ;; named composite OID). Class-name check avoids a require-loop, as
+    ;; for PgArray above.
+    (and (some? v)
+         (= "datahike.pg.records.PgRecord" (.getName (class v))))
+    (or (:type-oid v) 2249)
     (instance? clojure.lang.Ratio v) oid-float8
     (instance? Long v)    oid-int8
     (instance? Integer v) oid-int4

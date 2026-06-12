@@ -31,7 +31,9 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            CastExpression JdbcParameter Parenthesis NotExpression]
+            CastExpression JdbcParameter Parenthesis NotExpression
+            LongValue StringValue DoubleValue DateValue TimestampValue
+            SignedExpression BinaryExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between InExpression ExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
@@ -197,7 +199,9 @@
   ;; the sequence twice per logical use, or call now() twice and get
   ;; out-of-sync timestamps within one row. The IdentityHashMap
   ;; keeps marker identity → resolved-value through one walk, so
-  ;; each unique marker resolves exactly once.
+  ;; each unique marker resolves exactly once. (Callers must resolve
+  ;; before any postwalk-based rebuild that would clone — and thus
+  ;; un-share — the marker objects; see server.clj's dispatch order.)
   ;;
   ;; The function table here is intentionally minimal — extend by
   ;; adding to call-fns above and a clause here.
@@ -529,6 +533,20 @@
                            (let [[tns cn] (col-ns-name c)]
                              (when-let [oid (infer-param-oid-for-column schema tns cn)]
                                (.put result (.getIndex p) oid))))
+           ;; OID of a literal comparand, so `? OP <literal>` (e.g.
+           ;; `$1 = 1`, with no column to borrow a type from) still
+           ;; resolves the param's type. SignedExpression wraps a
+           ;; negative numeric literal (`-1` → SignedExpression[LongValue]).
+           literal-oid (fn literal-oid [n]
+                         (cond
+                           (instance? SignedExpression n)
+                           (recur (.getExpression ^SignedExpression n))
+                           (instance? LongValue n)      types/oid-int8
+                           (instance? DoubleValue n)    types/oid-float8
+                           (instance? StringValue n)    types/oid-text
+                           (instance? DateValue n)      types/oid-date
+                           (instance? TimestampValue n) types/oid-timestamp
+                           :else nil))
            ;; Strip CAST/Parenthesis wrappers so we can see the
            ;; Column / JdbcParameter inside. Returns the inner node.
            unwrap (fn unwrap [n]
@@ -554,17 +572,78 @@
                (let [ce ^CastExpression n
                      dt (.getColDataType ce)
                      type-str (when dt
-                                (str/lower-case (str (.getDataType dt))))]
-                 (or (get types/pg-name->oid type-str)
-                     (when-let [kw (get types/sql-name->elem-kw type-str)]
-                       (get types/elem-kw->oid kw))))))
+                                (str/lower-case (str (.getDataType dt))))
+                     elem-oid (or (get types/pg-name->oid type-str)
+                                  (when-let [kw (get types/sql-name->elem-kw type-str)]
+                                    (get types/elem-kw->oid kw))
+                                  ;; User-defined composite type: report its
+                                  ;; OID so the client (asyncpg) introspects it
+                                  ;; and builds a composite codec instead of a
+                                  ;; text one for `$1::my_composite`.
+                                  (when-let [d *parse-db*]
+                                    (some (fn [c]
+                                            (when (= type-str (str/lower-case (:name c)))
+                                              (:oid c)))
+                                          (try (pgs/composite-types d) (catch Throwable _ nil)))))
+                     ;; `T[]` — ColDataType carries array dimensions; map the
+                     ;; element OID to its array OID (e.g. oid → oid[] 1028).
+                     array? (when dt
+                              (let [ad (.getArrayData dt)]
+                                (and ad (pos? (.size ^java.util.List ad)))))]
+                 (when elem-oid
+                   (if array?
+                     (get types/element-oid->array-oid elem-oid types/oid-text-array)
+                     elem-oid)))))
            ;; Bind a param against (a) an explicit cast target on its
            ;; own side, or (b) the comparand column on the other side.
-           bind-param! (fn [^JdbcParameter p side-with-cast comparand-col]
+           bind-param! (fn [^JdbcParameter p side-with-cast comparand]
                          (if-let [oid (cast-target-oid side-with-cast)]
                            (.put result (.getIndex p) oid)
-                           (when (instance? Column comparand-col)
-                             (record-param! p ^Column comparand-col))))
+                           (cond
+                             (instance? Column comparand)
+                             (record-param! p ^Column comparand)
+                             ;; `(a, b, …) OP $n` — the comparand is a row
+                             ;; constructor (multi-element ExpressionList), so
+                             ;; the param is an anonymous record (OID 2249).
+                             ;; PG / asyncpg use this to detect & reject
+                             ;; anonymous-composite param input.
+                             (and (instance? ExpressionList comparand)
+                                  (> (.size ^ExpressionList comparand) 1))
+                             (.put result (.getIndex p) 2249)
+                             ;; `? OP <literal>` — borrow the literal's type
+                             ;; when there's no column comparand.
+                             :else
+                             (when-let [oid (literal-oid comparand)]
+                               (.put result (.getIndex p) oid)))))
+           ;; `col = ANY($n)` / `= ALL($n)` — JSqlParser parses the RHS as a
+           ;; Function named any/all/some wrapping the parameter. Return that
+           ;; JdbcParameter so the caller can type it as an ARRAY of col's
+           ;; type. asyncpg's type-introspection (`oid = ANY($1::oid[])`)
+           ;; depends on this.
+           ;; The single arg expression inside ANY(...)/ALL(...)/SOME(...),
+           ;; or nil. May itself be a CAST (`$1::oid[]`) — kept un-unwrapped
+           ;; so the caller can honour the cast target before the column.
+           any-all-arg (fn [n]
+                         (when (instance? net.sf.jsqlparser.expression.Function n)
+                           (let [f ^net.sf.jsqlparser.expression.Function n
+                                 nm (str/lower-case (.getName f))]
+                             (when (#{"any" "all" "some"} nm)
+                               (let [exprs (some-> (.getParameters f) .getExpressions)]
+                                 (when (= 1 (count exprs)) (first exprs)))))))
+           ;; Bind `$n` in `col OP ANY($n)`: prefer an explicit cast on the
+           ;; param (`$1::oid[]` → oid[]); otherwise the array OID of col's
+           ;; type. Honouring the cast is what makes asyncpg's
+           ;; `oid = ANY($1::oid[])` introspection work even though `oid` is
+           ;; a catalog column with no schema-derived type.
+           bind-any-arg! (fn [arg ^Column c]
+                           (let [p (unwrap arg)]
+                             (when (instance? JdbcParameter p)
+                               (if-let [oid (cast-target-oid arg)]
+                                 (.put result (.getIndex ^JdbcParameter p) oid)
+                                 (let [[tns cn] (col-ns-name c)]
+                                   (when-let [coid (infer-param-oid-for-column schema tns cn)]
+                                     (.put result (.getIndex ^JdbcParameter p)
+                                           (get types/element-oid->array-oid coid types/oid-text-array))))))))
            walk (fn walk [n]
                   (cond
                     (nil? n) nil
@@ -581,11 +660,20 @@
                                 r (.getRightExpression
                                    ^net.sf.jsqlparser.expression.operators.relational.ComparisonOperator n)
                                 lb (unwrap l) rb (unwrap r)]
+                            ;; Fire whenever a side is a parameter — the
+                            ;; comparand may be a Column (borrow its type)
+                            ;; or a literal (`$1 = 1`; borrow the literal's
+                            ;; type). bind-param! also honors a CAST on the
+                            ;; param's own side first.
                             (cond
-                              (and (instance? Column lb) (instance? JdbcParameter rb))
-                              (bind-param! rb r lb)
-                              (and (instance? Column rb) (instance? JdbcParameter lb))
-                              (bind-param! lb l rb))
+                              (instance? JdbcParameter lb) (bind-param! lb l rb)
+                              (instance? JdbcParameter rb) (bind-param! rb r lb)
+                              ;; col = ANY($n) — $n is an array (cast target,
+                              ;; else array of col's type)
+                              (and (instance? Column lb) (any-all-arg rb))
+                              (bind-any-arg! (any-all-arg rb) lb)
+                              (and (instance? Column rb) (any-all-arg lb))
+                              (bind-any-arg! (any-all-arg lb) rb))
                             (walk l) (walk r))
 
                          ;; col IN (?, ?, ...) — RHS items may also be
@@ -624,7 +712,24 @@
                           (instance? NotExpression n)
                           (walk (.getExpression ^NotExpression n))
                           (instance? CastExpression n)
-                          (walk (.getLeftExpression ^CastExpression n))))))]
+                          (do
+                            ;; A standalone `CAST($n AS T)` / `$n::T` types
+                            ;; the param directly from the cast target —
+                            ;; e.g. `SELECT $1::int4`. (The comparison cases
+                            ;; already honour a cast via bind-param!.)
+                            (let [inner (unwrap (.getLeftExpression ^CastExpression n))]
+                              (when (instance? JdbcParameter inner)
+                                (when-let [oid (cast-target-oid n)]
+                                  (.put result (.getIndex ^JdbcParameter inner) oid))))
+                            (walk (.getLeftExpression ^CastExpression n)))
+                         ;; Arithmetic / concatenation / etc. — any other
+                         ;; BinaryExpression (Addition, Subtraction, …). Recurse
+                         ;; both sides so a nested `$n::T` or `col OP $n` deeper
+                         ;; in the expression is still typed. (Comparisons,
+                         ;; AND/OR are matched above; this is the fallback.)
+                          (instance? BinaryExpression n)
+                          (do (walk (.getLeftExpression ^BinaryExpression n))
+                              (walk (.getRightExpression ^BinaryExpression n)))))))]
        (walk expr)
        (when (pos? (.size result)) (into {} result)))
      (catch Throwable _ nil))))

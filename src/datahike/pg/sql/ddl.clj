@@ -341,6 +341,17 @@
   (let [table (.getTable ct)
         table-name (params/unquote-ident (.getName ^Table table))
         ns table-name
+        ;; CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE — JSqlParser keeps the
+        ;; leading keywords in getCreateOptionsStrings. We track temp
+        ;; tables per session and drop them when the connection closes
+        ;; (see make-query-handler's :temp-tables / close). Not full
+        ;; per-session isolation — Datahike has one shared schema, so a
+        ;; temp table is visible to other live connections and concurrent
+        ;; CREATEs of the same name still collide — but it matches PG's
+        ;; default session lifetime for the sequential single-connection
+        ;; usage the conformance suites exercise.
+        temp? (boolean (some #(#{"temp" "temporary"} (str/lower-case %))
+                             (.getCreateOptionsStrings ct)))
         columns (.getColumnDefinitions ct)
         ;; Detect INHERITS (parent_table) — either from this CREATE TABLE
         ;; directly, or from prior registration (some clients issue CREATE
@@ -588,6 +599,31 @@
                                    "time with time zone"} base-type) "time"
                                 :else base-type))
 
+                       ;; Narrow integer columns. Datahike stores every
+                       ;; integer as :db.type/long, which would otherwise
+                       ;; advertise int8 (OID 20) for a column the user
+                       ;; declared `smallint`/`integer`. Record the width
+                       ;; so RowDescription / ParameterDescription report
+                       ;; int2 / int4 like PG — clients pick int4 vs int8
+                       ;; parsers off the OID (node-postgres returns int8
+                       ;; as a string, int4 as a number). bigint needs no
+                       ;; hint: :db.type/long already → int8.
+                       ;; Guard on (not array-spec): an `int[]` column has
+                       ;; base-type "int" too, and already set :pg/type to
+                       ;; its array name ("_int4") above — must not clobber.
+                       (and (not array-spec)
+                            (#{"smallint" "int2" "smallserial" "serial2"} base-type))
+                       (assoc :pg/type "int2")
+                       (and (not array-spec)
+                            (#{"integer" "int" "int4" "serial" "serial4"} base-type))
+                       (assoc :pg/type "int4")
+
+                       ;; oid columns: stored as a long, but advertise the
+                       ;; PG `oid` type (26) so clients parse it as a number
+                       ;; rather than an int8 string.
+                       (and (not array-spec) (= "oid" base-type))
+                       (assoc :pg/type "oid")
+
                        ;; ENUM-typed column: remember the enum's name so
                        ;; the dump can re-emit the column as `<enum>`
                        ;; (not `text`). Membership constraints could be
@@ -700,6 +736,7 @@
                             identity-cols))]
     (cond-> {:type :ddl-create
              :table-name table-name
+             :temp? temp?
              :if-not-exists? (.isIfNotExists ct)
              :column-order col-names
              :identity-cols identity-cols

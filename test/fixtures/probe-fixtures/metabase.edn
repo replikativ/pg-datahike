@@ -44,11 +44,11 @@
    :note nil}
   {:sql
    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
-   :expected-system-kind :set,
+   :expected-system-kind :set-session-isolation,
    :note nil}
   {:sql
    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
-   :expected-system-kind :set,
+   :expected-system-kind :set-session-isolation,
    :note nil}
   {:sql
    "SET application_name = 'Metabase v0.60.2.4 [36ccd359-2cb6-4691-a0f2-95ec145b8b95]'",

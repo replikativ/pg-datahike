@@ -214,15 +214,11 @@
   [coll]
   (count (remove #(or (nil? %) (= :__null__ %)) coll)))
 
-(defn filter-array-agg
-  "SQL array_agg(col) — collect all non-NULL values into a PgArray.
-   Element-type inferred from the first non-nil element; falls back
-   to :text when the input is empty (PG would return NULL; we follow
-   that by returning `:__null__`)."
-  [coll]
-  (let [vs (into []
-                 (map #(if (= :__null__ %) nil %))
-                 coll)
+(defn- box-array-agg
+  "Box an ordered seq of array_agg element values (`:__null__` → nil) into a
+   PgArray, inferring the element type from the first non-nil value."
+  [ordered-vals]
+  (let [vs (into [] (map #(if (= :__null__ %) nil %)) ordered-vals)
         arr-fn pg-arr/array
         pick-type (fn [v]
                     (cond
@@ -237,6 +233,44 @@
         first-v (some identity vs)
         elem-type (if (some? first-v) (pick-type first-v) :text)]
     (arr-fn elem-type vs)))
+
+(defn filter-array-agg
+  "SQL array_agg(col) — collect all non-NULL values into a PgArray.
+   Element-type inferred from the first non-nil element; falls back
+   to :text when the input is empty (PG would return NULL; we follow
+   that by returning `:__null__`)."
+  [coll]
+  (box-array-agg coll))
+
+(defn- akey-compare
+  "Null-safe comparator for array_agg `ORDER BY` keys. A key is a scalar or a
+   vector (multiple ORDER BY columns, compared lexicographically). NULLs sort
+   last (PG's default NULLS LAST for ASC)."
+  [a b]
+  (cond
+    (and (vector? a) (vector? b))
+    (loop [a a b b]
+      (cond (and (empty? a) (empty? b)) 0
+            (empty? a) -1
+            (empty? b) 1
+            :else (let [c (akey-compare (first a) (first b))]
+                    (if (zero? c) (recur (subvec a 1) (subvec b 1)) c))))
+    (= a b) 0
+    (nil? a) 1
+    (nil? b) -1
+    :else (compare a b)))
+
+(defn filter-array-agg-ordered
+  "SQL array_agg(expr ORDER BY … ASC) — `coll` is a collection of
+   [sort-key value] pairs; sort ascending by sort-key, then box the values."
+  [coll]
+  (box-array-agg (map second (sort-by first akey-compare coll))))
+
+(defn filter-array-agg-ordered-desc
+  "SQL array_agg(expr ORDER BY … DESC) — descending counterpart of
+   filter-array-agg-ordered."
+  [coll]
+  (box-array-agg (map second (sort-by first (fn [a b] (akey-compare b a)) coll))))
 
 (defn pg-many-ref-array
   "Per-row Datalog fn for `:db.cardinality/many :db.type/ref` SQL
