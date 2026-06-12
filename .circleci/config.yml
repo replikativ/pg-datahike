@@ -238,12 +238,19 @@ jobs:
           command: bash test/integration/pgjdbc/run-one.sh ResultSetTest
           no_output_timeout: 10m
 
-  # --- Nightly integration jobs ---------------------------------------------
+  # --- Client-conformance integration jobs ----------------------------------
   # Each job provisions the client toolchain (Python venv, Node npm, Maven)
   # on top of the matching cimg/* base image, installs Clojure + babashka,
   # starts the pgwire server in the background, waits on :15432, then runs
   # the harness's own setup.sh + run.sh. See `doc/integration-testing.md`
   # for the cross-engine testing model.
+  #
+  # asyncpg + node-postgres run per-commit (not nightly): their run.sh
+  # scripts gate green-unless-regression — node-postgres tiers files into
+  # must-pass vs XFAIL; asyncpg diffs live failures against a checked-in
+  # expected-failures.txt manifest. A failure outside the known-gap set
+  # fails the job; everything else stays green. (The one hanging asyncpg
+  # test — server-side cursor streaming — is deselected, see run.sh.)
 
   asyncpg-conformance:
     docker:
@@ -487,6 +494,14 @@ workflows:
           context: ghcr-read-package
           requires:
             - build
+      - asyncpg-conformance:
+          context: ghcr-read-package
+          requires:
+            - build
+      - node-postgres-conformance:
+          context: ghcr-read-package
+          requires:
+            - build
       - deploy:
           context:
             - ghcr-read-package
@@ -502,6 +517,8 @@ workflows:
             - pgjdbc-conformance
             - hibernate-app-conformance
             - sqlalchemy-conformance
+            - asyncpg-conformance
+            - node-postgres-conformance
       - build-uber:
           context: ghcr-read-package
           filters:
@@ -519,34 +536,3 @@ workflows:
           requires:
             - deploy
             - build-uber
-
-  # Nightly: wire-protocol regression targets that aren't release-ready
-  # yet. The harness scripts work cleanly; the SUT doesn't cover enough of
-  # what these clients probe (asyncpg: prepared-statement internals,
-  # node-postgres: COLLATE + extended-query metadata). Keeping them in
-  # nightly so a fix in core immediately lights them up, without blocking
-  # per-commit PRs on known gaps. Hibernate + SQLAlchemy moved to
-  # per-commit once they hit 100% on their curated suites.
-  nightly-integration:
-    triggers:
-      - schedule:
-          # 04:00 UTC daily
-          cron: "0 4 * * *"
-          filters:
-            branches:
-              only: main
-    jobs:
-      - setup:
-          context: ghcr-read-package
-      - build:
-          context: ghcr-read-package
-          requires:
-            - setup
-      - asyncpg-conformance:
-          context: ghcr-read-package
-          requires:
-            - build
-      - node-postgres-conformance:
-          context: ghcr-read-package
-          requires:
-            - build
