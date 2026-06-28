@@ -5667,7 +5667,7 @@
         ;; doesn't go through `parse` first) sees the registry when it
         ;; hits pg_database.
         (binding [catalog/*registered-databases* registered-databases
-                  datahike.query/*force-legacy* false]
+                  datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
         ;; If aborted, reject everything except ROLLBACK / ROLLBACK TO /
         ;; SAVEPOINT … — the latter two match PG behavior where a client

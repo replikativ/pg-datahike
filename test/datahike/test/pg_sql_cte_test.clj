@@ -15,7 +15,7 @@
      ParenthesedInsert → ParenthesedSelect cast.
 
    The recursive path needs the datahike query planner enabled. We
-   bind `*force-legacy* false` inside `materialize-recursive-cte!`
+   bind `*disable-planner* false` inside `materialize-recursive-cte!`
    itself (and `server.execute` also binds it at the handler entry),
    so the deftests don't have to set the env var."
   (:require [clojure.test :refer [deftest is use-fixtures]]

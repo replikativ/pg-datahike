@@ -4706,15 +4706,15 @@
    (substituted at Bind for the parameterised path).
 
    Forces the query planner on regardless of caller context — Datahike's
-   legacy engine can't evaluate the recursive bodies translate-recursive-cte
-   emits (head var bound through a function op then filtered by a predicate,
-   datahike PR #825)."
+   base (relational) engine can't evaluate the recursive bodies
+   translate-recursive-cte emits (head var bound through a function op then
+   filtered by a predicate, datahike PR #825)."
   [db rule rule-name rule-vars in-params in-args]
   (let [rule-call (apply list rule-name rule-vars)
         q {:find  rule-vars
            :in    (into '[$ %] in-params)
            :where [rule-call]}]
-    (binding [dq/*force-legacy* false]
+    (binding [dq/*disable-planner* false]
       (apply d/q q db rule in-args))))
 
 (defn- anchor-col-vtypes

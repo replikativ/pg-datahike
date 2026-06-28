@@ -519,10 +519,11 @@
             ;; recursive introspection hang; the planner runs the same query
             ;; in <10ms. server.execute already binds this false for the
             ;; execute-time path — this extends it to parse-time so the two
-            ;; phases use the same (fast) engine. datahike default is legacy
-            ;; (planner opt-in via DATAHIKE_QUERY_PLANNER), so we set it
-            ;; explicitly per parse.
-            dq/*force-legacy* false
+            ;; phases use the same (fast) engine. The planner is datahike's
+            ;; default now (disable via DATAHIKE_QUERY_PLANNER=false), so this
+            ;; binding is a defensive explicit per-parse no-op against any
+            ;; caller that disabled it.
+            dq/*disable-planner* false
              ;; Per-query memoisation for `schema-hints` /
              ;; `derive-virtual-tables`. Both are called by every
              ;; `catalog-data-for*` invocation against the same db /
