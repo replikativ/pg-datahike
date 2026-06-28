@@ -57,8 +57,8 @@
         ;; The pgwire connection runs on its own virtual thread, so a
         ;; thread-local `binding` from the test thread wouldn't reach
         ;; the handler. Flip the root so every thread sees the planner.
-        prev-legacy q/*force-legacy*]
-    (alter-var-root #'q/*force-legacy* (constantly false))
+        prev-disable-planner q/*disable-planner*]
+    (alter-var-root #'q/*disable-planner* (constantly false))
     (d/create-database cfg)
     (let [conn (d/connect cfg)
           ;; Hold the mutable latches in atoms so each test resets them
@@ -93,7 +93,7 @@
             (.stop server)
             (d/release conn)
             (d/delete-database cfg)
-            (alter-var-root #'q/*force-legacy* (constantly prev-legacy))))))))
+            (alter-var-root #'q/*disable-planner* (constantly prev-disable-planner))))))))
 
 (use-fixtures :once cancel-fixture)
 
