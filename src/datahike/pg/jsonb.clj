@@ -17,6 +17,18 @@
 
 (def ^:private mapper (json/object-mapper {:decode-key-fn str}))
 
+;; Canonical mapper — writes object keys in sorted order at every level, so two
+;; jsonb values that differ only in key order (or whitespace) serialize identically.
+;; This is what makes stored jsonb behave like Postgres jsonb rather than json:
+;; jsonb DROPS key order and whitespace and keeps only the LAST of duplicate keys
+;; (Jackson does last-wins on parse), so `=`, DISTINCT and GROUP BY compare by
+;; structure, not by input text.
+(def ^:private canonical-mapper
+  (doto ^com.fasterxml.jackson.databind.ObjectMapper
+   (json/object-mapper {:decode-key-fn str})
+    (.configure com.fasterxml.jackson.databind.SerializationFeature/ORDER_MAP_ENTRIES_BY_KEYS
+                true)))
+
 (defn parse-jsonb
   "Parse a JSON string to a Clojure data structure.
    Returns nil for nil input, passes through non-strings."
@@ -27,16 +39,31 @@
                      (catch Exception _ v))
     :else v))
 
-(defn serialize-jsonb
-  "Serialize a Clojure data structure to a JSON string.
-   Returns nil for nil input."
+(defn canonicalize-jsonb
+  "The canonical jsonb TEXT for a value — recursively key-sorted, whitespace-
+   normalized, duplicate keys collapsed to the last. This is the form stored and the
+   form a client reads back (Postgres normalizes jsonb on input). A string that is
+   valid JSON is re-emitted canonically; a string that is not JSON is a JSON string
+   scalar; a Clojure map/vector is written canonically. Returns nil for nil.
+
+   NOTE: numeric normalization is Jackson's, not Postgres's — e.g. `1.00`/`1e3` may
+   not match PG's exact jsonb numeric canonical form. Structural (key/whitespace/
+   duplicate) canonicalization is exact; numeric is best-effort."
   [v]
   (when (some? v)
-    (if (string? v)
-      ;; Already a string — check if it's valid JSON, otherwise wrap as JSON string
-      (try (json/read-value v mapper) v
-           (catch Exception _ (json/write-value-as-string v)))
-      (json/write-value-as-string v))))
+    (let [data (if (string? v)
+                 (try (json/read-value v mapper)   ;; valid JSON text → its data
+                      (catch Exception _ v))       ;; not JSON → a string scalar
+                 v)]
+      (json/write-value-as-string data canonical-mapper))))
+
+(defn serialize-jsonb
+  "Serialize a value to canonical jsonb TEXT for storage. Alias of
+   `canonicalize-jsonb` — every write path canonicalizes, so stored jsonb is
+   structure-normalized regardless of how it arrived (map/vector from a Clojure
+   literal, or a `'…'::jsonb` string literal)."
+  [v]
+  (canonicalize-jsonb v))
 
 ;; ============================================================================
 ;; Operators: -> and ->> (field/element access)

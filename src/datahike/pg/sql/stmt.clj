@@ -3193,7 +3193,10 @@
   (when (some? val)
     (let [vtype     (get-in schema [attr :db/valueType])
           elem-kw   (get-in schema [attr :pg/array-elem])
-          num-scale (get-in schema [attr :pg/numeric-scale])]
+          num-scale (get-in schema [attr :pg/numeric-scale])
+          ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it keeps
+          ;; key order, whitespace and duplicate keys — so it must NOT be canonicalized.
+          jsonb?    (= "jsonb" (get-in schema [attr :pg/type]))]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
@@ -3202,8 +3205,15 @@
         ;; "{\"idx\":N}" string for :db.type/string columns or stringify
         ;; via `(str val)`. Pass it through; substitute-params replaces
         ;; it with the decoded wire value, which already has the right
-        ;; type from Bind.
+        ;; type from Bind. (Must precede the jsonb branch below, or a
+        ;; jsonb `?` param would be serialized as its placeholder record.)
         (params/param-ref? val) val
+
+        ;; jsonb columns are :db.type/string, so a `'{…}'::jsonb` STRING literal would
+        ;; otherwise be stored verbatim (non-canonical → equality/DISTINCT wrong,
+        ;; behaving like PG `json`). Canonicalize every jsonb write here — string
+        ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
+        jsonb? (jb/serialize-jsonb val)
 
         ;; Native PG array column (`:pg/array-elem` recorded by DDL)
         ;; — Option C storage: serialize a PgArray (or coerce a
@@ -3724,9 +3734,22 @@
                               :where [[?e :db/ident ?ident]
                                       [?e :pg/typmod ?typmod]]}
                             db))
-                     (catch Throwable _ {}))]
+                     (catch Throwable _ {}))
+        ;; :pg/type — the original SQL type when the datahike valueType isn't 1:1
+        ;; (jsonb/json both reduce to :db.type/string; date/time/timestamp to
+        ;; :db.type/instant). Surfaced so INSERT coercion can tell a jsonb column
+        ;; from a plain text column and canonicalize it (both are :db.type/string).
+        type-meta (try
+                    (into {}
+                          (map (fn [[ident pgtype]] [ident {:pg/type pgtype}]))
+                          (d/q
+                           '{:find  [?ident ?pgtype]
+                             :where [[?e :db/ident ?ident]
+                                     [?e :pg/type ?pgtype]]}
+                           db))
+                    (catch Throwable _ {}))]
     (reduce-kv (fn [s ident more] (update s ident merge more))
-               schema (merge-with merge pg-meta scale-meta))))
+               schema (merge-with merge pg-meta scale-meta type-meta))))
 
 (defn enrich-schema-with-pg-array-meta
   "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side
