@@ -80,10 +80,11 @@
    prefix-with-dot))`) that we hide from dumps. These are Datahike
    and pg-datahike internal — schema attribute entities, validation
    metadata, sequences, branching state, etc. — not user tables."
-  #{"db"           ;; :db/ident, :db/valueType, db.entity/*, db.alter/*, …
+  #{"db"           ;; :db/ident, :db/valueType, db.entity/*, db.valid/*, db.secondary/*, …
     "datahike.pg"  ;; pg-datahike schema hints
     "pg"           ;; :pg/type, :pg/not-null, :pg/check-*, :pg/default-*
     "datahike"     ;; :datahike/* (versioning, branching, …)
+    "dh.ref"       ;; :dh.ref/* — datahike cross-database references (system schema)
     "__seq__"})    ;; sequences — handled separately
 
 (defn- internal-namespace? [^String ns]
