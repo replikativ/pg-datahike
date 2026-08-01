@@ -6079,41 +6079,55 @@
                     ;; non-parameterized prepared statements re-parse — bump
                     ;; the dispatch counter only on the re-parse branch
                     ;; (Extended-Query Parse already counted at this.parse).
-                          parsed (if-let [cached *cached-parsed*]
-                                   (if-let [bound *cached-bound*]
-                                     ;; Re-coerce INSERT values after ParamRef
-                                     ;; substitution so untyped text params
-                                     ;; (e.g. node-postgres "270" → int column)
-                                     ;; narrow to the column's :db/valueType.
-                                     (coerce-insert-tx-data
-                                      (resolve-param-refs cached bound) schema)
-                                     cached)
-                                   ;; Simple-protocol plan stability: rewrite
-                                   ;; bare number literals to $N so every cache
-                                   ;; layer (AST, parse result, datalog parse,
-                                   ;; plan) keys on ONE shape per statement
-                                   ;; family, then execute like a one-shot
-                                   ;; prepared statement. Any parse error on
-                                   ;; the templated form falls back to the
-                                   ;; original SQL untouched.
-                                   (or (when-let [{tsql :sql tvals :params}
-                                                  (template/parameterize-numbers sql)]
-                                         (let [p (sql/parse-sql tsql schema db)]
-                                           ;; v1: SELECT only — UPDATE/DELETE
-                                           ;; re-translate their WHERE at exec
-                                           ;; time against *cached-bound*,
-                                           ;; which the simple path doesn't
-                                           ;; carry yet.
-                                           (when (and p (not= :error (:type p))
-                                                      (= :select (:type p)))
-                                             (when bump-dispatch! (bump-dispatch! p))
-                                             ;; ParamRefs are 1-indexed; prepend
-                                             ;; an unused slot like the wire path.
-                                             (resolve-param-refs
-                                              p (into [nil] tvals)))))
-                                       (let [p (sql/parse-sql sql schema db)]
-                                         (when bump-dispatch! (bump-dispatch! p))
-                                         p)))
+                          {parsed :parsed templated-bound :bound}
+                          (if-let [cached *cached-parsed*]
+                            {:parsed
+                             (if-let [bound *cached-bound*]
+                               ;; Re-coerce INSERT values after ParamRef
+                               ;; substitution so untyped text params
+                               ;; (e.g. node-postgres "270" → int column)
+                               ;; narrow to the column's :db/valueType.
+                               (coerce-insert-tx-data
+                                (resolve-param-refs cached bound) schema)
+                               cached)}
+                            ;; Simple-protocol plan stability: rewrite
+                            ;; bare number literals to $N so every cache
+                            ;; layer (AST, parse result, datalog parse,
+                            ;; plan) keys on ONE shape per statement
+                            ;; family, then execute like a one-shot
+                            ;; prepared statement. Any parse error on
+                            ;; the templated form falls back to the
+                            ;; original SQL untouched. Only reachable
+                            ;; with *cached-parsed* nil (this if-let's
+                            ;; else-branch), so the extended-query path
+                            ;; never re-templates its $N statements.
+                            (or (when-let [{tsql :sql tvals :params}
+                                           (template/parameterize-numbers sql)]
+                                  (let [p (sql/parse-sql tsql schema db)]
+                                    (when (and p (not= :error (:type p))
+                                               (contains? #{:select :update :delete}
+                                                          (:type p)))
+                                      (when bump-dispatch! (bump-dispatch! p))
+                                      ;; ParamRefs are 1-indexed; prepend
+                                      ;; an unused slot like the wire path.
+                                      (let [bound (into [nil] tvals)]
+                                        {:parsed (resolve-param-refs p bound)
+                                         ;; UPDATE/DELETE re-translate their
+                                         ;; WHERE AST at execute time and eval
+                                         ;; SET expressions against
+                                         ;; *cached-bound* — carry the values
+                                         ;; to the dispatch arms below, exactly
+                                         ;; as executePrepared's binding does.
+                                         ;; SELECT is fully resolved by the
+                                         ;; substitution above. :insert never
+                                         ;; reaches here (own templater), so
+                                         ;; skipping coerce-insert-tx-data —
+                                         ;; :insert-gated — is a no-op.
+                                         :bound (when (not= :select (:type p))
+                                                  bound)}))))
+                                {:parsed (let [p (sql/parse-sql sql schema db)]
+                                           (when bump-dispatch! (bump-dispatch! p))
+                                           p)}))
                           ;; Sibling pass to ParamRef substitution: any
                           ;; `nextval('s')` markers left in tx-data/in-args
                           ;; resolve here against the live conn (PG's
@@ -6213,8 +6227,19 @@
                           :select                (exec-select ctx parsed)
                           :insert                (exec-insert ctx parsed)
                           :update-with-recursive (exec-update-with-recursive ctx parsed)
-                          :update                (exec-update ctx parsed)
-                          :delete                (exec-delete ctx parsed)
+                          ;; Templated simple-protocol UPDATE/DELETE ride
+                          ;; the prepared-statement machinery: the exec
+                          ;; paths re-translate WHERE and evaluate SET
+                          ;; against *cached-bound* (1-indexed, slot 0
+                          ;; unused), so bind the templater's captured
+                          ;; literals here. `or` keeps the real
+                          ;; executePrepared binding when not templated.
+                          :update                (binding [*cached-bound*
+                                                           (or templated-bound *cached-bound*)]
+                                                   (exec-update ctx parsed))
+                          :delete                (binding [*cached-bound*
+                                                           (or templated-bound *cached-bound*)]
+                                                   (exec-delete ctx parsed))
                           :truncate              (exec-truncate ctx parsed)
                           ;; Every DDL exec-* invalidates the per-schema cache.
                           ;; PG metadata (`:pg/not-null` etc.) lives on schema-
