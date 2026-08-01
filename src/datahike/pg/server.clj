@@ -953,6 +953,19 @@
       ::gap
       (reduce into #{} (map :eas entries)))))
 
+(defn- transact-recorded!
+  "d/transact that records the commit's [eid attr] write set in the
+   recent-commit ring. EVERY server-side transact must go through this
+   (or record manually): a commit missing from the ring makes any
+   overlapping conflict window fall back to the attribute-level
+   full-database scan — ~1s per COMMIT at 3M datoms."
+  [conn tx-data]
+  (let [report (d/transact conn tx-data)
+        eas (tx-buffer-eas tx-data)]
+    (record-commit-writes! (:max-tx (:db-after report))
+                           (if (= ::opaque eas) ::opaque eas))
+    report))
+
 (defn- eas-overlap?
   "Row-level overlap incl. [e ::all] entity-retraction wildcards on
    either side."
@@ -1999,7 +2012,7 @@
                       (auto-populate-identity table-name db)
                       (apply-column-constraints table-name (:ns parsed) db)
                       tx-wrap)
-          tx-report (d/transact conn tx-data)]
+          tx-report (transact-recorded! conn tx-data)]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
@@ -2116,7 +2129,7 @@
           full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
           full-tx (tx-wrap full-tx)]
       (when (seq full-tx)
-        (d/transact conn full-tx))
+        (transact-recorded! conn full-tx))
       (or returning-result
           (empty-result (str "DELETE " (count eids)))))
     (catch Exception e
@@ -2389,7 +2402,7 @@
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
           tx-data (tx-wrap tx-data)
-          tx-report (when (seq tx-data) (d/transact conn tx-data))
+          tx-report (when (seq tx-data) (transact-recorded! conn tx-data))
           returning (:returning parsed)]
       (if returning
         ;; RETURNING: read values from db-after
@@ -2455,7 +2468,7 @@
   (try
     (let [db (d/db conn)
           {:keys [eids tx-data]} (build-update-with-recursive-tx db parsed)]
-      (when (seq tx-data) (d/transact conn tx-data))
+      (when (seq tx-data) (transact-recorded! conn tx-data))
       (empty-result (str "UPDATE " (count eids))))
     (catch Exception e
       (classified-error "UPDATE (WITH RECURSIVE) error: " e))))
@@ -2552,7 +2565,7 @@
                                 (assoc tmpl :db/ident ident))))
                       spec)]
     (when (seq missing)
-      (d/transact conn missing))
+      (transact-recorded! conn missing))
     ;; User-facing hint attrs (:datahike.pg/*) installed via schema.clj's
     ;; own helper — keeps the hint schema definition colocated with its
     ;; consumers and lets bare-conn callers (no server) prime it by
@@ -2647,7 +2660,7 @@
 
       :else
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE TABLE")
         (catch Exception e
           (classified-error "CREATE TABLE error: " e))))))
@@ -3414,11 +3427,7 @@
                            :detail (str "base=" begin-max-tx
                                         ", current=" current-max-tx)})))))
     (when (seq buf)
-      (let [report (d/transact conn buf)
-            eas (tx-buffer-eas buf)]
-        (record-commit-writes! (:max-tx (:db-after report))
-                               (if (= ::opaque eas) ::opaque eas))
-        report))))
+      (transact-recorded! conn buf))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
@@ -3910,7 +3919,7 @@
       (let [curr (or (read-curr) 0)
             next (+ curr incr)
             cas-ok?
-            (try (d/transact conn [[:db/cas eid :__seq__/value curr next]])
+            (try (transact-recorded! conn [[:db/cas eid :__seq__/value curr next]])
                  true
                  (catch Throwable e
                    (if (cas-failure? e) false (throw e))))]
@@ -3981,7 +3990,7 @@
                                 (-> st
                                     (assoc :speculative-db (:db-after spec-report))
                                     (update :tx-buffer into setval-tx)))))
-            (d/transact conn setval-tx))
+            (transact-recorded! conn setval-tx))
           (single-row-result "setval" PgWireServer/OID_INT8 (str new-val)))
         (error-result (str "Sequence not found: " seq-name))))
     (catch Exception e
@@ -4999,7 +5008,7 @@
                             restart-tx)
               tx-data ((:tx-wrap ctx identity) tx-data)]
           (when (seq tx-data)
-            (d/transact conn tx-data))
+            (transact-recorded! conn tx-data))
           (empty-result "TRUNCATE TABLE"))
         (catch Exception e
           (classified-error "TRUNCATE error: " e))))))
@@ -5048,7 +5057,7 @@
 
       :else
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE SEQUENCE")
         (catch Exception e
           (classified-error "CREATE SEQUENCE error: " e))))))
@@ -5087,7 +5096,7 @@
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE TYPE")
         (catch Exception e
           (classified-error "CREATE TYPE error: " e))))))
@@ -5133,7 +5142,7 @@
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (sync-composites-to-codec! (d/db conn))
         (empty-result "CREATE TYPE")
         (catch Exception e
@@ -5176,7 +5185,7 @@
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE DOMAIN")
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE DOMAIN")
         (catch Exception e
           (classified-error "CREATE DOMAIN error: " e))))))
@@ -5259,7 +5268,7 @@
           (try
             (if (:in-tx? @tx-state)
               (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
-              (do (d/transact conn tx-data)
+              (do (transact-recorded! conn tx-data)
                   (empty-result "ALTER TABLE")))
             (catch Exception e
               ;; PK/UNIQUE upgrades need datahike's index-backfill
@@ -5308,7 +5317,7 @@
                              table-attrs)
         all-tx-data (into data-tx-data (filter some? schema-tx-data))]
     (when (seq all-tx-data)
-      (d/transact conn all-tx-data))))
+      (transact-recorded! conn all-tx-data))))
 
 (defn- exec-ddl-drop
   "DROP TABLE — single name (:table, JSqlParser path) or a list
@@ -5338,7 +5347,7 @@
                                    :in [$ ?n]}
                                  db seq-name))]
         (when seq-eid
-          (d/transact conn [[:db/retractEntity seq-eid]]))
+          (transact-recorded! conn [[:db/retractEntity seq-eid]]))
         (empty-result "DROP SEQUENCE"))
       (catch Exception e
         (classified-error "DROP SEQUENCE error: " e)))))
@@ -5521,7 +5530,7 @@
         (let [tx-data' (-> rows
                            (auto-populate-identity (:table s) (d/db conn))
                            (apply-column-constraints (:table s) (:ns s) (d/db conn)))]
-          (d/transact conn tx-data')
+          (transact-recorded! conn tx-data')
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
                                  (update :rows-committed + (count rows)))))
@@ -5765,7 +5774,7 @@
             ;; (freshen-tx-tempids), so concatenating is collision-free.
             (let [combined (vec (mapcat identity tx-data-list))]
               (when (seq combined)
-                (d/transact conn combined)))
+                (transact-recorded! conn combined)))
             nil
             (catch Exception e
               (classified-error "INSERT (batched) error: " e)))))
