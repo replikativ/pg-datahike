@@ -4194,6 +4194,69 @@
       ;; :scalar (and default): run the inner subquery, take first cell.
       (eval-corr-scalar (:inner-sql spec) true inner-schema query-db))))
 
+(defn- null-safe-order-cmp
+  "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
+   is a flat [col-idx dir col-idx dir …] spec; nil and the :__null__
+   sentinel both mean SQL NULL, which sorts last for ASC and first for
+   DESC (the PG default NULLS ordering)."
+  [sql-order-by]
+  (fn [a b]
+    (let [av (if (sequential? a) a [a])
+          bv (if (sequential? b) b [b])]
+      (loop [specs (partition 2 sql-order-by)]
+        (if-let [[idx dir] (first specs)]
+          (let [va (nth av idx nil)
+                vb (nth bv idx nil)
+                a-null? (or (nil? va) (= :__null__ va))
+                b-null? (or (nil? vb) (= :__null__ vb))
+                c (cond
+                    (and a-null? b-null?) 0
+                    ;; NULLs last for ASC, first for DESC (PG default)
+                    a-null? (if (= dir :asc) 1 -1)
+                    b-null? (if (= dir :asc) -1 1)
+                    :else (if (= dir :desc)
+                            (compare vb va)
+                            (compare va vb)))]
+            (if (zero? c)
+              (recur (rest specs))
+              c))
+          0)))))
+
+(defn- top-k-sort
+  "Return the first `k` rows of `rows` in ascending `cmp` order —
+   exactly what (take k (sort cmp rows)) yields, including the stable
+   tie order — without sorting the whole collection. Rows are paired
+   with their original index and ties break on that index, which is
+   what makes the selection identical to Clojure's stable full sort.
+   A size-k java.util.PriorityQueue with the INVERTED comparator keeps
+   the worst current survivor at its head so each new candidate either
+   evicts it or is discarded in O(log k): O(N log k) time, O(k) space
+   instead of O(N log N) / O(N)."
+  [k cmp rows]
+  (let [k (long k)]
+    (if-not (pos? k)
+      []
+      (let [stable-cmp (fn [[ia ra] [ib rb]]
+                         (let [c (cmp ra rb)]
+                           (if (zero? c) (compare ia ib) c)))
+            pq (java.util.PriorityQueue.
+                (int k) ^java.util.Comparator (fn [a b] (stable-cmp b a)))]
+        (reduce (fn [^long i row]
+                  (let [entry [i row]]
+                    (if (< (.size pq) k)
+                      (.offer pq entry)
+                      (when (neg? (stable-cmp entry (.peek pq)))
+                        (.poll pq)
+                        (.offer pq entry))))
+                  (inc i))
+                0 rows)
+        ;; Draining the max-heap yields descending order; cons onto a
+        ;; list to reverse into the ascending result.
+        (loop [acc ()]
+          (if-let [e (.poll pq)]
+            (recur (cons (second e) acc))
+            (vec acc)))))))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -4348,34 +4411,31 @@
                                               find-elems)]
                         [default-row])
                       results)
-            ;; Server-side null-safe sort (when ORDER BY has nullable columns)
+            ;; Server-side null-safe sort (when ORDER BY has nullable columns).
+            ;; With LIMIT n (+ OFFSET o) only the first n+o sorted rows are
+            ;; ever emitted, so a bounded top-k selection replaces the full
+            ;; sort. Restricted to where the sort+trim is the final
+            ;; row-shaping step: HAVING and window functions run AFTER this
+            ;; point in the pipeline, so those keep the full-sort path
+            ;; (top-k replicates the stable tie order, but the full sort is
+            ;; the reference behavior — prefer it in doubt). Also skipped
+            ;; when n+o covers half the result or more, where the heap
+            ;; bookkeeping has nothing left to win.
             results (if sql-order-by
-                      (let [null-safe-cmp
-                            (fn [a b]
-                              (let [av (if (sequential? a) a [a])
-                                    bv (if (sequential? b) b [b])]
-                                (loop [specs (partition 2 sql-order-by)]
-                                  (if-let [[idx dir] (first specs)]
-                                    (let [va (nth av idx nil)
-                                          vb (nth bv idx nil)
-                                          a-null? (or (nil? va) (= :__null__ va))
-                                          b-null? (or (nil? vb) (= :__null__ vb))
-                                          c (cond
-                                              (and a-null? b-null?) 0
-                                              ;; NULLs last for ASC, first for DESC (PG default)
-                                              a-null? (if (= dir :asc) 1 -1)
-                                              b-null? (if (= dir :asc) -1 1)
-                                              :else (if (= dir :desc)
-                                                      (compare vb va)
-                                                      (compare va vb)))]
-                                      (if (zero? c)
-                                        (recur (rest specs))
-                                        c))
-                                    0))))]
-                        (let [sorted (sort null-safe-cmp results)]
-                          (cond->> sorted
-                            sql-offset (drop sql-offset)
-                            sql-limit  (take sql-limit))))
+                      (let [null-safe-cmp (null-safe-order-cmp sql-order-by)
+                            k (when sql-limit
+                                (+ (long sql-limit) (long (or sql-offset 0))))
+                            use-top-k? (and k
+                                            (nil? having)
+                                            (empty? window-specs)
+                                            (< (* 2 k) (count results)))]
+                        (if use-top-k?
+                          (cond->> (top-k-sort k null-safe-cmp results)
+                            sql-offset (drop sql-offset))
+                          (let [sorted (sort null-safe-cmp results)]
+                            (cond->> sorted
+                              sql-offset (drop sql-offset)
+                              sql-limit  (take sql-limit)))))
                       results)
             ;; Apply HAVING filter BEFORE trimming hidden columns:
             ;; HAVING can reference an aggregate that wasn't in the SELECT
