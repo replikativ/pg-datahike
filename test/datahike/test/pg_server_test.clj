@@ -1752,3 +1752,12 @@
     (is (nil? (err (.execute *handler* "UPDATE tkey SET ts = current_timestamp WHERE id = 1"))))
     (let [r (.execute *handler* "SELECT ts IS NOT NULL FROM tkey WHERE id = 1")]
       (is (= [["t"]] (rows r))))))
+
+(deftest test-update-with-negative-literal-arithmetic
+  (testing "SET x = x + <negative literal> (SignedExpression operand; pgbench tpcb)"
+    (is (nil? (err (.execute *handler* "CREATE TABLE tneg(id INTEGER, bal INTEGER)"))))
+    (is (nil? (err (.execute *handler* "INSERT INTO tneg(id, bal) VALUES (1, 100)"))))
+    (is (nil? (err (.execute *handler* "UPDATE tneg SET bal = bal + -30 WHERE id = 1"))))
+    (is (= [["70"]] (rows (.execute *handler* "SELECT bal FROM tneg WHERE id = 1"))))
+    (is (nil? (err (.execute *handler* "UPDATE tneg SET bal = bal + +5 WHERE id = 1"))))
+    (is (= [["75"]] (rows (.execute *handler* "SELECT bal FROM tneg WHERE id = 1"))))))

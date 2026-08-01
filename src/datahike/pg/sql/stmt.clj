@@ -3601,6 +3601,16 @@
         :else
         (get entity-map (keyword ns-str col-name))))
 
+    ;; Negative literal operand: `SET x = x + -123` parses the RHS as a
+    ;; SignedExpression; without this branch it fell to `(str value-expr)`
+    ;; and the arithmetic threw String→Number (hit by pgbench's tpcb
+    ;; script, whose :delta is uniform over [-5000, 5000]).
+    (instance? SignedExpression value-expr)
+    (let [^SignedExpression se value-expr
+          inner (eval-update-expr (.getExpression se) entity-map ns-str schema)]
+      (when (number? inner)
+        (if (= \- (.getSign se)) (- inner) inner)))
+
     ;; Arithmetic: recurse on both sides
     (instance? Addition value-expr)
     (let [^Addition e value-expr
