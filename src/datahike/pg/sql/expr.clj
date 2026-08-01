@@ -94,6 +94,19 @@
          interpret-form
          parse-timestamp-string)
 
+(def ^:dynamic *conjunctive-where*
+  "True while translating top-level AND-ed conjuncts of a WHERE (or an
+   INNER JOIN's ON), where emitting a *data pattern* is sound: the
+   pattern constrains the whole query exactly like the predicate it
+   replaces. Enables the indexable fast paths (ctx/bind-col-value!,
+   ctx/unify-inner-equijoin!). MUST be re-bound false inside OR / NOT
+   branches — a data pattern added to the global :where set from inside
+   a disjunct would constrain rows the disjunct shouldn't touch. Bound
+   true by stmt.clj at the WHERE / inner-ON entry points; default false
+   keeps every other context (CASE conditions, HAVING, projections,
+   outer-join ON) on the predicate path."
+  false)
+
 (defn string-value-text
   "Extract the text of a JSqlParser `StringValue`, applying SQL/PG
    semantics for the `N'...'` (national character) prefix.
@@ -2534,17 +2547,37 @@
           params (.getParameters fn-expr)
           arr-expr (when params (first params))]
       (translate-quantified-cmp ctx op left arr-expr kind))
-    (let [[left right] (coerce-comparison-operands ctx left right)
-          ;; Each side is either an AST node (translate-expr-bound) or
-          ;; a pre-resolved typed Clojure value from coerce-unknown.
-          l (if (instance? net.sf.jsqlparser.expression.Expression left)
-              (translate-expr ctx left) left)
-          r (if (instance? net.sf.jsqlparser.expression.Expression right)
-              (translate-expr ctx right) right)
-          l (if (seq? l) (ctx/materialize-arg! ctx l) l)
-          r (if (seq? r) (ctx/materialize-arg! ctx r) r)
-          guards (ctx/null-guard-clauses ctx [l r])]
-      (conj guards [(list op l r)]))))
+    (or
+     ;; Implicit-join equality (`FROM a, b WHERE a.x = b.y`) between two
+     ;; plain columns in a top-level conjunct: unify on a shared logic
+     ;; var (hash join) instead of get-else + predicate (cross product).
+     ;; Same machinery as the explicit INNER JOIN ON path.
+     (when (and (= op '=) *conjunctive-where*
+                (instance? Column left) (instance? Column right)
+                (nil? (.getArrayConstructor ^Column left))
+                (nil? (.getArrayConstructor ^Column right)))
+       (let [resolve-col #(try (ctx/resolve-column ^Column %
+                                                   (:table-aliases ctx)
+                                                   (:default-table ctx)
+                                                   (:col-overrides ctx)
+                                                   (:derived-aliases ctx))
+                               (catch Throwable _ nil))
+             l-res (resolve-col left)
+             r-res (resolve-col right)]
+         (when (and l-res r-res
+                    (ctx/unify-inner-equijoin! ctx l-res r-res))
+           [])))
+     (let [[left right] (coerce-comparison-operands ctx left right)
+           ;; Each side is either an AST node (translate-expr-bound) or
+           ;; a pre-resolved typed Clojure value from coerce-unknown.
+           l (if (instance? net.sf.jsqlparser.expression.Expression left)
+               (translate-expr ctx left) left)
+           r (if (instance? net.sf.jsqlparser.expression.Expression right)
+               (translate-expr ctx right) right)
+           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+           guards (ctx/null-guard-clauses ctx [l r])]
+       (conj guards [(list op l r)])))))
 
 (defn translate-predicate
   "Translate a JSqlParser WHERE expression to Datalog :where clauses.
@@ -2558,8 +2591,13 @@
 
     (instance? OrExpression expr)
     (let [^OrExpression e expr
-          left-clauses (translate-predicate ctx (.getLeftExpression e))
-          right-clauses (translate-predicate ctx (.getRightExpression e))
+          ;; Inside a disjunct, data-pattern emission is unsound (it
+          ;; would constrain rows the other branch should keep) —
+          ;; force the predicate paths.
+          left-clauses (binding [*conjunctive-where* false]
+                         (translate-predicate ctx (.getLeftExpression e)))
+          right-clauses (binding [*conjunctive-where* false]
+                          (translate-predicate ctx (.getRightExpression e)))
           ;; The canonical "always false" sentinel produced by EXISTS /
           ;; IN-subquery handlers when the inner evaluates to no rows.
           ;; A branch carrying this sentinel (alone or under an `and`)
@@ -2718,11 +2756,19 @@
                 ;; See coerce/coerce-unknown for the dispatch.
                 coerced (coerce-unknown-literal ctx left right)
                 val (or coerced (translate-expr ctx right))]
-            (if (and (vector? resolved) (= :db-id (first resolved)))
+            (cond
+              (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
               (let [evar (ctx/entity-var! ctx (second resolved))]
                 [[(list '= evar val)]])
+              ;; Top-level conjunct on a plain column with a
+              ;; matching-typed constant → value-bound data pattern
+              ;; [?e :attr v]: an indexable clause instead of a
+              ;; get-else scan + equality predicate over every row.
+              (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
+              []
               ;; Regular column = value (including aliased columns)
+              :else
               (let [v (ctx/col-var! ctx resolved)]
                 [[(list '= v val)]])))
           (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e)))))
@@ -3045,7 +3091,10 @@
           ;; Temporarily set isNot and delegate to EXISTS handler
           (translate-predicate ctx (doto (ExistsExpression.) (.setNot true)
                                          (.setRightExpression (.getRightExpression exists-expr)))))
-        (let [inner (translate-predicate ctx inner-expr)]
+        ;; Under negation a data pattern is unsound (it would constrain
+        ;; the outer query, not the negated branch) — predicate paths only.
+        (let [inner (binding [*conjunctive-where* false]
+                      (translate-predicate ctx inner-expr))]
           [(concat ['not] inner)])))
 
     (instance? InExpression expr)

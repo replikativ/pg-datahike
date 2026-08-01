@@ -471,22 +471,29 @@
                                       :right-key-attr right-key-attr
                                       :right-alias right-alias
                                       :left-evar (ctx/entity-var! ctx (:default-table ctx))}))
-                ;; For inner joins: equality predicate + SQL null guards.
+                ;; For inner joins: unify on a shared logic var when both
+                ;; sides are plain columns — indexable data patterns the
+                ;; engine hash-joins in O(n), see ctx/unify-inner-equijoin!.
+                ;; The predicate fallback below cross-products the two
+                ;; relations before filtering (O(n²) time and heap).
+                ;;
+                ;; Fallback: equality predicate + SQL null guards.
                 ;; Datalog (= :__null__ :__null__) is TRUE, but SQL INNER
                 ;; JOIN on NULL=NULL must NOT match (3-valued logic: NULL =
                 ;; NULL is UNKNOWN, filtered out as non-TRUE). Emit explicit
                 ;; not-null guards for each side so rows whose join-column
                 ;; is NULL are excluded. nil and the :__null__ sentinel are
                 ;; both treated as SQL NULL.
-                  (let [l-var (expr/translate-expr ctx left)
-                        r-var (expr/translate-expr ctx right)]
-                    (ctx/add-clause! ctx [(list '= l-var r-var)])
-                    (when (symbol? l-var)
-                      (ctx/add-clause! ctx [(list 'not= l-var :__null__)])
-                      (ctx/add-clause! ctx [(list 'not= l-var nil)]))
-                    (when (symbol? r-var)
-                      (ctx/add-clause! ctx [(list 'not= r-var :__null__)])
-                      (ctx/add-clause! ctx [(list 'not= r-var nil)]))))))
+                  (or (ctx/unify-inner-equijoin! ctx left-resolved right-resolved)
+                      (let [l-var (expr/translate-expr ctx left)
+                            r-var (expr/translate-expr ctx right)]
+                        (ctx/add-clause! ctx [(list '= l-var r-var)])
+                        (when (symbol? l-var)
+                          (ctx/add-clause! ctx [(list 'not= l-var :__null__)])
+                          (ctx/add-clause! ctx [(list 'not= l-var nil)]))
+                        (when (symbol? r-var)
+                          (ctx/add-clause! ctx [(list 'not= r-var :__null__)])
+                          (ctx/add-clause! ctx [(list 'not= r-var nil)])))))))
 
           ;; Fall back to regular predicate translation. For OUTER joins
           ;; (LEFT/RIGHT/FULL), capture the predicate clauses for the
@@ -502,7 +509,10 @@
               (let [preds (expr/translate-predicate ctx expr)]
                 (swap! ref-info update :matched-only-preds (fnil into [])
                        (vec preds)))
-              (let [preds (expr/translate-predicate ctx expr)]
+              ;; INNER-join ON conjunct = top-level conjunct: allow the
+              ;; indexable data-pattern fast paths.
+              (let [preds (binding [expr/*conjunctive-where* true]
+                            (expr/translate-predicate ctx expr))]
                 (swap! (:where-clauses ctx) into preds)))))))
     {:name name :alias right-alias :join-type jtype :ref-info @ref-info}))
 
@@ -1550,9 +1560,14 @@
         ctx (assoc ctx :agg-aliases-warning-set agg-aliases-warning-set)
 
         where-expr (.getWhere select)
+        ;; *conjunctive-where* enables the indexable data-pattern fast
+        ;; paths (value-bound `[?e :attr v]`, shared-var equi-join
+        ;; unification) — sound only for top-level AND-ed conjuncts;
+        ;; expr.clj re-binds it false inside OR / NOT branches.
         _ (when where-expr
-            (let [preds (expr/translate-predicate ctx where-expr)]
-              (swap! (:where-clauses ctx) into preds)))
+            (binding [expr/*conjunctive-where* true]
+              (let [preds (expr/translate-predicate ctx where-expr)]
+                (swap! (:where-clauses ctx) into preds))))
 
         has-distinct? (some? (.getDistinct select))
 
@@ -2557,6 +2572,7 @@
                                         (reaches-find? next (conj seen v))))))
                 ;; Find data patterns that are candidates for get-else conversion
                 optional-patterns (atom [])
+                required-join-patterns @(:required-join-patterns ctx)
                 _ (doseq [clause all-clauses]
                     (when (and (vector? clause)
                                (= 3 (count clause))
@@ -2566,6 +2582,10 @@
                       (let [evar (first clause)
                             vvar (nth clause 2)]
                         (if (or (contains? required-vars vvar)
+                                ;; Equi-join unification patterns ARE the
+                                ;; join — get-else-ing them would make the
+                                ;; :__null__ sentinel joinable.
+                                (contains? required-join-patterns clause)
                                 (not (reaches-find? vvar #{})))
                           ;; Required or doesn't reach :find → stays as anchor
                           (swap! entity-has-anchor conj evar)
@@ -2607,6 +2627,7 @@
                                       v)))
                                 order-by-spec)
                   current-clauses @(:where-clauses ctx)
+                  required-join-patterns @(:required-join-patterns ctx)
                   to-convert (keep (fn [v]
                                      (first
                                       (filter (fn [c]
@@ -2614,6 +2635,7 @@
                                                      (symbol? (first c))
                                                      (keyword? (second c))
                                                      (= v (nth c 2))
+                                                     (not (contains? required-join-patterns c))
                                                      (not= "db-row-exists"
                                                            (clojure.core/name (second c)))
                                                      (not= "id"

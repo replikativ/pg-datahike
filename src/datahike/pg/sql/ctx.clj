@@ -181,6 +181,13 @@
    ;; null guards (per SQL's three-valued logic: `col op V` when col is
    ;; NULL → UNKNOWN → false in WHERE).
    :nullable-vars (atom #{})
+   ;; Data-pattern clauses emitted by the equi-join unification /
+   ;; value-bound fast paths (unify-inner-equijoin!, bind-col-value!).
+   ;; These patterns ARE the join/filter — the projection-nullability
+   ;; pass in translate-select must never rewrite them to get-else, or
+   ;; the `:__null__` sentinel becomes joinable and NULL = NULL rows
+   ;; reappear.
+   :required-join-patterns (atom #{})
    ;; Prepared-statement parameter placeholders. Map {index → ?var},
    ;; populated when translate-expr encounters a JSqlParser JdbcParameter
    ;; (`?` or `$N`). The handler looks at `:param-placeholders` on the
@@ -460,6 +467,105 @@
                   (do (swap! cvars assoc cache-key v) v)))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Inner-equijoin unification
+;;
+;; `a.x = b.y` used to translate as two independent `get-else` bindings
+;; plus an `(= ?ax ?by)` predicate. The engine cannot index a predicate,
+;; so it materialises the full cross product of the two relations before
+;; filtering — O(n²) time AND heap (an 8k-row self-join OOMed a 2 GB
+;; heap; the unified form below runs it in ~18 ms). Emitting two plain
+;; data patterns that share ONE logic var
+;;
+;;     [?a_eid :a/x ?j] [?b_eid :b/y ?j]
+;;
+;; lets the engine hash-join on ?j. SQL NULL semantics survive intact:
+;; NULL is stored as an *absent attribute*, so a row with a NULL join
+;; key produces no datom and can never match — exactly SQL's
+;; `NULL = anything → UNKNOWN → filtered` for INNER joins. (OUTER joins
+;; never reach this path; they go through the or-join machinery.)
+
+(defn- plain-join-col
+  "When `resolved` (a resolve-column result) denotes a plain data-pattern
+   column — a keyword or [:aliased …] attr with no ref-target deref, not
+   a derived-table alias (their materialised rows can carry the
+   `:__null__` sentinel as a stored value, which would wrongly unify),
+   and not an OUTER-JOIN right side — return `{:cache-key k :attr kw
+   :evar ?e}`. Else nil."
+  [ctx resolved]
+  (let [[alias-key attr]
+        (cond
+          (keyword? resolved)
+          [(namespace resolved)
+           (if-let [db (:db ctx)]
+             (resolve-inherited-attr resolved (:schema ctx) db)
+             resolved)]
+          (and (vector? resolved) (= :aliased (first resolved)))
+          [(nth resolved 1) (nth resolved 2)]
+          :else nil)]
+    (when (and alias-key (keyword? attr)
+               (nil? (get (:ref-targets ctx) attr))
+               (not (contains? (:derived-aliases ctx) alias-key)))
+      (let [evar (entity-var! ctx alias-key)]
+        (when-not (contains? @(:left-join-evars ctx) evar)
+          {:cache-key [alias-key attr] :attr attr :evar evar})))))
+
+(defn unify-inner-equijoin!
+  "Try to translate an INNER-JOIN equality between two plain columns as
+   shared-variable data patterns (see comment above). Returns true when
+   handled; nil when the caller must fall back to the predicate path
+   (ref-deref columns, derived tables, expressions, both vars already
+   bound)."
+  [ctx l-resolved r-resolved]
+  (when-let [l (plain-join-col ctx l-resolved)]
+    (when-let [r (plain-join-col ctx r-resolved)]
+      (let [cvars (:col->var ctx)
+            l-cached (get @cvars (:cache-key l))
+            r-cached (get @cvars (:cache-key r))]
+        ;; Both columns already bound to distinct vars elsewhere — the
+        ;; plain patterns couldn't share a var without rebinding one of
+        ;; them; leave it to the predicate path.
+        (when-not (and l-cached r-cached)
+          (let [jv (or l-cached r-cached
+                       (symbol (str "?join" (swap! (:var-counter ctx) inc))))]
+            ;; If a side was already get-else-bound, the plain pattern
+            ;; simply narrows it to rows where the datom exists and
+            ;; matches — the sentinel value never appears in storage
+            ;; for base tables, so `:__null__` rows drop out (correct
+            ;; for INNER joins).
+            (add-clause! ctx [(:evar l) (:attr l) jv])
+            (add-clause! ctx [(:evar r) (:attr r) jv])
+            (swap! (:required-join-patterns ctx) conj
+                   [(:evar l) (:attr l) jv] [(:evar r) (:attr r) jv])
+            (when-not l-cached (swap! cvars assoc (:cache-key l) jv))
+            (when-not r-cached (swap! cvars assoc (:cache-key r) jv))
+            true))))))
+
+(defn bind-col-value!
+  "Translate `col = <constant>` as a value-bound data pattern
+   `[?eid :attr v]` — an indexable clause — instead of a get-else
+   binding plus `(= ?col v)` predicate over every row. Only sound in a
+   top-level conjunctive context (the caller guards that) and only
+   emitted when the constant's runtime class matches the attribute's
+   declared valueType, so pattern-equality can't diverge from
+   predicate-equality on cross-type comparisons. Returns true when
+   handled."
+  [ctx resolved v]
+  (when (and (some? v) (not (symbol? v)) (not (seq? v)) (not= :__null__ v))
+    (when-let [c (plain-join-col ctx resolved)]
+      (let [vtype (get-in (:schema ctx) [(:attr c) :db/valueType])
+            match? (case vtype
+                     :db.type/long    (instance? Long v)
+                     :db.type/string  (instance? String v)
+                     :db.type/boolean (instance? Boolean v)
+                     :db.type/uuid    (instance? java.util.UUID v)
+                     :db.type/keyword (keyword? v)
+                     false)]
+        (when match?
+          (add-clause! ctx [(:evar c) (:attr c) v])
+          (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) v])
+          true)))))
+
+;; ---------------------------------------------------------------------------
 ;; Expression helpers
 
 (defn materialize-arg!
@@ -494,7 +600,8 @@
    because those patterns will be moved inside the or-join where NULL
    synthesis is handled by the matched/unmatched branches."
   [ctx vars]
-  (let [lj-evars @(:left-join-evars ctx)]
+  (let [lj-evars @(:left-join-evars ctx)
+        required @(:required-join-patterns ctx)]
     (doseq [v vars :when (symbol? v)]
       (let [clauses @(:where-clauses ctx)
             match (first (filter (fn [c]
@@ -506,7 +613,9 @@
         (when (and match
                    ;; Don't convert patterns on LEFT JOIN right-side entity vars.
                    ;; The LEFT JOIN or-join handles NULL synthesis for these.
-                   (not (contains? lj-evars (first match))))
+                   (not (contains? lj-evars (first match)))
+                   ;; Nor equi-join unification patterns — they ARE the join.
+                   (not (contains? required match)))
           (let [[evar attr _] match
                 ;; Replace in-place to preserve clause ordering (critical for binding resolution)
                 replacement [(list 'get-else '$ evar attr :__null__) v]]
