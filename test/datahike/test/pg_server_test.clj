@@ -870,9 +870,24 @@
       (is (some? r))))
 
   (testing "Division by zero"
-    ;; Division by zero in SQL should not crash the server
+    ;; PG raises SQLSTATE 22012 with message exactly "division by zero"
+    ;; for integer, float, and numeric division alike (int4div /
+    ;; float8div / numeric_div in postgres src/backend/utils/adt).
     (let [r (.execute *handler* "SELECT 1 / 0")]
-      (is (some? r)))))
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))
+
+    (let [r (.execute *handler* "SELECT 1.0 / 0")]
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))
+
+    (let [r (.execute *handler* "SELECT 1 % 0")]
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))
+
+    (let [r (.execute *handler* "SELECT age / 0 FROM person WHERE name = 'Alice'")]
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))))
 
 ;; ============================================================================
 ;; Arithmetic expressions

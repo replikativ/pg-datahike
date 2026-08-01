@@ -10,7 +10,8 @@
    See postgres/src/backend/utils/errcodes.txt for the canonical code
    list."
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.errors :as errors]))
+            [datahike.pg.errors :as errors]
+            [datahike.pg.sql.fns :as fns]))
 
 (deftest test-classify-ex-data-sqlstate
   (testing "explicit :sqlstate in ex-data wins over everything else"
@@ -188,6 +189,52 @@
         [code msg _] (errors/classify-exception e)]
     (is (= "0A000" code))
     (is (= "GRANT is not supported" msg))))
+
+(deftest test-division-by-zero-category
+  (testing ":division-by-zero → 22012 with PG's exact message"
+    (let [e (errors/pg-error :division-by-zero {})
+          [code msg _] (errors/classify-exception e)]
+      (is (= "22012" code))
+      (is (= "division by zero" msg))
+      ;; Paths that bypass classify-exception use .getMessage directly.
+      (is (= "division by zero" (.getMessage e))))))
+
+(deftest test-classify-message-divide-by-zero
+  (testing "raw ArithmeticException 'Divide by zero' (quot, aggregates) → 22012"
+    (let [e (ArithmeticException. "Divide by zero")]
+      (is (= "22012" (first (errors/classify-exception e))))))
+
+  (testing "'division by zero' message without ex-data → 22012"
+    (let [e (ex-info "division by zero" {})]
+      (is (= "22012" (first (errors/classify-exception e)))))))
+
+(deftest test-sql-div-mod-raise-22012
+  (testing "sql-div by zero raises 22012 for integer, float, and decimal divisors"
+    (doseq [[a b] [[1 0] [1.0 0.0] [1M 0M] [1 0.0] [5 -0.0] [1 0M]]]
+      (let [e (try (fns/sql-div a b) nil (catch Exception e e))]
+        (is (some? e) (str a " / " b " should throw"))
+        (when e
+          (is (= "division by zero" (.getMessage ^Exception e)))
+          (is (= "22012" (first (errors/classify-exception e))))))))
+
+  (testing "sql-mod with zero modulus raises 22012"
+    (doseq [[a b] [[1 0] [1.0 0.0] [1M 0M]]]
+      (let [e (try (fns/sql-mod a b) nil (catch Exception e e))]
+        (is (some? e) (str a " % " b " should throw"))
+        (when e
+          (is (= "division by zero" (.getMessage ^Exception e)))
+          (is (= "22012" (first (errors/classify-exception e))))))))
+
+  (testing "NULL propagates before the zero check — NULL / 0 is NULL, not an error"
+    (is (= :__null__ (fns/sql-div :__null__ 0)))
+    (is (= :__null__ (fns/sql-div nil 0)))
+    (is (= :__null__ (fns/sql-div 1 :__null__)))
+    (is (= :__null__ (fns/sql-mod :__null__ 0)))
+    (is (= :__null__ (fns/sql-mod 1 :__null__))))
+
+  (testing "non-zero divisors still divide"
+    (is (= 3 (fns/sql-div 6 2)))
+    (is (= 1 (fns/sql-mod 7 2)))))
 
 (deftest test-query-canceled
   (let [e (ex-info "x" {:error :query-canceled})

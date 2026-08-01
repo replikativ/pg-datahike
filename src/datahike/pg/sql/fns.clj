@@ -37,6 +37,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.errors :as errors]
             [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)
@@ -459,8 +460,34 @@
 (def sql-+ (null-safe +))
 (def sql-- (null-safe -))
 (def sql-* (null-safe *))
-(def sql-div (null-safe /))
-(def sql-mod (null-safe rem))
+
+(defn- throw-division-by-zero []
+  (throw (errors/pg-error :division-by-zero {})))
+
+(defn- checked-div
+  "Division that raises SQLSTATE 22012 (\"division by zero\") on a zero
+   divisor. PG errors for integer, float, AND numeric division alike
+   (int4div / float8div / numeric_div in postgres utils/adt), whereas
+   Clojure `(/ 1.0 0.0)` silently returns ##Inf — so the zero check must
+   run BEFORE dividing. NULL propagation is handled by the `null-safe`
+   wrapper around this fn, so NULL / 0 stays NULL as in PG."
+  ([a b]
+   (when (and (number? b) (zero? b)) (throw-division-by-zero))
+   (/ a b))
+  ([a b & more]
+   (when (some #(and (number? %) (zero? %)) (cons b more))
+     (throw-division-by-zero))
+   (apply / a b more)))
+
+(defn- checked-mod
+  "Modulo that raises SQLSTATE 22012 on a zero modulus — PG's int4mod /
+   float8mod / numeric_mod all raise \"division by zero\" there."
+  [a b]
+  (when (and (number? b) (zero? b)) (throw-division-by-zero))
+  (rem a b))
+
+(def sql-div (null-safe checked-div))
+(def sql-mod (null-safe checked-mod))
 
 ;; ---------------------------------------------------------------------------
 ;; SQL string function implementations
