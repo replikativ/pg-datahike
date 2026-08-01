@@ -3337,7 +3337,7 @@
    transaction (see open-implicit-tx! / *implicit-tx-allowed*) so the
    whole group is atomic. COPY is excluded — it runs its own sub-protocol
    and commits separately."
-  #{:insert :update :update-with-recursive :delete
+  #{:insert :update :update-with-recursive :delete :truncate
     :ddl-create :ddl-create-sequence :ddl-create-enum :ddl-create-domain
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-sequence})
 
@@ -4791,6 +4791,103 @@
           (classified-error "DELETE error: " e)))
       (execute-delete conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
+(defn- table-row-eids
+  "All row entity-ids of `table` in `db` — union across EVERY attr in
+   the table's namespace, not just the first (a row whose first column
+   is NULL must still be found; see drop-table-tx!'s history note).
+   Returns a set; empty when the table doesn't exist — TRUNCATE and
+   DROP treat a missing table as empty, matching DELETE."
+  [db table]
+  (let [db-schema (dbi/-schema db)
+        table-attrs (into []
+                          (keep (fn [[attr-kw _]]
+                                  (when (and (keyword? attr-kw)
+                                             (= (namespace attr-kw) table))
+                                    attr-kw)))
+                          db-schema)]
+    (into #{}
+          (mapcat (fn [attr]
+                    (map first
+                         (d/q {:find '[?e]
+                               :where [['?e attr]]}
+                              db))))
+          table-attrs)))
+
+(defn- restart-identity-tx-data
+  "TRUNCATE … RESTART IDENTITY: reset every IDENTITY-backing sequence
+   of `tables` to its pristine post-CREATE state. Identity sequences
+   (translate-create-table) initialise :__seq__/value to 0 = start(1) -
+   increment(1); handle-nextval is advance-then-return, so resetting to
+   `- 1 increment` makes the next nextval return 1 again. Sequences
+   with a non-default START WITH aren't reachable here — IDENTITY
+   columns always start at 1."
+  [db tables]
+  (when (get (dbi/-schema db) :__seq__/name)
+    (vec
+     (for [table tables
+           {:keys [seq-name]} (compute-identity-cols db table)
+           :let [seq-eid (ffirst (d/q '{:find [?e]
+                                        :where [[?e :__seq__/name ?n]]
+                                        :in [$ ?n]}
+                                      db seq-name))
+                 increment (or (when seq-eid
+                                 (ffirst (d/q '{:find [?i]
+                                                :where [[?e :__seq__/increment ?i]]
+                                                :in [$ ?e]}
+                                              db seq-eid)))
+                               1)]
+           :when seq-eid]
+       [:db/add seq-eid :__seq__/value (- 1 increment)]))))
+
+(defn- exec-truncate
+  "TRUNCATE [TABLE] t1, t2, … — retract every row of every listed
+   table in ONE transaction (PG truncates the listed set atomically).
+   No per-row FK enforcement: PG's TRUNCATE check is table-level and
+   exempts referencing tables that are themselves in the list, which
+   the row-level DELETE machinery would misfire on. Missing tables are
+   treated as empty, like DELETE."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        tables (:tables parsed)]
+    (if (:in-tx? @tx-state)
+      (try
+        (let [spec-db (:speculative-db @tx-state)
+              eid->tempid (:eid->tempid @tx-state)
+              eids (into [] (mapcat #(table-row-eids spec-db %)) tables)
+              restart-tx (when (:restart-identity? parsed)
+                           (restart-identity-tx-data spec-db tables))
+              ;; Speculative db keeps ORIGINAL entity IDs …
+              spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
+                                 restart-tx)
+              spec-report (dc/with spec-db spec-tx-data)
+              ;; … the commit buffer remaps to tempids (rows inserted
+              ;; earlier in this tx only exist as tempids at commit).
+              remap (fn [eid] (get eid->tempid eid eid))
+              commit-tx-data (into (mapv (fn [eid] [:db/retractEntity (remap eid)]) eids)
+                                   (map (fn [[op eid attr val]] [op (remap eid) attr val]))
+                                   restart-tx)]
+          (swap! tx-state (fn [ts]
+                            (-> ts
+                                (update :tx-buffer into commit-tx-data)
+                                (assoc :speculative-db (:db-after spec-report)))))
+          (empty-result "TRUNCATE TABLE"))
+        (catch Exception e
+          (swap! tx-state assoc :aborted? true)
+          (classified-error "TRUNCATE error: " e)))
+      (try
+        (let [db (d/db conn)
+              eids (into [] (mapcat #(table-row-eids db %)) tables)
+              restart-tx (when (:restart-identity? parsed)
+                           (restart-identity-tx-data db tables))
+              tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
+                            restart-tx)
+              tx-data ((:tx-wrap ctx identity) tx-data)]
+          (when (seq tx-data)
+            (d/transact conn tx-data))
+          (empty-result "TRUNCATE TABLE"))
+        (catch Exception e
+          (classified-error "TRUNCATE error: " e))))))
+
 (defn- exec-ddl-create
   [ctx parsed]
   (let [{:keys [conn tx-state temp-tables]} ctx
@@ -5080,21 +5177,10 @@
                                              (= (namespace attr-kw) table))
                                     attr-kw)))
                           db-schema)
-        ;; Collect all entity IDs for this table. An earlier
-        ;; version queried only the FIRST attr, which missed
-        ;; rows where that attr was null (pgjdbc's boolfloat
-        ;; inserts (i, a, NULL) — if first-attr was `b`, the
-        ;; row was never retracted and accumulated across
-        ;; DROP/CREATE cycles). Union across every attr to
-        ;; catch all rows.
+        ;; Collect all entity IDs for this table — union across every
+        ;; attr (see table-row-eids for the NULL-first-column history).
         data-eids (when (seq table-attrs)
-                    (into #{}
-                          (mapcat (fn [attr]
-                                    (map first
-                                         (d/q {:find '[?e]
-                                               :where [['?e attr]]}
-                                              db))))
-                          table-attrs))
+                    (table-row-eids db table))
         ;; Retract all data entities
         data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
         ;; Retract the schema attribute definitions themselves
@@ -5109,15 +5195,19 @@
       (d/transact conn all-tx-data))))
 
 (defn- exec-ddl-drop
+  "DROP TABLE — single name (:table, JSqlParser path) or a list
+   (:tables, classify's :drop-table-multi path). Per-table drops run
+   sequentially; a missing table is a no-op (drop-table-tx! finds no
+   attrs), so IF EXISTS needs no extra branch."
   [ctx parsed]
   (let [{:keys [conn temp-tables]} ctx]
     (try
-      (let [table (:table parsed)]
+      (doseq [table (or (:tables parsed) [(:table parsed)])]
         (drop-table-tx! conn table)
         ;; A DROP TABLE on a tracked temp table means close() must not
         ;; try to drop it again.
-        (when temp-tables (swap! temp-tables disj table))
-        (empty-result "DROP TABLE"))
+        (when temp-tables (swap! temp-tables disj table)))
+      (empty-result "DROP TABLE")
       (catch Exception e
         (classified-error "DROP TABLE error: " e)))))
 
@@ -6079,6 +6169,7 @@
                           :update-with-recursive (exec-update-with-recursive ctx parsed)
                           :update                (exec-update ctx parsed)
                           :delete                (exec-delete ctx parsed)
+                          :truncate              (exec-truncate ctx parsed)
                           ;; Every DDL exec-* invalidates the per-schema cache.
                           ;; PG metadata (`:pg/not-null` etc.) lives on schema-
                           ;; attribute entities but not in `(dbi/-schema db)`, so

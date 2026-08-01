@@ -1311,6 +1311,11 @@
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.
     :create-type-enum :create-type-composite :create-domain
+    ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks
+    ;; RESTART/CONTINUE IDENTITY) and multi-name DROP TABLE (JSqlParser
+    ;; 5.2 parses a single name only). Both re-tagged to non-:system
+    ;; types in parse-sql's sys-type case, like :create-domain.
+    :truncate :drop-table-multi
     ;; pg_dump-emitted utility statements we silently accept
     :owner-noop :psql-meta :set-config
     ;; COPY-IN routes through the wire-protocol sub-protocol; the
