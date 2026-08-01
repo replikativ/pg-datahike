@@ -4441,6 +4441,106 @@
             (recur (cons (second e) acc))
             (vec acc)))))))
 
+(def ^:private fast-select-cache
+  "CompiledStatement prototype (tier-1 SELECT): [(identity parsed)] →
+   {:schema <schema object> :exec (fn [db bound] QueryResult)} | ::none.
+   Compiled on first Execute; revalidated against the live schema object
+   (DDL mints a new schema map → recompile)."
+  (pg-cache/bounded-cache 512))
+
+(defn- compile-fast-select
+  "Compile a parsed plain SELECT into a direct executor: datalog query +
+   ParamRef argument template + precomputed result shape. Returns nil when
+   the statement needs the general exec-select machinery."
+  [parsed db]
+  (when (and (= :select (:type parsed))
+             (:query parsed) (seq (:find-aliases parsed))
+             (nil? (:enriched-db parsed))
+             (nil? (:correlated-subqueries parsed))
+             (nil? (:compound-exprs parsed))
+             (nil? (:window-specs parsed))
+             (nil? (:for-update parsed))
+             (not (:has-aggregates? parsed))
+             (not (:has-distinct? parsed))
+             (nil? (:limit parsed)) (nil? (:offset parsed))
+             (nil? (:sql-limit parsed)) (nil? (:sql-offset parsed))
+             (nil? (:sql-order-by parsed))
+             (nil? (:sub-results parsed))
+             (not (re-find #"(?i)for\s+(valid_time|system_time)"
+                           (or (:sql parsed) ""))))
+    (let [query (:query parsed)
+          in-args (vec (:in-args parsed))
+          aliases (:find-aliases parsed)
+          hidden (long (or (:hidden-count parsed) 0))
+          keep-n (- (count (:find query)) hidden)
+          parsed-with-shape (assoc parsed :find-aliases aliases :query query)
+          schema-oids (compute-schema-oids parsed-with-shape db)
+          item-oids (:select-item-oids parsed)
+          schema-oids (if (and item-oids (seq aliases))
+                        (let [n (count aliases)
+                              out (int-array n)]
+                          (dotimes [i n]
+                            (let [so (aget ^ints schema-oids i)
+                                  io (when (< i (count item-oids))
+                                       (nth item-oids i))]
+                              (aset out i (int (if (and (= so -1) io) io so)))))
+                          out)
+                        schema-oids)
+          sources (compute-column-sources parsed-with-shape db)]
+      (when (pos? keep-n)
+        {:schema (dbi/-schema db)
+         :exec
+         (fn [db bound]
+           (let [args (mapv (fn [a] (if (sql/param-ref? a)
+                                      (nth bound (:idx a))
+                                      a))
+                            in-args)
+                 res (run-param-query #(apply d/q query db args))
+                 rows (if (pos? hidden)
+                        (mapv #(subvec (vec %) 0 keep-n) res)
+                        res)
+                 result (format-query-result rows aliases schema-oids)]
+             (if sources
+               (-> ^PgWireServer$QueryResult result
+                   (.withColumnSources (first sources) (second sources))
+                   (.withColumnTypmods (nth sources 2)))
+               result)))}))))
+
+(defn- fast-select-prepared
+  "Tier-1 Execute path: run a compiled SELECT directly against the live db,
+   bypassing the general dispatch. Returns a QueryResult, or nil to fall
+   through to the full execute path (which is always semantically safe —
+   this lane only ever handles plain autocommit reads with no temporal or
+   session modifiers). Any exception falls back to the general path."
+  [conn parsed bound session-state tx-state on-query]
+  (when (map? parsed)
+    (let [k [(pg-cache/identity-key parsed)]
+          entry (.get ^java.util.Map fast-select-cache k)]
+      (when-not (identical? ::none entry)
+        (try
+          (let [ts @tx-state
+                ss @session-state]
+            (when (and (not (:aborted? ts))
+                       (nil? *snapshot-db*)
+                       (not (or (:as-of ss) (:since ss) (:history ss)
+                                (:branch ss) (:commit-id ss) (:valid-at ss)
+                                (:valid-between ss) (:statement-timeout ss))))
+              ;; Inside an explicit/implicit tx, reads see the speculative
+              ;; overlay — same db selection as the general execute path.
+              (let [db (if (:in-tx? ts)
+                         (or (:speculative-db ts) (d/db conn))
+                         (d/db conn))
+                    schema (dbi/-schema db)
+                    entry (if (and entry (identical? (:schema entry) schema))
+                            entry
+                            (let [e (compile-fast-select parsed db)]
+                              (.put ^java.util.Map fast-select-cache k (or e ::none))
+                              e))]
+                (when entry
+                  (when on-query (on-query (:sql parsed)))
+                  ((:exec entry) db bound)))))
+          (catch Exception _ nil))))))
+
 (def ^:private select-shape-cache
   "Result-shape cache for exec-select: [(identity parsed) (identity schema)
    find-aliases] → [schema-oids sources]. The final RowDescription metadata
@@ -6172,10 +6272,15 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (binding [*cached-parsed* parsed
-                  *cached-bound* (vec bound-params)
-                  *implicit-tx-allowed* true]
-          (.execute this (or (:sql parsed) ""))))
+        (let [bound (vec bound-params)]
+          (or
+           ;; Tier-1 compiled lane: plain autocommit SELECT with no
+           ;; session modifiers runs its compiled executor directly.
+           (fast-select-prepared conn parsed bound session-state tx-state on-query)
+           (binding [*cached-parsed* parsed
+                     *cached-bound* bound
+                     *implicit-tx-allowed* true]
+             (.execute this (or (:sql parsed) ""))))))
 
       (executeInGroup [this sql]
         ;; Simple-query group member: a write opens/joins the 'Q''s
