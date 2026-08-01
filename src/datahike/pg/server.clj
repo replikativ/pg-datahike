@@ -884,6 +884,88 @@
                   db begin-tx)))
     (catch Exception _ ::any)))
 
+(defn- tx-buffer-eas
+  "Return the set of [eid attr] pairs this tx-buffer writes, [eid ::all]
+   for entity retractions, or ::opaque when the buffer contains ops we
+   can't attribute (`:db.fn/call` wrappers, tempid-only maps are fine —
+   brand-new entities can't conflict with concurrent writers; unique
+   races are datahike's own upsert errors). Row-level granularity: two
+   transactions updating DIFFERENT rows of the same column no longer
+   'conflict' (the attr-level check aborted 16% of pgbench tpcb at 4
+   clients on false positives)."
+  [buf]
+  (reduce
+   (fn [acc item]
+     (cond
+       (map? item)
+       (let [eid (:db/id item)]
+         (if (and (number? eid) (pos? (long eid)))
+           (into acc (keep #(when (and (keyword? %) (not= :db/id %)) [eid %]))
+                 (keys item))
+           acc))
+       (vector? item)
+       (case (first item)
+         (:db/add :db/retract) (let [e (nth item 1 nil) a (nth item 2 nil)]
+                                 (if (and (number? e) (keyword? a))
+                                   (conj acc [(long e) a])
+                                   (reduced ::opaque)))
+         :db.fn/cas (let [e (nth item 1 nil) a (nth item 2 nil)]
+                      (if (and (number? e) (keyword? a))
+                        (conj acc [(long e) a])
+                        (reduced ::opaque)))
+         :db.fn/retractEntity (let [e (nth item 1 nil)]
+                                (if (number? e)
+                                  (conj acc [(long e) ::all])
+                                  (reduced ::opaque)))
+         (reduced ::opaque))
+       :else (reduced ::opaque)))
+   #{}
+   buf))
+
+(defonce ^{:doc "Ring of recent commits' write sets: [{:max-tx N :eas #{[e a]…}} …],
+  newest last, capped. Lets the COMMIT conflict check test row-level
+  overlap in O(concurrent writes) instead of scanning the whole
+  database, and only for the transactions that actually committed in
+  our window. Commits that bypass transact-tx-buffer! (COPY batches,
+  direct DDL) leave gaps — the checker detects incomplete coverage and
+  falls back to the attribute-level database scan."}
+  recent-commit-writes (atom clojure.lang.PersistentQueue/EMPTY))
+
+(def ^:private recent-commit-ring-size 512)
+
+(defn- record-commit-writes! [max-tx eas]
+  (swap! recent-commit-writes
+         (fn [q]
+           (let [q (conj q {:max-tx max-tx :eas eas})]
+             (if (> (count q) recent-commit-ring-size) (pop q) q)))))
+
+(defn- ring-write-eas
+  "Union of ring write-sets for commits with max-tx in (begin, current].
+   Returns ::gap unless every tx in that window is present (datahike
+   increments max-tx by one per transact, so coverage is checkable)."
+  [begin-max-tx current-max-tx]
+  (let [entries (filter #(and (> (:max-tx %) begin-max-tx)
+                              (<= (:max-tx %) current-max-tx))
+                        @recent-commit-writes)
+        want (- current-max-tx begin-max-tx)]
+    (if (or (not= want (count entries))
+            (some #(= ::opaque (:eas %)) entries))
+      ::gap
+      (reduce into #{} (map :eas entries)))))
+
+(defn- eas-overlap?
+  "Row-level overlap incl. [e ::all] entity-retraction wildcards on
+   either side."
+  [ours theirs]
+  (let [their-eids (into #{} (map first) theirs)
+        all-theirs (into #{} (keep #(when (= ::all (second %)) (first %))) theirs)]
+    (boolean
+     (some (fn [[e a :as ea]]
+             (or (contains? theirs ea)
+                 (contains? all-theirs e)
+                 (and (= ::all a) (contains? their-eids e))))
+           ours))))
+
 (defn- tag-tx-status
   "Set the txStatus field on a QueryResult based on tx-state atom."
   [^PgWireServer$QueryResult result tx-state]
@@ -3306,26 +3388,37 @@
         advanced? (and begin-max-tx current-max-tx
                        (> current-max-tx begin-max-tx))]
     ;; Concurrent-write detection: fire 40001 only when our write set
-    ;; overlaps a concurrent committer's. Wildcard case (retractEntity)
-    ;; falls back to the pessimistic "any concurrent write conflicts".
+    ;; overlaps a concurrent committer's. Preferred check is ROW-level
+    ;; ([eid attr] pairs) against the recent-commit ring — O(concurrent
+    ;; writes) and no false abort when two transactions update different
+    ;; rows of the same column. Falls back to the attribute-level
+    ;; database scan when the ring has gaps (commits that bypassed this
+    ;; path) or the buffer contains unattributable ops.
     (when (and (seq buf) advanced?)
-      (let [our-attrs   (tx-buffer-attrs buf)
-            wildcard?   (contains? our-attrs ::wildcard)
-            their-attrs (concurrent-write-attrs real-db begin-max-tx)
-            conflict?   (or wildcard?
-                            (= their-attrs ::any)
-                            (some their-attrs our-attrs))]
+      (let [our-eas (tx-buffer-eas buf)
+            their-eas (when (not= ::opaque our-eas)
+                        (ring-write-eas begin-max-tx current-max-tx))
+            conflict?
+            (if (and (not= ::opaque our-eas) (not= ::gap their-eas))
+              (eas-overlap? our-eas their-eas)
+              ;; Fallback: attribute-level (old behavior).
+              (let [our-attrs   (tx-buffer-attrs buf)
+                    wildcard?   (contains? our-attrs ::wildcard)
+                    their-attrs (concurrent-write-attrs real-db begin-max-tx)]
+                (or wildcard?
+                    (= their-attrs ::any)
+                    (boolean (some their-attrs our-attrs)))))]
         (when conflict?
           (throw (ex-info "could not serialize access due to concurrent update"
                           {:error  :serialization-failure
                            :detail (str "base=" begin-max-tx
-                                        ", current=" current-max-tx
-                                        ", overlap="
-                                        (cond wildcard? "wildcard (retractEntity)"
-                                              (= their-attrs ::any) "query-failed"
-                                              :else (pr-str
-                                                     (filter their-attrs our-attrs))))})))))
-    (when (seq buf) (d/transact conn buf))))
+                                        ", current=" current-max-tx)})))))
+    (when (seq buf)
+      (let [report (d/transact conn buf)
+            eas (tx-buffer-eas buf)]
+        (record-commit-writes! (:max-tx (:db-after report))
+                               (if (= ::opaque eas) ::opaque eas))
+        report))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
