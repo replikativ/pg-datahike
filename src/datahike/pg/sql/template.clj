@@ -531,6 +531,18 @@
 (def ^:private no-param-after
   #{"limit" "offset" "fetch" "top" "interval"})
 
+(def ^:private no-template-idents
+  "Statement-disqualifying identifiers: constructs that consume literal
+   values at PARSE/translate time, where a late-bound $N parameter
+   either leaks as the literal string \"$N\" (set-returning functions
+   materialized into the speculative db, table-free literal rows) or
+   breaks clause scoping (BETWEEN/IN expansions, HAVING predicates).
+   Conservative v1 — each of these can graduate off the list once its
+   translation handles ?pN vars."
+  #{"having" "between" "unnest" "generate_series" "array" "values"
+    "in" "any" "all" "case" "coalesce" "nullif" "distinct" "union"
+    "intersect" "except" "group"})
+
 (defn parameterize-numbers
   "Rewrite bare number literals in `sql` to $N placeholders. Returns
    {:sql <templated> :params [v ...]} (params 0-indexed, Long/Double)
@@ -540,11 +552,15 @@
   (try
     (let [toks (vec (cls/tokenize-all sql))
           kind (some-> (first toks) :text str/lower-case)]
-      (when (contains? #{"select" "update" "delete" "with"} kind)
+      (when (and (contains? #{"select" "update" "delete" "with"} kind)
+                 (not-any? #(and (= :ident (:type %))
+                                 (contains? no-template-idents
+                                            (str/lower-case (:text %))))
+                           toks))
         (let [sb (StringBuilder.)
               params (java.util.ArrayList.)
               n (count toks)]
-          (loop [i 0 last-end 0 skip-next-number? false]
+          (loop [i 0 last-end 0 skip-next-number? false fn-depth 0 paren-stack ()]
             (if (= i n)
               (do (.append sb (subs sql last-end))
                   (when (pos? (.size params))
@@ -552,10 +568,26 @@
               (let [{:keys [type text pos end] :as tok} (nth toks i)
                     ;; $N placeholders already present → mixing ours in
                     ;; would renumber theirs; bail entirely.
-                    bail? (= :param type)]
+                    bail? (= :param type)
+                    ;; Track whether we're inside a FUNCTION-CALL argument
+                    ;; list: `ident (` opens one. Literals there feed
+                    ;; translate-time machinery (pg_typeof's type answer,
+                    ;; SUBSTR positions, casts) and must stay inline.
+                    open? (and (= :punct type) (= "(" text))
+                    close? (and (= :punct type) (= ")" text))
+                    after-ident? (= :ident (:type (nth toks (dec i) nil)))
+                    [fn-depth' paren-stack']
+                    (cond
+                      open? [(if after-ident? (inc fn-depth) fn-depth)
+                             (cons (if after-ident? :fn :plain) paren-stack)]
+                      close? [(if (= :fn (first paren-stack))
+                                (dec fn-depth) fn-depth)
+                              (rest paren-stack)]
+                      :else [fn-depth paren-stack])]
                 (cond
                   bail? nil
                   (and (= :number type) (not skip-next-number?)
+                       (zero? fn-depth)
                        ;; `1::bigint` — leave for the constant-fold cast
                        (not (= "::" (:text (nth toks (inc i) nil)))))
                   (let [prev (nth toks (dec i) nil)
@@ -585,9 +617,10 @@
                     (.append sb (subs sql last-end start))
                     (.add params v)
                     (.append sb (str "$" (.size params)))
-                    (recur (inc i) (long end) false))
+                    (recur (inc i) (long end) false fn-depth' paren-stack'))
                   :else
                   (recur (inc i) (long last-end)
                          (and (= :ident type)
-                              (contains? no-param-after (str/lower-case text)))))))))))
+                              (contains? no-param-after (str/lower-case text)))
+                         fn-depth' paren-stack'))))))))
     (catch Throwable _ nil)))
