@@ -4277,6 +4277,15 @@
                 ;; in BOTH the args and the outer entity-maps gets
                 ;; resolved exactly once (see datahike.pg.sql.params).
                 [[:db.fn/call
+                  ;; :datahike.pg/fresh-insert (attached via with-meta at
+                  ;; the end of this fn form) — this tx-fn either throws
+                  ;; (23505) or emits the payload rows as FRESH entities
+                  ;; (gensym tempids, never upserts). The commit conflict
+                  ;; ring uses the tag to attribute such ops as writing no
+                  ;; existing rows instead of marking the whole commit
+                  ;; opaque (which disabled row-level conflict detection
+                  ;; for every INSERT-bearing transaction).
+                  (with-meta
                   (fn unique-check [txdb row-attrs]
                     (let [schema (:schema txdb)
                           q-fn d/q
@@ -4347,6 +4356,7 @@
                             (raise! attr tuple-val cname))
                           (vswap! seen update attr (fnil conj #{}) tuple-val)))
                       []))
+                    {:datahike.pg/fresh-insert true})
                   row-attrs]]
                 (vec (mapcat
                       (fn [attrs]

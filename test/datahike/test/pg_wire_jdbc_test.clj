@@ -447,17 +447,31 @@
           (is (= 10 (.getInt rs 1))))))))
 
 (deftest test-sqlstate-40001-serialization-failure
-  (testing "Concurrent write by another session makes COMMIT raise 40001"
+  (testing "Concurrent write to the SAME row makes COMMIT raise 40001"
+    ;; Historical note: this test used to assert 40001 for two INSERTs of
+    ;; DIFFERENT rows — the attribute-level conflict check aborted on any
+    ;; same-table concurrency. The check is row-level now (and INSERTs of
+    ;; fresh rows are attributed precisely), matching PostgreSQL: disjoint
+    ;; writes commit fine (see test-sqlstate-40001-not-raised-for-
+    ;; unrelated-writes). A genuine same-row overlap must still abort:
+    ;; session A updates a row it read before session B's committed write
+    ;; to that row — replaying A would lose B's update.
     (with-conn [a {:preferQueryMode "simple"}]
+      (with-open [seed (.createStatement a)]
+        (.executeUpdate seed "INSERT INTO t (id, name, age) VALUES (502, 'Contested', 1)"))
       (.setAutoCommit a false)
       (with-open [sta (.createStatement a)]
-        (.executeUpdate sta "INSERT INTO t (id, name, age) VALUES (500, 'Orig', 10)")
-        ;; Session B sneaks in and commits before A.
+        (.executeUpdate sta "UPDATE t SET age = 11 WHERE id = 502")
+        ;; Session B's writer must not take row locks or it would simply
+        ;; BLOCK behind A's UPDATE lock (the PG-faithful behavior, which
+        ;; would deadlock this single-threaded test). TRUNCATE retracts
+        ;; every row without row locks, overlapping A's row via the
+        ;; [eid ::all] wildcard — so A's replay would lose the truncate
+        ;; and must abort at COMMIT with 40001, the code Odoo retries on.
         (with-conn [b {:preferQueryMode "simple"}]
           (.setAutoCommit b true)
           (with-open [stb (.createStatement b)]
-            (.executeUpdate stb "INSERT INTO t (id, name, age) VALUES (501, 'Intruder', 99)")))
-        ;; A's commit must now fail with 40001 — Odoo retries on this code.
+            (.execute stb "TRUNCATE t")))
         (try (.commit a)
              (is false "expected serialization_failure on COMMIT")
              (catch SQLException e

@@ -53,7 +53,28 @@ Split for upstream as independent PRs, in this order:
 - Extend CompiledStatement tiers to UPDATE/INSERT.
 - Aggregate streaming eligibility (62× gap on whole-table sum/count).
 
+## Write-concurrency model (2026-08-01 slice) — known deltas vs PostgreSQL
+
+Implemented: blocking row locks for in-tx UPDATE/DELETE + snapshot rebase
+(READ COMMITTED per-statement anchoring), never-scan ring conflict check
+(grace-retry then conservative 40001), fresh-insert write-set attribution,
+per-database ring keying, commit check+transact under a global monitor,
+savepoints snapshot the conflict watermark. Adversarially reviewed
+(critic pass 2); accepted deltas, documented not fixed:
+
+- Rebase-and-retry after a lock wait re-runs the WHOLE statement predicate
+  against the new snapshot (PG re-checks only the blocked tuple —
+  EvalPlanQual). Rows that newly match during the wait can be affected.
+- Deadlock cycles across statements resolve by lock-wait timeout (2s →
+  40001), not a cycle detector; polling acquisition has no FIFO fairness.
+- Autocommit (non-tx) writes don't take row locks; they rely on the
+  commit-time conflict check only.
+- INSERT…SELECT / schema-map inserts are attributed conservatively
+  (::opaque when a map key is a unique attr) → they abort concurrent
+  windows rather than risk missed upsert conflicts.
+
 ## Current standings (clean, scale 8, vs PostgreSQL 17 disk)
 
 select c1 2754 vs 5732 (2.1×) · select c8 26320 vs ~40k (~1.5×) ·
-tpcb c1 133 vs 251 (1.9×) · tpcb c4 36-67 vs 302 (weak spot).
+tpcb c1 133 vs 251 (1.9×) · **tpcb c4 302 vs 302 (parity, 0 failures)** ·
+tpcb c8 266-339.

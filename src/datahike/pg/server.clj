@@ -238,6 +238,54 @@
         holder                :conflict
         :else                 :acquired))))
 
+(def ^:private row-lock-timeout-ms
+  "How long an in-transaction UPDATE/DELETE waits for a conflicting row
+   lock before giving up with serialization-failure (the application-level
+   equivalent of PG's deadlock resolution: one party retries)."
+  2000)
+
+(defn- lock-row-blocking!
+  "Acquire [table id] for `session-id`, waiting for a conflicting holder
+   to release. Polls the registry (200µs park) up to `timeout-ms`, then
+   throws serialization-failure so the client retries."
+  [session-id tx-state table id timeout-ms]
+  (let [deadline (+ (System/nanoTime) (* (long timeout-ms) 1000000))]
+    (loop []
+      ;; If the transaction ended while we were waiting (connection close,
+      ;; cancel, concurrent abort), stop instead of acquiring a lock that
+      ;; the session-close cleanup has already run past — that lock would
+      ;; leak forever.
+      (when-not (:in-tx? @tx-state)
+        (throw (ex-info "transaction ended during row lock wait"
+                        {:error :serialization-failure
+                         :detail (str "tx ended waiting on " table "/" id)})))
+      (case (acquire-lock! session-id table id)
+        :acquired (swap! tx-state update :owned-locks (fnil conj #{}) [table id])
+        :conflict
+        (if (> (System/nanoTime) deadline)
+          (throw (ex-info "deadlock detected: row lock wait timeout"
+                          {:error :serialization-failure
+                           :detail (str "lock wait timeout on " table "/" id)}))
+          (do (java.util.concurrent.locks.LockSupport/parkNanos 200000)
+              (recur)))))
+    :acquired))
+
+(defn- lock-rows-blocking!
+  "Blocking-acquire row locks for all `ids` (sorted, so concurrent
+   statements take locks in one global order). Returns
+   :acquired-immediately when no wait was needed; :waited when at least
+   one lock had to wait — the caller must then rebase and recompute,
+   because the awaited holder committed new values for that row."
+  [session-id tx-state table ids timeout-ms]
+  (loop [ids (sort ids) waited? false]
+    (if-let [[id & more] (seq ids)]
+      (if (= :acquired (acquire-lock! session-id table id))
+        (do (swap! tx-state update :owned-locks (fnil conj #{}) [table id])
+            (recur more waited?))
+        (do (lock-row-blocking! session-id tx-state table id timeout-ms)
+            (recur more true)))
+      (if waited? :waited :acquired-immediately))))
+
 ;; ============================================================================
 ;; Value → String conversion for pgwire result rows
 ;; ============================================================================
@@ -887,22 +935,51 @@
 (defn- tx-buffer-eas
   "Return the set of [eid attr] pairs this tx-buffer writes, [eid ::all]
    for entity retractions, or ::opaque when the buffer contains ops we
-   can't attribute (`:db.fn/call` wrappers, tempid-only maps are fine —
-   brand-new entities can't conflict with concurrent writers; unique
-   races are datahike's own upsert errors). Row-level granularity: two
-   transactions updating DIFFERENT rows of the same column no longer
-   'conflict' (the attr-level check aborted 16% of pgbench tpcb at 4
-   clients on false positives)."
-  [buf]
-  (reduce
-   (fn [acc item]
-     (cond
-       (map? item)
-       (let [eid (:db/id item)]
-         (if (and (number? eid) (pos? (long eid)))
-           (into acc (keep #(when (and (keyword? %) (not= :db/id %)) [eid %]))
-                 (keys item))
-           acc))
+   can't attribute. Row-level granularity: two transactions updating
+   DIFFERENT rows of the same column no longer 'conflict' (the attr-level
+   check aborted 16% of pgbench tpcb at 4 clients on false positives).
+
+   Entity maps without a numeric :db/id normally create fresh entities
+   and contribute nothing. When a map key is a unique attribute, datahike
+   may UPSERT an existing row: resolve the target against `db` — if the
+   unique value exists, attribute the map's writes to that eid; if not,
+   the entity is genuinely fresh. Without a `db` (1-arity) id-less maps
+   are treated conservatively (::opaque)."
+  ([buf] (tx-buffer-eas buf nil))
+  ([buf db]
+   (let [schema (when db (:schema db))]
+   (reduce
+    (fn [acc item]
+      (cond
+        (map? item)
+        (let [eid (:db/id item)]
+          (cond
+            (and (number? eid) (pos? (long eid)))
+            (into acc (keep #(when (and (keyword? %) (not= :db/id %)) [eid %]))
+                  (keys item))
+
+            (nil? schema) (reduced ::opaque)
+
+            :else
+            ;; id-less / tempid map: find upsert targets via its unique
+            ;; attribute values. Existing target → the map writes THAT
+            ;; row; none → fresh entity, no attributable writes.
+            (let [upsert-eids
+                  (keep (fn [[k v]]
+                          (when (and (keyword? k) (some? v)
+                                     (get-in schema [k :db/unique]))
+                            (some-> ^datahike.datom.Datom
+                                    (first (d/datoms db {:index :avet
+                                                         :components [k v]}))
+                                    (.-e))))
+                        item)]
+              (if (seq upsert-eids)
+                (into acc
+                      (for [e (distinct upsert-eids)
+                            k (keys item)
+                            :when (and (keyword? k) (not= :db/id k))]
+                        [(long e) k]))
+                acc))))
        (vector? item)
        (case (first item)
          (:db/add :db/retract) (let [e (nth item 1 nil) a (nth item 2 nil)]
@@ -913,14 +990,23 @@
                       (if (and (number? e) (keyword? a))
                         (conj acc [(long e) a])
                         (reduced ::opaque)))
-         :db.fn/retractEntity (let [e (nth item 1 nil)]
-                                (if (number? e)
-                                  (conj acc [(long e) ::all])
-                                  (reduced ::opaque)))
+         (:db.fn/retractEntity :db/retractEntity)
+         (let [e (nth item 1 nil)]
+           (if (number? e)
+             (conj acc [(long e) ::all])
+             (reduced ::opaque)))
+         ;; INSERT rows travel as [:db.fn/call unique-check payload]. The
+         ;; fn is tagged ^:datahike.pg/fresh-insert: it throws or emits the
+         ;; payload as fresh entities, so it writes NO existing rows —
+         ;; attribute it as the empty set. Untagged tx-fns stay opaque.
+         :db.fn/call
+         (if (:datahike.pg/fresh-insert (meta (nth item 1 nil)))
+           acc
+           (reduced ::opaque))
          (reduced ::opaque))
-       :else (reduced ::opaque)))
-   #{}
-   buf))
+        :else (reduced ::opaque)))
+    #{}
+    buf))))
 
 (defonce ^{:doc "Ring of recent commits' write sets: [{:max-tx N :eas #{[e a]…}} …],
   newest last, capped. Lets the COMMIT conflict check test row-level
@@ -933,18 +1019,27 @@
 
 (def ^:private recent-commit-ring-size 512)
 
-(defn- record-commit-writes! [max-tx eas]
+(defn- db-ring-key
+  "Ring entries are keyed per database: independent databases reuse the
+   same max-tx values, and an unkeyed ring can mistake another database's
+   commit record for coverage of this one's window (masking a real gap)."
+  [db]
+  (or (get-in (dbi/-config db) [:store :id]) ::default-db))
+
+(defn- record-commit-writes! [db-key max-tx eas]
   (swap! recent-commit-writes
          (fn [q]
-           (let [q (conj q {:max-tx max-tx :eas eas})]
+           (let [q (conj q {:db-key db-key :max-tx max-tx :eas eas})]
              (if (> (count q) recent-commit-ring-size) (pop q) q)))))
 
 (defn- ring-write-eas
-  "Union of ring write-sets for commits with max-tx in (begin, current].
-   Returns ::gap unless every tx in that window is present (datahike
-   increments max-tx by one per transact, so coverage is checkable)."
-  [begin-max-tx current-max-tx]
-  (let [entries (filter #(and (> (:max-tx %) begin-max-tx)
+  "Union of ring write-sets for `db-key`'s commits with max-tx in
+   (begin, current]. Returns ::gap unless every tx in that window is
+   present (datahike increments max-tx by one per transact, so coverage
+   is checkable)."
+  [db-key begin-max-tx current-max-tx]
+  (let [entries (filter #(and (= db-key (:db-key %))
+                              (> (:max-tx %) begin-max-tx)
                               (<= (:max-tx %) current-max-tx))
                         @recent-commit-writes)
         want (- current-max-tx begin-max-tx)]
@@ -952,6 +1047,21 @@
             (some #(= ::opaque (:eas %)) entries))
       ::gap
       (reduce into #{} (map :eas entries)))))
+
+(defn- ring-write-eas-graced
+  "ring-write-eas with a short grace loop: a committer records its write
+   set only AFTER d/transact returns, so a concurrent reader can observe
+   tx N+1's entry before tx N's (a µs-scale race). Re-read a few times
+   before concluding the window truly has a gap — this keeps the conflict
+   check O(concurrent writes) instead of falling into whole-database
+   work for a transient ordering artifact."
+  [db-key begin-max-tx current-max-tx]
+  (loop [attempt 0]
+    (let [r (ring-write-eas db-key begin-max-tx current-max-tx)]
+      (if (and (= ::gap r) (< attempt 8))
+        (do (java.util.concurrent.locks.LockSupport/parkNanos 1000000)
+            (recur (inc attempt)))
+        r))))
 
 (def ^:private fold-scalar-ins-var
   ;; datahike.query/*fold-scalar-ins* when the running datahike has it;
@@ -988,9 +1098,11 @@
    overlapping conflict window fall back to the attribute-level
    full-database scan — ~1s per COMMIT at 3M datoms."
   [conn tx-data]
-  (let [report (d/transact conn tx-data)
-        eas (tx-buffer-eas tx-data)]
-    (record-commit-writes! (:max-tx (:db-after report))
+  (let [db-before @conn
+        report (d/transact conn tx-data)
+        db-after (:db-after report)
+        eas (tx-buffer-eas tx-data db-before)]
+    (record-commit-writes! (db-ring-key db-after) (:max-tx db-after)
                            (if (= ::opaque eas) ::opaque eas))
     report))
 
@@ -3438,7 +3550,14 @@
                   :speculative-db (:speculative-db @tx-state)
                   :tx-buffer (:tx-buffer @tx-state)
                   :eid->tempid (:eid->tempid @tx-state)
-                  :owned-locks (:owned-locks @tx-state)})
+                  :owned-locks (:owned-locks @tx-state)
+                  ;; The conflict watermark travels WITH the snapshot: a
+                  ;; rebase after this savepoint advances begin-max-tx, and
+                  ;; ROLLBACK TO must restore the old value — otherwise the
+                  ;; resurrected older speculative-db pairs with a newer
+                  ;; watermark and concurrent commits in between escape the
+                  ;; commit conflict check (lost update).
+                  :begin-max-tx (:begin-max-tx @tx-state)})
           (empty-result "SAVEPOINT")))))
 
 (defn- handle-release-savepoint
@@ -3463,6 +3582,53 @@
       (do (swap! tx-state update :savepoints subvec 0 idx)
           (empty-result "RELEASE SAVEPOINT")))))
 
+(defonce ^:private commit-check-lock
+  ;; Serializes conflict-check + d/transact in transact-tx-buffer! (and
+  ;; the check inside rebase-tx-state!) so no commit can land between a
+  ;; transaction's window read and its own transact.
+  (Object.))
+
+(defn- rebase-tx-state!
+  "After a row-lock wait, the values this transaction has read are stale
+   by exactly the awaited holder's commit. Re-anchor the speculative
+   overlay on the latest committed database so the retried statement
+   computes against fresh row values; this also narrows the commit-time
+   conflict window to post-rebase commits. Replaying the buffer is only
+   attempted when it is deterministic (real-eid ops, no tempids); a
+   replay overlap with an intervening commit throws the same
+   serialization-failure the commit itself would have raised — just
+   earlier. Temporal-wrapped speculative dbs opt out entirely."
+  [conn tx-state]
+  (let [ts @tx-state
+        spec (:speculative-db ts)]
+    (when (nil? (:origin-db spec))
+      (let [base (d/db conn)
+            begin (:begin-max-tx ts)
+            cur (:max-tx base)]
+        (when (and begin cur (> (long cur) (long begin)))
+          (let [buf (:tx-buffer ts)]
+            (if (empty? buf)
+              (swap! tx-state assoc :speculative-db base :begin-max-tx cur)
+              (do
+                (when (seq (:eid->tempid ts))
+                  (throw (ex-info "could not serialize access due to concurrent update"
+                                  {:error :serialization-failure
+                                   :detail "concurrent update after inserts in this transaction"})))
+                (let [our-eas (tx-buffer-eas buf base)
+                      their (when (not= ::opaque our-eas)
+                              (ring-write-eas-graced (db-ring-key base) begin cur))
+                      conflict? (if (and (not= ::opaque our-eas) (not= ::gap their))
+                                  (eas-overlap? our-eas their)
+                                  true)]
+                  (when conflict?
+                    (throw (ex-info "could not serialize access due to concurrent update"
+                                    {:error :serialization-failure
+                                     :detail (str "rebase base=" begin ", current=" cur)})))
+                  (let [rep (dc/with base buf)]
+                    (swap! tx-state assoc
+                           :speculative-db (:db-after rep)
+                           :begin-max-tx cur)))))))))))
+
 (defn- transact-tx-buffer!
   "Commit the accumulated transaction buffer to `conn`, with the same
    concurrent-write (40001 serialization_failure) detection as an
@@ -3470,6 +3636,12 @@
    resets tx-state. Shared by explicit COMMIT and the implicit-group
    commit so both behave identically."
   [conn tx-state]
+  ;; The conflict check and the commit form one atomic step under a
+  ;; global monitor: without it two committers can both read the same
+  ;; current-max-tx, both pass, then serialize through d/transact and
+  ;; lose an update. Commits are already serialized by datahike's
+  ;; single writer, so the monitor adds no real concurrency cost.
+  (locking commit-check-lock
   (let [buf (:tx-buffer @tx-state)
         begin-max-tx (:begin-max-tx @tx-state)
         real-db (d/db conn)
@@ -3480,30 +3652,29 @@
     ;; overlaps a concurrent committer's. Preferred check is ROW-level
     ;; ([eid attr] pairs) against the recent-commit ring — O(concurrent
     ;; writes) and no false abort when two transactions update different
-    ;; rows of the same column. Falls back to the attribute-level
-    ;; database scan when the ring has gaps (commits that bypassed this
-    ;; path) or the buffer contains unattributable ops.
+    ;; rows of the same column.
     (when (and (seq buf) advanced?)
-      (let [our-eas (tx-buffer-eas buf)
+      (let [our-eas (tx-buffer-eas buf real-db)
             their-eas (when (not= ::opaque our-eas)
-                        (ring-write-eas begin-max-tx current-max-tx))
+                        (ring-write-eas-graced (db-ring-key real-db)
+                                               begin-max-tx current-max-tx))
+            ;; No attribute-level whole-database fallback here anymore:
+            ;; an unresolvable window (ring gap after the grace loop, or
+            ;; an unattributable buffer) aborts conservatively instead.
+            ;; A spurious 40001 costs the client one retry; the old scan
+            ;; cost seconds — while row locks were held, which convoyed
+            ;; every other writer (measured: tpcb c4 collapsed to 3 tps).
             conflict?
             (if (and (not= ::opaque our-eas) (not= ::gap their-eas))
               (eas-overlap? our-eas their-eas)
-              ;; Fallback: attribute-level (old behavior).
-              (let [our-attrs   (tx-buffer-attrs buf)
-                    wildcard?   (contains? our-attrs ::wildcard)
-                    their-attrs (concurrent-write-attrs real-db begin-max-tx)]
-                (or wildcard?
-                    (= their-attrs ::any)
-                    (boolean (some their-attrs our-attrs)))))]
+              true)]
         (when conflict?
           (throw (ex-info "could not serialize access due to concurrent update"
                           {:error  :serialization-failure
                            :detail (str "base=" begin-max-tx
                                         ", current=" current-max-tx)})))))
     (when (seq buf)
-      (transact-recorded! conn buf))))
+      (transact-recorded! conn buf)))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
@@ -3564,7 +3735,7 @@
       :else
       (let [target (nth sp-stack target-idx)
             {:keys [speculative-db tx-buffer eid->tempid
-                    owned-locks]} target
+                    owned-locks begin-max-tx]} target
             current-locks (:owned-locks @tx-state)
             to-release (clojure.set/difference current-locks
                                                (or owned-locks #{}))]
@@ -3579,6 +3750,10 @@
                :tx-buffer tx-buffer
                :eid->tempid eid->tempid
                :owned-locks (or owned-locks #{})
+               ;; Restore the conflict watermark alongside the snapshot —
+               ;; see handle-savepoint. Snapshots from before this field
+               ;; existed fall back to the current watermark.
+               :begin-max-tx (or begin-max-tx (:begin-max-tx @tx-state))
                ;; Keep savepoints up to AND INCLUDING the target (the
                ;; target stays active, more recent ones go).
                :savepoints (subvec sp-stack 0 (inc target-idx)))
@@ -5052,9 +5227,34 @@
   (let [{:keys [conn schema tx-state]} ctx]
     (if (:in-tx? @tx-state)
       (try
-        (let [spec-db (:speculative-db @tx-state)
+        (let [session-id (:session-id @tx-state)
+              ;; PG-style row locking: block on rows another in-flight tx
+              ;; has updated instead of computing against their old values
+              ;; and aborting at commit. On a wait, rebase the speculative
+              ;; overlay and RECOMPUTE the row match + SET expressions —
+              ;; the awaited holder committed new values. Loop terminates:
+              ;; locks acquired on one pass never conflict on the next.
+              ;; First write of the tx: re-anchor the snapshot on the latest
+              ;; committed db (buffer empty → free). This is PG READ
+              ;; COMMITTED's per-statement snapshot: it shrinks the commit
+              ;; conflict window from BEGIN→COMMIT to first-write→COMMIT.
+              _ (when (empty? (:tx-buffer @tx-state))
+                  (rebase-tx-state! conn tx-state))
+              {:keys [eids tx-data]}
+              (loop []
+                (let [spec-db (:speculative-db @tx-state)
+                      {:keys [eids] :as built} (build-update-tx spec-db schema parsed)
+                      lockable (filterv integer? eids)]
+                  (if (and session-id (seq lockable)
+                           (nil? (:origin-db spec-db))
+                           (= :waited (lock-rows-blocking! session-id tx-state
+                                                           (:table parsed) lockable
+                                                           row-lock-timeout-ms)))
+                    (do (rebase-tx-state! conn tx-state)
+                        (recur))
+                    built)))
+              spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              {:keys [eids tx-data]} (build-update-tx spec-db schema parsed)
               _ (check-update-identity-collisions! spec-db schema tx-data)
               _ (check-not-null-on-update! spec-db tx-data)
               _ (check-updates-against-row-constraints!
@@ -5088,9 +5288,25 @@
   (let [{:keys [conn schema tx-state]} ctx]
     (if (:in-tx? @tx-state)
       (try
-        (let [spec-db (:speculative-db @tx-state)
+        (let [session-id (:session-id @tx-state)
+              ;; Same blocking row-lock + rebase discipline as exec-update.
+              _ (when (empty? (:tx-buffer @tx-state))
+                  (rebase-tx-state! conn tx-state))
+              {:keys [eids]}
+              (loop []
+                (let [spec-db (:speculative-db @tx-state)
+                      {:keys [eids] :as built} (build-delete-tx spec-db schema parsed)
+                      lockable (filterv integer? eids)]
+                  (if (and session-id (seq lockable)
+                           (nil? (:origin-db spec-db))
+                           (= :waited (lock-rows-blocking! session-id tx-state
+                                                           (:table parsed) lockable
+                                                           row-lock-timeout-ms)))
+                    (do (rebase-tx-state! conn tx-state)
+                        (recur))
+                    built)))
+              spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              {:keys [eids]} (build-delete-tx spec-db schema parsed)
               _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
