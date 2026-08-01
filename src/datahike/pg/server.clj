@@ -4262,6 +4262,23 @@
             (recur (cons (second e) acc))
             (vec acc)))))))
 
+(def ^:private fold-scalar-ins-var
+  ;; datahike.query/*fold-scalar-ins* when the running datahike has it;
+  ;; nil on older datahike (the fast path simply doesn't apply).
+  (resolve 'datahike.query/*fold-scalar-ins*))
+
+(defn- run-param-query
+  "Run `thunk` (a d/q call with :in args) with datahike's scalar-:in
+   const-folding disabled when available: parameterized statements
+   repeat one query SHAPE with varying scalar values, and folding them
+   into the clauses made the plan cache miss (full replan) per value —
+   2x on novel-value point lookups. Function-valued in-args still fold
+   (datahike guards that internally)."
+  [thunk]
+  (if fold-scalar-ins-var
+    (with-bindings* {fold-scalar-ins-var false} thunk)
+    (thunk)))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -4316,7 +4333,7 @@
                       offset (assoc :offset offset)
                       :always (assoc :cancel (current-cancel)))
             results (if (seq in-args)
-                      (apply d/q q-input query-db in-args)
+                      (run-param-query #(apply d/q q-input query-db in-args))
                       (d/q q-input query-db))
             ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
             ;; Extract the `id` column from each result row, check the
