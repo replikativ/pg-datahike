@@ -143,14 +143,14 @@
         run! (fn [sql] (.execute h sql))]
     (is (nil? (.error ^PgWireServer$QueryResult (run! "CREATE SEQUENCE s_dup START WITH 1 INCREMENT BY 1"))))
     (is (= "1" (aget ^"[Ljava.lang.String;"
-                     (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_dup')"))) 0)))
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_dup')"))) 0)))
     (let [^PgWireServer$QueryResult dup (run! "CREATE SEQUENCE s_dup START WITH 1 INCREMENT BY 1")]
       (is (some? (.error dup)))
       (is (= "42P07" (.sqlstate dup)))
       (is (re-find #"relation \"s_dup\" already exists" (.error dup))))
     ;; The failed CREATE must not have touched the counter.
     (is (= "2" (aget ^"[Ljava.lang.String;"
-                     (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_dup')"))) 0)))))
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_dup')"))) 0)))))
 
 (deftest create-sequence-if-not-exists-noop-preserves-counter
   ;; PG: CREATE SEQUENCE IF NOT EXISTS on an existing sequence emits a
@@ -163,11 +163,11 @@
       (is (nil? (.error r)) (str "create failed: " (.error r)))
       (is (= "CREATE SEQUENCE" (.commandTag r))))
     (is (= "1" (aget ^"[Ljava.lang.String;"
-                     (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0)))
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0)))
     ;; Idempotent retry: success tag, no counter reset.
     (let [^PgWireServer$QueryResult r (run! "CREATE SEQUENCE IF NOT EXISTS s_ine START WITH 100 INCREMENT BY 1")]
       (is (nil? (.error r)))
       (is (= "CREATE SEQUENCE" (.commandTag r))))
     (is (= "2" (aget ^"[Ljava.lang.String;"
-                     (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0))
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0))
         "counter preserved across IF NOT EXISTS retry (no reset to 100)")))

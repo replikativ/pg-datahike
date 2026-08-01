@@ -1299,17 +1299,29 @@
                          #(read-check-constraints* db table-name))]
     (if (= ::nil v) [] v)))
 
+(def ^:private check-expr-ast-cache
+  "CHECK-expression text → parsed AST. Bounded LRU: enforcement runs
+   once per ROW per constraint, and re-parsing through JSqlParser per
+   row made bulk INSERTs pay a full parse × rows × constraints. The
+   AST is read-only after parse (same argument as sql.clj's AST cache),
+   and keying on the expression text needs no invalidation — a changed
+   constraint is a different string."
+  (pg-cache/bounded-cache 512))
+
 (defn- parse-check-expression
-  "Re-parse a stored CHECK expression string into a JSqlParser
-   Expression AST. We do this at enforcement time (not at CREATE
-   TABLE) so the cached serialized form stays simple strings —
-   cheap to persist, round-trips across restarts, no ABI ties to
-   JSqlParser's Expression class hierarchy."
+  "Parse a stored CHECK expression string into a JSqlParser Expression
+   AST, memoised by text. Parsing at enforcement time (not CREATE
+   TABLE) keeps the persisted form a plain string — cheap to persist,
+   round-trips across restarts, no ABI ties to JSqlParser's Expression
+   class hierarchy."
   [^String expr-text]
-  (try
-    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expr-text)
-    (catch Exception _
-      (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expr-text))))
+  (or (.get ^java.util.Map check-expr-ast-cache expr-text)
+      (let [ast (try
+                  (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expr-text)
+                  (catch Exception _
+                    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expr-text)))]
+        (.put ^java.util.Map check-expr-ast-cache expr-text ast)
+        ast)))
 
 (defn- enforce-check-constraints!
   "Evaluate every CHECK expression registered for `table-name` against

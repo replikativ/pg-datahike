@@ -314,6 +314,20 @@
 
 (def ^:private ast-cache-max-entries 4096)
 
+(def ^:private max-cacheable-sql-length
+  "Statements longer than this are parsed but never cached. The parse
+   and AST caches key on the (templated) SQL string and are bounded by
+   ENTRY count, not bytes — a bulk `INSERT … VALUES (…)×5000` templates
+   to a multi-MB string that would sit in the LRU as key + JSqlParser
+   AST + parsed tx-data. 4096 such entries is a multi-GB heap. Bulk
+   statements are exactly the ones that don't repeat verbatim, so
+   skipping them costs ~nothing; the ORM/driver shapes the caches exist
+   for are a few KB at most."
+  65536)
+
+(defn- cacheable-sql-size? [^String sql]
+  (<= (.length sql) (int max-cacheable-sql-length)))
+
 (def ^:private global-ast-cache
   (java.util.Collections/synchronizedMap
    (proxy [java.util.LinkedHashMap] [16 0.75 true]
@@ -330,7 +344,7 @@
    the preprocessed SQL. Falls through to a direct parse when caching
    is disabled."
   [^String preprocessed]
-  (if-let [cache *ast-cache*]
+  (if-let [cache (when (cacheable-sql-size? preprocessed) *ast-cache*)]
     (or (.get ^java.util.Map cache preprocessed)
         (let [ast (CCJSqlParserUtil/parse preprocessed)]
           (.put ^java.util.Map cache preprocessed ast)
@@ -1503,7 +1517,7 @@
             (when-not (some template/templater-fail? bound)
               (try
                 (let [tem-sql (:templated tem)
-                      cache *parse-cache*
+                      cache (when (cacheable-sql-size? (:templated tem)) *parse-cache*)
                       cache-key (when cache [tem-sql (hash schema)])
                       placeholder-parsed
                       (or (when cache (cache-get cache cache-key))
@@ -1572,7 +1586,9 @@
          ;; that case — otherwise the binding-free version (e.g. the parse done
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
-         cache (when (empty? params/*from-bindings*) *parse-cache*)
+         cache (when (and (empty? params/*from-bindings*)
+                          (cacheable-sql-size? sql))
+                 *parse-cache*)
          schema-key (when cache (hash schema))
          cache-key (when cache [sql schema-key])
          cached (when cache (cache-get cache cache-key))]

@@ -65,3 +65,33 @@
         (finally
           (release! a)
           (release! b))))))
+
+(deftest oversized-sql-bypasses-parse-caches
+  (testing "multi-MB statements are parsed but never cached (heap guard)"
+    ;; The parse/AST LRUs key on the SQL string and bound entry COUNT,
+    ;; not bytes — a 5000-tuple INSERT would pin key + AST + tx-data.
+    (let [a (fresh-handler)
+          parse-cache (java.util.HashMap.)
+          ast-cache (java.util.HashMap.)]
+      (try
+        (exec a "CREATE TABLE bulk(id INTEGER, s TEXT)")
+        (binding [datahike.pg.sql/*parse-cache* parse-cache
+                  datahike.pg.sql/*ast-cache* ast-cache]
+          ;; Small statement → cached.
+          (is (nil? (.error (exec a "INSERT INTO bulk(id,s) VALUES (1,'x')"))))
+          (let [big (str "INSERT INTO bulk(id,s) VALUES "
+                         (clojure.string/join ","
+                                              (map #(str "(" % ",'" (apply str (repeat 40 \y)) "')")
+                                                   (range 2000))))
+                key-strings (fn []
+                              (concat (map first (keys parse-cache))
+                                      (keys ast-cache)))]
+            (is (pos? (+ (.size parse-cache) (.size ast-cache))))
+            (is (> (count big) 65536))
+            (is (nil? (.error (exec a big))))
+            ;; The bulk statement may cache small derived shapes (the
+            ;; per-row template), but no multi-KB key may ever land.
+            (is (every? #(<= (count %) 65536) (key-strings))
+                (pr-str (map count (key-strings))))))
+        (finally
+          (release! a))))))
