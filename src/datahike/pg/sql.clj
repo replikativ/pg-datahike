@@ -1359,7 +1359,15 @@
 
           ;; CREATE SEQUENCE
                     (instance? CreateSequence stmt)
-                    (ddl/translate-create-sequence ^CreateSequence stmt)
+                    (cond-> (ddl/translate-create-sequence ^CreateSequence stmt)
+                      ;; IF NOT EXISTS is stripped pre-parse (JSqlParser's
+                      ;; CreateSequence grammar has no such production —
+                      ;; rewrite/create-sequence-if-not-exists-rule), so
+                      ;; re-detect it from the ORIGINAL source and carry
+                      ;; it for the executor's no-op-vs-42P07 decision.
+                      (re-find #"(?i)create\s+(?:temp(?:orary)?\s+|unlogged\s+)?sequence\s+if\s+not\s+exists"
+                               sql)
+                      (assoc :if-not-exists? true))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)

@@ -724,6 +724,59 @@
             (recur (inc i) acc)))))))
 
 ;; ============================================================================
+;; CREATE SEQUENCE IF NOT EXISTS — JSqlParser's CreateSequence grammar
+;; has no IF NOT EXISTS production at all (5.2), so the statement dies
+;; with a ParseException before translation. Strip the three-token
+;; span pre-parse; the flag is re-detected from the original source in
+;; sql.clj's CreateSequence dispatch and carried as `:if-not-exists?`
+;; for the executor's no-op-vs-42P07 decision.
+;; ============================================================================
+
+(defn create-sequence-if-not-exists-rule
+  "Strip `IF NOT EXISTS` from `CREATE [TEMP[ORARY]|UNLOGGED] SEQUENCE
+   IF NOT EXISTS …`. Replaces the span with a single space.
+
+   Anchored on the `CREATE … SEQUENCE` prefix so `CREATE TABLE IF NOT
+   EXISTS` (which JSqlParser handles natively) is untouched. Comment
+   tokens between keywords pass through invisibly."
+  [toks]
+  (let [n (count toks)
+        next-nc (fn [^long idx]
+                  ;; index of the next non-comment token after idx, or -1.
+                  (loop [i (inc idx)]
+                    (let [t (nth toks i nil)]
+                      (cond
+                        (nil? t) -1
+                        (= :comment (:type t)) (recur (inc i))
+                        :else i))))]
+    (loop [i 0, acc []]
+      (if (>= i n)
+        acc
+        (if-not (= "create" (kw-text (nth toks i)))
+          (recur (inc i) acc)
+          ;; Skip optional TEMP/TEMPORARY/UNLOGGED modifiers.
+          (let [j (loop [j (next-nc i)]
+                    (if (and (not (neg? j))
+                             (#{"temp" "temporary" "unlogged"}
+                              (kw-text (nth toks j))))
+                      (recur (next-nc j))
+                      j))]
+            (if-not (and (not (neg? j))
+                         (= "sequence" (kw-text (nth toks j))))
+              (recur (inc i) acc)
+              (let [k1 (next-nc j)
+                    k2 (if (neg? k1) -1 (next-nc k1))
+                    k3 (if (neg? k2) -1 (next-nc k2))]
+                (if (and (not (neg? k3))
+                         (= "if"     (kw-text (nth toks k1)))
+                         (= "not"    (kw-text (nth toks k2)))
+                         (= "exists" (kw-text (nth toks k3))))
+                  (recur (inc k3)
+                         (conj acc [(:pos (nth toks k1))
+                                    (:end (nth toks k3)) " "]))
+                  (recur (inc j) acc))))))))))
+
+;; ============================================================================
 ;; CREATE TABLE … (cols) PARTITION BY <strategy> (<expr>) — JSqlParser
 ;; chokes on the `RANGE` / `LIST` / `HASH` keyword after the closing `)`
 ;; of the column definition list. We don't model partitioning; pg_dump
@@ -860,4 +913,5 @@
    boolean-is-rule
    default-fn-call-paren-rule
    partition-by-rule
-   create-sequence-no-clause-rule])
+   create-sequence-no-clause-rule
+   create-sequence-if-not-exists-rule])
