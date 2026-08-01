@@ -40,6 +40,9 @@ Thumbs.db
 # SQLAlchemy dialect bytecode cache.
 /test/integration/__pycache__/
 
+# Benchmark harness: local real-PostgreSQL data dir (see bench/README.md).
+/bench/.realpg-data/
+
 # Runtime logs
 *.log
 /tmp/
