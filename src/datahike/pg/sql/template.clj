@@ -37,6 +37,7 @@
    degrade gracefully to the existing path; we never produce wrong
    tx-data."
   (:require [clojure.string :as str]
+            [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt])
   (:import [java.util ArrayList HashMap]))
@@ -501,4 +502,92 @@
           (-> parsed
               (update :tx-data params/substitute-params bound)
               (update :tx-data refresh-tempids)))))
+    (catch Throwable _ nil)))
+
+;; ============================================================================
+;; General number-literal parameterization (simple-protocol plan stability)
+;; ============================================================================
+;;
+;; Simple-protocol clients interpolate literals, so every statement is a
+;; novel string: JSqlParser, the parse-sql result cache, datalog's
+;; memoized query parse AND the planner's clause-keyed plan cache all
+;; miss on every call — a pgbench tpcb transaction re-ran the whole
+;; front end per statement (~13% jsqlparser + ~11% replanning of server
+;; CPU). Rewriting bare number literals to $N parameters makes one
+;; SHAPE per statement family: every layer keys on the templated string
+;; or the var-form clauses and hits.
+;;
+;; v1 scope — NUMBERS ONLY, conservatively:
+;;   - bare integer/decimal literals, including a unary +/- folded into
+;;     the captured value when the sign sits in operand position;
+;;   - skipped after LIMIT / OFFSET / FETCH / TOP (translation needs
+;;     compile-time numbers there) and before `::` casts (constant-fold
+;;     branches expect literals);
+;;   - strings stay inline: their translation is column-type-directed
+;;     (coerce-unknown-literal), which a late-bound parameter can't see.
+;; Callers MUST fall back to parsing the original SQL if the templated
+;; parse errors.
+
+(def ^:private no-param-after
+  #{"limit" "offset" "fetch" "top" "interval"})
+
+(defn parameterize-numbers
+  "Rewrite bare number literals in `sql` to $N placeholders. Returns
+   {:sql <templated> :params [v ...]} (params 0-indexed, Long/Double)
+   or nil when nothing was parameterized or the statement kind is out
+   of scope (only SELECT/UPDATE/DELETE; INSERT has its own templater)."
+  [^String sql]
+  (try
+    (let [toks (vec (cls/tokenize-all sql))
+          kind (some-> (first toks) :text str/lower-case)]
+      (when (contains? #{"select" "update" "delete" "with"} kind)
+        (let [sb (StringBuilder.)
+              params (java.util.ArrayList.)
+              n (count toks)]
+          (loop [i 0 last-end 0 skip-next-number? false]
+            (if (= i n)
+              (do (.append sb (subs sql last-end))
+                  (when (pos? (.size params))
+                    {:sql (.toString sb) :params (vec params)}))
+              (let [{:keys [type text pos end] :as tok} (nth toks i)
+                    ;; $N placeholders already present → mixing ours in
+                    ;; would renumber theirs; bail entirely.
+                    bail? (= :param type)]
+                (cond
+                  bail? nil
+                  (and (= :number type) (not skip-next-number?)
+                       ;; `1::bigint` — leave for the constant-fold cast
+                       (not (= "::" (:text (nth toks (inc i) nil)))))
+                  (let [prev (nth toks (dec i) nil)
+                        prev2 (nth toks (- i 2) nil)
+                        ;; unary sign: +/- whose own predecessor cannot
+                        ;; end an expression (operator, '(', ',', or a
+                        ;; keyword) — fold it into the value.
+                        unary? (and prev (= :op (:type prev))
+                                    (#{"-" "+"} (:text prev))
+                                    (or (nil? prev2)
+                                        (#{:op :punct} (:type prev2))
+                                        (and (= :punct (:type prev2))
+                                             (#{"(" ","} (:text prev2)))
+                                        (= :ident (:type prev2))))
+                        ;; ident before a sign only makes it unary after
+                        ;; keywords like WHERE/AND/VALUES — after a column
+                        ;; name it's binary. Conservative: treat ident as
+                        ;; binary (leave the sign in place, param the bare
+                        ;; number) EXCEPT we already required :op/:punct.
+                        unary? (and unary?
+                                    (not (= :ident (:type prev2))))
+                        start (if unary? (:pos prev) pos)
+                        raw (subs sql (if unary? (:pos prev) pos) end)
+                        v (if (re-find #"[.eE]" text)
+                            (Double/parseDouble raw)
+                            (Long/parseLong raw))]
+                    (.append sb (subs sql last-end start))
+                    (.add params v)
+                    (.append sb (str "$" (.size params)))
+                    (recur (inc i) (long end) false))
+                  :else
+                  (recur (inc i) (long last-end)
+                         (and (= :ident type)
+                              (contains? no-param-after (str/lower-case text)))))))))))
     (catch Throwable _ nil)))

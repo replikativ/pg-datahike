@@ -29,6 +29,7 @@
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.template :as template]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -6087,9 +6088,32 @@
                                      (coerce-insert-tx-data
                                       (resolve-param-refs cached bound) schema)
                                      cached)
-                                   (let [p (sql/parse-sql sql schema db)]
-                                     (when bump-dispatch! (bump-dispatch! p))
-                                     p))
+                                   ;; Simple-protocol plan stability: rewrite
+                                   ;; bare number literals to $N so every cache
+                                   ;; layer (AST, parse result, datalog parse,
+                                   ;; plan) keys on ONE shape per statement
+                                   ;; family, then execute like a one-shot
+                                   ;; prepared statement. Any parse error on
+                                   ;; the templated form falls back to the
+                                   ;; original SQL untouched.
+                                   (or (when-let [{tsql :sql tvals :params}
+                                                  (template/parameterize-numbers sql)]
+                                         (let [p (sql/parse-sql tsql schema db)]
+                                           ;; v1: SELECT only — UPDATE/DELETE
+                                           ;; re-translate their WHERE at exec
+                                           ;; time against *cached-bound*,
+                                           ;; which the simple path doesn't
+                                           ;; carry yet.
+                                           (when (and p (not= :error (:type p))
+                                                      (= :select (:type p)))
+                                             (when bump-dispatch! (bump-dispatch! p))
+                                             ;; ParamRefs are 1-indexed; prepend
+                                             ;; an unused slot like the wire path.
+                                             (resolve-param-refs
+                                              p (into [nil] tvals)))))
+                                       (let [p (sql/parse-sql sql schema db)]
+                                         (when bump-dispatch! (bump-dispatch! p))
+                                         p)))
                           ;; Sibling pass to ParamRef substitution: any
                           ;; `nextval('s')` markers left in tx-data/in-args
                           ;; resolve here against the live conn (PG's
