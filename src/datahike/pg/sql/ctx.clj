@@ -565,6 +565,25 @@
           (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) v])
           true)))))
 
+(defn bind-col-param!
+  "Translate `col = $N` (extended-protocol parameter) as a data pattern
+   `[?e :attr ?pN]` whose value var is `:in`-bound at Execute — the
+   engine seeks the index with the bound value instead of scanning a
+   get-else binding + equality predicate (this was why `pgbench -M
+   prepared` point lookups were 10x slower than interpolated literals).
+   SQL `col = NULL` must yield zero rows: the `(some? ?pN)` guard
+   enforces that — a nil `:in` binding degrades the pattern itself to a
+   scan, but the guard then rejects every row. Same soundness rules as
+   bind-col-value! (top-level conjunct, plain column). Returns true
+   when handled."
+  [ctx resolved pvar]
+  (when (symbol? pvar)
+    (when-let [c (plain-join-col ctx resolved)]
+      (add-clause! ctx [(:evar c) (:attr c) pvar])
+      (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) pvar])
+      (add-clause! ctx [(list 'some? pvar)])
+      true)))
+
 ;; ---------------------------------------------------------------------------
 ;; Expression helpers
 

@@ -2740,6 +2740,30 @@
         ;; (e.g. `xs[2]`) — that needs translate-expr's subscript
         ;; rewrite, which the fast-path bypasses by routing straight
         ;; through resolve-column / col-var!.
+        (if (and *conjunctive-where*
+                 (instance? Column left)
+                 (nil? (.getArrayConstructor ^Column left))
+                 (instance? JdbcParameter right))
+          ;; col = $N in a top-level conjunct: index-seekable data
+          ;; pattern with the :in-bound param var (Parse time), or the
+          ;; value-bound pattern when *bound-params* already inlined the
+          ;; literal (Execute-time re-translation).
+          (let [resolved (ctx/resolve-column left
+                                             (:table-aliases ctx)
+                                             (:default-table ctx)
+                                             (:col-overrides ctx)
+                                             (:derived-aliases ctx))
+                pv (translate-expr ctx right)]
+            (cond
+              (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
+              (and (not (symbol? pv)) (ctx/bind-col-value! ctx resolved pv)) []
+              :else
+              ;; Fallback: classic get-else + equality (repeated
+              ;; translate-expr on the same JdbcParameter returns the
+              ;; cached ?pN without duplicating :in-args).
+              (let [v (ctx/col-var! ctx resolved)
+                    guards (ctx/null-guard-clauses ctx [v])]
+                (conj guards [(list '= v pv)]))))
         (if (and (instance? Column left)
                  (nil? (.getArrayConstructor ^Column left))
                  (or (instance? LongValue right)
@@ -2771,7 +2795,7 @@
               :else
               (let [v (ctx/col-var! ctx resolved)]
                 [[(list '= v val)]])))
-          (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e)))))
+          (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e))))))
 
     (instance? NotEqualsTo expr)
     (let [^NotEqualsTo e expr
