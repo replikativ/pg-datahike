@@ -20,7 +20,14 @@
            :schema-flexibility :write
            ;; DATAHIKE_KEEP_HISTORY=true to exercise history; default off for
            ;; integration tests where writes are the throughput bottleneck.
-           :keep-history? (= "true" (System/getenv "DATAHIKE_KEEP_HISTORY"))}
+           :keep-history? (= "true" (System/getenv "DATAHIKE_KEEP_HISTORY"))
+           ;; DATAHIKE_SYNC_COMMIT=false → writer acks after the in-memory
+           ;; apply (synchronous_commit=off semantics; no durability
+           ;; difference on the :memory backend). Ignored by datahike
+           ;; versions without the option.
+           :writer (cond-> {:backend :self}
+                     (= "false" (System/getenv "DATAHIKE_SYNC_COMMIT"))
+                     (assoc :sync-commit? false))}
       _ (d/create-database cfg)
       conn (d/connect cfg)
       port (Integer/parseInt (or (System/getenv "DATAHIKE_PG_PORT") "15432"))
