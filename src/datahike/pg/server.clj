@@ -2411,6 +2411,18 @@
   (let [marker (pgs/row-marker-attr table-name)]
     (boolean (get (dbi/-schema db) marker))))
 
+(defn- sequence-exists?
+  "True when a sequence entity with this name is already present in
+   `db`. Guarded on the `:__seq__/name` schema attr so the very first
+   CREATE SEQUENCE (no sequence schema yet) doesn't query an unknown
+   attribute."
+  [db seq-name]
+  (boolean (and (get (dbi/-schema db) :__seq__/name)
+                (ffirst (d/q '{:find [?e]
+                               :where [[?e :__seq__/name ?n]]
+                               :in [$ ?n]}
+                             db seq-name)))))
+
 (defn- execute-ddl-in-tx
   "Execute DDL inside a transaction by applying schema changes to the
    speculative-db and adding to tx-buffer. This preserves uncommitted
@@ -4659,11 +4671,37 @@
 
 (defn- exec-ddl-create-sequence
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx]
-    (if (:in-tx? @tx-state)
-      (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE SEQUENCE")
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [seq-name if-not-exists? tx-data]} parsed
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))]
+    (cond
+      ;; CREATE SEQUENCE on an existing sequence. PG raises 42P07
+      ;; duplicate_table (sequences are relations — commands/sequence.c
+      ;; goes through heap_create_with_catalog like tables do); IF NOT
+      ;; EXISTS downgrades it to a notice + success. Before this check,
+      ;; collisions silently re-transacted the init entity, RESETTING
+      ;; the counter of a live sequence.
+      (and (sequence-exists? current-db seq-name) (not if-not-exists?))
+      (classified-error ""
+                        (ex-info (str "relation \"" seq-name "\" already exists")
+                                 {:sqlstate "42P07"
+                                  :table seq-name
+                                  :constraint seq-name}))
+
+      ;; IF NOT EXISTS on an existing sequence: PG emits a notice and
+      ;; makes no change. Skipping the transact keeps the live counter
+      ;; untouched (re-transacting the init entity would reset it).
+      (sequence-exists? current-db seq-name)
+      (empty-result "CREATE SEQUENCE")
+
+      (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE SEQUENCE")
+
+      :else
       (try
-        (d/transact conn (:tx-data parsed))
+        (d/transact conn tx-data)
         (empty-result "CREATE SEQUENCE")
         (catch Exception e
           (classified-error "CREATE SEQUENCE error: " e))))))

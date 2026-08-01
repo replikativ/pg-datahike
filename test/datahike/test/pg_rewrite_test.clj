@@ -274,3 +274,53 @@
     (let [sql "SELECT 1 AS select"]
       (is (= "SELECT 1 AS \"select\""
              (rw/rewrite sql rw/default-rules))))))
+
+;; ============================================================================
+;; create-sequence-if-not-exists-rule — JSqlParser's CreateSequence
+;; grammar has no IF NOT EXISTS production; the rule strips the span
+;; pre-parse (the flag is re-detected in sql.clj and carried as
+;; :if-not-exists? for the executor).
+;; ============================================================================
+
+(defn- strip-seq-ine [sql]
+  (rw/rewrite sql [rw/create-sequence-if-not-exists-rule]))
+
+(deftest create-sequence-if-not-exists-basic
+  (testing "IF NOT EXISTS span stripped, single space left"
+    (is (= "CREATE SEQUENCE   foo"
+           (strip-seq-ine "CREATE SEQUENCE IF NOT EXISTS foo")))))
+
+(deftest create-sequence-if-not-exists-case-insensitive
+  (testing "lowercase"
+    (is (= "create sequence   foo"
+           (strip-seq-ine "create sequence if not exists foo"))))
+  (testing "mixed case"
+    (is (= "Create Sequence   foo START WITH 5"
+           (strip-seq-ine "Create Sequence If Not Exists foo START WITH 5")))))
+
+(deftest create-sequence-if-not-exists-temp-modifiers
+  (testing "TEMP / TEMPORARY / UNLOGGED between CREATE and SEQUENCE"
+    (is (= "CREATE TEMP SEQUENCE   foo"
+           (strip-seq-ine "CREATE TEMP SEQUENCE IF NOT EXISTS foo")))
+    (is (= "CREATE TEMPORARY SEQUENCE   foo"
+           (strip-seq-ine "CREATE TEMPORARY SEQUENCE IF NOT EXISTS foo")))
+    (is (= "CREATE UNLOGGED SEQUENCE   foo"
+           (strip-seq-ine "CREATE UNLOGGED SEQUENCE IF NOT EXISTS foo")))))
+
+(deftest create-sequence-if-not-exists-in-string-literal
+  (testing "phrase inside a string literal must be preserved"
+    (let [sql "INSERT INTO t (note) VALUES ('CREATE SEQUENCE IF NOT EXISTS foo')"]
+      (is (= sql (strip-seq-ine sql))))))
+
+(deftest create-sequence-if-not-exists-leaves-create-table-alone
+  (testing "CREATE TABLE IF NOT EXISTS is JSqlParser-native — untouched"
+    (let [sql "CREATE TABLE IF NOT EXISTS t (id INT)"]
+      (is (= sql (strip-seq-ine sql)))))
+  (testing "plain CREATE SEQUENCE without the clause — untouched"
+    (let [sql "CREATE SEQUENCE foo START WITH 5"]
+      (is (= sql (strip-seq-ine sql))))))
+
+(deftest create-sequence-if-not-exists-integrates-with-default-rules
+  (testing "rule is part of default-rules"
+    (is (= "CREATE SEQUENCE   foo"
+           (rw/rewrite "CREATE SEQUENCE IF NOT EXISTS foo" rw/default-rules)))))

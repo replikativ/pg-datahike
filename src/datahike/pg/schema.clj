@@ -31,6 +31,12 @@
 (def ^:private internal-ns-prefixes
   #{"db" "db.type" "db.cardinality" "db.unique" "db.install"
     "db.entity" "db.part" "db.secondary" "db.sys"
+    ;; Datahike system-schema families that graduate over time. These are
+    ;; datahike internals — they must never surface as user tables. Keep this in
+    ;; step with datahike's system schema when bumping the dependency:
+    ;;   db.valid  — bitemporal valid-time (:db.valid/from, :db.valid/to)
+    ;;   dh.ref    — cross-database references (:dh.ref/db, :dh.ref/attr, …)
+    "db.valid" "dh.ref"
     ;; Pgwire's own meta-attrs for schema hints (see hint-schema below)
     ;; and for DDL-emitted constraints / catalog integrity. These live
     ;; on ident entities to tune the SQL-side view; they must not

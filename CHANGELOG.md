@@ -4,6 +4,25 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### jsonb fidelity
+
+- **jsonb is now canonicalized on ingest, so it behaves like PostgreSQL
+  `jsonb` rather than `json`.** Previously a jsonb value was stored as its
+  raw input text, so `'{"a":1,"b":2}'::jsonb = '{"b":2,"a":1}'::jsonb` was
+  `false` (two different strings) where Postgres returns `true`, and
+  duplicate keys survived. jsonb writes now recursively sort object keys,
+  strip insignificant whitespace, and collapse duplicate keys to the last —
+  so `=`, `DISTINCT` and `GROUP BY` compare by structure, and the value a
+  client reads back is canonical. Array element order is preserved (only
+  object keys sort); the text-faithful `json` type is left untouched. The
+  jsonb-ness of a column (`:pg/type`, which lives as an ident-entity fact,
+  not in datahike's `:db/*` schema) is now surfaced into the INSERT coercion
+  path. Numeric normalization is Jackson's, not Postgres's, so a few numeric
+  edge cases (`1.00`, `1e3`) may not match PG's exact jsonb numeric form —
+  structural canonicalization is exact. This is the correctness prerequisite
+  for indexing jsonb; index acceleration (a GIN-like secondary index) is
+  tracked separately.
+
 ### Bulk-insert performance
 
 - **Pagila replay: 274s → 12s (23×).** Cumulative across five
