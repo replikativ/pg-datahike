@@ -1639,22 +1639,24 @@
    (or its PK is updated). Used by DELETE / UPDATE to enforce
    parent-side RESTRICT and CASCADE actions."
   [db table-name]
-  (let [q-fn d/q]
-    (map (fn [[n ct cc pc od]]
-           {:name n :child-table ct
-            :child-cols (vec (jb/parse-jsonb cc))
-            :parent-cols (vec (jb/parse-jsonb pc))
-            ;; PG default for missing ON DELETE is NO ACTION.
-            :on-delete (or od :no-action)})
-         (q-fn '{:find [?n ?ct ?cc ?pc ?od]
-                 :in [$ ?pt]
-                 :where [[?e :pg/fk-name ?n]
-                         [?e :pg/fk-parent-table ?pt]
-                         [?e :pg/fk-child-table ?ct]
-                         [?e :pg/fk-child-cols ?cc]
-                         [?e :pg/fk-parent-cols ?pc]
-                         [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
-               db table-name))))
+  (let [v (schema-cached
+           db [::fk-parent table-name]
+           #(mapv (fn [[n ct cc pc od]]
+                    {:name n :child-table ct
+                     :child-cols (vec (jb/parse-jsonb cc))
+                     :parent-cols (vec (jb/parse-jsonb pc))
+                     ;; PG default for missing ON DELETE is NO ACTION.
+                     :on-delete (or od :no-action)})
+                  (d/q '{:find [?n ?ct ?cc ?pc ?od]
+                         :in [$ ?pt]
+                         :where [[?e :pg/fk-name ?n]
+                                 [?e :pg/fk-parent-table ?pt]
+                                 [?e :pg/fk-child-table ?ct]
+                                 [?e :pg/fk-child-cols ?cc]
+                                 [?e :pg/fk-parent-cols ?pc]
+                                 [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
+                       db table-name)))]
+    (if (= ::nil v) [] v)))
 
 (defn- enforce-fk-on-insert!
   "For each FK where this table is the child, verify every row in
@@ -2097,6 +2099,12 @@
       (reset! (:where-clauses ctx)
               (vec (cons [evar marker true] clauses))))))
 
+(def ^:private update-row-match-cache
+  "Row-matching query cache for UPDATE/DELETE: [(identity parsed)
+   (identity schema)] → {:q datalog :in-params [...] :in-args-raw [...]}.
+   ParamRefs stay unresolved in :in-args-raw; values substitute per call."
+  (pg-cache/bounded-cache 512))
+
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
@@ -2111,38 +2119,50 @@
   [db schema parsed]
   (let [{:keys [table alias where-expr enriched-db]} parsed
         query-db (or enriched-db db)
-        query-schema (or (:schema enriched-db) schema)
-        ;; Build alias map: {alias → table, table → table}
-        default-key (or alias table)
-        table-aliases (cond-> {table table}
-                        alias (assoc alias table))
-        ctx (#'sql/make-ctx query-schema table-aliases default-key
-                            {:db query-db :parse-sql sql/parse-sql})
-        _ (when where-expr
-            ;; Top-level DELETE WHERE = conjunctive context: enables the
-            ;; data-pattern fast paths. Params stay as ?pN vars (values
-            ;; via :in) so the row-matching plan is one-per-shape — see
-            ;; build-update-tx-for-bindings.
-            (binding [expr/*conjunctive-where* true]
-              (let [preds (#'sql/translate-predicate ctx where-expr)]
-                (swap! (:where-clauses ctx) into preds))))
-        evar (#'sql/entity-var! ctx default-key)
-        _ (when (empty? @(:where-clauses ctx))
-            (let [cols (pgs/column-info schema table)]
-              (when-let [first-col (second cols)]
-                (#'sql/col-var! ctx (:attr first-col)))))
-        _ (ensure-evar-anchor! ctx evar table)
-        ;; ?pN param plumbing (mirrors build-update-tx-for-bindings):
-        ;; the WHERE keeps params as vars, so supply the bound values as
-        ;; :in args and run with the plan-stable fold disabled.
-        in-params @(:in-params ctx)
-        in-args-raw @(:in-args ctx)
+        ;; Row-matching query cached per (parsed, schema) — see
+        ;; update-row-match-cache / build-update-tx-for-bindings.
+        shape-key (when (nil? enriched-db)
+                    [(pg-cache/identity-key parsed)
+                     (pg-cache/identity-key schema)])
+        cached (when shape-key
+                 (.get ^java.util.Map update-row-match-cache shape-key))
+        {:keys [q in-args-raw]}
+        (or cached
+            (let [query-schema (or (:schema enriched-db) schema)
+                  ;; Build alias map: {alias → table, table → table}
+                  default-key (or alias table)
+                  table-aliases (cond-> {table table}
+                                  alias (assoc alias table))
+                  ctx (#'sql/make-ctx query-schema table-aliases default-key
+                                      {:db query-db :parse-sql sql/parse-sql})
+                  _ (when where-expr
+                      ;; Top-level DELETE WHERE = conjunctive context: enables the
+                      ;; data-pattern fast paths. Params stay as ?pN vars (values
+                      ;; via :in) so the row-matching plan is one-per-shape — see
+                      ;; build-update-tx-for-bindings.
+                      (binding [expr/*conjunctive-where* true]
+                        (let [preds (#'sql/translate-predicate ctx where-expr)]
+                          (swap! (:where-clauses ctx) into preds))))
+                  evar (#'sql/entity-var! ctx default-key)
+                  _ (when (empty? @(:where-clauses ctx))
+                      (let [cols (pgs/column-info schema table)]
+                        (when-let [first-col (second cols)]
+                          (#'sql/col-var! ctx (:attr first-col)))))
+                  _ (ensure-evar-anchor! ctx evar table)
+                  ;; ?pN param plumbing (mirrors build-update-tx-for-bindings):
+                  ;; the WHERE keeps params as vars, so supply the bound values as
+                  ;; :in args and run with the plan-stable fold disabled.
+                  in-params @(:in-params ctx)
+                  v {:q (cond-> {:find [evar] :where (vec @(:where-clauses ctx))}
+                          (seq in-params) (assoc :in (into ['$] in-params)))
+                     :in-args-raw @(:in-args ctx)}]
+              (when shape-key
+                (.put ^java.util.Map update-row-match-cache shape-key v))
+              v))
         in-args (if-let [bound *cached-bound*]
                   (sql/substitute-params in-args-raw
                                          (fn [idx] (nth bound idx)))
                   in-args-raw)
-        q (cond-> {:find [evar] :where (vec @(:where-clauses ctx))}
-            (seq in-params) (assoc :in (into ['$] in-params)))
         eids (mapv first
                    (if (seq in-args)
                      (run-param-query #(apply d/q q query-db in-args))
@@ -2187,50 +2207,66 @@
   [db schema parsed from-bindings]
   (let [{:keys [table alias ns assignments where-expr enriched-db]} parsed
         query-db (or enriched-db db)
-        query-schema (or (:schema enriched-db) schema)
-        default-key (or alias table)
-        table-aliases (cond-> {table table}
-                        alias (assoc alias table))
-        ctx (#'sql/make-ctx query-schema table-aliases default-key
-                            {:db query-db :parse-sql sql/parse-sql})
-        _ (when where-expr
-            ;; Top-level UPDATE WHERE = conjunctive context: the value-bound
-            ;; data-pattern fast path makes the row-matching query indexed
-            ;; ([?e :attr v] instead of a get-else scan) — and self-anchoring:
-            ;; the datahike planner rejects a WHERE of only get-else clauses
-            ;; with an unbound entity var.
-            ;; Params stay as ?pN vars (values via :in): inlining the
-            ;; bound literal made the row-matching clauses NOVEL per
-            ;; value, so datalog's parse/plan caches missed and the full
-            ;; planner re-ran per Execute (~18% of tpcb CPU). With ?pN
-            ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
-            ;; plan per statement shape, values supplied at d/q time.
-            (binding [params/*from-bindings* from-bindings
-                      expr/*conjunctive-where* true]
-              (let [preds (#'sql/translate-predicate ctx where-expr)]
-                (swap! (:where-clauses ctx) into preds))))
-        evar (#'sql/entity-var! ctx default-key)
-        _ (when (empty? @(:where-clauses ctx))
-            (let [cols (pgs/column-info schema table)]
-              (when-let [first-col (second cols)]
-                (#'sql/col-var! ctx (:attr first-col)))))
-        _ (ensure-evar-anchor! ctx evar table)
-        where-clauses @(:where-clauses ctx)
-        ;; Prepared-statement UPDATE: translate-predicate lifts every
-        ;; JdbcParameter to a logic variable (e.g. `?p2`) and records a
-        ;; ParamRef in :in-args. Without plumbing :in/:in-args through
-        ;; to d/q, the row-matching query has an unbound var and
-        ;; returns zero rows (manifesting as "UPDATE 0" for a row that
-        ;; clearly exists). Substitute the ParamRefs against
-        ;; *cached-bound* here so the d/q call has concrete literals.
-        in-params @(:in-params ctx)
-        in-args-raw @(:in-args ctx)
+        ;; The row-matching query (WHERE translation, anchor, :in plumbing)
+        ;; is a pure function of (parsed, schema) when there are no
+        ;; per-row FROM(VALUES) bindings and no enriched-db — cache it per
+        ;; statement so repeated executions skip make-ctx + translate.
+        shape-key (when (and (nil? from-bindings) (nil? enriched-db))
+                    [(pg-cache/identity-key parsed)
+                     (pg-cache/identity-key schema)])
+        cached (when shape-key
+                 (.get ^java.util.Map update-row-match-cache shape-key))
+        {:keys [q in-params in-args-raw]}
+        (or cached
+            (let [query-schema (or (:schema enriched-db) schema)
+                  default-key (or alias table)
+                  table-aliases (cond-> {table table}
+                                  alias (assoc alias table))
+                  ctx (#'sql/make-ctx query-schema table-aliases default-key
+                                      {:db query-db :parse-sql sql/parse-sql})
+                  _ (when where-expr
+                      ;; Top-level UPDATE WHERE = conjunctive context: the value-bound
+                      ;; data-pattern fast path makes the row-matching query indexed
+                      ;; ([?e :attr v] instead of a get-else scan) — and self-anchoring:
+                      ;; the datahike planner rejects a WHERE of only get-else clauses
+                      ;; with an unbound entity var.
+                      ;; Params stay as ?pN vars (values via :in): inlining the
+                      ;; bound literal made the row-matching clauses NOVEL per
+                      ;; value, so datalog's parse/plan caches missed and the full
+                      ;; planner re-ran per Execute (~18% of tpcb CPU). With ?pN
+                      ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
+                      ;; plan per statement shape, values supplied at d/q time.
+                      (binding [params/*from-bindings* from-bindings
+                                expr/*conjunctive-where* true]
+                        (let [preds (#'sql/translate-predicate ctx where-expr)]
+                          (swap! (:where-clauses ctx) into preds))))
+                  evar (#'sql/entity-var! ctx default-key)
+                  _ (when (empty? @(:where-clauses ctx))
+                      (let [cols (pgs/column-info schema table)]
+                        (when-let [first-col (second cols)]
+                          (#'sql/col-var! ctx (:attr first-col)))))
+                  _ (ensure-evar-anchor! ctx evar table)
+                  where-clauses @(:where-clauses ctx)
+                  ;; Prepared-statement UPDATE: translate-predicate lifts every
+                  ;; JdbcParameter to a logic variable (e.g. `?p2`) and records a
+                  ;; ParamRef in :in-args. Without plumbing :in/:in-args through
+                  ;; to d/q, the row-matching query has an unbound var and
+                  ;; returns zero rows (manifesting as "UPDATE 0" for a row that
+                  ;; clearly exists). Substitute the ParamRefs against
+                  ;; *cached-bound* here so the d/q call has concrete literals.
+                  in-params @(:in-params ctx)
+                  in-args-raw @(:in-args ctx)
+                  v {:q (cond-> {:find [evar] :where (vec where-clauses)}
+                          (seq in-params) (assoc :in (into ['$] in-params)))
+                     :in-params in-params
+                     :in-args-raw in-args-raw}]
+              (when shape-key
+                (.put ^java.util.Map update-row-match-cache shape-key v))
+              v))
         in-args (if-let [bound *cached-bound*]
                   (sql/substitute-params in-args-raw
                                          (fn [idx] (nth bound idx)))
                   in-args-raw)
-        q (cond-> {:find [evar] :where (vec where-clauses)}
-            (seq in-params) (assoc :in (into ['$] in-params)))
         eids (mapv first
                    (if (seq in-args)
                      (run-param-query #(apply d/q q query-db in-args))
@@ -2370,13 +2406,15 @@
    A retract of a non-null attr is equivalent to setting it to NULL,
    which PG rejects."
   [db tx-data]
-  (let [q-fn d/q
-        not-null-attrs (into #{}
-                             (map first)
-                             (q-fn '{:find [?ident]
-                                     :where [[?e :db/ident ?ident]
-                                             [?e :pg/not-null true]]}
-                                   db))]
+  (let [not-null-attrs (let [v (schema-cached
+                                db [::not-null-attrs]
+                                #(into #{}
+                                       (map first)
+                                       (d/q '{:find [?ident]
+                                              :where [[?e :db/ident ?ident]
+                                                      [?e :pg/not-null true]]}
+                                            db)))]
+                         (if (= ::nil v) #{} v))]
     (doseq [op tx-data]
       (when (vector? op)
         (let [[verb _eid attr val] op]
@@ -4403,6 +4441,15 @@
             (recur (cons (second e) acc))
             (vec acc)))))))
 
+(def ^:private select-shape-cache
+  "Result-shape cache for exec-select: [(identity parsed) (identity schema)
+   find-aliases] → [schema-oids sources]. The final RowDescription metadata
+   (blended OIDs, column sources, typmods) is a pure function of the parsed
+   statement and the schema; recomputing it per execution cost ~10% of a
+   point SELECT. Bounded LRU; DDL mints a new schema object so stale
+   generations age out."
+  (pg-cache/bounded-cache 512))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -4703,7 +4750,27 @@
         ;; Derive schema-based OIDs for proper type metadata.
         ;; Shared with describeResult; see compute-schema-oids.
         (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
-              ;; Resolve column OIDs against the same db the query ran on:
+              ;; Result shape (final OIDs + column sources) is a pure function
+              ;; of (statement, schema, aliases): cache it across executions.
+              ;; Keyed on the parsed OBJECT (stable via the parse LRU /
+              ;; prepared statements) and the schema OBJECT (stable across
+              ;; non-DDL transactions). Only for the base db — an enriched-db
+              ;; (CTE / SRF virtual tables) carries per-execution type info.
+              shape-key (when (identical? query-db db)
+                          [(pg-cache/identity-key parsed)
+                           (pg-cache/identity-key (dbi/-schema db))
+                           find-aliases])
+              cached-shape (when shape-key
+                             (.get ^java.util.Map select-shape-cache shape-key))]
+          (if cached-shape
+            (let [[schema-oids sources] cached-shape
+                  result (format-query-result results find-aliases schema-oids)]
+              (if sources
+                (-> ^PgWireServer$QueryResult result
+                    (.withColumnSources (first sources) (second sources))
+                    (.withColumnTypmods (nth sources 2)))
+                result))
+        (let [;; Resolve column OIDs against the same db the query ran on:
               ;; when a derived table / SRF-in-FROM materialised a virtual
               ;; table (:enriched-db), its columns' :pg/type markers (e.g.
               ;; generate_series → int4) only live there, not on the base
@@ -4740,12 +4807,15 @@
                               out)
                             schema-oids)
               sources (compute-column-sources parsed-with-shape db)
+              _ (when shape-key
+                  (.put ^java.util.Map select-shape-cache shape-key
+                        [schema-oids sources]))
               result (format-query-result results find-aliases schema-oids)]
           (if sources
             (-> ^PgWireServer$QueryResult result
                 (.withColumnSources (first sources) (second sources))
                 (.withColumnTypmods (nth sources 2)))
-            result))))))
+            result))))))))
 
 (defn- remap-tempids
   "Rewrite every string tempid in `form` (any string sitting in a

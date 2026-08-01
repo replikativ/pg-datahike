@@ -756,6 +756,11 @@
             tables-from-attrs
             marker-tables)))
 
+(def ^:private dvt-last-cache
+  "Last [schema hints result] of `derive-virtual-tables` for execute-path
+   callers that run outside the parse-scoped *catalog-tx-cache*."
+  (volatile! [nil nil nil]))
+
 (defn derive-virtual-tables
   "Derive virtual table definitions from a Datahike schema map.
 
@@ -790,7 +795,18 @@
            (let [v (derive-virtual-tables* schema hints)]
              (.put ^java.util.IdentityHashMap inner hints v)
              v)))
-     (derive-virtual-tables* schema hints))))
+     ;; Execute-path callers (column-attnum via compute-column-sources, …)
+     ;; run outside any parse-scoped cache and were re-walking the whole
+     ;; schema on EVERY statement execution. The schema map is identity-
+     ;; stable across non-schema transactions, so a last-schema slot
+     ;; serves the steady state; a schema tx swaps the object and simply
+     ;; recomputes once. Benign race: worst case is a duplicate compute.
+     (let [[s h r] @dvt-last-cache]
+       (if (and (identical? s schema) (= h hints))
+         r
+         (let [v (derive-virtual-tables* schema hints)]
+           (vreset! dvt-last-cache [schema hints v])
+           v))))))
 
 (defn table-names
   "Return sorted list of virtual table names for a schema."
