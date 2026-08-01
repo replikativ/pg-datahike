@@ -958,6 +958,14 @@
   ;; nil on older datahike (the fast path simply doesn't apply).
   (resolve 'datahike.query/*fold-scalar-ins*))
 
+(def ^:private result-cache-min-weight-var
+  ;; datahike.query/*result-cache-min-weight* when available: for
+  ;; parameterized statements, inserting a tiny result into the result
+  ;; cache costs more (~200us of key/swap/LRU bookkeeping) than
+  ;; recomputing it with warm plan caches, so skip caching results
+  ;; under 4 tuples on these paths. Larger results still cache.
+  (resolve 'datahike.query/*result-cache-min-weight*))
+
 (defn- run-param-query
   "Run `thunk` (a d/q call with :in args) with datahike's scalar-:in
    const-folding disabled when available: parameterized statements
@@ -966,9 +974,12 @@
    2x on novel-value point lookups. Function-valued in-args still fold
    (datahike guards that internally)."
   [thunk]
-  (if fold-scalar-ins-var
-    (with-bindings* {fold-scalar-ins-var false} thunk)
-    (thunk)))
+  (let [binds (cond-> {}
+                fold-scalar-ins-var (assoc fold-scalar-ins-var false)
+                result-cache-min-weight-var (assoc result-cache-min-weight-var 4))]
+    (if (seq binds)
+      (with-bindings* binds thunk)
+      (thunk))))
 
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
