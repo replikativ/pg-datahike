@@ -366,6 +366,10 @@
       ;; Raw ArithmeticException from division paths not routed through
       ;; fns/sql-div (quot, aggregates, BigDecimal ops) → 22012.
       (re-find #"(?i)divide by zero|division by zero" msg) "22012"
+      ;; datahike's index-backfill migration rejecting ALTER TABLE ADD
+      ;; PRIMARY KEY/UNIQUE over existing duplicate values — PG raises
+      ;; unique-violation for that, not a syntax-class error.
+      (re-find #"existing duplicate value" msg) "23505"
       (re-find #"(?i)unique constraint|unique value.*already" msg) "23505"
       (re-find #"(?i)not-null|NOT NULL constraint" msg) "23502"
       (re-find #"(?i)foreign key|ref.*not.*exist" msg) "23503"

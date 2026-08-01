@@ -1102,10 +1102,15 @@
                         (assoc :isolation (isolation-level-after rest-toks)))
                       {:kind :generic-sql})
           "commit"  {:kind :commit}
-          "end"     (if (or (nil? (first rest-toks))
-                            (kw-in? (first rest-toks) #{"work" "transaction"}))
-                      {:kind :commit}
-                      {:kind :generic-sql})
+          ;; Bare END / END WORK / END TRANSACTION = COMMIT. A trailing
+          ;; `;` token must not disqualify it — pgbench -M prepared sends
+          ;; "END;" as its own Parse message (jsqlparser can't parse END).
+          "end"     (let [t (first rest-toks)]
+                      (if (or (nil? t)
+                              (= ";" (:text t))
+                              (kw-in? t #{"work" "transaction"}))
+                        {:kind :commit}
+                        {:kind :generic-sql}))
           "rollback" (classify-rollback rest-toks)
           "savepoint" {:kind :savepoint :name (ident-text (first rest-toks))}
           "release"  (let [nm (if (kw=? (first rest-toks) "savepoint")

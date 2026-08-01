@@ -1446,8 +1446,29 @@
                                                               {:name (unquote-ident (.getColumnName cdt))
                                                                :type (str/lower-case (str (.getDataType (.getColDataType cdt))))})
                                                             cdts)})
-                                ;; ADD CONSTRAINT (FK, UNIQUE, CHECK, etc.) — no-op
-                                          (= op "ADD") {:op :add-constraint}
+                                ;; ADD [CONSTRAINT name] PRIMARY KEY / UNIQUE —
+                                ;; carry the columns so the executor can upgrade
+                                ;; the attributes to :db/unique (single column)
+                                ;; or :db/index (composite members) via
+                                ;; datahike's index-backfill migration. Bare
+                                ;; forms surface via getPkColumns/getUkColumns;
+                                ;; named-constraint forms via getIndex.
+                                          (= op "ADD")
+                                          (let [idx (.getIndex exp)
+                                                idx-type (some-> idx .getType str/upper-case)
+                                                pk-cols (seq (.getPkColumns exp))
+                                                uk-cols (seq (.getUkColumns exp))]
+                                            (cond
+                                              (or pk-cols (= idx-type "PRIMARY KEY"))
+                                              {:op :add-primary-key
+                                               :columns (mapv unquote-ident
+                                                              (or pk-cols (.getColumnsNames idx)))}
+                                              (or uk-cols (= idx-type "UNIQUE"))
+                                              {:op :add-unique
+                                               :columns (mapv unquote-ident
+                                                              (or uk-cols (.getColumnsNames idx)))}
+                                              ;; FK, CHECK, etc. — no-op
+                                              :else {:op :add-constraint}))
                                 ;; DROP — no-op
                                           (= op "DROP") {:op :drop}
                                 ;; ALTER (SET NOT NULL, TYPE change, etc.) — no-op

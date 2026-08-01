@@ -26,6 +26,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql :as sql]
+            [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
@@ -1949,6 +1950,24 @@
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
+(declare ^:dynamic *cached-bound*)
+
+(defn- ensure-evar-anchor!
+  "The UPDATE/DELETE row-matching query needs at least one data pattern
+   binding the table's entity var — a WHERE consisting only of get-else /
+   function-binding clauses (e.g. `WHERE col = $1` via the predicate
+   path) leaves it unbound, which the datahike planner rejects. Prepend
+   the row-marker anchor when no clause binds it."
+  [ctx evar table]
+  (let [clauses @(:where-clauses ctx)
+        binds-evar? (some (fn [c]
+                            (and (vector? c) (>= (count c) 2)
+                                 (= evar (first c)) (keyword? (second c))))
+                          clauses)]
+    (when-not binds-evar?
+      (reset! (:where-clauses ctx)
+              (vec (cons [evar (pgs/row-marker-attr table) true] clauses))))))
+
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
@@ -1971,13 +1990,22 @@
         ctx (#'sql/make-ctx query-schema table-aliases default-key
                             {:db query-db :parse-sql sql/parse-sql})
         _ (when where-expr
-            (let [preds (#'sql/translate-predicate ctx where-expr)]
-              (swap! (:where-clauses ctx) into preds)))
+            ;; Top-level DELETE WHERE = conjunctive context: enables the
+            ;; value-bound data-pattern fast path (indexed row matching).
+            ;; *bound-params* inlines extended-protocol parameters so
+            ;; prepared `WHERE pk = $1` seeks too.
+            (binding [expr/*conjunctive-where* true
+                      params/*bound-params* (or params/*bound-params*
+                                                (when-let [cb *cached-bound*]
+                                                  (vec (rest cb))))]
+              (let [preds (#'sql/translate-predicate ctx where-expr)]
+                (swap! (:where-clauses ctx) into preds))))
         evar (#'sql/entity-var! ctx default-key)
         _ (when (empty? @(:where-clauses ctx))
             (let [cols (pgs/column-info schema table)]
               (when-let [first-col (second cols)]
                 (#'sql/col-var! ctx (:attr first-col)))))
+        _ (ensure-evar-anchor! ctx evar table)
         q {:find [evar] :where (vec @(:where-clauses ctx))}
         eids (mapv first (d/q q query-db))]
     {:eids eids
@@ -2009,8 +2037,6 @@
 ;; Forward-declare so build-update-tx-for-bindings (below) can read the
 ;; prepared-statement param vector; the binding site is in executePrepared
 ;; further down, after the handler closure setup.
-(declare ^:dynamic *cached-bound*)
-
 (defn- build-update-tx-for-bindings
   "Build tx-data for a single UPDATE row, optionally with from-bindings for
    UPDATE ... FROM (VALUES ...) substitution. Returns {:eids [...] :tx-data [...]}.
@@ -2029,7 +2055,19 @@
         ctx (#'sql/make-ctx query-schema table-aliases default-key
                             {:db query-db :parse-sql sql/parse-sql})
         _ (when where-expr
-            (binding [params/*from-bindings* from-bindings]
+            ;; Top-level UPDATE WHERE = conjunctive context: the value-bound
+            ;; data-pattern fast path makes the row-matching query indexed
+            ;; ([?e :attr v] instead of a get-else scan) — and self-anchoring:
+            ;; the datahike planner rejects a WHERE of only get-else clauses
+            ;; with an unbound entity var.
+            ;; With *bound-params* available (extended-protocol Execute),
+            ;; JdbcParameters inline to literals, so `WHERE pk = $1` takes
+            ;; the value-bound data-pattern fast path (indexed) too.
+            (binding [params/*from-bindings* from-bindings
+                      params/*bound-params* (or params/*bound-params*
+                                                (when-let [cb *cached-bound*]
+                                                  (vec (rest cb))))
+                      expr/*conjunctive-where* true]
               (let [preds (#'sql/translate-predicate ctx where-expr)]
                 (swap! (:where-clauses ctx) into preds))))
         evar (#'sql/entity-var! ctx default-key)
@@ -2037,6 +2075,7 @@
             (let [cols (pgs/column-info schema table)]
               (when-let [first-col (second cols)]
                 (#'sql/col-var! ctx (:attr first-col)))))
+        _ (ensure-evar-anchor! ctx evar table)
         where-clauses @(:where-clauses ctx)
         ;; Prepared-statement UPDATE: translate-predicate lifts every
         ;; JdbcParameter to a logic variable (e.g. `?p2`) and records a
@@ -2091,7 +2130,17 @@
                                     eff-from-bindings (merge from-bindings outer-binding)]
                                 (for [{:keys [column value-expr]} assignments
                                       :let [attr (keyword ns column)
+                                            ;; *bound-params* (0-based; *cached-bound*
+                                            ;; is 1-indexed with slot 0 unused) lets
+                                            ;; JdbcParameter operands resolve inline —
+                                            ;; `SET bal = bal + $1` used to throw
+                                            ;; ClassCastException on the ParamRef
+                                            ;; (pgbench -M prepared).
                                             raw-val (binding [params/*from-bindings* eff-from-bindings
+                                                              params/*bound-params*
+                                                              (or params/*bound-params*
+                                                                  (when-let [cb *cached-bound*]
+                                                                    (vec (rest cb))))
                                                               stmt/*eval-update-db* db]
                                                       (sql/eval-update-expr value-expr entity-map ns schema))
                                             resolved (resolve-param raw-val)
@@ -2453,11 +2502,16 @@
   (try
     (let [spec-db (:speculative-db @tx-state)
           schema (:schema spec-db)
-          ;; Filter out schema attributes that already exist
-          ;; (CREATE TABLE on an existing table should be idempotent)
+          ;; Filter out full attribute DECLARATIONS that already exist
+          ;; (CREATE TABLE on an existing table should be idempotent).
+          ;; Schema UPDATES — {:db/ident X :db/unique …} / :db/index from
+          ;; ALTER TABLE ADD PRIMARY KEY/UNIQUE — carry no :db/valueType
+          ;; and must pass through; the old ident-only filter silently
+          ;; swallowed them (statement reported success, nothing applied).
           new-tx-data (vec (remove (fn [datum]
                                      (and (map? datum)
                                           (:db/ident datum)
+                                          (:db/valueType datum)
                                           (get schema (:db/ident datum))))
                                    tx-data))]
       (when (seq new-tx-data)
@@ -4893,9 +4947,11 @@
   (let [{:keys [conn tx-state]} ctx]
     (try
       (let [{:keys [table operations]} parsed
+            schema (dbi/-schema (d/db conn))
             tx-data (vec (mapcat
                           (fn [{:keys [op columns]}]
-                            (when (= op :add-column)
+                            (case op
+                              :add-column
                               (for [{:keys [name type]} columns
                                     :let [base-type (str/replace type #"\s*\([^)]*\)" "")
                                           dh-type (or (get types/sql-name->dh-type type)
@@ -4905,13 +4961,45 @@
                                          :db/valueType dh-type
                                          :db/cardinality :db.cardinality/one}
                                   (#{"jsonb" "json"} base-type)
-                                  (assoc :pg/type base-type)))))
+                                  (assoc :pg/type base-type)))
+                              ;; PK/UNIQUE on an existing column: upgrade the
+                              ;; attribute — datahike's index-backfill migration
+                              ;; populates AVET for pre-existing datoms and
+                              ;; verifies uniqueness (duplicates reject the tx).
+                              ;; A composite key can't map to per-attr
+                              ;; uniqueness (that would over-constrain), so its
+                              ;; members get :db/index only.
+                              (:add-primary-key :add-unique)
+                              (let [single? (= 1 (count columns))
+                                    unique-kw (if (= op :add-primary-key)
+                                                :db.unique/identity
+                                                :db.unique/value)]
+                                (for [col columns
+                                      :let [attr (keyword table col)]
+                                      :when (contains? schema attr)]
+                                  (if single?
+                                    {:db/ident attr :db/unique unique-kw}
+                                    {:db/ident attr :db/index true})))
+                              nil))
                           operations))]
         (if (seq tx-data)
-          (if (:in-tx? @tx-state)
-            (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
-            (do (d/transact conn tx-data)
-                (empty-result "ALTER TABLE")))
+          (try
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
+              (do (d/transact conn tx-data)
+                  (empty-result "ALTER TABLE")))
+            (catch Exception e
+              ;; PK/UNIQUE upgrades need datahike's index-backfill
+              ;; migration. Against an older datahike that rejects
+              ;; schema updates on existing attributes, degrade to the
+              ;; historical accept-as-no-op behavior (uniqueness is
+              ;; still enforced by the SQL layer's identity checks)
+              ;; instead of failing statements that used to succeed.
+              (if (and (not-any? #(= :add-column (:op %)) operations)
+                       (re-find #"Update not supported"
+                                (str (.getMessage e))))
+                (empty-result "ALTER TABLE")
+                (throw e))))
           (empty-result "ALTER TABLE")))
       (catch Exception e
         (classified-error "ALTER TABLE error: " e)))))

@@ -451,3 +451,13 @@
 
   (testing "other set_* functions don't accidentally classify as set-config"
     (is (= :setval (kind "SELECT setval('s', 100)")))))
+
+(deftest classify-end-with-semicolon
+  ;; pgbench -M prepared sends "END;" as its own Parse message; jsqlparser
+  ;; cannot parse END, so the classifier must catch it despite the
+  ;; trailing semicolon token.
+  (is (= :commit (kind "END")))
+  (is (= :commit (kind "END;")))
+  (is (= :commit (kind "END WORK;")))
+  (is (= :commit (kind "END TRANSACTION")))
+  (is (= :generic-sql (kind "END foo"))))

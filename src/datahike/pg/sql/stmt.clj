@@ -3556,6 +3556,19 @@
       ;; clause should land above this `:else`.
       :else nil)))
 
+(defn- num-operand
+  "PG-style unknown-operand resolution for arithmetic: a text-format
+   wire parameter decodes as a String; in numeric context PG casts it
+   to the numeric type. Numeric-looking strings parse (long or double
+   by shape); everything else passes through unchanged so non-numeric
+   operands still fail the arithmetic's number? guards."
+  [x]
+  (if (and (string? x)
+           (re-matches #"\s*[+-]?\d+(\.\d+)?([eE][+-]?\d+)?\s*" x))
+    (try (coerce/coerce-numeric x (if (re-find #"[.eE]" x) :double :long))
+         (catch Exception _ x))
+    x))
+
 (defn eval-update-expr
   "Evaluate an UPDATE SET expression for a specific entity.
    For simple literals, returns the literal value.
@@ -3566,7 +3579,15 @@
   [value-expr entity-map ns-str schema]
   (cond
     (instance? JdbcParameter value-expr)
-    (->ParamRef (.getIndex ^JdbcParameter value-expr))
+    ;; Execute-time re-evaluation (*bound-params* bound): resolve to the
+    ;; concrete value so arithmetic like `SET bal = bal + $1` computes —
+    ;; a ParamRef operand made `+` throw ClassCastException (hit by
+    ;; pgbench -M prepared). Parse time keeps the ParamRef sentinel for
+    ;; the tx-build substitution pass.
+    (let [idx (.getIndex ^JdbcParameter value-expr)]
+      (if-let [bound params/*bound-params*]
+        (nth bound (dec (long idx)))
+        (->ParamRef idx)))
 
     (instance? LongValue value-expr)
     (.getValue ^LongValue value-expr)
@@ -3601,6 +3622,17 @@
         :else
         (get entity-map (keyword ns-str col-name))))
 
+    ;; Arithmetic context: a wire parameter of unknown type decodes as a
+    ;; String; PG resolves `int + $1` by casting the unknown operand to
+    ;; the numeric type. Mirror that for numeric-looking strings only —
+    ;; anything else keeps its type and fails the arithmetic like PG's
+    ;; 22P02 would.
+    (instance? Addition value-expr)
+    (let [^Addition e value-expr
+          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
+          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
+      (when (and (number? l) (number? r)) (+ l r)))
+
     ;; Negative literal operand: `SET x = x + -123` parses the RHS as a
     ;; SignedExpression; without this branch it fell to `(str value-expr)`
     ;; and the arithmetic threw String→Number (hit by pgbench's tpcb
@@ -3610,13 +3642,6 @@
           inner (eval-update-expr (.getExpression se) entity-map ns-str schema)]
       (when (number? inner)
         (if (= \- (.getSign se)) (- inner) inner)))
-
-    ;; Arithmetic: recurse on both sides
-    (instance? Addition value-expr)
-    (let [^Addition e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and l r) (+ l r)))
 
     ;; Subtraction: numeric subtract or jsonb key deletion (col - 'key' or col - idx)
     (instance? Subtraction value-expr)
@@ -3632,21 +3657,23 @@
                        (jb/jsonb-delete-idx l (long r))
                        (jb/jsonb-delete-key l (str r)))]
           (jb/serialize-jsonb result))
-        ;; Numeric subtraction
-        (and (number? l) (number? r)) (- l r)
+        ;; Numeric subtraction (num-operand: unknown-type wire params
+        ;; arrive as strings — cast in numeric context like PG)
+        (and (number? (num-operand l)) (number? (num-operand r)))
+        (- (num-operand l) (num-operand r))
         :else nil))
 
     (instance? Multiplication value-expr)
     (let [^Multiplication e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and l r) (* l r)))
+          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
+          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
+      (when (and (number? l) (number? r)) (* l r)))
 
     (instance? Division value-expr)
     (let [^Division e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and l r (not (zero? r))) (/ l r)))
+          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
+          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
+      (when (and (number? l) (number? r) (not (zero? r))) (/ l r)))
 
     ;; String/jsonb concatenation: col || '...'::jsonb merges jsonb; string concat otherwise
     (instance? Concat value-expr)
