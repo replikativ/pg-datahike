@@ -5470,21 +5470,30 @@
 
 (defn- columns-from-schema
   "When `COPY t FROM stdin` is invoked WITHOUT an explicit column
-   list, derive the column names from `t`'s schema. Order is the same
-   as `pg_attribute.attnum` would expose — we look at every keyword
-   attribute in the schema whose namespace matches `ns`, in
-   alphabetical order (deterministic; pg_dump uses an explicit
-   column list anyway, so this fallback is mostly used by hand-typed
-   psql `COPY t FROM stdin` invocations)."
-  [schema ns]
-  (->> schema
-       keys
-       (filter keyword?)
-       (filter #(= ns (namespace %)))
-       (remove #(= "db-row-exists" (name %)))
-       (mapv name)
-       sort
-       vec))
+   list, derive the column names in TABLE DECLARATION order — PG
+   assigns incoming fields positionally by attnum. The alphabetical
+   fallback this replaces silently shifted every column of pgbench's
+   list-free COPY (bbalance sorts before bid, so all branches loaded
+   with bid=0 and tellers hit spurious NOT NULL violations).
+   Declaration order comes from pgs/column-info (schema entity-id
+   order when a db is supplied); the sorted set remains as the final
+   fallback when the table can't be derived."
+  ([schema ns] (columns-from-schema schema ns nil))
+  ([schema ns db]
+   (or (when-let [cols (seq (pgs/column-info schema ns db))]
+         (->> cols
+              (map :name)
+              (remove #(or (= "db_id" %) (= "db-row-exists" %)))
+              vec
+              not-empty))
+       (->> schema
+            keys
+            (filter keyword?)
+            (filter #(= ns (namespace %)))
+            (remove #(= "db-row-exists" (name %)))
+            (mapv name)
+            sort
+            vec))))
 
 (defn- exec-copy-from-stdin
   "Initialise a COPY-IN session and return a QueryResult signalling
@@ -5493,10 +5502,12 @@
    the QueryHandler reify's copyChunk/copyComplete/copyAbort
    methods (which read the session out of `:copy-state`)."
   [ctx parsed]
-  (let [{:keys [schema copy-state]} ctx
+  (let [{:keys [schema copy-state conn]} ctx
         {:keys [ns table columns options]} parsed
         ns (or ns table)
-        col-names (or columns (columns-from-schema schema ns))]
+        col-names (or columns
+                      (columns-from-schema schema ns
+                                           (when conn (d/db conn))))]
     (when (empty? col-names)
       (throw (ex-info (str "no columns found for COPY into \"" table "\"")
                       {:error :undefined-table :table table})))
