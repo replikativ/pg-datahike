@@ -42,6 +42,7 @@
             [datahike.api :as d]
             [datahike.datom]
             [datahike.query :as dq]
+            [datahike.pg.cache :as pg-cache]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -3721,16 +3722,24 @@
         :*
         (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
 
-;; Per-schema cache for enriched-schema. The enrichment is a pure
-;; function of the schema (the db is just a query source). Schema is
-;; immutable until DDL transacts. CREATE TABLE adds new attrs which
-;; mints a new schema-map (new identity → new cache key), so no
-;; explicit invalidator is needed — the only writer of
-;; `:pg/array-elem` is `translate-create-table`, in the same tx that
-;; mints the new schema. ALTER TABLE adding new columns does the
-;; same.
+;; Per-schema cache for enriched-schema. NOT a pure function of the
+;; schema map: the :pg/array-elem / :pg/typmod / :pg/type facts live on
+;; ident *entities* in the db, so two databases with structurally equal
+;; schema maps can enrich differently — the cache must key on schema
+;; IDENTITY (same object ⇒ same database generation), not equality.
+;; CREATE TABLE / ALTER ADD COLUMN mint a new schema map (new identity
+;; → natural miss), but a typmod-only ALTER COLUMN TYPE does not, so
+;; the server's DDL path also clears this cache explicitly
+;; (invalidate-enriched-schema-cache!, wired into
+;; server/invalidate-schema-cache!).
 (def ^:private enriched-schema-cache
-  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+  (pg-cache/bounded-cache 64))
+
+(defn invalidate-enriched-schema-cache!
+  "Clear the array-meta/typmod enriched-schema cache. Called from the
+   server's DDL exec path."
+  []
+  (.clear ^java.util.Map enriched-schema-cache))
 
 (defn- compute-array-meta-enriched [schema db]
   (let [pg-meta (try
@@ -3788,12 +3797,13 @@
   [schema db]
   (if (nil? db)
     schema
-    (let [^java.util.Map outer enriched-schema-cache]
-      (or (.get outer schema)
+    (let [^java.util.Map outer enriched-schema-cache
+          k (pg-cache/identity-key schema)]
+      (or (.get outer k)
           (locking outer
-            (or (.get outer schema)
+            (or (.get outer k)
                 (let [enriched (compute-array-meta-enriched schema db)]
-                  (.put outer schema enriched)
+                  (.put outer k enriched)
                   enriched)))))))
 
 (defn translate-insert

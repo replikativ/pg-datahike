@@ -283,6 +283,19 @@
    isolated map; nil disables caching entirely."
   global-parse-cache)
 
+(defn invalidate-parse-cache!
+  "Clear the server-wide parse-sql result cache. Called from every DDL
+   exec branch (via server/invalidate-schema-cache!). The cache key is
+   `[sql (hash schema)]`, but translation also depends on the `:pg/*`
+   metadata stored on ident *entities* (NOT NULL, CHECK, FK, defaults,
+   typmod) which does not appear in `(dbi/-schema db)` — so an
+   `ALTER TABLE … ADD CHECK / SET NOT NULL / ALTER COLUMN TYPE` leaves
+   the hash unchanged and would keep serving parse results translated
+   against the old constraints. The AST cache is untouched: JSqlParser
+   output depends only on the SQL text."
+  []
+  (.clear ^java.util.Map global-parse-cache))
+
 ;; ----------------------------------------------------------------------------
 ;; JSqlParser AST cache
 ;;

@@ -21,6 +21,7 @@
             [datahike.db.interface :as dbi]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.cache :as pg-cache]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -1093,7 +1094,12 @@
 ;; ----------------------------------------------------------------------------
 
 (def ^:private schema-deriv-cache
-  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+  ;; Identity-keyed LRU (see datahike.pg.cache): WeakHashMap compared
+  ;; schema maps with .equals, so two DATABASES with structurally equal
+  ;; schemas shared FK/CHECK/NOT-NULL/identity metadata — and
+  ;; compute-identity-cols reads per-database :__seq__/:__inherit__
+  ;; datoms, so that sharing returned another database's answers.
+  (pg-cache/bounded-cache 64))
 
 (def ^:dynamic *schema-cache-enabled?*
   "Bind false to bypass the cache. For perf comparisons only;
@@ -1114,7 +1120,9 @@
    changes — see sql/invalidate-catalog-cache!."
   []
   (.clear ^java.util.Map schema-deriv-cache)
-  (sql/invalidate-catalog-cache!))
+  (sql/invalidate-catalog-cache!)
+  (sql/invalidate-parse-cache!)
+  (stmt/invalidate-enriched-schema-cache!))
 
 (defn- schema-cached
   "`(schema-cached db cache-key produce)` — memoise `(produce)`
@@ -1122,14 +1130,14 @@
   [db cache-key produce]
   (if-not *schema-cache-enabled?*
     (produce)
-    (let [schema (dbi/-schema db)
+    (let [schema-k (pg-cache/identity-key (dbi/-schema db))
           ^java.util.Map outer schema-deriv-cache
           ^java.util.concurrent.ConcurrentHashMap inner
-          (or (.get outer schema)
+          (or (.get outer schema-k)
               (locking outer
-                (or (.get outer schema)
+                (or (.get outer schema-k)
                     (let [m (java.util.concurrent.ConcurrentHashMap.)]
-                      (.put outer schema m)
+                      (.put outer schema-k m)
                       m))))
           existing (.get inner cache-key)]
       (if (some? existing)
