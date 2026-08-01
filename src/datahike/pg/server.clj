@@ -953,6 +953,23 @@
       ::gap
       (reduce into #{} (map :eas entries)))))
 
+(def ^:private fold-scalar-ins-var
+  ;; datahike.query/*fold-scalar-ins* when the running datahike has it;
+  ;; nil on older datahike (the fast path simply doesn't apply).
+  (resolve 'datahike.query/*fold-scalar-ins*))
+
+(defn- run-param-query
+  "Run `thunk` (a d/q call with :in args) with datahike's scalar-:in
+   const-folding disabled when available: parameterized statements
+   repeat one query SHAPE with varying scalar values, and folding them
+   into the clauses made the plan cache miss (full replan) per value —
+   2x on novel-value point lookups. Function-valued in-args still fold
+   (datahike guards that internally)."
+  [thunk]
+  (if fold-scalar-ins-var
+    (with-bindings* {fold-scalar-ins-var false} thunk)
+    (thunk)))
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -2092,13 +2109,10 @@
                             {:db query-db :parse-sql sql/parse-sql})
         _ (when where-expr
             ;; Top-level DELETE WHERE = conjunctive context: enables the
-            ;; value-bound data-pattern fast path (indexed row matching).
-            ;; *bound-params* inlines extended-protocol parameters so
-            ;; prepared `WHERE pk = $1` seeks too.
-            (binding [expr/*conjunctive-where* true
-                      params/*bound-params* (or params/*bound-params*
-                                                (when-let [cb *cached-bound*]
-                                                  (vec (rest cb))))]
+            ;; data-pattern fast paths. Params stay as ?pN vars (values
+            ;; via :in) so the row-matching plan is one-per-shape — see
+            ;; build-update-tx-for-bindings.
+            (binding [expr/*conjunctive-where* true]
               (let [preds (#'sql/translate-predicate ctx where-expr)]
                 (swap! (:where-clauses ctx) into preds))))
         evar (#'sql/entity-var! ctx default-key)
@@ -2107,8 +2121,21 @@
               (when-let [first-col (second cols)]
                 (#'sql/col-var! ctx (:attr first-col)))))
         _ (ensure-evar-anchor! ctx evar table)
-        q {:find [evar] :where (vec @(:where-clauses ctx))}
-        eids (mapv first (d/q q query-db))]
+        ;; ?pN param plumbing (mirrors build-update-tx-for-bindings):
+        ;; the WHERE keeps params as vars, so supply the bound values as
+        ;; :in args and run with the plan-stable fold disabled.
+        in-params @(:in-params ctx)
+        in-args-raw @(:in-args ctx)
+        in-args (if-let [bound *cached-bound*]
+                  (sql/substitute-params in-args-raw
+                                         (fn [idx] (nth bound idx)))
+                  in-args-raw)
+        q (cond-> {:find [evar] :where (vec @(:where-clauses ctx))}
+            (seq in-params) (assoc :in (into ['$] in-params)))
+        eids (mapv first
+                   (if (seq in-args)
+                     (run-param-query #(apply d/q q query-db in-args))
+                     (d/q q query-db)))]
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
@@ -2161,13 +2188,13 @@
             ;; ([?e :attr v] instead of a get-else scan) — and self-anchoring:
             ;; the datahike planner rejects a WHERE of only get-else clauses
             ;; with an unbound entity var.
-            ;; With *bound-params* available (extended-protocol Execute),
-            ;; JdbcParameters inline to literals, so `WHERE pk = $1` takes
-            ;; the value-bound data-pattern fast path (indexed) too.
+            ;; Params stay as ?pN vars (values via :in): inlining the
+            ;; bound literal made the row-matching clauses NOVEL per
+            ;; value, so datalog's parse/plan caches missed and the full
+            ;; planner re-ran per Execute (~18% of tpcb CPU). With ?pN
+            ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
+            ;; plan per statement shape, values supplied at d/q time.
             (binding [params/*from-bindings* from-bindings
-                      params/*bound-params* (or params/*bound-params*
-                                                (when-let [cb *cached-bound*]
-                                                  (vec (rest cb))))
                       expr/*conjunctive-where* true]
               (let [preds (#'sql/translate-predicate ctx where-expr)]
                 (swap! (:where-clauses ctx) into preds))))
@@ -2195,7 +2222,7 @@
             (seq in-params) (assoc :in (into ['$] in-params)))
         eids (mapv first
                    (if (seq in-args)
-                     (apply d/q q query-db in-args)
+                     (run-param-query #(apply d/q q query-db in-args))
                      (d/q q query-db)))
         ;; For prepared UPDATE, resolve ParamRef values BEFORE
         ;; coerce-insert-value — otherwise the coercion fires on a
@@ -4364,23 +4391,6 @@
           (if-let [e (.poll pq)]
             (recur (cons (second e) acc))
             (vec acc)))))))
-
-(def ^:private fold-scalar-ins-var
-  ;; datahike.query/*fold-scalar-ins* when the running datahike has it;
-  ;; nil on older datahike (the fast path simply doesn't apply).
-  (resolve 'datahike.query/*fold-scalar-ins*))
-
-(defn- run-param-query
-  "Run `thunk` (a d/q call with :in args) with datahike's scalar-:in
-   const-folding disabled when available: parameterized statements
-   repeat one query SHAPE with varying scalar values, and folding them
-   into the clauses made the plan cache miss (full replan) per value —
-   2x on novel-value point lookups. Function-valued in-args still fold
-   (datahike guards that internally)."
-  [thunk]
-  (if fold-scalar-ins-var
-    (with-bindings* {fold-scalar-ins-var false} thunk)
-    (thunk)))
 
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
