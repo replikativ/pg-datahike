@@ -42,6 +42,7 @@
             [datahike.api :as d]
             [datahike.datom]
             [datahike.query :as dq]
+            [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.coerce :as coerce]
@@ -3131,6 +3132,13 @@
          {:fn :now}
 
          :else (str e)))
+    ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
+    ;; parse as TimeKeyExpression, not Function — same marker as the
+    ;; function forms above; without this branch the keyword fell
+    ;; through to `(str e)` and the literal string reached the
+    ;; transactor (issue #14).
+     (instance? TimeKeyExpression e)
+     {:fn :now}
      (instance? TimezoneExpression e)
     ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
     ;; bare-function case above.
@@ -3632,6 +3640,12 @@
     (instance? net.sf.jsqlparser.expression.TimezoneExpression value-expr)
     (eval-update-expr (.getLeftExpression ^net.sf.jsqlparser.expression.TimezoneExpression value-expr)
                       entity-map ns-str schema)
+
+    ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
+    ;; — TimeKeyExpression, same value as the function forms below
+    ;; (issue #14's UPDATE-path twin).
+    (instance? TimeKeyExpression value-expr)
+    (java.util.Date.)
 
     ;; Function call.
     (instance? net.sf.jsqlparser.expression.Function value-expr)

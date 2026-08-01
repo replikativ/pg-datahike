@@ -749,5 +749,10 @@
     (float? v)            oid-float8
     (boolean? v)          oid-bool
     (inst? v)             oid-timestamp
+    ;; ::date / ::time cast results are java.time locals (issue #13);
+    ;; without these they reported as text.
+    (instance? java.time.LocalDate v)     oid-date
+    (instance? java.time.LocalTime v)     oid-time
+    (instance? java.time.LocalDateTime v) oid-timestamp
     (uuid? v)             oid-uuid
     :else                 oid-text))

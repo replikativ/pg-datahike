@@ -1629,16 +1629,31 @@
             (let [fn-param (symbol (str "?cast-date" (swap! (:var-counter ctx) inc)))
                   date-fn (fn [v]
                             (when v
-                              (let [s (str/trim (str v))]
-                                (or (try (java.time.LocalDate/parse
-                                          s
-                                          (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                                         (catch Exception _ nil))
-                                    (when-let [d (parse-timestamp-string s)]
-                                      (when (instance? java.util.Date d)
-                                        (-> ^java.util.Date d .toInstant
-                                            (.atZone java.time.ZoneOffset/UTC)
-                                            .toLocalDate)))))))]
+                              ;; Temporal instances (now()/current_timestamp
+                              ;; bindings, stored instants) must not round-trip
+                              ;; through `str` — `(str Date)` is RFC-822ish and
+                              ;; unparseable, which dropped the row (issue #13).
+                              (cond
+                                (instance? java.util.Date v)
+                                (-> ^java.util.Date v .toInstant
+                                    (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
+                                (instance? java.time.Instant v)
+                                (-> ^java.time.Instant v
+                                    (.atZone java.time.ZoneOffset/UTC) .toLocalDate)
+                                (instance? java.time.LocalDate v) v
+                                (instance? java.time.LocalDateTime v)
+                                (.toLocalDate ^java.time.LocalDateTime v)
+                                :else
+                                (let [s (str/trim (str v))]
+                                  (or (try (java.time.LocalDate/parse
+                                            s
+                                            (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
+                                           (catch Exception _ nil))
+                                      (when-let [d (parse-timestamp-string s)]
+                                        (when (instance? java.util.Date d)
+                                          (-> ^java.util.Date d .toInstant
+                                              (.atZone java.time.ZoneOffset/UTC)
+                                              .toLocalDate))))))))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj date-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -1647,10 +1662,21 @@
             (let [fn-param (symbol (str "?cast-time" (swap! (:var-counter ctx) inc)))
                   time-fn (fn [v]
                             (when v
-                              (let [s (str/trim (str v))
-                                    time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                                (try (java.time.LocalTime/parse time-only)
-                                     (catch Exception _ s)))))]
+                              (cond
+                                (instance? java.util.Date v)
+                                (-> ^java.util.Date v .toInstant
+                                    (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
+                                (instance? java.time.Instant v)
+                                (-> ^java.time.Instant v
+                                    (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
+                                (instance? java.time.LocalTime v) v
+                                (instance? java.time.LocalDateTime v)
+                                (.toLocalTime ^java.time.LocalDateTime v)
+                                :else
+                                (let [s (str/trim (str v))
+                                      time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
+                                  (try (java.time.LocalTime/parse time-only)
+                                       (catch Exception _ s))))))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj time-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -1658,7 +1684,16 @@
             is-ts?
           ;; Timestamp cast: use an in-param function for runtime parsing
             (let [ts-fn-param (symbol (str "?cast-ts" (swap! (:var-counter ctx) inc)))
-                  ts-fn (fn [v] (when v (parse-timestamp-string (str v))))]
+                  ts-fn (fn [v]
+                          (when v
+                            (cond
+                              (instance? java.util.Date v) v
+                              (instance? java.time.LocalDateTime v) v
+                              (instance? java.time.Instant v)
+                              (java.util.Date/from ^java.time.Instant v)
+                              (instance? java.time.LocalDate v)
+                              (.atStartOfDay ^java.time.LocalDate v)
+                              :else (parse-timestamp-string (str v)))))]
               (swap! (:in-params ctx) conj ts-fn-param)
               (swap! (:in-args ctx) conj ts-fn)
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
@@ -2234,10 +2269,11 @@
                    (or (= key-str "current_timestamp")
                        (= key-str "now()"))
                    (fn [] (java.util.Date.))
+                   ;; LocalDate (not a midnight java.util.Date) so the
+                   ;; result renders as "yyyy-MM-dd" with OID 1082, like
+                   ;; PG's date type.
                    (= key-str "current_date")
-                   (fn [] (java.util.Date/from
-                           (.toInstant (.atStartOfDay (java.time.LocalDate/now)
-                                                      java.time.ZoneOffset/UTC))))
+                   (fn [] (java.time.LocalDate/now java.time.ZoneOffset/UTC))
                    (= key-str "current_time")
                    (fn [] (java.util.Date.))
                    :else (fn [] (java.util.Date.)))

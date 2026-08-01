@@ -141,6 +141,11 @@
   (is (= :version          (kind "SELECT version()")))
   (is (= :now              (kind "SELECT now()")))
   (is (= :now              (kind "SELECT (now() AT TIME ZONE 'UTC')")))
+  ;; A trailing cast changes result type + column name, so the
+  ;; single-value hijack must NOT fire — the translator handles it
+  ;; (issue #13: `SELECT now()::date` rendered as timestamp).
+  (is (= :generic-sql      (kind "SELECT now()::date")))
+  (is (= :generic-sql      (kind "SELECT version()::text")))
   (is (= :current-schema   (kind "SELECT current_schema()")))
   (is (= :current-database (kind "SELECT current_database()")))
   (is (= :pg-backend-pid   (kind "SELECT pg_backend_pid()")))
