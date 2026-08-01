@@ -652,6 +652,23 @@
                    :message (.getMessage e)
                    :sqlstate "42601"}))
 
+              ;; TRUNCATE — fully token-classified (base carries
+              ;; :tables / :restart-identity? / :cascade? from
+              ;; cls-info). CASCADE would have to chase FK references
+              ;; into unlisted tables — reject like other unsupported
+              ;; features until that exists.
+              :truncate
+              (if (:cascade? cls-info)
+                {:type :error
+                 :message "TRUNCATE ... CASCADE is not supported by datahike pgwire"
+                 :sqlstate "0A000"}
+                (assoc base :type :truncate))
+
+              ;; DROP TABLE a, b, … — same executor as single-name
+              ;; :ddl-drop (exec-ddl-drop loops :tables when present).
+              :drop-table-multi
+              (assoc base :type :ddl-drop)
+
               :create-domain
               (try
                 (let [toks (database/tokenize sql)

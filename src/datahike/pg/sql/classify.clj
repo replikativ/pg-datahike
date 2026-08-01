@@ -676,9 +676,82 @@
 
       :else                 {:kind :generic-sql})))
 
+(defn- read-relation-name
+  "Consume one `[ONLY] [schema.]name [*]` from the token stream.
+   Returns [last-name-segment remaining-toks], or nil when the head is
+   not a relation name. The schema qualifier is dropped (single-
+   namespace store — mirrors the JSqlParser Drop branch's
+   `(-> .getName .getName)` in parse-sql)."
+  [toks]
+  (let [toks (if (kw=? (first toks) "only") (rest toks) toks)]
+    (when (ident-tok? (first toks))
+      (loop [nm (ident-text (first toks))
+             ts (rest toks)]
+        (if (and (= "." (:text (first ts))) (ident-tok? (second ts)))
+          (recur (ident-text (second ts)) (drop 2 ts))
+          [nm (if (= "*" (:text (first ts))) (rest ts) ts)])))))
+
+(defn- read-relation-list
+  "Comma-separated relation names (each per read-relation-name).
+   Returns [names remaining-toks], or nil on a malformed head — the
+   caller falls back to :generic-sql and JSqlParser reports the real
+   syntax error."
+  [toks]
+  (loop [names [] ts toks]
+    (when-let [[nm ts'] (read-relation-name ts)]
+      (if (= "," (:text (first ts')))
+        (recur (conj names nm) (rest ts'))
+        [(conj names nm) ts']))))
+
+(defn- classify-drop-table
+  "DROP TABLE with MORE THAN ONE name. JSqlParser 5.2's Drop grammar
+   accepts a single name (ParseException at the comma — it expects
+   CASCADE/ON/RESTRICT), so the list form is classified here and
+   executed as one :ddl-drop with a :tables vector; pgbench -i sends
+   `drop table if exists pgbench_accounts, pgbench_branches, …`.
+   Single-name DROP TABLE keeps flowing through JSqlParser unchanged.
+   A trailing CASCADE/RESTRICT is accepted and ignored, matching the
+   JSqlParser branch (which discards Drop parameters)."
+  [toks]
+  (let [if-exists? (boolean (and (kw=? (first toks) "if")
+                                 (kw=? (second toks) "exists")))
+        ts (if if-exists? (drop 2 toks) toks)]
+    (or (when-let [[names ts'] (read-relation-list ts)]
+          (let [ts' (if (kw-in? (first ts') #{"cascade" "restrict"})
+                      (rest ts') ts')
+                ts' (drop-while #(= ";" (:text %)) ts')]
+            (when (and (empty? ts') (> (count names) 1))
+              {:kind :drop-table-multi :tables names :if-exists? if-exists?})))
+        {:kind :generic-sql})))
+
+(defn- classify-truncate
+  "TRUNCATE [TABLE] [ONLY] name [*] [, …] [RESTART|CONTINUE IDENTITY]
+   [CASCADE|RESTRICT]. Token-classified in full: JSqlParser's Truncate
+   grammar lacks RESTART/CONTINUE IDENTITY and parse-sql has no branch
+   for its AST. ONLY/`*` are accepted and ignored (no inheritance
+   children to include/exclude); CASCADE is carried so parse-sql can
+   reject it with 0A000."
+  [toks]
+  (let [ts (if (kw=? (first toks) "table") (rest toks) toks)]
+    (or (when-let [[names ts1] (read-relation-list ts)]
+          (let [identity? (and (or (kw=? (first ts1) "restart")
+                                   (kw=? (first ts1) "continue"))
+                               (kw=? (second ts1) "identity"))
+                restart? (boolean (and identity? (kw=? (first ts1) "restart")))
+                ts2 (if identity? (drop 2 ts1) ts1)
+                cascade? (kw=? (first ts2) "cascade")
+                ts3 (if (or cascade? (kw=? (first ts2) "restrict"))
+                      (rest ts2) ts2)
+                ts4 (drop-while #(= ";" (:text %)) ts3)]
+            (when (empty? ts4)
+              {:kind :truncate :tables names
+               :restart-identity? restart? :cascade? (boolean cascade?)})))
+        {:kind :generic-sql})))
+
 (defn- classify-drop [toks]
   (let [t1 (first toks)]
     (cond
+      (kw=? t1 "table")     (classify-drop-table (rest toks))
       (kw=? t1 "policy")    {:kind :drop-policy :reject-kind :policy :tag "DROP POLICY"}
       (kw=? t1 "extension") {:kind :drop-extension :reject-kind :create-extension
                              :tag "DROP EXTENSION"}
@@ -1083,7 +1156,11 @@
 
           ;; --- DDL routed by second keyword
           "create"  (classify-create rest-toks)
-          "drop"    (classify-drop rest-toks)
+          ;; classify-drop walks a comma-separated name list of
+          ;; unbounded length (DROP TABLE a, b, …) — feed it the full
+          ;; lazy token stream, not the 64-token prefix, so a long list
+          ;; can't be silently cut short at the realization boundary.
+          "drop"    (classify-drop (rest skipped))
           "alter"   (classify-alter rest-toks)
 
           ;; --- COPY — recognised so parse-sql can dispatch to the
@@ -1166,7 +1243,9 @@
           "update"  {:kind :generic-sql}
           "delete"  {:kind :generic-sql}
           "merge"   {:kind :generic-sql}
-          "truncate" {:kind :generic-sql}
+          ;; Full stream for the same reason as "drop" — the table list
+          ;; is unbounded.
+          "truncate" (classify-truncate (rest skipped))
 
           ;; --- EXPLAIN, CALL (function)
           "explain" {:kind :generic-sql}

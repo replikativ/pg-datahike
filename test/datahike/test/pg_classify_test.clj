@@ -258,7 +258,11 @@
   (is (= :generic-sql (kind "ALTER TABLE t ADD COLUMN y INT")))
   (is (= :generic-sql (kind "MERGE INTO t USING s ON …")))
   (is (= :generic-sql (kind "EXPLAIN SELECT 1")))
-  (is (= :generic-sql (kind "TRUNCATE TABLE t"))))
+  ;; TRUNCATE no longer passes through — JSqlParser's Truncate AST had
+  ;; no parse-sql branch (and its grammar lacks RESTART/CONTINUE
+  ;; IDENTITY), so the whole statement is token-classified now; see
+  ;; datahike.test.pg-truncate-drop-test.
+  (is (= :truncate (kind "TRUNCATE TABLE t"))))
 
 (deftest classify-empty-and-whitespace
   (is (= :empty (kind "")))
