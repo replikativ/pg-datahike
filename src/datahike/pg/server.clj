@@ -1960,13 +1960,18 @@
    the row-marker anchor when no clause binds it."
   [ctx evar table]
   (let [clauses @(:where-clauses ctx)
+        marker (pgs/row-marker-attr table)
         binds-evar? (some (fn [c]
                             (and (vector? c) (>= (count c) 2)
                                  (= evar (first c)) (keyword? (second c))))
                           clauses)]
-    (when-not binds-evar?
+    ;; Only tables created through SQL DDL carry the row marker; tables
+    ;; seeded directly via datahike (test fixtures) don't, and anchoring
+    ;; on a nonexistent attribute would match zero rows.
+    (when (and (not binds-evar?)
+               (contains? (:schema ctx) marker))
       (reset! (:where-clauses ctx)
-              (vec (cons [evar (pgs/row-marker-attr table) true] clauses))))))
+              (vec (cons [evar marker true] clauses))))))
 
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
