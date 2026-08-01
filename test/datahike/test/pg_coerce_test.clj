@@ -78,3 +78,17 @@
   (is (nil? (c/coerce-numeric nil :long)))
   (is (nil? (c/coerce-numeric nil :double)))
   (is (nil? (c/coerce-numeric nil :bigdec))))
+
+(deftest parse-bool-token-pg-fidelity
+  (testing "PG parse_bool_with_len acceptance table (issue #12)"
+    ;; prefixes of true/yes and false/no; on/off with off's 'of' prefix;
+    ;; exact 1/0; case-insensitive; whitespace-trimmed.
+    (doseq [s ["t" "tr" "tru" "true" "TRUE" "y" "ye" "yes" "on" "1" " t " "\tYeS "]]
+      (is (true? (c/parse-bool-token s)) s))
+    (doseq [s ["f" "fa" "fal" "fals" "false" "FALSE" "n" "no" "of" "off" "0" " off "]]
+      (is (false? (c/parse-bool-token s)) s)))
+  (testing "rejected inputs return nil"
+    ;; 'o' is ambiguous between on/off; multi-digit numbers, garbage and
+    ;; blank are invalid — PG raises 22P02 for all of these.
+    (doseq [s ["o" "2" "10" "01" "maybe" "" "  " "truex" "offf" "yesno"]]
+      (is (nil? (c/parse-bool-token s)) s))))

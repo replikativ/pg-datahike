@@ -20,6 +20,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.copy :as copy]
             [datahike.pg.sql.database :as database]
             [datahike.pg.sql.types :as user-types]
@@ -1131,7 +1132,13 @@
                                                                               (double raw)
                                                                               (Double/parseDouble (str/trim (str raw))))
                                                                    :text (str raw)
-                                                                   :boolean (Boolean/parseBoolean (str raw))
+                                                                   :boolean (if (instance? Boolean raw)
+                                                                              raw
+                                                                              (let [b (coerce/parse-bool-token (str raw))]
+                                                                                (when (nil? b)
+                                                                                  (throw (errors/pg-error :invalid-text-representation
+                                                                                                          {:type "boolean" :value (str raw)})))
+                                                                                b))
                                                                    :date (let [s (str/trim (str raw))]
                                                                            (or (try (java.time.LocalDate/parse
                                                                                      s (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))

@@ -45,6 +45,7 @@
             [datahike.pg.sql.oid-infer :as oid-infer]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -1577,7 +1578,13 @@
           is-numeric? (try (java.math.BigDecimal. (str/trim (str inner-raw)))
                            (catch Exception _ inner-raw))
           is-text? (str inner-raw)
-          is-bool? (Boolean/parseBoolean (str inner-raw))
+          is-bool? (if (instance? Boolean inner-raw)
+                     inner-raw
+                     (let [b (coerce/parse-bool-token (str inner-raw))]
+                       (when (nil? b)
+                         (throw (errors/pg-error :invalid-text-representation
+                                                 {:type "boolean" :value (str inner-raw)})))
+                       b))
         ;; ::date — extract the LocalDate so serialization can omit the
         ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
           is-date? (try

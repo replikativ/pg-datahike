@@ -57,7 +57,7 @@
            [net.sf.jsqlparser.expression
             Alias Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis SignedExpression CastExpression
-            JsonExpression TimezoneExpression ArrayConstructor JdbcParameter]
+            JsonExpression TimezoneExpression TimeKeyExpression ArrayConstructor JdbcParameter]
            [net.sf.jsqlparser.expression.operators.relational
             GreaterThan GreaterThanEquals MinorThan MinorThanEquals
             EqualsTo NotEqualsTo IsNullExpression
@@ -2997,7 +2997,13 @@
         (= cast-cat :integer)   (coerce/coerce-numeric inner :long)
         (= cast-cat :float)     (coerce/coerce-numeric inner :double)
         (= cast-cat :text)      (if (string? inner) inner (str inner))
-        (= cast-cat :boolean)   (if (boolean? inner) inner (Boolean/parseBoolean (str inner)))
+        (= cast-cat :boolean)   (if (boolean? inner)
+                                  inner
+                                  (let [b (coerce/parse-bool-token (str inner))]
+                                    (when (nil? b)
+                                      (throw (errors/pg-error :invalid-text-representation
+                                                              {:type "boolean" :value (str inner)})))
+                                    b))
         (= cast-cat :timestamp) (if (instance? java.util.Date inner)
                                   inner
                                   (expr/parse-timestamp-string (str inner)))
@@ -3279,8 +3285,14 @@
         (coerce/coerce-numeric val :double)
         (and (= vtype :db.type/float) (or (string? val) (integer? val)))
         (coerce/coerce-numeric val :float)
+        ;; PG boolin: 't'/'yes'/'on'/'1' etc. — Boolean/parseBoolean
+        ;; would silently turn '1' into false (issue #12).
         (and (= vtype :db.type/boolean) (string? val))
-        (Boolean/parseBoolean val)
+        (let [b (coerce/parse-bool-token val)]
+          (when (nil? b)
+            (throw (errors/pg-error :invalid-text-representation
+                                    {:type "boolean" :value val})))
+          b)
         ;; :db.type/keyword: SQL has no keyword literal, so clients
         ;; send the bare name as a string. Coerce 'draft' → :draft and
         ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
