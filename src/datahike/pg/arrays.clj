@@ -44,7 +44,8 @@
    - NULL elements emit unquoted `NULL` token
    - Booleans as `t`/`f` (PG text format for BOOL)
    - Non-default lbounds emit a `[lo1:hi1][lo2:hi2]…=` prefix"
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [datahike.pg.sql.coerce :as coerce]))
 
 (defrecord PgArray [elem-type elements dims lbounds])
 
@@ -460,10 +461,13 @@
       :int8     (Long/parseLong raw)
       :float4   (Double/parseDouble raw)
       :float8   (Double/parseDouble raw)
-      :bool     (case (str/lower-case raw)
-                  ("t" "true" "1" "yes" "y" "on")  true
-                  ("f" "false" "0" "no" "n" "off") false
-                  (Boolean/parseBoolean raw))
+      :bool     (let [b (coerce/parse-bool-token raw)]
+                  (when (nil? b)
+                    (throw (ex-info (str "invalid input syntax for type boolean: "
+                                         (pr-str raw))
+                                    {:error :invalid-text-representation
+                                     :type "boolean" :value raw})))
+                  b)
       raw)))
 
 (defn- parse-lbound-prefix

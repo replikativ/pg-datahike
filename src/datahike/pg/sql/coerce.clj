@@ -192,14 +192,23 @@
 ;; valueType we recognise.
 
 (defn parse-bool-token
-  "Mirror PG's `boolin`: accept t/true/y/yes/on/1 and f/false/n/no/off/0
+  "Mirror PG's `parse_bool_with_len` (bool.c): any prefix of true/yes
+   and false/no ('t', 'tru', 'ye', …), 'on'/'off' needing ≥2 chars so
+   a bare 'o' stays ambiguous ('on', 'of', 'off'), and exact '1'/'0'
    (case-insensitive, leading/trailing whitespace ignored). Returns
    nil for unrecognised input."
   [^String s]
-  (case (clojure.string/lower-case (.trim s))
-    ("t" "true" "y" "yes" "on" "1") true
-    ("f" "false" "n" "no" "off" "0") false
-    nil))
+  (let [v (clojure.string/lower-case (.trim s))
+        n (.length v)
+        prefix? (fn [^String word] (and (pos? n) (<= n (.length word))
+                                        (.startsWith word v)))]
+    (cond
+      (or (prefix? "true") (prefix? "yes")) true
+      (or (prefix? "false") (prefix? "no")) false
+      (and (>= n 2) (prefix? "off")) false
+      (= v "on") true
+      (= v "1") true
+      (= v "0") false)))
 
 (defn- safe [f]
   (fn [s] (try (f s) (catch Throwable _ nil))))

@@ -363,6 +363,9 @@
     (cond
       (re-find #"(?i)Bad entity value .* does not match schema" msg) "22P02"
       (re-find #"(?i)cannot be cast to class" msg) "22P02"
+      ;; Raw ArithmeticException from division paths not routed through
+      ;; fns/sql-div (quot, aggregates, BigDecimal ops) → 22012.
+      (re-find #"(?i)divide by zero|division by zero" msg) "22012"
       (re-find #"(?i)unique constraint|unique value.*already" msg) "23505"
       (re-find #"(?i)not-null|NOT NULL constraint" msg) "23502"
       (re-find #"(?i)foreign key|ref.*not.*exist" msg) "23503"

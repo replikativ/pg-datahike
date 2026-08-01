@@ -79,6 +79,8 @@
 
 (defn- err [^PgWireServer$QueryResult r] (.error r))
 
+(defn- sqlstate [^PgWireServer$QueryResult r] (.sqlstate r))
+
 ;; ============================================================================
 ;; SQL-level PREPARE / EXECUTE / DEALLOCATE
 ;; ============================================================================
@@ -868,9 +870,24 @@
       (is (some? r))))
 
   (testing "Division by zero"
-    ;; Division by zero in SQL should not crash the server
+    ;; PG raises SQLSTATE 22012 with message exactly "division by zero"
+    ;; for integer, float, and numeric division alike (int4div /
+    ;; float8div / numeric_div in postgres src/backend/utils/adt).
     (let [r (.execute *handler* "SELECT 1 / 0")]
-      (is (some? r)))))
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))
+
+    (let [r (.execute *handler* "SELECT 1.0 / 0")]
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))
+
+    (let [r (.execute *handler* "SELECT 1 % 0")]
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))
+
+    (let [r (.execute *handler* "SELECT age / 0 FROM person WHERE name = 'Alice'")]
+      (is (= "22012" (sqlstate r)))
+      (is (= "division by zero" (err r))))))
 
 ;; ============================================================================
 ;; Arithmetic expressions
@@ -1693,3 +1710,45 @@
                       "SELECT name FROM person WHERE has_schema_privilege('x', 'public', 'usage') AND age > 30")]
       (is (nil? (err r)))
       (is (= 1 (count (rows r)))))))
+
+;; ============================================================================
+;; Issues #12 / #13 / #14 — boolean input fidelity + current_timestamp
+;; ============================================================================
+
+(deftest test-boolean-cast-pg-fidelity
+  (testing "string→boolean casts accept the full PG boolin table (issue #12)"
+    (is (= [["t" "t" "t" "t"]]
+           (rows (.execute *handler*
+                           "SELECT '1'::boolean, 'yes'::boolean, ' t '::boolean, 'on'::boolean"))))
+    (is (= [["f" "f" "f" "f"]]
+           (rows (.execute *handler*
+                           "SELECT '0'::boolean, 'no'::boolean, 'of'::boolean, 'F'::boolean")))))
+  (testing "invalid boolean input raises 22P02 like PG, not silent false"
+    (let [r (.execute *handler* "SELECT 'maybe'::boolean")]
+      (is (some? (err r)))
+      (is (= "22P02" (sqlstate r))))))
+
+(deftest test-current-timestamp-cast-and-render
+  (testing "current_timestamp::date returns one row rendered as a date (issue #13)"
+    (let [r (.execute *handler* "SELECT current_timestamp::date")]
+      (is (nil? (err r)))
+      (is (= 1 (count (rows r))))
+      (is (re-matches #"\d{4}-\d{2}-\d{2}" (ffirst (rows r))))))
+  (testing "now()::date is not hijacked by the :now fast path"
+    (let [r (.execute *handler* "SELECT now()::date")]
+      (is (nil? (err r)))
+      (is (re-matches #"\d{4}-\d{2}-\d{2}" (ffirst (rows r))))))
+  (testing "current_date renders as a bare date"
+    (let [r (.execute *handler* "SELECT current_date")]
+      (is (nil? (err r)))
+      (is (re-matches #"\d{4}-\d{2}-\d{2}" (ffirst (rows r)))))))
+
+(deftest test-insert-update-current-timestamp-keyword
+  (testing "bare current_timestamp (TimeKeyExpression) in VALUES / SET (issue #14)"
+    (is (nil? (err (.execute *handler* "CREATE TABLE tkey(id INTEGER, ts TIMESTAMP)"))))
+    (is (nil? (err (.execute *handler* "INSERT INTO tkey(id, ts) VALUES (1, current_timestamp)"))))
+    (let [r (.execute *handler* "SELECT ts IS NOT NULL FROM tkey WHERE id = 1")]
+      (is (= [["t"]] (rows r))))
+    (is (nil? (err (.execute *handler* "UPDATE tkey SET ts = current_timestamp WHERE id = 1"))))
+    (let [r (.execute *handler* "SELECT ts IS NOT NULL FROM tkey WHERE id = 1")]
+      (is (= [["t"]] (rows r))))))

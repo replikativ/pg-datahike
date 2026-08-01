@@ -42,6 +42,8 @@
             [datahike.api :as d]
             [datahike.datom]
             [datahike.query :as dq]
+            [datahike.pg.cache :as pg-cache]
+            [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.coerce :as coerce]
@@ -57,7 +59,7 @@
            [net.sf.jsqlparser.expression
             Alias Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis SignedExpression CastExpression
-            JsonExpression TimezoneExpression ArrayConstructor JdbcParameter]
+            JsonExpression TimezoneExpression TimeKeyExpression ArrayConstructor JdbcParameter]
            [net.sf.jsqlparser.expression.operators.relational
             GreaterThan GreaterThanEquals MinorThan MinorThanEquals
             EqualsTo NotEqualsTo IsNullExpression
@@ -469,22 +471,29 @@
                                       :right-key-attr right-key-attr
                                       :right-alias right-alias
                                       :left-evar (ctx/entity-var! ctx (:default-table ctx))}))
-                ;; For inner joins: equality predicate + SQL null guards.
+                ;; For inner joins: unify on a shared logic var when both
+                ;; sides are plain columns — indexable data patterns the
+                ;; engine hash-joins in O(n), see ctx/unify-inner-equijoin!.
+                ;; The predicate fallback below cross-products the two
+                ;; relations before filtering (O(n²) time and heap).
+                ;;
+                ;; Fallback: equality predicate + SQL null guards.
                 ;; Datalog (= :__null__ :__null__) is TRUE, but SQL INNER
                 ;; JOIN on NULL=NULL must NOT match (3-valued logic: NULL =
                 ;; NULL is UNKNOWN, filtered out as non-TRUE). Emit explicit
                 ;; not-null guards for each side so rows whose join-column
                 ;; is NULL are excluded. nil and the :__null__ sentinel are
                 ;; both treated as SQL NULL.
-                  (let [l-var (expr/translate-expr ctx left)
-                        r-var (expr/translate-expr ctx right)]
-                    (ctx/add-clause! ctx [(list '= l-var r-var)])
-                    (when (symbol? l-var)
-                      (ctx/add-clause! ctx [(list 'not= l-var :__null__)])
-                      (ctx/add-clause! ctx [(list 'not= l-var nil)]))
-                    (when (symbol? r-var)
-                      (ctx/add-clause! ctx [(list 'not= r-var :__null__)])
-                      (ctx/add-clause! ctx [(list 'not= r-var nil)]))))))
+                  (or (ctx/unify-inner-equijoin! ctx left-resolved right-resolved)
+                      (let [l-var (expr/translate-expr ctx left)
+                            r-var (expr/translate-expr ctx right)]
+                        (ctx/add-clause! ctx [(list '= l-var r-var)])
+                        (when (symbol? l-var)
+                          (ctx/add-clause! ctx [(list 'not= l-var :__null__)])
+                          (ctx/add-clause! ctx [(list 'not= l-var nil)]))
+                        (when (symbol? r-var)
+                          (ctx/add-clause! ctx [(list 'not= r-var :__null__)])
+                          (ctx/add-clause! ctx [(list 'not= r-var nil)])))))))
 
           ;; Fall back to regular predicate translation. For OUTER joins
           ;; (LEFT/RIGHT/FULL), capture the predicate clauses for the
@@ -500,7 +509,10 @@
               (let [preds (expr/translate-predicate ctx expr)]
                 (swap! ref-info update :matched-only-preds (fnil into [])
                        (vec preds)))
-              (let [preds (expr/translate-predicate ctx expr)]
+              ;; INNER-join ON conjunct = top-level conjunct: allow the
+              ;; indexable data-pattern fast paths.
+              (let [preds (binding [expr/*conjunctive-where* true]
+                            (expr/translate-predicate ctx expr))]
                 (swap! (:where-clauses ctx) into preds)))))))
     {:name name :alias right-alias :join-type jtype :ref-info @ref-info}))
 
@@ -1548,9 +1560,14 @@
         ctx (assoc ctx :agg-aliases-warning-set agg-aliases-warning-set)
 
         where-expr (.getWhere select)
+        ;; *conjunctive-where* enables the indexable data-pattern fast
+        ;; paths (value-bound `[?e :attr v]`, shared-var equi-join
+        ;; unification) — sound only for top-level AND-ed conjuncts;
+        ;; expr.clj re-binds it false inside OR / NOT branches.
         _ (when where-expr
-            (let [preds (expr/translate-predicate ctx where-expr)]
-              (swap! (:where-clauses ctx) into preds)))
+            (binding [expr/*conjunctive-where* true]
+              (let [preds (expr/translate-predicate ctx where-expr)]
+                (swap! (:where-clauses ctx) into preds))))
 
         has-distinct? (some? (.getDistinct select))
 
@@ -2555,6 +2572,7 @@
                                         (reaches-find? next (conj seen v))))))
                 ;; Find data patterns that are candidates for get-else conversion
                 optional-patterns (atom [])
+                required-join-patterns @(:required-join-patterns ctx)
                 _ (doseq [clause all-clauses]
                     (when (and (vector? clause)
                                (= 3 (count clause))
@@ -2564,6 +2582,10 @@
                       (let [evar (first clause)
                             vvar (nth clause 2)]
                         (if (or (contains? required-vars vvar)
+                                ;; Equi-join unification patterns ARE the
+                                ;; join — get-else-ing them would make the
+                                ;; :__null__ sentinel joinable.
+                                (contains? required-join-patterns clause)
                                 (not (reaches-find? vvar #{})))
                           ;; Required or doesn't reach :find → stays as anchor
                           (swap! entity-has-anchor conj evar)
@@ -2605,6 +2627,7 @@
                                       v)))
                                 order-by-spec)
                   current-clauses @(:where-clauses ctx)
+                  required-join-patterns @(:required-join-patterns ctx)
                   to-convert (keep (fn [v]
                                      (first
                                       (filter (fn [c]
@@ -2612,6 +2635,7 @@
                                                      (symbol? (first c))
                                                      (keyword? (second c))
                                                      (= v (nth c 2))
+                                                     (not (contains? required-join-patterns c))
                                                      (not= "db-row-exists"
                                                            (clojure.core/name (second c)))
                                                      (not= "id"
@@ -2997,7 +3021,13 @@
         (= cast-cat :integer)   (coerce/coerce-numeric inner :long)
         (= cast-cat :float)     (coerce/coerce-numeric inner :double)
         (= cast-cat :text)      (if (string? inner) inner (str inner))
-        (= cast-cat :boolean)   (if (boolean? inner) inner (Boolean/parseBoolean (str inner)))
+        (= cast-cat :boolean)   (if (boolean? inner)
+                                  inner
+                                  (let [b (coerce/parse-bool-token (str inner))]
+                                    (when (nil? b)
+                                      (throw (errors/pg-error :invalid-text-representation
+                                                              {:type "boolean" :value (str inner)})))
+                                    b))
         (= cast-cat :timestamp) (if (instance? java.util.Date inner)
                                   inner
                                   (expr/parse-timestamp-string (str inner)))
@@ -3125,6 +3155,13 @@
          {:fn :now}
 
          :else (str e)))
+    ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
+    ;; parse as TimeKeyExpression, not Function — same marker as the
+    ;; function forms above; without this branch the keyword fell
+    ;; through to `(str e)` and the literal string reached the
+    ;; transactor (issue #14).
+     (instance? TimeKeyExpression e)
+     {:fn :now}
      (instance? TimezoneExpression e)
     ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
     ;; bare-function case above.
@@ -3289,8 +3326,14 @@
         (coerce/coerce-numeric val :double)
         (and (= vtype :db.type/float) (or (string? val) (integer? val)))
         (coerce/coerce-numeric val :float)
+        ;; PG boolin: 't'/'yes'/'on'/'1' etc. — Boolean/parseBoolean
+        ;; would silently turn '1' into false (issue #12).
         (and (= vtype :db.type/boolean) (string? val))
-        (Boolean/parseBoolean val)
+        (let [b (coerce/parse-bool-token val)]
+          (when (nil? b)
+            (throw (errors/pg-error :invalid-text-representation
+                                    {:type "boolean" :value val})))
+          b)
         ;; :db.type/keyword: SQL has no keyword literal, so clients
         ;; send the bare name as a string. Coerce 'draft' → :draft and
         ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
@@ -3631,6 +3674,12 @@
     (eval-update-expr (.getLeftExpression ^net.sf.jsqlparser.expression.TimezoneExpression value-expr)
                       entity-map ns-str schema)
 
+    ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
+    ;; — TimeKeyExpression, same value as the function forms below
+    ;; (issue #14's UPDATE-path twin).
+    (instance? TimeKeyExpression value-expr)
+    (java.util.Date.)
+
     ;; Function call.
     (instance? net.sf.jsqlparser.expression.Function value-expr)
     (let [^net.sf.jsqlparser.expression.Function f value-expr
@@ -3695,16 +3744,24 @@
         :*
         (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
 
-;; Per-schema cache for enriched-schema. The enrichment is a pure
-;; function of the schema (the db is just a query source). Schema is
-;; immutable until DDL transacts. CREATE TABLE adds new attrs which
-;; mints a new schema-map (new identity → new cache key), so no
-;; explicit invalidator is needed — the only writer of
-;; `:pg/array-elem` is `translate-create-table`, in the same tx that
-;; mints the new schema. ALTER TABLE adding new columns does the
-;; same.
+;; Per-schema cache for enriched-schema. NOT a pure function of the
+;; schema map: the :pg/array-elem / :pg/typmod / :pg/type facts live on
+;; ident *entities* in the db, so two databases with structurally equal
+;; schema maps can enrich differently — the cache must key on schema
+;; IDENTITY (same object ⇒ same database generation), not equality.
+;; CREATE TABLE / ALTER ADD COLUMN mint a new schema map (new identity
+;; → natural miss), but a typmod-only ALTER COLUMN TYPE does not, so
+;; the server's DDL path also clears this cache explicitly
+;; (invalidate-enriched-schema-cache!, wired into
+;; server/invalidate-schema-cache!).
 (def ^:private enriched-schema-cache
-  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+  (pg-cache/bounded-cache 64))
+
+(defn invalidate-enriched-schema-cache!
+  "Clear the array-meta/typmod enriched-schema cache. Called from the
+   server's DDL exec path."
+  []
+  (.clear ^java.util.Map enriched-schema-cache))
 
 (defn- compute-array-meta-enriched [schema db]
   (let [pg-meta (try
@@ -3762,12 +3819,13 @@
   [schema db]
   (if (nil? db)
     schema
-    (let [^java.util.Map outer enriched-schema-cache]
-      (or (.get outer schema)
+    (let [^java.util.Map outer enriched-schema-cache
+          k (pg-cache/identity-key schema)]
+      (or (.get outer k)
           (locking outer
-            (or (.get outer schema)
+            (or (.get outer k)
                 (let [enriched (compute-array-meta-enriched schema db)]
-                  (.put outer schema enriched)
+                  (.put outer k enriched)
                   enriched)))))))
 
 (defn translate-insert

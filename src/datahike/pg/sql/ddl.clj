@@ -470,14 +470,21 @@
                                                                     [?e :datahike.pg.enum/values-ordered ?vs-ord]]
                                                             :in [$ ?n]}
                                                           db type-no-schema)))
-                               domain-match (when (and db (not enum-match))
-                                              (let [e (when (some? type-no-schema)
-                                                        (try
-                                                          (d/entity
-                                                           db [:datahike.pg.domain/name type-no-schema])
-                                                          (catch Throwable _ nil)))]
-                                                (when (and e (:datahike.pg.domain/base-type e))
-                                                  (into {} e))))
+                               ;; Query rather than a lookup-ref d/entity:
+                               ;; :datahike.pg.domain/name isn't :db/unique,
+                               ;; so a lookup ref makes datahike log an
+                               ;; :error line for every non-domain type name
+                               ;; (i.e. every ordinary CREATE TABLE column).
+                               domain-match (when (and db (not enum-match)
+                                                       (some? type-no-schema))
+                                              (when-let [eid (ffirst
+                                                              (q-fn '{:find [?e]
+                                                                      :where [[?e :datahike.pg.domain/name ?n]]
+                                                                      :in [$ ?n]}
+                                                                    db type-no-schema))]
+                                                (let [e (d/entity db eid)]
+                                                  (when (:datahike.pg.domain/base-type e)
+                                                    (into {} e)))))
                                ;; Resolved raw-type: enum → 'text', domain →
                                ;; its base-type + any args. Otherwise pass
                                ;; through.

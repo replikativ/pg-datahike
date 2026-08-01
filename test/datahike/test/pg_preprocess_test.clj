@@ -167,3 +167,18 @@
   (testing "COLLATE in a /* block comment */ must be preserved"
     (let [sql "SELECT 1 /* COLLATE \"C\" was here */ FROM t"]
       (is (= sql (preprocess sql))))))
+
+;; ============================================================================
+;; CREATE SEQUENCE IF NOT EXISTS — strip pre-parse (JSqlParser's
+;; CreateSequence grammar has no IF NOT EXISTS production)
+;; ============================================================================
+
+(deftest create-sequence-if-not-exists-still-rewrites
+  (testing "IF NOT EXISTS stripped so JSqlParser can parse the statement"
+    (is (= "CREATE SEQUENCE   foo START WITH 5"
+           (preprocess "CREATE SEQUENCE IF NOT EXISTS foo START WITH 5")))))
+
+(deftest create-sequence-if-not-exists-in-string-literal
+  (testing "the phrase inside a string literal must be preserved"
+    (let [sql "INSERT INTO t (note) VALUES ('CREATE SEQUENCE IF NOT EXISTS foo')"]
+      (is (= sql (preprocess sql))))))

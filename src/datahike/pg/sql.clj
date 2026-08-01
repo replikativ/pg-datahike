@@ -20,6 +20,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.copy :as copy]
             [datahike.pg.sql.database :as database]
             [datahike.pg.sql.types :as user-types]
@@ -282,6 +283,19 @@
    isolated map; nil disables caching entirely."
   global-parse-cache)
 
+(defn invalidate-parse-cache!
+  "Clear the server-wide parse-sql result cache. Called from every DDL
+   exec branch (via server/invalidate-schema-cache!). The cache key is
+   `[sql (hash schema)]`, but translation also depends on the `:pg/*`
+   metadata stored on ident *entities* (NOT NULL, CHECK, FK, defaults,
+   typmod) which does not appear in `(dbi/-schema db)` — so an
+   `ALTER TABLE … ADD CHECK / SET NOT NULL / ALTER COLUMN TYPE` leaves
+   the hash unchanged and would keep serving parse results translated
+   against the old constraints. The AST cache is untouched: JSqlParser
+   output depends only on the SQL text."
+  []
+  (.clear ^java.util.Map global-parse-cache))
+
 ;; ----------------------------------------------------------------------------
 ;; JSqlParser AST cache
 ;;
@@ -300,6 +314,20 @@
 
 (def ^:private ast-cache-max-entries 4096)
 
+(def ^:private max-cacheable-sql-length
+  "Statements longer than this are parsed but never cached. The parse
+   and AST caches key on the (templated) SQL string and are bounded by
+   ENTRY count, not bytes — a bulk `INSERT … VALUES (…)×5000` templates
+   to a multi-MB string that would sit in the LRU as key + JSqlParser
+   AST + parsed tx-data. 4096 such entries is a multi-GB heap. Bulk
+   statements are exactly the ones that don't repeat verbatim, so
+   skipping them costs ~nothing; the ORM/driver shapes the caches exist
+   for are a few KB at most."
+  65536)
+
+(defn- cacheable-sql-size? [^String sql]
+  (<= (.length sql) (int max-cacheable-sql-length)))
+
 (def ^:private global-ast-cache
   (java.util.Collections/synchronizedMap
    (proxy [java.util.LinkedHashMap] [16 0.75 true]
@@ -316,7 +344,7 @@
    the preprocessed SQL. Falls through to a direct parse when caching
    is disabled."
   [^String preprocessed]
-  (if-let [cache *ast-cache*]
+  (if-let [cache (when (cacheable-sql-size? preprocessed) *ast-cache*)]
     (or (.get ^java.util.Map cache preprocessed)
         (let [ast (CCJSqlParserUtil/parse preprocessed)]
           (.put ^java.util.Map cache preprocessed ast)
@@ -1131,7 +1159,13 @@
                                                                               (double raw)
                                                                               (Double/parseDouble (str/trim (str raw))))
                                                                    :text (str raw)
-                                                                   :boolean (Boolean/parseBoolean (str raw))
+                                                                   :boolean (if (instance? Boolean raw)
+                                                                              raw
+                                                                              (let [b (coerce/parse-bool-token (str raw))]
+                                                                                (when (nil? b)
+                                                                                  (throw (errors/pg-error :invalid-text-representation
+                                                                                                          {:type "boolean" :value (str raw)})))
+                                                                                b))
                                                                    :date (let [s (str/trim (str raw))]
                                                                            (or (try (java.time.LocalDate/parse
                                                                                      s (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
@@ -1359,7 +1393,15 @@
 
           ;; CREATE SEQUENCE
                     (instance? CreateSequence stmt)
-                    (ddl/translate-create-sequence ^CreateSequence stmt)
+                    (cond-> (ddl/translate-create-sequence ^CreateSequence stmt)
+                      ;; IF NOT EXISTS is stripped pre-parse (JSqlParser's
+                      ;; CreateSequence grammar has no such production —
+                      ;; rewrite/create-sequence-if-not-exists-rule), so
+                      ;; re-detect it from the ORIGINAL source and carry
+                      ;; it for the executor's no-op-vs-42P07 decision.
+                      (re-find #"(?i)create\s+(?:temp(?:orary)?\s+|unlogged\s+)?sequence\s+if\s+not\s+exists"
+                               sql)
+                      (assoc :if-not-exists? true))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)
@@ -1475,7 +1517,7 @@
             (when-not (some template/templater-fail? bound)
               (try
                 (let [tem-sql (:templated tem)
-                      cache *parse-cache*
+                      cache (when (cacheable-sql-size? (:templated tem)) *parse-cache*)
                       cache-key (when cache [tem-sql (hash schema)])
                       placeholder-parsed
                       (or (when cache (cache-get cache cache-key))
@@ -1544,7 +1586,9 @@
          ;; that case — otherwise the binding-free version (e.g. the parse done
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
-         cache (when (empty? params/*from-bindings*) *parse-cache*)
+         cache (when (and (empty? params/*from-bindings*)
+                          (cacheable-sql-size? sql))
+                 *parse-cache*)
          schema-key (when cache (hash schema))
          cache-key (when cache [sql schema-key])
          cached (when cache (cache-get cache cache-key))]

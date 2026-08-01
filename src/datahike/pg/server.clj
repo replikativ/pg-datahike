@@ -21,6 +21,7 @@
             [datahike.db.interface :as dbi]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.cache :as pg-cache]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -1093,7 +1094,12 @@
 ;; ----------------------------------------------------------------------------
 
 (def ^:private schema-deriv-cache
-  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+  ;; Identity-keyed LRU (see datahike.pg.cache): WeakHashMap compared
+  ;; schema maps with .equals, so two DATABASES with structurally equal
+  ;; schemas shared FK/CHECK/NOT-NULL/identity metadata — and
+  ;; compute-identity-cols reads per-database :__seq__/:__inherit__
+  ;; datoms, so that sharing returned another database's answers.
+  (pg-cache/bounded-cache 64))
 
 (def ^:dynamic *schema-cache-enabled?*
   "Bind false to bypass the cache. For perf comparisons only;
@@ -1114,7 +1120,9 @@
    changes — see sql/invalidate-catalog-cache!."
   []
   (.clear ^java.util.Map schema-deriv-cache)
-  (sql/invalidate-catalog-cache!))
+  (sql/invalidate-catalog-cache!)
+  (sql/invalidate-parse-cache!)
+  (stmt/invalidate-enriched-schema-cache!))
 
 (defn- schema-cached
   "`(schema-cached db cache-key produce)` — memoise `(produce)`
@@ -1122,14 +1130,14 @@
   [db cache-key produce]
   (if-not *schema-cache-enabled?*
     (produce)
-    (let [schema (dbi/-schema db)
+    (let [schema-k (pg-cache/identity-key (dbi/-schema db))
           ^java.util.Map outer schema-deriv-cache
           ^java.util.concurrent.ConcurrentHashMap inner
-          (or (.get outer schema)
+          (or (.get outer schema-k)
               (locking outer
-                (or (.get outer schema)
+                (or (.get outer schema-k)
                     (let [m (java.util.concurrent.ConcurrentHashMap.)]
-                      (.put outer schema m)
+                      (.put outer schema-k m)
                       m))))
           existing (.get inner cache-key)]
       (if (some? existing)
@@ -1291,17 +1299,29 @@
                          #(read-check-constraints* db table-name))]
     (if (= ::nil v) [] v)))
 
+(def ^:private check-expr-ast-cache
+  "CHECK-expression text → parsed AST. Bounded LRU: enforcement runs
+   once per ROW per constraint, and re-parsing through JSqlParser per
+   row made bulk INSERTs pay a full parse × rows × constraints. The
+   AST is read-only after parse (same argument as sql.clj's AST cache),
+   and keying on the expression text needs no invalidation — a changed
+   constraint is a different string."
+  (pg-cache/bounded-cache 512))
+
 (defn- parse-check-expression
-  "Re-parse a stored CHECK expression string into a JSqlParser
-   Expression AST. We do this at enforcement time (not at CREATE
-   TABLE) so the cached serialized form stays simple strings —
-   cheap to persist, round-trips across restarts, no ABI ties to
-   JSqlParser's Expression class hierarchy."
+  "Parse a stored CHECK expression string into a JSqlParser Expression
+   AST, memoised by text. Parsing at enforcement time (not CREATE
+   TABLE) keeps the persisted form a plain string — cheap to persist,
+   round-trips across restarts, no ABI ties to JSqlParser's Expression
+   class hierarchy."
   [^String expr-text]
-  (try
-    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expr-text)
-    (catch Exception _
-      (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expr-text))))
+  (or (.get ^java.util.Map check-expr-ast-cache expr-text)
+      (let [ast (try
+                  (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expr-text)
+                  (catch Exception _
+                    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expr-text)))]
+        (.put ^java.util.Map check-expr-ast-cache expr-text ast)
+        ast)))
 
 (defn- enforce-check-constraints!
   "Evaluate every CHECK expression registered for `table-name` against
@@ -2410,6 +2430,18 @@
   [db table-name]
   (let [marker (pgs/row-marker-attr table-name)]
     (boolean (get (dbi/-schema db) marker))))
+
+(defn- sequence-exists?
+  "True when a sequence entity with this name is already present in
+   `db`. Guarded on the `:__seq__/name` schema attr so the very first
+   CREATE SEQUENCE (no sequence schema yet) doesn't query an unknown
+   attribute."
+  [db seq-name]
+  (boolean (and (get (dbi/-schema db) :__seq__/name)
+                (ffirst (d/q '{:find [?e]
+                               :where [[?e :__seq__/name ?n]]
+                               :in [$ ?n]}
+                             db seq-name)))))
 
 (defn- execute-ddl-in-tx
   "Execute DDL inside a transaction by applying schema changes to the
@@ -4659,11 +4691,37 @@
 
 (defn- exec-ddl-create-sequence
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx]
-    (if (:in-tx? @tx-state)
-      (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE SEQUENCE")
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [seq-name if-not-exists? tx-data]} parsed
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))]
+    (cond
+      ;; CREATE SEQUENCE on an existing sequence. PG raises 42P07
+      ;; duplicate_table (sequences are relations — commands/sequence.c
+      ;; goes through heap_create_with_catalog like tables do); IF NOT
+      ;; EXISTS downgrades it to a notice + success. Before this check,
+      ;; collisions silently re-transacted the init entity, RESETTING
+      ;; the counter of a live sequence.
+      (and (sequence-exists? current-db seq-name) (not if-not-exists?))
+      (classified-error ""
+                        (ex-info (str "relation \"" seq-name "\" already exists")
+                                 {:sqlstate "42P07"
+                                  :table seq-name
+                                  :constraint seq-name}))
+
+      ;; IF NOT EXISTS on an existing sequence: PG emits a notice and
+      ;; makes no change. Skipping the transact keeps the live counter
+      ;; untouched (re-transacting the init entity would reset it).
+      (sequence-exists? current-db seq-name)
+      (empty-result "CREATE SEQUENCE")
+
+      (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE SEQUENCE")
+
+      :else
       (try
-        (d/transact conn (:tx-data parsed))
+        (d/transact conn tx-data)
         (empty-result "CREATE SEQUENCE")
         (catch Exception e
           (classified-error "CREATE SEQUENCE error: " e))))))

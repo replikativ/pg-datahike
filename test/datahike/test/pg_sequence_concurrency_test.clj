@@ -128,3 +128,46 @@
           (is (= 2 in-tx))
           (is (= 3 post)
               "nextval advanced by ROLLBACK is preserved (PG semantics)"))))))
+
+;; ============================================================================
+;; CREATE SEQUENCE duplicate semantics (issue #15) — not a concurrency
+;; property, but the handler fixture here is the natural home for
+;; sequence-DDL execution tests.
+;; ============================================================================
+
+(deftest duplicate-create-sequence-raises-42p07
+  ;; PG: re-running CREATE SEQUENCE on an existing sequence raises 42P07
+  ;; duplicate_table (sequences are relations). Pre-fix this silently
+  ;; re-transacted the init entity, RESETTING the live counter.
+  (let [h (pg/make-query-handler *conn*)
+        run! (fn [sql] (.execute h sql))]
+    (is (nil? (.error ^PgWireServer$QueryResult (run! "CREATE SEQUENCE s_dup START WITH 1 INCREMENT BY 1"))))
+    (is (= "1" (aget ^"[Ljava.lang.String;"
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_dup')"))) 0)))
+    (let [^PgWireServer$QueryResult dup (run! "CREATE SEQUENCE s_dup START WITH 1 INCREMENT BY 1")]
+      (is (some? (.error dup)))
+      (is (= "42P07" (.sqlstate dup)))
+      (is (re-find #"relation \"s_dup\" already exists" (.error dup))))
+    ;; The failed CREATE must not have touched the counter.
+    (is (= "2" (aget ^"[Ljava.lang.String;"
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_dup')"))) 0)))))
+
+(deftest create-sequence-if-not-exists-noop-preserves-counter
+  ;; PG: CREATE SEQUENCE IF NOT EXISTS on an existing sequence emits a
+  ;; notice and completes as a no-op — the counter is NOT reset, even
+  ;; when the retry carries a different START WITH.
+  (let [h (pg/make-query-handler *conn*)
+        run! (fn [sql] (.execute h sql))]
+    ;; Fresh IF NOT EXISTS create works like a plain create.
+    (let [^PgWireServer$QueryResult r (run! "CREATE SEQUENCE IF NOT EXISTS s_ine START WITH 1 INCREMENT BY 1")]
+      (is (nil? (.error r)) (str "create failed: " (.error r)))
+      (is (= "CREATE SEQUENCE" (.commandTag r))))
+    (is (= "1" (aget ^"[Ljava.lang.String;"
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0)))
+    ;; Idempotent retry: success tag, no counter reset.
+    (let [^PgWireServer$QueryResult r (run! "CREATE SEQUENCE IF NOT EXISTS s_ine START WITH 100 INCREMENT BY 1")]
+      (is (nil? (.error r)))
+      (is (= "CREATE SEQUENCE" (.commandTag r))))
+    (is (= "2" (aget ^"[Ljava.lang.String;"
+                (first (.rows ^PgWireServer$QueryResult (run! "SELECT nextval('s_ine')"))) 0))
+        "counter preserved across IF NOT EXISTS retry (no reset to 100)")))
