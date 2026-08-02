@@ -110,7 +110,6 @@ tests/test_prepare.py::TestPrepare::test_prepare_13_connect
 tests/test_prepare.py::TestPrepare::test_prepare_14_explain
 tests/test_prepare.py::TestPrepare::test_prepare_19_concurrent_calls
 tests/test_prepare.py::TestPrepare::test_prepare_20_concurrent_calls
-tests/test_prepare.py::TestPrepare::test_prepare_21_errors
 tests/test_prepare.py::TestPrepare::test_prepare_22_empty
 tests/test_prepare.py::TestPrepare::test_prepare_23_no_stmt_cache_seq
 tests/test_prepare.py::TestPrepare::test_prepare_31_pgbouncer_note

@@ -4,6 +4,113 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### PostgreSQL conformance (issues #18–#22)
+
+- **An empty query now answers `EmptyQueryResponse` instead of a parse
+  error (#18).** A query string holding no statement — `""`, `";"`,
+  `"  ;  ;  "`, a comment-only string — is an *empty query* in PostgreSQL:
+  one `I` message and nothing else, per `exec_simple_query`'s
+  `if (!parsetree_list) NullCommand(dest)`. `splitStatements` correctly
+  discarded every blank fragment and then handed the *raw* string back, so
+  `";"` reached JSqlParser and came back `42601`. It now reports zero
+  statements, which routes to the `parsed == null` path that already
+  existed. Two neighbours went with it: the statement loop's blank test
+  missed comment-only fragments (comment stripping yields `" "`, not
+  `""`), and `Parse(";")` errored in the extended protocol where PG
+  accepts it. Verified message-for-message against PostgreSQL 17.10 on
+  both protocols.
+
+- **Math functions follow PostgreSQL semantics rather than
+  `java.lang.Math`'s (#22).** `sqrt(-42)` returned `NaN`; PG raises
+  `2201F`. The cause was structural — SQL functions were mapped straight
+  onto their Java namesakes, which differ three separate ways:
+  *domain errors* (Java returns NaN/Infinity where PG raises: `sqrt` of a
+  negative `2201F`, `ln(0)`/`ln(-x)` `2201E`, `power(0,-x)` and
+  `power(-x, 0.5)` `2201F`, `asin`/`acos` outside `[-1,1]` `22003`,
+  overflow **and underflow** `22003`); *a different function under the
+  same name* — SQL `log(x)` is base-10 while `Math/log` is natural, so
+  `log(100)` silently returned `4.605` instead of `2`, a wrong answer
+  rather than an error; and *different tie-breaking* — `Math/round`
+  rounds halves toward positive infinity, so `round(-2.5)` gave `-2`
+  where PG gives `-3`. Argument counts now resolve at translate time as
+  `42883` instead of leaking Clojure's `ArityException` as `XX000`.
+  Adds `ln`, `log10`, `log(b, x)`, `cbrt`, `asin`, `acos`, `atan2`,
+  `sinh`/`cosh`/`tanh`, `asinh`/`acosh`/`atanh`, `degrees`, `radians`,
+  `cot`, `trunc`, `gcd`, `lcm`, `width_bucket`, `pi`. PG's own
+  inconsistencies are mirrored deliberately: `sinh`/`cosh` overflow to
+  Infinity without error while `exp` raises, `cot(0)` is Infinity,
+  `atanh(±1)` is Infinity, float8 `sign(NaN)` is `0`, and
+  `width_bucket`'s argument failures are `2201G`, not the `22003` the
+  surrounding float code uses.
+
+- **`CREATE`/`ALTER SEQUENCE` are parsed in full (#21).**
+  `CREATE SEQUENCE … INCREMENT 20 START WITH 400` failed to parse. The
+  reported token was one hole in a grammar that is a strict subset of
+  PG's: `START 400` (no `WITH`), `INCREMENT -1` (signed), `AS bigint`,
+  `IF NOT EXISTS`, `NO MINVALUE` and every form of `ALTER SEQUENCE` also
+  failed. Two pre-parse rewrite rules existed to delete the offending
+  tokens, and that only moved the problem — the option *values* were then
+  recovered by regex over the re-rendered SQL
+  (`increment\s+by\s+(\d+)`), which cannot see a negative increment and
+  silently dropped `MINVALUE`/`MAXVALUE`/`CACHE`/`CYCLE`, so
+  `CREATE SEQUENCE s MAXVALUE 10 CYCLE` reported success and produced an
+  unbounded non-cycling sequence. Sequence DDL is now token-classified in
+  full and never reaches JSqlParser; both rewrite rules are deleted rather
+  than extended. Defaults and validation mirror `init_params` including
+  its *order*, so a statement with several problems reports the one PG
+  reports — covering the direction-dependent defaults (`INCREMENT -1`
+  gives min type-min, max `-1`, start `-1`), the `AS`-type bounds, and
+  `NO MINVALUE` meaning "recompute the default" rather than "unbounded".
+  The options are now honoured at runtime: `CYCLE` wraps to `MINVALUE`
+  ascending and `MAXVALUE` descending (not to `START`), and exhaustion
+  without `CYCLE` raises `2200H`. `ALTER SEQUENCE` revalidates against the
+  sequence's current parameters; `RESTART` moves the counter without
+  changing `START`.
+
+- **`bit` / `bit varying` are real types (#19).** `SELECT 0::bit`
+  returned a text column and `pg_typeof(0::bit)` answered `text`. The
+  digits were already right — the value was a bare string, so both type
+  paths fell through to text. Bit values are now a wrapper carrying the
+  two things a string cannot: the **width**, which is part of the value
+  (PG compares bit strings by content then length, so `B'101'` is *not*
+  equal to `B'10100000'` and `B'0' < B'00' < B'000'`), and the
+  `bit`/`bit varying` distinction (OIDs 1560/1562, with different width
+  coercion — `bit(n)` zero-pads on the right, `bit varying(n)` truncates
+  but never pads). Also fixes cases where treating a bit as its text gave
+  a *wrong answer*: hex input expands to four bits per digit including
+  leading zeros (`X'1F'` is the 8-bit `00011111`, not 5 bits, which
+  changes `length`, `octet_length` and sort position); `int → bit(n)`
+  keeps the rightmost `n` bits and sign-extends on the left, so
+  `(-44)::bit(12)` is `111111010100`; and `bit → int` reinterprets the
+  bits rather than reading the digits as decimal, so `'101'::bit(3)::int`
+  is `5`, not `101`. `pg_typeof` also now reports its own return type as
+  `regtype` (2206) rather than `text` — that is the OID quoted in the
+  issue as the expected bit type.
+
+- **`TRUNCATE TABLE` (#20)** was fixed earlier on this branch and simply
+  had not shipped; v0.1.58 predates it.
+
+### CAST consolidation
+
+- **One implementation of `CAST`.** Cast semantics were written out four
+  times — the table-free literal fast path, `translate-cast` (both its
+  compile-time fold and its runtime binding), `apply-sql-cast`, and the
+  INSERT coercion path — each a dispatch over the same type categories
+  that had drifted from the others. Which copy ran depended on the
+  *shape* of the expression rather than its meaning, so one cast could
+  behave three ways: `29::bit(4)` was correct, `(-44)::bit(12)` passed
+  the value through untouched, and `'101'::bit(3)::int` read the digits
+  as decimal. Issue #12 hit this for `'1'::boolean` and was fixed by
+  patching four call sites; #19 hit it again. The value-level semantics
+  now live in one namespace and the scalar paths delegate to it; callers
+  keep only their own surrounding logic. Unifying exposed differences the
+  copies had accumulated, resolved toward the more complete behaviour:
+  `apply-sql-cast` had no `:date`, `:time` or `:numeric` branch at all
+  and returned such casts unchanged. Also fixes `length()` /
+  `char_length()` / `octet_length()` on a bit string, which were bare
+  `count` and so reported the wrapper's field count rather than the bit
+  width.
+
 ### jsonb fidelity
 
 - **jsonb is now canonicalized on ingest, so it behaves like PostgreSQL
