@@ -31,3 +31,33 @@ select-only	simple	4	38413.748205	0.104	0.000
 select-only	prepared	1	10846.681711	0.092	0.000
 select-only	prepared	4	63594.276457	0.063	0.000
 ```
+
+## scale8-matched — 2026-08-02 — pg-datahike 2668514 + datahike 0.8.1768 vs real PG 17
+
+Env: SCALE=8 (800k accounts), prepared mode, T=20-30s per cell, same
+machine, same day. pg-datahike: in-memory store, `clojure -M:server`,
+tpcb with `--max-tries=10` (0.000% failed in every cell; retried
+transactions are transparent client-side retries on 40001). Real PG:
+default config on local NVMe (full fsync durability — pg-datahike's
+memory store has no durability either way, so writes are not
+apples-to-apples; reads are).
+
+```tsv
+script	server	clients	tps	latency_ms
+select-only	pg-datahike	1	2816	0.355
+select-only	postgresql	1	19194	0.052
+select-only	pg-datahike	8	21283	-
+select-only	postgresql	8	81554	-
+tpcb	pg-datahike	1	103	9.7
+tpcb	postgresql	1	419	2.384
+tpcb	pg-datahike	4	336	-
+tpcb	postgresql	4	719	-
+tpcb	pg-datahike	8	277	-
+tpcb	postgresql	8	997	-
+```
+
+Gap summary: reads 3.8-6.8×, writes 2.1-4.1×. NOTE: the realpg-smoke
+section above (scale 1, 5s cells) is NOT comparable to scale-8 numbers —
+scale-1 tpcb funnels every transaction through one branch row (max
+contention) and its select numbers were taken in simple mode; an earlier
+revision of our docs mistakenly compared across these baselines.

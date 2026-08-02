@@ -51,3 +51,4 @@ Thumbs.db
 # own notes here. Persisted across worktree switches but never pushed.
 /.internal/
 .claude/
+.internal/
