@@ -46,6 +46,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
@@ -2965,29 +2966,10 @@
 ;; DML translation: INSERT, UPDATE, DELETE
 ;; ============================================================================
 
-(defn parse-bytea-hex
-  "Decode a PostgreSQL bytea hex-format literal (`\\xDEADBEEF`) to a byte array.
-   Accepts both `\\x...` and `\\\\x...` prefixes (JDBC/psycopg2 escape variants).
-   Returns nil for values that don't look like hex bytea literals."
-  [s]
-  (when (string? s)
-    (let [trimmed (str/trim s)
-          without-prefix (cond
-                           (str/starts-with? trimmed "\\x") (subs trimmed 2)
-                           (str/starts-with? trimmed "\\\\x") (subs trimmed 3)
-                           :else nil)]
-      (when (and without-prefix
-                 (re-matches #"[0-9a-fA-F]*" without-prefix)
-                 (even? (count without-prefix)))
-        (let [n (/ (count without-prefix) 2)
-              bs (byte-array n)]
-          (dotimes [i n]
-            (aset-byte bs i
-                       (unchecked-byte
-                        (Integer/parseInt
-                         (subs without-prefix (* 2 i) (+ 2 (* 2 i)))
-                         16))))
-          bs)))))
+(def parse-bytea-hex
+  "Re-exported from datahike.pg.sql.coerce, where it moved so the shared
+   cast implementation (a leaf namespace) could reach it."
+  coerce/parse-bytea-hex)
 
 (defn apply-sql-cast
   "Apply a SQL CAST to a value. Returns the value cast to the target type.
@@ -3008,8 +2990,7 @@
           ;; non-array inputs through `pg-arr/array` for consistency.
           array-data (try (.getArrayData col-data-type) (catch Throwable _ nil))
           array-target? (and (some? type-str) (seq array-data))]
-      (cond
-        array-target?
+      (if array-target?
         (let [elem-kw (or (get types/sql-name->elem-kw type-str) :text)]
           (cond
             (pg-arr/array? inner) (pg-arr/array elem-kw (:elements inner)
@@ -3017,40 +2998,19 @@
             (sequential? inner)   (pg-arr/array elem-kw (vec inner))
             (string? inner)       (pg-arr/from-pg-text inner elem-kw)
             :else                 (pg-arr/array elem-kw [inner])))
-
-        (= cast-cat :integer)   (coerce/coerce-numeric inner :long)
-        (= cast-cat :float)     (coerce/coerce-numeric inner :double)
-        (= cast-cat :text)      (if (string? inner) inner (str inner))
-        (= cast-cat :boolean)   (if (boolean? inner)
-                                  inner
-                                  (let [b (coerce/parse-bool-token (str inner))]
-                                    (when (nil? b)
-                                      (throw (errors/pg-error :invalid-text-representation
-                                                              {:type "boolean" :value (str inner)})))
-                                    b))
-        (= cast-cat :timestamp) (if (instance? java.util.Date inner)
-                                  inner
-                                  (expr/parse-timestamp-string (str inner)))
-        (= cast-cat :uuid)      (if (instance? java.util.UUID inner)
-                                  inner
-                                  (java.util.UUID/fromString (str inner)))
-        (= cast-cat :bytes)     (cond
-                                  (bytes? inner) inner
-                                  (string? inner) (or (parse-bytea-hex inner)
-                                                      (.getBytes ^String inner "UTF-8"))
-                                  :else inner)
-        ;; ::regnamespace — resolve to namespace OID
-        (= type-str "regnamespace") 2200
-        ;; ::regclass — match the same precedence used elsewhere:
-        ;; :pg/table-oid first, then the hashCode fallback.
-        (= type-str "regclass")
-        (let [n (str inner)]
-          (or (when (and params/*parse-db* (some? inner))
-                (pgs/table-oid params/*parse-db* n))
-              (when (seq n) (Math/abs (.hashCode ^String n)))
-              0))
-        ;; No category match — return as-is
-        :else inner))))
+        ;; Scalar targets go through the one shared implementation
+        ;; (datahike.pg.sql.cast) rather than a fourth private copy of
+        ;; the category dispatch — see that namespace's docstring.
+        (sql-cast/cast-scalar
+         inner type-str
+         {:explicit? true
+          :parse-timestamp expr/parse-timestamp-string
+          :resolve-regclass
+          (fn [n]
+            (or (when (and params/*parse-db* (some? inner))
+                  (pgs/table-oid params/*parse-db* n))
+                (when (seq n) (Math/abs (.hashCode ^String n)))
+                0))})))))
 
 (defn extract-value
   "Extract a Clojure value from a JSqlParser expression for INSERT VALUES.

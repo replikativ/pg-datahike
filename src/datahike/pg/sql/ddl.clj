@@ -20,6 +20,7 @@
      - extract-inherits        — PostgreSQL INHERITS"
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params]
@@ -758,39 +759,207 @@
 ;; Sequence DDL translation
 ;; ============================================================================
 
+(def ^:private seq-type-bounds
+  "PG's per-type sequence bounds (sequence.c:1454, :1486). The default
+   type is bigint."
+  {"smallint" [-32768 32767]
+   "int2"     [-32768 32767]
+   "integer"  [-2147483648 2147483647]
+   "int"      [-2147483648 2147483647]
+   "int4"     [-2147483648 2147483647]
+   "bigint"   [-9223372036854775808 9223372036854775807]
+   "int8"     [-9223372036854775808 9223372036854775807]})
+
+(defn- seq-invalid [detail]
+  (throw (errors/pg-error :invalid-parameter-value {:detail detail})))
+
+(defn- seq-syntax [detail]
+  (throw (errors/pg-error :syntax-error {:detail detail})))
+
+(defn sequence-params
+  "Resolve a classifier option list into concrete sequence parameters,
+   applying PG's defaults and raising PG's errors.
+
+   Mirrors `init_params` (postgres src/backend/commands/sequence.c:1260)
+   including its ORDER, because a statement with more than one problem
+   must report the same one PG reports: duplicate detection, then AS,
+   INCREMENT, CYCLE, MAXVALUE, MINVALUE, the min/max crosscheck, START,
+   RESTART, CACHE.
+
+   `existing` is the current parameter map for ALTER (nil for CREATE);
+   options left unspecified keep their existing values on ALTER and take
+   the defaults on CREATE.
+
+   Returns {:type :increment :minvalue :maxvalue :start :cache :cycle?
+            :restart :owned-by}."
+  [opts {:keys [existing]}]
+  ;; Duplicate/conflicting options — 42601, before anything is read.
+  ;; NO MINVALUE and MINVALUE n are the same option, so `MINVALUE 5 NO
+  ;; MINVALUE` collides here, as does CYCLE with NO CYCLE.
+  (let [names (map first opts)]
+    (when-let [dup (some (fn [[k n]] (when (> n 1) k)) (frequencies names))]
+      (when (contains? #{:as :cache :cycle :increment :maxvalue :minvalue
+                         :owned-by :restart :start}
+                       dup)
+        (seq-syntax "conflicting or redundant options"))))
+
+  (let [o (into {} opts)
+        init? (nil? existing)]
+
+    ;; Options PG parses but refuses in this position.
+    (when (contains? o :sequence-name)
+      (seq-syntax "invalid sequence option SEQUENCE NAME"))
+    (when (or (contains? o :logged) (contains? o :unlogged))
+      ;; PG reaches this through a bare elog, so it really is XX000
+      ;; upstream rather than a user-facing error class.
+      (throw (ex-info (str "option \""
+                           (if (contains? o :logged) "logged" "unlogged")
+                           "\" not recognized")
+                      {:sqlstate "XX000"})))
+
+    (let [;; --- AS <type>
+          type-name (or (:as o) (:type existing) "bigint")
+          [type-min type-max]
+          (or (seq-type-bounds type-name)
+              (seq-invalid "sequence type must be smallint, integer, or bigint"))
+
+          ;; --- INCREMENT
+          increment (cond
+                      (contains? o :increment) (:increment o)
+                      existing (:increment existing)
+                      :else 1)
+          _ (when (zero? increment) (seq-invalid "INCREMENT must not be zero"))
+          ascending? (pos? increment)
+
+          ;; --- CYCLE
+          cycle? (cond
+                   (contains? o :cycle) (:cycle o)
+                   existing (:cycle? existing)
+                   :else false)
+
+          ;; --- MAXVALUE. `NO MAXVALUE` (:none) means "the default for
+          ;; this type and increment sign", NOT unbounded.
+          maxvalue (let [v (:maxvalue o)]
+                     (cond
+                       (and (some? v) (not= v :none)) v
+                       (or (= v :none) init?) (if ascending? type-max -1)
+                       :else (:maxvalue existing)))
+          _ (when (or (< maxvalue type-min) (> maxvalue type-max))
+              (seq-invalid (str "MAXVALUE (" maxvalue ") is out of range for "
+                                "sequence data type " type-name)))
+
+          ;; --- MINVALUE
+          minvalue (let [v (:minvalue o)]
+                     (cond
+                       (and (some? v) (not= v :none)) v
+                       (or (= v :none) init?) (if ascending? 1 type-min)
+                       :else (:minvalue existing)))
+          _ (when (or (< minvalue type-min) (> minvalue type-max))
+              (seq-invalid (str "MINVALUE (" minvalue ") is out of range for "
+                                "sequence data type " type-name)))
+
+          ;; PG compares with >=, so min == max is rejected even though
+          ;; the message says "must be less than".
+          _ (when (>= minvalue maxvalue)
+              (seq-invalid (str "MINVALUE (" minvalue ") must be less than "
+                                "MAXVALUE (" maxvalue ")")))
+
+          ;; --- START
+          start (cond
+                  (contains? o :start) (:start o)
+                  existing (:start existing)
+                  :else (if ascending? minvalue maxvalue))
+          _ (when (< start minvalue)
+              (seq-invalid (str "START value (" start ") cannot be less than "
+                                "MINVALUE (" minvalue ")")))
+          _ (when (> start maxvalue)
+              (seq-invalid (str "START value (" start ") cannot be greater than "
+                                "MAXVALUE (" maxvalue ")")))
+
+          ;; --- RESTART. A bare RESTART (:default) restarts at START —
+          ;; the START of this same statement, since START is applied
+          ;; first. RESTART never changes START itself.
+          restart (when (contains? o :restart)
+                    (let [v (:restart o)]
+                      (if (= v :default) start v)))
+          _ (when restart
+              (when (< restart minvalue)
+                (seq-invalid (str "RESTART value (" restart ") cannot be less than "
+                                  "MINVALUE (" minvalue ")")))
+              (when (> restart maxvalue)
+                (seq-invalid (str "RESTART value (" restart ") cannot be greater than "
+                                  "MAXVALUE (" maxvalue ")"))))
+
+          ;; --- CACHE
+          cache (cond
+                  (contains? o :cache) (:cache o)
+                  existing (:cache existing)
+                  :else 1)
+          _ (when (<= cache 0)
+              (seq-invalid (str "CACHE (" cache ") must be greater than zero")))]
+      {:type type-name
+       :increment increment
+       :minvalue minvalue
+       :maxvalue maxvalue
+       :start start
+       :cache cache
+       :cycle? cycle?
+       :restart restart
+       :owned-by (:owned-by o)})))
+
+(def sequence-schema
+  "Schema attributes backing a sequence entity. Idempotent — re-transacted
+   on every CREATE SEQUENCE."
+  [{:db/ident :__seq__/name :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :__seq__/value :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/increment :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/minvalue :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/maxvalue :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/cache :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/cycle :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/start :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/type :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}])
+
+(defn sequence-entity
+  "The stored entity for a sequence with the given resolved params.
+
+   `:__seq__/value` holds the last value HANDED OUT, so a fresh sequence
+   stores `start - increment` and the first advance lands exactly on
+   start. (PG models this as last_value + is_called=false; the offset
+   encoding is equivalent for a single-value-at-a-time nextval and is
+   what the IDENTITY path in translate-create-table already assumes.)"
+  [seq-name {:keys [increment minvalue maxvalue start cache cycle? type]}]
+  {:__seq__/name seq-name
+   :__seq__/value (- start increment)
+   :__seq__/increment increment
+   :__seq__/minvalue minvalue
+   :__seq__/maxvalue maxvalue
+   :__seq__/cache cache
+   :__seq__/cycle cycle?
+   :__seq__/start start
+   :__seq__/type type})
+
 (defn translate-create-sequence
-  "Translate CREATE SEQUENCE to Datahike schema + initial entity.
-   Sequences are stored as entities with :__seq__/* attributes."
-  [^CreateSequence cs]
-  (let [seq-name (params/unquote-ident (str (.getName (.getSequence cs))))
-        ;; Parse options: START WITH, INCREMENT BY
-        full-sql (str cs)
-        lower (str/lower-case full-sql)
-        start-val (or (when-let [m (re-find #"start\s+with\s+(\d+)" lower)]
-                        (Long/parseLong (second m)))
-                      1)
-        increment (or (when-let [m (re-find #"increment\s+by\s+(\d+)" lower)]
-                        (Long/parseLong (second m)))
-                      1)]
+  "Translate a classified CREATE SEQUENCE into schema + initial entity.
+
+   Consumes the token classifier's `:seq-opts` rather than JSqlParser's
+   AST: the grammar there covers only a subset of PG's option list, and
+   the values used to be recovered by regex over the re-rendered SQL
+   (`increment\\s+by\\s+(\\d+)`), which could not see a negative increment
+   and silently dropped MINVALUE/MAXVALUE/CACHE/CYCLE. See issue #21."
+  [{:keys [seq-name seq-opts if-not-exists?]}]
+  (let [params (sequence-params seq-opts {})]
     {:type :ddl-create-sequence
      :seq-name seq-name
-     :tx-data
-     [;; Schema attributes for sequences (idempotent — already exist after first CREATE)
-      {:db/ident :__seq__/name :db/valueType :db.type/string
-       :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
-      {:db/ident :__seq__/value :db/valueType :db.type/long
-       :db/cardinality :db.cardinality/one}
-      {:db/ident :__seq__/increment :db/valueType :db.type/long
-       :db/cardinality :db.cardinality/one}
-      ;; The sequence entity itself.
-      ;; PG semantics: `CREATE SEQUENCE s START WITH N` means the
-      ;; first `nextval('s')` returns N. handle-nextval is
-      ;; advance-then-return (reads :__seq__/value, writes value+inc,
-      ;; returns value+inc), so we initialise the stored value to
-      ;; `start-val - increment` — the first advance lands on
-      ;; start-val. The IDENTITY-column path (translate-create-table
-      ;; line ~635) follows the same convention with `:__seq__/value
-      ;; 0` for `START WITH 1, INCREMENT BY 1`.
-      {:__seq__/name seq-name
-       :__seq__/value (- start-val increment)
-       :__seq__/increment increment}]}))
+     :if-not-exists? if-not-exists?
+     :seq-params params
+     :tx-data (conj (vec sequence-schema) (sequence-entity seq-name params))}))

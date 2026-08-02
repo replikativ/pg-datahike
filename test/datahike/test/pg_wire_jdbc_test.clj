@@ -532,3 +532,62 @@
         ;; Next statement succeeds
         (with-open [rs (.executeQuery st "SELECT count(*) FROM t")]
           (is (.next rs)))))))
+
+;; ============================================================================
+;; Empty query (issue #18)
+;; ============================================================================
+;;
+;; A query string that yields no statements at all is an *empty query*:
+;; PG answers with a single EmptyQueryResponse ('I'), never a parse
+;; error. Verified against PostgreSQL 17.10 at the protocol level for
+;; each form below. pgjdbc surfaces 'I' as "no result set" — `execute`
+;; → false — and raises nothing. (It reports getUpdateCount 0 there,
+;; which is a driver-side mapping of EmptyQueryResponse rather than
+;; anything we put on the wire, so it isn't asserted here.)
+;;
+;; Before the fix, splitStatements returned the raw string when every
+;; fragment was blank, so ";" reached JSqlParser and came back 42601.
+
+(deftest test-empty-query-simple-protocol
+  (testing "statement-less query strings return EmptyQueryResponse, not 42601"
+    (with-conn [c {:preferQueryMode "simple"}]
+      (doseq [sql ["" ";" "  ;  ;  " "-- just a comment" "/* block */"]]
+        (with-open [st (.createStatement c)]
+          (let [raised (try
+                         (is (false? (.execute st sql))
+                             (str "no result set expected for " (pr-str sql)))
+                         nil
+                         (catch SQLException e e))]
+            (is (nil? raised)
+                (str "empty query " (pr-str sql) " must not raise, got "
+                     (some-> raised .getSQLState) ": "
+                     (some-> raised .getMessage)))))))))
+
+(deftest test-empty-query-extended-protocol
+  (testing "Parse/Bind/Execute of a statement-less string → EmptyQueryResponse"
+    (with-conn [c {:preferQueryMode "extended"}]
+      (doseq [sql ["" ";" "-- just a comment"]]
+        (let [raised (try
+                       (with-open [ps (.prepareStatement c sql)]
+                         (is (false? (.execute ps))
+                             (str "no result set expected for " (pr-str sql))))
+                       nil
+                       (catch SQLException e e))]
+          (is (nil? raised)
+              (str "empty query " (pr-str sql) " must not raise at Parse, got "
+                   (some-> raised .getSQLState) ": "
+                   (some-> raised .getMessage))))))))
+
+(deftest test-empty-fragments-between-statements-are-dropped
+  (testing "'SELECT 1;;' runs one statement — empty fragments yield no 'I'"
+    (with-conn [c {:preferQueryMode "simple"}]
+      (with-open [st (.createStatement c)]
+        ;; execute → true means the FIRST response was a result set, so the
+        ;; trailing empty fragment produced nothing of its own.
+        (is (true? (.execute st "SELECT 1;;")))
+        (with-open [rs (.getResultSet st)]
+          (is (.next rs))
+          (is (= 1 (.getInt rs 1))))
+        ;; and no further result follows the empty fragment
+        (is (false? (.getMoreResults st)))
+        (is (= -1 (.getUpdateCount st)))))))

@@ -599,6 +599,10 @@
              (= "level" (nth texts 3 nil))
              (= "security" (nth texts 4 nil))))))
 
+;; Sequence DDL is classified in full further down (it needs
+;; read-relation-name, which is defined after this dispatch).
+(declare classify-create-sequence classify-alter-sequence)
+
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
   ;; TEMPORARY, GLOBAL, LOCAL, UNLOGGED) that don't disambiguate kind.
@@ -618,7 +622,7 @@
       (kw=? t1 "view")      {:kind :create-view}
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
-      (kw=? t1 "sequence")  {:kind :generic-sql}
+      (kw=? t1 "sequence")  (classify-create-sequence (rest toks))
 
       ;; CREATE TYPE — only AS ENUM is supported as a first-class
       ;; type (lowered to string + check-in). Other forms (composite,
@@ -724,6 +728,187 @@
               {:kind :drop-table-multi :tables names :if-exists? if-exists?})))
         {:kind :generic-sql})))
 
+;; ============================================================================
+;; CREATE / ALTER SEQUENCE — token-classified in full.
+;;
+;; JSqlParser's CreateSequence grammar is a strict subset of PG's, and
+;; every gap is a statement real clients send:
+;;
+;;   INCREMENT 20        BY is optional in PG      (issue #21, as reported)
+;;   START 400           WITH is optional
+;;   INCREMENT -1        signed values are legal
+;;   AS bigint           no production at all
+;;   IF NOT EXISTS       no production at all
+;;   NO MINVALUE         no production at all
+;;   ALTER SEQUENCE …    no AST branch downstream
+;;
+;; Patching that up with pre-parse rewrite rules only moves the problem:
+;; the option VALUES were then recovered by regex over JSqlParser's
+;; re-rendered SQL (`increment\s+by\s+(\d+)`), which cannot see a
+;; negative increment and silently drops MINVALUE/MAXVALUE/CACHE/CYCLE.
+;;
+;; The option list is a flat, unordered, comma-free token sequence —
+;; exactly what this classifier handles well and a fixed grammar we don't
+;; control handles badly. Duplicates are PRESERVED in order here rather
+;; than merged, because PG rejects a repeated option with 42601
+;; ("conflicting or redundant options") and that check belongs with the
+;; other validation, in ddl/sequence-params.
+;; ============================================================================
+
+(def ^:private seq-opt-keywords
+  "Words that begin a sequence option. Used to decide whether a bare
+   RESTART is followed by its optional value or by the next option."
+  #{"as" "cache" "cycle" "increment" "logged" "maxvalue" "minvalue" "no"
+    "owned" "restart" "sequence" "start" "unlogged"})
+
+(defn- read-signed-number
+  "Consume `[+|-] <number>`, returning [value remaining-toks] or nil.
+   PG's NumericOnly accepts an explicit sign on every numeric sequence
+   option, which is how `INCREMENT -1` and `MINVALUE -9223372036854775808`
+   are written. The tokenizer emits the sign as a separate :op token."
+  [toks]
+  (let [t0 (first toks)
+        [neg? ts] (cond
+                    (= "-" (:text t0)) [true (rest toks)]
+                    (= "+" (:text t0)) [false (rest toks)]
+                    :else [false toks])]
+    (when-let [v (number-value (first ts))]
+      [(if neg? (- v) v) (rest ts)])))
+
+(defn- read-sequence-option
+  "Consume ONE sequence option. Returns [[opt-name value] remaining-toks],
+   or nil when the head is not a recognised option.
+
+   `value` is the parsed literal, `:none` for the NO / unspecified forms,
+   and `:default` for a bare RESTART (which means \"restart at START\").
+   Unrecognised-but-parseable options (LOGGED, SEQUENCE NAME) are
+   returned too so validation can reject them the way PG does, rather
+   than the statement dying with a syntax error."
+  [toks]
+  (let [t0 (first toks)]
+    (cond
+      ;; AS <type> — the type name may carry a typmod we ignore.
+      (kw=? t0 "as")
+      (when-let [nm (ident-text (second toks))]
+        [[:as (str/lower-case nm)] (drop 2 toks)])
+
+      ;; INCREMENT [BY] n
+      (kw=? t0 "increment")
+      (let [ts (if (kw=? (second toks) "by") (drop 2 toks) (rest toks))]
+        (when-let [[v ts'] (read-signed-number ts)]
+          [[:increment v] ts']))
+
+      ;; START [WITH] n
+      (kw=? t0 "start")
+      (let [ts (if (kw=? (second toks) "with") (drop 2 toks) (rest toks))]
+        (when-let [[v ts'] (read-signed-number ts)]
+          [[:start v] ts']))
+
+      ;; RESTART [[WITH] n] — the ONLY option whose value is optional, so
+      ;; it needs lookahead: a WITH or a signed numeric is its argument;
+      ;; another option keyword, `;`, or end-of-input means bare RESTART.
+      (kw=? t0 "restart")
+      (let [ts (if (kw=? (second toks) "with") (drop 2 toks) (rest toks))]
+        (or (when-let [[v ts'] (read-signed-number ts)]
+              [[:restart v] ts'])
+            [[:restart :default] ts]))
+
+      (kw=? t0 "cache")
+      (when-let [[v ts'] (read-signed-number (rest toks))]
+        [[:cache v] ts'])
+
+      (kw=? t0 "minvalue")
+      (when-let [[v ts'] (read-signed-number (rest toks))]
+        [[:minvalue v] ts'])
+
+      (kw=? t0 "maxvalue")
+      (when-let [[v ts'] (read-signed-number (rest toks))]
+        [[:maxvalue v] ts'])
+
+      (kw=? t0 "cycle") [[:cycle true] (rest toks)]
+
+      ;; NO {CYCLE | MINVALUE | MAXVALUE}. `NO MINVALUE` does NOT mean
+      ;; unbounded — it means "use the default for this type and
+      ;; increment sign", which is what :none signals downstream.
+      (kw=? t0 "no")
+      (let [t1 (second toks)]
+        (cond
+          (kw=? t1 "cycle")    [[:cycle false]    (drop 2 toks)]
+          (kw=? t1 "minvalue") [[:minvalue :none] (drop 2 toks)]
+          (kw=? t1 "maxvalue") [[:maxvalue :none] (drop 2 toks)]
+          :else nil))
+
+      ;; OWNED BY {table.column | NONE} — accepted and carried; we have
+      ;; no dependency tracking, so it is a no-op semantically.
+      (and (kw=? t0 "owned") (kw=? (second toks) "by"))
+      (when-let [[nm ts'] (read-relation-name (drop 2 toks))]
+        [[:owned-by nm] ts'])
+
+      ;; Parse-but-reject forms, so the error is PG's rather than a
+      ;; syntax error: SEQUENCE NAME is 42601 and LOGGED/UNLOGGED are
+      ;; "option not recognized" when used as sequence options.
+      (and (kw=? t0 "sequence") (kw=? (second toks) "name"))
+      (when-let [[nm ts'] (read-relation-name (drop 2 toks))]
+        [[:sequence-name nm] ts'])
+
+      (kw=? t0 "logged")   [[:logged true] (rest toks)]
+      (kw=? t0 "unlogged") [[:unlogged true] (rest toks)]
+
+      :else nil)))
+
+(defn- read-sequence-options
+  "Consume the whole option list. Returns [opts remaining-toks] with
+   `opts` an ordered vector of [name value] pairs — duplicates kept, so
+   validation can raise 42601 for a repeated option."
+  [toks]
+  (loop [opts [], ts toks]
+    (if-let [[opt ts'] (read-sequence-option ts)]
+      (recur (conj opts opt) ts')
+      [opts ts])))
+
+(defn- classify-create-sequence
+  "CREATE [TEMP|UNLOGGED] SEQUENCE [IF NOT EXISTS] name [options…].
+   `toks` starts just after the SEQUENCE keyword (classify-create has
+   already eaten the persistence qualifiers).
+
+   Falls back to :generic-sql when the tail doesn't parse, so anything
+   this doesn't model still reaches JSqlParser and reports its own
+   syntax error rather than being silently accepted."
+  [toks]
+  (let [ine? (and (kw=? (first toks) "if")
+                  (kw=? (second toks) "not")
+                  (kw=? (nth toks 2 nil) "exists"))
+        ts (if ine? (drop 3 toks) toks)]
+    (or (when-let [[nm ts1] (read-relation-name ts)]
+          (let [[opts ts2] (read-sequence-options ts1)
+                ts3 (drop-while #(= ";" (:text %)) ts2)]
+            (when (empty? ts3)
+              {:kind :create-sequence
+               :seq-name nm
+               :if-not-exists? ine?
+               :seq-opts opts})))
+        {:kind :generic-sql})))
+
+(defn- classify-alter-sequence
+  "ALTER SEQUENCE [IF EXISTS] name options… — at least one option is
+   MANDATORY here (PG's SeqOptList, not OptSeqOptList), which is the one
+   grammatical difference from CREATE.
+
+   RENAME TO / SET SCHEMA / OWNER TO are different statement shapes; they
+   fall through to :generic-sql."
+  [toks]
+  (let [ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
+        ts (if ie? (drop 2 toks) toks)]
+    (or (when-let [[nm ts1] (read-relation-name ts)]
+          (let [[opts ts2] (read-sequence-options ts1)
+                ts3 (drop-while #(= ";" (:text %)) ts2)]
+            (when (and (seq opts) (empty? ts3))
+              {:kind :alter-sequence
+               :seq-name nm
+               :if-exists? ie?
+               :seq-opts opts})))
+        {:kind :generic-sql})))
+
 (defn- classify-truncate
   "TRUNCATE [TABLE] [ONLY] name [*] [, …] [RESTART|CONTINUE IDENTITY]
    [CASCADE|RESTRICT]. Token-classified in full: JSqlParser's Truncate
@@ -814,6 +999,10 @@
            (contains-owner-to? rest-toks))
       {:kind :owner-noop
        :tag (str "ALTER " (str/upper-case (:text t1)))}
+
+      ;; Must come after the OWNER TO check above, which claims
+      ;; `ALTER SEQUENCE s OWNER TO r` as a no-op.
+      (kw=? t1 "sequence") (classify-alter-sequence rest-toks)
 
       (kw=? t1 "table")
       ;; Consume optional [ONLY], [IF EXISTS] and the table name (possibly

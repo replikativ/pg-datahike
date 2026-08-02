@@ -148,13 +148,62 @@
 
    :numeric-value-out-of-range
    {:sqlstate "22003"
-    :format (fn [{:keys [type value]}]
-              (when (and type value)
-                (str "value " (pr-str value) " out of range for type " type)))}
+    :format (fn [{:keys [type value detail]}]
+              (cond
+                (and type value)
+                (str "value " (pr-str value) " out of range for type " type)
+                ;; Math-function range failures carry a ready-made message
+                ;; ("input is out of range", "value out of range: overflow")
+                ;; rather than a type/value pair.
+                detail detail
+                :else nil))}
 
    :division-by-zero
    {:sqlstate "22012"
     :format (fn [_] "division by zero")}
+
+   ;; PG's two math-domain codes. Both come from the same places we call
+   ;; Math/* — float.c and numeric.c raise them instead of returning the
+   ;; IEEE-754 NaN/Inf that Java hands back. `detail` carries PG's exact
+   ;; wording ("cannot take square root of a negative number", …); see
+   ;; datahike.pg.sql.fns for the call sites.
+   :invalid-argument-for-power-function
+   {:sqlstate "2201F"
+    :format (fn [{:keys [detail]}] detail)}
+
+   :invalid-argument-for-logarithm
+   {:sqlstate "2201E"
+    :format (fn [{:keys [detail]}] detail)}
+
+   ;; width_bucket has its OWN code — its argument failures are 2201G,
+   ;; not the 22003 the surrounding float code uses (float.c:4190).
+   :invalid-argument-for-width-bucket
+   {:sqlstate "2201G"
+    :format (fn [{:keys [detail]}] detail)}
+
+   ;; Bit-string width coercion. PG uses two distinct codes: a fixed-width
+   ;; `bit(n)` mismatch is 22026, an over-long `bit varying(n)` is 22001
+   ;; (varbit.c:404, :755).
+   :string-data-length-mismatch
+   {:sqlstate "22026"
+    :format (fn [{:keys [detail]}] detail)}
+
+   :string-data-right-truncation
+   {:sqlstate "22001"
+    :format (fn [{:keys [detail]}] detail)}
+
+   ;; nextval past MAXVALUE / MINVALUE on a non-CYCLE sequence
+   ;; (sequence.c:736). PG names the sequence and the bound it hit.
+   :sequence-generator-limit-exceeded
+   {:sqlstate "2200H"
+    :format (fn [{:keys [detail]}] detail)}
+
+   :undefined-function
+   {:sqlstate "42883"
+    :format (fn [{:keys [function detail]}]
+              (or detail
+                  (when function
+                    (str "function " function " does not exist"))))}
 
    :array-element-error
    {:sqlstate "2202E"

@@ -285,3 +285,163 @@
           [code msg _] (errors/classify-exception outer)]
       (is (= "42703" code))
       (is (re-find #"column \"dept_id\"" msg)))))
+
+;; ============================================================================
+;; Math function domain errors (issue #22)
+;; ============================================================================
+;;
+;; Every expectation below was captured from PostgreSQL 17.10 — both the
+;; SQLSTATE and the exact errmsg string. Java's Math.* returns NaN or
+;; Infinity for all of these; PG raises. See the "Math function
+;; implementations" section in datahike.pg.sql.fns for why each check
+;; exists.
+
+(defn- call-sql-fn
+  "Invoke a mapped SQL function by name, as the translator does."
+  [fname & args]
+  (apply (get fns/sql-fn->clj-fn fname) args))
+
+(defn- sql-fn-error
+  "Return [sqlstate message] for a call expected to raise, or nil."
+  [fname & args]
+  (try (apply call-sql-fn fname args) nil
+       (catch Exception e
+         (let [[code msg _] (errors/classify-exception e)] [code msg]))))
+
+(deftest test-math-domain-errors
+  (testing "sqrt of a negative number → 2201F (was NaN — issue #22)"
+    (is (= ["2201F" "cannot take square root of a negative number"]
+           (sql-fn-error "sqrt" -5.0)))
+    (is (= ["2201F" "cannot take square root of a negative number"]
+           (sql-fn-error "sqrt" -42))))
+
+  (testing "logarithm domain → 2201E"
+    (is (= ["2201E" "cannot take logarithm of zero"] (sql-fn-error "ln" 0.0)))
+    (is (= ["2201E" "cannot take logarithm of a negative number"]
+           (sql-fn-error "ln" -1.0)))
+    (is (= ["2201E" "cannot take logarithm of zero"] (sql-fn-error "log" 0.0)))
+    (is (= ["2201E" "cannot take logarithm of a negative number"]
+           (sql-fn-error "log10" -1.0)))
+    (is (= ["2201E" "cannot take logarithm of zero"] (sql-fn-error "log" 0.0 10.0))))
+
+  (testing "log(1, x) is division by zero in PG, not a logarithm error"
+    (is (= ["22012" "division by zero"] (sql-fn-error "log" 1.0 10.0))))
+
+  (testing "power domain → 2201F"
+    (is (= ["2201F" "zero raised to a negative power is undefined"]
+           (sql-fn-error "power" 0.0 -1.0)))
+    (is (= ["2201F" "a negative number raised to a non-integer power yields a complex result"]
+           (sql-fn-error "power" -2.0 0.5))))
+
+  (testing "asin/acos outside [-1,1] → 22003"
+    (is (= ["22003" "input is out of range"] (sql-fn-error "asin" 2.0)))
+    (is (= ["22003" "input is out of range"] (sql-fn-error "acos" -2.0))))
+
+  (testing "overflow to infinity from finite inputs → 22003"
+    (is (= ["22003" "value out of range: overflow"] (sql-fn-error "exp" 10000.0)))
+    (is (= ["22003" "value out of range: overflow"] (sql-fn-error "power" 2.0 10000.0))))
+
+  (testing "UNDERFLOW is an error too — exp(-1000::float8) is not 0 in PG"
+    (is (= ["22003" "value out of range: underflow"] (sql-fn-error "exp" -1000.0))))
+
+  (testing "trig rejects an infinite argument (Java returns NaN)"
+    (doseq [fname ["sin" "cos" "tan" "cot"]]
+      (is (= ["22003" "input is out of range"]
+             (sql-fn-error fname Double/POSITIVE_INFINITY))
+          (str fname "(Infinity)"))))
+
+  (testing "acosh/atanh domain → 22003"
+    (is (= ["22003" "input is out of range"] (sql-fn-error "acosh" 0.5)))
+    (is (= ["22003" "input is out of range"] (sql-fn-error "atanh" 2.0))))
+
+  (testing "width_bucket argument failures are 2201G, not 22003"
+    (is (= ["2201G" "count must be greater than zero"]
+           (sql-fn-error "width_bucket" 5.0 0.0 10.0 0)))
+    (is (= ["2201G" "lower bound cannot equal upper bound"]
+           (sql-fn-error "width_bucket" 5.0 3.0 3.0 5)))
+    (is (= ["2201G" "lower and upper bounds cannot be NaN"]
+           (sql-fn-error "width_bucket" 5.0 Double/NaN 10.0 5)))
+    (is (= ["2201G" "lower and upper bounds must be finite"]
+           (sql-fn-error "width_bucket" 5.0 0.0 Double/POSITIVE_INFINITY 5)))))
+
+(deftest test-math-non-errors-that-look-like-errors
+  (testing "sinh/cosh overflow to Infinity WITHOUT error, unlike exp"
+    (is (Double/isInfinite (double (call-sql-fn "sinh" 1000.0))))
+    (is (Double/isInfinite (double (call-sql-fn "cosh" 1000.0)))))
+
+  (testing "cot(0) is Infinity, not an error"
+    (is (Double/isInfinite (double (call-sql-fn "cot" 0.0)))))
+
+  (testing "atanh(±1) is ±Infinity, not an error"
+    (is (Double/isInfinite (double (call-sql-fn "atanh" 1.0))))
+    (is (Double/isInfinite (double (call-sql-fn "atanh" -1.0)))))
+
+  (testing "acosh(NaN) is NaN — NaN slips past the `< 1.0` guard, as in PG"
+    (is (Double/isNaN (double (call-sql-fn "acosh" Double/NaN)))))
+
+  (testing "float8 sign(NaN) is 0 in PG, not NaN as Math/signum gives"
+    (is (= 0.0 (call-sql-fn "sign" Double/NaN))))
+
+  (testing "width_bucket with low > high mirror-reverses rather than erroring"
+    (is (= 3 (call-sql-fn "width_bucket" 5.0 10.0 0.0 5)))))
+
+(deftest test-math-nan-propagates-without-error
+  (testing "NaN input propagates — PG does NOT raise a domain error for it"
+    (doseq [fname ["sqrt" "ln" "log10" "asin" "acos" "exp"]]
+      (let [r (call-sql-fn fname Double/NaN)]
+        (is (and (number? r) (Double/isNaN (double r)))
+            (str fname "(NaN) should be NaN, got " r)))))
+
+  (testing "NaN in either power argument yields NaN"
+    (is (Double/isNaN (double (call-sql-fn "power" Double/NaN 2.0))))
+    (is (Double/isNaN (double (call-sql-fn "power" 2.0 Double/NaN))))))
+
+(deftest test-math-values-match-postgres
+  (testing "log is base 10, not natural log — ln is natural log"
+    ;; The old mapping sent `log` to Math/log, silently returning
+    ;; 4.605… for log(100): a wrong ANSWER, not an error.
+    (is (= 2.0 (call-sql-fn "log" 100.0)))
+    (is (= 2.0 (call-sql-fn "log10" 100.0)))
+    (is (= 3.0 (call-sql-fn "log" 2.0 8.0)))
+    (is (< (Math/abs (- 0.6931471805599453 (double (call-sql-fn "ln" 2.0)))) 1e-15)))
+
+  (testing "round breaks ties away from zero, like PG (Math/round rounds toward +inf)"
+    (is (= 3 (call-sql-fn "round" 2.5)))
+    (is (= -3 (call-sql-fn "round" -2.5)))
+    (is (= 0 (compare 2.46M (call-sql-fn "round" 2.4567 2)))))
+
+  (testing "trunc rounds toward zero"
+    (is (= 1 (call-sql-fn "trunc" 1.7)))
+    (is (= -1 (call-sql-fn "trunc" -1.7))))
+
+  (testing "cbrt of a negative number is defined (unlike sqrt)"
+    (is (= -2.0 (call-sql-fn "cbrt" -8.0))))
+
+  (testing "gcd / lcm / width_bucket"
+    (is (= 0 (compare (biginteger 4) (call-sql-fn "gcd" 12 8))))
+    (is (= 0 (compare (biginteger 24) (call-sql-fn "lcm" 12 8))))
+    (is (= 0 (compare (biginteger 0) (call-sql-fn "lcm" 0 8))))
+    (is (= 3 (call-sql-fn "width_bucket" 5.0 0.0 10.0 5)))
+    (is (= 0 (call-sql-fn "width_bucket" -1.0 0.0 10.0 5)))
+    (is (= 6 (call-sql-fn "width_bucket" 99.0 0.0 10.0 5)))))
+
+(deftest test-math-arity-is-42883
+  (testing "wrong argument count resolves as 42883, not a runtime XX000"
+    (let [[code msg _] (try (fns/check-arity! "sqrt" 2) nil
+                            (catch Exception e (errors/classify-exception e)))]
+      (is (= "42883" code))
+      ;; PG's wording for untyped literals: sqrt('a','b') reports
+      ;; "function sqrt(unknown, unknown) does not exist".
+      (is (= "function sqrt(unknown, unknown) does not exist" msg)))
+    (let [[code _] (try (fns/check-arity! "pi" 1) nil
+                        (catch Exception e (errors/classify-exception e)))]
+      (is (= "42883" code))))
+
+  (testing "accepted arities pass"
+    (is (nil? (fns/check-arity! "log" 1)))
+    (is (nil? (fns/check-arity! "log" 2)))
+    (is (nil? (fns/check-arity! "round" 2)))
+    (is (nil? (fns/check-arity! "pi" 0))))
+
+  (testing "unregistered names are unchecked"
+    (is (nil? (fns/check-arity! "pg_get_expr" 7)))))

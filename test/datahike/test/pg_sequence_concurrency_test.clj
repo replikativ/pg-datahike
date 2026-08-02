@@ -87,11 +87,14 @@
         "values cover the contiguous range [1 … N×M] with no gaps")))
 
 (deftest nextval-with-increment-by-step-no-duplicates
-  ;; Same shape, but with INCREMENT BY 5. PG semantics: `START WITH 0`
-  ;; means the first nextval returns 0; INCREMENT BY 5 advances by 5
-  ;; per call. Expect contiguous [0, 5, 10, … (total-1)×5].
+  ;; Same shape, but with INCREMENT BY 5. Starting at 0 needs an explicit
+  ;; MINVALUE 0: an ascending sequence defaults to MINVALUE 1, and PG
+  ;; rejects `START WITH 0` against it with 22023 "START value (0) cannot
+  ;; be less than MINVALUE (1)" (verified against PostgreSQL 17.10). The
+  ;; first nextval then returns 0 and each call advances by 5, giving a
+  ;; contiguous [0, 5, 10, … (total-1)x5].
   (let [setup (pg/make-query-handler *conn*)]
-    (let [^PgWireServer$QueryResult r (.execute setup "CREATE SEQUENCE s5 START WITH 0 INCREMENT BY 5")]
+    (let [^PgWireServer$QueryResult r (.execute setup "CREATE SEQUENCE s5 START WITH 0 MINVALUE 0 INCREMENT BY 5")]
       (is (nil? (.error r)))))
   (let [n-threads 4
         n-calls 25

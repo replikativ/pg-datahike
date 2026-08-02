@@ -28,7 +28,9 @@
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
@@ -317,6 +319,11 @@
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
      (pg-arr/array? v) (pg-arr/to-pg-text v)
+    ;; PgBit → its digit run. Before the wrapper existed a bit value WAS
+    ;; a String and fell through to the string? branch below, which is
+    ;; why it reported as text (#19). Same defrecord-before-string
+    ;; ordering as PgArray.
+     (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
     ;; PgRecord → PG canonical record_out text `(f1,f2,…)`. Checked before
     ;; string?/vector? for the same defrecord reason as PgArray.
      (pg-rec/record? v) (do (pg-rec/register-layouts!
@@ -3826,7 +3833,8 @@
    whole group is atomic. COPY is excluded — it runs its own sub-protocol
    and commits separately."
   #{:insert :update :update-with-recursive :delete :truncate
-    :ddl-create :ddl-create-sequence :ddl-create-enum :ddl-create-domain
+    :ddl-create :ddl-create-sequence :ddl-alter-sequence
+    :ddl-create-enum :ddl-create-domain
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-sequence})
 
 (defn- handle-commit
@@ -4281,6 +4289,40 @@
                                  :in [$ ?e]}
                                db0 eid))
                  1)
+        ;; Bounds and CYCLE. Absent on sequences created before these
+        ;; attributes existed (and on the IDENTITY-column path), so fall
+        ;; back to the type-max/min an unqualified CREATE SEQUENCE gives.
+        seq-attr (fn [attr default]
+                   (let [v (ffirst (q-fn {:find '[?v]
+                                          :where [['?e attr '?v]]
+                                          :in '[$ ?e]}
+                                         db0 eid))]
+                     (if (some? v) v default)))
+        maxv (seq-attr :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
+        minv (seq-attr :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
+        cycle? (boolean (seq-attr :__seq__/cycle false))
+        ;; PG's wraparound test asks whether the NEXT value would pass the
+        ;; bound, and is written to avoid signed overflow (sequence.c:732).
+        ;; Exhausted without CYCLE is 2200H; with CYCLE the counter wraps
+        ;; to MINVALUE going up / MAXVALUE going down — not to START.
+        advance (fn [^long curr]
+                  (if (pos? incr)
+                    (if (if (>= maxv 0) (> curr (- maxv incr)) (> (+ curr incr) maxv))
+                      (if cycle?
+                        minv
+                        (throw (errors/pg-error
+                                :sequence-generator-limit-exceeded
+                                {:detail (str "nextval: reached maximum value of sequence \""
+                                              seq-name "\" (" maxv ")")})))
+                      (+ curr incr))
+                    (if (if (< minv 0) (< curr (- minv incr)) (< (+ curr incr) minv))
+                      (if cycle?
+                        maxv
+                        (throw (errors/pg-error
+                                :sequence-generator-limit-exceeded
+                                {:detail (str "nextval: reached minimum value of sequence \""
+                                              seq-name "\" (" minv ")")})))
+                      (+ curr incr))))
         read-curr (fn []
                     (ffirst (q-fn '{:find [?v]
                                     :where [[?e :__seq__/value ?v]]
@@ -4301,7 +4343,7 @@
     ;; (commit-wait-time) between batches before flushing.
     (loop [attempt 0]
       (let [curr (or (read-curr) 0)
-            next (+ curr incr)
+            next (advance curr)
             cas-ok?
             (try (transact-recorded! conn [[:db/cas eid :__seq__/value curr next]])
                  true
@@ -4325,7 +4367,10 @@
   (try
     (single-row-result "nextval" PgWireServer/OID_INT8 (str (nextval! conn (:seq-name parsed))))
     (catch Exception e
-      (classified-error "nextval error: " e))))
+      ;; No prefix: every error reachable here is already PG-shaped
+      ;; ("relation \"s\" does not exist", "nextval: reached maximum
+      ;; value of sequence …"), and PG prefixes neither.
+      (classified-error "" e))))
 
 (defn- handle-currval
   "SELECT currval('seq_name') — read current value. PG raises 55000 if
@@ -5564,6 +5609,79 @@
     (when (and temp-tables (:temp? parsed) (nil? (.-error result)))
       (swap! temp-tables conj (:table-name parsed)))
     result))
+
+(defn- sequence-current-params
+  "Read a sequence's stored parameters back into the shape
+   ddl/sequence-params expects as `:existing`, so ALTER validates the
+   merge of old and new the way PG's init_params does."
+  [db seq-name]
+  (when-let [eid (ffirst (d/q '{:find [?e]
+                                :where [[?e :__seq__/name ?n]]
+                                :in [$ ?n]}
+                              db seq-name))]
+    (let [attr (fn [a default]
+                 (let [v (ffirst (d/q {:find '[?v]
+                                       :where [['?e a '?v]]
+                                       :in '[$ ?e]}
+                                      db eid))]
+                   (if (some? v) v default)))
+          incr (attr :__seq__/increment 1)]
+      {:eid eid
+       :type (attr :__seq__/type "bigint")
+       :increment incr
+       :minvalue (attr :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
+       :maxvalue (attr :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
+       :start (attr :__seq__/start 1)
+       :cache (attr :__seq__/cache 1)
+       :cycle? (boolean (attr :__seq__/cycle false))})))
+
+(defn- exec-ddl-alter-sequence
+  "ALTER SEQUENCE [IF EXISTS] name options…
+
+   Every option except RESTART rewrites the sequence's parameters;
+   RESTART additionally moves the counter. RESTART never changes START —
+   only `START WITH` does — and a bare RESTART restarts at the START in
+   effect after this same statement."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        {:keys [seq-name if-exists? seq-opts]} parsed
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))
+        existing (sequence-current-params current-db seq-name)]
+    (cond
+      (and (nil? existing) if-exists?)
+      ;; PG emits a notice and succeeds.
+      (empty-result "ALTER SEQUENCE")
+
+      (nil? existing)
+      (classified-error ""
+                        (ex-info (str "relation \"" seq-name "\" does not exist")
+                                 {:sqlstate "42P01" :table seq-name}))
+
+      :else
+      (try
+        (let [params (ddl/sequence-params seq-opts {:existing existing})
+              eid (:eid existing)
+              ;; The stored counter is the last value handed out, so a
+              ;; RESTART to N is stored as N - increment for the next
+              ;; advance to land exactly on N.
+              tx-data (cond-> [[:db/add eid :__seq__/increment (:increment params)]
+                               [:db/add eid :__seq__/minvalue (:minvalue params)]
+                               [:db/add eid :__seq__/maxvalue (:maxvalue params)]
+                               [:db/add eid :__seq__/cache (:cache params)]
+                               [:db/add eid :__seq__/cycle (:cycle? params)]
+                               [:db/add eid :__seq__/start (:start params)]
+                               [:db/add eid :__seq__/type (:type params)]]
+                        (:restart params)
+                        (conj [:db/add eid :__seq__/value
+                               (- (:restart params) (:increment params))]))]
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state tx-data "ALTER SEQUENCE")
+            (do (transact-recorded! conn tx-data)
+                (empty-result "ALTER SEQUENCE"))))
+        (catch Exception e
+          (classified-error "" e))))))
 
 (defn- exec-ddl-create-sequence
   [ctx parsed]
@@ -6908,6 +7026,8 @@
                                                      (exec-ddl-create ctx parsed))
                           :ddl-create-sequence   (do (invalidate-schema-cache!)
                                                      (exec-ddl-create-sequence ctx parsed))
+                          :ddl-alter-sequence    (do (invalidate-schema-cache!)
+                                                     (exec-ddl-alter-sequence ctx parsed))
                           :ddl-create-enum       (do (invalidate-schema-cache!)
                                                      (exec-ddl-create-enum ctx parsed))
                           :ddl-create-composite  (do (invalidate-schema-cache!)

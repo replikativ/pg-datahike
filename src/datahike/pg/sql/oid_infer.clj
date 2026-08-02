@@ -91,10 +91,24 @@
    "ceiling"       :arg-type
    "floor"         :arg-type
    "round"         :arg-type
+   "trunc"         :arg-type
    "sign"          :arg-type
    "mod"           :arg-type
+   "gcd"           :arg-type
+   "lcm"           :arg-type
+   "width_bucket"  types/oid-int4
    ;; Math — always float
    "sqrt"          types/oid-float8
+   "cbrt"          types/oid-float8
+   "degrees"       types/oid-float8
+   "radians"       types/oid-float8
+   "cot"           types/oid-float8
+   "sinh"          types/oid-float8
+   "cosh"          types/oid-float8
+   "tanh"          types/oid-float8
+   "asinh"         types/oid-float8
+   "acosh"         types/oid-float8
+   "atanh"         types/oid-float8
    "exp"           types/oid-float8
    "ln"            types/oid-float8
    "log"           types/oid-float8
@@ -129,7 +143,9 @@
    "extract"       types/oid-float8
    "age"           types/oid-interval
    ;; Type checks / introspection
-   "pg_typeof"     types/oid-text
+   ;; pg_typeof returns regtype, not text — this is the OID the
+   ;; reporter of #19 saw and mistook for the bit type's own.
+   "pg_typeof"     types/oid-regtype
    "version"       types/oid-text
    "format_type"   types/oid-text
    "current_setting" types/oid-text
@@ -425,7 +441,8 @@
                         :else types/oid-timestamp)
            :uuid      types/oid-uuid
            :bytes     types/oid-bytea
-           :bit       types/oid-text
+           :bit       types/oid-bit
+           :varbit    types/oid-varbit
            nil)
          ;; Fallback for types cast-category doesn't width-classify (jsonb,
          ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
