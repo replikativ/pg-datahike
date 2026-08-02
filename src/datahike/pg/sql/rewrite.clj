@@ -696,85 +696,14 @@
                          (conj [(:end lhs-end-tok)   (:end lhs-end-tok)   ")"]))))))))))
 
 ;; ============================================================================
-;; CREATE SEQUENCE … NO MINVALUE / NO MAXVALUE / NO CYCLE — JSqlParser's
-;; grammar accepts MINVALUE n / MAXVALUE n / CYCLE / etc. but rejects the
-;; `NO` modifier pg_dump emits. The clause is a no-op semantically (use
-;; default min/max, no cycling), so strip the two-token group.
+;; CREATE / ALTER SEQUENCE used to need two rules here — one to strip
+;; `NO MINVALUE`/`NO MAXVALUE`/`NO CYCLE`, one to strip `IF NOT EXISTS` —
+;; because JSqlParser's CreateSequence grammar has no production for
+;; either. Both are gone: sequence DDL is now token-classified in full
+;; (classify/classify-create-sequence) and never reaches JSqlParser, so
+;; the option list is parsed rather than deleted before parsing. See
+;; issue #21.
 ;; ============================================================================
-
-(defn create-sequence-no-clause-rule
-  "Strip `NO MINVALUE`, `NO MAXVALUE`, `NO CYCLE` token pairs anywhere
-   they appear (typically inside a CREATE SEQUENCE statement). Replaces
-   each with a single space.
-
-   We don't restrict to CREATE SEQUENCE context because a `NO MINVALUE`
-   pair would only appear there in well-formed SQL, and the token-driven
-   matcher is comment- and string-literal-safe via classify."
-  [toks]
-  (let [n (count toks)]
-    (loop [i 0, acc []]
-      (if (>= i (dec n))
-        acc
-        (let [t0 (nth toks i)
-              t1 (nth toks (inc i) nil)]
-          (if (and (= "no" (kw-text t0))
-                   (#{"minvalue" "maxvalue" "cycle"} (kw-text t1)))
-            (recur (+ i 2)
-                   (conj acc [(:pos t0) (:end t1) " "]))
-            (recur (inc i) acc)))))))
-
-;; ============================================================================
-;; CREATE SEQUENCE IF NOT EXISTS — JSqlParser's CreateSequence grammar
-;; has no IF NOT EXISTS production at all (5.2), so the statement dies
-;; with a ParseException before translation. Strip the three-token
-;; span pre-parse; the flag is re-detected from the original source in
-;; sql.clj's CreateSequence dispatch and carried as `:if-not-exists?`
-;; for the executor's no-op-vs-42P07 decision.
-;; ============================================================================
-
-(defn create-sequence-if-not-exists-rule
-  "Strip `IF NOT EXISTS` from `CREATE [TEMP[ORARY]|UNLOGGED] SEQUENCE
-   IF NOT EXISTS …`. Replaces the span with a single space.
-
-   Anchored on the `CREATE … SEQUENCE` prefix so `CREATE TABLE IF NOT
-   EXISTS` (which JSqlParser handles natively) is untouched. Comment
-   tokens between keywords pass through invisibly."
-  [toks]
-  (let [n (count toks)
-        next-nc (fn [^long idx]
-                  ;; index of the next non-comment token after idx, or -1.
-                  (loop [i (inc idx)]
-                    (let [t (nth toks i nil)]
-                      (cond
-                        (nil? t) -1
-                        (= :comment (:type t)) (recur (inc i))
-                        :else i))))]
-    (loop [i 0, acc []]
-      (if (>= i n)
-        acc
-        (if-not (= "create" (kw-text (nth toks i)))
-          (recur (inc i) acc)
-          ;; Skip optional TEMP/TEMPORARY/UNLOGGED modifiers.
-          (let [j (loop [j (next-nc i)]
-                    (if (and (not (neg? j))
-                             (#{"temp" "temporary" "unlogged"}
-                              (kw-text (nth toks j))))
-                      (recur (next-nc j))
-                      j))]
-            (if-not (and (not (neg? j))
-                         (= "sequence" (kw-text (nth toks j))))
-              (recur (inc i) acc)
-              (let [k1 (next-nc j)
-                    k2 (if (neg? k1) -1 (next-nc k1))
-                    k3 (if (neg? k2) -1 (next-nc k2))]
-                (if (and (not (neg? k3))
-                         (= "if"     (kw-text (nth toks k1)))
-                         (= "not"    (kw-text (nth toks k2)))
-                         (= "exists" (kw-text (nth toks k3))))
-                  (recur (inc k3)
-                         (conj acc [(:pos (nth toks k1))
-                                    (:end (nth toks k3)) " "]))
-                  (recur (inc j) acc))))))))))
 
 ;; ============================================================================
 ;; CREATE TABLE … (cols) PARTITION BY <strategy> (<expr>) — JSqlParser
@@ -912,6 +841,4 @@
    reserved-column-name-rule
    boolean-is-rule
    default-fn-call-paren-rule
-   partition-by-rule
-   create-sequence-no-clause-rule
-   create-sequence-if-not-exists-rule])
+   partition-by-rule])

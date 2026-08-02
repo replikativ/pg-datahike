@@ -1311,6 +1311,11 @@
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.
     :create-type-enum :create-type-composite :create-domain
+    ;; CREATE / ALTER SEQUENCE — JSqlParser's grammar covers only a
+    ;; subset of PG's option list (INCREMENT BY but not INCREMENT,
+    ;; no AS / IF NOT EXISTS / NO MINVALUE / signed values) and has no
+    ;; AlterSequence branch downstream, so both are parsed here.
+    :create-sequence :alter-sequence
     ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks
     ;; RESTART/CONTINUE IDENTITY) and multi-name DROP TABLE (JSqlParser
     ;; 5.2 parses a single name only). Both re-tagged to non-:system

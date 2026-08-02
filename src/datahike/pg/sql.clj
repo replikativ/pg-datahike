@@ -669,6 +669,23 @@
               :drop-table-multi
               (assoc base :type :ddl-drop)
 
+              ;; CREATE / ALTER SEQUENCE — fully token-classified; the
+              ;; option list arrives on cls-info as :seq-opts. Validation
+              ;; (defaults, bounds, 42601/22023) runs in ddl and raises,
+              ;; so it is caught here and surfaced with its own SQLSTATE.
+              :create-sequence
+              (try
+                (merge base (ddl/translate-create-sequence cls-info))
+                (catch Throwable e
+                  (let [[state msg _] (errors/classify-exception e)]
+                    {:type :error :message msg :sqlstate state})))
+
+              ;; ALTER validates against the sequence's CURRENT parameters,
+              ;; which live in the db — so it only carries the options here
+              ;; and the executor resolves them.
+              :alter-sequence
+              (assoc base :type :ddl-alter-sequence)
+
               :create-domain
               (try
                 (let [toks (database/tokenize sql)
@@ -1407,18 +1424,6 @@
           ;; CREATE TABLE
                     (instance? CreateTable stmt)
                     (ddl/translate-create-table ^CreateTable stmt db)
-
-          ;; CREATE SEQUENCE
-                    (instance? CreateSequence stmt)
-                    (cond-> (ddl/translate-create-sequence ^CreateSequence stmt)
-                      ;; IF NOT EXISTS is stripped pre-parse (JSqlParser's
-                      ;; CreateSequence grammar has no such production —
-                      ;; rewrite/create-sequence-if-not-exists-rule), so
-                      ;; re-detect it from the ORIGINAL source and carry
-                      ;; it for the executor's no-op-vs-42P07 decision.
-                      (re-find #"(?i)create\s+(?:temp(?:orary)?\s+|unlogged\s+)?sequence\s+if\s+not\s+exists"
-                               sql)
-                      (assoc :if-not-exists? true))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)

@@ -181,6 +181,12 @@
    {:sqlstate "2201G"
     :format (fn [{:keys [detail]}] detail)}
 
+   ;; nextval past MAXVALUE / MINVALUE on a non-CYCLE sequence
+   ;; (sequence.c:736). PG names the sequence and the bound it hit.
+   :sequence-generator-limit-exceeded
+   {:sqlstate "2200H"
+    :format (fn [{:keys [detail]}] detail)}
+
    :undefined-function
    {:sqlstate "42883"
     :format (fn [{:keys [function detail]}]

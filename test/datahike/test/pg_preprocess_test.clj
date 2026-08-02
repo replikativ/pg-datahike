@@ -169,16 +169,20 @@
       (is (= sql (preprocess sql))))))
 
 ;; ============================================================================
-;; CREATE SEQUENCE IF NOT EXISTS — strip pre-parse (JSqlParser's
-;; CreateSequence grammar has no IF NOT EXISTS production)
+;; CREATE SEQUENCE is NOT rewritten any more — it is token-classified in
+;; full (classify/classify-create-sequence) and never reaches JSqlParser,
+;; so IF NOT EXISTS and NO MINVALUE survive preprocessing untouched.
 ;; ============================================================================
 
-(deftest create-sequence-if-not-exists-still-rewrites
-  (testing "IF NOT EXISTS stripped so JSqlParser can parse the statement"
-    (is (= "CREATE SEQUENCE   foo START WITH 5"
-           (preprocess "CREATE SEQUENCE IF NOT EXISTS foo START WITH 5")))))
+(deftest create-sequence-is-not-preprocessed
+  (testing "IF NOT EXISTS is left in place for the classifier to read"
+    (let [sql "CREATE SEQUENCE IF NOT EXISTS foo START WITH 5"]
+      (is (= sql (preprocess sql)))))
+  (testing "NO MINVALUE / NO MAXVALUE / NO CYCLE survive too"
+    (let [sql "CREATE SEQUENCE foo NO MINVALUE NO MAXVALUE NO CYCLE"]
+      (is (= sql (preprocess sql))))))
 
-(deftest create-sequence-if-not-exists-in-string-literal
+(deftest create-sequence-in-string-literal
   (testing "the phrase inside a string literal must be preserved"
     (let [sql "INSERT INTO t (note) VALUES ('CREATE SEQUENCE IF NOT EXISTS foo')"]
       (is (= sql (preprocess sql))))))
