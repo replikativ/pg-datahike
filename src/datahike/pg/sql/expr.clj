@@ -2764,38 +2764,38 @@
               (let [v (ctx/col-var! ctx resolved)
                     guards (ctx/null-guard-clauses ctx [v])]
                 (conj guards [(list '= v pv)]))))
-        (if (and (instance? Column left)
-                 (nil? (.getArrayConstructor ^Column left))
-                 (or (instance? LongValue right)
-                     (instance? DoubleValue right)
-                     (instance? StringValue right)))
-          (let [resolved (ctx/resolve-column left
-                                             (:table-aliases ctx)
-                                             (:default-table ctx)
-                                             (:col-overrides ctx)
-                                             (:derived-aliases ctx))
+          (if (and (instance? Column left)
+                   (nil? (.getArrayConstructor ^Column left))
+                   (or (instance? LongValue right)
+                       (instance? DoubleValue right)
+                       (instance? StringValue right)))
+            (let [resolved (ctx/resolve-column left
+                                               (:table-aliases ctx)
+                                               (:default-table ctx)
+                                               (:col-overrides ctx)
+                                               (:derived-aliases ctx))
                 ;; PG-style unknown-literal coercion: `<typed-col> = '<lit>'`
                 ;; routes the literal through the column's typinput when
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
-                coerced (coerce-unknown-literal ctx left right)
-                val (or coerced (translate-expr ctx right))]
-            (cond
-              (and (vector? resolved) (= :db-id (first resolved)))
+                  coerced (coerce-unknown-literal ctx left right)
+                  val (or coerced (translate-expr ctx right))]
+              (cond
+                (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
-              (let [evar (ctx/entity-var! ctx (second resolved))]
-                [[(list '= evar val)]])
+                (let [evar (ctx/entity-var! ctx (second resolved))]
+                  [[(list '= evar val)]])
               ;; Top-level conjunct on a plain column with a
               ;; matching-typed constant → value-bound data pattern
               ;; [?e :attr v]: an indexable clause instead of a
               ;; get-else scan + equality predicate over every row.
-              (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
-              []
+                (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
+                []
               ;; Regular column = value (including aliased columns)
-              :else
-              (let [v (ctx/col-var! ctx resolved)]
-                [[(list '= v val)]])))
-          (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e))))))
+                :else
+                (let [v (ctx/col-var! ctx resolved)]
+                  [[(list '= v val)]])))
+            (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e))))))
 
     (instance? NotEqualsTo expr)
     (let [^NotEqualsTo e expr

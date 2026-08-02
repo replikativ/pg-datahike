@@ -4286,76 +4286,76 @@
                   ;; opaque (which disabled row-level conflict detection
                   ;; for every INSERT-bearing transaction).
                   (with-meta
-                  (fn unique-check [txdb row-attrs]
-                    (let [schema (:schema txdb)
-                          q-fn d/q
+                    (fn unique-check [txdb row-attrs]
+                      (let [schema (:schema txdb)
+                            q-fn d/q
                       ;; Partition identity attrs by shape.
                       ;;   scalar-ids → {:attr constraint-name}
                       ;;   tuple-ids  → [{:attr :cols [component-attrs] :name c}]
-                          scalar-ids
-                          (into {}
-                                (keep (fn [[attr m]]
-                                        (when (and (map? m)
-                                                   (= :db.unique/identity (:db/unique m))
-                                                   (not= :db.type/tuple (:db/valueType m))
-                                                   (keyword? attr))
-                                          [attr (str table-name "_pkey")])))
-                                schema)
-                          tuple-ids
-                          (into []
-                                (keep (fn [[attr m]]
-                                        (when (and (map? m)
-                                                   (= :db.unique/identity (:db/unique m))
-                                                   (= :db.type/tuple (:db/valueType m))
-                                                   (seq (:db/tupleAttrs m))
-                                                   (keyword? attr))
-                                          {:attr attr
-                                           :cols (:db/tupleAttrs m)
-                                           :name (str table-name "_pkey")})))
-                                schema)
-                          seen (volatile! {})
-                          raise! (fn [attr val constraint]
-                                   (throw (ex-info "unique violation"
-                                                   {:error      :unique-violation
-                                                    :table      table-name
-                                                    :column     (name attr)
-                                                    :constraint constraint
-                                                    :value      val
-                                                    :datahike/collision [attr val]})))]
-                      (doseq [attrs row-attrs]
+                            scalar-ids
+                            (into {}
+                                  (keep (fn [[attr m]]
+                                          (when (and (map? m)
+                                                     (= :db.unique/identity (:db/unique m))
+                                                     (not= :db.type/tuple (:db/valueType m))
+                                                     (keyword? attr))
+                                            [attr (str table-name "_pkey")])))
+                                  schema)
+                            tuple-ids
+                            (into []
+                                  (keep (fn [[attr m]]
+                                          (when (and (map? m)
+                                                     (= :db.unique/identity (:db/unique m))
+                                                     (= :db.type/tuple (:db/valueType m))
+                                                     (seq (:db/tupleAttrs m))
+                                                     (keyword? attr))
+                                            {:attr attr
+                                             :cols (:db/tupleAttrs m)
+                                             :name (str table-name "_pkey")})))
+                                  schema)
+                            seen (volatile! {})
+                            raise! (fn [attr val constraint]
+                                     (throw (ex-info "unique violation"
+                                                     {:error      :unique-violation
+                                                      :table      table-name
+                                                      :column     (name attr)
+                                                      :constraint constraint
+                                                      :value      val
+                                                      :datahike/collision [attr val]})))]
+                        (doseq [attrs row-attrs]
                     ;; 1) Scalar identity checks
-                        (doseq [[a v] attrs
-                                :when (and (contains? scalar-ids a) (some? v))]
-                          (let [cname (get scalar-ids a)]
-                            (when (ffirst (q-fn '{:find [?e]
-                                                  :in [$ ?a ?v]
-                                                  :where [[?e ?a ?v]]}
-                                                txdb a v))
-                              (raise! a v cname))
-                            (when (contains? (get @seen a) v)
-                              (raise! a v cname))
-                            (vswap! seen update a (fnil conj #{}) v)))
+                          (doseq [[a v] attrs
+                                  :when (and (contains? scalar-ids a) (some? v))]
+                            (let [cname (get scalar-ids a)]
+                              (when (ffirst (q-fn '{:find [?e]
+                                                    :in [$ ?a ?v]
+                                                    :where [[?e ?a ?v]]}
+                                                  txdb a v))
+                                (raise! a v cname))
+                              (when (contains? (get @seen a) v)
+                                (raise! a v cname))
+                              (vswap! seen update a (fnil conj #{}) v)))
                     ;; 2) Tuple identity checks (multi-col PK).
                     ;; Mirror Datahike's auto-population: the tuple
                     ;; value is the vector of component-attr values in
                     ;; :db/tupleAttrs order. Skip rows where any
                     ;; component is absent — those can't be enforced
                     ;; until the writer sees the full entity.
-                        (doseq [tid tuple-ids
-                                :let [attr (:attr tid)
-                                      cols (:cols tid)
-                                      cname (:name tid)
-                                      tuple-val (mapv #(get attrs %) cols)]
-                                :when (every? some? tuple-val)]
-                          (when (ffirst (q-fn '{:find [?e]
-                                                :in [$ ?a ?v]
-                                                :where [[?e ?a ?v]]}
-                                              txdb attr tuple-val))
-                            (raise! attr tuple-val cname))
-                          (when (contains? (get @seen attr) tuple-val)
-                            (raise! attr tuple-val cname))
-                          (vswap! seen update attr (fnil conj #{}) tuple-val)))
-                      []))
+                          (doseq [tid tuple-ids
+                                  :let [attr (:attr tid)
+                                        cols (:cols tid)
+                                        cname (:name tid)
+                                        tuple-val (mapv #(get attrs %) cols)]
+                                  :when (every? some? tuple-val)]
+                            (when (ffirst (q-fn '{:find [?e]
+                                                  :in [$ ?a ?v]
+                                                  :where [[?e ?a ?v]]}
+                                                txdb attr tuple-val))
+                              (raise! attr tuple-val cname))
+                            (when (contains? (get @seen attr) tuple-val)
+                              (raise! attr tuple-val cname))
+                            (vswap! seen update attr (fnil conj #{}) tuple-val)))
+                        []))
                     {:datahike.pg/fresh-insert true})
                   row-attrs]]
                 (vec (mapcat

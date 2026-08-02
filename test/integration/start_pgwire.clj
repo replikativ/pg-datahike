@@ -27,14 +27,14 @@
                :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))}
               {:backend :memory :id (java.util.UUID/randomUUID)})
       cfg (cond-> {:store store
-           :schema-flexibility :write
+                   :schema-flexibility :write
            ;; DATAHIKE_KEEP_HISTORY=true to exercise history; default off for
            ;; integration tests where writes are the throughput bottleneck.
-           :keep-history? (= "true" (System/getenv "DATAHIKE_KEEP_HISTORY"))
+                   :keep-history? (= "true" (System/getenv "DATAHIKE_KEEP_HISTORY"))
            ;; SQL migration order (CREATE TABLE -> COPY -> ADD PRIMARY KEY)
            ;; enables uniqueness on populated attributes — the gated
            ;; index-backfill migration (replikativ/datahike#934) must be on.
-           :allow-index-backfill? true}
+                   :allow-index-backfill? true}
             (= "true" (System/getenv "DATAHIKE_WRITE_OPT"))
             (assoc :index-config {:diff-buf-size 256}
                    :fuse-index-roots? true))

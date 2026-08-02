@@ -948,65 +948,65 @@
   ([buf] (tx-buffer-eas buf nil))
   ([buf db]
    (let [schema (when db (:schema db))]
-   (reduce
-    (fn [acc item]
-      (cond
-        (map? item)
-        (let [eid (:db/id item)]
-          (cond
-            (and (number? eid) (pos? (long eid)))
-            (into acc (keep #(when (and (keyword? %) (not= :db/id %)) [eid %]))
-                  (keys item))
+     (reduce
+      (fn [acc item]
+        (cond
+          (map? item)
+          (let [eid (:db/id item)]
+            (cond
+              (and (number? eid) (pos? (long eid)))
+              (into acc (keep #(when (and (keyword? %) (not= :db/id %)) [eid %]))
+                    (keys item))
 
-            (nil? schema) (reduced ::opaque)
+              (nil? schema) (reduced ::opaque)
 
-            :else
+              :else
             ;; id-less / tempid map: find upsert targets via its unique
             ;; attribute values. Existing target → the map writes THAT
             ;; row; none → fresh entity, no attributable writes.
-            (let [upsert-eids
-                  (keep (fn [[k v]]
-                          (when (and (keyword? k) (some? v)
-                                     (get-in schema [k :db/unique]))
-                            (some-> ^datahike.datom.Datom
-                                    (first (d/datoms db {:index :avet
-                                                         :components [k v]}))
-                                    (.-e))))
-                        item)]
-              (if (seq upsert-eids)
-                (into acc
-                      (for [e (distinct upsert-eids)
-                            k (keys item)
-                            :when (and (keyword? k) (not= :db/id k))]
-                        [(long e) k]))
-                acc))))
-       (vector? item)
-       (case (first item)
-         (:db/add :db/retract) (let [e (nth item 1 nil) a (nth item 2 nil)]
-                                 (if (and (number? e) (keyword? a))
-                                   (conj acc [(long e) a])
-                                   (reduced ::opaque)))
-         :db.fn/cas (let [e (nth item 1 nil) a (nth item 2 nil)]
-                      (if (and (number? e) (keyword? a))
-                        (conj acc [(long e) a])
-                        (reduced ::opaque)))
-         (:db.fn/retractEntity :db/retractEntity)
-         (let [e (nth item 1 nil)]
-           (if (number? e)
-             (conj acc [(long e) ::all])
-             (reduced ::opaque)))
+              (let [upsert-eids
+                    (keep (fn [[k v]]
+                            (when (and (keyword? k) (some? v)
+                                       (get-in schema [k :db/unique]))
+                              (some-> ^datahike.datom.Datom
+                               (first (d/datoms db {:index :avet
+                                                    :components [k v]}))
+                                      (.-e))))
+                          item)]
+                (if (seq upsert-eids)
+                  (into acc
+                        (for [e (distinct upsert-eids)
+                              k (keys item)
+                              :when (and (keyword? k) (not= :db/id k))]
+                          [(long e) k]))
+                  acc))))
+          (vector? item)
+          (case (first item)
+            (:db/add :db/retract) (let [e (nth item 1 nil) a (nth item 2 nil)]
+                                    (if (and (number? e) (keyword? a))
+                                      (conj acc [(long e) a])
+                                      (reduced ::opaque)))
+            :db.fn/cas (let [e (nth item 1 nil) a (nth item 2 nil)]
+                         (if (and (number? e) (keyword? a))
+                           (conj acc [(long e) a])
+                           (reduced ::opaque)))
+            (:db.fn/retractEntity :db/retractEntity)
+            (let [e (nth item 1 nil)]
+              (if (number? e)
+                (conj acc [(long e) ::all])
+                (reduced ::opaque)))
          ;; INSERT rows travel as [:db.fn/call unique-check payload]. The
          ;; fn is tagged ^:datahike.pg/fresh-insert: it throws or emits the
          ;; payload as fresh entities, so it writes NO existing rows —
          ;; attribute it as the empty set. Untagged tx-fns stay opaque.
-         :db.fn/call
-         (if (:datahike.pg/fresh-insert (meta (nth item 1 nil)))
-           acc
-           (reduced ::opaque))
-         (reduced ::opaque))
-        :else (reduced ::opaque)))
-    #{}
-    buf))))
+            :db.fn/call
+            (if (:datahike.pg/fresh-insert (meta (nth item 1 nil)))
+              acc
+              (reduced ::opaque))
+            (reduced ::opaque))
+          :else (reduced ::opaque)))
+      #{}
+      buf))))
 
 (defonce ^{:doc "Ring of recent commits' write sets: [{:max-tx N :eas #{[e a]…}} …],
   newest last, capped. Lets the COMMIT conflict check test row-level
@@ -1117,19 +1117,19 @@
    (datahike guards that internally)."
   ([thunk] (run-param-query nil thunk))
   ([query thunk]
-  (let [binds (cond-> {}
-                (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
-                     fold-scalar-ins-var
-                     (not (and query (params-in-scoped-clauses? query))))
-                (assoc fold-scalar-ins-var false)
-                (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
-                     prepared-execution-var)
-                (assoc prepared-execution-var true)
-                result-cache-min-weight-var (assoc result-cache-min-weight-var 4))]
-    (if (seq binds)
-      (try
-        (with-bindings* binds thunk)
-        (catch clojure.lang.ExceptionInfo e
+   (let [binds (cond-> {}
+                 (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
+                      fold-scalar-ins-var
+                      (not (and query (params-in-scoped-clauses? query))))
+                 (assoc fold-scalar-ins-var false)
+                 (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
+                      prepared-execution-var)
+                 (assoc prepared-execution-var true)
+                 result-cache-min-weight-var (assoc result-cache-min-weight-var 4))]
+     (if (seq binds)
+       (try
+         (with-bindings* binds thunk)
+         (catch clojure.lang.ExceptionInfo e
           ;; Some translator shapes (CTE-derived get-else-only queries,
           ;; post-filters over parameter vars) plan under folded constants
           ;; or only on the relational engine, not with value-free
@@ -1137,29 +1137,29 @@
           ;; discipline, retry the failing call with stock bindings, then
           ;; with the relational engine — correctness first, the prepared
           ;; fast path second.
-          (if (re-find #"insufficient bindings|unknown var"
-                       (or (ex-message e) ""))
-            (try
-              (thunk)
-              (catch clojure.lang.ExceptionInfo e2
-                (if (and disable-planner-var
-                         (re-find #"insufficient bindings|unknown var"
-                                  (or (ex-message e2) "")))
-                  (try
-                    (with-bindings* {disable-planner-var true} thunk)
-                    (catch clojure.lang.ExceptionInfo e3
-                      (if (re-find #"insufficient bindings|Cannot resolve"
-                                   (or (ex-message e3) ""))
+           (if (re-find #"insufficient bindings|unknown var"
+                        (or (ex-message e) ""))
+             (try
+               (thunk)
+               (catch clojure.lang.ExceptionInfo e2
+                 (if (and disable-planner-var
+                          (re-find #"insufficient bindings|unknown var"
+                                   (or (ex-message e2) "")))
+                   (try
+                     (with-bindings* {disable-planner-var true} thunk)
+                     (catch clojure.lang.ExceptionInfo e3
+                       (if (re-find #"insufficient bindings|Cannot resolve"
+                                    (or (ex-message e3) ""))
                         ;; NO engine can resolve this query as written —
                         ;; typically a reference to a never-materialised
                         ;; virtual table (a skipped data-modifying CTE):
                         ;; there is no data it could match. Empty, with a
                         ;; trace for visibility.
-                        #{}
-                        (throw e3))))
-                  (throw e2))))
-            (throw e))))
-      (thunk)))))
+                         #{}
+                         (throw e3))))
+                   (throw e2))))
+             (throw e))))
+       (thunk)))))
 
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
@@ -3727,39 +3727,39 @@
   ;; lose an update. Commits are already serialized by datahike's
   ;; single writer, so the monitor adds no real concurrency cost.
   (locking commit-check-lock
-  (let [buf (:tx-buffer @tx-state)
-        begin-max-tx (:begin-max-tx @tx-state)
-        real-db (d/db conn)
-        current-max-tx (when begin-max-tx (:max-tx real-db))
-        advanced? (and begin-max-tx current-max-tx
-                       (> current-max-tx begin-max-tx))]
+    (let [buf (:tx-buffer @tx-state)
+          begin-max-tx (:begin-max-tx @tx-state)
+          real-db (d/db conn)
+          current-max-tx (when begin-max-tx (:max-tx real-db))
+          advanced? (and begin-max-tx current-max-tx
+                         (> current-max-tx begin-max-tx))]
     ;; Concurrent-write detection: fire 40001 only when our write set
     ;; overlaps a concurrent committer's. Preferred check is ROW-level
     ;; ([eid attr] pairs) against the recent-commit ring — O(concurrent
     ;; writes) and no false abort when two transactions update different
     ;; rows of the same column.
-    (when (and (seq buf) advanced?)
-      (let [our-eas (tx-buffer-eas buf real-db)
-            their-eas (when (not= ::opaque our-eas)
-                        (ring-write-eas-graced (db-ring-key real-db)
-                                               begin-max-tx current-max-tx))
+      (when (and (seq buf) advanced?)
+        (let [our-eas (tx-buffer-eas buf real-db)
+              their-eas (when (not= ::opaque our-eas)
+                          (ring-write-eas-graced (db-ring-key real-db)
+                                                 begin-max-tx current-max-tx))
             ;; No attribute-level whole-database fallback here anymore:
             ;; an unresolvable window (ring gap after the grace loop, or
             ;; an unattributable buffer) aborts conservatively instead.
             ;; A spurious 40001 costs the client one retry; the old scan
             ;; cost seconds — while row locks were held, which convoyed
             ;; every other writer (measured: tpcb c4 collapsed to 3 tps).
-            conflict?
-            (if (and (not= ::opaque our-eas) (not= ::gap their-eas))
-              (eas-overlap? our-eas their-eas)
-              true)]
-        (when conflict?
-          (throw (ex-info "could not serialize access due to concurrent update"
-                          {:error  :serialization-failure
-                           :detail (str "base=" begin-max-tx
-                                        ", current=" current-max-tx)})))))
-    (when (seq buf)
-      (transact-recorded! conn buf)))))
+              conflict?
+              (if (and (not= ::opaque our-eas) (not= ::gap their-eas))
+                (eas-overlap? our-eas their-eas)
+                true)]
+          (when conflict?
+            (throw (ex-info "could not serialize access due to concurrent update"
+                            {:error  :serialization-failure
+                             :detail (str "base=" begin-max-tx
+                                          ", current=" current-max-tx)})))))
+      (when (seq buf)
+        (transact-recorded! conn buf)))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
@@ -5130,52 +5130,52 @@
                     (.withColumnSources (first sources) (second sources))
                     (.withColumnTypmods (nth sources 2)))
                 result))
-        (let [;; Resolve column OIDs against the same db the query ran on:
+            (let [;; Resolve column OIDs against the same db the query ran on:
               ;; when a derived table / SRF-in-FROM materialised a virtual
               ;; table (:enriched-db), its columns' :pg/type markers (e.g.
               ;; generate_series → int4) only live there, not on the base
               ;; conn db.
-              schema-oids (compute-schema-oids parsed-with-shape query-db)
+                  schema-oids (compute-schema-oids parsed-with-shape query-db)
               ;; Blend parse-time OIDs (oid-infer)
               ;; over the -1 sentinel so empty
               ;; result sets and aggregate /
               ;; CAST / literal columns keep the
               ;; correct type when value inference
               ;; would otherwise fall back to TEXT.
-              item-oids (:select-item-oids parsed)
-              schema-oids (if (and item-oids (seq find-aliases))
-                            (let [n (count find-aliases)
-                                  out (int-array n)]
-                              (dotimes [i n]
-                                (let [so (aget ^ints schema-oids i)
-                                      io (when (< i (count item-oids))
-                                           (nth item-oids i))]
-                                  (aset out i
-                                        (int (if (and (= so -1) io) io so)))))
-                              out)
-                            schema-oids)
+                  item-oids (:select-item-oids parsed)
+                  schema-oids (if (and item-oids (seq find-aliases))
+                                (let [n (count find-aliases)
+                                      out (int-array n)]
+                                  (dotimes [i n]
+                                    (let [so (aget ^ints schema-oids i)
+                                          io (when (< i (count item-oids))
+                                               (nth item-oids i))]
+                                      (aset out i
+                                            (int (if (and (= so -1) io) io so)))))
+                                  out)
+                                schema-oids)
               ;; Correlated subqueries: the spliced columns aren't schema/
               ;; item columns, so force each one's advertised OID (its
               ;; inner-projection :oid) at its out-pos — keeping the
               ;; execute-path encoding consistent with the RowDescription
               ;; describeResult sent (e.g. array_agg → text[] binary).
-              schema-oids (if-let [cs (:correlated-subqueries parsed)]
-                            (let [out (aclone ^ints schema-oids)]
-                              (doseq [{:keys [out-pos oid]} (:subqueries cs)]
-                                (when (< out-pos (alength out))
-                                  (aset out out-pos (int (or oid PgWireServer/OID_TEXT)))))
-                              out)
-                            schema-oids)
-              sources (compute-column-sources parsed-with-shape db)
-              _ (when shape-key
-                  (.put ^java.util.Map select-shape-cache shape-key
-                        [schema-oids sources]))
-              result (format-query-result results find-aliases schema-oids)]
-          (if sources
-            (-> ^PgWireServer$QueryResult result
-                (.withColumnSources (first sources) (second sources))
-                (.withColumnTypmods (nth sources 2)))
-            result))))))))
+                  schema-oids (if-let [cs (:correlated-subqueries parsed)]
+                                (let [out (aclone ^ints schema-oids)]
+                                  (doseq [{:keys [out-pos oid]} (:subqueries cs)]
+                                    (when (< out-pos (alength out))
+                                      (aset out out-pos (int (or oid PgWireServer/OID_TEXT)))))
+                                  out)
+                                schema-oids)
+                  sources (compute-column-sources parsed-with-shape db)
+                  _ (when shape-key
+                      (.put ^java.util.Map select-shape-cache shape-key
+                            [schema-oids sources]))
+                  result (format-query-result results find-aliases schema-oids)]
+              (if sources
+                (-> ^PgWireServer$QueryResult result
+                    (.withColumnSources (first sources) (second sources))
+                    (.withColumnTypmods (nth sources 2)))
+                result))))))))
 
 (defn- remap-tempids
   "Rewrite every string tempid in `form` (any string sitting in a
