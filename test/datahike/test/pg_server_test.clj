@@ -1752,3 +1752,29 @@
     (is (nil? (err (.execute *handler* "UPDATE tkey SET ts = current_timestamp WHERE id = 1"))))
     (let [r (.execute *handler* "SELECT ts IS NOT NULL FROM tkey WHERE id = 1")]
       (is (= [["t"]] (rows r))))))
+
+(deftest test-update-with-negative-literal-arithmetic
+  (testing "SET x = x + <negative literal> (SignedExpression operand; pgbench tpcb)"
+    (is (nil? (err (.execute *handler* "CREATE TABLE tneg(id INTEGER, bal INTEGER)"))))
+    (is (nil? (err (.execute *handler* "INSERT INTO tneg(id, bal) VALUES (1, 100)"))))
+    (is (nil? (err (.execute *handler* "UPDATE tneg SET bal = bal + -30 WHERE id = 1"))))
+    (is (= [["70"]] (rows (.execute *handler* "SELECT bal FROM tneg WHERE id = 1"))))
+    (is (nil? (err (.execute *handler* "UPDATE tneg SET bal = bal + +5 WHERE id = 1"))))
+    (is (= [["75"]] (rows (.execute *handler* "SELECT bal FROM tneg WHERE id = 1"))))))
+
+(deftest test-prepared-update-with-param-arithmetic
+  (testing "extended-protocol UPDATE SET x = x + $1 / WHERE pk = $2 (pgbench -M prepared)"
+    (is (nil? (err (.execute *handler* "CREATE TABLE acct(aid INTEGER PRIMARY KEY, bal INTEGER)"))))
+    (is (nil? (err (.execute *handler* "INSERT INTO acct(aid, bal) VALUES (1, 100), (2, 200)"))))
+    (let [parsed (.parse *handler* "UPDATE acct SET bal = bal + $1 WHERE aid = $2" nil)
+          ;; bound-params is a 1-indexed Object[] (element 0 unused).
+          ;; The wire layer decodes params by their inferred OIDs, so the
+          ;; SET operand arrives typed for known columns; a String here
+          ;; still exercises the unknown-type numeric-context coercion
+          ;; (num-operand), while the WHERE param is typed like the wire
+          ;; delivers it.
+          r (.executePrepared *handler* parsed (object-array [nil "-30" (long 1)]))]
+      (is (nil? (err r)) (err r))
+      (.commitImplicit *handler*))
+    (is (= [["70"]] (rows (.execute *handler* "SELECT bal FROM acct WHERE aid = 1"))))
+    (is (= [["200"]] (rows (.execute *handler* "SELECT bal FROM acct WHERE aid = 2"))))))

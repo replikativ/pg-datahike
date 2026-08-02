@@ -2740,38 +2740,62 @@
         ;; (e.g. `xs[2]`) — that needs translate-expr's subscript
         ;; rewrite, which the fast-path bypasses by routing straight
         ;; through resolve-column / col-var!.
-        (if (and (instance? Column left)
+        (if (and *conjunctive-where*
+                 (instance? Column left)
                  (nil? (.getArrayConstructor ^Column left))
-                 (or (instance? LongValue right)
-                     (instance? DoubleValue right)
-                     (instance? StringValue right)))
+                 (instance? JdbcParameter right))
+          ;; col = $N in a top-level conjunct: index-seekable data
+          ;; pattern with the :in-bound param var (Parse time), or the
+          ;; value-bound pattern when *bound-params* already inlined the
+          ;; literal (Execute-time re-translation).
           (let [resolved (ctx/resolve-column left
                                              (:table-aliases ctx)
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx))
+                pv (translate-expr ctx right)]
+            (cond
+              (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
+              (and (not (symbol? pv)) (ctx/bind-col-value! ctx resolved pv)) []
+              :else
+              ;; Fallback: classic get-else + equality (repeated
+              ;; translate-expr on the same JdbcParameter returns the
+              ;; cached ?pN without duplicating :in-args).
+              (let [v (ctx/col-var! ctx resolved)
+                    guards (ctx/null-guard-clauses ctx [v])]
+                (conj guards [(list '= v pv)]))))
+          (if (and (instance? Column left)
+                   (nil? (.getArrayConstructor ^Column left))
+                   (or (instance? LongValue right)
+                       (instance? DoubleValue right)
+                       (instance? StringValue right)))
+            (let [resolved (ctx/resolve-column left
+                                               (:table-aliases ctx)
+                                               (:default-table ctx)
+                                               (:col-overrides ctx)
+                                               (:derived-aliases ctx))
                 ;; PG-style unknown-literal coercion: `<typed-col> = '<lit>'`
                 ;; routes the literal through the column's typinput when
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
-                coerced (coerce-unknown-literal ctx left right)
-                val (or coerced (translate-expr ctx right))]
-            (cond
-              (and (vector? resolved) (= :db-id (first resolved)))
+                  coerced (coerce-unknown-literal ctx left right)
+                  val (or coerced (translate-expr ctx right))]
+              (cond
+                (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
-              (let [evar (ctx/entity-var! ctx (second resolved))]
-                [[(list '= evar val)]])
+                (let [evar (ctx/entity-var! ctx (second resolved))]
+                  [[(list '= evar val)]])
               ;; Top-level conjunct on a plain column with a
               ;; matching-typed constant → value-bound data pattern
               ;; [?e :attr v]: an indexable clause instead of a
               ;; get-else scan + equality predicate over every row.
-              (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
-              []
+                (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
+                []
               ;; Regular column = value (including aliased columns)
-              :else
-              (let [v (ctx/col-var! ctx resolved)]
-                [[(list '= v val)]])))
-          (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e)))))
+                :else
+                (let [v (ctx/col-var! ctx resolved)]
+                  [[(list '= v val)]])))
+            (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e))))))
 
     (instance? NotEqualsTo expr)
     (let [^NotEqualsTo e expr

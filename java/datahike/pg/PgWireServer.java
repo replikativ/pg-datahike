@@ -775,8 +775,22 @@ public final class PgWireServer {
                         System.err.println("PgWire: setTcpNoDelay failed on "
                                 + client.getRemoteSocketAddress() + ": " + e);
                     }
-                    Thread.ofVirtual().name("pgwire-conn-" + client.getRemoteSocketAddress())
-                        .start(() -> handleConnection(client));
+                    // Connection thread model. Platform threads are the default:
+                    // a blocking-read request/response loop on a virtual thread
+                    // pays poller -> scheduler -> mount hops per message group
+                    // (~0.5-0.7 ms per query measured against the ~0.1 ms
+                    // handler), which dominates single-connection latency.
+                    // Virtual threads remain available for massive connection
+                    // counts via DATAHIKE_CONN_THREADS=virtual.
+                    String connThreads = System.getenv("DATAHIKE_CONN_THREADS");
+                    String connName = "pgwire-conn-" + client.getRemoteSocketAddress();
+                    if ("virtual".equalsIgnoreCase(connThreads)) {
+                        Thread.ofVirtual().name(connName)
+                            .start(() -> handleConnection(client));
+                    } else {
+                        Thread.ofPlatform().name(connName).daemon(true)
+                            .start(() -> handleConnection(client));
+                    }
                 } catch (IOException e) {
                     if (running.get()) {
                         System.err.println("PgWire accept error: " + e.getMessage());
@@ -2016,7 +2030,11 @@ public final class PgWireServer {
         // clean up here — the next Bind to the unnamed name replaces
         // the entry, and Sync can do broader cleanup if needed.
 
-        out.flush();
+        // No flush here: PostgreSQL sends extended-query output at Sync
+        // (or an explicit Flush 'H'), and clients don't read before
+        // then. Flushing per Execute doubled the syscalls per query;
+        // the BufferedOutputStream self-flushes if a large result
+        // overflows it, and handleSync/'H' drain the rest.
     }
 
     private void handleSync(DataOutputStream out, char[] txStatus,

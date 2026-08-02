@@ -26,8 +26,10 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql :as sql]
+            [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.template :as template]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -235,6 +237,63 @@
         (= holder session-id) :acquired
         holder                :conflict
         :else                 :acquired))))
+
+(defn- fresh-insert-fn
+  "Tag an INSERT tx-fn for conflict attribution: it emits its payload as
+   FRESH entities (or raises) and writes no existing rows, except
+   sequence-counter bumps which follow PostgreSQL nextval semantics
+   (non-transactional, never a serialization conflict). tx-buffer-eas
+   attributes such ops as the empty write-set instead of ::opaque."
+  [f]
+  (with-meta f {:datahike.pg/fresh-insert true}))
+
+(def ^:private row-lock-timeout-ms
+  "How long an in-transaction UPDATE/DELETE waits for a conflicting row
+   lock before giving up with serialization-failure (the application-level
+   equivalent of PG's deadlock resolution: one party retries)."
+  2000)
+
+(defn- lock-row-blocking!
+  "Acquire [table id] for `session-id`, waiting for a conflicting holder
+   to release. Polls the registry (200µs park) up to `timeout-ms`, then
+   throws serialization-failure so the client retries."
+  [session-id tx-state table id timeout-ms]
+  (let [deadline (+ (System/nanoTime) (* (long timeout-ms) 1000000))]
+    (loop []
+      ;; If the transaction ended while we were waiting (connection close,
+      ;; cancel, concurrent abort), stop instead of acquiring a lock that
+      ;; the session-close cleanup has already run past — that lock would
+      ;; leak forever.
+      (when-not (:in-tx? @tx-state)
+        (throw (ex-info "transaction ended during row lock wait"
+                        {:error :serialization-failure
+                         :detail (str "tx ended waiting on " table "/" id)})))
+      (case (acquire-lock! session-id table id)
+        :acquired (swap! tx-state update :owned-locks (fnil conj #{}) [table id])
+        :conflict
+        (if (> (System/nanoTime) deadline)
+          (throw (ex-info "deadlock detected: row lock wait timeout"
+                          {:error :serialization-failure
+                           :detail (str "lock wait timeout on " table "/" id)}))
+          (do (java.util.concurrent.locks.LockSupport/parkNanos 200000)
+              (recur)))))
+    :acquired))
+
+(defn- lock-rows-blocking!
+  "Blocking-acquire row locks for all `ids` (sorted, so concurrent
+   statements take locks in one global order). Returns
+   :acquired-immediately when no wait was needed; :waited when at least
+   one lock had to wait — the caller must then rebase and recompute,
+   because the awaited holder committed new values for that row."
+  [session-id tx-state table ids timeout-ms]
+  (loop [ids (sort ids) waited? false]
+    (if-let [[id & more] (seq ids)]
+      (if (= :acquired (acquire-lock! session-id table id))
+        (do (swap! tx-state update :owned-locks (fnil conj #{}) [table id])
+            (recur more waited?))
+        (do (lock-row-blocking! session-id tx-state table id timeout-ms)
+            (recur more true)))
+      (if waited? :waited :acquired-immediately))))
 
 ;; ============================================================================
 ;; Value → String conversion for pgwire result rows
@@ -882,6 +941,295 @@
                   db begin-tx)))
     (catch Exception _ ::any)))
 
+(defn- tx-buffer-eas
+  "Return the set of [eid attr] pairs this tx-buffer writes, [eid ::all]
+   for entity retractions, or ::opaque when the buffer contains ops we
+   can't attribute. Row-level granularity: two transactions updating
+   DIFFERENT rows of the same column no longer 'conflict' (the attr-level
+   check aborted 16% of pgbench tpcb at 4 clients on false positives).
+
+   Entity maps without a numeric :db/id normally create fresh entities
+   and contribute nothing. When a map key is a unique attribute, datahike
+   may UPSERT an existing row: resolve the target against `db` — if the
+   unique value exists, attribute the map's writes to that eid; if not,
+   the entity is genuinely fresh. Without a `db` (1-arity) id-less maps
+   are treated conservatively (::opaque)."
+  ([buf] (tx-buffer-eas buf nil))
+  ([buf db]
+   (let [schema (when db (:schema db))]
+     (reduce
+      (fn [acc item]
+        (cond
+          (map? item)
+          (let [eid (:db/id item)]
+            (cond
+              (and (number? eid) (pos? (long eid)))
+              (into acc (keep #(when (and (keyword? %) (not= :db/id %)) [eid %]))
+                    (keys item))
+
+              (nil? schema) (reduced ::opaque)
+
+              :else
+            ;; id-less / tempid map: find upsert targets via its unique
+            ;; attribute values. Existing target → the map writes THAT
+            ;; row; none → fresh entity, no attributable writes.
+              (let [upsert-eids
+                    (keep (fn [[k v]]
+                            (when (and (keyword? k) (some? v)
+                                       (get-in schema [k :db/unique]))
+                              (some-> ^datahike.datom.Datom
+                               (first (d/datoms db {:index :avet
+                                                    :components [k v]}))
+                                      (.-e))))
+                          item)]
+                (if (seq upsert-eids)
+                  (into acc
+                        (for [e (distinct upsert-eids)
+                              k (keys item)
+                              :when (and (keyword? k) (not= :db/id k))]
+                          [(long e) k]))
+                  acc))))
+          (vector? item)
+          (case (first item)
+            (:db/add :db/retract)
+            (let [e (nth item 1 nil) a (nth item 2 nil) v (nth item 3 nil)]
+              (cond
+                ;; Sequence counters follow PostgreSQL nextval semantics:
+                ;; non-transactional, never a serialization conflict.
+                (and (keyword? a) (= "__seq__" (namespace a)))
+                acc
+                (and (number? e) (keyword? a))
+                (conj acc [(long e) a])
+                ;; Tempid entity var (string / negative id): the op writes a
+                ;; FRESH entity — unless the attribute is unique, where
+                ;; datahike upserts onto an existing row holding that value.
+                ;; Resolve the target like the entity-map branch does; a
+                ;; retract on a tempid touches nothing. (In-transaction
+                ;; INSERT buffers remap eids to tempids, so Hibernate-style
+                ;; INSERT-then-COMMIT groups hit this constantly — treating
+                ;; them as opaque aborted every such commit that raced ANY
+                ;; other connection's commit.)
+                (and (keyword? a) (not (number? e)) (= :db/add (first item)))
+                (if (and schema (get-in schema [a :db/unique]))
+                  (if-let [target (and db (some? v)
+                                       (some-> ^datahike.datom.Datom
+                                        (first (d/datoms db {:index :avet
+                                                             :components [a v]}))
+                                               (.-e)))]
+                    (conj acc [(long target) a])
+                    (if db acc (reduced ::opaque)))
+                  acc)
+                (and (keyword? a) (not (number? e)))
+                acc
+                :else (reduced ::opaque)))
+            (:db.fn/cas :db/cas)
+            (let [e (nth item 1 nil) a (nth item 2 nil)]
+              (cond
+                ;; nextval semantics — see the :db/add case.
+                (and (keyword? a) (= "__seq__" (namespace a)))
+                acc
+                (and (number? e) (keyword? a))
+                (conj acc [(long e) a])
+                :else (reduced ::opaque)))
+            (:db.fn/retractEntity :db/retractEntity)
+            (let [e (nth item 1 nil)]
+              (if (number? e)
+                (conj acc [(long e) ::all])
+                (reduced ::opaque)))
+         ;; INSERT rows travel as [:db.fn/call unique-check payload]. The
+         ;; fn is tagged ^:datahike.pg/fresh-insert: it throws or emits the
+         ;; payload as fresh entities, so it writes NO existing rows —
+         ;; attribute it as the empty set. Untagged tx-fns stay opaque.
+            :db.fn/call
+            (if (:datahike.pg/fresh-insert (meta (nth item 1 nil)))
+              acc
+              (reduced ::opaque))
+            (reduced ::opaque))
+          :else (reduced ::opaque)))
+      #{}
+      buf))))
+
+(defonce ^{:doc "Ring of recent commits' write sets: [{:max-tx N :eas #{[e a]…}} …],
+  newest last, capped. Lets the COMMIT conflict check test row-level
+  overlap in O(concurrent writes) instead of scanning the whole
+  database, and only for the transactions that actually committed in
+  our window. Commits that bypass transact-tx-buffer! (COPY batches,
+  direct DDL) leave gaps — the checker detects incomplete coverage and
+  falls back to the attribute-level database scan."}
+  recent-commit-writes (atom clojure.lang.PersistentQueue/EMPTY))
+
+(def ^:private recent-commit-ring-size 512)
+
+(defn- db-ring-key
+  "Ring entries are keyed per database: independent databases reuse the
+   same max-tx values, and an unkeyed ring can mistake another database's
+   commit record for coverage of this one's window (masking a real gap)."
+  [db]
+  (or (get-in (dbi/-config db) [:store :id]) ::default-db))
+
+(defn- record-commit-writes! [db-key max-tx eas]
+  (swap! recent-commit-writes
+         (fn [q]
+           (let [q (conj q {:db-key db-key :max-tx max-tx :eas eas})]
+             (if (> (count q) recent-commit-ring-size) (pop q) q)))))
+
+(defn- ring-write-eas
+  "Union of ring write-sets for `db-key`'s commits with max-tx in
+   (begin, current]. Returns ::gap unless every tx in that window is
+   present (datahike increments max-tx by one per transact, so coverage
+   is checkable)."
+  [db-key begin-max-tx current-max-tx]
+  (let [entries (filter #(and (= db-key (:db-key %))
+                              (> (:max-tx %) begin-max-tx)
+                              (<= (:max-tx %) current-max-tx))
+                        @recent-commit-writes)
+        want (- current-max-tx begin-max-tx)]
+    (if (or (not= want (count entries))
+            (some #(= ::opaque (:eas %)) entries))
+      ::gap
+      (reduce into #{} (map :eas entries)))))
+
+(defn- ring-write-eas-graced
+  "ring-write-eas with a short grace loop: a committer records its write
+   set only AFTER d/transact returns, so a concurrent reader can observe
+   tx N+1's entry before tx N's (a µs-scale race). Re-read a few times
+   before concluding the window truly has a gap — this keeps the conflict
+   check O(concurrent writes) instead of falling into whole-database
+   work for a transient ordering artifact."
+  [db-key begin-max-tx current-max-tx]
+  (loop [attempt 0]
+    (let [r (ring-write-eas db-key begin-max-tx current-max-tx)]
+      (if (and (= ::gap r) (< attempt 8))
+        (do (java.util.concurrent.locks.LockSupport/parkNanos 1000000)
+            (recur (inc attempt)))
+        r))))
+
+(def ^:private fold-scalar-ins-var
+  ;; datahike.query/*fold-scalar-ins* when the running datahike has it;
+  ;; nil on older datahike (the fast path simply doesn't apply).
+  (resolve 'datahike.query/*fold-scalar-ins*))
+
+(def ^:private disable-planner-var
+  ;; datahike.query/*disable-planner* — relational-engine fallback seam.
+  (resolve 'datahike.query/*disable-planner*))
+
+(def ^:private prepared-execution-var
+  ;; datahike.query.execute/*prepared-execution* when the running datahike
+  ;; has it (>= the #936 release): value-free plan reuse + compiled point
+  ;; programs for parameterized statements. nil on older datahike — the
+  ;; binding simply doesn't apply.
+  (try (requiring-resolve 'datahike.query.execute/*prepared-execution*)
+       (catch Throwable _ nil)))
+
+(def ^:private result-cache-min-weight-var
+  ;; datahike.query/*result-cache-min-weight* when available: for
+  ;; parameterized statements, inserting a tiny result into the result
+  ;; cache costs more (~200us of key/swap/LRU bookkeeping) than
+  ;; recomputing it with warm plan caches, so skip caching results
+  ;; under 4 tuples on these paths. Larger results still cache.
+  (resolve 'datahike.query/*result-cache-min-weight*))
+
+(defn- params-in-scoped-clauses?
+  "True when a translated :where contains a parameter var (?pN) inside an
+   or / or-join / not / not-join / and body. Under value-free parameter
+   binding those vars are branch-local to the promoted or-join and never
+   receive the outer binding — the branch silently matches nothing
+   (replikativ/datahike#938; same seam as #927). Such statements run
+   with stock const-folding instead; delete this guard when #938 lands."
+  [query]
+  (letfn [(param? [x] (and (symbol? x) (re-matches #"\?p\d+" (name x))))
+          (has-param? [form]
+            (cond (param? form) true
+                  (coll? form) (some has-param? form)
+                  :else false))
+          (scoped? [clause]
+            (and (seq? clause)
+                 (symbol? (first clause))
+                 ('#{or or-join not not-join and} (first clause))
+                 (has-param? (rest clause))))]
+    (boolean (some scoped? (:where query)))))
+
+(defn- run-param-query
+  "Run `thunk` (a d/q call with :in args) with datahike's scalar-:in
+   const-folding disabled when available: parameterized statements
+   repeat one query SHAPE with varying scalar values, and folding them
+   into the clauses made the plan cache miss (full replan) per value —
+   2x on novel-value point lookups. Function-valued in-args still fold
+   (datahike guards that internally)."
+  ([thunk] (run-param-query nil thunk))
+  ([query thunk]
+   (let [binds (cond-> {}
+                 (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
+                      fold-scalar-ins-var
+                      (not (and query (params-in-scoped-clauses? query))))
+                 (assoc fold-scalar-ins-var false)
+                 (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
+                      prepared-execution-var)
+                 (assoc prepared-execution-var true)
+                 result-cache-min-weight-var (assoc result-cache-min-weight-var 4))]
+     (if (seq binds)
+       (try
+         (with-bindings* binds thunk)
+         (catch clojure.lang.ExceptionInfo e
+          ;; Some translator shapes (CTE-derived get-else-only queries,
+          ;; post-filters over parameter vars) plan under folded constants
+          ;; or only on the relational engine, not with value-free
+          ;; parameter vars. Until each shape is taught the prepared
+          ;; discipline, retry the failing call with stock bindings, then
+          ;; with the relational engine — correctness first, the prepared
+          ;; fast path second.
+           (if (re-find #"insufficient bindings|unknown var"
+                        (or (ex-message e) ""))
+             (try
+               (thunk)
+               (catch clojure.lang.ExceptionInfo e2
+                 (if (and disable-planner-var
+                          (re-find #"insufficient bindings|unknown var"
+                                   (or (ex-message e2) "")))
+                   (try
+                     (with-bindings* {disable-planner-var true} thunk)
+                     (catch clojure.lang.ExceptionInfo e3
+                       (if (re-find #"insufficient bindings|Cannot resolve"
+                                    (or (ex-message e3) ""))
+                        ;; NO engine can resolve this query as written —
+                        ;; typically a reference to a never-materialised
+                        ;; virtual table (a skipped data-modifying CTE):
+                        ;; there is no data it could match. Empty, with a
+                        ;; trace for visibility.
+                         #{}
+                         (throw e3))))
+                   (throw e2))))
+             (throw e))))
+       (thunk)))))
+
+(defn- transact-recorded!
+  "d/transact that records the commit's [eid attr] write set in the
+   recent-commit ring. EVERY server-side transact must go through this
+   (or record manually): a commit missing from the ring makes any
+   overlapping conflict window fall back to the attribute-level
+   full-database scan — ~1s per COMMIT at 3M datoms."
+  [conn tx-data]
+  (let [db-before @conn
+        report (d/transact conn tx-data)
+        db-after (:db-after report)
+        eas (tx-buffer-eas tx-data db-before)]
+    (record-commit-writes! (db-ring-key db-after) (:max-tx db-after)
+                           (if (= ::opaque eas) ::opaque eas))
+    report))
+
+(defn- eas-overlap?
+  "Row-level overlap incl. [e ::all] entity-retraction wildcards on
+   either side."
+  [ours theirs]
+  (let [their-eids (into #{} (map first) theirs)
+        all-theirs (into #{} (keep #(when (= ::all (second %)) (first %))) theirs)]
+    (boolean
+     (some (fn [[e a :as ea]]
+             (or (contains? theirs ea)
+                 (contains? all-theirs e)
+                 (and (= ::all a) (contains? their-eids e))))
+           ours))))
+
 (defn- tag-tx-status
   "Set the txStatus field on a QueryResult based on tx-state atom."
   [^PgWireServer$QueryResult result tx-state]
@@ -1199,58 +1547,59 @@
       ;; within the same multi-row INSERT (txdb is immutable, can't see
       ;; prior rows' sequence increments).
       [[:db.fn/call
-        (fn [txdb]
-          (let [q-fn d/q
+        (fresh-insert-fn
+         (fn [txdb]
+           (let [q-fn d/q
                 ;; Pre-fetch sequence state for each identity column
-                seq-state (atom
-                           (into {}
-                                 (for [{:keys [col ns seq-name]} identity-cols
-                                       :let [seq-eid (ffirst (q-fn '{:find [?e]
-                                                                     :where [[?e :__seq__/name ?n]]
-                                                                     :in [$ ?n]}
-                                                                   txdb seq-name))
-                                             curr-val (when seq-eid
-                                                        (or (ffirst (q-fn '{:find [?v]
-                                                                            :where [[?e :__seq__/value ?v]]
-                                                                            :in [$ ?e]}
-                                                                          txdb seq-eid))
-                                                            0))
-                                             increment (or (when seq-eid
-                                                             (ffirst (q-fn '{:find [?i]
-                                                                             :where [[?e :__seq__/increment ?i]]
+                 seq-state (atom
+                            (into {}
+                                  (for [{:keys [col ns seq-name]} identity-cols
+                                        :let [seq-eid (ffirst (q-fn '{:find [?e]
+                                                                      :where [[?e :__seq__/name ?n]]
+                                                                      :in [$ ?n]}
+                                                                    txdb seq-name))
+                                              curr-val (when seq-eid
+                                                         (or (ffirst (q-fn '{:find [?v]
+                                                                             :where [[?e :__seq__/value ?v]]
                                                                              :in [$ ?e]}
-                                                                           txdb seq-eid)))
-                                                           1)]
-                                       :when seq-eid]
-                                   [col {:eid seq-eid :val (or curr-val 0) :inc increment :ns ns}])))]
-            (vec (mapcat
-                  (fn [entity-map]
-                    (if-not (map? entity-map)
-                      [entity-map]
-                      (let [populated
-                            (reduce
-                             (fn [m {:keys [col ns]}]
+                                                                           txdb seq-eid))
+                                                             0))
+                                              increment (or (when seq-eid
+                                                              (ffirst (q-fn '{:find [?i]
+                                                                              :where [[?e :__seq__/increment ?i]]
+                                                                              :in [$ ?e]}
+                                                                            txdb seq-eid)))
+                                                            1)]
+                                        :when seq-eid]
+                                    [col {:eid seq-eid :val (or curr-val 0) :inc increment :ns ns}])))]
+             (vec (mapcat
+                   (fn [entity-map]
+                     (if-not (map? entity-map)
+                       [entity-map]
+                       (let [populated
+                             (reduce
+                              (fn [m {:keys [col ns]}]
                                ;; Use the column's owning namespace (may be parent for inherited)
-                               (let [attr (keyword ns col)]
-                                 (if (contains? m attr)
-                                   m
+                                (let [attr (keyword ns col)]
+                                  (if (contains? m attr)
+                                    m
                                    ;; Auto-generate: increment local counter
-                                   (let [{:keys [val inc]} (get @seq-state col)
-                                         new-val (+ val inc)]
-                                     (swap! seq-state assoc-in [col :val] new-val)
-                                     (assoc m attr new-val)))))
-                             entity-map
-                             identity-cols)]
-                        (let [seq-updates
-                              (keep (fn [{:keys [col ns]}]
-                                      (let [attr (keyword ns col)]
-                                        (when-not (contains? entity-map attr)
-                                          (let [{:keys [eid val]} (get @seq-state col)]
-                                            (when eid
-                                              [:db/add eid :__seq__/value val])))))
-                                    identity-cols)]
-                          (into [populated] seq-updates)))))
-                  tx-data))))]])))
+                                    (let [{:keys [val inc]} (get @seq-state col)
+                                          new-val (+ val inc)]
+                                      (swap! seq-state assoc-in [col :val] new-val)
+                                      (assoc m attr new-val)))))
+                              entity-map
+                              identity-cols)]
+                         (let [seq-updates
+                               (keep (fn [{:keys [col ns]}]
+                                       (let [attr (keyword ns col)]
+                                         (when-not (contains? entity-map attr)
+                                           (let [{:keys [eid val]} (get @seq-state col)]
+                                             (when eid
+                                               [:db/add eid :__seq__/value val])))))
+                                     identity-cols)]
+                           (into [populated] seq-updates)))))
+                   tx-data)))))]])))
 
 (defn- eval-default
   "Evaluate a :pg/default-* triple at INSERT time. Stateless defaults
@@ -1514,22 +1863,24 @@
    (or its PK is updated). Used by DELETE / UPDATE to enforce
    parent-side RESTRICT and CASCADE actions."
   [db table-name]
-  (let [q-fn d/q]
-    (map (fn [[n ct cc pc od]]
-           {:name n :child-table ct
-            :child-cols (vec (jb/parse-jsonb cc))
-            :parent-cols (vec (jb/parse-jsonb pc))
-            ;; PG default for missing ON DELETE is NO ACTION.
-            :on-delete (or od :no-action)})
-         (q-fn '{:find [?n ?ct ?cc ?pc ?od]
-                 :in [$ ?pt]
-                 :where [[?e :pg/fk-name ?n]
-                         [?e :pg/fk-parent-table ?pt]
-                         [?e :pg/fk-child-table ?ct]
-                         [?e :pg/fk-child-cols ?cc]
-                         [?e :pg/fk-parent-cols ?pc]
-                         [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
-               db table-name))))
+  (let [v (schema-cached
+           db [::fk-parent table-name]
+           #(mapv (fn [[n ct cc pc od]]
+                    {:name n :child-table ct
+                     :child-cols (vec (jb/parse-jsonb cc))
+                     :parent-cols (vec (jb/parse-jsonb pc))
+                     ;; PG default for missing ON DELETE is NO ACTION.
+                     :on-delete (or od :no-action)})
+                  (d/q '{:find [?n ?ct ?cc ?pc ?od]
+                         :in [$ ?pt]
+                         :where [[?e :pg/fk-name ?n]
+                                 [?e :pg/fk-parent-table ?pt]
+                                 [?e :pg/fk-child-table ?ct]
+                                 [?e :pg/fk-child-cols ?cc]
+                                 [?e :pg/fk-parent-cols ?pc]
+                                 [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
+                       db table-name)))]
+    (if (= ::nil v) [] v)))
 
 (defn- enforce-fk-on-insert!
   "For each FK where this table is the child, verify every row in
@@ -1807,105 +2158,111 @@
     (if (and (empty? cols) (not has-checks?) (not has-fks?) (not has-domain-enum?))
       tx-data
       [[:db.fn/call
-        (fn [txdb]
-          (let [q-fn d/q
-                bump-seq! (fn [seq-name]
+        ;; fresh-insert-fn: conflict attribution treats this as writing no
+        ;; existing rows — it emits the payload as fresh entities (or
+        ;; raises); its only existing-entity writes are sequence-counter
+        ;; bumps, which follow PostgreSQL nextval semantics
+        ;; (non-transactional, never a serialization conflict).
+        (fresh-insert-fn
+         (fn [txdb]
+           (let [q-fn d/q
+                 bump-seq! (fn [seq-name]
                             ;; Mirror the behavior in auto-populate-identity:
                             ;; find the sequence entity, compute next value,
                             ;; return [new-value [:db/add eid :__seq__/value v]].
-                            (let [eid (ffirst (q-fn '{:find [?e]
-                                                      :where [[?e :__seq__/name ?n]]
-                                                      :in [$ ?n]}
-                                                    txdb seq-name))
-                                  curr (when eid
-                                         (ffirst (q-fn '{:find [?v]
-                                                         :where [[?e :__seq__/value ?v]]
-                                                         :in [$ ?e]}
-                                                       txdb eid)))
-                                  incr (when eid
-                                         (or (ffirst (q-fn '{:find [?i]
-                                                             :where [[?e :__seq__/increment ?i]]
-                                                             :in [$ ?e]}
-                                                           txdb eid))
-                                             1))
-                                  nxt (when eid (+ (or curr 0) incr))]
-                              (when eid
-                                [nxt [:db/add eid :__seq__/value nxt]])))
-                result
-                (reduce
-                 (fn [acc entry]
-                   (if-not (map? entry)
-                     (conj acc entry)
-                     (let [{:keys [filled seq-ops]}
-                           (reduce-kv
-                            (fn [st col-name {:keys [attr not-null? default]}]
-                              (let [ns-attr (keyword ns col-name)
-                                    legacy (keyword (namespace attr) col-name)
-                                    present-key (some #(when (contains? (:filled st) %) %)
-                                                      [ns-attr attr legacy])]
-                                (cond
-                                  present-key
-                                  (let [v (get-in st [:filled present-key])]
-                                    (if (and not-null? (nil? v))
-                                      (throw (ex-info "not-null violation"
-                                                      {:error  :not-null-violation
-                                                       :table  table-name
-                                                       :column col-name}))
-                                      st))
+                             (let [eid (ffirst (q-fn '{:find [?e]
+                                                       :where [[?e :__seq__/name ?n]]
+                                                       :in [$ ?n]}
+                                                     txdb seq-name))
+                                   curr (when eid
+                                          (ffirst (q-fn '{:find [?v]
+                                                          :where [[?e :__seq__/value ?v]]
+                                                          :in [$ ?e]}
+                                                        txdb eid)))
+                                   incr (when eid
+                                          (or (ffirst (q-fn '{:find [?i]
+                                                              :where [[?e :__seq__/increment ?i]]
+                                                              :in [$ ?e]}
+                                                            txdb eid))
+                                              1))
+                                   nxt (when eid (+ (or curr 0) incr))]
+                               (when eid
+                                 [nxt [:db/add eid :__seq__/value nxt]])))
+                 result
+                 (reduce
+                  (fn [acc entry]
+                    (if-not (map? entry)
+                      (conj acc entry)
+                      (let [{:keys [filled seq-ops]}
+                            (reduce-kv
+                             (fn [st col-name {:keys [attr not-null? default]}]
+                               (let [ns-attr (keyword ns col-name)
+                                     legacy (keyword (namespace attr) col-name)
+                                     present-key (some #(when (contains? (:filled st) %) %)
+                                                       [ns-attr attr legacy])]
+                                 (cond
+                                   present-key
+                                   (let [v (get-in st [:filled present-key])]
+                                     (if (and not-null? (nil? v))
+                                       (throw (ex-info "not-null violation"
+                                                       {:error  :not-null-violation
+                                                        :table  table-name
+                                                        :column col-name}))
+                                       st))
 
-                                  default
-                                  (let [[kind value arg] default
-                                        v (eval-default kind value arg)]
-                                    (cond
-                                      (and (vector? v) (= ::nextval (first v)))
-                                      (let [[nxt seq-tx] (bump-seq! (second v))]
-                                        (if nxt
-                                          (-> st
-                                              (assoc-in [:filled ns-attr] nxt)
-                                              (update :seq-ops conj seq-tx))
-                                          (if not-null?
-                                            (throw (ex-info "not-null violation"
-                                                            {:error  :not-null-violation
-                                                             :table  table-name
-                                                             :column col-name}))
-                                            st)))
+                                   default
+                                   (let [[kind value arg] default
+                                         v (eval-default kind value arg)]
+                                     (cond
+                                       (and (vector? v) (= ::nextval (first v)))
+                                       (let [[nxt seq-tx] (bump-seq! (second v))]
+                                         (if nxt
+                                           (-> st
+                                               (assoc-in [:filled ns-attr] nxt)
+                                               (update :seq-ops conj seq-tx))
+                                           (if not-null?
+                                             (throw (ex-info "not-null violation"
+                                                             {:error  :not-null-violation
+                                                              :table  table-name
+                                                              :column col-name}))
+                                             st)))
 
-                                      (nil? v)
-                                      (if not-null?
-                                        (throw (ex-info "not-null violation"
-                                                        {:error  :not-null-violation
-                                                         :table  table-name
-                                                         :column col-name}))
-                                        st)
+                                       (nil? v)
+                                       (if not-null?
+                                         (throw (ex-info "not-null violation"
+                                                         {:error  :not-null-violation
+                                                          :table  table-name
+                                                          :column col-name}))
+                                         st)
 
-                                      :else
-                                      (assoc-in st [:filled ns-attr] v)))
+                                       :else
+                                       (assoc-in st [:filled ns-attr] v)))
 
-                                  not-null?
-                                  (throw (ex-info "not-null violation"
-                                                  {:error  :not-null-violation
-                                                   :table  table-name
-                                                   :column col-name}))
+                                   not-null?
+                                   (throw (ex-info "not-null violation"
+                                                   {:error  :not-null-violation
+                                                    :table  table-name
+                                                    :column col-name}))
 
-                                  :else st)))
-                            {:filled entry :seq-ops []}
-                            cols)]
-                       (into (conj acc filled) seq-ops))))
-                 []
-                 tx-data)
+                                   :else st)))
+                             {:filled entry :seq-ops []}
+                             cols)]
+                        (into (conj acc filled) seq-ops))))
+                  []
+                  tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
                 ;; bumps etc. don't.
-                filled-entities (filterv map? result)]
-            (when has-checks?
-              (doseq [em filled-entities]
-                (enforce-check-constraints! txdb table-name ns em)))
-            (when has-domain-enum?
-              (enforce-domain-enum-checks! txdb table-name ns filled-entities))
-            (when has-fks?
-              (enforce-fk-on-insert! txdb table-name ns filled-entities))
-            result))]])))
+                 filled-entities (filterv map? result)]
+             (when has-checks?
+               (doseq [em filled-entities]
+                 (enforce-check-constraints! txdb table-name ns em)))
+             (when has-domain-enum?
+               (enforce-domain-enum-checks! txdb table-name ns filled-entities))
+             (when has-fks?
+               (enforce-fk-on-insert! txdb table-name ns filled-entities))
+             result)))]])))
 
 (defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
@@ -1915,7 +2272,7 @@
                       (auto-populate-identity table-name db)
                       (apply-column-constraints table-name (:ns parsed) db)
                       tx-wrap)
-          tx-report (d/transact conn tx-data)]
+          tx-report (transact-recorded! conn tx-data)]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
@@ -1949,6 +2306,50 @@
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
+(declare ^:dynamic *cached-bound*)
+
+(defn- ensure-evar-anchor!
+  "The UPDATE/DELETE row-matching query needs at least one data pattern
+   binding the table's entity var — a WHERE consisting only of get-else /
+   function-binding clauses (e.g. `WHERE col = $1` via the predicate
+   path) leaves it unbound, which the datahike planner rejects. Prepend
+   the row-marker anchor when no clause binds it."
+  [ctx evar table]
+  (let [clauses @(:where-clauses ctx)
+        marker (pgs/row-marker-attr table)
+        binds-evar? (some (fn [c]
+                            (and (vector? c) (>= (count c) 2)
+                                 (= evar (first c)) (keyword? (second c))))
+                          clauses)]
+    (when-not binds-evar?
+      (cond
+        ;; Tables created through SQL DDL carry the row marker — the
+        ;; cheapest anchor (one indexed boolean per row).
+        (contains? (:schema ctx) marker)
+        (reset! (:where-clauses ctx)
+                (vec (cons [evar marker true] clauses)))
+        ;; Markerless tables (databases seeded directly through datahike —
+        ;; a first-class use case: SQL over an existing datahike db):
+        ;; anchor on the presence of ANY table column. A row is exactly an
+        ;; entity holding at least one of the table's attributes, so the
+        ;; or-union binds the entity var without changing semantics. The
+        ;; engine (post-#923) correctly rejects get-else-only queries with
+        ;; an unbound entity var, so SOME anchor is required.
+        :else
+        (when-let [col-attrs (seq (keep (fn [c]
+                                          (let [a (:attr c)]
+                                            (when (and a (not= :db/id a)) a)))
+                                        (pgs/column-info (:schema ctx) table)))]
+          (reset! (:where-clauses ctx)
+                  (vec (cons (cons 'or (mapv (fn [a] [evar a]) col-attrs))
+                             clauses))))))))
+
+(def ^:private update-row-match-cache
+  "Row-matching query cache for UPDATE/DELETE: [(identity parsed)
+   (identity schema)] → {:q datalog :in-params [...] :in-args-raw [...]}.
+   ParamRefs stay unresolved in :in-args-raw; values substitute per call."
+  (pg-cache/bounded-cache 512))
+
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
@@ -1963,23 +2364,54 @@
   [db schema parsed]
   (let [{:keys [table alias where-expr enriched-db]} parsed
         query-db (or enriched-db db)
-        query-schema (or (:schema enriched-db) schema)
-        ;; Build alias map: {alias → table, table → table}
-        default-key (or alias table)
-        table-aliases (cond-> {table table}
-                        alias (assoc alias table))
-        ctx (#'sql/make-ctx query-schema table-aliases default-key
-                            {:db query-db :parse-sql sql/parse-sql})
-        _ (when where-expr
-            (let [preds (#'sql/translate-predicate ctx where-expr)]
-              (swap! (:where-clauses ctx) into preds)))
-        evar (#'sql/entity-var! ctx default-key)
-        _ (when (empty? @(:where-clauses ctx))
-            (let [cols (pgs/column-info schema table)]
-              (when-let [first-col (second cols)]
-                (#'sql/col-var! ctx (:attr first-col)))))
-        q {:find [evar] :where (vec @(:where-clauses ctx))}
-        eids (mapv first (d/q q query-db))]
+        ;; Row-matching query cached per (parsed, schema) — see
+        ;; update-row-match-cache / build-update-tx-for-bindings.
+        shape-key (when (nil? enriched-db)
+                    [(pg-cache/identity-key parsed)
+                     (pg-cache/identity-key schema)])
+        cached (when shape-key
+                 (.get ^java.util.Map update-row-match-cache shape-key))
+        {:keys [q in-args-raw]}
+        (or cached
+            (let [query-schema (or (:schema enriched-db) schema)
+                  ;; Build alias map: {alias → table, table → table}
+                  default-key (or alias table)
+                  table-aliases (cond-> {table table}
+                                  alias (assoc alias table))
+                  ctx (#'sql/make-ctx query-schema table-aliases default-key
+                                      {:db query-db :parse-sql sql/parse-sql})
+                  _ (when where-expr
+                      ;; Top-level DELETE WHERE = conjunctive context: enables the
+                      ;; data-pattern fast paths. Params stay as ?pN vars (values
+                      ;; via :in) so the row-matching plan is one-per-shape — see
+                      ;; build-update-tx-for-bindings.
+                      (binding [expr/*conjunctive-where* true]
+                        (let [preds (#'sql/translate-predicate ctx where-expr)]
+                          (swap! (:where-clauses ctx) into preds))))
+                  evar (#'sql/entity-var! ctx default-key)
+                  _ (when (empty? @(:where-clauses ctx))
+                      (let [cols (pgs/column-info schema table)]
+                        (when-let [first-col (second cols)]
+                          (#'sql/col-var! ctx (:attr first-col)))))
+                  _ (ensure-evar-anchor! ctx evar table)
+                  ;; ?pN param plumbing (mirrors build-update-tx-for-bindings):
+                  ;; the WHERE keeps params as vars, so supply the bound values as
+                  ;; :in args and run with the plan-stable fold disabled.
+                  in-params @(:in-params ctx)
+                  v {:q (cond-> {:find [evar] :where (vec @(:where-clauses ctx))}
+                          (seq in-params) (assoc :in (into ['$] in-params)))
+                     :in-args-raw @(:in-args ctx)}]
+              (when shape-key
+                (.put ^java.util.Map update-row-match-cache shape-key v))
+              v))
+        in-args (if-let [bound *cached-bound*]
+                  (sql/substitute-params in-args-raw
+                                         (fn [idx] (nth bound idx)))
+                  in-args-raw)
+        eids (mapv first
+                   (if (seq in-args)
+                     (run-param-query q #(apply d/q q query-db in-args))
+                     (run-param-query q #(d/q q query-db))))]
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
@@ -2000,7 +2432,7 @@
           full-tx (cond-> (vec tx-data) (seq cascade-tx) (into cascade-tx))
           full-tx (tx-wrap full-tx)]
       (when (seq full-tx)
-        (d/transact conn full-tx))
+        (transact-recorded! conn full-tx))
       (or returning-result
           (empty-result (str "DELETE " (count eids)))))
     (catch Exception e
@@ -2009,8 +2441,6 @@
 ;; Forward-declare so build-update-tx-for-bindings (below) can read the
 ;; prepared-statement param vector; the binding site is in executePrepared
 ;; further down, after the handler closure setup.
-(declare ^:dynamic *cached-bound*)
-
 (defn- build-update-tx-for-bindings
   "Build tx-data for a single UPDATE row, optionally with from-bindings for
    UPDATE ... FROM (VALUES ...) substitution. Returns {:eids [...] :tx-data [...]}.
@@ -2022,41 +2452,70 @@
   [db schema parsed from-bindings]
   (let [{:keys [table alias ns assignments where-expr enriched-db]} parsed
         query-db (or enriched-db db)
-        query-schema (or (:schema enriched-db) schema)
-        default-key (or alias table)
-        table-aliases (cond-> {table table}
-                        alias (assoc alias table))
-        ctx (#'sql/make-ctx query-schema table-aliases default-key
-                            {:db query-db :parse-sql sql/parse-sql})
-        _ (when where-expr
-            (binding [params/*from-bindings* from-bindings]
-              (let [preds (#'sql/translate-predicate ctx where-expr)]
-                (swap! (:where-clauses ctx) into preds))))
-        evar (#'sql/entity-var! ctx default-key)
-        _ (when (empty? @(:where-clauses ctx))
-            (let [cols (pgs/column-info schema table)]
-              (when-let [first-col (second cols)]
-                (#'sql/col-var! ctx (:attr first-col)))))
-        where-clauses @(:where-clauses ctx)
-        ;; Prepared-statement UPDATE: translate-predicate lifts every
-        ;; JdbcParameter to a logic variable (e.g. `?p2`) and records a
-        ;; ParamRef in :in-args. Without plumbing :in/:in-args through
-        ;; to d/q, the row-matching query has an unbound var and
-        ;; returns zero rows (manifesting as "UPDATE 0" for a row that
-        ;; clearly exists). Substitute the ParamRefs against
-        ;; *cached-bound* here so the d/q call has concrete literals.
-        in-params @(:in-params ctx)
-        in-args-raw @(:in-args ctx)
+        ;; The row-matching query (WHERE translation, anchor, :in plumbing)
+        ;; is a pure function of (parsed, schema) when there are no
+        ;; per-row FROM(VALUES) bindings and no enriched-db — cache it per
+        ;; statement so repeated executions skip make-ctx + translate.
+        shape-key (when (and (nil? from-bindings) (nil? enriched-db))
+                    [(pg-cache/identity-key parsed)
+                     (pg-cache/identity-key schema)])
+        cached (when shape-key
+                 (.get ^java.util.Map update-row-match-cache shape-key))
+        {:keys [q in-params in-args-raw]}
+        (or cached
+            (let [query-schema (or (:schema enriched-db) schema)
+                  default-key (or alias table)
+                  table-aliases (cond-> {table table}
+                                  alias (assoc alias table))
+                  ctx (#'sql/make-ctx query-schema table-aliases default-key
+                                      {:db query-db :parse-sql sql/parse-sql})
+                  _ (when where-expr
+                      ;; Top-level UPDATE WHERE = conjunctive context: the value-bound
+                      ;; data-pattern fast path makes the row-matching query indexed
+                      ;; ([?e :attr v] instead of a get-else scan) — and self-anchoring:
+                      ;; the datahike planner rejects a WHERE of only get-else clauses
+                      ;; with an unbound entity var.
+                      ;; Params stay as ?pN vars (values via :in): inlining the
+                      ;; bound literal made the row-matching clauses NOVEL per
+                      ;; value, so datalog's parse/plan caches missed and the full
+                      ;; planner re-ran per Execute (~18% of tpcb CPU). With ?pN
+                      ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
+                      ;; plan per statement shape, values supplied at d/q time.
+                      (binding [params/*from-bindings* from-bindings
+                                expr/*conjunctive-where* true]
+                        (let [preds (#'sql/translate-predicate ctx where-expr)]
+                          (swap! (:where-clauses ctx) into preds))))
+                  evar (#'sql/entity-var! ctx default-key)
+                  _ (when (empty? @(:where-clauses ctx))
+                      (let [cols (pgs/column-info schema table)]
+                        (when-let [first-col (second cols)]
+                          (#'sql/col-var! ctx (:attr first-col)))))
+                  _ (ensure-evar-anchor! ctx evar table)
+                  where-clauses @(:where-clauses ctx)
+                  ;; Prepared-statement UPDATE: translate-predicate lifts every
+                  ;; JdbcParameter to a logic variable (e.g. `?p2`) and records a
+                  ;; ParamRef in :in-args. Without plumbing :in/:in-args through
+                  ;; to d/q, the row-matching query has an unbound var and
+                  ;; returns zero rows (manifesting as "UPDATE 0" for a row that
+                  ;; clearly exists). Substitute the ParamRefs against
+                  ;; *cached-bound* here so the d/q call has concrete literals.
+                  in-params @(:in-params ctx)
+                  in-args-raw @(:in-args ctx)
+                  v {:q (cond-> {:find [evar] :where (vec where-clauses)}
+                          (seq in-params) (assoc :in (into ['$] in-params)))
+                     :in-params in-params
+                     :in-args-raw in-args-raw}]
+              (when shape-key
+                (.put ^java.util.Map update-row-match-cache shape-key v))
+              v))
         in-args (if-let [bound *cached-bound*]
                   (sql/substitute-params in-args-raw
                                          (fn [idx] (nth bound idx)))
                   in-args-raw)
-        q (cond-> {:find [evar] :where (vec where-clauses)}
-            (seq in-params) (assoc :in (into ['$] in-params)))
         eids (mapv first
                    (if (seq in-args)
-                     (apply d/q q query-db in-args)
-                     (d/q q query-db)))
+                     (run-param-query q #(apply d/q q query-db in-args))
+                     (run-param-query q #(d/q q query-db))))
         ;; For prepared UPDATE, resolve ParamRef values BEFORE
         ;; coerce-insert-value — otherwise the coercion fires on a
         ;; placeholder record (no-op passthrough), then the bound
@@ -2091,7 +2550,17 @@
                                     eff-from-bindings (merge from-bindings outer-binding)]
                                 (for [{:keys [column value-expr]} assignments
                                       :let [attr (keyword ns column)
+                                            ;; *bound-params* (0-based; *cached-bound*
+                                            ;; is 1-indexed with slot 0 unused) lets
+                                            ;; JdbcParameter operands resolve inline —
+                                            ;; `SET bal = bal + $1` used to throw
+                                            ;; ClassCastException on the ParamRef
+                                            ;; (pgbench -M prepared).
                                             raw-val (binding [params/*from-bindings* eff-from-bindings
+                                                              params/*bound-params*
+                                                              (or params/*bound-params*
+                                                                  (when-let [cb *cached-bound*]
+                                                                    (vec (rest cb))))
                                                               stmt/*eval-update-db* db]
                                                       (sql/eval-update-expr value-expr entity-map ns schema))
                                             resolved (resolve-param raw-val)
@@ -2182,13 +2651,15 @@
    A retract of a non-null attr is equivalent to setting it to NULL,
    which PG rejects."
   [db tx-data]
-  (let [q-fn d/q
-        not-null-attrs (into #{}
-                             (map first)
-                             (q-fn '{:find [?ident]
-                                     :where [[?e :db/ident ?ident]
-                                             [?e :pg/not-null true]]}
-                                   db))]
+  (let [not-null-attrs (let [v (schema-cached
+                                db [::not-null-attrs]
+                                #(into #{}
+                                       (map first)
+                                       (d/q '{:find [?ident]
+                                              :where [[?e :db/ident ?ident]
+                                                      [?e :pg/not-null true]]}
+                                            db)))]
+                         (if (= ::nil v) #{} v))]
     (doseq [op tx-data]
       (when (vector? op)
         (let [[verb _eid attr val] op]
@@ -2252,7 +2723,7 @@
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
           tx-data (tx-wrap tx-data)
-          tx-report (when (seq tx-data) (d/transact conn tx-data))
+          tx-report (when (seq tx-data) (transact-recorded! conn tx-data))
           returning (:returning parsed)]
       (if returning
         ;; RETURNING: read values from db-after
@@ -2318,7 +2789,7 @@
   (try
     (let [db (d/db conn)
           {:keys [eids tx-data]} (build-update-with-recursive-tx db parsed)]
-      (when (seq tx-data) (d/transact conn tx-data))
+      (when (seq tx-data) (transact-recorded! conn tx-data))
       (empty-result (str "UPDATE " (count eids))))
     (catch Exception e
       (classified-error "UPDATE (WITH RECURSIVE) error: " e))))
@@ -2415,7 +2886,7 @@
                                 (assoc tmpl :db/ident ident))))
                       spec)]
     (when (seq missing)
-      (d/transact conn missing))
+      (transact-recorded! conn missing))
     ;; User-facing hint attrs (:datahike.pg/*) installed via schema.clj's
     ;; own helper — keeps the hint schema definition colocated with its
     ;; consumers and lets bare-conn callers (no server) prime it by
@@ -2453,11 +2924,16 @@
   (try
     (let [spec-db (:speculative-db @tx-state)
           schema (:schema spec-db)
-          ;; Filter out schema attributes that already exist
-          ;; (CREATE TABLE on an existing table should be idempotent)
+          ;; Filter out full attribute DECLARATIONS that already exist
+          ;; (CREATE TABLE on an existing table should be idempotent).
+          ;; Schema UPDATES — {:db/ident X :db/unique …} / :db/index from
+          ;; ALTER TABLE ADD PRIMARY KEY/UNIQUE — carry no :db/valueType
+          ;; and must pass through; the old ident-only filter silently
+          ;; swallowed them (statement reported success, nothing applied).
           new-tx-data (vec (remove (fn [datum]
                                      (and (map? datum)
                                           (:db/ident datum)
+                                          (:db/valueType datum)
                                           (get schema (:db/ident datum))))
                                    tx-data))]
       (when (seq new-tx-data)
@@ -2505,7 +2981,7 @@
 
       :else
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE TABLE")
         (catch Exception e
           (classified-error "CREATE TABLE error: " e))))))
@@ -3207,7 +3683,14 @@
                   :speculative-db (:speculative-db @tx-state)
                   :tx-buffer (:tx-buffer @tx-state)
                   :eid->tempid (:eid->tempid @tx-state)
-                  :owned-locks (:owned-locks @tx-state)})
+                  :owned-locks (:owned-locks @tx-state)
+                  ;; The conflict watermark travels WITH the snapshot: a
+                  ;; rebase after this savepoint advances begin-max-tx, and
+                  ;; ROLLBACK TO must restore the old value — otherwise the
+                  ;; resurrected older speculative-db pairs with a newer
+                  ;; watermark and concurrent commits in between escape the
+                  ;; commit conflict check (lost update).
+                  :begin-max-tx (:begin-max-tx @tx-state)})
           (empty-result "SAVEPOINT")))))
 
 (defn- handle-release-savepoint
@@ -3232,6 +3715,53 @@
       (do (swap! tx-state update :savepoints subvec 0 idx)
           (empty-result "RELEASE SAVEPOINT")))))
 
+(defonce ^:private commit-check-lock
+  ;; Serializes conflict-check + d/transact in transact-tx-buffer! (and
+  ;; the check inside rebase-tx-state!) so no commit can land between a
+  ;; transaction's window read and its own transact.
+  (Object.))
+
+(defn- rebase-tx-state!
+  "After a row-lock wait, the values this transaction has read are stale
+   by exactly the awaited holder's commit. Re-anchor the speculative
+   overlay on the latest committed database so the retried statement
+   computes against fresh row values; this also narrows the commit-time
+   conflict window to post-rebase commits. Replaying the buffer is only
+   attempted when it is deterministic (real-eid ops, no tempids); a
+   replay overlap with an intervening commit throws the same
+   serialization-failure the commit itself would have raised — just
+   earlier. Temporal-wrapped speculative dbs opt out entirely."
+  [conn tx-state]
+  (let [ts @tx-state
+        spec (:speculative-db ts)]
+    (when (nil? (:origin-db spec))
+      (let [base (d/db conn)
+            begin (:begin-max-tx ts)
+            cur (:max-tx base)]
+        (when (and begin cur (> (long cur) (long begin)))
+          (let [buf (:tx-buffer ts)]
+            (if (empty? buf)
+              (swap! tx-state assoc :speculative-db base :begin-max-tx cur)
+              (do
+                (when (seq (:eid->tempid ts))
+                  (throw (ex-info "could not serialize access due to concurrent update"
+                                  {:error :serialization-failure
+                                   :detail "concurrent update after inserts in this transaction"})))
+                (let [our-eas (tx-buffer-eas buf base)
+                      their (when (not= ::opaque our-eas)
+                              (ring-write-eas-graced (db-ring-key base) begin cur))
+                      conflict? (if (and (not= ::opaque our-eas) (not= ::gap their))
+                                  (eas-overlap? our-eas their)
+                                  true)]
+                  (when conflict?
+                    (throw (ex-info "could not serialize access due to concurrent update"
+                                    {:error :serialization-failure
+                                     :detail (str "rebase base=" begin ", current=" cur)})))
+                  (let [rep (dc/with base buf)]
+                    (swap! tx-state assoc
+                           :speculative-db (:db-after rep)
+                           :begin-max-tx cur)))))))))))
+
 (defn- transact-tx-buffer!
   "Commit the accumulated transaction buffer to `conn`, with the same
    concurrent-write (40001 serialization_failure) detection as an
@@ -3239,33 +3769,45 @@
    resets tx-state. Shared by explicit COMMIT and the implicit-group
    commit so both behave identically."
   [conn tx-state]
-  (let [buf (:tx-buffer @tx-state)
-        begin-max-tx (:begin-max-tx @tx-state)
-        real-db (d/db conn)
-        current-max-tx (when begin-max-tx (:max-tx real-db))
-        advanced? (and begin-max-tx current-max-tx
-                       (> current-max-tx begin-max-tx))]
+  ;; The conflict check and the commit form one atomic step under a
+  ;; global monitor: without it two committers can both read the same
+  ;; current-max-tx, both pass, then serialize through d/transact and
+  ;; lose an update. Commits are already serialized by datahike's
+  ;; single writer, so the monitor adds no real concurrency cost.
+  (locking commit-check-lock
+    (let [buf (:tx-buffer @tx-state)
+          begin-max-tx (:begin-max-tx @tx-state)
+          real-db (d/db conn)
+          current-max-tx (when begin-max-tx (:max-tx real-db))
+          advanced? (and begin-max-tx current-max-tx
+                         (> current-max-tx begin-max-tx))]
     ;; Concurrent-write detection: fire 40001 only when our write set
-    ;; overlaps a concurrent committer's. Wildcard case (retractEntity)
-    ;; falls back to the pessimistic "any concurrent write conflicts".
-    (when (and (seq buf) advanced?)
-      (let [our-attrs   (tx-buffer-attrs buf)
-            wildcard?   (contains? our-attrs ::wildcard)
-            their-attrs (concurrent-write-attrs real-db begin-max-tx)
-            conflict?   (or wildcard?
-                            (= their-attrs ::any)
-                            (some their-attrs our-attrs))]
-        (when conflict?
-          (throw (ex-info "could not serialize access due to concurrent update"
-                          {:error  :serialization-failure
-                           :detail (str "base=" begin-max-tx
-                                        ", current=" current-max-tx
-                                        ", overlap="
-                                        (cond wildcard? "wildcard (retractEntity)"
-                                              (= their-attrs ::any) "query-failed"
-                                              :else (pr-str
-                                                     (filter their-attrs our-attrs))))})))))
-    (when (seq buf) (d/transact conn buf))))
+    ;; overlaps a concurrent committer's. Preferred check is ROW-level
+    ;; ([eid attr] pairs) against the recent-commit ring — O(concurrent
+    ;; writes) and no false abort when two transactions update different
+    ;; rows of the same column.
+      (when (and (seq buf) advanced?)
+        (let [our-eas (tx-buffer-eas buf real-db)
+              their-eas (when (not= ::opaque our-eas)
+                          (ring-write-eas-graced (db-ring-key real-db)
+                                                 begin-max-tx current-max-tx))
+            ;; No attribute-level whole-database fallback here anymore:
+            ;; an unresolvable window (ring gap after the grace loop, or
+            ;; an unattributable buffer) aborts conservatively instead.
+            ;; A spurious 40001 costs the client one retry; the old scan
+            ;; cost seconds — while row locks were held, which convoyed
+            ;; every other writer (measured: tpcb c4 collapsed to 3 tps).
+              conflict?
+              (if (and (not= ::opaque our-eas) (not= ::gap their-eas))
+                (eas-overlap? our-eas their-eas)
+                true)]
+          (when conflict?
+            (throw (ex-info "could not serialize access due to concurrent update"
+                            {:error  :serialization-failure
+                             :detail (str "base=" begin-max-tx
+                                          ", current=" current-max-tx)})))))
+      (when (seq buf)
+        (transact-recorded! conn buf)))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
@@ -3283,7 +3825,7 @@
    transaction (see open-implicit-tx! / *implicit-tx-allowed*) so the
    whole group is atomic. COPY is excluded — it runs its own sub-protocol
    and commits separately."
-  #{:insert :update :update-with-recursive :delete
+  #{:insert :update :update-with-recursive :delete :truncate
     :ddl-create :ddl-create-sequence :ddl-create-enum :ddl-create-domain
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-sequence})
 
@@ -3326,7 +3868,7 @@
       :else
       (let [target (nth sp-stack target-idx)
             {:keys [speculative-db tx-buffer eid->tempid
-                    owned-locks]} target
+                    owned-locks begin-max-tx]} target
             current-locks (:owned-locks @tx-state)
             to-release (clojure.set/difference current-locks
                                                (or owned-locks #{}))]
@@ -3341,6 +3883,10 @@
                :tx-buffer tx-buffer
                :eid->tempid eid->tempid
                :owned-locks (or owned-locks #{})
+               ;; Restore the conflict watermark alongside the snapshot —
+               ;; see handle-savepoint. Snapshots from before this field
+               ;; existed fall back to the current watermark.
+               :begin-max-tx (or begin-max-tx (:begin-max-tx @tx-state))
                ;; Keep savepoints up to AND INCLUDING the target (the
                ;; target stays active, more recent ones go).
                :savepoints (subvec sp-stack 0 (inc target-idx)))
@@ -3757,7 +4303,7 @@
       (let [curr (or (read-curr) 0)
             next (+ curr incr)
             cas-ok?
-            (try (d/transact conn [[:db/cas eid :__seq__/value curr next]])
+            (try (transact-recorded! conn [[:db/cas eid :__seq__/value curr next]])
                  true
                  (catch Throwable e
                    (if (cas-failure? e) false (throw e))))]
@@ -3828,7 +4374,7 @@
                                 (-> st
                                     (assoc :speculative-db (:db-after spec-report))
                                     (update :tx-buffer into setval-tx)))))
-            (d/transact conn setval-tx))
+            (transact-recorded! conn setval-tx))
           (single-row-result "setval" PgWireServer/OID_INT8 (str new-val)))
         (error-result (str "Sequence not found: " seq-name))))
     (catch Exception e
@@ -4140,6 +4686,178 @@
       ;; :scalar (and default): run the inner subquery, take first cell.
       (eval-corr-scalar (:inner-sql spec) true inner-schema query-db))))
 
+(defn- null-safe-order-cmp
+  "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
+   is a flat [col-idx dir col-idx dir …] spec; nil and the :__null__
+   sentinel both mean SQL NULL, which sorts last for ASC and first for
+   DESC (the PG default NULLS ordering)."
+  [sql-order-by]
+  (fn [a b]
+    (let [av (if (sequential? a) a [a])
+          bv (if (sequential? b) b [b])]
+      (loop [specs (partition 2 sql-order-by)]
+        (if-let [[idx dir] (first specs)]
+          (let [va (nth av idx nil)
+                vb (nth bv idx nil)
+                a-null? (or (nil? va) (= :__null__ va))
+                b-null? (or (nil? vb) (= :__null__ vb))
+                c (cond
+                    (and a-null? b-null?) 0
+                    ;; NULLs last for ASC, first for DESC (PG default)
+                    a-null? (if (= dir :asc) 1 -1)
+                    b-null? (if (= dir :asc) -1 1)
+                    :else (if (= dir :desc)
+                            (compare vb va)
+                            (compare va vb)))]
+            (if (zero? c)
+              (recur (rest specs))
+              c))
+          0)))))
+
+(defn- top-k-sort
+  "Return the first `k` rows of `rows` in ascending `cmp` order —
+   exactly what (take k (sort cmp rows)) yields, including the stable
+   tie order — without sorting the whole collection. Rows are paired
+   with their original index and ties break on that index, which is
+   what makes the selection identical to Clojure's stable full sort.
+   A size-k java.util.PriorityQueue with the INVERTED comparator keeps
+   the worst current survivor at its head so each new candidate either
+   evicts it or is discarded in O(log k): O(N log k) time, O(k) space
+   instead of O(N log N) / O(N)."
+  [k cmp rows]
+  (let [k (long k)]
+    (if-not (pos? k)
+      []
+      (let [stable-cmp (fn [[ia ra] [ib rb]]
+                         (let [c (cmp ra rb)]
+                           (if (zero? c) (compare ia ib) c)))
+            pq (java.util.PriorityQueue.
+                (int k) ^java.util.Comparator (fn [a b] (stable-cmp b a)))]
+        (reduce (fn [^long i row]
+                  (let [entry [i row]]
+                    (if (< (.size pq) k)
+                      (.offer pq entry)
+                      (when (neg? (stable-cmp entry (.peek pq)))
+                        (.poll pq)
+                        (.offer pq entry))))
+                  (inc i))
+                0 rows)
+        ;; Draining the max-heap yields descending order; cons onto a
+        ;; list to reverse into the ascending result.
+        (loop [acc ()]
+          (if-let [e (.poll pq)]
+            (recur (cons (second e) acc))
+            (vec acc)))))))
+
+(def ^:private fast-select-cache
+  "CompiledStatement prototype (tier-1 SELECT): [(identity parsed)] →
+   {:schema <schema object> :exec (fn [db bound] QueryResult)} | ::none.
+   Compiled on first Execute; revalidated against the live schema object
+   (DDL mints a new schema map → recompile)."
+  (pg-cache/bounded-cache 512))
+
+(defn- compile-fast-select
+  "Compile a parsed plain SELECT into a direct executor: datalog query +
+   ParamRef argument template + precomputed result shape. Returns nil when
+   the statement needs the general exec-select machinery."
+  [parsed db]
+  (when (and (= :select (:type parsed))
+             (:query parsed) (seq (:find-aliases parsed))
+             (nil? (:enriched-db parsed))
+             (nil? (:correlated-subqueries parsed))
+             (nil? (:compound-exprs parsed))
+             (nil? (:window-specs parsed))
+             (nil? (:for-update parsed))
+             (not (:has-aggregates? parsed))
+             (not (:has-distinct? parsed))
+             (nil? (:limit parsed)) (nil? (:offset parsed))
+             (nil? (:sql-limit parsed)) (nil? (:sql-offset parsed))
+             (nil? (:sql-order-by parsed))
+             (nil? (:sub-results parsed))
+             (not (re-find #"(?i)for\s+(valid_time|system_time)"
+                           (or (:sql parsed) ""))))
+    (let [query (:query parsed)
+          in-args (vec (:in-args parsed))
+          aliases (:find-aliases parsed)
+          hidden (long (or (:hidden-count parsed) 0))
+          keep-n (- (count (:find query)) hidden)
+          parsed-with-shape (assoc parsed :find-aliases aliases :query query)
+          schema-oids (compute-schema-oids parsed-with-shape db)
+          item-oids (:select-item-oids parsed)
+          schema-oids (if (and item-oids (seq aliases))
+                        (let [n (count aliases)
+                              out (int-array n)]
+                          (dotimes [i n]
+                            (let [so (aget ^ints schema-oids i)
+                                  io (when (< i (count item-oids))
+                                       (nth item-oids i))]
+                              (aset out i (int (if (and (= so -1) io) io so)))))
+                          out)
+                        schema-oids)
+          sources (compute-column-sources parsed-with-shape db)]
+      (when (pos? keep-n)
+        {:schema (dbi/-schema db)
+         :exec
+         (fn [db bound]
+           (let [args (mapv (fn [a] (if (sql/param-ref? a)
+                                      (nth bound (:idx a))
+                                      a))
+                            in-args)
+                 res (run-param-query query #(apply d/q query db args))
+                 rows (if (pos? hidden)
+                        (mapv #(subvec (vec %) 0 keep-n) res)
+                        res)
+                 result (format-query-result rows aliases schema-oids)]
+             (if sources
+               (-> ^PgWireServer$QueryResult result
+                   (.withColumnSources (first sources) (second sources))
+                   (.withColumnTypmods (nth sources 2)))
+               result)))}))))
+
+(defn- fast-select-prepared
+  "Tier-1 Execute path: run a compiled SELECT directly against the live db,
+   bypassing the general dispatch. Returns a QueryResult, or nil to fall
+   through to the full execute path (which is always semantically safe —
+   this lane only ever handles plain autocommit reads with no temporal or
+   session modifiers). Any exception falls back to the general path."
+  [conn parsed bound session-state tx-state on-query]
+  (when (map? parsed)
+    (let [k [(pg-cache/identity-key parsed)]
+          entry (.get ^java.util.Map fast-select-cache k)]
+      (when-not (identical? ::none entry)
+        (try
+          (let [ts @tx-state
+                ss @session-state]
+            (when (and (not (:aborted? ts))
+                       (nil? *snapshot-db*)
+                       (not (or (:as-of ss) (:since ss) (:history ss)
+                                (:branch ss) (:commit-id ss) (:valid-at ss)
+                                (:valid-between ss) (:statement-timeout ss))))
+              ;; Inside an explicit/implicit tx, reads see the speculative
+              ;; overlay — same db selection as the general execute path.
+              (let [db (if (:in-tx? ts)
+                         (or (:speculative-db ts) (d/db conn))
+                         (d/db conn))
+                    schema (dbi/-schema db)
+                    entry (if (and entry (identical? (:schema entry) schema))
+                            entry
+                            (let [e (compile-fast-select parsed db)]
+                              (.put ^java.util.Map fast-select-cache k (or e ::none))
+                              e))]
+                (when entry
+                  (when on-query (on-query (:sql parsed)))
+                  ((:exec entry) db bound)))))
+          (catch Exception _ nil))))))
+
+(def ^:private select-shape-cache
+  "Result-shape cache for exec-select: [(identity parsed) (identity schema)
+   find-aliases] → [schema-oids sources]. The final RowDescription metadata
+   (blended OIDs, column sources, typmods) is a pure function of the parsed
+   statement and the schema; recomputing it per execution cost ~10% of a
+   point SELECT. Bounded LRU; DDL mints a new schema object so stale
+   generations age out."
+  (pg-cache/bounded-cache 512))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -4194,8 +4912,8 @@
                       offset (assoc :offset offset)
                       :always (assoc :cancel (current-cancel)))
             results (if (seq in-args)
-                      (apply d/q q-input query-db in-args)
-                      (d/q q-input query-db))
+                      (run-param-query q-input #(apply d/q q-input query-db in-args))
+                      (run-param-query q-input #(d/q q-input query-db)))
             ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
             ;; Extract the `id` column from each result row, check the
             ;; server-wide lock registry, and either:
@@ -4294,34 +5012,31 @@
                                               find-elems)]
                         [default-row])
                       results)
-            ;; Server-side null-safe sort (when ORDER BY has nullable columns)
+            ;; Server-side null-safe sort (when ORDER BY has nullable columns).
+            ;; With LIMIT n (+ OFFSET o) only the first n+o sorted rows are
+            ;; ever emitted, so a bounded top-k selection replaces the full
+            ;; sort. Restricted to where the sort+trim is the final
+            ;; row-shaping step: HAVING and window functions run AFTER this
+            ;; point in the pipeline, so those keep the full-sort path
+            ;; (top-k replicates the stable tie order, but the full sort is
+            ;; the reference behavior — prefer it in doubt). Also skipped
+            ;; when n+o covers half the result or more, where the heap
+            ;; bookkeeping has nothing left to win.
             results (if sql-order-by
-                      (let [null-safe-cmp
-                            (fn [a b]
-                              (let [av (if (sequential? a) a [a])
-                                    bv (if (sequential? b) b [b])]
-                                (loop [specs (partition 2 sql-order-by)]
-                                  (if-let [[idx dir] (first specs)]
-                                    (let [va (nth av idx nil)
-                                          vb (nth bv idx nil)
-                                          a-null? (or (nil? va) (= :__null__ va))
-                                          b-null? (or (nil? vb) (= :__null__ vb))
-                                          c (cond
-                                              (and a-null? b-null?) 0
-                                              ;; NULLs last for ASC, first for DESC (PG default)
-                                              a-null? (if (= dir :asc) 1 -1)
-                                              b-null? (if (= dir :asc) -1 1)
-                                              :else (if (= dir :desc)
-                                                      (compare vb va)
-                                                      (compare va vb)))]
-                                      (if (zero? c)
-                                        (recur (rest specs))
-                                        c))
-                                    0))))]
-                        (let [sorted (sort null-safe-cmp results)]
-                          (cond->> sorted
-                            sql-offset (drop sql-offset)
-                            sql-limit  (take sql-limit))))
+                      (let [null-safe-cmp (null-safe-order-cmp sql-order-by)
+                            k (when sql-limit
+                                (+ (long sql-limit) (long (or sql-offset 0))))
+                            use-top-k? (and k
+                                            (nil? having)
+                                            (empty? window-specs)
+                                            (< (* 2 k) (count results)))]
+                        (if use-top-k?
+                          (cond->> (top-k-sort k null-safe-cmp results)
+                            sql-offset (drop sql-offset))
+                          (let [sorted (sort null-safe-cmp results)]
+                            (cond->> sorted
+                              sql-offset (drop sql-offset)
+                              sql-limit  (take sql-limit)))))
                       results)
             ;; Apply HAVING filter BEFORE trimming hidden columns:
             ;; HAVING can reference an aggregate that wasn't in the SELECT
@@ -4443,49 +5158,72 @@
         ;; Derive schema-based OIDs for proper type metadata.
         ;; Shared with describeResult; see compute-schema-oids.
         (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
-              ;; Resolve column OIDs against the same db the query ran on:
+              ;; Result shape (final OIDs + column sources) is a pure function
+              ;; of (statement, schema, aliases): cache it across executions.
+              ;; Keyed on the parsed OBJECT (stable via the parse LRU /
+              ;; prepared statements) and the schema OBJECT (stable across
+              ;; non-DDL transactions). Only for the base db — an enriched-db
+              ;; (CTE / SRF virtual tables) carries per-execution type info.
+              shape-key (when (identical? query-db db)
+                          [(pg-cache/identity-key parsed)
+                           (pg-cache/identity-key (dbi/-schema db))
+                           find-aliases])
+              cached-shape (when shape-key
+                             (.get ^java.util.Map select-shape-cache shape-key))]
+          (if cached-shape
+            (let [[schema-oids sources] cached-shape
+                  result (format-query-result results find-aliases schema-oids)]
+              (if sources
+                (-> ^PgWireServer$QueryResult result
+                    (.withColumnSources (first sources) (second sources))
+                    (.withColumnTypmods (nth sources 2)))
+                result))
+            (let [;; Resolve column OIDs against the same db the query ran on:
               ;; when a derived table / SRF-in-FROM materialised a virtual
               ;; table (:enriched-db), its columns' :pg/type markers (e.g.
               ;; generate_series → int4) only live there, not on the base
               ;; conn db.
-              schema-oids (compute-schema-oids parsed-with-shape query-db)
+                  schema-oids (compute-schema-oids parsed-with-shape query-db)
               ;; Blend parse-time OIDs (oid-infer)
               ;; over the -1 sentinel so empty
               ;; result sets and aggregate /
               ;; CAST / literal columns keep the
               ;; correct type when value inference
               ;; would otherwise fall back to TEXT.
-              item-oids (:select-item-oids parsed)
-              schema-oids (if (and item-oids (seq find-aliases))
-                            (let [n (count find-aliases)
-                                  out (int-array n)]
-                              (dotimes [i n]
-                                (let [so (aget ^ints schema-oids i)
-                                      io (when (< i (count item-oids))
-                                           (nth item-oids i))]
-                                  (aset out i
-                                        (int (if (and (= so -1) io) io so)))))
-                              out)
-                            schema-oids)
+                  item-oids (:select-item-oids parsed)
+                  schema-oids (if (and item-oids (seq find-aliases))
+                                (let [n (count find-aliases)
+                                      out (int-array n)]
+                                  (dotimes [i n]
+                                    (let [so (aget ^ints schema-oids i)
+                                          io (when (< i (count item-oids))
+                                               (nth item-oids i))]
+                                      (aset out i
+                                            (int (if (and (= so -1) io) io so)))))
+                                  out)
+                                schema-oids)
               ;; Correlated subqueries: the spliced columns aren't schema/
               ;; item columns, so force each one's advertised OID (its
               ;; inner-projection :oid) at its out-pos — keeping the
               ;; execute-path encoding consistent with the RowDescription
               ;; describeResult sent (e.g. array_agg → text[] binary).
-              schema-oids (if-let [cs (:correlated-subqueries parsed)]
-                            (let [out (aclone ^ints schema-oids)]
-                              (doseq [{:keys [out-pos oid]} (:subqueries cs)]
-                                (when (< out-pos (alength out))
-                                  (aset out out-pos (int (or oid PgWireServer/OID_TEXT)))))
-                              out)
-                            schema-oids)
-              sources (compute-column-sources parsed-with-shape db)
-              result (format-query-result results find-aliases schema-oids)]
-          (if sources
-            (-> ^PgWireServer$QueryResult result
-                (.withColumnSources (first sources) (second sources))
-                (.withColumnTypmods (nth sources 2)))
-            result))))))
+                  schema-oids (if-let [cs (:correlated-subqueries parsed)]
+                                (let [out (aclone ^ints schema-oids)]
+                                  (doseq [{:keys [out-pos oid]} (:subqueries cs)]
+                                    (when (< out-pos (alength out))
+                                      (aset out out-pos (int (or oid PgWireServer/OID_TEXT)))))
+                                  out)
+                                schema-oids)
+                  sources (compute-column-sources parsed-with-shape db)
+                  _ (when shape-key
+                      (.put ^java.util.Map select-shape-cache shape-key
+                            [schema-oids sources]))
+                  result (format-query-result results find-aliases schema-oids)]
+              (if sources
+                (-> ^PgWireServer$QueryResult result
+                    (.withColumnSources (first sources) (second sources))
+                    (.withColumnTypmods (nth sources 2)))
+                result))))))))
 
 (defn- remap-tempids
   "Rewrite every string tempid in `form` (any string sitting in a
@@ -4622,9 +5360,34 @@
   (let [{:keys [conn schema tx-state]} ctx]
     (if (:in-tx? @tx-state)
       (try
-        (let [spec-db (:speculative-db @tx-state)
+        (let [session-id (:session-id @tx-state)
+              ;; PG-style row locking: block on rows another in-flight tx
+              ;; has updated instead of computing against their old values
+              ;; and aborting at commit. On a wait, rebase the speculative
+              ;; overlay and RECOMPUTE the row match + SET expressions —
+              ;; the awaited holder committed new values. Loop terminates:
+              ;; locks acquired on one pass never conflict on the next.
+              ;; First write of the tx: re-anchor the snapshot on the latest
+              ;; committed db (buffer empty → free). This is PG READ
+              ;; COMMITTED's per-statement snapshot: it shrinks the commit
+              ;; conflict window from BEGIN→COMMIT to first-write→COMMIT.
+              _ (when (empty? (:tx-buffer @tx-state))
+                  (rebase-tx-state! conn tx-state))
+              {:keys [eids tx-data]}
+              (loop []
+                (let [spec-db (:speculative-db @tx-state)
+                      {:keys [eids] :as built} (build-update-tx spec-db schema parsed)
+                      lockable (filterv integer? eids)]
+                  (if (and session-id (seq lockable)
+                           (nil? (:origin-db spec-db))
+                           (= :waited (lock-rows-blocking! session-id tx-state
+                                                           (:table parsed) lockable
+                                                           row-lock-timeout-ms)))
+                    (do (rebase-tx-state! conn tx-state)
+                        (recur))
+                    built)))
+              spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              {:keys [eids tx-data]} (build-update-tx spec-db schema parsed)
               _ (check-update-identity-collisions! spec-db schema tx-data)
               _ (check-not-null-on-update! spec-db tx-data)
               _ (check-updates-against-row-constraints!
@@ -4658,9 +5421,25 @@
   (let [{:keys [conn schema tx-state]} ctx]
     (if (:in-tx? @tx-state)
       (try
-        (let [spec-db (:speculative-db @tx-state)
+        (let [session-id (:session-id @tx-state)
+              ;; Same blocking row-lock + rebase discipline as exec-update.
+              _ (when (empty? (:tx-buffer @tx-state))
+                  (rebase-tx-state! conn tx-state))
+              {:keys [eids]}
+              (loop []
+                (let [spec-db (:speculative-db @tx-state)
+                      {:keys [eids] :as built} (build-delete-tx spec-db schema parsed)
+                      lockable (filterv integer? eids)]
+                  (if (and session-id (seq lockable)
+                           (nil? (:origin-db spec-db))
+                           (= :waited (lock-rows-blocking! session-id tx-state
+                                                           (:table parsed) lockable
+                                                           row-lock-timeout-ms)))
+                    (do (rebase-tx-state! conn tx-state)
+                        (recur))
+                    built)))
+              spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
-              {:keys [eids]} (build-delete-tx spec-db schema parsed)
               _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
@@ -4676,6 +5455,103 @@
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
       (execute-delete conn parsed schema :tx-wrap (:tx-wrap ctx)))))
+
+(defn- table-row-eids
+  "All row entity-ids of `table` in `db` — union across EVERY attr in
+   the table's namespace, not just the first (a row whose first column
+   is NULL must still be found; see drop-table-tx!'s history note).
+   Returns a set; empty when the table doesn't exist — TRUNCATE and
+   DROP treat a missing table as empty, matching DELETE."
+  [db table]
+  (let [db-schema (dbi/-schema db)
+        table-attrs (into []
+                          (keep (fn [[attr-kw _]]
+                                  (when (and (keyword? attr-kw)
+                                             (= (namespace attr-kw) table))
+                                    attr-kw)))
+                          db-schema)]
+    (into #{}
+          (mapcat (fn [attr]
+                    (map first
+                         (d/q {:find '[?e]
+                               :where [['?e attr]]}
+                              db))))
+          table-attrs)))
+
+(defn- restart-identity-tx-data
+  "TRUNCATE … RESTART IDENTITY: reset every IDENTITY-backing sequence
+   of `tables` to its pristine post-CREATE state. Identity sequences
+   (translate-create-table) initialise :__seq__/value to 0 = start(1) -
+   increment(1); handle-nextval is advance-then-return, so resetting to
+   `- 1 increment` makes the next nextval return 1 again. Sequences
+   with a non-default START WITH aren't reachable here — IDENTITY
+   columns always start at 1."
+  [db tables]
+  (when (get (dbi/-schema db) :__seq__/name)
+    (vec
+     (for [table tables
+           {:keys [seq-name]} (compute-identity-cols db table)
+           :let [seq-eid (ffirst (d/q '{:find [?e]
+                                        :where [[?e :__seq__/name ?n]]
+                                        :in [$ ?n]}
+                                      db seq-name))
+                 increment (or (when seq-eid
+                                 (ffirst (d/q '{:find [?i]
+                                                :where [[?e :__seq__/increment ?i]]
+                                                :in [$ ?e]}
+                                              db seq-eid)))
+                               1)]
+           :when seq-eid]
+       [:db/add seq-eid :__seq__/value (- 1 increment)]))))
+
+(defn- exec-truncate
+  "TRUNCATE [TABLE] t1, t2, … — retract every row of every listed
+   table in ONE transaction (PG truncates the listed set atomically).
+   No per-row FK enforcement: PG's TRUNCATE check is table-level and
+   exempts referencing tables that are themselves in the list, which
+   the row-level DELETE machinery would misfire on. Missing tables are
+   treated as empty, like DELETE."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        tables (:tables parsed)]
+    (if (:in-tx? @tx-state)
+      (try
+        (let [spec-db (:speculative-db @tx-state)
+              eid->tempid (:eid->tempid @tx-state)
+              eids (into [] (mapcat #(table-row-eids spec-db %)) tables)
+              restart-tx (when (:restart-identity? parsed)
+                           (restart-identity-tx-data spec-db tables))
+              ;; Speculative db keeps ORIGINAL entity IDs …
+              spec-tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
+                                 restart-tx)
+              spec-report (dc/with spec-db spec-tx-data)
+              ;; … the commit buffer remaps to tempids (rows inserted
+              ;; earlier in this tx only exist as tempids at commit).
+              remap (fn [eid] (get eid->tempid eid eid))
+              commit-tx-data (into (mapv (fn [eid] [:db/retractEntity (remap eid)]) eids)
+                                   (map (fn [[op eid attr val]] [op (remap eid) attr val]))
+                                   restart-tx)]
+          (swap! tx-state (fn [ts]
+                            (-> ts
+                                (update :tx-buffer into commit-tx-data)
+                                (assoc :speculative-db (:db-after spec-report)))))
+          (empty-result "TRUNCATE TABLE"))
+        (catch Exception e
+          (swap! tx-state assoc :aborted? true)
+          (classified-error "TRUNCATE error: " e)))
+      (try
+        (let [db (d/db conn)
+              eids (into [] (mapcat #(table-row-eids db %)) tables)
+              restart-tx (when (:restart-identity? parsed)
+                           (restart-identity-tx-data db tables))
+              tx-data (into (mapv (fn [eid] [:db/retractEntity eid]) eids)
+                            restart-tx)
+              tx-data ((:tx-wrap ctx identity) tx-data)]
+          (when (seq tx-data)
+            (transact-recorded! conn tx-data))
+          (empty-result "TRUNCATE TABLE"))
+        (catch Exception e
+          (classified-error "TRUNCATE error: " e))))))
 
 (defn- exec-ddl-create
   [ctx parsed]
@@ -4721,7 +5597,7 @@
 
       :else
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE SEQUENCE")
         (catch Exception e
           (classified-error "CREATE SEQUENCE error: " e))))))
@@ -4760,7 +5636,7 @@
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE TYPE")
         (catch Exception e
           (classified-error "CREATE TYPE error: " e))))))
@@ -4806,7 +5682,7 @@
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (sync-composites-to-codec! (d/db conn))
         (empty-result "CREATE TYPE")
         (catch Exception e
@@ -4849,7 +5725,7 @@
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE DOMAIN")
       (try
-        (d/transact conn tx-data)
+        (transact-recorded! conn tx-data)
         (empty-result "CREATE DOMAIN")
         (catch Exception e
           (classified-error "CREATE DOMAIN error: " e))))))
@@ -4893,9 +5769,11 @@
   (let [{:keys [conn tx-state]} ctx]
     (try
       (let [{:keys [table operations]} parsed
+            schema (dbi/-schema (d/db conn))
             tx-data (vec (mapcat
                           (fn [{:keys [op columns]}]
-                            (when (= op :add-column)
+                            (case op
+                              :add-column
                               (for [{:keys [name type]} columns
                                     :let [base-type (str/replace type #"\s*\([^)]*\)" "")
                                           dh-type (or (get types/sql-name->dh-type type)
@@ -4905,13 +5783,45 @@
                                          :db/valueType dh-type
                                          :db/cardinality :db.cardinality/one}
                                   (#{"jsonb" "json"} base-type)
-                                  (assoc :pg/type base-type)))))
+                                  (assoc :pg/type base-type)))
+                              ;; PK/UNIQUE on an existing column: upgrade the
+                              ;; attribute — datahike's index-backfill migration
+                              ;; populates AVET for pre-existing datoms and
+                              ;; verifies uniqueness (duplicates reject the tx).
+                              ;; A composite key can't map to per-attr
+                              ;; uniqueness (that would over-constrain), so its
+                              ;; members get :db/index only.
+                              (:add-primary-key :add-unique)
+                              (let [single? (= 1 (count columns))
+                                    unique-kw (if (= op :add-primary-key)
+                                                :db.unique/identity
+                                                :db.unique/value)]
+                                (for [col columns
+                                      :let [attr (keyword table col)]
+                                      :when (contains? schema attr)]
+                                  (if single?
+                                    {:db/ident attr :db/unique unique-kw}
+                                    {:db/ident attr :db/index true})))
+                              nil))
                           operations))]
         (if (seq tx-data)
-          (if (:in-tx? @tx-state)
-            (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
-            (do (d/transact conn tx-data)
-                (empty-result "ALTER TABLE")))
+          (try
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state tx-data "ALTER TABLE")
+              (do (transact-recorded! conn tx-data)
+                  (empty-result "ALTER TABLE")))
+            (catch Exception e
+              ;; PK/UNIQUE upgrades need datahike's index-backfill
+              ;; migration. Against an older datahike that rejects
+              ;; schema updates on existing attributes, degrade to the
+              ;; historical accept-as-no-op behavior (uniqueness is
+              ;; still enforced by the SQL layer's identity checks)
+              ;; instead of failing statements that used to succeed.
+              (if (and (not-any? #(= :add-column (:op %)) operations)
+                       (re-find #"Update not supported"
+                                (str (.getMessage e))))
+                (empty-result "ALTER TABLE")
+                (throw e))))
           (empty-result "ALTER TABLE")))
       (catch Exception e
         (classified-error "ALTER TABLE error: " e)))))
@@ -4932,21 +5842,10 @@
                                              (= (namespace attr-kw) table))
                                     attr-kw)))
                           db-schema)
-        ;; Collect all entity IDs for this table. An earlier
-        ;; version queried only the FIRST attr, which missed
-        ;; rows where that attr was null (pgjdbc's boolfloat
-        ;; inserts (i, a, NULL) — if first-attr was `b`, the
-        ;; row was never retracted and accumulated across
-        ;; DROP/CREATE cycles). Union across every attr to
-        ;; catch all rows.
+        ;; Collect all entity IDs for this table — union across every
+        ;; attr (see table-row-eids for the NULL-first-column history).
         data-eids (when (seq table-attrs)
-                    (into #{}
-                          (mapcat (fn [attr]
-                                    (map first
-                                         (d/q {:find '[?e]
-                                               :where [['?e attr]]}
-                                              db))))
-                          table-attrs))
+                    (table-row-eids db table))
         ;; Retract all data entities
         data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
         ;; Retract the schema attribute definitions themselves
@@ -4958,18 +5857,22 @@
                              table-attrs)
         all-tx-data (into data-tx-data (filter some? schema-tx-data))]
     (when (seq all-tx-data)
-      (d/transact conn all-tx-data))))
+      (transact-recorded! conn all-tx-data))))
 
 (defn- exec-ddl-drop
+  "DROP TABLE — single name (:table, JSqlParser path) or a list
+   (:tables, classify's :drop-table-multi path). Per-table drops run
+   sequentially; a missing table is a no-op (drop-table-tx! finds no
+   attrs), so IF EXISTS needs no extra branch."
   [ctx parsed]
   (let [{:keys [conn temp-tables]} ctx]
     (try
-      (let [table (:table parsed)]
+      (doseq [table (or (:tables parsed) [(:table parsed)])]
         (drop-table-tx! conn table)
         ;; A DROP TABLE on a tracked temp table means close() must not
         ;; try to drop it again.
-        (when temp-tables (swap! temp-tables disj table))
-        (empty-result "DROP TABLE"))
+        (when temp-tables (swap! temp-tables disj table)))
+      (empty-result "DROP TABLE")
       (catch Exception e
         (classified-error "DROP TABLE error: " e)))))
 
@@ -4984,7 +5887,7 @@
                                    :in [$ ?n]}
                                  db seq-name))]
         (when seq-eid
-          (d/transact conn [[:db/retractEntity seq-eid]]))
+          (transact-recorded! conn [[:db/retractEntity seq-eid]]))
         (empty-result "DROP SEQUENCE"))
       (catch Exception e
         (classified-error "DROP SEQUENCE error: " e)))))
@@ -5009,7 +5912,7 @@
                    (let [q-input (assoc query :cancel (current-cancel))
                          raw (if (seq in-args)
                                (apply d/q q-input query-db in-args)
-                               (d/q q-input query-db))
+                               (run-param-query q-input #(d/q q-input query-db)))
                          hc (or hidden-count 0)
                          visible (- (count (:find query)) hc)
                          results (if (pos? hc)
@@ -5097,21 +6000,30 @@
 
 (defn- columns-from-schema
   "When `COPY t FROM stdin` is invoked WITHOUT an explicit column
-   list, derive the column names from `t`'s schema. Order is the same
-   as `pg_attribute.attnum` would expose — we look at every keyword
-   attribute in the schema whose namespace matches `ns`, in
-   alphabetical order (deterministic; pg_dump uses an explicit
-   column list anyway, so this fallback is mostly used by hand-typed
-   psql `COPY t FROM stdin` invocations)."
-  [schema ns]
-  (->> schema
-       keys
-       (filter keyword?)
-       (filter #(= ns (namespace %)))
-       (remove #(= "db-row-exists" (name %)))
-       (mapv name)
-       sort
-       vec))
+   list, derive the column names in TABLE DECLARATION order — PG
+   assigns incoming fields positionally by attnum. The alphabetical
+   fallback this replaces silently shifted every column of pgbench's
+   list-free COPY (bbalance sorts before bid, so all branches loaded
+   with bid=0 and tellers hit spurious NOT NULL violations).
+   Declaration order comes from pgs/column-info (schema entity-id
+   order when a db is supplied); the sorted set remains as the final
+   fallback when the table can't be derived."
+  ([schema ns] (columns-from-schema schema ns nil))
+  ([schema ns db]
+   (or (when-let [cols (seq (pgs/column-info schema ns db))]
+         (->> cols
+              (map :name)
+              (remove #(or (= "db_id" %) (= "db-row-exists" %)))
+              vec
+              not-empty))
+       (->> schema
+            keys
+            (filter keyword?)
+            (filter #(= ns (namespace %)))
+            (remove #(= "db-row-exists" (name %)))
+            (mapv name)
+            sort
+            vec))))
 
 (defn- exec-copy-from-stdin
   "Initialise a COPY-IN session and return a QueryResult signalling
@@ -5120,10 +6032,12 @@
    the QueryHandler reify's copyChunk/copyComplete/copyAbort
    methods (which read the session out of `:copy-state`)."
   [ctx parsed]
-  (let [{:keys [schema copy-state]} ctx
+  (let [{:keys [schema copy-state conn]} ctx
         {:keys [ns table columns options]} parsed
         ns (or ns table)
-        col-names (or columns (columns-from-schema schema ns))]
+        col-names (or columns
+                      (columns-from-schema schema ns
+                                           (when conn (d/db conn))))]
     (when (empty? col-names)
       (throw (ex-info (str "no columns found for COPY into \"" table "\"")
                       {:error :undefined-table :table table})))
@@ -5167,7 +6081,7 @@
         (let [tx-data' (-> rows
                            (auto-populate-identity (:table s) (d/db conn))
                            (apply-column-constraints (:table s) (:ns s) (d/db conn)))]
-          (d/transact conn tx-data')
+          (transact-recorded! conn tx-data')
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
                                  (update :rows-committed + (count rows)))))
@@ -5411,7 +6325,7 @@
             ;; (freshen-tx-tempids), so concatenating is collision-free.
             (let [combined (vec (mapcat identity tx-data-list))]
               (when (seq combined)
-                (d/transact conn combined)))
+                (transact-recorded! conn combined)))
             nil
             (catch Exception e
               (classified-error "INSERT (batched) error: " e)))))
@@ -5707,10 +6621,15 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (binding [*cached-parsed* parsed
-                  *cached-bound* (vec bound-params)
-                  *implicit-tx-allowed* true]
-          (.execute this (or (:sql parsed) ""))))
+        (let [bound (vec bound-params)]
+          (or
+           ;; Tier-1 compiled lane: plain autocommit SELECT with no
+           ;; session modifiers runs its compiled executor directly.
+           (fast-select-prepared conn parsed bound session-state tx-state on-query)
+           (binding [*cached-parsed* parsed
+                     *cached-bound* bound
+                     *implicit-tx-allowed* true]
+             (.execute this (or (:sql parsed) ""))))))
 
       (executeInGroup [this sql]
         ;; Simple-query group member: a write opens/joins the 'Q''s
@@ -5818,18 +6737,55 @@
                     ;; non-parameterized prepared statements re-parse — bump
                     ;; the dispatch counter only on the re-parse branch
                     ;; (Extended-Query Parse already counted at this.parse).
-                          parsed (if-let [cached *cached-parsed*]
-                                   (if-let [bound *cached-bound*]
-                                     ;; Re-coerce INSERT values after ParamRef
-                                     ;; substitution so untyped text params
-                                     ;; (e.g. node-postgres "270" → int column)
-                                     ;; narrow to the column's :db/valueType.
-                                     (coerce-insert-tx-data
-                                      (resolve-param-refs cached bound) schema)
-                                     cached)
-                                   (let [p (sql/parse-sql sql schema db)]
-                                     (when bump-dispatch! (bump-dispatch! p))
-                                     p))
+                          {parsed :parsed templated-bound :bound}
+                          (if-let [cached *cached-parsed*]
+                            {:parsed
+                             (if-let [bound *cached-bound*]
+                               ;; Re-coerce INSERT values after ParamRef
+                               ;; substitution so untyped text params
+                               ;; (e.g. node-postgres "270" → int column)
+                               ;; narrow to the column's :db/valueType.
+                               (coerce-insert-tx-data
+                                (resolve-param-refs cached bound) schema)
+                               cached)}
+                            ;; Simple-protocol plan stability: rewrite
+                            ;; bare number literals to $N so every cache
+                            ;; layer (AST, parse result, datalog parse,
+                            ;; plan) keys on ONE shape per statement
+                            ;; family, then execute like a one-shot
+                            ;; prepared statement. Any parse error on
+                            ;; the templated form falls back to the
+                            ;; original SQL untouched. Only reachable
+                            ;; with *cached-parsed* nil (this if-let's
+                            ;; else-branch), so the extended-query path
+                            ;; never re-templates its $N statements.
+                            (or (when-let [{tsql :sql tvals :params}
+                                           (template/parameterize-numbers sql)]
+                                  (let [p (sql/parse-sql tsql schema db)]
+                                    (when (and p (not= :error (:type p))
+                                               (contains? #{:select :update :delete}
+                                                          (:type p)))
+                                      (when bump-dispatch! (bump-dispatch! p))
+                                      ;; ParamRefs are 1-indexed; prepend
+                                      ;; an unused slot like the wire path.
+                                      (let [bound (into [nil] tvals)]
+                                        {:parsed (resolve-param-refs p bound)
+                                         ;; UPDATE/DELETE re-translate their
+                                         ;; WHERE AST at execute time and eval
+                                         ;; SET expressions against
+                                         ;; *cached-bound* — carry the values
+                                         ;; to the dispatch arms below, exactly
+                                         ;; as executePrepared's binding does.
+                                         ;; SELECT is fully resolved by the
+                                         ;; substitution above. :insert never
+                                         ;; reaches here (own templater), so
+                                         ;; skipping coerce-insert-tx-data —
+                                         ;; :insert-gated — is a no-op.
+                                         :bound (when (not= :select (:type p))
+                                                  bound)}))))
+                                {:parsed (let [p (sql/parse-sql sql schema db)]
+                                           (when bump-dispatch! (bump-dispatch! p))
+                                           p)}))
                           ;; Sibling pass to ParamRef substitution: any
                           ;; `nextval('s')` markers left in tx-data/in-args
                           ;; resolve here against the live conn (PG's
@@ -5929,8 +6885,20 @@
                           :select                (exec-select ctx parsed)
                           :insert                (exec-insert ctx parsed)
                           :update-with-recursive (exec-update-with-recursive ctx parsed)
-                          :update                (exec-update ctx parsed)
-                          :delete                (exec-delete ctx parsed)
+                          ;; Templated simple-protocol UPDATE/DELETE ride
+                          ;; the prepared-statement machinery: the exec
+                          ;; paths re-translate WHERE and evaluate SET
+                          ;; against *cached-bound* (1-indexed, slot 0
+                          ;; unused), so bind the templater's captured
+                          ;; literals here. `or` keeps the real
+                          ;; executePrepared binding when not templated.
+                          :update                (binding [*cached-bound*
+                                                           (or templated-bound *cached-bound*)]
+                                                   (exec-update ctx parsed))
+                          :delete                (binding [*cached-bound*
+                                                           (or templated-bound *cached-bound*)]
+                                                   (exec-delete ctx parsed))
+                          :truncate              (exec-truncate ctx parsed)
                           ;; Every DDL exec-* invalidates the per-schema cache.
                           ;; PG metadata (`:pg/not-null` etc.) lives on schema-
                           ;; attribute entities but not in `(dbi/-schema db)`, so

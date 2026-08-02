@@ -3556,6 +3556,19 @@
       ;; clause should land above this `:else`.
       :else nil)))
 
+(defn- num-operand
+  "PG-style unknown-operand resolution for arithmetic: a text-format
+   wire parameter decodes as a String; in numeric context PG casts it
+   to the numeric type. Numeric-looking strings parse (long or double
+   by shape); everything else passes through unchanged so non-numeric
+   operands still fail the arithmetic's number? guards."
+  [x]
+  (if (and (string? x)
+           (re-matches #"\s*[+-]?\d+(\.\d+)?([eE][+-]?\d+)?\s*" x))
+    (try (coerce/coerce-numeric x (if (re-find #"[.eE]" x) :double :long))
+         (catch Exception _ x))
+    x))
+
 (defn eval-update-expr
   "Evaluate an UPDATE SET expression for a specific entity.
    For simple literals, returns the literal value.
@@ -3566,7 +3579,15 @@
   [value-expr entity-map ns-str schema]
   (cond
     (instance? JdbcParameter value-expr)
-    (->ParamRef (.getIndex ^JdbcParameter value-expr))
+    ;; Execute-time re-evaluation (*bound-params* bound): resolve to the
+    ;; concrete value so arithmetic like `SET bal = bal + $1` computes —
+    ;; a ParamRef operand made `+` throw ClassCastException (hit by
+    ;; pgbench -M prepared). Parse time keeps the ParamRef sentinel for
+    ;; the tx-build substitution pass.
+    (let [idx (.getIndex ^JdbcParameter value-expr)]
+      (if-let [bound params/*bound-params*]
+        (nth bound (dec (long idx)))
+        (->ParamRef idx)))
 
     (instance? LongValue value-expr)
     (.getValue ^LongValue value-expr)
@@ -3601,12 +3622,26 @@
         :else
         (get entity-map (keyword ns-str col-name))))
 
-    ;; Arithmetic: recurse on both sides
+    ;; Arithmetic context: a wire parameter of unknown type decodes as a
+    ;; String; PG resolves `int + $1` by casting the unknown operand to
+    ;; the numeric type. Mirror that for numeric-looking strings only —
+    ;; anything else keeps its type and fails the arithmetic like PG's
+    ;; 22P02 would.
     (instance? Addition value-expr)
     (let [^Addition e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and l r) (+ l r)))
+          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
+          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
+      (when (and (number? l) (number? r)) (+ l r)))
+
+    ;; Negative literal operand: `SET x = x + -123` parses the RHS as a
+    ;; SignedExpression; without this branch it fell to `(str value-expr)`
+    ;; and the arithmetic threw String→Number (hit by pgbench's tpcb
+    ;; script, whose :delta is uniform over [-5000, 5000]).
+    (instance? SignedExpression value-expr)
+    (let [^SignedExpression se value-expr
+          inner (eval-update-expr (.getExpression se) entity-map ns-str schema)]
+      (when (number? inner)
+        (if (= \- (.getSign se)) (- inner) inner)))
 
     ;; Subtraction: numeric subtract or jsonb key deletion (col - 'key' or col - idx)
     (instance? Subtraction value-expr)
@@ -3622,21 +3657,23 @@
                        (jb/jsonb-delete-idx l (long r))
                        (jb/jsonb-delete-key l (str r)))]
           (jb/serialize-jsonb result))
-        ;; Numeric subtraction
-        (and (number? l) (number? r)) (- l r)
+        ;; Numeric subtraction (num-operand: unknown-type wire params
+        ;; arrive as strings — cast in numeric context like PG)
+        (and (number? (num-operand l)) (number? (num-operand r)))
+        (- (num-operand l) (num-operand r))
         :else nil))
 
     (instance? Multiplication value-expr)
     (let [^Multiplication e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and l r) (* l r)))
+          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
+          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
+      (when (and (number? l) (number? r)) (* l r)))
 
     (instance? Division value-expr)
     (let [^Division e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and l r (not (zero? r))) (/ l r)))
+          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
+          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
+      (when (and (number? l) (number? r) (not (zero? r))) (/ l r)))
 
     ;; String/jsonb concatenation: col || '...'::jsonb merges jsonb; string concat otherwise
     (instance? Concat value-expr)
@@ -4240,76 +4277,86 @@
                 ;; in BOTH the args and the outer entity-maps gets
                 ;; resolved exactly once (see datahike.pg.sql.params).
                 [[:db.fn/call
-                  (fn unique-check [txdb row-attrs]
-                    (let [schema (:schema txdb)
-                          q-fn d/q
+                  ;; :datahike.pg/fresh-insert (attached via with-meta at
+                  ;; the end of this fn form) — this tx-fn either throws
+                  ;; (23505) or emits the payload rows as FRESH entities
+                  ;; (gensym tempids, never upserts). The commit conflict
+                  ;; ring uses the tag to attribute such ops as writing no
+                  ;; existing rows instead of marking the whole commit
+                  ;; opaque (which disabled row-level conflict detection
+                  ;; for every INSERT-bearing transaction).
+                  (with-meta
+                    (fn unique-check [txdb row-attrs]
+                      (let [schema (:schema txdb)
+                            q-fn d/q
                       ;; Partition identity attrs by shape.
                       ;;   scalar-ids → {:attr constraint-name}
                       ;;   tuple-ids  → [{:attr :cols [component-attrs] :name c}]
-                          scalar-ids
-                          (into {}
-                                (keep (fn [[attr m]]
-                                        (when (and (map? m)
-                                                   (= :db.unique/identity (:db/unique m))
-                                                   (not= :db.type/tuple (:db/valueType m))
-                                                   (keyword? attr))
-                                          [attr (str table-name "_pkey")])))
-                                schema)
-                          tuple-ids
-                          (into []
-                                (keep (fn [[attr m]]
-                                        (when (and (map? m)
-                                                   (= :db.unique/identity (:db/unique m))
-                                                   (= :db.type/tuple (:db/valueType m))
-                                                   (seq (:db/tupleAttrs m))
-                                                   (keyword? attr))
-                                          {:attr attr
-                                           :cols (:db/tupleAttrs m)
-                                           :name (str table-name "_pkey")})))
-                                schema)
-                          seen (volatile! {})
-                          raise! (fn [attr val constraint]
-                                   (throw (ex-info "unique violation"
-                                                   {:error      :unique-violation
-                                                    :table      table-name
-                                                    :column     (name attr)
-                                                    :constraint constraint
-                                                    :value      val
-                                                    :datahike/collision [attr val]})))]
-                      (doseq [attrs row-attrs]
+                            scalar-ids
+                            (into {}
+                                  (keep (fn [[attr m]]
+                                          (when (and (map? m)
+                                                     (= :db.unique/identity (:db/unique m))
+                                                     (not= :db.type/tuple (:db/valueType m))
+                                                     (keyword? attr))
+                                            [attr (str table-name "_pkey")])))
+                                  schema)
+                            tuple-ids
+                            (into []
+                                  (keep (fn [[attr m]]
+                                          (when (and (map? m)
+                                                     (= :db.unique/identity (:db/unique m))
+                                                     (= :db.type/tuple (:db/valueType m))
+                                                     (seq (:db/tupleAttrs m))
+                                                     (keyword? attr))
+                                            {:attr attr
+                                             :cols (:db/tupleAttrs m)
+                                             :name (str table-name "_pkey")})))
+                                  schema)
+                            seen (volatile! {})
+                            raise! (fn [attr val constraint]
+                                     (throw (ex-info "unique violation"
+                                                     {:error      :unique-violation
+                                                      :table      table-name
+                                                      :column     (name attr)
+                                                      :constraint constraint
+                                                      :value      val
+                                                      :datahike/collision [attr val]})))]
+                        (doseq [attrs row-attrs]
                     ;; 1) Scalar identity checks
-                        (doseq [[a v] attrs
-                                :when (and (contains? scalar-ids a) (some? v))]
-                          (let [cname (get scalar-ids a)]
-                            (when (ffirst (q-fn '{:find [?e]
-                                                  :in [$ ?a ?v]
-                                                  :where [[?e ?a ?v]]}
-                                                txdb a v))
-                              (raise! a v cname))
-                            (when (contains? (get @seen a) v)
-                              (raise! a v cname))
-                            (vswap! seen update a (fnil conj #{}) v)))
+                          (doseq [[a v] attrs
+                                  :when (and (contains? scalar-ids a) (some? v))]
+                            (let [cname (get scalar-ids a)]
+                              (when (ffirst (q-fn '{:find [?e]
+                                                    :in [$ ?a ?v]
+                                                    :where [[?e ?a ?v]]}
+                                                  txdb a v))
+                                (raise! a v cname))
+                              (when (contains? (get @seen a) v)
+                                (raise! a v cname))
+                              (vswap! seen update a (fnil conj #{}) v)))
                     ;; 2) Tuple identity checks (multi-col PK).
                     ;; Mirror Datahike's auto-population: the tuple
                     ;; value is the vector of component-attr values in
                     ;; :db/tupleAttrs order. Skip rows where any
                     ;; component is absent — those can't be enforced
                     ;; until the writer sees the full entity.
-                        (doseq [tid tuple-ids
-                                :let [attr (:attr tid)
-                                      cols (:cols tid)
-                                      cname (:name tid)
-                                      tuple-val (mapv #(get attrs %) cols)]
-                                :when (every? some? tuple-val)]
-                          (when (ffirst (q-fn '{:find [?e]
-                                                :in [$ ?a ?v]
-                                                :where [[?e ?a ?v]]}
-                                              txdb attr tuple-val))
-                            (raise! attr tuple-val cname))
-                          (when (contains? (get @seen attr) tuple-val)
-                            (raise! attr tuple-val cname))
-                          (vswap! seen update attr (fnil conj #{}) tuple-val)))
-                      []))
+                          (doseq [tid tuple-ids
+                                  :let [attr (:attr tid)
+                                        cols (:cols tid)
+                                        cname (:name tid)
+                                        tuple-val (mapv #(get attrs %) cols)]
+                                  :when (every? some? tuple-val)]
+                            (when (ffirst (q-fn '{:find [?e]
+                                                  :in [$ ?a ?v]
+                                                  :where [[?e ?a ?v]]}
+                                                txdb attr tuple-val))
+                              (raise! attr tuple-val cname))
+                            (when (contains? (get @seen attr) tuple-val)
+                              (raise! attr tuple-val cname))
+                            (vswap! seen update attr (fnil conj #{}) tuple-val)))
+                        []))
+                    {:datahike.pg/fresh-insert true})
                   row-attrs]]
                 (vec (mapcat
                       (fn [attrs]
