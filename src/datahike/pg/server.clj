@@ -238,6 +238,15 @@
         holder                :conflict
         :else                 :acquired))))
 
+(defn- fresh-insert-fn
+  "Tag an INSERT tx-fn for conflict attribution: it emits its payload as
+   FRESH entities (or raises) and writes no existing rows, except
+   sequence-counter bumps which follow PostgreSQL nextval semantics
+   (non-transactional, never a serialization conflict). tx-buffer-eas
+   attributes such ops as the empty write-set instead of ::opaque."
+  [f]
+  (with-meta f {:datahike.pg/fresh-insert true}))
+
 (def ^:private row-lock-timeout-ms
   "How long an in-transaction UPDATE/DELETE waits for a conflicting row
    lock before giving up with serialization-failure (the application-level
@@ -982,14 +991,46 @@
                   acc))))
           (vector? item)
           (case (first item)
-            (:db/add :db/retract) (let [e (nth item 1 nil) a (nth item 2 nil)]
-                                    (if (and (number? e) (keyword? a))
-                                      (conj acc [(long e) a])
-                                      (reduced ::opaque)))
-            :db.fn/cas (let [e (nth item 1 nil) a (nth item 2 nil)]
-                         (if (and (number? e) (keyword? a))
-                           (conj acc [(long e) a])
-                           (reduced ::opaque)))
+            (:db/add :db/retract)
+            (let [e (nth item 1 nil) a (nth item 2 nil) v (nth item 3 nil)]
+              (cond
+                ;; Sequence counters follow PostgreSQL nextval semantics:
+                ;; non-transactional, never a serialization conflict.
+                (and (keyword? a) (= "__seq__" (namespace a)))
+                acc
+                (and (number? e) (keyword? a))
+                (conj acc [(long e) a])
+                ;; Tempid entity var (string / negative id): the op writes a
+                ;; FRESH entity — unless the attribute is unique, where
+                ;; datahike upserts onto an existing row holding that value.
+                ;; Resolve the target like the entity-map branch does; a
+                ;; retract on a tempid touches nothing. (In-transaction
+                ;; INSERT buffers remap eids to tempids, so Hibernate-style
+                ;; INSERT-then-COMMIT groups hit this constantly — treating
+                ;; them as opaque aborted every such commit that raced ANY
+                ;; other connection's commit.)
+                (and (keyword? a) (not (number? e)) (= :db/add (first item)))
+                (if (and schema (get-in schema [a :db/unique]))
+                  (if-let [target (and db (some? v)
+                                       (some-> ^datahike.datom.Datom
+                                        (first (d/datoms db {:index :avet
+                                                             :components [a v]}))
+                                               (.-e)))]
+                    (conj acc [(long target) a])
+                    (if db acc (reduced ::opaque)))
+                  acc)
+                (and (keyword? a) (not (number? e)))
+                acc
+                :else (reduced ::opaque)))
+            (:db.fn/cas :db/cas)
+            (let [e (nth item 1 nil) a (nth item 2 nil)]
+              (cond
+                ;; nextval semantics — see the :db/add case.
+                (and (keyword? a) (= "__seq__" (namespace a)))
+                acc
+                (and (number? e) (keyword? a))
+                (conj acc [(long e) a])
+                :else (reduced ::opaque)))
             (:db.fn/retractEntity :db/retractEntity)
             (let [e (nth item 1 nil)]
               (if (number? e)
@@ -1506,58 +1547,59 @@
       ;; within the same multi-row INSERT (txdb is immutable, can't see
       ;; prior rows' sequence increments).
       [[:db.fn/call
-        (fn [txdb]
-          (let [q-fn d/q
+        (fresh-insert-fn
+         (fn [txdb]
+           (let [q-fn d/q
                 ;; Pre-fetch sequence state for each identity column
-                seq-state (atom
-                           (into {}
-                                 (for [{:keys [col ns seq-name]} identity-cols
-                                       :let [seq-eid (ffirst (q-fn '{:find [?e]
-                                                                     :where [[?e :__seq__/name ?n]]
-                                                                     :in [$ ?n]}
-                                                                   txdb seq-name))
-                                             curr-val (when seq-eid
-                                                        (or (ffirst (q-fn '{:find [?v]
-                                                                            :where [[?e :__seq__/value ?v]]
-                                                                            :in [$ ?e]}
-                                                                          txdb seq-eid))
-                                                            0))
-                                             increment (or (when seq-eid
-                                                             (ffirst (q-fn '{:find [?i]
-                                                                             :where [[?e :__seq__/increment ?i]]
+                 seq-state (atom
+                            (into {}
+                                  (for [{:keys [col ns seq-name]} identity-cols
+                                        :let [seq-eid (ffirst (q-fn '{:find [?e]
+                                                                      :where [[?e :__seq__/name ?n]]
+                                                                      :in [$ ?n]}
+                                                                    txdb seq-name))
+                                              curr-val (when seq-eid
+                                                         (or (ffirst (q-fn '{:find [?v]
+                                                                             :where [[?e :__seq__/value ?v]]
                                                                              :in [$ ?e]}
-                                                                           txdb seq-eid)))
-                                                           1)]
-                                       :when seq-eid]
-                                   [col {:eid seq-eid :val (or curr-val 0) :inc increment :ns ns}])))]
-            (vec (mapcat
-                  (fn [entity-map]
-                    (if-not (map? entity-map)
-                      [entity-map]
-                      (let [populated
-                            (reduce
-                             (fn [m {:keys [col ns]}]
+                                                                           txdb seq-eid))
+                                                             0))
+                                              increment (or (when seq-eid
+                                                              (ffirst (q-fn '{:find [?i]
+                                                                              :where [[?e :__seq__/increment ?i]]
+                                                                              :in [$ ?e]}
+                                                                            txdb seq-eid)))
+                                                            1)]
+                                        :when seq-eid]
+                                    [col {:eid seq-eid :val (or curr-val 0) :inc increment :ns ns}])))]
+             (vec (mapcat
+                   (fn [entity-map]
+                     (if-not (map? entity-map)
+                       [entity-map]
+                       (let [populated
+                             (reduce
+                              (fn [m {:keys [col ns]}]
                                ;; Use the column's owning namespace (may be parent for inherited)
-                               (let [attr (keyword ns col)]
-                                 (if (contains? m attr)
-                                   m
+                                (let [attr (keyword ns col)]
+                                  (if (contains? m attr)
+                                    m
                                    ;; Auto-generate: increment local counter
-                                   (let [{:keys [val inc]} (get @seq-state col)
-                                         new-val (+ val inc)]
-                                     (swap! seq-state assoc-in [col :val] new-val)
-                                     (assoc m attr new-val)))))
-                             entity-map
-                             identity-cols)]
-                        (let [seq-updates
-                              (keep (fn [{:keys [col ns]}]
-                                      (let [attr (keyword ns col)]
-                                        (when-not (contains? entity-map attr)
-                                          (let [{:keys [eid val]} (get @seq-state col)]
-                                            (when eid
-                                              [:db/add eid :__seq__/value val])))))
-                                    identity-cols)]
-                          (into [populated] seq-updates)))))
-                  tx-data))))]])))
+                                    (let [{:keys [val inc]} (get @seq-state col)
+                                          new-val (+ val inc)]
+                                      (swap! seq-state assoc-in [col :val] new-val)
+                                      (assoc m attr new-val)))))
+                              entity-map
+                              identity-cols)]
+                         (let [seq-updates
+                               (keep (fn [{:keys [col ns]}]
+                                       (let [attr (keyword ns col)]
+                                         (when-not (contains? entity-map attr)
+                                           (let [{:keys [eid val]} (get @seq-state col)]
+                                             (when eid
+                                               [:db/add eid :__seq__/value val])))))
+                                     identity-cols)]
+                           (into [populated] seq-updates)))))
+                   tx-data)))))]])))
 
 (defn- eval-default
   "Evaluate a :pg/default-* triple at INSERT time. Stateless defaults
@@ -2116,105 +2158,111 @@
     (if (and (empty? cols) (not has-checks?) (not has-fks?) (not has-domain-enum?))
       tx-data
       [[:db.fn/call
-        (fn [txdb]
-          (let [q-fn d/q
-                bump-seq! (fn [seq-name]
+        ;; fresh-insert-fn: conflict attribution treats this as writing no
+        ;; existing rows — it emits the payload as fresh entities (or
+        ;; raises); its only existing-entity writes are sequence-counter
+        ;; bumps, which follow PostgreSQL nextval semantics
+        ;; (non-transactional, never a serialization conflict).
+        (fresh-insert-fn
+         (fn [txdb]
+           (let [q-fn d/q
+                 bump-seq! (fn [seq-name]
                             ;; Mirror the behavior in auto-populate-identity:
                             ;; find the sequence entity, compute next value,
                             ;; return [new-value [:db/add eid :__seq__/value v]].
-                            (let [eid (ffirst (q-fn '{:find [?e]
-                                                      :where [[?e :__seq__/name ?n]]
-                                                      :in [$ ?n]}
-                                                    txdb seq-name))
-                                  curr (when eid
-                                         (ffirst (q-fn '{:find [?v]
-                                                         :where [[?e :__seq__/value ?v]]
-                                                         :in [$ ?e]}
-                                                       txdb eid)))
-                                  incr (when eid
-                                         (or (ffirst (q-fn '{:find [?i]
-                                                             :where [[?e :__seq__/increment ?i]]
-                                                             :in [$ ?e]}
-                                                           txdb eid))
-                                             1))
-                                  nxt (when eid (+ (or curr 0) incr))]
-                              (when eid
-                                [nxt [:db/add eid :__seq__/value nxt]])))
-                result
-                (reduce
-                 (fn [acc entry]
-                   (if-not (map? entry)
-                     (conj acc entry)
-                     (let [{:keys [filled seq-ops]}
-                           (reduce-kv
-                            (fn [st col-name {:keys [attr not-null? default]}]
-                              (let [ns-attr (keyword ns col-name)
-                                    legacy (keyword (namespace attr) col-name)
-                                    present-key (some #(when (contains? (:filled st) %) %)
-                                                      [ns-attr attr legacy])]
-                                (cond
-                                  present-key
-                                  (let [v (get-in st [:filled present-key])]
-                                    (if (and not-null? (nil? v))
-                                      (throw (ex-info "not-null violation"
-                                                      {:error  :not-null-violation
-                                                       :table  table-name
-                                                       :column col-name}))
-                                      st))
+                             (let [eid (ffirst (q-fn '{:find [?e]
+                                                       :where [[?e :__seq__/name ?n]]
+                                                       :in [$ ?n]}
+                                                     txdb seq-name))
+                                   curr (when eid
+                                          (ffirst (q-fn '{:find [?v]
+                                                          :where [[?e :__seq__/value ?v]]
+                                                          :in [$ ?e]}
+                                                        txdb eid)))
+                                   incr (when eid
+                                          (or (ffirst (q-fn '{:find [?i]
+                                                              :where [[?e :__seq__/increment ?i]]
+                                                              :in [$ ?e]}
+                                                            txdb eid))
+                                              1))
+                                   nxt (when eid (+ (or curr 0) incr))]
+                               (when eid
+                                 [nxt [:db/add eid :__seq__/value nxt]])))
+                 result
+                 (reduce
+                  (fn [acc entry]
+                    (if-not (map? entry)
+                      (conj acc entry)
+                      (let [{:keys [filled seq-ops]}
+                            (reduce-kv
+                             (fn [st col-name {:keys [attr not-null? default]}]
+                               (let [ns-attr (keyword ns col-name)
+                                     legacy (keyword (namespace attr) col-name)
+                                     present-key (some #(when (contains? (:filled st) %) %)
+                                                       [ns-attr attr legacy])]
+                                 (cond
+                                   present-key
+                                   (let [v (get-in st [:filled present-key])]
+                                     (if (and not-null? (nil? v))
+                                       (throw (ex-info "not-null violation"
+                                                       {:error  :not-null-violation
+                                                        :table  table-name
+                                                        :column col-name}))
+                                       st))
 
-                                  default
-                                  (let [[kind value arg] default
-                                        v (eval-default kind value arg)]
-                                    (cond
-                                      (and (vector? v) (= ::nextval (first v)))
-                                      (let [[nxt seq-tx] (bump-seq! (second v))]
-                                        (if nxt
-                                          (-> st
-                                              (assoc-in [:filled ns-attr] nxt)
-                                              (update :seq-ops conj seq-tx))
-                                          (if not-null?
-                                            (throw (ex-info "not-null violation"
-                                                            {:error  :not-null-violation
-                                                             :table  table-name
-                                                             :column col-name}))
-                                            st)))
+                                   default
+                                   (let [[kind value arg] default
+                                         v (eval-default kind value arg)]
+                                     (cond
+                                       (and (vector? v) (= ::nextval (first v)))
+                                       (let [[nxt seq-tx] (bump-seq! (second v))]
+                                         (if nxt
+                                           (-> st
+                                               (assoc-in [:filled ns-attr] nxt)
+                                               (update :seq-ops conj seq-tx))
+                                           (if not-null?
+                                             (throw (ex-info "not-null violation"
+                                                             {:error  :not-null-violation
+                                                              :table  table-name
+                                                              :column col-name}))
+                                             st)))
 
-                                      (nil? v)
-                                      (if not-null?
-                                        (throw (ex-info "not-null violation"
-                                                        {:error  :not-null-violation
-                                                         :table  table-name
-                                                         :column col-name}))
-                                        st)
+                                       (nil? v)
+                                       (if not-null?
+                                         (throw (ex-info "not-null violation"
+                                                         {:error  :not-null-violation
+                                                          :table  table-name
+                                                          :column col-name}))
+                                         st)
 
-                                      :else
-                                      (assoc-in st [:filled ns-attr] v)))
+                                       :else
+                                       (assoc-in st [:filled ns-attr] v)))
 
-                                  not-null?
-                                  (throw (ex-info "not-null violation"
-                                                  {:error  :not-null-violation
-                                                   :table  table-name
-                                                   :column col-name}))
+                                   not-null?
+                                   (throw (ex-info "not-null violation"
+                                                   {:error  :not-null-violation
+                                                    :table  table-name
+                                                    :column col-name}))
 
-                                  :else st)))
-                            {:filled entry :seq-ops []}
-                            cols)]
-                       (into (conj acc filled) seq-ops))))
-                 []
-                 tx-data)
+                                   :else st)))
+                             {:filled entry :seq-ops []}
+                             cols)]
+                        (into (conj acc filled) seq-ops))))
+                  []
+                  tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
                 ;; bumps etc. don't.
-                filled-entities (filterv map? result)]
-            (when has-checks?
-              (doseq [em filled-entities]
-                (enforce-check-constraints! txdb table-name ns em)))
-            (when has-domain-enum?
-              (enforce-domain-enum-checks! txdb table-name ns filled-entities))
-            (when has-fks?
-              (enforce-fk-on-insert! txdb table-name ns filled-entities))
-            result))]])))
+                 filled-entities (filterv map? result)]
+             (when has-checks?
+               (doseq [em filled-entities]
+                 (enforce-check-constraints! txdb table-name ns em)))
+             (when has-domain-enum?
+               (enforce-domain-enum-checks! txdb table-name ns filled-entities))
+             (when has-fks?
+               (enforce-fk-on-insert! txdb table-name ns filled-entities))
+             result)))]])))
 
 (defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
