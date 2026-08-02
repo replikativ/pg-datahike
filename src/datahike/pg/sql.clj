@@ -20,6 +20,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.copy :as copy]
@@ -1191,71 +1192,11 @@
                                                                    :__null__
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
                                                                  :else
-                                                                 (case (types/cast-category type-str)
-                                                                ;; CAST('1' AS BIGINT): inner was a
-                                                                ;; StringValue, so raw is a String —
-                                                                ;; (long "1") throws. Parse numerically.
-                                                                   :integer (if (number? raw)
-                                                                              (long raw)
-                                                                              (Long/parseLong (str/trim (str raw))))
-                                                                   :float   (if (number? raw)
-                                                                              (double raw)
-                                                                              (Double/parseDouble (str/trim (str raw))))
-                                                                   :text (str raw)
-                                                                   :boolean (if (instance? Boolean raw)
-                                                                              raw
-                                                                              (let [b (coerce/parse-bool-token (str raw))]
-                                                                                (when (nil? b)
-                                                                                  (throw (errors/pg-error :invalid-text-representation
-                                                                                                          {:type "boolean" :value (str raw)})))
-                                                                                b))
-                                                                   :date (let [s (str/trim (str raw))]
-                                                                           (or (try (java.time.LocalDate/parse
-                                                                                     s (java.time.format.DateTimeFormatter/ofPattern "yyyy-M-d"))
-                                                                                    (catch Exception _ nil))
-                                                                               (let [d (expr/parse-timestamp-string s)]
-                                                                                 (when (instance? java.util.Date d)
-                                                                                   (-> ^java.util.Date d .toInstant
-                                                                                       (.atZone java.time.ZoneOffset/UTC)
-                                                                                       .toLocalDate)))))
-                                                                   :time (let [s (str/trim (str raw))
-                                                                               time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                                                                           (try (java.time.LocalTime/parse time-only)
-                                                                                (catch Exception _ s)))
-                                                                   :timestamp
-                                                       ;; Preserve sub-millisecond precision for CAST
-                                                       ;; results (pgjdbc tests assert full '…130861'
-                                                       ;; microseconds in their error strings).
-                                                       ;; expr/parse-timestamp-string routes through
-                                                       ;; java.util.Date which is millisecond-only.
-                                                                   (let [s (-> (str raw) str/trim
-                                                                               (str/replace #"(\d{4}-\d{2}-\d{2})\s+(\d)" "$1T$2"))]
-                                                                     (or (try (java.time.LocalDateTime/parse s)
-                                                                              (catch Exception _ nil))
-                                                                         (expr/parse-timestamp-string (str raw))))
-                                                                   :uuid (java.util.UUID/fromString (str raw))
-                                                       ;; `N::bit(W)` / `'101'::bit(W)` — PG's
-                                                       ;; bit-string type. Produces a PgBit, not a
-                                                       ;; String: the width is part of the value
-                                                       ;; and the type must report as 1560/1562
-                                                       ;; rather than text (#19). cast-category
-                                                       ;; strips the `(…)`, so re-read W here;
-                                                       ;; bare `bit` means bit(1), bare `bit
-                                                       ;; varying` means unlimited.
-                                                                   (:bit :varbit)
-                                                                   (let [varying? (= :varbit (types/cast-category type-str))
-                                                                         w (some-> (re-find #"\((\d+)\)" type-str)
-                                                                                   second
-                                                                                   Integer/parseInt)
-                                                                         w (or w (when-not varying? 1))]
-                                                                     (if (number? raw)
-                                                                       ;; int → bit(n): rightmost n bits,
-                                                                       ;; sign-extended on the left.
-                                                                       (cond-> (pg-bits/from-integer (long raw) (or w 1))
-                                                                         varying? (assoc :varying? true))
-                                                                       (-> (pg-bits/parse-bit-literal (str raw) varying?)
-                                                                           (pg-bits/coerce-width w true))))
-                                                                   raw)))
+                                                                 (sql-cast/cast-scalar
+                                                                  raw type-str
+                                                                  {:explicit? true
+                                                                   :prefer-local-datetime? true
+                                                                   :parse-timestamp expr/parse-timestamp-string})))
                                                    ;; Scalar subquery in projection —
                                                    ;; execute and take first value
                                                              (instance? ParenthesedSelect expr)

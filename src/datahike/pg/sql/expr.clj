@@ -50,6 +50,7 @@
             [datahike.pg.records :as pg-rec]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
@@ -1564,39 +1565,34 @@
       ;; there, so `(-44)::bit(12)` (a SignedExpression) and any cast of
       ;; a column reach this site instead, and without a branch the
       ;; value passed through UNCHANGED — `(-44)::bit(12)` answered -44.
-      ;; A bit value cast to int is a REINTERPRETATION of its bits
-      ;; (varbit.c:1598), not a decimal read of its digits: '101'::bit(3)
-      ;; is 5, not one hundred and one. Cast to text yields the digit run.
-      ;; Both are handled here, ahead of the generic branches, because a
-      ;; PgBit reaching those stringifies as a defrecord.
-      (and (or is-int? is-text?) (pg-bits/pg-bit? inner-raw))
-      (if is-int? (pg-bits/to-long inner-raw) (pg-bits/to-pg-text inner-raw))
-
-      is-bit?
-      (let [varying? (= :varbit cast-cat)
-            w (some-> (re-find #"\((\d+)\)" type-str) second Integer/parseInt)
-            w (or w (when-not varying? 1))
-            fn-param (symbol (str "?cast-bit" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)
-            cast-fn (fn [v]
-                      (cond
-                        (nil? v) :__null__
-                        (= :__null__ v) :__null__
-                        (pg-bits/pg-bit? v)
-                        (-> (assoc v :varying? varying?)
-                            (pg-bits/coerce-width w true))
-                        ;; int → bit(n): rightmost n bits, sign-extended.
-                        (number? v)
-                        (cond-> (pg-bits/from-integer (long v) (or w 1))
-                          varying? (assoc :varying? true))
-                        :else
-                        (-> (pg-bits/parse-bit-literal (str v) varying?)
-                            (pg-bits/coerce-width w true))))
-            inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj cast-fn)
-        (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
-        result-var)
+      ;; Scalar casts delegate to the one shared implementation
+      ;; (datahike.pg.sql.cast). This site used to carry its own
+      ;; category dispatch with no bit branch at all, so a cast that
+      ;; reached HERE rather than sql.clj's literal fast path passed the
+      ;; value through untouched — `(-44)::bit(12)` answered -44.
+      ;;
+      ;; Compile-time fold when the operand is already a value; otherwise
+      ;; bind a runtime fn, since the same semantics must apply to a
+      ;; column as to a literal.
+      ;; Also claim a scalar cast whose OPERAND is already a bit value:
+      ;; the is-int?/is-text? branches below predate PgBit and would
+      ;; stringify the record ('101'::bit(3)::text) or hand it to
+      ;; coerce-numeric ('101'::bit(3)::int).
+      (or is-bit?
+          (and (pg-bits/pg-bit? inner-raw)
+               (or is-int? is-float? is-numeric? is-text?)))
+      (let [cast1 #(sql-cast/cast-scalar % type-str
+                                         {:explicit? true
+                                          :parse-timestamp parse-timestamp-string})]
+        (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+          (cast1 inner-raw)
+          (let [fn-param (symbol (str "?cast-bit" (swap! (:var-counter ctx) inc)))
+                result-var (ctx/fresh-var! ctx)
+                inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
+            (swap! (:in-params ctx) conj fn-param)
+            (swap! (:in-args ctx) conj cast1)
+            (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+            result-var)))
 
       ;; CAST(<expr> AS T[]) — accept an existing PgArray unchanged
       ;; (element-type retype not supported; we only use the target to
@@ -1813,14 +1809,16 @@
 
             (or is-int? is-float? is-bool?)
             (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
-                  cast-fn (cond
-                            is-int?   (fn [v] (when (and (some? v) (not= :__null__ v))
-                                                (coerce/coerce-numeric v :long)))
-                            is-float? (fn [v] (when (and (some? v) (not= :__null__ v))
-                                                (coerce/coerce-numeric v :double)))
-                            :else     (fn [v] (when (and (some? v) (not= :__null__ v))
-                                                (if (boolean? v) v
-                                                    (coerce/parse-bool-token (str v))))))]
+                  ;; Through the shared cast impl so a value whose type is
+                  ;; only known at RUNTIME still gets full semantics — a
+                  ;; bit string cast to int must reinterpret its bits
+                  ;; (5, not the digits 101), and coerce-numeric alone
+                  ;; cannot see a PgBit.
+                  cast-fn (fn [v] (when (and (some? v) (not= :__null__ v))
+                                    (sql-cast/cast-scalar
+                                     v type-str
+                                     {:explicit? true
+                                      :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj cast-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -1841,7 +1839,13 @@
                                ;; bytea: keep the byte[] so value->string emits
                                ;; PG hex `\x…` rather than the Java array toString.
                                (bytes? v)         v
-                               :else              (str v)))]
+                               ;; Same reason as the numeric branch above: a
+                               ;; PgBit reaching `str` stringifies as a
+                               ;; defrecord instead of its digit run.
+                               :else              (sql-cast/cast-scalar
+                                                   v type-str
+                                                   {:explicit? true
+                                                    :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj cast-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])))

@@ -27,6 +27,7 @@
    Both errors are encoded as `ex-info` with `:sqlstate`; the wire
    layer's `handler.clj` already lifts those into ErrorResponse
    messages."
+  (:require [clojure.string :as str])
   (:import [java.math BigInteger BigDecimal]))
 
 (set! *warn-on-reflection* true)
@@ -190,6 +191,30 @@
 ;; and IN/BETWEEN) at translation time and dispatches the unknown
 ;; literal through this table when the column resolves to a Datahike
 ;; valueType we recognise.
+
+(defn parse-bytea-hex
+  "Decode a PostgreSQL bytea hex-format literal (`\\xDEADBEEF`) to a byte array.
+   Accepts both `\\x...` and `\\\\x...` prefixes (JDBC/psycopg2 escape variants).
+   Returns nil for values that don't look like hex bytea literals."
+  [s]
+  (when (string? s)
+    (let [trimmed (str/trim s)
+          without-prefix (cond
+                           (str/starts-with? trimmed "\\x") (subs trimmed 2)
+                           (str/starts-with? trimmed "\\\\x") (subs trimmed 3)
+                           :else nil)]
+      (when (and without-prefix
+                 (re-matches #"[0-9a-fA-F]*" without-prefix)
+                 (even? (count without-prefix)))
+        (let [n (/ (count without-prefix) 2)
+              bs (byte-array n)]
+          (dotimes [i n]
+            (aset-byte bs i
+                       (unchecked-byte
+                        (Integer/parseInt
+                         (subs without-prefix (* 2 i) (+ 2 (* 2 i)))
+                         16))))
+          bs)))))
 
 (defn parse-bool-token
   "Mirror PG's `parse_bool_with_len` (bool.c): any prefix of true/yes

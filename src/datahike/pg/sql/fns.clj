@@ -37,6 +37,7 @@
             [datahike.api :as d]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.types :as types]))
 
@@ -751,6 +752,17 @@
 ;; ---------------------------------------------------------------------------
 ;; SQL string function implementations
 
+(defn sql-length
+  "SQL LENGTH / CHAR_LENGTH. Bit strings measure in bits, not in the
+   record's map entries."
+  [v]
+  (if (pg-bits/pg-bit? v) (pg-bits/width v) (count v)))
+
+(defn sql-octet-length
+  "SQL OCTET_LENGTH. For a bit string PG reports ceil(bits / 8)."
+  [v]
+  (if (pg-bits/pg-bit? v) (pg-bits/octet-length v) (count v)))
+
 (defn sql-lpad
   "Left-pad string s to length n with fill character/string."
   ([s n] (sql-lpad s n " "))
@@ -934,7 +946,10 @@
    so they're callable through the same path."
   {"upper"    str/upper-case
    "lower"    str/lower-case
-   "length"   count
+   ;; NOT bare `count`: a PgBit is a defrecord, so `count` returns its
+   ;; number of MAP ENTRIES (2), not its bit width. PG's length() on a
+   ;; bit string is the bit count; octet_length is ceil(bits/8).
+   "length"   sql-length
    "abs"      clojure.core/abs
    "floor"    #(Math/floor (double %))
    "ceil"     #(Math/ceil (double %))
@@ -1000,8 +1015,8 @@
    "reverse"  str/reverse
    "left"     sql-left
    "right"    sql-right
-   "char_length"  count
-   "octet_length" count
+   "char_length"  sql-length
+   "octet_length" sql-octet-length
    "position"     sql-position
    "strpos"       sql-position
    "pg_table_is_visible"      pg-table-is-visible
