@@ -183,6 +183,11 @@
 
 (defn- build-template [{:keys [memory? data-dir history?]}]
   (cond-> {:schema-flexibility :write
+           ;; SQL migration order is CREATE TABLE -> COPY -> ADD PRIMARY KEY:
+           ;; enabling uniqueness on populated attributes needs datahike's
+           ;; index-backfill migration (opt-in upstream; ignored by datahike
+           ;; versions without it).
+           :allow-index-backfill? true
            :keep-history? history?}
     memory?
     (assoc :store {:backend :memory})
@@ -302,6 +307,7 @@
                      (read-config-file config-file)
                      {:store {:backend :file :path (str data-dir "/" db)}
                       :schema-flexibility :write
+                      :allow-index-backfill? true
                       :keep-history? false})
           store-id (or (get-in base-cfg [:store :id])
                        (discover-store-id (:store base-cfg)))
