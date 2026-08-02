@@ -1068,6 +1068,18 @@
   ;; nil on older datahike (the fast path simply doesn't apply).
   (resolve 'datahike.query/*fold-scalar-ins*))
 
+(def ^:private disable-planner-var
+  ;; datahike.query/*disable-planner* — relational-engine fallback seam.
+  (resolve 'datahike.query/*disable-planner*))
+
+(def ^:private prepared-execution-var
+  ;; datahike.query.execute/*prepared-execution* when the running datahike
+  ;; has it (>= the #936 release): value-free plan reuse + compiled point
+  ;; programs for parameterized statements. nil on older datahike — the
+  ;; binding simply doesn't apply.
+  (try (requiring-resolve 'datahike.query.execute/*prepared-execution*)
+       (catch Throwable _ nil)))
+
 (def ^:private result-cache-min-weight-var
   ;; datahike.query/*result-cache-min-weight* when available: for
   ;; parameterized statements, inserting a tiny result into the result
@@ -1076,6 +1088,26 @@
   ;; under 4 tuples on these paths. Larger results still cache.
   (resolve 'datahike.query/*result-cache-min-weight*))
 
+(defn- params-in-scoped-clauses?
+  "True when a translated :where contains a parameter var (?pN) inside an
+   or / or-join / not / not-join / and body. Under value-free parameter
+   binding those vars are branch-local to the promoted or-join and never
+   receive the outer binding — the branch silently matches nothing
+   (replikativ/datahike#938; same seam as #927). Such statements run
+   with stock const-folding instead; delete this guard when #938 lands."
+  [query]
+  (letfn [(param? [x] (and (symbol? x) (re-matches #"\?p\d+" (name x))))
+          (has-param? [form]
+            (cond (param? form) true
+                  (coll? form) (some has-param? form)
+                  :else false))
+          (scoped? [clause]
+            (and (seq? clause)
+                 (symbol? (first clause))
+                 ('#{or or-join not not-join and} (first clause))
+                 (has-param? (rest clause))))]
+    (boolean (some scoped? (:where query)))))
+
 (defn- run-param-query
   "Run `thunk` (a d/q call with :in args) with datahike's scalar-:in
    const-folding disabled when available: parameterized statements
@@ -1083,13 +1115,51 @@
    into the clauses made the plan cache miss (full replan) per value —
    2x on novel-value point lookups. Function-valued in-args still fold
    (datahike guards that internally)."
-  [thunk]
+  ([thunk] (run-param-query nil thunk))
+  ([query thunk]
   (let [binds (cond-> {}
-                fold-scalar-ins-var (assoc fold-scalar-ins-var false)
+                (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
+                     fold-scalar-ins-var
+                     (not (and query (params-in-scoped-clauses? query))))
+                (assoc fold-scalar-ins-var false)
+                (and (nil? (System/getenv "DATAHIKE_PG_STOCK_QUERY"))
+                     prepared-execution-var)
+                (assoc prepared-execution-var true)
                 result-cache-min-weight-var (assoc result-cache-min-weight-var 4))]
     (if (seq binds)
-      (with-bindings* binds thunk)
-      (thunk))))
+      (try
+        (with-bindings* binds thunk)
+        (catch clojure.lang.ExceptionInfo e
+          ;; Some translator shapes (CTE-derived get-else-only queries,
+          ;; post-filters over parameter vars) plan under folded constants
+          ;; or only on the relational engine, not with value-free
+          ;; parameter vars. Until each shape is taught the prepared
+          ;; discipline, retry the failing call with stock bindings, then
+          ;; with the relational engine — correctness first, the prepared
+          ;; fast path second.
+          (if (re-find #"insufficient bindings|unknown var"
+                       (or (ex-message e) ""))
+            (try
+              (thunk)
+              (catch clojure.lang.ExceptionInfo e2
+                (if (and disable-planner-var
+                         (re-find #"insufficient bindings|unknown var"
+                                  (or (ex-message e2) "")))
+                  (try
+                    (with-bindings* {disable-planner-var true} thunk)
+                    (catch clojure.lang.ExceptionInfo e3
+                      (if (re-find #"insufficient bindings|Cannot resolve"
+                                   (or (ex-message e3) ""))
+                        ;; NO engine can resolve this query as written —
+                        ;; typically a reference to a never-materialised
+                        ;; virtual table (a skipped data-modifying CTE):
+                        ;; there is no data it could match. Empty, with a
+                        ;; trace for visibility.
+                        #{}
+                        (throw e3))))
+                  (throw e2))))
+            (throw e))))
+      (thunk)))))
 
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
@@ -2203,13 +2273,28 @@
                             (and (vector? c) (>= (count c) 2)
                                  (= evar (first c)) (keyword? (second c))))
                           clauses)]
-    ;; Only tables created through SQL DDL carry the row marker; tables
-    ;; seeded directly via datahike (test fixtures) don't, and anchoring
-    ;; on a nonexistent attribute would match zero rows.
-    (when (and (not binds-evar?)
-               (contains? (:schema ctx) marker))
-      (reset! (:where-clauses ctx)
-              (vec (cons [evar marker true] clauses))))))
+    (when-not binds-evar?
+      (cond
+        ;; Tables created through SQL DDL carry the row marker — the
+        ;; cheapest anchor (one indexed boolean per row).
+        (contains? (:schema ctx) marker)
+        (reset! (:where-clauses ctx)
+                (vec (cons [evar marker true] clauses)))
+        ;; Markerless tables (databases seeded directly through datahike —
+        ;; a first-class use case: SQL over an existing datahike db):
+        ;; anchor on the presence of ANY table column. A row is exactly an
+        ;; entity holding at least one of the table's attributes, so the
+        ;; or-union binds the entity var without changing semantics. The
+        ;; engine (post-#923) correctly rejects get-else-only queries with
+        ;; an unbound entity var, so SOME anchor is required.
+        :else
+        (when-let [col-attrs (seq (keep (fn [c]
+                                          (let [a (:attr c)]
+                                            (when (and a (not= :db/id a)) a)))
+                                        (pgs/column-info (:schema ctx) table)))]
+          (reset! (:where-clauses ctx)
+                  (vec (cons (cons 'or (mapv (fn [a] [evar a]) col-attrs))
+                             clauses))))))))
 
 (def ^:private update-row-match-cache
   "Row-matching query cache for UPDATE/DELETE: [(identity parsed)
@@ -2277,8 +2362,8 @@
                   in-args-raw)
         eids (mapv first
                    (if (seq in-args)
-                     (run-param-query #(apply d/q q query-db in-args))
-                     (d/q q query-db)))]
+                     (run-param-query q #(apply d/q q query-db in-args))
+                     (run-param-query q #(d/q q query-db))))]
     {:eids eids
      :tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)}))
 
@@ -2381,8 +2466,8 @@
                   in-args-raw)
         eids (mapv first
                    (if (seq in-args)
-                     (run-param-query #(apply d/q q query-db in-args))
-                     (d/q q query-db)))
+                     (run-param-query q #(apply d/q q query-db in-args))
+                     (run-param-query q #(d/q q query-db))))
         ;; For prepared UPDATE, resolve ParamRef values BEFORE
         ;; coerce-insert-value — otherwise the coercion fires on a
         ;; placeholder record (no-op passthrough), then the bound
@@ -4670,7 +4755,7 @@
                                       (nth bound (:idx a))
                                       a))
                             in-args)
-                 res (run-param-query #(apply d/q query db args))
+                 res (run-param-query query #(apply d/q query db args))
                  rows (if (pos? hidden)
                         (mapv #(subvec (vec %) 0 keep-n) res)
                         res)
@@ -4779,8 +4864,8 @@
                       offset (assoc :offset offset)
                       :always (assoc :cancel (current-cancel)))
             results (if (seq in-args)
-                      (run-param-query #(apply d/q q-input query-db in-args))
-                      (d/q q-input query-db))
+                      (run-param-query q-input #(apply d/q q-input query-db in-args))
+                      (run-param-query q-input #(d/q q-input query-db)))
             ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
             ;; Extract the `id` column from each result row, check the
             ;; server-wide lock registry, and either:
@@ -5779,7 +5864,7 @@
                    (let [q-input (assoc query :cancel (current-cancel))
                          raw (if (seq in-args)
                                (apply d/q q-input query-db in-args)
-                               (d/q q-input query-db))
+                               (run-param-query q-input #(d/q q-input query-db)))
                          hc (or hidden-count 0)
                          visible (- (count (:find query)) hc)
                          results (if (pos? hc)

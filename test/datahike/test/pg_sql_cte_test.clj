@@ -34,34 +34,20 @@
              :keep-history? false}]
     (d/create-database cfg)
     (let [conn (d/connect cfg)]
-      (d/transact conn
-                  [{:db/ident :emp/id     :db/valueType :db.type/long
-                    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
-                   {:db/ident :emp/name   :db/valueType :db.type/string
-                    :db/cardinality :db.cardinality/one}
-                   {:db/ident :emp/dept   :db/valueType :db.type/string
-                    :db/cardinality :db.cardinality/one}
-                   {:db/ident :emp/salary :db/valueType :db.type/double
-                    :db/cardinality :db.cardinality/one}
-                   {:db/ident :node/id     :db/valueType :db.type/long
-                    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
-                   {:db/ident :node/parent :db/valueType :db.type/long
-                    :db/cardinality :db.cardinality/one}
-                   {:db/ident :node/name   :db/valueType :db.type/string
-                    :db/cardinality :db.cardinality/one}])
-      (d/transact conn
-                  [{:emp/id 1 :emp/name "Alice" :emp/dept "Eng"   :emp/salary 90000.0}
-                   {:emp/id 2 :emp/name "Bob"   :emp/dept "Eng"   :emp/salary 85000.0}
-                   {:emp/id 3 :emp/name "Carol" :emp/dept "Sales" :emp/salary 70000.0}
-                   {:emp/id 4 :emp/name "Dave"  :emp/dept "Sales" :emp/salary 75000.0}
-                   {:emp/id 5 :emp/name "Eve"   :emp/dept "Eng"   :emp/salary 95000.0}])
-      (d/transact conn
-                  ;; Small tree: root(1) → a(2),b(3); a → a1(4),a2(5)
-                  [{:node/id 1 :node/parent 0 :node/name "root"}
-                   {:node/id 2 :node/parent 1 :node/name "a"}
-                   {:node/id 3 :node/parent 1 :node/name "b"}
-                   {:node/id 4 :node/parent 2 :node/name "a1"}
-                   {:node/id 5 :node/parent 2 :node/name "a2"}])
+      ;; Seed through SQL DDL/DML — the representative path: tables created
+      ;; via SQL carry the row-marker attribute UPDATE/DELETE row matching
+      ;; anchors on. (Seeding via d/transact leaves the marker out, and the
+      ;; query engine now — correctly — rejects the resulting anchorless
+      ;; get-else-only row-match queries; see #923-era strictness.)
+      (let [h (pg/make-query-handler conn)]
+        (doseq [sql ["CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary DOUBLE PRECISION)"
+                     "CREATE TABLE node (id INTEGER PRIMARY KEY, parent INTEGER, name TEXT)"
+                     "INSERT INTO emp (id, name, dept, salary) VALUES (1, 'Alice', 'Eng', 90000.0), (2, 'Bob', 'Eng', 85000.0), (3, 'Carol', 'Sales', 70000.0), (4, 'Dave', 'Sales', 75000.0), (5, 'Eve', 'Eng', 95000.0)"
+                     ;; Small tree: root(1) -> a(2),b(3); a -> a1(4),a2(5)
+                     "INSERT INTO node (id, parent, name) VALUES (1, 0, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'a1'), (5, 2, 'a2')"]]
+          (let [r (.execute h sql)]
+            (when (.-error r)
+              (throw (ex-info "fixture seed failed" {:sql sql :err (.-error r)}))))))
       (let [{:keys [server]} (pg/start-server {"cte" conn} {:port 0})]
         (try
           (binding [*conn* conn *port* (.getPort server)]
