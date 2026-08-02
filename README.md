@@ -428,6 +428,15 @@ per-tenant views) as virtual catalog tables without forking this repo:
 
 Then queryable as a regular table: `SELECT * FROM app_metrics`.
 
+## Performance
+
+Measured with stock `pgbench` against a real PostgreSQL 17 on the same
+machine — see **[doc/benchmarks.md](doc/benchmarks.md)** for the current
+numbers (memory and durable file store), full methodology, caveats, and
+reproduction commands. Summary as of 2026-08: point reads within 3.8–6.8×
+of PostgreSQL, writes within 2.1–4.1× (memory store) with zero failed
+transactions and PostgreSQL-style row-locking concurrency.
+
 ## Compatibility
 
 Tested against:

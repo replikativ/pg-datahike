@@ -16,7 +16,17 @@
          '[datahike.pg.dev :as dev]
          '[nrepl.server :as nrepl])
 
-(let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+(let [store (if-let [path (System/getenv "DATAHIKE_STORE_PATH")]
+              ;; Durable file store (konserve: atomic, fsynced object
+              ;; writes). DATAHIKE_WRITE_OPT=true additionally enables the
+              ;; write-amplification options (diff-buf + fused index
+              ;; roots, both Experimental) for a commit shape closer to a
+              ;; WAL append.
+              {:backend :file :path path
+               ;; deterministic store id so reconnects find the same store
+               :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))}
+              {:backend :memory :id (java.util.UUID/randomUUID)})
+      cfg (cond-> {:store store
            :schema-flexibility :write
            ;; DATAHIKE_KEEP_HISTORY=true to exercise history; default off for
            ;; integration tests where writes are the throughput bottleneck.
@@ -25,7 +35,10 @@
            ;; enables uniqueness on populated attributes — the gated
            ;; index-backfill migration (replikativ/datahike#934) must be on.
            :allow-index-backfill? true}
-      _ (d/create-database cfg)
+            (= "true" (System/getenv "DATAHIKE_WRITE_OPT"))
+            (assoc :index-config {:diff-buf-size 256}
+                   :fuse-index-roots? true))
+      _ (when-not (d/database-exists? cfg) (d/create-database cfg))
       conn (d/connect cfg)
       port (Integer/parseInt (or (System/getenv "DATAHIKE_PG_PORT") "15432"))
       nrepl-port (Integer/parseInt (or (System/getenv "DATAHIKE_NREPL_PORT") "15433"))

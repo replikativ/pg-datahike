@@ -8,17 +8,31 @@ client counts.
 
 ## Results (2026-08-02, scale 8 = 800k accounts, prepared protocol)
 
-| workload | clients | pg-datahike | PostgreSQL 17 | gap |
+| workload | clients | pg-datahike (memory) | pg-datahike (file) | PostgreSQL 17 |
 |---|---|---|---|---|
-| select-only | 1 | 2,816 tps (0.36 ms) | 19,194 tps (0.05 ms) | 6.8× |
-| select-only | 8 | 21,283 tps | 81,554 tps | 3.8× |
-| tpcb-like | 1 | 103 tps | 419 tps | 4.1× |
-| tpcb-like | 4 | 336 tps | 719 tps | 2.1× |
-| tpcb-like | 8 | 277 tps | 997 tps | 3.6× |
+| select-only | 1 | 2,816 tps (0.36 ms) | 2,986 tps (0.34 ms) | 19,194 tps (0.05 ms) |
+| select-only | 8 | 21,283 tps | 21,636 tps | 81,554 tps |
+| tpcb-like | 1 | 103 tps | 53 tps (19 ms) | 419 tps (2.4 ms) |
+| tpcb-like | 4 | 336 tps | 82 tps | 719 tps |
+| tpcb-like | 8 | 277 tps | 84 tps | 997 tps |
 
-pg-datahike: released artifacts only (datahike 0.8.1768 from Clojars),
-in-memory store, zero failed transactions in every cell. PostgreSQL:
-default configuration on local NVMe.
+Gaps vs PostgreSQL: reads 3.8–6.8× (identical for memory and file — the
+warm node cache makes the durable store free on reads), writes 2.1–4.1×
+from the memory store and 5–12× from the durable file store. Zero failed
+transactions in every pg-datahike cell; released artifacts only
+(datahike 0.8.1768 from Clojars). PostgreSQL: default configuration on
+local NVMe.
+
+**Which write comparison is apples-to-apples?** The file store (konserve:
+atomic, fsynced object writes) is the durability-comparable tier for
+writes; the memory store shows the transaction-machinery ceiling with
+storage taken out. The remaining structural difference on the file tier
+is commit shape: a datahike commit writes several objects (index roots +
+commit record; the scale-8 dataset occupies ~1.9 GB vs PostgreSQL's
+~150 MB) where PostgreSQL appends one WAL record. Datahike's
+write-amplification options (`:diff-buf-size`, `:fuse-index-roots?`)
+halve the store size but trade commit latency for it on local NVMe —
+their target is request-priced object stores (S3).
 
 For context: before the 2026-08 performance campaign, select-only c1 ran
 ~35× slower than this and the tpcb workload *lost* throughput as clients

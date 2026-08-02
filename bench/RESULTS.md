@@ -61,3 +61,12 @@ section above (scale 1, 5s cells) is NOT comparable to scale-8 numbers —
 scale-1 tpcb funnels every transaction through one branch row (max
 contention) and its select numbers were taken in simple mode; an earlier
 revision of our docs mistakenly compared across these baselines.
+
+## scale8-filestore — 2026-08-02 — same build, konserve file store
+
+Same matrix, `DATAHIKE_STORE_PATH` file backend (fsynced object writes):
+select c1 2986 / c8 21636 (≈ memory: warm node cache); tpcb c1 52.7 /
+c4 82.2 / c8 83.8, 0.000% failed (commit-IO bound past c4). Store size
+1.9G at scale 8. With `DATAHIKE_WRITE_OPT=true` (diff-buf 256 + fused
+index roots): store 976M but tpcb 32/51/51 and select c1 1859 — the
+write-amplification options target object stores, not local NVMe.
