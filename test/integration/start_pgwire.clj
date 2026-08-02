@@ -21,13 +21,10 @@
            ;; DATAHIKE_KEEP_HISTORY=true to exercise history; default off for
            ;; integration tests where writes are the throughput bottleneck.
            :keep-history? (= "true" (System/getenv "DATAHIKE_KEEP_HISTORY"))
-           ;; DATAHIKE_SYNC_COMMIT=false → writer acks after the in-memory
-           ;; apply (synchronous_commit=off semantics; no durability
-           ;; difference on the :memory backend). Ignored by datahike
-           ;; versions without the option.
-           :writer (cond-> {:backend :self}
-                     (= "false" (System/getenv "DATAHIKE_SYNC_COMMIT"))
-                     (assoc :sync-commit? false))}
+           ;; SQL migration order (CREATE TABLE -> COPY -> ADD PRIMARY KEY)
+           ;; enables uniqueness on populated attributes — the gated
+           ;; index-backfill migration (replikativ/datahike#934) must be on.
+           :allow-index-backfill? true}
       _ (d/create-database cfg)
       conn (d/connect cfg)
       port (Integer/parseInt (or (System/getenv "DATAHIKE_PG_PORT") "15432"))
