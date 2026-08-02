@@ -42,9 +42,15 @@ PR order (each gated + critic-passed, rebased onto post-merge main):
 3. b7ddda93 drop-attr check on db-after (narrow, semantic — alone).
 4. Inert tuning seams: 71d1083f `*fold-scalar-ins*` + the
    `*result-cache-min-weight*` half of 9a22574e (defaults unchanged).
-5. 9b53c281 `:sync-commit?` writer — with the commit-id threading fix,
-   plus failure/batching tests; document the ack contract (report lacks
-   final :db/commitId; async commit failure after ack).
+5. ~~`:sync-commit?` writer~~ — WITHDRAWN (#933 closed): a controlled
+   A/B on the final stack showed the writer's pipelining already
+   swallows the memory-store commit cost (sync mode reproduces the
+   PG-parity numbers: tpcb c1 95 / c4 303 / c8 361). The flag only
+   reorders ack vs an in-RAM step on :memory and trades real
+   durability on durable backends. The genuine writer opportunity is
+   group-commit batching (+50-80% in isolated experiments, ~35k tps
+   direct-PSS ceiling) — a separate design-first proposal. The stack
+   no longer touches writer.cljc at all.
 6. e1fb24bb index-backfill — behind `:allow-index-backfill?` config
    (default false) per critic recommendation, with migration suite.
 7. Form-analysis memoization (rest of 9a22574e + BigDecimal fix) —
