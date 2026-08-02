@@ -51,8 +51,14 @@ PR order (each gated + critic-passed, rebased onto post-merge main):
    group-commit batching (+50-80% in isolated experiments, ~35k tps
    direct-PSS ceiling) — a separate design-first proposal. The stack
    no longer touches writer.cljc at all.
-6. e1fb24bb index-backfill — behind `:allow-index-backfill?` config
-   (default false) per critic recommendation, with migration suite.
+6. ~~index-backfill~~ — LANDED (#934, squash-merged) behind
+   `:allow-index-backfill?` (default false). FOLLOW-UP design note
+   (from whilo): secondary indices backfill ASYNC in the background —
+   the same pattern could serve `:db/index` enablement (pure index
+   population, no acceptance semantics). `:db/unique` addition must
+   stay synchronous: the transaction's acceptance depends on the
+   duplicate check completing atomically with the schema change.
+   Revisit splitting the two paths after the campaign lands.
 7. Form-analysis memoization (rest of 9a22574e + BigDecimal fix) —
    consider default-off flag; fix double-LRU-entry capacity cost.
 8. **Prepared execution** (71074449 + critic fixes) — behind a dynamic
