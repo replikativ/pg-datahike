@@ -23,26 +23,43 @@ Follow-ups that refactor rather than add:
   (tier-0: parser emits our IR directly; removes the ad-hoc expansion
   layer).
 
-## datahike (worktree branch feature/index-backfill, 10 commits)
+## datahike (worktree branch feature/index-backfill, ~860 insertions)
 
-Split for upstream as independent PRs, in this order:
+Landing-risk review (critic pass 3, gpt-5.6-sol) ranked the risks and
+proposed the split below. Three of its findings were fixed immediately
+(commit pending): normalize-q-input memoized on the WHOLE query input,
+retaining DB snapshots in the LRU for map-form calls (now keys on the
+query form only); the async writer re-read a possibly-stale parent
+commit-id from the connection between commits (now threads the returned
+id); index-backfill used java.util.HashSet in cljc (CLJS blocker) with
+JVM equality (misses array value-equality — now a set of
+arr/wrap-comparable keys).
 
-1. **Mechanical, no semantics**: 8da03459 bucket-weight O(1); e240d60a
-   query-cache bucket cap. Trivial review.
-2. **Caching, semantics-neutral**: 9a22574e form-analysis memoization +
-   `*result-cache-min-weight*`; b0c8ad78 critic fixes fold into this PR
-   (BigDecimal-scale key canonicalization is part of the memoization
-   story).
-3. **Prepared execution** (the big one): 71074449 + its half of b0c8ad78.
-   Needs a design note: value-free plan keys, single-tuple-rel absorption,
-   compiled point programs, lookup-ref routing rule. Ship with the
-   14-shape × 4-engine differential as a test.
-4. **Behavioral features, each with an issue first**: e1fb24bb
-   index-backfill migration; 9b53c281 `:sync-commit?` writer mode;
-   b7ddda93 drop-attr check on db-after.
-5. **Upstream issue (no code)**: repeated get-else output vars diverge
-   between legacy (rebind) and planner engine (equality) — pre-existing,
-   found by the critic pass.
+PR order (each gated + critic-passed, rebased onto post-merge main):
+
+1. 8da03459 bucket-weight O(1) — pure win, zero semantic surface.
+2. e240d60a cache-propagation cap (make threshold configurable).
+3. b7ddda93 drop-attr check on db-after (narrow, semantic — alone).
+4. Inert tuning seams: 71d1083f `*fold-scalar-ins*` + the
+   `*result-cache-min-weight*` half of 9a22574e (defaults unchanged).
+5. 9b53c281 `:sync-commit?` writer — with the commit-id threading fix,
+   plus failure/batching tests; document the ack contract (report lacks
+   final :db/commitId; async commit failure after ack).
+6. e1fb24bb index-backfill — behind `:allow-index-backfill?` config
+   (default false) per critic recommendation, with migration suite.
+7. Form-analysis memoization (rest of 9a22574e + BigDecimal fix) —
+   consider default-off flag; fix double-LRU-entry capacity cost.
+8. **Prepared execution** (71074449 + critic fixes) — behind a dynamic
+   var defaulting OFF so it lands inert (pg-datahike binds it on). The
+   unconditionally-active pieces the critic flagged must fold under the
+   flag or be justified separately: try-point-group inside
+   execute-plan-direct (affects fold-on users), 64-slot result-list,
+   empty-consts lookup shortcut, plan-map :program-cache atom (breaks
+   plan value-equality/printing — consider metadata instead of a map
+   key). Ship with the 14-shape × 4-engine differential as a test plus
+   a generative differential.
+9. Upstream issue (no code): repeated get-else output vars diverge
+   between legacy (rebind) and planner engine (equality) — pre-existing.
 
 ## Open perf fronts (in priority order)
 
