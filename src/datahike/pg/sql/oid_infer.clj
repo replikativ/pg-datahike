@@ -143,7 +143,9 @@
    "extract"       types/oid-float8
    "age"           types/oid-interval
    ;; Type checks / introspection
-   "pg_typeof"     types/oid-text
+   ;; pg_typeof returns regtype, not text — this is the OID the
+   ;; reporter of #19 saw and mistook for the bit type's own.
+   "pg_typeof"     types/oid-regtype
    "version"       types/oid-text
    "format_type"   types/oid-text
    "current_setting" types/oid-text
@@ -439,7 +441,8 @@
                         :else types/oid-timestamp)
            :uuid      types/oid-uuid
            :bytes     types/oid-bytea
-           :bit       types/oid-text
+           :bit       types/oid-bit
+           :varbit    types/oid-varbit
            nil)
          ;; Fallback for types cast-category doesn't width-classify (jsonb,
          ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is

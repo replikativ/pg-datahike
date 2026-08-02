@@ -181,6 +181,17 @@
    {:sqlstate "2201G"
     :format (fn [{:keys [detail]}] detail)}
 
+   ;; Bit-string width coercion. PG uses two distinct codes: a fixed-width
+   ;; `bit(n)` mismatch is 22026, an over-long `bit varying(n)` is 22001
+   ;; (varbit.c:404, :755).
+   :string-data-length-mismatch
+   {:sqlstate "22026"
+    :format (fn [{:keys [detail]}] detail)}
+
+   :string-data-right-truncation
+   {:sqlstate "22001"
+    :format (fn [{:keys [detail]}] detail)}
+
    ;; nextval past MAXVALUE / MINVALUE on a non-CYCLE sequence
    ;; (sequence.c:736). PG names the sequence and the bound it hit.
    :sequence-generator-limit-exceeded

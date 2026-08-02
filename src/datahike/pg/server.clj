@@ -28,6 +28,7 @@
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
+            [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
@@ -318,6 +319,11 @@
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
      (pg-arr/array? v) (pg-arr/to-pg-text v)
+    ;; PgBit → its digit run. Before the wrapper existed a bit value WAS
+    ;; a String and fell through to the string? branch below, which is
+    ;; why it reported as text (#19). Same defrecord-before-string
+    ;; ordering as PgArray.
+     (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
     ;; PgRecord → PG canonical record_out text `(f1,f2,…)`. Checked before
     ;; string?/vector? for the same defrecord reason as PgArray.
      (pg-rec/record? v) (do (pg-rec/register-layouts!

@@ -18,6 +18,7 @@
             [datahike.query :as dq]
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.coerce :as coerce]
@@ -1225,26 +1226,27 @@
                                                                               (catch Exception _ nil))
                                                                          (expr/parse-timestamp-string (str raw))))
                                                                    :uuid (java.util.UUID/fromString (str raw))
-                                                       ;; `N::bit(W)` — PG's bit-string type,
-                                                       ;; emitted as a W-char '0'/'1' string
-                                                       ;; of the low-W bits. We extract W from
-                                                       ;; the type-str pattern (cast-category
-                                                       ;; strips the `(…)` so re-parse here).
-                                                                   :bit
-                                                                   (let [w (or (some-> (re-find #"\((\d+)\)" type-str)
-                                                                                       second
-                                                                                       Integer/parseInt)
-                                                                               1)
-                                                                         n (long (if (number? raw)
-                                                                                   raw
-                                                                                   (Long/parseLong (str raw))))
-                                                                         mask (if (< w 64) (dec (bit-shift-left 1 w)) -1)
-                                                                         low  (bit-and n mask)
-                                                                         s (Long/toBinaryString low)
-                                                                         pad (- w (.length ^String s))]
-                                                                     (if (pos? pad)
-                                                                       (str (apply str (repeat pad \0)) s)
-                                                                       s))
+                                                       ;; `N::bit(W)` / `'101'::bit(W)` — PG's
+                                                       ;; bit-string type. Produces a PgBit, not a
+                                                       ;; String: the width is part of the value
+                                                       ;; and the type must report as 1560/1562
+                                                       ;; rather than text (#19). cast-category
+                                                       ;; strips the `(…)`, so re-read W here;
+                                                       ;; bare `bit` means bit(1), bare `bit
+                                                       ;; varying` means unlimited.
+                                                                   (:bit :varbit)
+                                                                   (let [varying? (= :varbit (types/cast-category type-str))
+                                                                         w (some-> (re-find #"\((\d+)\)" type-str)
+                                                                                   second
+                                                                                   Integer/parseInt)
+                                                                         w (or w (when-not varying? 1))]
+                                                                     (if (number? raw)
+                                                                       ;; int → bit(n): rightmost n bits,
+                                                                       ;; sign-extended on the left.
+                                                                       (cond-> (pg-bits/from-integer (long raw) (or w 1))
+                                                                         varying? (assoc :varying? true))
+                                                                       (-> (pg-bits/parse-bit-literal (str raw) varying?)
+                                                                           (pg-bits/coerce-width w true))))
                                                                    raw)))
                                                    ;; Scalar subquery in projection —
                                                    ;; execute and take first value

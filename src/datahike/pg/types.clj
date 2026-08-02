@@ -41,6 +41,9 @@
 (def oid-interval 1186)
 (def oid-numeric  1700)
 (def oid-uuid     2950)
+(def oid-regtype  2206)
+(def oid-bit      1560)
+(def oid-varbit   1562)
 (def oid-jsonb    3802)
 
 ;; Array OIDs — every scalar type has a paired `T[]` OID. PG catalog
@@ -381,6 +384,9 @@
    oid-float4     "real"
    oid-float8     "double precision"
    oid-numeric    "numeric"
+   oid-regtype    "regtype"
+   oid-bit        "bit"
+   oid-varbit     "bit varying"
    oid-text       "text"
    oid-varchar    "character varying"
    oid-bpchar     "character"
@@ -464,6 +470,12 @@
    asserts `29::bit(4)` serializes as \"1101\"."
   #{"bit"})
 
+(def cast-varbit-types
+  "SQL type names for BIT VARYING. A distinct type from `bit` (OID 1562
+   vs 1560) with different width coercion: `bit(n)` zero-pads on the
+   right, `bit varying(n)` truncates but never pads."
+  #{"varbit" "bit varying"})
+
 ;; ============================================================================
 ;; Catalog data: pg_type rows for virtual table materialization
 ;; ============================================================================
@@ -491,6 +503,8 @@
    [oid-interval  "interval"  16  "b"]
    [oid-numeric   "numeric"   -1  "b"]
    [oid-uuid      "uuid"      16  "b"]
+   [oid-bit       "bit"       -1  "b"]
+   [oid-varbit    "varbit"    -1  "b"]
    [oid-jsonb     "jsonb"     -1  "b"]
    ;; Array types — one per scalar with a paired T[] OID. typtype="b"
    ;; like scalars; the typelem linkage is exposed via element-oid
@@ -696,6 +710,7 @@
         (contains? cast-timestamp-types base) :timestamp
         (contains? cast-uuid-types base)      :uuid
         (contains? cast-bytes-types base)     :bytes
+        (contains? cast-varbit-types base)    :varbit
         (contains? cast-bit-types base)       :bit
         :else nil))))
 
@@ -740,6 +755,12 @@
     (and (some? v)
          (= "datahike.pg.records.PgRecord" (.getName (class v))))
     (or (:type-oid v) 2249)
+    ;; PgBit → bit (1560) or bit varying (1562). Class-name check to
+    ;; avoid a require-loop, as for PgArray above; without it a bit
+    ;; value reported as text because its digits are a String (#19).
+    (and (some? v)
+         (= "datahike.pg.bits.PgBit" (.getName (class v))))
+    (if (:varying? v) oid-varbit oid-bit)
     (instance? clojure.lang.Ratio v) oid-float8
     (instance? Long v)    oid-int8
     (instance? Integer v) oid-int4
