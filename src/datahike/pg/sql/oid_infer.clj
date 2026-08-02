@@ -91,10 +91,24 @@
    "ceiling"       :arg-type
    "floor"         :arg-type
    "round"         :arg-type
+   "trunc"         :arg-type
    "sign"          :arg-type
    "mod"           :arg-type
+   "gcd"           :arg-type
+   "lcm"           :arg-type
+   "width_bucket"  types/oid-int4
    ;; Math — always float
    "sqrt"          types/oid-float8
+   "cbrt"          types/oid-float8
+   "degrees"       types/oid-float8
+   "radians"       types/oid-float8
+   "cot"           types/oid-float8
+   "sinh"          types/oid-float8
+   "cosh"          types/oid-float8
+   "tanh"          types/oid-float8
+   "asinh"         types/oid-float8
+   "acosh"         types/oid-float8
+   "atanh"         types/oid-float8
    "exp"           types/oid-float8
    "ln"            types/oid-float8
    "log"           types/oid-float8

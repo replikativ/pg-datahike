@@ -826,7 +826,12 @@
       ;; so SQL NULL propagates (UPPER(NULL)=NULL etc.) instead of throwing
       ;; when a raw Clojure fn receives the `:__null__` keyword sentinel.
       (contains? fns/sql-fn->clj-fn fname)
-      (let [clj-fn (get fns/sql-fn->clj-fn fname)
+      (let [;; Resolve the arity here, at translate time, the way PG
+            ;; resolves against pg_proc during parse/analyze: a bad
+            ;; argument count is 42883, not a runtime ArityException
+            ;; surfacing as XX000.
+            _ (fns/check-arity! fname (count args))
+            clj-fn (get fns/sql-fn->clj-fn fname)
             wrapped (fns/null-safe clj-fn)
             fn-param (symbol (str "?fn-" fname "-"
                                   (swap! (:var-counter ctx) inc)))]

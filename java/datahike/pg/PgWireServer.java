@@ -655,6 +655,9 @@ public final class PgWireServer {
     /** Maximum SSL/startup negotiation rounds before closing connection. */
     private static final int MAX_STARTUP_ROUNDS = 5;
 
+    /** splitStatements' "this string holds no statement" result. */
+    private static final String[] EMPTY_STATEMENTS = new String[0];
+
     private final int port;
     private final String host;
     private final QueryHandlerFactory handlerFactory;
@@ -1280,14 +1283,23 @@ public final class PgWireServer {
     private void handleQuery(byte[] body, DataOutputStream out, char[] txStatus, QueryHandler handler, int[] copyState, BatchBuffer batch) throws IOException {
         String sql = new String(body, 0, body.length - 1, StandardCharsets.UTF_8).trim();
 
-        if (sql.isEmpty()) {
+        String[] statements = splitStatements(sql);
+
+        // A query string that yields NO statements at all — "", ";",
+        // "  ;  ; ", "-- just a comment" — is an empty query: exactly one
+        // EmptyQueryResponse and nothing else. Matches PG's
+        // exec_simple_query (src/backend/tcop/postgres.c):
+        //     if (!parsetree_list) NullCommand(dest);
+        // Note this is about the string as a whole. Empty fragments
+        // BETWEEN real statements ("SELECT 1;;") produce no 'I' — PG's
+        // raw parser simply never yields a parsetree for them, which is
+        // what splitStatements' blank-fragment skipping mirrors.
+        if (statements.length == 0) {
             sendEmptyQueryResponse(out);
             sendReadyForQuery(out, txStatus[0]);
             out.flush();
             return;
         }
-
-        String[] statements = splitStatements(sql);
 
         // On first error, stop processing remaining statements (PG semantics:
         // a Simple Query with multiple statements aborts the whole batch on
@@ -1296,7 +1308,10 @@ public final class PgWireServer {
         for (String stmt : statements) {
             if (errored) break;
             stmt = stripComments(stmt);
-            if (stmt.isEmpty()) continue;
+            // stripComments replaces a comment with a SPACE (to keep token
+            // separation), so a comment-only fragment comes back as " ",
+            // not "" — test the trimmed form or it reaches the parser.
+            if (stmt.trim().isEmpty()) continue;
 
             // Between-statement cancellation: a CancelRequest arriving on a
             // parallel connection flips the flag; we raise 57014 for the
@@ -1471,9 +1486,22 @@ public final class PgWireServer {
         out.flush();  // Single flush for all response messages
     }
 
+    /**
+     * Split a query string into individual statements, dropping fragments
+     * that hold no statement (blank, or comments only).
+     *
+     * Contract: the returned array contains exactly the statements PG's raw
+     * parser would yield a parsetree for. A zero-length result therefore
+     * means "empty query" — callers turn that into an EmptyQueryResponse
+     * rather than trying to parse anything.
+     */
     private String[] splitStatements(String sql) {
         if (!sql.contains(";")) {
-            return new String[]{sql};
+            // Single fragment: still no statement if it is blank or only
+            // comments ("-- ping"). stripComments is used for the test
+            // only; the caller re-strips the raw text it gets back.
+            return stripComments(sql).trim().isEmpty()
+                ? EMPTY_STATEMENTS : new String[]{sql};
         }
         List<String> stmts = new ArrayList<>();
         boolean inSingleQuote = false;
@@ -1557,7 +1585,11 @@ public final class PgWireServer {
                 stmts.add(part);
             }
         }
-        return stmts.isEmpty() ? new String[]{sql} : stmts.toArray(new String[0]);
+        // No fallback to `new String[]{sql}` here: an empty list means every
+        // fragment was blank/comment-only, i.e. an empty query. Handing the
+        // raw string back made handleQuery feed ";" to JSqlParser, which
+        // answered 42601 where PG answers EmptyQueryResponse (issue #18).
+        return stmts.toArray(new String[0]);
     }
 
     /**
@@ -1706,7 +1738,15 @@ public final class PgWireServer {
         // prepared statement as a ping. Don't try to translate — store
         // a PreparedStmt with parsed=null and emit EmptyQueryResponse
         // at Execute time.
-        Object parsed = query.isEmpty() ? null : handler.parse(query, paramOids);
+        //
+        // "Empty" is the same statement-less test the simple path uses, not
+        // just isEmpty(): PG accepts Parse(";") and Parse("-- c") and
+        // answers EmptyQueryResponse at Execute. Testing isEmpty() alone
+        // sent ";" to JSqlParser and errored at Parse time (issue #18);
+        // `query` is already comment-stripped above, so this catches the
+        // comment-only form too.
+        Object parsed = splitStatements(query).length == 0
+            ? null : handler.parse(query, paramOids);
 
         // Resolve parameter types the way PostgreSQL does at Parse time:
         // the client may declare some/none, and the server infers the rest

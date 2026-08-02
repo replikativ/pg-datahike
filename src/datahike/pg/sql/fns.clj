@@ -490,6 +490,265 @@
 (def sql-mod (null-safe checked-mod))
 
 ;; ---------------------------------------------------------------------------
+;; Math function implementations — PostgreSQL semantics, not IEEE-754
+;;
+;; The temptation is to map a SQL math function straight onto its
+;; `java.lang.Math` namesake. That is wrong in three separate ways, and
+;; every one of them used to be live here:
+;;
+;;   1. DOMAIN ERRORS. Java returns NaN/Infinity where PG raises. PG's
+;;      float.c and numeric.c check the argument first:
+;;        sqrt(-x)            → 2201F cannot take square root of a negative number
+;;        ln(0) / log(0)      → 2201E cannot take logarithm of zero
+;;        ln(-x)              → 2201E cannot take logarithm of a negative number
+;;        power(0, -x)        → 2201F zero raised to a negative power is undefined
+;;        power(-x, 0.5)      → 2201F a negative number raised to a
+;;                                    non-integer power yields a complex result
+;;        asin/acos(|x| > 1)  → 22003 input is out of range
+;;        exp / power overflow→ 22003 value out of range: overflow
+;;      Returning NaN instead was issue #22.
+;;
+;;   2. DIFFERENT FUNCTIONS UNDER THE SAME NAME. SQL `log(x)` is base-10;
+;;      `Math/log` is natural log. That mapping silently returned
+;;      4.605… for `log(100)` where PG returns 2 — a wrong answer, not
+;;      an error. Natural log is `ln`.
+;;
+;;   3. DIFFERENT ROUNDING. `Math/round` breaks ties toward positive
+;;      infinity (round(-2.5) = -2); PG rounds half away from zero
+;;      (round(-2.5) = -3).
+;;
+;; NaN inputs are exempt from the domain checks: PG propagates NaN
+;; through sqrt/ln/asin/power without raising (verified against 17.10).
+;; Every check below therefore tests the input, and lets NaN through.
+
+(defn- nan?* [x]
+  (and (number? x) (Double/isNaN (double x))))
+
+(defn- throw-power-domain [detail]
+  (throw (errors/pg-error :invalid-argument-for-power-function {:detail detail})))
+
+(defn- throw-log-domain [detail]
+  (throw (errors/pg-error :invalid-argument-for-logarithm {:detail detail})))
+
+(defn- throw-out-of-range [detail]
+  (throw (errors/pg-error :numeric-value-out-of-range {:detail detail})))
+
+(defn- finite-range
+  "PG's float.c overflow/underflow guard idiom, applied verbatim:
+
+     if (isinf(result) && !isinf(arg1)) float_overflow_error();
+     if (result == 0.0 && arg1 != 0.0) float_underflow_error();
+
+   An infinite *input* may legitimately produce an infinite result, and
+   a zero input a zero result — only the finite→infinite and
+   nonzero→zero transitions are errors. The UNDERFLOW half is the one
+   that gets forgotten: `exp(-1000.0::float8)` is an error in PG."
+  ^double [^double result ^double input]
+  (cond
+    (and (Double/isInfinite result) (not (Double/isInfinite input)))
+    (throw-out-of-range "value out of range: overflow")
+    (and (zero? result) (not (zero? input)))
+    (throw-out-of-range "value out of range: underflow")
+    :else result))
+
+(defn- finite-input
+  "sin/cos/tan/cot reject an infinite argument with 22003 'input is out
+   of range' (float.c:1895) instead of returning NaN as Java does. NaN
+   passes through — only Infinity is rejected."
+  ^double [x]
+  (let [d (double x)]
+    (if (Double/isInfinite d)
+      (throw-out-of-range "input is out of range")
+      d)))
+
+(defn- sql-sqrt [x]
+  (let [d (double x)]
+    (cond
+      (Double/isNaN d) d
+      (neg? d) (throw-power-domain "cannot take square root of a negative number")
+      :else (Math/sqrt d))))
+
+(defn- sql-ln [x]
+  (let [d (double x)]
+    (cond
+      (Double/isNaN d) d
+      (zero? d) (throw-log-domain "cannot take logarithm of zero")
+      (neg? d)  (throw-log-domain "cannot take logarithm of a negative number")
+      :else (Math/log d))))
+
+(defn- sql-log10 [x]
+  (let [d (double x)]
+    (cond
+      (Double/isNaN d) d
+      (zero? d) (throw-log-domain "cannot take logarithm of zero")
+      (neg? d)  (throw-log-domain "cannot take logarithm of a negative number")
+      :else (Math/log10 d))))
+
+(defn- sql-log
+  "SQL LOG. One argument → base 10 (NOT natural log — that is `ln`).
+   Two arguments → LOG(base, x) = ln(x) / ln(base).
+
+   `log(1, x)` divides by ln(1) = 0, which PG reports as 22012 division
+   by zero (numeric.c reaches div_var_fast with a zero divisor) rather
+   than as a logarithm-domain error — so route it through checked-div."
+  ([x] (sql-log10 x))
+  ([base x]
+   (let [lb (sql-ln base)
+         lx (sql-ln x)]
+     (if (or (nan?* lb) (nan?* lx))
+       Double/NaN
+       (checked-div lx lb)))))
+
+(defn- sql-exp [x]
+  (let [d (double x)]
+    (if (Double/isNaN d) d (finite-range (Math/exp d) d))))
+
+(defn- sql-power [base exponent]
+  (let [b (double base)
+        e (double exponent)]
+    (cond
+      (or (Double/isNaN b) (Double/isNaN e)) Double/NaN
+      (and (zero? b) (neg? e))
+      (throw-power-domain "zero raised to a negative power is undefined")
+      (and (neg? b) (not (Double/isInfinite e)) (not= e (Math/rint e)))
+      (throw-power-domain
+       "a negative number raised to a non-integer power yields a complex result")
+      :else
+      (let [r (Math/pow b e)]
+        (if (and (Double/isInfinite r)
+                 (not (Double/isInfinite b))
+                 (not (Double/isInfinite e)))
+          (throw-out-of-range "value out of range: overflow")
+          r)))))
+
+(defn- unit-domain
+  "asin/acos are defined on [-1, 1]; outside it PG raises 22003 'input
+   is out of range' (float.c dasin/dacos) rather than returning NaN."
+  ^double [x]
+  (let [d (double x)]
+    (cond
+      (Double/isNaN d) d
+      (> (Math/abs d) 1.0) (throw-out-of-range "input is out of range")
+      :else d)))
+
+(defn- sql-asin [x] (let [d (unit-domain x)] (if (Double/isNaN d) d (Math/asin d))))
+(defn- sql-acos [x] (let [d (unit-domain x)] (if (Double/isNaN d) d (Math/acos d))))
+
+(defn- sql-acosh
+  "acosh is defined on [1, ∞). NaN passes the `< 1.0` guard (every
+   NaN comparison is false) and comes back NaN, as in PG."
+  [x]
+  (let [d (double x)]
+    (if (< d 1.0)
+      (throw-out-of-range "input is out of range")
+      (Math/log (+ d (Math/sqrt (- (* d d) 1.0)))))))
+
+(defn- sql-atanh
+  "atanh is defined on [-1, 1]; atanh(±1) is ±Infinity and NOT an error
+   in PG, but an infinite argument is (float.c:2724)."
+  [x]
+  (let [d (double x)]
+    (if (or (< d -1.0) (> d 1.0))
+      (throw-out-of-range "input is out of range")
+      (* 0.5 (Math/log (/ (+ 1.0 d) (- 1.0 d)))))))
+
+(defn- sql-asinh [x]
+  ;; PG's dasinh has no guards at all — mirror that exactly.
+  (let [d (double x)]
+    (Math/log (+ d (Math/sqrt (+ (* d d) 1.0))))))
+
+(defn- sql-cbrt [x] (Math/cbrt (double x)))
+
+(defn- sql-sign
+  "float8 sign(NaN) is 0 in PG — dsign has no NaN guard, so both
+   `arg1 > 0` and `arg1 < 0` are false and the result stays 0
+   (float.c:1410). Java's Math/signum returns NaN instead. (The
+   *numeric* sign(NaN) is NaN, but we have one representation.)"
+  [x]
+  (let [d (double x)]
+    (cond (Double/isNaN d) 0.0
+          (pos? d) 1.0
+          (neg? d) -1.0
+          :else 0.0)))
+
+(defn- sql-round
+  "SQL ROUND — half away from zero, i.e. PG's NUMERIC rounding
+   (numeric.c:11657 round_var). `Math/round` breaks ties toward
+   positive infinity and returns a long, so round(-2.5) came back -2
+   instead of -3.
+
+   Deliberately NOT float8 semantics. PG's round(float8) is `rint()`,
+   which is half-to-EVEN — round(2.5::float8) is 2, not 3. We apply the
+   numeric rule to every input because a decimal literal like `2.5` is
+   numeric in PG but arrives here as a Double: dispatching on the
+   runtime type would make `SELECT round(2.5)` answer 2 where PG
+   answers 3, which is the more visible divergence. The right fix is
+   upstream — type decimal literals as numeric — and this should
+   become type-dispatched once that lands.
+
+   Two-arg ROUND(x, n) rounds to n decimal places; PG defines it for
+   numeric only and returns numeric, so compute in BigDecimal rather
+   than reintroducing binary-float error."
+  ([x]
+   (if (integer? x)
+     x
+     (-> (bigdec x) (.setScale 0 java.math.RoundingMode/HALF_UP) (.longValueExact))))
+  ([x n]
+   (-> (bigdec x)
+       (.setScale (int n) java.math.RoundingMode/HALF_UP)
+       ;; strip to the plain numeric the wire encoder expects
+       (.stripTrailingZeros)
+       (.setScale (int n) java.math.RoundingMode/UNNECESSARY))))
+
+(defn- sql-trunc
+  "SQL TRUNC — round toward zero. TRUNC(x, n) truncates to n decimals."
+  ([x]
+   (if (integer? x)
+     x
+     (-> (bigdec x) (.setScale 0 java.math.RoundingMode/DOWN) (.longValueExact))))
+  ([x n]
+   (-> (bigdec x) (.setScale (int n) java.math.RoundingMode/DOWN))))
+
+(defn- sql-gcd [a b]
+  (.gcd (biginteger a) (biginteger b)))
+
+(defn- sql-lcm
+  "SQL LCM. lcm(0, x) = 0 (PG defines it so, no error)."
+  [a b]
+  (let [x (biginteger a) y (biginteger b)]
+    (if (or (zero? a) (zero? b))
+      (biginteger 0)
+      (.abs (.divide (.multiply x y) (.gcd x y))))))
+
+(defn- throw-width-bucket [detail]
+  (throw (errors/pg-error :invalid-argument-for-width-bucket {:detail detail})))
+
+(defn- sql-width-bucket
+  "SQL WIDTH_BUCKET(operand, low, high, count) — 1-based histogram
+   bucket, 0 below `low`, count+1 at or above `high`.
+
+   `low > high` is LEGAL and mirror-reverses the histogram; only
+   `low == high` is an error. A NaN operand is allowed (PG treats NaN
+   as larger than everything); NaN or infinite BOUNDS are not. All four
+   argument failures are 2201G, not the 22003 used elsewhere in
+   float.c — see float.c:4190-4203."
+  [operand low high cnt]
+  (let [o (double operand) l (double low) h (double high) n (long cnt)]
+    (when (<= n 0) (throw-width-bucket "count must be greater than zero"))
+    (when (or (Double/isNaN l) (Double/isNaN h))
+      (throw-width-bucket "lower and upper bounds cannot be NaN"))
+    (when (or (Double/isInfinite l) (Double/isInfinite h))
+      (throw-width-bucket "lower and upper bounds must be finite"))
+    (when (= l h) (throw-width-bucket "lower bound cannot equal upper bound"))
+    (let [asc? (< l h)
+          below? (if asc? (< o l) (> o l))
+          above? (if asc? (>= o h) (<= o h))]
+      (cond
+        below? 0
+        above? (inc n)
+        :else (inc (long (Math/floor (* n (/ (- o l) (- h l))))))))))
+
+;; ---------------------------------------------------------------------------
 ;; SQL string function implementations
 
 (defn sql-lpad
@@ -677,8 +936,6 @@
    "lower"    str/lower-case
    "length"   count
    "abs"      clojure.core/abs
-   "round"    #(Math/round (double %))
-   "sqrt"     #(Math/sqrt (double %))
    "floor"    #(Math/floor (double %))
    "ceil"     #(Math/ceil (double %))
    "ceiling"  #(Math/ceil (double %))
@@ -688,11 +945,54 @@
    "replace"  str/replace
    "greatest" clojure.core/max
    "least"    clojure.core/min
-   "sign"     #(Math/signum (double %))
-   "exp"      #(Math/exp (double %))
-   "log"      #(Math/log (double %))
-   "power"    #(Math/pow (double %1) (double %2))
    "mod"      rem
+
+   ;; --- Math: PG semantics, see the "Math function implementations"
+   ;; section above. Do NOT swap these back for bare Math/* methods —
+   ;; each one differs from its Java namesake in domain checking,
+   ;; base, or tie-breaking.
+   "sqrt"     sql-sqrt
+   "cbrt"     sql-cbrt
+   "exp"      sql-exp
+   "ln"       sql-ln
+   "log"      sql-log            ; base 10 (1-arg) / log(base, x) (2-arg)
+   "log10"    sql-log10
+   "power"    sql-power
+   "pow"      sql-power
+   "round"    sql-round
+   "trunc"    sql-trunc
+   "sign"     sql-sign
+   "gcd"      sql-gcd
+   "lcm"      sql-lcm
+   "width_bucket" sql-width-bucket
+   "pi"       (fn [] Math/PI)
+   ;; degrees/radians route through PG's checked multiply/divide, so
+   ;; they can raise 22003 where Math/toDegrees silently returns Inf.
+   "degrees"  #(let [d (double %)] (finite-range (Math/toDegrees d) d))
+   "radians"  #(let [d (double %)] (finite-range (Math/toRadians d) d))
+   ;; sin/cos/tan/cot reject an infinite argument (22003); tan and cot
+   ;; deliberately do NOT check their result — PG documents cot(0) as
+   ;; Infinity rather than an error.
+   "sin"      #(let [d (finite-input %)] (finite-range (Math/sin d) d))
+   "cos"      #(let [d (finite-input %)] (finite-range (Math/cos d) d))
+   "tan"      #(Math/tan (finite-input %))
+   "cot"      #(/ 1.0 (Math/tan (finite-input %)))
+   "asin"     sql-asin
+   "acos"     sql-acos
+   "atan"     #(Math/atan (double %))
+   "atan2"    #(Math/atan2 (double %1) (double %2))
+   ;; sinh/cosh overflow to ±Infinity WITHOUT an error in PG (float.c
+   ;; :2611) — unlike exp. cosh does raise on underflow. asinh has no
+   ;; guards at all. Mirrored exactly, inconsistency included.
+   "sinh"     #(Math/sinh (double %))
+   "cosh"     #(let [d (double %) r (Math/cosh d)]
+                 (if (and (zero? r) (not (zero? d)))
+                   (throw-out-of-range "value out of range: underflow")
+                   r))
+   "tanh"     #(Math/tanh (double %))
+   "asinh"    sql-asinh
+   "acosh"    sql-acosh
+   "atanh"    sql-atanh
    "lpad"     sql-lpad
    "rpad"     sql-rpad
    "repeat"   sql-repeat
@@ -762,3 +1062,61 @@
    "immediately_succeeds"   (fn [af _at _bf bt] (= af bt))
    ;; MEETS is the standard alias for IMMEDIATELY_PRECEDES (A.end == B.start)
    "meets"                  (fn [_af at bf _bt] (= at bf))})
+
+;; ---------------------------------------------------------------------------
+;; Declared arities
+;;
+;; PG resolves a function call against pg_proc at PARSE time, so a wrong
+;; argument count is a 42883 ("function sqrt(integer, integer) does not
+;; exist") before anything runs. Our functions are plain IFns, so a bad
+;; count used to surface at execute time as Clojure's own ArityException,
+;; which reached the client as XX000 ("Wrong number of args (2) passed
+;; to: fns/fn--72143") — an internal error string for what is really a
+;; user-facing name-resolution failure.
+;;
+;; Entries map a lowercased SQL function name to the SET of argument
+;; counts it accepts. A name ABSENT from this map is unchecked (the
+;; catalog stubs and the variadic string helpers), so this can be filled
+;; in incrementally without breaking anything.
+
+(def sql-fn-arities
+  "SQL function name → set of accepted argument counts. Absent = unchecked."
+  {"pi"       #{0}
+   "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
+   "exp"      #{1} "ln"      #{1} "log10" #{1}
+   "floor"    #{1} "ceil"    #{1} "ceiling" #{1}
+   "degrees"  #{1} "radians" #{1}
+   "sin"      #{1} "cos"     #{1} "tan"   #{1} "cot"  #{1}
+   "asin"     #{1} "acos"    #{1} "atan"  #{1}
+   "sinh"     #{1} "cosh"    #{1} "tanh"  #{1}
+   "asinh"    #{1} "acosh"   #{1} "atanh" #{1}
+   "log"      #{1 2}     ; log(x) = base 10; log(base, x)
+   "round"    #{1 2}     ; round(x); round(x, decimals)
+   "trunc"    #{1 2}
+   "power"    #{2} "pow" #{2} "atan2" #{2} "mod" #{2} "gcd" #{2} "lcm" #{2}
+   "width_bucket" #{4}
+   "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
+   "length"   #{1} "char_length" #{1} "octet_length" #{1}
+   "left"     #{2} "right" #{2} "position" #{2} "strpos" #{2}
+   "repeat"   #{2}
+   "lpad"     #{2 3} "rpad" #{2 3}})
+
+(defn check-arity!
+  "Raise 42883 when `argc` is not an accepted arity for `fname`. No-op
+   for unchecked names. Called at translate time so the error lands
+   where PG's does — during parse/analyze, not execution."
+  [^String fname argc]
+  (let [lname (str/lower-case fname)]
+    (when-let [ok (get sql-fn-arities lname)]
+      (when-not (contains? ok argc)
+        ;; PG renders the signature with the argument types it resolved,
+        ;; and "unknown" for untyped literals — `sqrt('a','b')` reports
+        ;; `function sqrt(unknown, unknown) does not exist`. We don't
+        ;; carry inferred arg types this far down, so report the arity
+        ;; with `unknown` placeholders, which is what PG itself prints
+        ;; for the untyped-literal case. The HINT is PG's verbatim.
+        (throw (errors/pg-error
+                :undefined-function
+                {:function (str lname "(" (str/join ", " (repeat argc "unknown")) ")")
+                 :hint (str "No function matches the given name and argument types. "
+                            "You might need to add explicit type casts.")}))))))
