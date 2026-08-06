@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Licensing
+
+- **pg-datahike is now under the PostgreSQL License**, replacing the Eclipse
+  Public License 2.0. A PostgreSQL-compatible server should not be harder to
+  build on than PostgreSQL: the new terms let anyone embed, fork, or ship it
+  commercially and closed-source. Contributions are accepted under a DCO
+  sign-off rather than a CLA, so contributed code arrives already licensed for
+  commercial use — see `CONTRIBUTING.md`. Every line in the repository is the
+  work of a single copyright holder, so no consent had to be collected.
+
+  This governs pg-datahike's own code. Distributed artifacts — notably the
+  standalone uberjar — still bundle datahike and the replikativ storage stack
+  under EPL-1.0, which is file-level copyleft: proprietary work on top is
+  fine, and only modifications to those libraries' own files must be
+  published. The new `NOTICE` file records the full third-party breakdown and
+  is now packaged into both jars at `META-INF/`.
+
 ### PostgreSQL conformance (issues #18–#22)
 
 - **An empty query now answers `EmptyQueryResponse` instead of a parse

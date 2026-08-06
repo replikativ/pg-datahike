@@ -44,12 +44,22 @@
     (.mkdirs (.getParentFile f))
     (spit f version)))
 
+(defn- copy-legal!
+  "Ship LICENSE and NOTICE inside the jar at the conventional META-INF
+   location. NOTICE matters most for the uberjar: it bundles datahike and
+   the rest of the EPL storage stack, and EPL-1.0 wants the recipient told
+   where that source lives."
+  []
+  (doseq [f ["LICENSE" "NOTICE"]]
+    (b/copy-file {:src f :target (str class-dir "/META-INF/" f)})))
+
 (defn jar [_]
   (clean nil)
   (compile-java nil)
   (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})
   (write-version-resource!)
+  (copy-legal!)
   (b/write-pom {:class-dir class-dir
                 :lib lib
                 :version version
@@ -58,8 +68,8 @@
                 :scm {:url "https://github.com/replikativ/pg-datahike"}
                 :pom-data [[:licenses
                             [:license
-                             [:name "Eclipse Public License 2.0"]
-                             [:url "https://www.eclipse.org/legal/epl-2.0/"]
+                             [:name "PostgreSQL License"]
+                             [:url "https://opensource.org/licenses/PostgreSQL"]
                              [:distribution "repo"]]]]})
   (b/jar {:class-dir class-dir
           :jar-file jar-file}))
@@ -82,6 +92,7 @@
   (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})
   (write-version-resource!)
+  (copy-legal!)
   (b/compile-clj {:basis (basis)
                   :class-dir class-dir
                   :src-dirs ["src"]
