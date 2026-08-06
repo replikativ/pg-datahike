@@ -1,0 +1,78 @@
+pg-datahike
+Copyright (c) 2026, Christian Weilbach and contributors
+
+This product is licensed under the PostgreSQL License; see LICENSE.
+
+The source tree contains no third-party code. What follows applies to
+*distributed artifacts* — in particular the standalone uberjar built by
+`clojure -T:build uber`, which bundles the dependencies below. Their
+licenses attach to that combined artifact, not to pg-datahike's own source.
+
+
+Weak copyleft
+-------------
+
+  org.replikativ/datahike  and the replikativ storage stack it pulls in
+  (konserve, hasch, incognito, superv.async, persistent-sorted-set,
+  datalog-parser)
+      Eclipse Public License 1.0
+      https://github.com/replikativ/datahike
+
+  org.clojure/clojure and most of the Clojure ecosystem libraries
+      Eclipse Public License 1.0
+
+  metosin/malli
+      Eclipse Public License 2.0
+
+  org.mozilla/rhino
+      Mozilla Public License 2.0
+      Reached only through an old ClojureScript dependency of
+      tailrecursion/cljs-priority-map; unused on the JVM.
+
+EPL and MPL are file-level copyleft: you may build proprietary software on
+top of these libraries and combine them freely with your own code. The
+obligation is to make source available for *those libraries' own files* if
+you distribute them, and to publish your modifications to those files.
+Unmodified upstream source for every component above is public at the URLs
+given here and on Clojars/Maven Central.
+
+
+Dual-licensed — the permissive arm is elected
+---------------------------------------------
+
+  com.github.jsqlparser/jsqlparser
+      Apache License 2.0 OR LGPL 2.1 — used under Apache License 2.0.
+
+  org.javassist/javassist
+      MPL 1.1 OR LGPL 2.1 OR Apache License 2.0 — used under Apache
+      License 2.0. Transitive: hasch -> incognito -> transit-java ->
+      msgpack.
+
+
+Permissive
+----------
+
+  Apache License 2.0   transit-clj/-java, msgpack, json-simple, lz4-java,
+                       org.replikativ/logging, google-closure-library
+  MIT                  cljs-cache
+  BSD-3-Clause         org.ow2.asm/asm
+  Public domain        mvxcvi/clj-cbor, mvxcvi/arrangement
+
+
+Provenance notes
+----------------
+
+java/datahike/pg/PgWireServer.java was adapted from the PgWireServer of
+org.replikativ/stratum, which is distributed under the Apache License 2.0.
+That file is the sole work of Christian Weilbach, who holds copyright in it
+and licenses this derivation under the PostgreSQL License. No Apache
+License 2.0 obligation carries over.
+
+pg-datahike contains no code copied from PostgreSQL. Source comments cite
+PostgreSQL files (`src/backend/...`) as a behavioral specification for
+wire-protocol and SQL semantics; the implementations are original.
+
+The integration suites under test/integration/ clone upstream driver
+repositories (pgjdbc, asyncpg, node-postgres) at test time. Those trees are
+git-ignored, are never distributed as part of pg-datahike, and remain under
+their own licenses.

@@ -568,4 +568,15 @@ Module inventory (`src/datahike/pg/`):
 
 Copyright © 2026 Christian Weilbach and contributors.
 
-Released under the Eclipse Public License 2.0. See `LICENSE`.
+Released under the [PostgreSQL License](LICENSE) — the same license as
+PostgreSQL itself. Embed it, fork it, ship it commercially and closed-source;
+no CLA is required to contribute (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+That covers pg-datahike's own code. As with PostgreSQL — whose shipped
+binaries link GPL-3 readline into `psql` and LGPL-2.1 libsystemd into the
+server — the assembled product includes copyleft components. Here that is
+[datahike](https://github.com/replikativ/datahike) and the storage stack
+beneath it, under the Eclipse Public License 1.0: file-level copyleft, so you
+can build proprietary software on top and only need to publish changes to
+those libraries' own files. `NOTICE` has the full breakdown for the
+standalone uberjar.

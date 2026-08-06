@@ -24,6 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * </ol>
  *
  * <p>Adapted from Stratum's PgWireServer for Datahike's SQL compatibility layer.
+ * Stratum is Apache-2.0, but that file is the sole work of this project's
+ * copyright holder, who licenses this derivation under the PostgreSQL License
+ * along with the rest of pg-datahike. See NOTICE.
  */
 public final class PgWireServer {
 
