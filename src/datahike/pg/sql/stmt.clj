@@ -791,6 +791,7 @@
 
 (declare translate-select)
 (declare extract-value)
+(declare eval-corr-scalar)
 (declare ^:dynamic *eval-update-db*)
 
 (defn- srf-const-eval
@@ -907,12 +908,59 @@
   [^net.sf.jsqlparser.statement.select.TableFunction tf db]
   (let [talias (when-let [a (.getAlias tf)]
                  (unquote-ident (str/trim (.getName ^Alias a))))
+        ;; `AS s(r)` renames the columns positionally. Without this the
+        ;; column kept the ALIAS name, so `SELECT r FROM
+        ;; generate_series(1,3) AS s(r)` resolved nothing — it read as
+        ;; NULL before the unknown-column check and as 42703 after.
+        ;; pgjdbc's TypeInfoCache introspection uses exactly this shape,
+        ;; which is why ResultSet.getObject on a jsonb column failed.
+        alias-cols (when-let [a (.getAlias tf)]
+                     (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                  (unquote-ident (.-name c)))
+                                (or (.getAliasColumns ^Alias a) []))))
         fname  (str/lower-case (or (.getName (.getFunction tf)) "tf"))
         ;; Storage namespace, not the user's alias — see
         ;; materialize-derived-select! for why they must differ.
         sub-name (str "__srf__" (or talias fname))]
-    (when-let [{:keys [aliases rows vtypes pg-types]} (materialize-table-function tf)]
-      (let [aliases (if (and talias (= 1 (count aliases))) [talias] aliases)
+    (when-let [{:keys [aliases rows vtypes pg-types]}
+               (materialize-table-function
+                tf
+                ;; Literals first; then fall back to evaluating a CONSTANT
+                ;; scalar expression. `srf-const-eval` alone only knew
+                ;; literals, so `generate_series(1, array_upper(
+                ;; current_schemas(false), 1))` -- the shape in pgjdbc's
+                ;; TypeInfoCache probe -- failed to materialise and its
+                ;; alias resolved to nothing, which is why
+                ;; ResultSet.getObject on any non-trivial type failed.
+                ;;
+                ;; A genuinely correlated argument (a Column, under
+                ;; LATERAL) does not evaluate standalone: the inner parse
+                ;; raises, eval-corr-scalar answers nil, and we return
+                ;; ::corr exactly as before. That keeps this a widening of
+                ;; the constant case rather than a change to the
+                ;; correlated one.
+                (fn [e]
+                  (let [v (srf-const-eval e)]
+                    (if (not= ::corr v)
+                      v
+                      (let [pf params/*parse-sql*]
+                        (if-let [r (and pf db
+                                        (eval-corr-scalar pf (str e) false
+                                                          (:schema db) db))]
+                          r
+                          ::corr))))))]
+      (let [_ (when (and alias-cols (> (count alias-cols) (count aliases)))
+                (throw (ex-info (str "table \"" (or talias "") "\" has " (count aliases)
+                                     " columns available but " (count alias-cols)
+                                     " columns specified")
+                                {:error :invalid-column-reference :sqlstate "42P10"})))
+            aliases (cond
+                      ;; Positional rename; PostgreSQL lets the list be
+                      ;; SHORTER than the column list, leaving the rest.
+                      alias-cols (vec (map-indexed (fn [i a] (or (nth alias-cols i nil) a))
+                                                   aliases))
+                      (and talias (= 1 (count aliases))) [talias]
+                      :else aliases)
             schema-tx (mapv (fn [a vt pt]
                               (cond-> {:db/ident       (keyword sub-name a)
                                        :db/valueType   vt
