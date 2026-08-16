@@ -218,3 +218,107 @@
     (.execute *handler* "CREATE TABLE av (id int PRIMARY KEY, v int)")
     (.execute *handler* "INSERT INTO av VALUES (1,1),(2,1),(3,1),(4,1),(5,1),(6,1),(7,1)")
     (is (= [["1.00000000000000000000"]] (rows "SELECT avg(v) FROM av")))))
+
+;; ---------------------------------------------------------------------------
+;; ORDER BY over aggregates
+;;
+;; Fixture: eng {10,20}, ops {30,40,50}.
+;; ---------------------------------------------------------------------------
+
+(deftest order-by-an-aggregate
+  (testing "written out in ORDER BY — refused with 0A000 even when the
+            aggregate WAS projected, because the ORDER BY translator saw
+            only an {:aggregate} marker and never asked whether the
+            projection had already emitted it"
+    (is (= [["eng" "2"] ["ops" "3"]]
+           (rows "SELECT dept, count(*) FROM g GROUP BY dept ORDER BY count(*)")))
+    (is (= [["ops" "3"] ["eng" "2"]]
+           (rows "SELECT dept, count(*) FROM g GROUP BY dept ORDER BY count(*) DESC")))
+    (is (= [["eng" "30"] ["ops" "120"]]
+           (rows "SELECT dept, sum(sal) FROM g GROUP BY dept ORDER BY sum(sal)"))))
+
+  (testing "and when it is NOT projected — PostgreSQL allows that too, so
+            the aggregate is synthesized and rides on :hidden-count"
+    (is (= [["eng"] ["ops"]]
+           (rows "SELECT dept FROM g GROUP BY dept ORDER BY count(*)")))
+    (is (= [["ops"] ["eng"]]
+           (rows "SELECT dept FROM g GROUP BY dept ORDER BY sum(sal) DESC"))))
+
+  (testing "by the aggregate's output alias — COUNT(*) emits the bare
+            `count` symbol, which the materialise-allowlist never
+            covered, so this became the where-clause [(count ?e) ?v] and
+            Datalog called clojure.core/count on an entity id:
+            \"count not supported on this type: Long\""
+    (is (= [["ops" "3"] ["eng" "2"]]
+           (rows "SELECT dept, count(*) c FROM g GROUP BY dept ORDER BY c DESC")))
+    (is (= [["eng" "2"] ["ops" "3"]]
+           (rows "SELECT dept, count(*) c FROM g GROUP BY dept ORDER BY c")))
+    (testing "SUM always worked — it emits the qualified filter-sum, which
+              WAS on the allowlist. That asymmetry is the bug."
+      (is (= [["eng" "30"] ["ops" "120"]]
+             (rows "SELECT dept, sum(sal) s FROM g GROUP BY dept ORDER BY s")))))
+
+  (testing "combined with HAVING and LIMIT"
+    (is (= [["eng" "2"] ["ops" "3"]]
+           (rows "SELECT dept, count(*) FROM g GROUP BY dept HAVING count(*) > 1 ORDER BY count(*)")))
+    (is (= [["ops" "3"]]
+           (rows "SELECT dept, count(*) FROM g GROUP BY dept ORDER BY count(*) DESC LIMIT 1")))))
+
+;; ---------------------------------------------------------------------------
+;; Select-list ordinals
+;; ---------------------------------------------------------------------------
+
+(deftest order-by-ordinal
+  (testing "a bare integer is a 1-based ordinal into the select list.
+            The simple-query path templates bare number literals to $N
+            for plan-cache stability, which turned `ORDER BY 2` into
+            `ORDER BY $1` — sorting every row by the same constant. The
+            sort was silently dropped."
+    (is (= [["eng" "10"] ["eng" "20"] ["ops" "30"] ["ops" "40"] ["ops" "50"]]
+           (rows "SELECT dept, sal FROM g ORDER BY 2")))
+    (is (= [["ops" "50"] ["ops" "40"] ["ops" "30"] ["eng" "20"] ["eng" "10"]]
+           (rows "SELECT dept, sal FROM g ORDER BY 2 DESC")))
+    (is (= [["eng" "10"] ["eng" "20"] ["ops" "30"] ["ops" "40"] ["ops" "50"]]
+           (rows "SELECT dept, sal FROM g ORDER BY 1, 2"))))
+
+  (testing "out of range"
+    (is (= "42P10" (state "SELECT dept, sal FROM g ORDER BY 3")))
+    (is (re-find #"ORDER BY position 3 is not in select list"
+                 (or (err "SELECT dept, sal FROM g ORDER BY 3") "")))
+    (is (= "42P10" (state "SELECT dept, sal FROM g ORDER BY 0"))))
+
+  (testing "values elsewhere in the statement must STILL be templated —
+            the fix has to be positional, not a blanket opt-out"
+    (is (= [["eng" "20"] ["ops" "30"] ["ops" "40"] ["ops" "50"]]
+           (rows "SELECT dept, sal FROM g WHERE sal > 15 ORDER BY 2")))
+    (is (= [["eng" "10"] ["eng" "20"] ["ops" "30"]]
+           (rows "SELECT dept, sal FROM g ORDER BY 2 LIMIT 3")))
+    (testing "and a number that is part of an expression is a VALUE, not
+              an ordinal"
+      (is (= [["eng" "10"] ["eng" "20"] ["ops" "30"] ["ops" "40"] ["ops" "50"]]
+             (rows "SELECT dept, sal FROM g ORDER BY sal + 2"))))))
+
+(deftest group-by-ordinal
+  (is (= {["eng" "2"] 1 ["ops" "3"] 1}
+         (bag "SELECT dept, count(*) FROM g GROUP BY 1")))
+  (is (= [["ops" "3"] ["eng" "2"]]
+         (rows "SELECT dept, count(*) FROM g GROUP BY 1 ORDER BY 2 DESC")))
+  (is (= [["eng" "30"] ["ops" "120"]]
+         (rows "SELECT dept, sum(sal) FROM g GROUP BY 1 ORDER BY 2")))
+  (testing "out of range, and an ordinal pointing AT an aggregate"
+    (is (= "42P10" (state "SELECT dept, sal FROM g GROUP BY 5")))
+    (is (= "42803" (state "SELECT count(*) FROM g GROUP BY 1")))
+    (is (re-find #"aggregate functions are not allowed in GROUP BY"
+                 (or (err "SELECT count(*) FROM g GROUP BY 1") "")))))
+
+(deftest non-integer-constant-is-rejected
+  (testing "only an INTEGER constant is an ordinal; PostgreSQL rejects
+            every other bare constant rather than sorting or grouping
+            every row by the same value"
+    (is (= "42601" (state "SELECT dept, sal FROM g ORDER BY 'abc'")))
+    (is (re-find #"non-integer constant in ORDER BY"
+                 (or (err "SELECT dept, sal FROM g ORDER BY 'abc'") "")))
+    (is (= "42601" (state "SELECT dept, sal FROM g ORDER BY NULL")))
+    (is (= "42601" (state "SELECT dept, sal FROM g ORDER BY 1.5")))
+    (is (= "42601" (state "SELECT dept FROM g GROUP BY 'abc'")))
+    (is (= "42601" (state "SELECT dept FROM g GROUP BY dept, 'x'")))))
