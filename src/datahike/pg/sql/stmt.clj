@@ -81,6 +81,15 @@
 
 (set! *warn-on-reflection* true)
 
+(defn- exact-schema-for-grouping?
+  "The 42803 check needs to know a column reference really is a column,
+   which is only knowable where the schema is exhaustive — the same
+   `:schema-flexibility :write` gate `ctx/validate-column!` uses, and
+   for the same reason. Fails permissive, including on a FilteredDB
+   (temporal queries) whose config lookup throws."
+  [db]
+  (= :write (try (:schema-flexibility (:config db)) (catch Throwable _ nil))))
+
 ;; Unqualified aliases so the copied body reads naturally — same
 ;; pattern used by ctx / ddl / catalog / expr.
 (def ^:private unquote-ident params/unquote-ident)
@@ -1837,18 +1846,48 @@
         ;; aliased expression. Translating such an item as a column
         ;; would report it as undefined.
         select-alias-names (into #{} (keep select-item-alias) (.getSelectItems select))
-        _ (when (seq group-by)
-            (doseq [g group-by]
-              (let [alias-only? (and (instance? Column g)
-                                     (nil? (.getTable ^Column g))
-                                     (contains? select-alias-names
-                                                (unquote-ident (.getColumnName ^Column g)))
-                                     ;; a real column of the table wins
-                                     (nil? (get schema
-                                                (keyword (or default-table "")
-                                                         (unquote-ident (.getColumnName ^Column g))))))]
-                (when-not alias-only?
-                  (expr/translate-expr ctx g)))))
+        ;; The translated grouping keys. Datalog derives grouping from
+        ;; the NON-AGGREGATE :find elements, so these have to reach
+        ;; :find or the GROUP BY has no effect at all — see
+        ;; `group-by-hidden` below, which is where they get added.
+        group-by-alias-only?
+        (fn [g] (and (instance? Column g)
+                     (nil? (.getTable ^Column g))
+                     (contains? select-alias-names
+                                (unquote-ident (.getColumnName ^Column g)))
+                     ;; a real column of the table wins
+                     (nil? (get schema
+                                (keyword (or default-table "")
+                                         (unquote-ident (.getColumnName ^Column g)))))))
+        ;; GROUP BY items naming an output-column alias. Their grouping
+        ;; key is the select item itself, which is already in :find, so
+        ;; they contribute no var — but the 42803 check still has to
+        ;; count them as grouped, which it does by resolving the alias
+        ;; through find-aliases once the select list is translated.
+        group-by-alias-names
+        (when (seq group-by)
+          (into #{}
+                (comp (filter group-by-alias-only?)
+                      (map #(unquote-ident (.getColumnName ^Column %))))
+                group-by))
+        group-by-vars
+        (when (seq group-by)
+          (vec
+           (keep (fn [g]
+                   (when-not (group-by-alias-only? g)
+                     ;; A bare column translates to its logic var, which
+                     ;; col-var! caches — so a column that is ALSO
+                     ;; projected yields the same symbol here and in
+                     ;; :find, and is not double-counted. A compound
+                     ;; expression (`GROUP BY sal / 10`) translates to a
+                     ;; form, which :find cannot hold, so bind it to a
+                     ;; var first.
+                     (let [t (expr/translate-expr ctx g)]
+                       (cond
+                         (symbol? t) t
+                         (seq? t)    (ctx/materialize-arg! ctx t)
+                         :else       nil))))
+                 group-by)))
 
         ;; HAVING clause
         having-expr (.getHaving select)
@@ -3006,6 +3045,64 @@
                                           (instance? IsNullExpression e)    (walk (.getLeftExpression ^IsNullExpression e)))))]
                            (walk having-expr)
                            @found))
+        ;; PostgreSQL rejects a select item that is neither aggregated
+        ;; nor grouped (42803). Datalog has no such rule — it groups by
+        ;; whatever non-aggregate :find elements it is given — so
+        ;; `SELECT sal, count(*) FROM g GROUP BY dept` quietly returned
+        ;; five ungrouped rows instead of erroring, which is a wrong
+        ;; answer wearing the right shape.
+        ;;
+        ;; PostgreSQL licenses an ungrouped column when the table's
+        ;; PRIMARY KEY is a subset of the grouping columns, because the
+        ;; grouping is then a no-op for that table
+        ;; (check_functional_grouping in pg_constraint.c) — that is what
+        ;; makes `SELECT * FROM g GROUP BY id` legal. A SQL PRIMARY KEY
+        ;; is stored as the namespace's `:db.unique/identity` attribute,
+        ;; so covering it is the same test here.
+        ;;
+        ;; Only plain column references are checked. A materialised
+        ;; expression has no entry in `:col->var`, so it is skipped
+        ;; rather than guessed at — PostgreSQL would reject more than we
+        ;; do, and under-reporting is the safe direction for a check
+        ;; whose whole risk is false positives.
+        _ (when (and (or (seq group-by) @has-aggregates?)
+                     (exact-schema-for-grouping? db))
+            (let [gvars (into (set group-by-vars)
+                              ;; an output alias named in GROUP BY groups
+                              ;; by its select-list element
+                              (keep (fn [[a el]]
+                                      (when (contains? group-by-alias-names a) el))
+                                    (map vector @find-aliases @find-elements)))
+                  var->col (persistent!
+                            (reduce (fn [m [k v]]
+                                      (if (and (vector? k) (keyword? (second k)))
+                                        (assoc! m v k)
+                                        m))
+                                    (transient {}) @(:col->var ctx)))
+                  ;; Namespaces whose identity attribute is a grouping
+                  ;; key: every column of those is licensed.
+                  pk-grouped (into #{}
+                                   (keep (fn [v]
+                                           (when-let [[_ attr] (var->col v)]
+                                             (when (= :db.unique/identity
+                                                      (:db/unique (get schema attr)))
+                                               (namespace attr)))))
+                                   group-by-vars)
+                  visible (take (count @find-aliases) @find-elements)]
+              (doseq [el visible]
+                (when (and (symbol? el) (not (contains? gvars el)))
+                  (when-let [[alias-key attr] (var->col el)]
+                    (when-not (contains? pk-grouped (namespace attr))
+                      ;; `name` is shadowed by a local holding the table
+                      ;; name throughout this let, hence the qualified calls.
+                      (throw (ex-info (str "column \"" (or alias-key (namespace attr))
+                                           "." (clojure.core/name attr)
+                                           "\" must appear in the GROUP BY clause "
+                                           "or be used in an aggregate function")
+                                      {:error :grouping-error
+                                       :sqlstate "42803"
+                                       :column (clojure.core/name attr)}))))))))
+
         ;; Append each HAVING-only aggregate as a hidden find element.
         ;; `find-aliases` gets a sentinel "__having_agg_<i>" so its
         ;; length keeps matching find-elements; the hidden-count below
@@ -3067,6 +3164,29 @@
                            ;; aligned with find-aliases.
                            elem))))
                count))
+        ;; GROUP BY keys that are not projected must still reach :find,
+        ;; because Datalog derives grouping from the non-aggregate :find
+        ;; elements — there is no separate grouping clause. Without this
+        ;; the GROUP BY was inert whenever its columns were not in the
+        ;; SELECT list, so `SELECT count(*) FROM g GROUP BY dept`
+        ;; collapsed all five rows into ONE group and answered 5 where
+        ;; PostgreSQL answers 2 and 3. `SELECT dept, count(*) … GROUP BY
+        ;; dept` only ever worked because projecting the key happened to
+        ;; put it in :find.
+        ;;
+        ;; They ride on :hidden-count like the HAVING-only aggregates
+        ;; above: appended at the end of :find, stripped by the wire
+        ;; layer, and deliberately not added to find-aliases, which
+        ;; tracks the VISIBLE projection.
+        group-by-hidden
+        (if (seq group-by-vars)
+          (let [existing (set @find-elements)]
+            (->> group-by-vars
+                 (remove #(contains? existing %))
+                 distinct
+                 (reduce (fn [n v] (swap! find-elements conj v) (inc n)) 0)))
+          0)
+
         ;; Snapshot where-clauses AFTER the HAVING-aggregate translation
         ;; has had a chance to add column bindings via col-var!. If we
         ;; snapshot before, the aggregate's input var (e.g. ?sales_amount)
@@ -3099,7 +3219,7 @@
                            (let [idx (.indexOf ^java.util.List extended-find v)]
                              (when (>= idx 0) [idx dir])))
                          order-by-spec))
-                hidden (+ (count missing) having-hidden)]
+                hidden (+ (count missing) having-hidden group-by-hidden)]
             (if has-nullable-order?
               ;; Nullable ORDER BY → server-side sort (don't emit :order-by to Datahike)
               [extended-find hidden nil ob]
@@ -3129,9 +3249,9 @@
                                   (conj find-elems-vec evar)
                                   find-elems-vec)
                   idx (if (neg? already) (dec (count extended-find)) already)
-                  hidden (+ (if (neg? already) 1 0) having-hidden)]
+                  hidden (+ (if (neg? already) 1 0) having-hidden group-by-hidden)]
               [extended-find hidden [idx :asc] nil])
-            [find-elems-vec having-hidden nil nil]))
+            [find-elems-vec (+ having-hidden group-by-hidden) nil nil]))
 
         in-params @(:in-params ctx)
         in-args @(:in-args ctx)
@@ -4238,6 +4358,20 @@
                        (when-let [cols (pgs/column-info schema raw-table)]
                          (mapv :name (rest cols)))))
         [table-name col-names] (canonical-relation schema raw-table raw-cols)
+        ;; PostgreSQL rejects a target column named twice. We built a
+        ;; map from the column list, so the last value silently won and
+        ;; `INSERT INTO t (id, id) VALUES (91, 92)` reported INSERT 0 1
+        ;; having stored 92 — a row the client never asked for. Checked
+        ;; only for an EXPLICIT column list; the implicit one is derived
+        ;; from the schema and cannot repeat.
+        _ (when (seq columns)
+            (when-let [dup (first (for [[c n] (frequencies col-names)
+                                        :when (> n 1)]
+                                    c))]
+              (throw (ex-info (str "column \"" dup "\" specified more than once")
+                              {:error :duplicate-column
+                               :sqlstate "42701"
+                               :column dup}))))
         ns table-name
         select (.getSelect insert)
         ;; ON CONFLICT handling
@@ -4975,6 +5109,22 @@
         ns table-name
         where-expr (.getWhere update)
         update-sets (.getUpdateSets update)
+        ;; Same hazard as the INSERT column list, different SQLSTATE:
+        ;; `UPDATE t SET sal = 1, sal = 2` built one assignment map and
+        ;; the last write won, reporting UPDATE 1 for a statement
+        ;; PostgreSQL refuses.
+        _ (when-let [dup (first (for [[c n] (frequencies
+                                             (mapcat (fn [^UpdateSet us]
+                                                       (map #(unquote-ident
+                                                              (.getColumnName ^Column %))
+                                                            (.getColumns us)))
+                                                     update-sets))
+                                      :when (> n 1)]
+                                  c))]
+            (throw (ex-info (str "multiple assignments to same column \"" dup "\"")
+                            {:error :syntax-error
+                             :sqlstate "42601"
+                             :column dup})))
         withs (.getWithItemsList update)
         from-values (extract-from-values update)]
     (if (and withs (seq withs)
