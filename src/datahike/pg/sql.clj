@@ -308,7 +308,8 @@
 ;; which lets us bind `*bound-params*` to per-row literals and reach
 ;; the inline-resolution branch in `expr/extract-value` — that's
 ;; what makes the lexical-template fast path correct (translate-insert
-;; never produces ParamRefs inside `:db.fn/call` closure captures).
+;; never hides ParamRefs from `substitute-params`: every `:db.fn/call`
+;; it emits takes its row maps as ARGS, not closure captures).
 ;;
 ;; Thread-safety: JSqlParser AST is read-only after parse for the
 ;; usages we have (all `.getXxx` / instance-of branches, no setters).
