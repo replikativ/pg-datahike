@@ -3782,14 +3782,23 @@
    read and write FK semantics symmetric. Falls through to the raw
    value when no target is resolvable (hint-only refs without a
    threaded db, or genuinely-unmapped refs)."
-  [val attr schema]
+  [val attr schema & [db]]
   (when (some? val)
     (let [vtype     (get-in schema [attr :db/valueType])
           elem-kw   (get-in schema [attr :pg/array-elem])
           num-scale (get-in schema [attr :pg/numeric-scale])
-          ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it keeps
-          ;; key order, whitespace and duplicate keys — so it must NOT be canonicalized.
-          jsonb?    (= "jsonb" (get-in schema [attr :pg/type]))]
+          ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it
+          ;; keeps key order, whitespace and duplicate keys — so it must NOT
+          ;; be canonicalized.
+          ;;
+          ;; `:pg/type` is an ident-entity fact, not a `:db/*` key, so it is
+          ;; absent from Datahike's schema map unless the caller enriched it
+          ;; first. Exactly one of the three callers did, so canonicalization
+          ;; silently did NOT happen for UPDATE or for a parameterised INSERT
+          ;; — i.e. for every client that is not psql. Absent metadata has to
+          ;; mean "ask", not "not jsonb".
+          jsonb?    (= "jsonb" (or (get-in schema [attr :pg/type])
+                                   (params/pg-type-of-attr db attr)))]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches

@@ -2651,8 +2651,13 @@
                                                               stmt/*eval-update-db* db]
                                                       (sql/eval-update-expr value-expr entity-map ns schema))
                                             resolved (resolve-param raw-val)
+                                            ;; `db` so coerce-insert-value can
+                                            ;; resolve :pg/type when the schema
+                                            ;; map does not carry it — without
+                                            ;; it every UPDATE to a jsonb column
+                                            ;; stored the text uncanonicalized.
                                             val (when (some? resolved)
-                                                  (#'sql/coerce-insert-value resolved attr schema))
+                                                  (#'sql/coerce-insert-value resolved attr schema db))
                                             old-val (get entity-map attr)]]
                                   (if (nil? val)
                                 ;; SET col = NULL → retract the attribute.
@@ -3347,7 +3352,7 @@
    CONFLICT upsert fn, the unique-check wrapper) precisely so the
    Execute-time passes can reach it, and those rows are the ones the
    transactor asserts."
-  [parsed schema]
+  [parsed schema & [db]]
   (if (and (= :insert (:type parsed)) (seq (:tx-data parsed)))
     (let [coerce-entity
           (fn [entry]
@@ -3362,7 +3367,7 @@
                    ;; a coerced `false`/`0`/empty is a real value.
                    ;; (if-let here would wrongly drop a boolean
                    ;; false, reading back as NULL.)
-                   :else (let [c (#'sql/coerce-insert-value v attr schema)]
+                   :else (let [c (#'sql/coerce-insert-value v attr schema db)]
                            (if (nil? c) m (assoc m attr c)))))
                {} entry)
               entry))
@@ -7082,8 +7087,11 @@
                                  ;; substitution so untyped text params
                                  ;; (e.g. node-postgres "270" → int column)
                                  ;; narrow to the column's :db/valueType.
+                                 ;; `db` lets coerce-insert-value resolve
+                                 ;; :pg/type; without it a parameterised INSERT
+                                 ;; into a jsonb column skipped canonicalization.
                                  (coerce-insert-tx-data
-                                  (resolve-param-refs cached bound) schema)
+                                  (resolve-param-refs cached bound) schema db)
                                  cached)}
                               ;; Simple-protocol plan stability: rewrite
                               ;; bare number literals to $N so every cache

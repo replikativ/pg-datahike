@@ -404,7 +404,7 @@
 ;; ---------------------------------------------------------------------------
 ;; PG OID inference
 
-(defn- pg-type-of-attr
+(defn pg-type-of-attr
   "Look up the :pg/type string attached to a schema ident entity.
    Datahike's (:schema db) only surfaces schema-governing attrs
    (:db/valueType, :db/cardinality, :db/unique) — custom attrs like
