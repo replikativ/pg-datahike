@@ -230,12 +230,12 @@
                                                           (:table-aliases ctx)
                                                           (:default-table ctx)
                                                           (:col-overrides ctx)
-                                                          (:derived-aliases ctx))
+                                                          (:derived-aliases ctx) (:ci-index ctx))
                       array-resolved (ctx/resolve-column ^Column array
                                                          (:table-aliases ctx)
                                                          (:default-table ctx)
                                                          (:col-overrides ctx)
-                                                         (:derived-aliases ctx))
+                                                         (:derived-aliases ctx) (:ci-index ctx))
                       bare-attr (fn [r] (if (vector? r) (nth r 2) r))
                       schema (:schema ctx)
                       m2m-attr (when-not (and (vector? array-resolved)
@@ -275,8 +275,8 @@
             (let [^EqualsTo eq expr
                   left (.getLeftExpression eq)
                   right (.getRightExpression eq)
-                  left-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
-                  right-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
+                  left-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+                  right-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
                   schema (:schema ctx)
                   hints  (:hints ctx)
                   ;; Pull target-unique fact for an attr: true when the
@@ -433,8 +433,8 @@
                 ;; emits plain patterns for right-side columns referenced
                 ;; here.
                   (let [l-var (expr/translate-expr ctx left)
-                        l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
-                        r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
+                        l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+                        r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
                       ;; Right-side attr is the one from THIS join's right
                       ;; table (== right-alias). The previous heuristic
                       ;; compared l-ns to (:default-table ctx) (the FROM
@@ -1514,7 +1514,13 @@
             (str/starts-with? t "information_schema")
             (str/includes? t ".")            ; schema-qualified catalog ref
             (contains? *cte-relations* t)
-            (some (fn [[k _]] (and (keyword? k) (= (namespace k) tname)))
+            ;; Case-insensitive: the reference has been folded, but a
+            ;; database created before folding — or a Datalog-native one —
+            ;; stores `:MixedCase/...`. This also fixes a latent
+            ;; inconsistency: `t` was lowercased above and then compared
+            ;; against the RAW `tname`.
+            (some (fn [[k _]] (and (keyword? k)
+                                   (= (str/lower-case (namespace k)) t)))
                   schema)))))
 
 (defn correlated-subquery-refs
@@ -1681,8 +1687,17 @@
           ;; Regular table
           :else
           (let [{tname :name talias :alias} (when (instance? Table from-item)
-                                              (ctx/extract-table-info ^Table from-item))]
-            [db schema tname talias]))
+                                              (ctx/extract-table-info ^Table from-item))
+                ;; The reference has been case-folded; storage may not be.
+                ;; A database created before folding holds `:MixedCase/*`,
+                ;; and a Datalog-native one holds whatever its attributes
+                ;; were named. Resolve the folded name back to the stored
+                ;; one — identity when they already agree, i.e. the common
+                ;; path.
+                stored (when tname
+                         (let [c (pgs/canonical-table (pgs/ci-index schema) tname)]
+                           (if (pgs/ambiguous? c) tname c)))]
+            [db schema (or stored tname) (or talias tname)]))
         ;; default-table is the alias key used for entity-var lookup.
         default-table (or alias name)
 
@@ -4168,6 +4183,29 @@
 
         :else nil))))
 
+(defn- canonical-relation
+  "Resolve a folded table name back to the name it is STORED under, and
+   each column name likewise.
+
+   References arrive case-folded (PostgreSQL folds unquoted identifiers),
+   but storage may not be: a database created before folding landed holds
+   `:MixedCase/ColA`, and a Datalog-native one holds whatever its
+   attributes were named. Identity when the two already agree, which is
+   every database created by a current pg-datahike.
+
+   The WRITE paths need this as much as the read paths do, and more
+   urgently: an INSERT that folded without resolving would assert
+   `:mixedcase/cola` alongside an existing `:MixedCase/ColA` and split
+   the table in two, with half the rows invisible to any single query and
+   no error at any point."
+  [schema tname col-names]
+  (let [ci (pgs/ci-index schema)
+        t (let [c (pgs/canonical-table ci tname)] (if (pgs/ambiguous? c) tname c))]
+    [t (mapv (fn [c]
+               (let [a (pgs/canonical-attr ci t c)]
+                 (if (and a (not (pgs/ambiguous? a))) (name a) c)))
+             col-names)]))
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
@@ -4175,14 +4213,15 @@
   [^Insert insert schema db]
   (let [schema (enrich-schema-with-pg-array-meta schema db)
         table (.getTable insert)
-        table-name (unquote-ident (.getName ^Table table))
-        ns table-name
+        raw-table (unquote-ident (.getName ^Table table))
         columns (.getColumns insert)
-        col-names (if (seq columns)
-                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
-                    (or (pgs/column-order-from-db db table-name)
-                        (when-let [cols (pgs/column-info schema table-name)]
-                          (mapv :name (rest cols)))))
+        raw-cols (if (seq columns)
+                   (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
+                   (or (pgs/column-order-from-db db raw-table)
+                       (when-let [cols (pgs/column-info schema raw-table)]
+                         (mapv :name (rest cols)))))
+        [table-name col-names] (canonical-relation schema raw-table raw-cols)
+        ns table-name
         select (.getSelect insert)
         ;; ON CONFLICT handling
         ^net.sf.jsqlparser.statement.insert.InsertConflictAction
@@ -4814,9 +4853,9 @@
 
 (defn translate-delete
   "Translate a DELETE statement to Datahike retraction query + tx-data."
-  [^Delete delete _schema]
+  [^Delete delete schema]
   (let [table (.getTable delete)
-        table-name (unquote-ident (.getName ^Table table))
+        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name
@@ -4904,7 +4943,7 @@
    and target table info for the server to execute."
   [^Update update schema db]
   (let [table (.getTable update)
-        table-name (unquote-ident (.getName ^Table table))
+        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name

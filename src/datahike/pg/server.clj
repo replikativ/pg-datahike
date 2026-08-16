@@ -2966,8 +2966,17 @@
    created table carries. More reliable than scanning for individual
    column attrs, which may have been ALTER TABLE-added separately."
   [db table-name]
-  (let [marker (pgs/row-marker-attr table-name)]
-    (boolean (get (dbi/-schema db) marker))))
+  (let [schema (dbi/-schema db)]
+    (or (boolean (get schema (pgs/row-marker-attr table-name)))
+        ;; Case-insensitively too: the name arrives folded, but a
+        ;; database created before folding stores `:MixedCase/*`. Without
+        ;; this, `CREATE TABLE MixedCase` against such a database sees no
+        ;; `:mixedcase/db-row-exists`, skips the 42P07, and mints a
+        ;; lowercase TWIN of a table that already exists.
+        (let [c (pgs/canonical-table (pgs/ci-index schema) table-name)]
+          (and (not (pgs/ambiguous? c))
+               (not= c table-name)
+               (boolean (get schema (pgs/row-marker-attr c))))))))
 
 (defn- sequence-exists?
   "True when a sequence entity with this name is already present in

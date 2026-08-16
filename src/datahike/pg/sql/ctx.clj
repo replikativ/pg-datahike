@@ -28,6 +28,7 @@
    them without re-exporting through the top-level sql ns."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params])
   (:import [net.sf.jsqlparser.expression Alias]
@@ -59,6 +60,8 @@
   ([^Column col table-aliases default-table col-overrides]
    (resolve-column col table-aliases default-table col-overrides nil))
   ([^Column col table-aliases default-table col-overrides derived-aliases]
+   (resolve-column col table-aliases default-table col-overrides derived-aliases nil))
+  ([^Column col table-aliases default-table col-overrides derived-aliases ci]
    (let [table-ref (.getTable col)
          table-alias (when table-ref (params/unquote-ident (.getName ^Table table-ref)))
          alias-key (or table-alias default-table)
@@ -74,7 +77,15 @@
        [:db-id alias-key]
 
        :else
+       ;; Exact storage name first, then the case-folded index, then the
+       ;; constructed keyword — which preserves NULL-for-unknown-column
+       ;; when nothing claims the name. Exact-before-folded is what makes
+       ;; a quoted identifier still select precisely: `"firstName"`
+       ;; hits `:person/firstName` directly, and `"firstname"` hits
+       ;; `:person/firstname` if that is what exists.
        (let [kw (or (get-in col-overrides [table-name col-name])
+                    (when-let [a (pgs/canonical-attr ci table-name col-name)]
+                      (when-not (pgs/ambiguous? a) a))
                     (keyword table-name col-name))]
          (if (not= alias-key table-name)
            [:aliased alias-key kw]
@@ -192,6 +203,12 @@
    :db            db
    :parse-sql     parse-sql
    :hints         (or hints {})
+   ;; Case-folding index: PostgreSQL folds unquoted identifiers, but
+   ;; storage may hold `:MixedCase/ColA` (a database created before
+   ;; folding) or `:person/firstName` (a Datalog-native one). This is
+   ;; what lets a folded reference reach either. Identity for a database
+   ;; whose names are already lower case, i.e. the common path.
+   :ci-index      (pgs/ci-index schema hints)
    ;; {ref-attr-ident → target-pk-attr-ident} — drives SQL FK
    ;; semantics: projecting a `:db.type/ref` column yields the
    ;; target's PK value (matching a real-PG INT FK column), not the

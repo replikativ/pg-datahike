@@ -46,14 +46,69 @@
 ;; ---------------------------------------------------------------------------
 ;; Identifier unquoting (local copy — also re-exported from datahike.pg.sql)
 
-(defn unquote-ident
-  "Strip SQL double-quote delimiters from an identifier.
-   PostgreSQL uses double quotes for case-sensitive or reserved-word
-   identifiers: '\"MyTable\"' → 'MyTable', 'my_table' → 'my_table'"
+(def ^:const max-identifier-bytes
+  "PostgreSQL's NAMEDATALEN - 1 (pg_config_manual.h). Identifiers longer
+   than this are truncated; PG also emits a NOTICE, which we don't."
+  63)
+
+(defn fold-identifier
+  "Apply PostgreSQL's case rule to an already-unquoted identifier:
+   fold ASCII A-Z to lower case, and truncate to 63 bytes.
+
+   ASCII-only, and deliberately not `.toLowerCase` of any flavour.
+   PostgreSQL's `downcase_truncate_identifier` (scansup.c) only maps
+   A-Z under standard encodings — verified against a UTF8 server, where
+   `CREATE TABLE ÄTest` yields the relation `Ätest`: the `T` folded, the
+   `Ä` did not. A Unicode-aware fold would produce `ätest` and miss it.
+
+   Being ASCII-only also sidesteps the locale trap that would otherwise
+   need guarding against: `clojure.string/lower-case` uses the default
+   locale, under which Turkish folds \"ID\" to \"ıd\" and every
+   identifier on the server silently mis-resolves.
+
+   Truncation is by BYTES, without splitting a character — PG uses
+   pg_mbcliplen for the same reason."
   [^String s]
-  (if (and s (str/starts-with? s "\"") (str/ends-with? s "\""))
-    (subs s 1 (dec (count s)))
-    s))
+  (when s
+    (let [n (.length s)
+          sb (StringBuilder. n)]
+      (dotimes [i n]
+        (let [c (.charAt s i)]
+          (.append sb (if (and (>= (int c) (int \A)) (<= (int c) (int \Z)))
+                        (char (+ (int c) 32))
+                        c))))
+      (let [folded (.toString sb)]
+        (if (<= (alength (.getBytes folded java.nio.charset.StandardCharsets/UTF_8))
+                max-identifier-bytes)
+          folded
+          (loop [end (min (.length folded) max-identifier-bytes)]
+            (let [cand (subs folded 0 end)]
+              (if (<= (alength (.getBytes cand java.nio.charset.StandardCharsets/UTF_8))
+                      max-identifier-bytes)
+                cand
+                (recur (dec end))))))))))
+
+(defn unquote-ident
+  "Normalise a SQL identifier to the form used as a Datahike name.
+
+   PostgreSQL folds UNQUOTED identifiers to lower case at parse time and
+   leaves quoted ones alone, so `CREATE TABLE MixedCase` names the table
+   `mixedcase` while `\"MixedCase\"` names it `MixedCase`. We used to
+   store whatever was typed, which meant `SELECT ... FROM mixedcase`
+   raised 42P01 for a table created as `MixedCase`, and — worse —
+   `pg_class.relname` reported `MixedCase`, so a client that folds the
+   name (as PostgreSQL does) and reflects it found nothing.
+
+   The fold has to happen HERE rather than in the callers: the
+   quoted/unquoted distinction lives only in the raw text JSqlParser
+   hands us, and is gone the moment the quotes are stripped.
+
+   A quoted identifier also un-escapes doubled quotes: `\"a\"\"b\"` is
+   the single name `a\"b`."
+  [^String s]
+  (if (and s (>= (count s) 2) (str/starts-with? s "\"") (str/ends-with? s "\""))
+    (str/replace (subs s 1 (dec (count s))) "\"\"" "\"")
+    (fold-identifier s)))
 
 ;; ---------------------------------------------------------------------------
 ;; Placeholder record + dynamic vars
