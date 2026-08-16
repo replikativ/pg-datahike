@@ -71,7 +71,8 @@
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.expression.operators.arithmetic
-            Addition Subtraction Multiplication Division Modulo Concat]
+            Addition Subtraction Multiplication Division Modulo Concat
+            BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem AllColumns ParenthesedSelect Join]))
 
@@ -1872,14 +1873,55 @@
    op-sym — aggregate compound evaluation is numeric-only and runs
    server-side after the query."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
-  (let [l (translate-expr ctx (.getLeftExpression expr))
+  (let [left-expr (.getLeftExpression expr)
+        ;; PG puts prefix `~` at the generic-operator precedence level,
+        ;; BELOW `+ - * / %` and `^`, so `~1 + 1` means `~(1 + 1)` = -3
+        ;; and `~2 * 3` means `~(2 * 3)` = -7. JSqlParser binds the `~`
+        ;; to its own operand instead, giving `(~1) + 1` = -1.
+        ;;
+        ;; Re-associating here rather than rebuilding the AST keeps it to
+        ;; a choice of which operand to feed the arithmetic and what to
+        ;; wrap the result in. Same-level operators (`& | << >>`) are
+        ;; left-associative in both grammars — `~1 & 3` is `(~1) & 3` in
+        ;; PG too — so they deliberately do NOT come through here.
+        not-prefix? (and (instance? SignedExpression left-expr)
+                         (= \~ (.getSign ^SignedExpression left-expr)))
+        l (translate-expr ctx (if not-prefix?
+                                (.getExpression ^SignedExpression left-expr)
+                                left-expr))
         r (translate-expr ctx (.getRightExpression expr))]
     (if (or (map? l) (map? r))
       ;; Compound aggregate expression: return descriptor for SELECT handler
       {:compound-agg true :op op-sym :left l :right r :expr expr}
-      (let [emit-op (get arith-op->null-safe op-sym op-sym)]
-        (list emit-op (if (seq? l) (ctx/materialize-arg! ctx l) l)
-              (if (seq? r) (ctx/materialize-arg! ctx r) r))))))
+      (let [emit-op (get arith-op->null-safe op-sym op-sym)
+            arith (list emit-op (if (seq? l) (ctx/materialize-arg! ctx l) l)
+                        (if (seq? r) (ctx/materialize-arg! ctx r) r))]
+        (if not-prefix?
+          (list 'datahike.pg.sql/sql-bit-not (ctx/materialize-arg! ctx arith))
+          arith)))))
+
+(defn translate-binary-fn
+  "Translate a binary expression into a call to `fn-sym`, constant-folding
+   through `f` when both operands are already values.
+
+   Used by the bitwise operators, whose operands may be either integers
+   or bit strings — the dispatch happens inside the runtime fn rather
+   than here, because the operand types generally aren't known until
+   execution."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr fn-sym f]
+  (let [l (translate-expr ctx (.getLeftExpression expr))
+        r (translate-expr ctx (.getRightExpression expr))
+        ;; Fold only when BOTH operands are already values. A column
+        ;; reference translates to a Datalog VAR (a symbol), which is
+        ;; neither a seq nor a map — folding on "not a seq" applied the
+        ;; runtime fn to the symbol itself, and the resulting clause
+        ;; matched nothing, so `SELECT flags & 6 FROM t` came back empty.
+        value? (fn [x] (or (number? x) (pg-bits/pg-bit? x)))]
+    (if (and (value? l) (value? r))
+      (f l r)
+      (list fn-sym
+            (if (seq? l) (ctx/materialize-arg! ctx l) l)
+            (if (seq? r) (ctx/materialize-arg! ctx r) r)))))
 
 (defn flatten-json-chain
   "Flatten a JsonExpression into {:base Expression :chain [[key op-str] ...]} pairs.
@@ -2190,18 +2232,54 @@
     (instance? SignedExpression expr)
     (let [^SignedExpression se expr
           sign (.getSign se)
-          inner (translate-expr ctx (.getExpression se))]
-      (if (= sign \-)
-        (if (number? inner) (- inner) (list '* -1 inner))
+          inner (translate-expr ctx (.getExpression se))
+          inner (if (seq? inner) (ctx/materialize-arg! ctx inner) inner)]
+      (case sign
+        \- (if (number? inner) (- inner) (list '* -1 inner))
+        ;; `~` — bitwise NOT, over integers and bit strings alike.
+        ;; Previously fell through to the identity branch below, so
+        ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,
+        ;; not an unsupported-feature error.
+        \~ (if (or (number? inner) (pg-bits/pg-bit? inner))
+             (fns/sql-bit-not inner)
+             (list 'datahike.pg.sql/sql-bit-not inner))
         inner))
 
     ;; Arithmetic — materialize sub-expression operands to ensure Datahike
     ;; evaluates flat function bindings (no nested lists like (+ ?a (* ?b ?c)))
+    ;;
+    ;; A leading `~` is re-associated inside translate-binary-arith —
+    ;; PG's prefix `~` binds looser than these operators. See there.
     (instance? Addition expr) (translate-binary-arith ctx expr '+)
     (instance? Subtraction expr) (translate-binary-arith ctx expr '-)
     (instance? Multiplication expr) (translate-binary-arith ctx expr '*)
     (instance? Division expr) (translate-binary-arith ctx expr '/)
     (instance? Modulo expr) (translate-binary-arith ctx expr 'rem)
+
+    ;; --- Bitwise operators ----------------------------------------------
+    ;; `&` `|` `<<` `>>` over integers and bit strings. JSqlParser's
+    ;; precedence for these already matches PG's — one shared level,
+    ;; left-associative, BELOW `+`/`-` — which is what makes
+    ;; `4 | 3 & 1` = 1 and `1 << 2 + 3` = 32 come out right.
+    ;;
+    ;; `^` is EXPONENTIATION in PG, not xor (PG spells xor `#`), despite
+    ;; JSqlParser naming the node BitwiseXor. Its precedence there is
+    ;; above `*` and left-associative, which JSqlParser also matches, so
+    ;; `2 ^ 3 ^ 3` = 512 and `2 ^ 3 * 2` = 16.
+    ;;
+    ;; `#` itself stays a syntax error: JSqlParser cannot lex it as an
+    ;; operator at all, and emulating it textually could not reproduce
+    ;; its precedence. See unsupported-operator-error in sql.clj.
+    (instance? BitwiseAnd expr)
+    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-and fns/sql-bit-and)
+    (instance? BitwiseOr expr)
+    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-or fns/sql-bit-or)
+    (instance? BitwiseLeftShift expr)
+    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-left fns/sql-bit-shift-left)
+    (instance? BitwiseRightShift expr)
+    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-right fns/sql-bit-shift-right)
+    (instance? BitwiseXor expr)
+    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-power fns/sql-power)
 
     ;; PG operators that overload on arrays: @> (contains), <@ (contained
     ;; by), && (overlap). JSqlParser uses JsonOperator for @> and <@,

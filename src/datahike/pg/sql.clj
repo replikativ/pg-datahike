@@ -100,6 +100,17 @@
 (def sql-*   fns/sql-*)
 (def sql-div fns/sql-div)
 (def sql-mod fns/sql-mod)
+
+;; Bitwise operators. Re-exported here because the translator emits
+;; fully-qualified `datahike.pg.sql/...` symbols that Datahike's
+;; resolve-fn looks up at execute time.
+(def sql-bit-and         fns/sql-bit-and)
+(def sql-bit-or          fns/sql-bit-or)
+(def sql-bit-xor         fns/sql-bit-xor)
+(def sql-bit-not         fns/sql-bit-not)
+(def sql-bit-shift-left  fns/sql-bit-shift-left)
+(def sql-bit-shift-right fns/sql-bit-shift-right)
+(def sql-power           fns/sql-power)
 (def null-safe fns/null-safe)
 
 ;; Context primitives moved to datahike.pg.sql.ctx. Re-export at old names

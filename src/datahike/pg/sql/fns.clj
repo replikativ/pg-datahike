@@ -604,7 +604,15 @@
   (let [d (double x)]
     (if (Double/isNaN d) d (finite-range (Math/exp d) d))))
 
-(defn- sql-power [base exponent]
+(defn sql-power
+  "PG's `dpow` — the implementation behind both `power(a,b)`/`pow(a,b)`
+   and the `^` OPERATOR (which is exponentiation in PG, not xor; PG
+   spells xor `#`). Public because the translator emits it for `^`.
+
+   Carries PG's domain errors rather than IEEE results: 0 to a negative
+   power and a negative base to a fractional power are 2201F, and an
+   overflow to infinity from finite inputs is 22003."
+  [base exponent]
   (let [b (double base)
         e (double exponent)]
     (cond
@@ -762,6 +770,52 @@
   "SQL OCTET_LENGTH. For a bit string PG reports ceil(bits / 8)."
   [v]
   (if (pg-bits/pg-bit? v) (pg-bits/octet-length v) (count v)))
+
+;; ---------------------------------------------------------------------------
+;; Bitwise operators — `&` `|` `~` `<<` `>>`, over integers and bit strings.
+;;
+;; PG has no cross-type integer forms (`int8 << int8` is actually an error
+;; there, because the shift RHS is always int4 and int8→int4 is
+;; assignment-only); we store every integer as int8 and compute on longs,
+;; which is the int8 row of PG's operator table.
+;;
+;; Shift semantics follow PG's, which are just C's: `>>` is arithmetic
+;; (sign-propagating), and the shift distance is masked to the word width
+;; rather than saturating. Clojure's bit-shift-* on longs already do both.
+;; ---------------------------------------------------------------------------
+
+(defn- bit-dispatch
+  "Apply `bitf` for bit-string operands, `intf` for integers."
+  [bitf intf a b]
+  (if (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b))
+    (bitf a b)
+    (intf (long a) (long b))))
+
+(defn sql-bit-and [a b] (bit-dispatch pg-bits/and-bits bit-and a b))
+(defn sql-bit-or  [a b] (bit-dispatch pg-bits/or-bits  bit-or  a b))
+(defn sql-bit-xor [a b] (bit-dispatch pg-bits/xor-bits bit-xor a b))
+
+(defn sql-bit-not
+  "`~` — bitwise NOT."
+  [a]
+  (if (pg-bits/pg-bit? a) (pg-bits/not-bits a) (bit-not (long a))))
+
+(defn sql-bit-shift-left
+  "`<<`. On a bit string the width is preserved and vacated positions are
+   zero-filled; on an integer it is a plain shift."
+  [a n]
+  (if (pg-bits/pg-bit? a)
+    (pg-bits/shift-bits a (long n))
+    (bit-shift-left (long a) (long n))))
+
+(defn sql-bit-shift-right
+  "`>>`. Arithmetic (sign-propagating) on integers, matching PG's bare C
+   `>>` on a signed operand; width-preserving and zero-filled on a bit
+   string."
+  [a n]
+  (if (pg-bits/pg-bit? a)
+    (pg-bits/shift-bits a (- (long n)))
+    (bit-shift-right (long a) (long n))))
 
 (defn sql-bit-length
   "SQL BIT_LENGTH — the length in BITS.

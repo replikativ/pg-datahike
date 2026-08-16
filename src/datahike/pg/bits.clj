@@ -117,6 +117,68 @@
             body))
       varying?))))
 
+(defn- same-size!
+  "PG refuses bitwise operations on bit strings of different widths
+   (varbit.c:1230) rather than padding — the width is part of the value,
+   so padding would silently change one operand."
+  [op ^PgBit a ^PgBit b]
+  (when-not (= (count (:bits a)) (count (:bits b)))
+    ;; 22026, not the 22001 the width-coercion path uses — PG separates
+    ;; "these two operands don't line up" from "this value is too long
+    ;; for its declared width".
+    (throw (errors/pg-error
+            :string-data-length-mismatch
+            {:detail (str "cannot " op " bit strings of different sizes")}))))
+
+(defn- zipwith-bits
+  "Combine two equal-width bit strings position by position.
+
+   The result is always `bit`, never `bit varying`: PG declares
+   `&`/`|`/`#`/`~`/`<<`/`>>` only on bit, with a bit result, and a varbit
+   operand reaches them through the implicit binary cast — so
+   `pg_typeof(varbit & varbit)` is `bit`. (`||` is the mirror image: it
+   is declared only on varbit and always returns varbit.)"
+  [f ^PgBit a ^PgBit b]
+  (make-bit (apply str (map (fn [x y] (if (f (= x \1) (= y \1)) \1 \0))
+                            (:bits a) (:bits b)))
+            false))
+
+(defn and-bits
+  "`&` — bitwise AND of two equal-width bit strings."
+  [a b] (same-size! "AND" a b) (zipwith-bits #(and %1 %2) a b))
+
+(defn or-bits
+  "`|` — bitwise OR of two equal-width bit strings."
+  [a b] (same-size! "OR" a b) (zipwith-bits #(or %1 %2) a b))
+
+(defn xor-bits
+  "`#` — bitwise XOR of two equal-width bit strings."
+  [a b] (same-size! "XOR" a b) (zipwith-bits not= a b))
+
+(defn not-bits
+  "`~` — bitwise NOT. Width is preserved; the result is `bit` (see
+   zipwith-bits on why never varbit)."
+  [^PgBit b]
+  (make-bit (apply str (map {\0 \1, \1 \0} (:bits b))) false))
+
+(defn shift-bits
+  "`<<` / `>>` on a bit string — shift WITHIN the existing width, zero
+   filling (varbit.c:1310). The result is the same width as the input,
+   so `B'1100' << 1` is `1000`, not `11000`. A shift at least as wide as
+   the value yields all zeros. A negative distance shifts the other way,
+   as PG's does."
+  [^PgBit b n]
+  (let [w (count (:bits b))
+        n (long n)]
+    (make-bit
+     (cond
+       (>= (Math/abs n) w) (apply str (repeat w \0))
+       (pos? n) (str (subs (:bits b) n) (apply str (repeat n \0)))
+       (neg? n) (let [n (- n)]
+                  (str (apply str (repeat n \0)) (subs (:bits b) 0 (- w n))))
+       :else (:bits b))
+     false)))
+
 (defn concat-bits
   "`||` on two bit strings — PG's `bitcat` (varbit.c:1180).
 

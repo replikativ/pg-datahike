@@ -31,7 +31,8 @@
             NullValue Parenthesis SignedExpression StringValue TimeKeyExpression
             TimestampValue TimeValue DateValue WhenClause]
            [net.sf.jsqlparser.expression.operators.arithmetic
-            Addition Concat Division Modulo Multiplication Subtraction]
+            Addition BitwiseAnd BitwiseLeftShift BitwiseOr BitwiseRightShift
+            BitwiseXor Concat Division Modulo Multiplication Subtraction]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.expression.operators.relational
@@ -552,6 +553,23 @@
       (instance? Multiplication expr) (binary-arith-oid expr env)
       (instance? Division expr)       types/oid-float8  ; PG: integer div is exact
       (instance? Modulo expr)         (binary-arith-oid expr env)
+
+      ;; --- Bitwise operators ---------------------------------------------
+      ;; `& | << >>` return the operand type: bit for bit operands (PG
+      ;; declares them only on bit, so even varbit operands yield bit),
+      ;; otherwise the promoted integer type.
+      (or (instance? BitwiseAnd expr) (instance? BitwiseOr expr)
+          (instance? BitwiseLeftShift expr) (instance? BitwiseRightShift expr))
+      (let [^BinaryExpression e expr
+            l (expr-oid (.getLeftExpression e) env)]
+        (if (or (= l types/oid-bit) (= l types/oid-varbit))
+          types/oid-bit
+          (binary-arith-oid e env)))
+
+      ;; `^` is exponentiation, not xor — float8 for integer operands,
+      ;; matching PG's preference for float8 over numeric when neither
+      ;; `^(float8,float8)` nor `^(numeric,numeric)` matches exactly.
+      (instance? BitwiseXor expr) types/oid-float8
 
       ;; --- Concat (||) ---------------------------------------------------
       ;; bit || bit is `bitcat`, whose result is always bit varying (the
