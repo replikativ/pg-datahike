@@ -570,6 +570,10 @@
       {:kind :nextval :seq-name (first (extract-fn-string-args rest-args))}
       (fn-name=? t1 "currval")
       {:kind :currval :seq-name (first (extract-fn-string-args rest-args))}
+      ;; lastval() takes no arguments — it reports the sequence most
+      ;; recently advanced by nextval in THIS session.
+      (fn-name=? t1 "lastval")
+      {:kind :lastval}
       (fn-name=? t1 "setval")
       {:kind :setval
        :seq-name (first (extract-fn-string-args rest-args))

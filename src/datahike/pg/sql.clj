@@ -229,7 +229,18 @@
           sorted-names (sort (remove #(contains? existing (pgs/row-marker-attr %))
                                      catalog-names))
           cache *catalog-cache*
-          cache-key [(hash existing) sorted-names]]
+          ;; The schema hash alone does not identify the catalog CONTENT
+          ;; for sequence-backed tables: `nextval` moves :__seq__/value
+          ;; and a second CREATE SEQUENCE adds a row, neither of which
+          ;; touches the schema (the :__seq__/* attrs are installed by
+          ;; the FIRST CREATE SEQUENCE and never change after). Without
+          ;; this component, `SELECT last_value FROM pg_sequences` re-run
+          ;; after a nextval was served from the cache and reported the
+          ;; pre-advance value. Only paid when such a table is actually
+          ;; being materialised.
+          seq-fingerprint (when (some catalog/sequence-backed-catalogs sorted-names)
+                            (hash (catalog/sequence-state db)))
+          cache-key [(hash existing) sorted-names seq-fingerprint]]
       (cond
         (empty? sorted-names) db
         :else

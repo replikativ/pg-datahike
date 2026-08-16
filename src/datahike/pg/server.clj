@@ -3468,6 +3468,7 @@
     :pg-keywords            {:names ["string_agg"]                 :oids [PgWireServer/OID_TEXT]}
     :nextval                {:names ["nextval"]                    :oids [PgWireServer/OID_INT8]}
     :currval                {:names ["currval"]                    :oids [PgWireServer/OID_INT8]}
+    :lastval                {:names ["lastval"]                    :oids [PgWireServer/OID_INT8]}
     :setval                 {:names ["setval"]                     :oids [PgWireServer/OID_INT8]}
     :set-config             {:names ["set_config"]                 :oids [PgWireServer/OID_TEXT]}
     :advisory-lock          {:names ["pg_advisory_lock"]           :oids [OID_VOID]}
@@ -4407,9 +4408,16 @@
 
 (defn- handle-nextval
   "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
-  [{:keys [conn]} parsed]
+  [{:keys [conn session-state]} parsed]
   (try
-    (single-row-result "nextval" PgWireServer/OID_INT8 (str (nextval! conn (:seq-name parsed))))
+    (let [v (nextval! conn (:seq-name parsed))]
+      ;; Remember which sequence this session last advanced so lastval()
+      ;; can answer. PG scopes lastval to the session for exactly this
+      ;; reason — it is the "what id did my INSERT just get" idiom, and
+      ;; a global answer would hand back another connection's value.
+      (when session-state
+        (swap! session-state assoc :last-sequence (:seq-name parsed)))
+      (single-row-result "nextval" PgWireServer/OID_INT8 (str v)))
     (catch Exception e
       ;; No prefix: every error reachable here is already PG-shaped
       ;; ("relation \"s\" does not exist", "nextval: reached maximum
@@ -4436,6 +4444,33 @@
       (single-row-result "currval" PgWireServer/OID_INT8 (str (or curr-val 0))))
     (catch Exception e
       (classified-error "currval error: " e))))
+
+(defn- handle-lastval
+  "SELECT lastval() — the value nextval most recently returned in this
+   session.
+
+   PG raises 55000 when nextval hasn't run yet on this connection, and
+   that error is the point of the function: it is how a client learns
+   its \"give me the id I just inserted\" call had nothing to report,
+   rather than silently receiving someone else's number. (currval is
+   laxer here for historical reasons — see handle-currval.)"
+  [{:keys [conn tx-state session-state]} _parsed]
+  (try
+    (let [seq-name (:last-sequence @session-state)]
+      (when-not seq-name
+        (throw (errors/pg-error :object-not-in-prerequisite-state
+                                {:detail "lastval is not yet defined in this session"})))
+      (let [lookup-db (if (:in-tx? @tx-state)
+                        (:speculative-db @tx-state)
+                        (d/db conn))
+            v (ffirst (d/q '{:find [?v]
+                             :where [[?e :__seq__/name ?n]
+                                     [?e :__seq__/value ?v]]
+                             :in [$ ?n]}
+                           lookup-db seq-name))]
+        (single-row-result "lastval" PgWireServer/OID_INT8 (str v))))
+    (catch Exception e
+      (classified-error "" e))))
 
 (defn- handle-setval
   "SELECT setval('seq_name', N[, is_called]) — force the sequence to N.
@@ -4702,6 +4737,7 @@
       ;; Sequence functions (classify supplies :seq-name / :new-value)
       :nextval           (handle-nextval ctx parsed)
       :currval           (handle-currval ctx parsed)
+      :lastval           (handle-lastval ctx parsed)
       :setval            (handle-setval ctx parsed)
 
       ;; datahike.* branching / versioning

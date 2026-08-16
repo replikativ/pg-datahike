@@ -777,6 +777,61 @@
         {:db spec-db2 :schema (:schema spec-db2)
          :name sub-name :alias sub-name :aliases aliases}))))
 
+(defn- sequence->virtual-table
+  "Materialise `FROM <sequence-name>` into a one-row virtual table.
+
+   PostgreSQL exposes every sequence as a relation with three columns —
+   last_value, log_cnt, is_called — and `SELECT * FROM myseq` is the
+   classic way to read a sequence's position. We store the last value
+   HANDED OUT, so a never-advanced sequence holds `start - increment`;
+   PG's equivalent encoding is last_value=start with is_called=false,
+   which is what this reconstructs.
+
+   log_cnt is PG's count of WAL-preallocated values — an internal
+   recovery detail with no analogue here, reported as 0.
+
+   Returns {:db :schema :name :alias} or nil when `tbl` is not a
+   sequence, in which case the caller treats it as an ordinary table."
+  [^Table tbl db]
+  (let [tname (unquote-ident (.getName tbl))
+        talias (when-let [a (.getAlias tbl)]
+                 (unquote-ident (str/trim (.getName ^Alias a))))
+        row (first (d/q '{:find [?v ?s ?i]
+                          :in [$ ?n]
+                          :where [[?e :__seq__/name ?n]
+                                  [?e :__seq__/value ?v]
+                                  [?e :__seq__/start ?s]
+                                  [?e :__seq__/increment ?i]]}
+                        db tname))]
+    (when row
+      (let [[value start increment] row
+            called? (not= value (- start increment))
+            ;; The row-marker attr is what anchors entity enumeration for
+            ;; a table whose columns are all read through get-else (the
+            ;; same idiom the pg_* catalog tables use). Without it the
+            ;; projection has nothing to iterate and the scan returns
+            ;; zero rows even though the row is there.
+            schema-tx [{:db/ident (keyword tname "last_value")
+                        :db/valueType :db.type/long
+                        :db/cardinality :db.cardinality/one}
+                       {:db/ident (keyword tname "log_cnt")
+                        :db/valueType :db.type/long
+                        :db/cardinality :db.cardinality/one}
+                       {:db/ident (keyword tname "is_called")
+                        :db/valueType :db.type/boolean
+                        :db/cardinality :db.cardinality/one}
+                       {:db/ident (pgs/row-marker-attr tname)
+                        :db/valueType :db.type/boolean
+                        :db/cardinality :db.cardinality/one}]
+            spec-db (d/db-with db schema-tx)
+            spec-db2 (d/db-with spec-db
+                                [{(keyword tname "last_value") (if called? value start)
+                                  (keyword tname "log_cnt") 0
+                                  (keyword tname "is_called") called?
+                                  (pgs/row-marker-attr tname) true}])]
+        {:db spec-db2 :schema (:schema spec-db2)
+         :name tname :alias (or talias tname)}))))
+
 (defn materialize-derived-select!
   "Given a ParenthesedSelect in FROM/JOIN position, return an enriched db
    that has a virtual table populated with the subquery's results.
@@ -1414,6 +1469,11 @@
   [^PlainSelect select schema & [db]]
   (let [;; FROM clause — may be a Table or a derived table (subquery)
         from-item (.getFromItem select)
+        ;; `FROM <sequence>` reads the sequence's position — nil for
+        ;; every ordinary table, so this only costs a lookup when the
+        ;; FROM item is a bare relation name (issue #26).
+        seq-vt (when (and db (instance? Table from-item))
+                 (sequence->virtual-table ^Table from-item db))
         ;; Handle derived tables: FROM (SELECT ...) AS sub, including
         ;; table-function forms like (SELECT * FROM unnest(ARRAY[…])
         ;; WITH ORDINALITY) AS sub.
@@ -1438,6 +1498,12 @@
                     ^net.sf.jsqlparser.statement.select.TableFunction from-item db)]
             [vdb vschema vname valias]
             [db schema nil nil])
+
+          ;; A sequence is a relation in PG: `SELECT * FROM myseq` reads
+          ;; its position. Materialise the three-column form so the rest
+          ;; of the query scans it like any other table (issue #26).
+          seq-vt
+          [(:db seq-vt) (:schema seq-vt) (:name seq-vt) (:alias seq-vt)]
 
           ;; Regular table
           :else
@@ -2946,6 +3012,11 @@
                                         ;; bare SRF in FROM materialised into
                                         ;; a virtual table (table-fn->virtual-table)
                                         (instance? net.sf.jsqlparser.statement.select.TableFunction from-item)
+                                        ;; `FROM <sequence>` — its row lives only
+                                        ;; in the speculative db built above, so
+                                        ;; Execute has to run against that db and
+                                        ;; not the caller's (issue #26).
+                                        seq-vt
                                         (seq derived-joins))
                                 db)
              ;; Server-side sort for nullable ORDER BY columns
