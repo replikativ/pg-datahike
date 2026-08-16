@@ -107,6 +107,23 @@ PostgreSQL has **no** `=`, `<>`, `<`, `>`, `@>`, `?` on `json` — the type
 has no btree/hash opclass at all. We accept them silently. PostgreSQL
 raises 42883, or 42704 for an index attempt.
 
+### `pg_dump` cannot run against us
+
+`pg_dump` fails immediately on `pg_catalog.pg_is_in_recovery()`, which
+is unimplemented. Our own dump command works and round-trips json
+verbatim and jsonb canonically, but `pg_dump` is the interop path most
+users reach for — and dump/restore fidelity is what makes any future
+storage-representation change reversible. Small function, high leverage.
+
+### A value-size cap surfaces as XX000 with a raw Clojure exception
+
+`:db/maxLength` / `:max-string-length` fire correctly but emerge as
+`XX000: INSERT error: clojure.lang.ExceptionInfo: String value for
+:cap/d exceeds max length 512 (was 2008) {:error :transact/max-length,
+...}` — internal ex-data and all. PostgreSQL's class for a size ceiling
+is 54000 `program_limit_exceeded`. Until this is mapped, the per-column
+cap is not usable by clients.
+
 ### Unknown functions leak internal errors
 
 `SELECT json_build_object('a',1)` →
