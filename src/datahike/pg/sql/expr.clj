@@ -2449,7 +2449,7 @@
           base-val (translate-expr ctx base)]
       (reduce
        (fn [current [key-val op-str]]
-         (let [op-fn  (if (= op-str "->>") jb/jsonb-get-text jb/jsonb-get)
+         (let [op-fn  (jb/op op-str)
                param  (symbol (str "?json-op" (swap! (:var-counter ctx) inc)))
                result (ctx/fresh-var! ctx)]
            (swap! (:in-params ctx) conj param)
@@ -3747,128 +3747,23 @@
                          :feature "multi-element ParenthesedExpressionList in WHERE"
                          :expr (str expr)}))))
 
-    ;; jsonb field access in WHERE: name->>'key' = 'value'
-    ;; JSqlParser folds the comparison into the JsonExpression's ident list
+    ;; A bare `d->'a'` standing alone as a WHERE predicate.
+    ;;
+    ;; This branch used to also carry ~110 lines that decomposed a
+    ;; comparison folded into the JsonExpression's ident list, on the
+    ;; premise recorded in its comment that "JSqlParser folds the
+    ;; comparison into the JsonExpression's ident list". jsqlparser 5.2
+    ;; does no such thing — `d->>'k' = 'x'` parses as an EqualsTo whose
+    ;; LEFT is the JsonExpression, so it reaches translate-expr through
+    ;; the comparison branch and never arrives here. Verified for `=`,
+    ;; `<>`, `>`, `>=`, `<`, `<=`, LIKE and IS NULL, and for chained
+    ;; access: the last ident of a JsonExpression is always a value or a
+    ;; nested JsonExpression, never a comparison. The guard could not
+    ;; fire, and the code behind it had a latent bug (it reused the LAST
+    ;; key for every step of a chain) that no test ever saw.
     (instance? JsonExpression expr)
-    (let [^JsonExpression je expr
-          idents (vec (.getIdents je))
-          operators (vec (.getOperators je))
-          last-ident (last idents)]
-      (if (or (instance? EqualsTo last-ident)
-              (instance? NotEqualsTo last-ident)
-              (instance? GreaterThan last-ident)
-              (instance? GreaterThanEquals last-ident)
-              (instance? MinorThan last-ident)
-              (instance? MinorThanEquals last-ident)
-              (instance? LikeExpression last-ident)
-              (instance? IsNullExpression last-ident))
-        ;; The comparison is folded into the json chain.
-        ;; Decompose: the left side of the comparison is the json key,
-        ;; the right side is the comparison value.
-        (let [comp-expr last-ident
-              ;; Build a synthetic JsonExpression for the left side (without the comparison)
-              ;; The json key is the left expression of the comparison
-              json-key (cond
-                         (instance? EqualsTo comp-expr) (.getLeftExpression ^EqualsTo comp-expr)
-                         (instance? NotEqualsTo comp-expr) (.getLeftExpression ^NotEqualsTo comp-expr)
-                         (instance? GreaterThan comp-expr) (.getLeftExpression ^GreaterThan comp-expr)
-                         (instance? GreaterThanEquals comp-expr) (.getLeftExpression ^GreaterThanEquals comp-expr)
-                         (instance? MinorThan comp-expr) (.getLeftExpression ^MinorThan comp-expr)
-                         (instance? MinorThanEquals comp-expr) (.getLeftExpression ^MinorThanEquals comp-expr)
-                         (instance? LikeExpression comp-expr) (.getLeftExpression ^LikeExpression comp-expr)
-                         (instance? IsNullExpression comp-expr) (.getLeftExpression ^IsNullExpression comp-expr))
-              ;; Extract the key string
-              key-str (cond
-                        (instance? StringValue json-key) (.getNotExcapedValue ^StringValue json-key)
-                        (instance? LongValue json-key) (.getValue ^LongValue json-key)
-                        :else (str json-key))
-              ;; Build the json access: translate base through all operators
-              base-val (translate-expr ctx (.getExpression je))
-              ;; Apply all json operators (there might be a chain before the comparison)
-              json-val (let [chain (map vector
-                                        (if (> (count idents) 1)
-                                          (conj (subvec idents 0 (dec (count idents))) json-key)
-                                          [json-key])
-                                        operators)]
-                         (reduce
-                          (fn [current [_ident op-str]]
-                            (let [op-fn (if (= op-str "->>") jb/jsonb-get-text jb/jsonb-get)
-                                  param (symbol (str "?json-w" (swap! (:var-counter ctx) inc)))
-                                  result (ctx/fresh-var! ctx)]
-                              (swap! (:in-params ctx) conj param)
-                              (swap! (:in-args ctx) conj op-fn)
-                              (swap! (:where-clauses ctx) conj [(list param current key-str) result])
-                              result))
-                          base-val
-                          chain))
-              ;; Now translate the comparison with the json-val as the left side
-              comp-right (cond
-                           (instance? EqualsTo comp-expr) (.getRightExpression ^EqualsTo comp-expr)
-                           (instance? NotEqualsTo comp-expr) (.getRightExpression ^NotEqualsTo comp-expr)
-                           (instance? GreaterThan comp-expr) (.getRightExpression ^GreaterThan comp-expr)
-                           (instance? GreaterThanEquals comp-expr) (.getRightExpression ^GreaterThanEquals comp-expr)
-                           (instance? MinorThan comp-expr) (.getRightExpression ^MinorThan comp-expr)
-                           (instance? MinorThanEquals comp-expr) (.getRightExpression ^MinorThanEquals comp-expr)
-                           (instance? LikeExpression comp-expr) (.getRightExpression ^LikeExpression comp-expr)
-                           :else nil)
-              right-val (when comp-right (translate-expr ctx comp-right))
-              right-val (when right-val
-                          (if (seq? right-val) (ctx/materialize-arg! ctx right-val) right-val))]
-          (cond
-            (instance? EqualsTo comp-expr)
-            [[(list '= json-val right-val)]]
-            (instance? NotEqualsTo comp-expr)
-            [[(list 'not= json-val right-val)]]
-            (instance? GreaterThan comp-expr)
-            [[(list '> json-val right-val)]]
-            (instance? GreaterThanEquals comp-expr)
-            [[(list '>= json-val right-val)]]
-            (instance? MinorThan comp-expr)
-            [[(list '< json-val right-val)]]
-            (instance? MinorThanEquals comp-expr)
-            [[(list '<= json-val right-val)]]
-            (instance? LikeExpression comp-expr)
-            ;; Build LIKE regex using the extracted json-val as subject
-            (let [^LikeExpression le comp-expr
-                  not-like? (.isNot le)
-                  case-insensitive? (.isCaseInsensitive le)
-                  pattern (translate-expr ctx (.getRightExpression le))
-                  ^Character escape-char (let [esc (.getEscape le)]
-                                           (if (and esc (not (str/blank? (str esc))))
-                                             (Character/valueOf (char (first (str esc))))
-                                             (Character/valueOf \\)))
-                  pat-str (str pattern)
-                  regex-sb (StringBuilder. "^")
-                  _ (loop [i 0]
-                      (when (< i (count pat-str))
-                        (let [c (.charAt ^String pat-str i)]
-                          (if (= c (.charValue escape-char))
-                            (if (< (inc i) (count pat-str))
-                              (let [next-c (.charAt ^String pat-str (inc i))]
-                                (.append regex-sb (java.util.regex.Pattern/quote (str next-c)))
-                                (recur (+ i 2)))
-                              (recur (inc i)))
-                            (case c
-                              \% (do (.append regex-sb ".*") (recur (inc i)))
-                              \_ (do (.append regex-sb ".") (recur (inc i)))
-                              (do (.append regex-sb (java.util.regex.Pattern/quote (str c)))
-                                  (recur (inc i))))))))
-                  _ (.append regex-sb "$")
-                  regex-str (str regex-sb)
-                  regex-str (if case-insensitive? (str "(?i)" regex-str) regex-str)
-                  pred (list 're-find (re-pattern regex-str) json-val)]
-              (if not-like?
-                [[(list 'not [pred])]]
-                [[pred]]))
-            (instance? IsNullExpression comp-expr)
-            (if (.isNot ^IsNullExpression comp-expr)
-              [[(list 'some? json-val)]]
-              [[(list 'nil? json-val)]])
-            :else
-            [[(list '= json-val right-val)]]))
-        ;; Not a comparison — just translate as expression (shouldn't reach predicate)
-        (let [v (translate-expr ctx expr)]
-          [[(list 'identity v)]])))
+    (let [v (translate-expr ctx expr)]
+      [[(list 'identity v)]])
 
     ;; jsonb operators: @>, <@, ?, ?|, ?&
     (instance? JsonOperator expr)

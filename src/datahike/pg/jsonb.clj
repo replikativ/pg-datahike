@@ -232,6 +232,37 @@
 ;; Functions: builders
 ;; ============================================================================
 
+;; ============================================================================
+;; Operator registry
+;; ============================================================================
+
+(def op
+  "SQL operator string → the runtime fn implementing it.
+
+   THE registry. Every consumer — the SELECT emitter that lowers an
+   operator into a datalog function-call clause, and the UPDATE SET
+   interpreter that applies it eagerly to a materialised entity map —
+   looks the fn up here rather than carrying its own `if`. Those two
+   had already drifted: one wrapped the `->` result in
+   `serialize-jsonb` and the other did not, which is precisely the
+   divergence a shared table prevents. (That difference is preserved
+   at the UPDATE call site for now and resolved deliberately when the
+   operator semantics are fixed, not silently by this refactor.)
+
+   Adding an operator is one entry here plus, for the ones the parser
+   currently rejects, a narrowing of `sql/unsupported-op-chars`."
+  {"->"  jsonb-get
+   "->>" jsonb-get-text
+   "#>"  jsonb-get-path
+   "#>>" jsonb-get-path-text
+   "@>"  jsonb-contains?
+   "<@"  jsonb-contained?
+   "?"   jsonb-exists?
+   "?|"  jsonb-exists-any?
+   "?&"  jsonb-exists-all?
+   "||"  jsonb-concat
+   "-"   jsonb-delete-key})
+
 (defn jsonb-build-object
   "PostgreSQL jsonb_build_object(k1, v1, k2, v2, ...): build jsonb from pairs."
   [& args]
@@ -364,11 +395,6 @@
 ;; These are used as reduce functions in the SQL translator's aggregate handling
 ;; ============================================================================
 
-(defn jsonb-object-agg-step
-  "Accumulator step for jsonb_object_agg(key, value)."
-  [acc k v]
-  (assoc (or acc {}) (str k) v))
-
 ;; ============================================================================
 ;; Functions: misc
 ;; ============================================================================
@@ -391,13 +417,3 @@
 ;; Wire protocol: formatting jsonb for transport
 ;; ============================================================================
 
-(defn format-jsonb-value
-  "Format a jsonb Clojure value for PgWire text protocol transport.
-   Returns a JSON string."
-  [v]
-  (when (some? v)
-    (if (string? v)
-      ;; Already a string — might be a raw scalar
-      (try (json/read-value v mapper) v
-           (catch Exception _ (json/write-value-as-string v)))
-      (json/write-value-as-string v))))

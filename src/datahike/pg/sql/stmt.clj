@@ -4260,9 +4260,12 @@
           base-val (eval-update-expr base entity-map ns-str schema)]
       (reduce
        (fn [current [key-val op-str]]
-         (if (= op-str "->>")
-           (jb/jsonb-get-text current key-val)
-           (jb/serialize-jsonb (jb/jsonb-get current key-val))))
+         (let [r ((jb/op op-str) current key-val)]
+           ;; `->` is serialised here and NOT in the SELECT emitter. That
+           ;; divergence predates the shared registry; it is preserved
+           ;; deliberately so this refactor stays behaviour-preserving,
+           ;; and is resolved when the operator semantics are fixed.
+           (if (= op-str "->>") r (jb/serialize-jsonb r))))
        base-val
        chain))
 

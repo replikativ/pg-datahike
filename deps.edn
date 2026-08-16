@@ -4,7 +4,13 @@
  {org.clojure/clojure               {:mvn/version "1.12.4"}
   org.replikativ/datahike           {:mvn/version "0.8.1770"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
-  com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}}
+  com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}
+  ;; JSON codec for the json/jsonb types. Declared rather than inherited
+  ;; through datahike: it decides the CANONICAL FORM of stored jsonb, so
+  ;; letting transitive resolution pick the version means a datahike bump
+  ;; can silently change bytes already on disk. (jackson-core is contested
+  ;; in this tree — transit-java asks for 2.8.7 and loses to jsonista's.)
+  metosin/jsonista                  {:mvn/version "0.3.14"}}
 
  :aliases
  {;; Prep task: compile Java sources before Clojure can load them.
