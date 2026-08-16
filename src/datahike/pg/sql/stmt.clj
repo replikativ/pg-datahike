@@ -81,6 +81,21 @@
 
 (set! *warn-on-reflection* true)
 
+(defn- bare-non-integer-constant?
+  "A constant in ORDER BY / GROUP BY that is not an integer. PostgreSQL
+   reads a bare INTEGER constant there as a select-list ordinal and
+   rejects every other bare constant with 42601 rather than sorting or
+   grouping every row by the same value — see the `!IsA(&aconst->val,
+   Integer)` branch of findTargetlistEntrySQL92. A compound expression
+   like `1+1` is not a bare constant and stays an ordinary expression."
+  [e]
+  (or (instance? StringValue e)
+      (instance? DoubleValue e)
+      (instance? NullValue e)
+      (instance? net.sf.jsqlparser.expression.DateValue e)
+      (instance? net.sf.jsqlparser.expression.TimestampValue e)
+      (and (instance? net.sf.jsqlparser.expression.BooleanValue e))))
+
 (defn- exact-schema-for-grouping?
   "The 42803 check needs to know a column reference really is a column,
    which is only knowable where the schema is exhaustive — the same
@@ -1870,11 +1885,27 @@
                 (comp (filter group-by-alias-only?)
                       (map #(unquote-ident (.getColumnName ^Column %))))
                 group-by))
+        ;; A bare integer constant in GROUP BY is a 1-based ordinal into
+        ;; the select list, same rule as ORDER BY. Like an alias, it
+        ;; names an item that is already projected, so it contributes no
+        ;; new :find element — only a grouping key, resolved once the
+        ;; select list is translated.
+        _ (when (seq group-by)
+            (when (some bare-non-integer-constant? group-by)
+              (throw (ex-info "non-integer constant in GROUP BY"
+                              {:error :syntax-error
+                               :sqlstate "42601"}))))
+        group-by-ordinals
+        (when (seq group-by)
+          (into #{} (comp (filter #(instance? LongValue %))
+                          (map #(.getValue ^LongValue %)))
+                group-by))
         group-by-vars
         (when (seq group-by)
           (vec
            (keep (fn [g]
-                   (when-not (group-by-alias-only? g)
+                   (when-not (or (group-by-alias-only? g)
+                                 (instance? LongValue g))
                      ;; A bare column translates to its logic var, which
                      ;; col-var! caches — so a column that is ALSO
                      ;; projected yields the same symbol here and in
@@ -2509,6 +2540,43 @@
                      default-table)
             (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
 
+        ;; Translate a Function into the same `(agg-sym ?v)` shape
+        ;; the SELECT-item aggregate branch emits. Returns nil for
+        ;; shapes we don't synthesize (COUNT(*), CORR, ordered-set
+        ;; aggregates with WITHIN GROUP, …) — those are rare in a
+        ;; HAVING-only position and can be added if needed.
+        translate-agg
+        (fn [^Function f]
+          (let [fname (str/lower-case (.getName f))
+                params (.getParameters f)
+                is-count-star? (or (nil? params)
+                                   (zero? (count params))
+                                   (and (= 1 (count params))
+                                        (instance? AllColumns (first params))))]
+            (cond
+              (and (= fname "count") is-count-star? default-table)
+              (let [evar (ctx/entity-var! ctx default-table)
+                    table-name (get (:table-aliases ctx) default-table default-table)
+                    marker-attr (pgs/row-marker-attr table-name)]
+                (when (empty? @(:where-clauses ctx))
+                  (if (get schema marker-attr)
+                    (ctx/add-clause! ctx [evar marker-attr true])
+                    (when-let [cols (pgs/column-info schema table-name db)]
+                      (when-let [first-col (second cols)]
+                        (ctx/col-var! ctx (:attr first-col))))))
+                (list 'count evar))
+              (and params (= 1 (count params)) (not is-count-star?))
+              (let [agg-sym (get fns/sql-aggregate->datalog fname)
+                    v (expr/translate-expr ctx (first params))
+                    v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                    precision-variant (pick-precision-variant
+                                       fname
+                                       (oid/expr-oid (first params) agg-oid-env))]
+                (when agg-sym
+                  (when-not (= fname "count")
+                    (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
+                  (list (or precision-variant agg-sym) v))))))
+
         ;; ORDER BY — resolve aliases to find-elements before creating patterns
         order-by (.getOrderByElements select)
         order-by-spec (when (seq order-by)
@@ -2518,7 +2586,37 @@
                                   (let [expr (.getExpression obe)
                                         asc? (.isAsc obe)
                                         ;; Check if ORDER BY references a SELECT alias
-                                        v (if (instance? Column expr)
+                                        v (cond
+                                            ;; A bare integer constant is a 1-based
+                                            ;; ORDINAL into the select list, not a value
+                                            ;; to sort by (PostgreSQL's
+                                            ;; findTargetlistEntrySQL92 accepts only an
+                                            ;; integer A_Const here, so `ORDER BY 1+1`
+                                            ;; stays an expression). We translated it as
+                                            ;; a constant, which sorts by nothing — so
+                                            ;; `ORDER BY 2 DESC` silently returned rows
+                                            ;; in whatever order the scan produced.
+                                            ;; Only an INTEGER constant is an ordinal.
+                                            ;; PostgreSQL rejects any other bare
+                                            ;; constant outright rather than sorting
+                                            ;; every row by the same value
+                                            ;; (findTargetlistEntrySQL92's
+                                            ;; !IsA(Integer) branch).
+                                            (bare-non-integer-constant? expr)
+                                            (throw (ex-info "non-integer constant in ORDER BY"
+                                                            {:error :syntax-error
+                                                             :sqlstate "42601"}))
+
+                                            (instance? LongValue expr)
+                                            (let [pos (.getValue ^LongValue expr)]
+                                              (when (or (< pos 1) (> pos (count fa-snap)))
+                                                (throw (ex-info (str "ORDER BY position " pos
+                                                                     " is not in select list")
+                                                                {:error :invalid-column-reference
+                                                                 :sqlstate "42P10"})))
+                                              (nth fe-snap (dec pos)))
+
+                                            (instance? Column expr)
                                             (let [col-name (.getColumnName ^Column expr)
                                                   tbl (.getTable ^Column expr)
                                                   ;; Only alias-resolve unqualified column refs
@@ -2529,7 +2627,8 @@
                                               (if alias-idx
                                                 (nth fe-snap alias-idx)
                                                 (expr/translate-expr ctx expr)))
-                                            (expr/translate-expr ctx expr))
+
+                                            :else (expr/translate-expr ctx expr))
                                         ;; Materialize expression results for ORDER BY.
                                         ;; NOT aggregate forms — those are find-elements looked
                                         ;; up by index, not function bindings. Other qualified
@@ -2547,12 +2646,52 @@
                                         agg-syms (into (set (vals fns/sql-aggregate->datalog))
                                                        '#{datahike.pg.sql/filter-sum-numeric
                                                           datahike.pg.sql/filter-avg-numeric})
+                                        ;; A form that is ALREADY a find element is an
+                                        ;; aggregate the projection emitted, not a scalar
+                                        ;; expression to bind — materialising it turns
+                                        ;; `(count ?e)` into the where-clause
+                                        ;; `[(count ?e) ?v]`, where Datalog calls
+                                        ;; clojure.core/count on an entity id and fails
+                                        ;; with "count not supported on this type: Long".
+                                        ;; COUNT(*) emits the bare `count` symbol, which
+                                        ;; the agg-syms allowlist never covered, so
+                                        ;; `ORDER BY <count alias>` hit exactly that.
+                                        ;; Checking membership in :find is self-
+                                        ;; maintaining; the allowlist had already drifted
+                                        ;; twice.
+                                        in-find? (contains? (set fe-snap) v)
                                         v (if (and (seq? v)
+                                                   (not in-find?)
                                                    (not (contains? agg-syms (first v))))
                                             (ctx/materialize-arg! ctx v)
                                             v)
-                                        ;; Detect unsupported: aggregate in ORDER BY not in SELECT
-                                        _ (when (and (map? v) (:aggregate v))
+                                        ;; An aggregate written out in ORDER BY rather
+                                        ;; than referenced by alias. PostgreSQL allows it
+                                        ;; whether or not it is projected — `SELECT dept
+                                        ;; … GROUP BY dept ORDER BY count(*)` is ordinary
+                                        ;; SQL. If the projection already emitted this
+                                        ;; aggregate, order by THAT element; otherwise
+                                        ;; synthesize it and let the hidden-element pass
+                                        ;; below append it to :find and strip it again.
+                                        v (if (and (map? v) (:aggregate v)
+                                                   (instance? Function expr))
+                                            (let [f ^Function expr]
+                                              (if-let [idx (match-aggregate-index
+                                                            f fe-snap fa-snap)]
+                                                (nth fe-snap idx)
+                                                (when-let [elem (translate-agg f)]
+                                                  ;; :find now carries an aggregate, so
+                                                  ;; the passes that key on that must see
+                                                  ;; it — otherwise the default-order
+                                                  ;; branch adds the entity var to :find
+                                                  ;; and breaks the grouping.
+                                                  (reset! has-aggregates? true)
+                                                  elem)))
+                                            v)
+                                        ;; Still a marker: an aggregate shape
+                                        ;; translate-agg does not synthesize (CORR,
+                                        ;; ordered-set aggregates with WITHIN GROUP, …).
+                                        _ (when (or (nil? v) (and (map? v) (:aggregate v)))
                                             (throw (ex-info "ORDER BY on aggregate not in SELECT list"
                                                             {:error :feature-not-supported
                                                              :feature "ORDER BY on aggregate not in SELECT list"
@@ -3067,12 +3206,28 @@
         ;; whose whole risk is false positives.
         _ (when (and (or (seq group-by) @has-aggregates?)
                      (exact-schema-for-grouping? db))
-            (let [gvars (into (set group-by-vars)
+            (let [fe @find-elements
+                  fa @find-aliases
+                  ordinal-elems
+                  (mapv (fn [pos]
+                          (when (or (< pos 1) (> pos (count fa)))
+                            (throw (ex-info (str "GROUP BY position " pos
+                                                 " is not in select list")
+                                            {:error :invalid-column-reference
+                                             :sqlstate "42P10"})))
+                          (let [el (nth fe (dec pos))]
+                            (when (seq? el)
+                              (throw (ex-info "aggregate functions are not allowed in GROUP BY"
+                                              {:error :grouping-error
+                                               :sqlstate "42803"})))
+                            el))
+                        group-by-ordinals)
+                  gvars (into (into (set group-by-vars) ordinal-elems)
                               ;; an output alias named in GROUP BY groups
                               ;; by its select-list element
                               (keep (fn [[a el]]
                                       (when (contains? group-by-alias-names a) el))
-                                    (map vector @find-aliases @find-elements)))
+                                    (map vector fa fe)))
                   var->col (persistent!
                             (reduce (fn [m [k v]]
                                       (if (and (vector? k) (keyword? (second k)))
@@ -3111,43 +3266,7 @@
         (let [existing-agg-shapes
               (into #{}
                     (filter (fn [el] (and (seq? el) (symbol? (first el)))))
-                    @find-elements)
-              ;; Translate a Function into the same `(agg-sym ?v)` shape
-              ;; the SELECT-item aggregate branch emits. Returns nil for
-              ;; shapes we don't synthesize (COUNT(*), CORR, ordered-set
-              ;; aggregates with WITHIN GROUP, …) — those are rare in a
-              ;; HAVING-only position and can be added if needed.
-              translate-agg
-              (fn [^Function f]
-                (let [fname (str/lower-case (.getName f))
-                      params (.getParameters f)
-                      is-count-star? (or (nil? params)
-                                         (zero? (count params))
-                                         (and (= 1 (count params))
-                                              (instance? AllColumns (first params))))]
-                  (cond
-                    (and (= fname "count") is-count-star? default-table)
-                    (let [evar (ctx/entity-var! ctx default-table)
-                          table-name (get (:table-aliases ctx) default-table default-table)
-                          marker-attr (pgs/row-marker-attr table-name)]
-                      (when (empty? @(:where-clauses ctx))
-                        (if (get schema marker-attr)
-                          (ctx/add-clause! ctx [evar marker-attr true])
-                          (when-let [cols (pgs/column-info schema table-name db)]
-                            (when-let [first-col (second cols)]
-                              (ctx/col-var! ctx (:attr first-col))))))
-                      (list 'count evar))
-                    (and params (= 1 (count params)) (not is-count-star?))
-                    (let [agg-sym (get fns/sql-aggregate->datalog fname)
-                          v (expr/translate-expr ctx (first params))
-                          v (if (seq? v) (ctx/materialize-arg! ctx v) v)
-                          precision-variant (pick-precision-variant
-                                             fname
-                                             (oid/expr-oid (first params) agg-oid-env))]
-                      (when agg-sym
-                        (when-not (= fname "count")
-                          (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
-                        (list (or precision-variant agg-sym) v))))))]
+                    @find-elements)]
           (->> having-agg-fns
                (keep (fn [f]
                        (when-let [elem (translate-agg f)]
@@ -3209,8 +3328,11 @@
                                        order-by-spec))
         [find-elems-vec hidden-count order-by-flat sql-order-by]
         (if order-by-spec
-          (let [missing (filterv (fn [[v _dir]]
-                                   (and (symbol? v)
+          (let [;; seq? covers an aggregate form contributed by ORDER BY that
+                ;; the projection did not emit — it rides on :hidden-count
+                ;; exactly like a plain sort key.
+                missing (filterv (fn [[v _dir]]
+                                   (and (or (symbol? v) (seq? v))
                                         (neg? (.indexOf ^java.util.List find-elems-vec v))))
                                  order-by-spec)
                 extended-find (into find-elems-vec (map first missing))

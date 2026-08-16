@@ -563,7 +563,21 @@
         (let [sb (StringBuilder.)
               params (java.util.ArrayList.)
               n (count toks)]
-          (loop [i 0 last-end 0 skip-next-number? false fn-depth 0 paren-stack ()]
+          ;; A bare integer in ORDER BY / GROUP BY is a 1-based ORDINAL
+          ;; into the select list, not a value. Templating it to $N
+          ;; destroys that: `ORDER BY $1` sorts every row by the same
+          ;; constant, which is what PostgreSQL does with a real
+          ;; parameter there too — so `ORDER BY 2` silently returned
+          ;; rows in scan order and `ORDER BY 3` never raised 42P10.
+          ;; (GROUP BY escaped only because "group" is in
+          ;; no-template-idents and disqualifies the whole statement.)
+          ;;
+          ;; `ordinal-pos?` marks the positions where a number would BE
+          ;; the whole sort item: right after `BY`, and right after each
+          ;; comma in the list. Anywhere else — `ORDER BY sal + 2` — the
+          ;; number is an ordinary value and still templates.
+          (loop [i 0 last-end 0 skip-next-number? false fn-depth 0 paren-stack ()
+                 ordinal-pos? false in-sort-list? false]
             (if (= i n)
               (do (.append sb (subs sql last-end))
                   (when (pos? (.size params))
@@ -590,6 +604,7 @@
                 (cond
                   bail? nil
                   (and (= :number type) (not skip-next-number?)
+                       (not ordinal-pos?)
                        (zero? fn-depth)
                        ;; `1::bigint` — leave for the constant-fold cast
                        (not (= "::" (:text (nth toks (inc i) nil)))))
@@ -620,10 +635,26 @@
                     (.append sb (subs sql last-end start))
                     (.add params v)
                     (.append sb (str "$" (.size params)))
-                    (recur (inc i) (long end) false fn-depth' paren-stack'))
+                    (recur (inc i) (long end) false fn-depth' paren-stack'
+                           false in-sort-list?))
                   :else
-                  (recur (inc i) (long last-end)
-                         (and (= :ident type)
-                              (contains? no-param-after (str/lower-case text)))
-                         fn-depth' paren-stack'))))))))
+                  (let [low (when (= :ident type) (str/lower-case text))
+                        prev-low (let [pt (nth toks (dec i) nil)]
+                                   (when (= :ident (:type pt))
+                                     (str/lower-case (:text pt))))
+                        by? (and (= low "by") (contains? #{"order" "group"} prev-low))
+                        ;; LIMIT / OFFSET / FETCH end the sort list; so
+                        ;; does closing the parens of a subquery.
+                        ends? (or (contains? #{"limit" "offset" "fetch"} low)
+                                  (and (= :punct type) (= ")" text)))
+                        in-sort-list?' (cond by? true ends? false
+                                             :else in-sort-list?)]
+                    (recur (inc i) (long last-end)
+                           (and (= :ident type)
+                                (contains? no-param-after low))
+                           fn-depth' paren-stack'
+                           (or by?
+                               (and in-sort-list?'
+                                    (= :punct type) (= "," text)))
+                           in-sort-list?')))))))))
     (catch Throwable _ nil)))
