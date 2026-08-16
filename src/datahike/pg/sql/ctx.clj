@@ -336,84 +336,6 @@
                                     "referenced in WHERE; use HAVING or "
                                     "wrap the query in a subquery")})))))
 
-(def ^:dynamic *strict-columns*
-  "When true (the default), a column that resolves to no schema
-   attribute raises 42703 instead of reading as NULL.
-
-   Bound to false around translations where an absent attribute is
-   expected and NULL is the right answer — chiefly the catalog probes,
-   whose SELECT lists routinely name pg_catalog columns we don't
-   materialise and which must degrade rather than fail."
-  true)
-
-(defn- catalog-attr?
-  "True for the virtual pg_catalog / information_schema namespaces.
-
-   Their column sets are whatever we chose to materialise, and client
-   introspection queries legitimately ask for columns beyond that — the
-   empty-catalog machinery answers those as NULL on purpose. Applying
-   the strict check to them would turn every unimplemented catalog
-   column into a hard error for drivers that are only probing."
-  [attr]
-  (when-let [ns (namespace attr)]
-    (or (str/starts-with? ns "pg_")
-        (str/starts-with? ns "information_schema"))))
-
-(def ^:private row-marker-col
-  "Mirrors datahike.pg.schema/row-marker-col. Duplicated rather than
-   required: schema.clj sits above this namespace in the load order."
-  "db-row-exists")
-
-(defn- table-known?
-  "True when `table` has at least one attribute in `schema`.
-
-   Distinguishes 'unknown column of a known table' (42703) from
-   'unknown relation' — which is a different error, raised elsewhere,
-   and which also covers the relations we materialise speculatively:
-   an unmaterialised CTE or a derived table contributes NO attribute to
-   this schema, so it must not be reported as a column error.
-
-   Checks the row-existence marker first, which every pgwire CREATE
-   TABLE installs, and only falls back to scanning the schema for a
-   namespace match (tables created by transacting Datahike schema
-   directly have no marker)."
-  [schema table]
-  (boolean
-   (or (get schema (keyword table row-marker-col))
-       (some (fn [k] (and (keyword? k) (= table (namespace k)))) (keys schema)))))
-
-(defn validate-column!
-  "Raise 42703 when `attr` names a column that does not exist on a table
-   that does.
-
-   PostgreSQL rejects an unknown column at parse-analyze. We used to
-   translate it into a `get-else … :__null__` like any other column, so
-   `SELECT nosuchcol FROM t` returned a row of NULL and
-   `WHERE nosuchcol = 1` returned no rows — a typo in an application
-   read as data rather than as the error it is.
-
-   The test is whether the attribute is in the schema: this layer is
-   schema-on-write, so every column that exists has one. That makes the
-   check exact rather than heuristic, but it must run AFTER inheritance
-   resolution, since an INHERITS child legitimately resolves into its
-   parent's namespace.
-
-   Exempt: catalog namespaces (see catalog-attr?), derived-table and CTE
-   aliases, relations with no attributes at all (see table-known?), and
-   anything reached while *strict-columns* is rebound to false."
-  [ctx attr]
-  (when (and *strict-columns*
-             (keyword? attr)
-             (namespace attr)
-             (not (catalog-attr? attr))
-             (not (contains? (or (:derived-aliases ctx) #{}) (namespace attr)))
-             (not (get (:schema ctx) attr))
-             (table-known? (:schema ctx) (namespace attr)))
-    (throw (ex-info (str "column \"" (name attr) "\" does not exist")
-                    {:error :undefined-column
-                     :sqlstate "42703"
-                     :column (name attr)}))))
-
 (defn col-var!
   "Get or create the logic variable for an attribute.
 
@@ -457,10 +379,6 @@
     (and (vector? attr) (= :aliased (first attr)))
     (let [alias-key (nth attr 1)
           kw (nth attr 2)
-          ;; `FROM t alias` resolves through this branch, so the
-          ;; unknown-column check belongs here too — the namespace is
-          ;; still the real table name.
-          _ (validate-column! ctx kw)
           cache-key [alias-key kw]
           cvars (:col->var ctx)
           ref-target-entry (get (:ref-targets ctx) kw)
@@ -517,7 +435,6 @@
                                :else                       [nil false])]
       (or (get @cvars cache-key)
           (do
-            (validate-column! ctx resolved-attr)
             (check-agg-alias-collision! ctx resolved-attr)
             (cond
               ;; :db.cardinality/many ref → PgArray of target PKs.
@@ -585,13 +502,6 @@
           (and (vector? resolved) (= :aliased (first resolved)))
           [(nth resolved 1) (nth resolved 2)]
           :else nil)]
-    ;; The data-pattern paths (`col = $N`, `col = <literal>`, inner
-    ;; equijoins) bypass col-var! entirely, so the unknown-column check
-    ;; has to happen here too — otherwise `WHERE nosuchcol = 1` compiles
-    ;; to a pattern on a nonexistent attribute and silently matches
-    ;; nothing, which is the very case that makes a typo invisible.
-    (when (and alias-key (keyword? attr))
-      (validate-column! ctx attr))
     (when (and alias-key (keyword? attr)
                (nil? (get (:ref-targets ctx) attr))
                (not (contains? (:derived-aliases ctx) alias-key)))

@@ -3055,11 +3055,6 @@
 
             ;; For IS NULL / IS NOT NULL: use get-else to detect missing attributes.
             ;; This is consistent with our NULL synthesis approach.
-            ;;
-            ;; But "the attribute is absent from this row" and "there is
-            ;; no such column" are different things, and only the first
-            ;; is NULL — so the reference is validated first (42703),
-            ;; the same as every other column position.
             :else
             (let [;; Determine attr keyword and entity var
                   [alias-key kw]
@@ -3068,7 +3063,6 @@
                     [(nth resolved 1) (nth resolved 2)]
                     :else
                     [(namespace resolved) resolved])
-                  _ (ctx/validate-column! ctx kw)
                   evar (ctx/entity-var! ctx alias-key)
                   val-var (ctx/fresh-var! ctx)
                   ;; Ensure the entity var is bound by an anchor pattern.
