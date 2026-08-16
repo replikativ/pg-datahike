@@ -157,6 +157,37 @@ plausible wrong answer rather than an error.
 
 ---
 
+## Latent — not currently reachable, but will be
+
+### Cardinality-many BigDecimal attributes collapse scale-distinct values
+
+Writing `1.00M`, `1.0M`, `1.000M` to one `:db.cardinality/many`
+`:db.type/bigdec` attribute leaves a single value, `1.00M`. Datahike's
+`compare-value` bottoms out in `BigDecimal.compareTo`, which is
+scale-blind, so the later values are "already present".
+
+Cardinality-ONE is unaffected — verified with and without `:db/index`,
+the last write wins and its scale is preserved. SQL scalar columns are
+cardinality-one, so this does not affect jsonb or numeric columns today.
+It would affect any future multi-valued numeric column.
+
+### jsonb numeric limits are not enforced
+
+PostgreSQL's numeric caps display scale at 16383 and integer digits at
+131072, raising 22003 `value overflows numeric format` beyond that.
+`BigDecimal` is strictly more permissive, so a document PostgreSQL
+rejects would be accepted. Needs an explicit range check at parse time.
+
+### `BigDecimal.hashCode()` is scale-sensitive
+
+`(hash 1M)` and `(hash 1.00M)` agree (both 31); `.hashCode()` gives 31
+and 3102. Clojure's `=`/`hash` reproduce PostgreSQL's scale-insensitive
+numeric equality for free, but only through `clojure.core/hash` — any
+Java-interop collection (`HashMap`, `HashSet`) silently breaks the
+invariant.
+
+---
+
 ## Test-surface note
 
 Before this round the entire JSON surface was **6 assertions**, all
