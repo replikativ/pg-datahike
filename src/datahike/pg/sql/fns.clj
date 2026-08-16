@@ -121,22 +121,32 @@
         (long (Math/floor (/ (double (dec int-digits)) 4.0)))))))
 
 (defn- leading-dec-digit-chunk
-  "PG's NumericDigit base-10000 leading chunk: the value of the first
-   DEC_DIGITS=4 group of decimal digits, or 0 for zero. Used by PG's
-   select_div_scale to decide whether to subtract 1 from qweight when
-   the dividend's leading digit ≤ the divisor's."
+  "PG's leading NumericDigit: the base-10000 digit at position
+   `weight`, or 0 for zero. `select_div_scale` compares the dividend's
+   against the divisor's to decide whether the quotient lands one
+   digit below the naive estimate.
+
+   The base-10000 grouping is aligned to the DECIMAL POINT, not to the
+   leading significant digit, so the chunk is NOT simply the first four
+   digits. `120` is one digit of value 120 (not 1200); `12345` is
+   `[1, 2345]` with a leading digit of 1; `0.5` is `[5000]` at weight
+   -1. Left-aligning instead made AVG(int) pick a 20-digit scale where
+   PostgreSQL picks 16 whenever the sum's leading decimal digit
+   happened to be ≤ the count's — `sum 120 / count 3` compared 1200
+   against 3000 rather than 120 against 3.
+
+   The chunk therefore spans decimal exponents [4·weight, 4·weight+3],
+   which is `int-digits - 4·weight` digits taken from the leading
+   significant one, right-padded with zeros when the value has fewer."
   [^java.math.BigDecimal v]
   (if (zero? (.signum v))
     0
-    (let [unscaled (.unscaledValue (.abs v))
-          s (.toString unscaled)
-          ;; Take leading 1..4 digits, padded to 4 with trailing zeros
-          ;; so 550 → 5500 (one DEC_DIGITS chunk), comparable across
-          ;; magnitudes the way PG's first-digit comparison is.
-          digits-needed 4
-          chunk (if (>= (count s) digits-needed)
-                  (subs s 0 digits-needed)
-                  (str s (apply str (repeat (- digits-needed (count s)) \0))))]
+    (let [s (.toString (.unscaledValue (.abs v)))
+          int-digits (- (.precision v) (.scale v))
+          take-n (- int-digits (* 4 (decimal-weight v)))
+          chunk (if (>= (count s) take-n)
+                  (subs s 0 take-n)
+                  (str s (apply str (repeat (- take-n (count s)) \0))))]
       (Long/parseLong chunk))))
 
 (defn- select-div-scale

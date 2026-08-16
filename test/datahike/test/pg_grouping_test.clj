@@ -188,3 +188,33 @@
     (is (= "UPDATE 1"
            (.-commandTag ^PgWireServer$QueryResult
             (run "UPDATE g SET sal = 11, dept = 'z' WHERE id = 1"))))))
+
+;; ---------------------------------------------------------------------------
+;; AVG result scale — exposed by grouping, not caused by it
+;; ---------------------------------------------------------------------------
+
+(deftest avg-numeric-result-scale
+  ;; PostgreSQL picks a division result scale via select_div_scale
+  ;; (numeric.c): at least NUMERIC_MIN_SIG_DIGITS=16, minus 4 per unit of
+  ;; estimated quotient weight, with one extra digit of headroom when the
+  ;; dividend's leading digit is <= the divisor's.
+  ;;
+  ;; That comparison is on base-10000 NumericDigits, and the grouping is
+  ;; aligned to the DECIMAL POINT rather than to the leading significant
+  ;; digit: 120 is ONE digit of value 120, not 1200. We left-aligned, so
+  ;; `sum 120 / count 3` compared 1200 against 3000 instead of 120
+  ;; against 3, took the headroom branch, and produced 20 fractional
+  ;; digits where PostgreSQL produces 16.
+  ;;
+  ;; Only visible once GROUP BY worked: before that every group was one
+  ;; group, so few sums ever hit the mis-compare.
+  (testing "16 digits, the common case"
+    (is (= [["15.0000000000000000"]] (rows "SELECT avg(sal) FROM g WHERE dept = 'eng'")))
+    (is (= [["40.0000000000000000"]] (rows "SELECT avg(sal) FROM g WHERE dept = 'ops'")))
+    (is (= {["15.0000000000000000"] 1 ["40.0000000000000000"] 1}
+           (bag "SELECT avg(sal) FROM g GROUP BY dept"))))
+  (testing "20 digits where PostgreSQL genuinely produces them — the
+            headroom branch is real, it was just being taken too often"
+    (.execute *handler* "CREATE TABLE av (id int PRIMARY KEY, v int)")
+    (.execute *handler* "INSERT INTO av VALUES (1,1),(2,1),(3,1),(4,1),(5,1),(6,1),(7,1)")
+    (is (= [["1.00000000000000000000"]] (rows "SELECT avg(v) FROM av")))))
