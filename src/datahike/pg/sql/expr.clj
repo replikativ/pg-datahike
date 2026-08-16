@@ -3067,6 +3067,7 @@
                     ;; child-namespace attr is always absent, making the
                     ;; test true for every row.
                     [(namespace resolved) (ctx/attr-of ctx resolved)])
+                  _ (ctx/validate-column! ctx kw)
                   evar (ctx/entity-var! ctx alias-key)
                   val-var (ctx/fresh-var! ctx)
                   ;; Ensure the entity var is bound by an anchor pattern.

@@ -855,12 +855,21 @@
 ;; ============================================================================
 
 (deftest test-semantic-errors
-  (testing "Unknown column returns NULL values (EAV: missing attribute = NULL)"
-    ;; In EAV, a non-existent column maps to a non-existent attribute.
-    ;; get-else returns :__null__ sentinel which displays as NULL.
-    ;; This is consistent behavior, not an error.
+  (testing "Unknown column on a known table raises 42703"
+    ;; REVERSED from what this asserted originally. The old behaviour
+    ;; mapped a non-existent column to a non-existent attribute, which
+    ;; `get-else` reads as the `:__null__` sentinel — internally
+    ;; consistent, but it meant a typo'd column name returned a row of
+    ;; NULLs and `WHERE nosuchcol = 1` returned no rows, with nothing to
+    ;; distinguish "this column is empty" from "this column does not
+    ;; exist". PostgreSQL rejects it at parse-analyze.
+    ;;
+    ;; The permissiveness that IS wanted is untouched: a row lacking a
+    ;; value for a column the table HAS still reads as NULL, and under
+    ;; `:schema-flexibility :read` — where a real column need not appear
+    ;; in the schema at all — the check does not run.
     (let [r (.execute *handler* "SELECT nonexistent_column FROM person")]
-      (is (nil? (err r)))))
+      (is (= "column \"nonexistent_column\" does not exist" (err r)))))
 
   (testing "Type mismatch in INSERT"
     ;; Try inserting string into INTEGER column via DDL table

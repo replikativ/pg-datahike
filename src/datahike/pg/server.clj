@@ -882,7 +882,27 @@
                     (first (errors/classify-exception e))))
       (.printStackTrace e ^java.io.PrintWriter *err*)))
   (let [[sqlstate msg fields] (errors/classify-exception e)
-        ^PgWireServer$QueryResult result (error-result (str prefix msg) sqlstate)]
+        ;; Same rule parse-sql* applies to its own "SQL parse error: "
+        ;; prefix: an error that already carries a SQLSTATE or a
+        ;; registered category was raised deliberately and its message
+        ;; is already PG-shaped, so prefixing it only makes it diverge —
+        ;; `UPDATE error: column "c" does not exist` where PostgreSQL
+        ;; says `column "c" does not exist`. The prefix stays for
+        ;; unclassified failures, where naming the statement kind is the
+        ;; only context the client gets.
+        data (ex-data e)
+        structured? (or (:sqlstate data)
+                        (and (:error data)
+                             (contains? errors/error-categories (:error data)))
+                        ;; Datahike's own exceptions carry ex-data we did
+                        ;; not choose, but classify-exception rewrites the
+                        ;; ones it recognises into PG's exact wording (a
+                        ;; :transact/schema failure becomes `column "c" of
+                        ;; relation "t" does not exist`). Landing on a
+                        ;; specific SQLSTATE is the signal that happened.
+                        (not= "XX000" sqlstate))
+        ^PgWireServer$QueryResult result
+        (error-result (str (when-not structured? prefix) msg) sqlstate)]
     (if fields (.withErrorFields result fields) result)))
 
 (defn- rewrite-cursor-page

@@ -402,6 +402,119 @@
                                     "referenced in WHERE; use HAVING or "
                                     "wrap the query in a subquery")})))))
 
+(def ^:dynamic *strict-columns*
+  "Set to false to suppress the unknown-column check for one
+   translation. Bound by the catalog-probe path, where a client
+   legitimately asks for pg_catalog columns we don't materialise."
+  true)
+
+(defn- catalog-attr?
+  "The virtual pg_catalog / information_schema namespaces. Their column
+   sets are whatever we chose to materialise, and driver introspection
+   asks for more than that on purpose — the empty-catalog machinery
+   answers those as NULL. Applying the check here would turn every
+   unimplemented catalog column into a hard error for a driver that is
+   only probing."
+  [attr]
+  (when-let [ns (namespace attr)]
+    (or (str/starts-with? ns "pg_")
+        (str/starts-with? ns "information_schema"))))
+
+(defn- exact-schema?
+  "True when every column that exists necessarily HAS a schema entry, so
+   `absent from the schema` means `does not exist`.
+
+   That holds only under `:schema-flexibility :write`. Under `:read`,
+   Datahike stores a plain scalar attribute with no schema entry at all,
+   so the same test would reject columns that hold data — which is
+   exactly how an earlier attempt at this check broke a documented
+   configuration. Gate on the database's own setting rather than on an
+   assumption about it."
+  [ctx]
+  ;; Guarded: a temporal query runs against a FilteredDB, which does not
+  ;; support keyword lookup and throws. Failing to :write here means
+  ;; failing PERMISSIVE, which is the right direction for a check whose
+  ;; whole risk is false positives.
+  (= :write (try (:schema-flexibility (:config (:db ctx)))
+                 (catch Throwable _ nil))))
+
+(defn- relation-in-scope?
+  "True when `nm` names a relation this query has in scope.
+
+   PostgreSQL resolves a bare identifier that matches a visible table
+   alias as a WHOLE-ROW reference, so it must never be reported as an
+   unknown column. We don't implement whole-row values, but answering
+   NULL for one is much better than rejecting a statement PostgreSQL
+   accepts."
+  [ctx nm]
+  (boolean (or (contains? (:table-aliases ctx) nm)
+               (= nm (:default-table ctx)))))
+
+(defn validate-column!
+  "Raise 42703 when `attr` names a column that does not exist on a table
+   that does.
+
+   PostgreSQL rejects an unknown column at parse-analyze. Translating it
+   into the same `get-else … :__null__` binding a real column gets meant
+   `SELECT nosuchcol FROM t` returned a row of NULLs and
+   `WHERE nosuchcol = 1` returned no rows — a typo reading as data.
+
+   Every condition below is a case where the name might legitimately
+   resolve to something other than a column of this table, and each one
+   was learned from a false positive rather than reasoned out in
+   advance:
+
+     - `exact-schema?` — under :schema-flexibility :read a real column
+       need not be in the schema at all;
+     - `catalog-attr?` — driver introspection probes columns we don't
+       materialise;
+     - `:derived-aliases` — a derived table's columns live in a
+       speculative schema this ctx may not carry;
+     - `relation-in-scope?` — a bare name matching a table alias is a
+       whole-row reference in PostgreSQL;
+     - and the table itself must be known, since a namespace with no
+       attributes at all is an unknown or unmaterialised RELATION, which
+       is a different error raised elsewhere.
+
+   Must run AFTER inheritance resolution — an INHERITS child resolves
+   into its parent's namespace — which is why callers pass the output of
+   `attr-of` rather than the raw attribute."
+  [ctx attr]
+  (when (and *strict-columns*
+             (keyword? attr)
+             (namespace attr)
+             (exact-schema? ctx)
+             (not (catalog-attr? attr))
+             (not (contains? (or (:derived-aliases ctx) #{}) (namespace attr)))
+             (not (relation-in-scope? ctx (name attr)))
+             (not (get (:schema ctx) attr)))
+    (if (some (fn [[k _]] (and (keyword? k) (= (namespace k) (namespace attr))))
+              (:schema ctx))
+      ;; The table exists; this column of it does not.
+      ;;
+      ;; PostgreSQL renders a QUALIFIED reference unquoted and qualified
+      ;; (`column u.nosuchcol does not exist`) and a bare one quoted. We
+      ;; always emit the bare form: the only record of what the user
+      ;; typed is the Column node's `.getTable`, and by here the
+      ;; reference is a resolved attribute. `[:aliased alias …]` looks
+      ;; like the qualifier but only means "alias differs from table
+      ;; name", so using it mis-qualifies `SELECT nosuchcol FROM t u`.
+      ;; The SQLSTATE — what clients branch on — is right either way.
+      (throw (ex-info (str "column \"" (name attr) "\" does not exist")
+                      {:error :undefined-column
+                       :sqlstate "42703"
+                       :column (name attr)}))
+      ;; No attribute anywhere in that namespace, and it is not a
+      ;; relation this query has in scope: the QUALIFIER is the thing
+      ;; that does not resolve. `SELECT other.a FROM uc` bound
+      ;; `?other_eid` to nothing, so the query failed internally and
+      ;; the client got an empty result rather than an error.
+      (throw (ex-info (str "missing FROM-clause entry for table \""
+                           (namespace attr) "\"")
+                      {:error :undefined-table
+                       :sqlstate "42P01"
+                       :table (namespace attr)})))))
+
 (defn col-var!
   "Get or create the logic variable for an attribute.
 
@@ -445,6 +558,7 @@
     (and (vector? attr) (= :aliased (first attr)))
     (let [alias-key (nth attr 1)
           kw (attr-of ctx attr)
+          _ (validate-column! ctx kw)
           cache-key [alias-key kw]
           cvars (:col->var ctx)
           ref-target-entry (get (:ref-targets ctx) kw)
@@ -485,6 +599,7 @@
     :else
     (let [alias-key (namespace attr)
           resolved-attr (attr-of ctx attr)
+          _ (validate-column! ctx resolved-attr)
           cache-key [alias-key resolved-attr]
           cvars (:col->var ctx)
           ref-target-entry (get (:ref-targets ctx) resolved-attr)
@@ -559,6 +674,12 @@
           (keyword? resolved)                                   [(namespace resolved) (attr-of ctx resolved)]
           (and (vector? resolved) (= :aliased (first resolved))) [(nth resolved 1) (attr-of ctx resolved)]
           :else nil)]
+    ;; `col = $N` / `col = <literal>` / inner equijoins compile to an
+    ;; index-seekable data pattern and never reach col-var!, so the
+    ;; check has to happen here too — this is how `WHERE nosuchcol = 1`
+    ;; slipped through last time.
+    (when (and alias-key (keyword? attr))
+      (validate-column! ctx attr))
     (when (and alias-key (keyword? attr)
                (nil? (get (:ref-targets ctx) attr))
                (not (contains? (:derived-aliases ctx) alias-key)))

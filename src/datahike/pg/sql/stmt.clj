@@ -1830,8 +1830,25 @@
         group-by-element (.getGroupBy select)
         group-by (when group-by-element
                    (seq (.getGroupByExpressions ^GroupByElement group-by-element)))
+        ;; PostgreSQL resolves a bare name in GROUP BY as: a local FROM
+        ;; column first, then an OUTPUT-COLUMN ALIAS, then an outer
+        ;; column (parse_clause.c's findTargetlistEntrySQL92). So
+        ;; `SELECT a AS x FROM t GROUP BY x` is legal and groups by the
+        ;; aliased expression. Translating such an item as a column
+        ;; would report it as undefined.
+        select-alias-names (into #{} (keep select-item-alias) (.getSelectItems select))
         _ (when (seq group-by)
-            (doseq [g group-by] (expr/translate-expr ctx g)))
+            (doseq [g group-by]
+              (let [alias-only? (and (instance? Column g)
+                                     (nil? (.getTable ^Column g))
+                                     (contains? select-alias-names
+                                                (unquote-ident (.getColumnName ^Column g)))
+                                     ;; a real column of the table wins
+                                     (nil? (get schema
+                                                (keyword (or default-table "")
+                                                         (unquote-ident (.getColumnName ^Column g))))))]
+                (when-not alias-only?
+                  (expr/translate-expr ctx g)))))
 
         ;; HAVING clause
         having-expr (.getHaving select)
@@ -4253,6 +4270,15 @@
                            (.getSelect ^ParenthesedSelect select)
                            select)
             inner-parsed (params/*parse-sql* (str inner-select) schema db)
+            ;; parse-sql CATCHES: a source SELECT that failed to
+            ;; translate comes back as {:type :error}, not as a throw.
+            ;; Ignoring that carried a nil :query into d/q, whose
+            ;; "Query should be a vector or a map" then replaced the
+            ;; real diagnosis — so `INSERT INTO t (id) SELECT nope FROM
+            ;; t` reported XX000 instead of the inner 42703.
+            _ (when (= :error (:type inner-parsed))
+                (throw (ex-info (str (:message inner-parsed))
+                                {:sqlstate (or (:sqlstate inner-parsed) "XX000")})))
             inner-query (:query inner-parsed)
             inner-in-args (:in-args inner-parsed)
             q-fn d/q

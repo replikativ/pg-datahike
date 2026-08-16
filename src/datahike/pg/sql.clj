@@ -571,10 +571,25 @@
                [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
                [curr-db curr-schema deferred ns-map])
 
-             ;; Data-modifying CTE body or shape we don't recognise —
-             ;; skip rather than crash. The outer translate-* will
-             ;; surface a clearer error if the body's results are
-             ;; actually needed.
+             ;; A data-modifying WITH body (INSERT/UPDATE/DELETE/MERGE,
+             ;; with or without RETURNING). PostgreSQL runs these and
+             ;; feeds RETURNING to the outer query; we don't implement
+             ;; that. Skipping used to leave the CTE unmaterialised, so
+             ;; `SELECT id FROM i` quietly returned zero rows — and once
+             ;; unknown columns became an error it reported a missing
+             ;; FROM-clause entry, which points at the wrong thing. Say
+             ;; what is actually true.
+             (or (instance? Insert body)
+                 (instance? Update body)
+                 (instance? Delete body))
+             (throw (ex-info (str "WITH clause containing a data-modifying "
+                                  "statement is not supported")
+                             {:error :unsupported-feature
+                              :sqlstate "0A000"}))
+
+             ;; A shape we don't recognise — skip rather than crash. The
+             ;; outer translate-* will surface a clearer error if the
+             ;; body's results are actually needed.
              :else
              [curr-db curr-schema deferred ns-map])))
        [db schema [] {}]
@@ -1734,7 +1749,16 @@
                           (cacheable-sql-size? sql))
                  *parse-cache*)
          schema-key (when cache (hash schema))
-         cache-key (when cache [sql schema-key])
+         ;; Schema-flexibility is part of the key because it changes the
+         ;; TRANSLATION, not just the data: under :write an unknown
+         ;; column is 42703, under :read it reads as NULL (a real column
+         ;; need not be in the schema there). Two databases with
+         ;; identical schemas but different flexibility would otherwise
+         ;; share entries, and whichever parsed first would decide for
+         ;; both.
+         flex-key (when cache
+                    (try (:schema-flexibility (:config db)) (catch Throwable _ nil)))
+         cache-key (when cache [sql schema-key flex-key])
          cached (when cache (cache-get cache cache-key))]
      (cond
        cached cached

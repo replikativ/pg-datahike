@@ -119,26 +119,27 @@
     (is (= [["Carol" "Retail"] ["Dave" "Retail"]]
            (rows c "SELECT name, dept FROM emp WHERE dept = 'Retail' ORDER BY name")))))
 
-(deftest data-modifying-cte-skipped-cleanly
+(deftest data-modifying-cte-rejected-as-unsupported
   ;; JSqlParser's WithItem.getSelect() unsafely casts to ParenthesedSelect,
   ;; so naively walking a WITH list with a DML body throws a CCE that
   ;; surfaces as XX000. Our materialize-withs! uses .getParenthesedStatement
-  ;; instead and skips DML-bodied items rather than crashing. The CTE then
-  ;; isn't materialised, so the outer SELECT's reference to `i` resolves
-  ;; against an empty/missing virtual table — execute returns 0 rows
-  ;; instead of an internal error.
+  ;; instead.
+  ;;
+  ;; PostgreSQL RUNS a data-modifying CTE and feeds its RETURNING rows to
+  ;; the outer query. We don't implement that. Skipping the item silently
+  ;; left the CTE unmaterialised, so the outer SELECT returned zero rows
+  ;; and looked like a legitimately empty result — the same class of
+  ;; silent wrong answer as an unresolvable column. Say so instead.
   (with-open [c (jdbc)]
-    (let [r (rows c "WITH i AS (INSERT INTO emp(id, name, dept, salary)
-                                VALUES (99, 'Z', 'Eng', 1.0) RETURNING id)
-                     SELECT id FROM i")]
-      ;; Currently degrades to 0 rows; the alternative (a clean 0A000)
-      ;; would be a follow-up. The contract this test enforces is
-      ;; "doesn't crash with a Java type cast as the user-facing error."
-      (is (vector? r))
-      ;; Side-effect rule: the INSERT inside the CTE must not have run.
-      ;; If it had, emp would contain id=99. PG's data-modifying CTEs
-      ;; do execute the inner DML; pg-datahike does not yet.
-      (is (empty? (rows c "SELECT id FROM emp WHERE id = 99"))))))
+    (let [e (is (thrown? org.postgresql.util.PSQLException
+                         (rows c "WITH i AS (INSERT INTO emp(id, name, dept, salary)
+                                             VALUES (99, 'Z', 'Eng', 1.0) RETURNING id)
+                                  SELECT id FROM i")))]
+      (is (= "0A000" (.getSQLState ^org.postgresql.util.PSQLException e)))
+      (is (re-find #"data-modifying" (.getMessage ^org.postgresql.util.PSQLException e))))
+    ;; Side-effect rule: the INSERT inside the CTE must not have run.
+    (is (empty? (rows c "SELECT id FROM emp WHERE id = 99")))))
+
 
 ;; ---------------------------------------------------------------------------
 ;; WITH RECURSIVE in SELECT
