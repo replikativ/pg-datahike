@@ -3941,8 +3941,12 @@
             (cond-> {:type :insert
                      :row-refs row-refs
                      :tx-data
+                     ;; row-attrs travels as an explicit arg, not a closed-over
+                     ;; value — see the VALUES ON CONFLICT branch below for why
+                     ;; (substitute-params / resolve-nextvals! walk data only).
                      [[:db.fn/call
-                       (fn [txdb]
+                       (fn [txdb row-attrs]
+                         (reset! row-refs [])
                          (let [q d/q]
                            (vec
                             (mapcat
@@ -3961,7 +3965,8 @@
                                    (let [tempid (str (gensym "insert-select-"))]
                                      (swap! row-refs conj tempid)
                                      [(assoc attrs :db/id tempid)]))))
-                             row-attrs))))]]
+                             row-attrs))))
+                       row-attrs]]
                      :count (count row-attrs)
                      :table table-name :ns ns}
               returning (assoc :returning returning)))
@@ -4070,7 +4075,26 @@
                                     attr (keyword ns col-name)
                                     value-expr (first (.getValues us))]
                                 {:attr attr :col-name col-name :value-expr value-expr}))
-                            (.getUpdateSets conflict-action)))]
+                            (.getUpdateSets conflict-action)))
+                ;; DO UPDATE SET may itself carry placeholders
+                ;; (`SET title = $2`, `SET n = n + $3`). Those live in the
+                ;; JSqlParser value-expr, which eval-update-expr only
+                ;; resolves when `*bound-params*` is bound — so hoist the
+                ;; indices into a 0-based ParamRef vector that travels as a
+                ;; `:db.fn/call` ARG (reachable by substitute-params) and
+                ;; rebind it around the evaluation inside the tx-fn.
+                    set-params
+                    (let [idxs (into (sorted-set)
+                                     (mapcat #(params/ast-param-indices (:value-expr %)))
+                                     update-assignments)]
+                      (when (seq idxs)
+                        ;; 0-based layout — eval-update-expr's JdbcParameter
+                        ;; branch reads `(nth bound (dec idx))`. Unused slots
+                        ;; stay nil; substitute-params walks vectors
+                        ;; element-wise so they survive the pass.
+                        (reduce (fn [v i] (assoc v (dec (long i)) (->ParamRef i)))
+                                (vec (repeat (long (apply max idxs)) nil))
+                                idxs)))]
             ;; Shared atom: fn writes [eid-or-tempid] in row order so the
             ;; RETURNING dispatch can resolve ids in VALUES order (not hash order).
             ;; Existing rows (DO UPDATE) store the eid; new rows store the tempid.
@@ -4078,8 +4102,23 @@
                   {:type :insert
                    :row-refs row-refs
                    :tx-data
+                   ;; `row-attrs` / `set-params` are passed as explicit
+                   ;; `:db.fn/call` ARGS rather than captured by the
+                   ;; closure: substitute-params (Execute-time ParamRef
+                   ;; resolution), resolve-nextvals! and the INSERT value
+                   ;; re-coercion all walk tx-data as data and cannot see
+                   ;; inside a Clojure fn. Closing over them left `$N`
+                   ;; placeholders in the conflict lookup and in the
+                   ;; asserted values — every parameterized
+                   ;; `INSERT … ON CONFLICT` (the shape every ORM emits)
+                   ;; died with "ParamRef cannot be cast to Number".
                    [[:db.fn/call
-                     (fn [txdb]
+                     (fn [txdb row-attrs set-params]
+                 ;; A prepared statement's parsed map — and with it this
+                 ;; atom — is reused across Executes, and an in-transaction
+                 ;; write replays its buffer at COMMIT, so the refs from a
+                 ;; previous run must not leak into this one's RETURNING.
+                       (reset! row-refs [])
                  ;; Pre-fetch sequence state for identity column auto-population.
                  ;; Sequences are named <table>_<col>_seq.
                        (let [q-fn d/q
@@ -4172,8 +4211,14 @@
                                                                                             [(keyword "excluded" (name k)) v])
                                                                                           attrs))
                                                                combined (merge old-map excluded-map)]
-                                                           (eval-update-expr
-                                                            value-expr combined ns schema)))]
+                                                  ;; set-params (0-based, ParamRefs already
+                                                  ;; substituted by the wire layer) lets
+                                                  ;; eval-update-expr resolve `$N` operands
+                                                  ;; inline — same idiom the UPDATE path uses.
+                                                           (binding [params/*bound-params*
+                                                                     (or set-params params/*bound-params*)]
+                                                             (eval-update-expr
+                                                              value-expr combined ns schema))))]
                                                    (when (some? new-val)
                                                      [:db/add existing attr
                                                       (or (coerce-insert-value new-val attr schema) new-val)])))
@@ -4200,7 +4245,9 @@
                                ;; Record new tempid at row position
                                        (swap! row-refs conj tempid)
                                        (into [(assoc populated :db/id tempid)] seq-updates)))))
-                               row-attrs))))]]
+                               row-attrs))))
+                     row-attrs
+                     set-params]]
                    :count (count rows)
                    :table table-name :ns ns}))
           ;; No ON CONFLICT — normal INSERT.

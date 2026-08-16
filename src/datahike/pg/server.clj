@@ -3251,28 +3251,43 @@
    coerced at parse time stay put), so this is safe to apply to every
    attribute. A parameter that resolved to SQL NULL drops out of the
    entity map — matching translate-insert's own `keep` semantics, where a
-   nil column value means \"don't assert this attribute\" (EAV null)."
+   nil column value means \"don't assert this attribute\" (EAV null).
+
+   Row maps handed to a `:db.fn/call` tx-fn as ARGUMENTS get the same
+   treatment: translate-insert passes its payload that way (the ON
+   CONFLICT upsert fn, the unique-check wrapper) precisely so the
+   Execute-time passes can reach it, and those rows are the ones the
+   transactor asserts."
   [parsed schema]
   (if (and (= :insert (:type parsed)) (seq (:tx-data parsed)))
-    (update parsed :tx-data
-            (fn [tx]
-              (mapv (fn [entry]
-                      (if (map? entry)
-                        (reduce-kv
-                         (fn [m attr v]
-                           (cond
-                             (= :db/id attr)   (assoc m attr v)
-                             (not (keyword? attr)) (assoc m attr v)
-                             (nil? v)          m
-                             ;; Only a nil coercion means "SQL NULL → omit";
-                             ;; a coerced `false`/`0`/empty is a real value.
-                             ;; (if-let here would wrongly drop a boolean
-                             ;; false, reading back as NULL.)
-                             :else (let [c (#'sql/coerce-insert-value v attr schema)]
-                                     (if (nil? c) m (assoc m attr c)))))
-                         {} entry)
-                        entry))
-                    tx)))
+    (let [coerce-entity
+          (fn [entry]
+            (if (map? entry)
+              (reduce-kv
+               (fn [m attr v]
+                 (cond
+                   (= :db/id attr)   (assoc m attr v)
+                   (not (keyword? attr)) (assoc m attr v)
+                   (nil? v)          m
+                   ;; Only a nil coercion means "SQL NULL → omit";
+                   ;; a coerced `false`/`0`/empty is a real value.
+                   ;; (if-let here would wrongly drop a boolean
+                   ;; false, reading back as NULL.)
+                   :else (let [c (#'sql/coerce-insert-value v attr schema)]
+                           (if (nil? c) m (assoc m attr c)))))
+               {} entry)
+              entry))
+          coerce-entry
+          (fn [entry]
+            (cond
+              (map? entry) (coerce-entity entry)
+              (and (vector? entry) (= :db.fn/call (first entry)) (> (count entry) 2))
+              (into (subvec entry 0 2)
+                    (map (fn [arg]
+                           (if (vector? arg) (mapv coerce-entity arg) arg)))
+                    (subvec entry 2))
+              :else entry))]
+      (update parsed :tx-data #(mapv coerce-entry %)))
     parsed))
 
 (declare nextval!)

@@ -270,10 +270,13 @@
 (defn- has-on-conflict?
   "True if the SQL contains an ON CONFLICT clause outside string
    literals or comments. ON CONFLICT routes through translate-insert's
-   alternate `:db.fn/call` which captures row-attrs by closure and
-   maintains a `:row-refs` atom — substitute-params can't reach into
-   either, so the templated path can't faithfully reconstruct the
-   shape. Bail and use full parse-sql for these."
+   alternate `:db.fn/call`, which maintains a `:row-refs` atom that
+   RETURNING reads back after the transact. That atom is per-parse
+   mutable state the templated path — whose whole point is reusing one
+   cached parsed map across calls — can't share safely (`cacheable-parse?`
+   excludes `:row-refs` for the same reason). Bail and use full parse-sql
+   for these. (The row maps themselves ARE reachable: they travel as
+   `:db.fn/call` args, not closure captures.)"
   [^String s]
   (let [n (.length s)]
     (loop [i 0]
