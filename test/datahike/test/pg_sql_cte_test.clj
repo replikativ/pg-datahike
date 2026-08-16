@@ -140,7 +140,6 @@
     ;; Side-effect rule: the INSERT inside the CTE must not have run.
     (is (empty? (rows c "SELECT id FROM emp WHERE id = 99")))))
 
-
 ;; ---------------------------------------------------------------------------
 ;; WITH RECURSIVE in SELECT
 ;; ---------------------------------------------------------------------------
