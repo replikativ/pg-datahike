@@ -1275,7 +1275,12 @@
                                                                            :else (str e)))]
                                                                (fmt expr))
                                                              :else (str expr))
-                                                       alias (or alias-str (str expr))]
+                                                       ;; PG's naming rules, not the
+                                                       ;; expression's SQL text — which is
+                                                       ;; what gave `SELECT B'1001000'` the
+                                                       ;; column name `B'1001000'`.
+                                                       alias (or alias-str
+                                                                 (stmt/figure-colname expr))]
                                                    [val alias]))
                                                select-items)]
                                      {:type :select

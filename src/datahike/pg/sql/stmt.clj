@@ -60,7 +60,8 @@
            [net.sf.jsqlparser.expression
             Alias Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis SignedExpression CastExpression
-            JsonExpression TimezoneExpression TimeKeyExpression ArrayConstructor JdbcParameter]
+            JsonExpression TimezoneExpression TimeKeyExpression ArrayConstructor JdbcParameter
+            CaseExpression RowConstructor]
            [net.sf.jsqlparser.expression.operators.relational
             GreaterThan GreaterThanEquals MinorThan MinorThanEquals
             EqualsTo NotEqualsTo IsNullExpression
@@ -517,9 +518,137 @@
                 (swap! (:where-clauses ctx) into preds)))))))
     {:name name :alias right-alias :join-type jtype :ref-info @ref-info}))
 
-(defn select-item-alias [^SelectItem item]
+(defn select-item-alias
+  "The explicit `AS` label of a select item, or nil.
+
+   An UNQUOTED alias is down-cased, the way PG's lexer folds every
+   unquoted identifier (scan.l's `downcase_truncate_identifier`), so
+   `SELECT 1 AS Foo` names the column `foo`. A quoted one keeps its
+   case: `AS \"Foo\"` stays `Foo`."
+  [^SelectItem item]
   (when-let [alias (.getAlias item)]
-    (unquote-ident (.getName ^Alias alias))))
+    (let [raw (.getName ^Alias alias)]
+      (if (and raw (str/starts-with? raw "\""))
+        (unquote-ident raw)
+        (some-> raw str/lower-case)))))
+
+(def ^:private sql-type->internal-name
+  "SQL type spelling → the name PostgreSQL actually stores in pg_type.
+
+   A cast names its output column after the type, but after the
+   grammar's `SystemTypeName` rewrite — so `1::int` is `int4`, not
+   `int`, and `x::character varying` is `varchar`. Types not listed here
+   (text, date, json, user-defined) already are their own internal name.
+   See gram.y's Numeric/Character/ConstDatetime productions."
+  {"int" "int4", "integer" "int4"
+   "bigint" "int8"
+   "smallint" "int2"
+   "real" "float4"
+   "double precision" "float8", "double" "float8"
+   "boolean" "bool"
+   "decimal" "numeric", "dec" "numeric"
+   "char" "bpchar", "character" "bpchar"
+   "character varying" "varchar"
+   "bit varying" "varbit"
+   "timestamp with time zone" "timestamptz"
+   "timestamp without time zone" "timestamp"
+   "time with time zone" "timetz"
+   "time without time zone" "time"})
+
+(defn- figure-colname*
+  "PostgreSQL's `FigureColnameInternal` (parse_target.c), returning
+   `[name strength]` where strength is 0 (no idea), 1 (second-best) or
+   2 (good). nil name means no idea.
+
+   Strength only matters at two recursion points — a cast and a CASE —
+   where a *good* name from the operand is kept but a second-best one is
+   overwritten. That is what makes `a::text` be `a` while `1::int8::text`
+   is `text` and `CASE … ELSE 2::int8 END` is `case`."
+  [expr]
+  (cond
+    (nil? expr) [nil 0]
+
+    ;; A column reference is named by its last component: `t.a` is `a`.
+    (instance? Column expr)
+    [(unquote-ident (.getColumnName ^Column expr)) 2]
+
+    ;; Function calls — including COALESCE / GREATEST / LEAST / window
+    ;; functions, which JSqlParser also surfaces as calls and which PG
+    ;; special-cases to the same names. Schema qualification is dropped.
+    (instance? Function expr)
+    [(let [n (str/lower-case (.getName ^Function expr))]
+       (if-let [i (str/last-index-of n ".")] (subs n (inc i)) n))
+     2]
+
+    (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
+    [(str/lower-case (.getName ^net.sf.jsqlparser.expression.AnalyticExpression expr)) 2]
+
+    ;; A cast takes the operand's name when that name is a good one, and
+    ;; otherwise the target type's — so the type name is only a fallback.
+    (instance? CastExpression expr)
+    (let [[n s] (figure-colname* (.getLeftExpression ^CastExpression expr))]
+      (if (> s 1)
+        [n s]
+        (let [dt (.getColDataType ^CastExpression expr)
+              raw (str/lower-case (str (.getDataType dt)))
+              ;; Array brackets aren't part of the type's name: PG keeps
+              ;; them in a separate arrayBounds field, so `::text[]` is
+              ;; named `text`.
+              base (str/replace raw #"\[.*$" "")
+              base (str/trim (str/replace base #"\(.*$" ""))]
+          [(get sql-type->internal-name base base) 1])))
+
+    ;; CASE inherits a good name from its ELSE arm, else it is "case".
+    (instance? CaseExpression expr)
+    (let [[n s] (figure-colname* (.getElseExpression ^CaseExpression expr))]
+      (if (> s 1) [n s] ["case" 1]))
+
+    ;; Parens are not a node in PG's tree at all — see straight through.
+    (instance? Parenthesis expr)
+    (figure-colname* (.getExpression ^Parenthesis expr))
+    (and (instance? ParenthesedExpressionList expr)
+         (= 1 (count ^ParenthesedExpressionList expr)))
+    (figure-colname* (first ^ParenthesedExpressionList expr))
+
+    ;; A scalar subquery is named after its own single output column —
+    ;; `SELECT (SELECT id FROM t)` is `id`, and a subquery whose column
+    ;; is itself unnamed propagates `?column?`.
+    (instance? ParenthesedSelect expr)
+    (let [inner (.getPlainSelect ^ParenthesedSelect expr)
+          ^SelectItem it (first (some-> inner .getSelectItems))]
+      (if it
+        [(or (select-item-alias it)
+             (first (figure-colname* (.getExpression it)))
+             "?column?")
+         2]
+        [nil 0]))
+
+    (instance? net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr)
+    ["exists" 2]
+    (instance? ArrayConstructor expr) ["array" 2]
+    (instance? net.sf.jsqlparser.expression.RowConstructor expr) ["row" 2]
+
+    ;; CURRENT_DATE / CURRENT_TIMESTAMP / USER / … — JSqlParser surfaces
+    ;; these bare keywords as a TimeKeyExpression or a Column, and PG
+    ;; names the column after the keyword.
+    (instance? TimeKeyExpression expr)
+    [(str/lower-case (str/replace (.getStringValue ^TimeKeyExpression expr) #"\(.*$" "")) 2]
+
+    ;; Everything else — literals (including `B'101'`), placeholders,
+    ;; operators, boolean expressions, IS NULL, BETWEEN, IN — has no
+    ;; case in PG's switch and falls through to the default.
+    :else [nil 0]))
+
+(defn figure-colname
+  "The name PostgreSQL gives an un-aliased SELECT output column.
+
+   Mirrors `FigureColname` (parse_target.c:1711): consult the rules,
+   and fall back to the literal `?column?`. We used to answer with
+   whatever was closest to hand — the datalog variable (`p1`, `v1`), or
+   the expression's own SQL text (`B'1001000'`, `B'101'::varbit`) —
+   none of which any PostgreSQL client would see."
+  [expr]
+  (or (first (figure-colname* expr)) "?column?"))
 
 (defn match-aggregate-index
   "Try to find the index of an aggregate function in the find-elements.
@@ -2099,15 +2228,13 @@
                                                         bind-v (if (nil? v) :__null__ v)]
                                                     (ctx/add-clause! ctx [(list 'identity bind-v) var])
                                                     var)
-                              :else               v)
-                          col-alias (when (and (nil? alias-str) (instance? Column expr))
-                                      (unquote-ident (.getColumnName ^Column expr)))]
+                              :else               v)]
                       (swap! find-elements conj v)
+                      ;; PG's naming rules — NOT the datalog variable
+                      ;; (`p1`, `v1`) or the expression's SQL text, which
+                      ;; is what the old fallback chain produced.
                       (swap! find-aliases conj (or alias-str
-                                                   col-alias
-                                                   (when (symbol? v)
-                                                     (subs (str v) 1))
-                                                   (str v)))))))))
+                                                   (figure-colname expr)))))))))
 
         ;; Thread each distinct correlation column (e.g. t.oid) into :find
         ;; as a trailing hidden column so every outer row carries the value
