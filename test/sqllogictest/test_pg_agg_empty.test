@@ -101,9 +101,35 @@ CREATE TABLE ordagg (grp INTEGER, val INTEGER, extra INTEGER)
 statement ok
 INSERT INTO ordagg VALUES (1, 10, 100), (1, 20, 200), (2, 5, 50), (2, 15, 150), (3, 30, 300)
 
-# ORDER BY on an aggregate not in SELECT is not supported
-statement error
+# ORDER BY on an aggregate that is NOT in the SELECT list is legal SQL;
+# PostgreSQL 17 accepts both of these. This used to be `statement error`,
+# pinning our own limitation rather than PostgreSQL's behaviour.
+#
+# SUM(extra) is 300/200/300 per group, so groups 1 and 3 tie and the row
+# ORDER is genuinely ambiguous — rowsort checks the result set, and the
+# nosort case below pins real ordering on a key with no ties.
+query II rowsort
 SELECT grp, SUM(val) FROM ordagg GROUP BY grp ORDER BY SUM(extra)
+----
+1	30
+2	20
+3	30
+
+# MAX(extra) is 200/150/300 — distinct, so the order is well defined.
+query II nosort
+SELECT grp, SUM(val) FROM ordagg GROUP BY grp ORDER BY MAX(extra)
+----
+2	20
+1	30
+3	30
+
+# ORDER BY an aggregate that IS projected, and by its output alias.
+query II nosort
+SELECT grp, MAX(extra) FROM ordagg GROUP BY grp ORDER BY MAX(extra) DESC
+----
+3	300
+1	200
+2	150
 
 # ============================================================
 # DISTINCT on a single aggregate (should be a no-op, not an error)
