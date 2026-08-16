@@ -22,7 +22,7 @@
 (defn hints-fixture [f]
   (pg/reset-lock-registry!)
   (Class/forName "org.postgresql.Driver")
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? false}]
     (d/create-database cfg)

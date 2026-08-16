@@ -238,7 +238,7 @@
   (when-not *real-pg-skip-reason*
     (testing "Chinook SQL ingests into pg-datahike with identical row counts"
       (pg/reset-lock-registry!)
-      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                  :schema-flexibility :write :keep-history? false}]
         (d/create-database cfg)
         (let [conn (d/connect cfg)
@@ -266,7 +266,7 @@
   (when-not *real-pg-skip-reason*
     (testing "real-PG → pg-datahike → dump → real-PG: every row matches by value"
       (pg/reset-lock-registry!)
-      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                  :schema-flexibility :write :keep-history? false}]
         (d/create-database cfg)
         (let [conn (d/connect cfg)
@@ -316,7 +316,7 @@
   (when-not *real-pg-skip-reason*
     (testing "real-PG → pg-datahike → dump → fresh real-PG yields identical state"
       (pg/reset-lock-registry!)
-      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+      (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                  :schema-flexibility :write :keep-history? false}]
         (d/create-database cfg)
         (let [conn (d/connect cfg)

@@ -313,6 +313,33 @@
     cfg
     (assoc-in cfg [:store :id] (java.util.UUID/randomUUID))))
 
+(def ^:private value-cap-keys
+  "Datahike's value-size config keys. Any one of them (including a `0`,
+   which disables that cap) counts as a deliberate choice."
+  #{:value-caps :max-string-length :max-bytes-length
+    :max-float-array-length :max-double-array-length
+    :max-tuple-string-length})
+
+(defn ensure-value-caps
+  "Default a server-created database to UNBOUNDED value sizes unless the
+   operator's template says otherwise.
+
+   Datahike leaves value-size caps opt-in and warns once per
+   `create-database` that they are unset. The nudge is aimed at Datalog
+   applications; for a PostgreSQL surrogate the answer is not the
+   `:value-caps :default` preset, because that is Datomic parity — 4096
+   characters for a string — and PostgreSQL's `text` is bounded only by
+   the 1GB varlena limit. Adopting the preset would reject values a real
+   PostgreSQL accepts, so we record the unbounded choice explicitly
+   (`:max-string-length 0` disables the cap) rather than inherit a
+   silent 4096.
+
+   An operator who wants caps sets them in the template and keeps them."
+  [cfg]
+  (if (some #(contains? cfg %) value-cap-keys)
+    cfg
+    (assoc cfg :max-string-length 0)))
+
 (defn db-from-template
   "Build an `:on-create-database` hook from a server-level config
    template. The returned fn receives `[db-name parsed-options]`,
@@ -333,7 +360,8 @@
     (let [{:keys [config]} (options->config server-template parsed-options)
           resolved (-> config
                        (interpolate-name db-name)
-                       ensure-store-id)]
+                       ensure-store-id
+                       ensure-value-caps)]
       (d/create-database resolved)
       (d/connect resolved))))
 

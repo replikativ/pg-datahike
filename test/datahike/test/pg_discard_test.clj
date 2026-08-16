@@ -22,7 +22,7 @@
 
 (defn fixture [f]
   (pg/reset-lock-registry!)
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write}]
     (d/create-database cfg)
     (let [conn (d/connect cfg)]

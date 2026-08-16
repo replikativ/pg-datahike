@@ -40,7 +40,7 @@
 (def ^:dynamic *h* nil)
 
 (defn nsem-fixture [f]
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? true}]
     (d/create-database cfg)

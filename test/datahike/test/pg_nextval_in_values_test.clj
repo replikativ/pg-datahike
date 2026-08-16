@@ -18,7 +18,7 @@
 (defn- nextval-fixture [f]
   (Class/forName "org.postgresql.Driver")
   (pg/reset-lock-registry!)
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write :keep-history? false}]
     (d/create-database cfg)
     (let [conn (d/connect cfg)

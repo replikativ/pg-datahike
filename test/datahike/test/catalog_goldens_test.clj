@@ -103,7 +103,7 @@
 ;; Fixture: build a handler against a tiny stable DB
 
 (defn- fresh-handler ^datahike.pg.PgWireServer$QueryHandler []
-  (let [cfg {:store {:backend :memory :id (random-uuid)}
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :max-string-length 0
              :schema-flexibility :write}]
     (d/create-database cfg)
     (let [conn (d/connect cfg)
