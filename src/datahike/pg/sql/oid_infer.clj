@@ -18,6 +18,7 @@
        column, subquery, etc.) — callers fall back to TEXT (OID 25),
        matching the pre-existing behavior."
   (:require [clojure.string :as str]
+            [datahike.pg.bits :as bits]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -492,6 +493,10 @@
       ;; --- Literals -----------------------------------------------------
       (instance? LongValue expr)      types/oid-int8
       (instance? DoubleValue expr)    types/oid-float8
+      ;; Bit-string literals MUST precede StringValue — JSqlParser also
+      ;; uses StringValue for `B'1001000'` (prefix "B"). PG types both
+      ;; `B'…'` and `X'…'` as bit (1560), not text (issue #28).
+      (bits/bit-string-literal? expr)  types/oid-bit
       (instance? StringValue expr)    types/oid-text
       (instance? NullValue expr)      types/oid-text
       (instance? BooleanValue expr)   types/oid-bool
@@ -548,8 +553,17 @@
       (instance? Division expr)       types/oid-float8  ; PG: integer div is exact
       (instance? Modulo expr)         (binary-arith-oid expr env)
 
-      ;; --- String concat (||) -------------------------------------------
-      (instance? Concat expr) types/oid-text
+      ;; --- Concat (||) ---------------------------------------------------
+      ;; bit || bit is `bitcat`, whose result is always bit varying (the
+      ;; widths add, so no fixed-width type fits) — PG resolves the
+      ;; varbit operator, not the text one. Everything else concatenates
+      ;; as text.
+      (instance? Concat expr)
+      (let [^BinaryExpression e expr]
+        (if (and (some-> (.getLeftExpression e) (expr-oid env) (= types/oid-bit))
+                 (some-> (.getRightExpression e) (expr-oid env) (= types/oid-bit)))
+          types/oid-varbit
+          types/oid-text))
 
       ;; --- Array constructor / subscript --------------------------------
       ;; ARRAY[…] → T[] where T is the LUB of element OIDs; fall back

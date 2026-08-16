@@ -763,6 +763,16 @@
   [v]
   (if (pg-bits/pg-bit? v) (pg-bits/octet-length v) (count v)))
 
+(defn sql-bit-length
+  "SQL BIT_LENGTH — the length in BITS.
+
+   For a bit string that is its width; for text it is 8 × the byte
+   length, which is why this can't just delegate to sql-length."
+  [v]
+  (if (pg-bits/pg-bit? v)
+    (pg-bits/width v)
+    (* 8 (count (.getBytes (str v) java.nio.charset.StandardCharsets/UTF_8)))))
+
 (defn sql-lpad
   "Left-pad string s to length n with fill character/string."
   ([s n] (sql-lpad s n " "))
@@ -1017,6 +1027,7 @@
    "right"    sql-right
    "char_length"  sql-length
    "octet_length" sql-octet-length
+   "bit_length"   sql-bit-length
    "position"     sql-position
    "strpos"       sql-position
    "pg_table_is_visible"      pg-table-is-visible
@@ -1111,7 +1122,7 @@
    "power"    #{2} "pow" #{2} "atan2" #{2} "mod" #{2} "gcd" #{2} "lcm" #{2}
    "width_bucket" #{4}
    "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
-   "length"   #{1} "char_length" #{1} "octet_length" #{1}
+   "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}
    "left"     #{2} "right" #{2} "position" #{2} "strpos" #{2}
    "repeat"   #{2}
    "lpad"     #{2 3} "rpad" #{2 3}})

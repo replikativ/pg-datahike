@@ -607,6 +607,18 @@
                                    "time with time zone"} base-type) "time"
                                 :else base-type))
 
+                       ;; bit / bit varying columns. Like jsonb they
+                       ;; reduce to :db.type/string (the stored form is
+                       ;; PG's own text output — the digit run), so the
+                       ;; hint is what makes RowDescription report bit
+                       ;; (1560) / varbit (1562) instead of text — see
+                       ;; issue #28.
+                       (and (not array-spec)
+                            (#{:bit :varbit} (types/cast-category base-type)))
+                       (assoc :pg/type
+                              (if (= :varbit (types/cast-category base-type))
+                                "varbit" "bit"))
+
                        ;; Narrow integer columns. Datahike stores every
                        ;; integer as :db.type/long, which would otherwise
                        ;; advertise int8 (OID 20) for a column the user

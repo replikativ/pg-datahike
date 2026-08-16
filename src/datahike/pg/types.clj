@@ -321,7 +321,13 @@
     "jsonb"       oid-jsonb
     "oid"         oid-oid
     "char"        oid-char
-    "bytea"       oid-bytea}
+    "bytea"       oid-bytea
+    ;; bit / bit varying. Datahike has no bit type, so these columns
+    ;; store PG's text form (the digit run) as :db.type/string — the
+    ;; :pg/type hint is the only thing that keeps them from advertising
+    ;; text (25) instead of bit (1560) / varbit (1562).
+    "bit"         oid-bit
+    "varbit"      oid-varbit}
    ;; Array entries: "_T" → array OID. Generated from elem-kw->oid
    ;; so adding a new scalar type only needs three rows
    ;; (elem-kw->oid, element-oid->array-oid, sql-name->elem-kw).

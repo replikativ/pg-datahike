@@ -2001,6 +2001,20 @@
     (instance? DoubleValue expr)
     (.getValue ^DoubleValue expr)
 
+    ;; Bit-string literals — MUST precede the plain StringValue branch,
+    ;; which JSqlParser also uses for `B'1001000'` (prefix "B").
+    ;;
+    ;; `B'…'` and `X'…'` are the SQL standard's bit-string literals and
+    ;; PG types both as `bit` (1560), not text: `SELECT B'1001000'`
+    ;; describes as bit and `pg_typeof` answers `bit` (issue #28).
+    ;; Without this they reached the client as a bare String, i.e. text
+    ;; (25), losing the width that makes bit comparison and ordering
+    ;; correct. Everything downstream — width coercion, ordering,
+    ;; `length()`, the 1560/1562 OID — already understands PgBit; only
+    ;; the literal was missing.
+    (pg-bits/bit-string-literal? expr)
+    (pg-bits/bit-string-literal-value expr)
+
     (instance? StringValue expr)
     (string-value-text ^StringValue expr)
 
@@ -2246,6 +2260,11 @@
                       (cond
                         (and (pg-arr/array? a) (pg-arr/array? b))
                         (pg-arr/concat-arrs a b)
+                        ;; bit || bit is bitcat, not string concat — the
+                        ;; generic `(str a b)` below would stringify the
+                        ;; PgBit records themselves.
+                        (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b))
+                        (pg-bits/concat-bits a b)
                         ;; Append/prepend scalar to array — PG allows
                         ;; `arr || scalar` and `scalar || arr`.
                         (pg-arr/array? a)
@@ -2547,8 +2566,23 @@
    to string and matches nothing — real PG resolves the literal via
    `oidin('16384')`."
   [ctx ^Column col lit]
-  (when (and (instance? StringValue lit)
-             (instance? Column col))
+  (cond
+    ;; A bit-string literal compared against a bit column. Datahike has
+    ;; no bit type, so a `bit`/`varbit` column stores PG's text form —
+    ;; the digit run — and the literal has to come down to that form to
+    ;; match. (Comparing PgBit against the stored String matches
+    ;; nothing, which is how `WHERE b = B'1001000'` silently returned
+    ;; zero rows once literals started producing PgBit.)
+    ;;
+    ;; Only for a string-typed column: against anything else the value
+    ;; keeps its bit type and the normal operator rules apply.
+    (and (instance? Column col)
+         (pg-bits/bit-string-literal? lit)
+         (= :db.type/string (column-vtype ctx col)))
+    (pg-bits/to-pg-text (pg-bits/bit-string-literal-value lit))
+
+    (and (instance? StringValue lit)
+         (instance? Column col))
     (when-let [vt (column-vtype ctx col)]
       (let [s (.getNotExcapedValue ^StringValue lit)
             v (coerce/coerce-unknown s vt parse-timestamp-string)]

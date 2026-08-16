@@ -1144,6 +1144,15 @@
                                                        val (cond
                                                              (instance? LongValue expr) (.getValue ^LongValue expr)
                                                              (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+                                                            ;; Bit-string literals before StringValue —
+                                                            ;; JSqlParser spells `B'1001000'` as a
+                                                            ;; StringValue with prefix "B". Returning the
+                                                            ;; bare digits here made `SELECT B'1001000'`
+                                                            ;; a text value (issue #28) and skipped the
+                                                            ;; digit validation, so `B'102'` came back as
+                                                            ;; "102" instead of raising 22P02.
+                                                             (pg-bits/bit-string-literal? expr)
+                                                             (pg-bits/bit-string-literal-value expr)
                                                              (instance? StringValue expr) (.getNotExcapedValue ^StringValue expr)
                                                              (instance? NullValue expr) :__null__
                                                             ;; Bare TRUE/FALSE — JSqlParser 5.x emits a
@@ -1180,6 +1189,14 @@
                                                                    raw (cond
                                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
                                                                          (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
+                                                                        ;; Before StringValue — see above. A bit
+                                                                        ;; source also changes what the cast MEANS:
+                                                                        ;; `B'101'::int` reinterprets the bits (5),
+                                                                        ;; it does not read the digits as decimal
+                                                                        ;; (101). cast-scalar already does that,
+                                                                        ;; but only for a PgBit input.
+                                                                         (pg-bits/bit-string-literal? inner)
+                                                                         (pg-bits/bit-string-literal-value inner)
                                                                          (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
                                                                          :else (str inner))]
                                                                (cond
