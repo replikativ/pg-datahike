@@ -700,6 +700,23 @@
 (defn- empty-result [tag]
   (PgWireServer$QueryResult/empty tag))
 
+(defn- insert-affected-count
+  "Row count for an INSERT's CommandComplete tag.
+
+   `:count` is the parse-time number of VALUES rows, which is right for
+   a plain INSERT but not for ON CONFLICT: PG counts only the rows the
+   statement actually inserted or updated, so a DO NOTHING that hit a
+   conflict reports `INSERT 0 0` and a three-row VALUES with one
+   conflict reports `INSERT 0 2`. The upsert tx-fn tallies the real
+   number into `:affected-count` as it runs.
+
+   Falls back to `:count` for every non-upsert INSERT, which has no
+   such atom."
+  [parsed]
+  (if-let [a (:affected-count parsed)]
+    @a
+    (:count parsed)))
+
 (defn- error-result
   "Build an error QueryResult. Optional sqlstate defaults to \"XX000\".
 
@@ -2338,7 +2355,7 @@
                           (filterv has-row? ordered-eids)
                           (filterv has-row? (vals tempids)))]
           (build-returning-result returning db data-eids table-name schema))
-        (empty-result (str "INSERT 0 " (:count parsed)))))
+        (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
@@ -5444,7 +5461,7 @@
                               (filterv has-row? ordered-eids)
                               (filterv has-row? (vals tempids-map)))]
               (build-returning-result returning db-after data-eids table-name (:schema db-after)))
-            (empty-result (str "INSERT 0 " (:count parsed)))))
+            (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
