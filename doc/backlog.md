@@ -171,6 +171,34 @@ the last write wins and its scale is preserved. SQL scalar columns are
 cardinality-one, so this does not affect jsonb or numeric columns today.
 It would affect any future multi-valued numeric column.
 
+### Large jsonb values are stored inline, with no promotion threshold
+
+A jsonb column is a `:db.type/string` datom value, so an arbitrarily
+large document sits inline in the index. There is no out-of-line
+promotion and no size guard beyond `:max-string-length`.
+
+Datalevin promotes at **497 bytes** (`+val-bytes-wo-hdr+`) into a
+separate `datalevin/giants` DBI, keeping a truncated key plus a
+reference in the main index, and zstd-compresses above a further
+threshold. PostgreSQL TOASTs at ~2 KB for the same reason: keep the
+tuple small so scans that do not read the value stay cheap.
+
+Measured so far: 1000 rows x 20 KB documents (~19 MB) showed **no**
+penalty on queries that never touch the jsonb column — `count(*)`,
+point lookup and a scan on a sibling text column were all within noise
+of an identical table without the column. That is consistent with AEVT
+grouping datoms by attribute, so an attribute-scoped scan never walks
+the big values.
+
+The risk is therefore not disproved, only unobserved at that scale: an
+entity-ordered walk (EAVT) does put a row's big value adjacent to its
+small ones, and node size affects what a fetch pulls in. Worth
+re-measuring with fewer, much larger documents and with a file backend
+before concluding. If it does bite, the fix is a promotion threshold —
+`:db.type/store-ref` exists and is GC-marked, though datahike's own
+schema note argues against it for structured data, and content-id
+identity would give byte equality rather than jsonb equality.
+
 ### jsonb numeric limits are not enforced
 
 PostgreSQL's numeric caps display scale at 16383 and integer digits at
