@@ -144,13 +144,31 @@
 ;; ---------------------------------------------------------------------------
 ;; Context constructor + primitives
 
+(def ^:dynamic *relation-namespaces*
+  "`{relation-name -> storage-namespace}` for speculative relations —
+   currently the CTEs in scope. Bound by the translator; consulted here
+   so no FROM-clause site can forget it.
+
+   A CTE is stored as ordinary attributes in a speculative db, and its
+   namespace used to be its own name, so a CTE named after a real table
+   wrote into that table's namespace and the two merged instead of the
+   CTE shadowing the table. Redirecting the NAME while leaving the ALIAS
+   as the user wrote it routes the reference through the same machinery
+   as `FROM emp e`, which already resolves an alias to a differently-named
+   relation correctly."
+  {})
+
 (defn extract-table-info
-  "Extract table name and alias from a FROM clause Table."
+  "Extract table name and alias from a FROM clause Table.
+
+   `:name` is the relation's STORAGE name and `:alias` the name the
+   query refers to it by; they differ for an aliased table and for any
+   relation in `*relation-namespaces*`."
   [^Table table]
   (let [name (params/unquote-ident (.getName table))
         alias (.getAlias table)
         alias-name (when alias (params/unquote-ident (.getName ^Alias alias)))]
-    {:name  name
+    {:name  (get *relation-namespaces* name name)
      :alias (or alias-name name)}))
 
 (defn make-ctx

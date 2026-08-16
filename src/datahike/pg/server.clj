@@ -32,6 +32,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
+            [datahike.pg.sql.ctx :as sql-ctx]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -2403,6 +2404,19 @@
    ParamRefs stay unresolved in :in-args-raw; values substitute per call."
   (pg-cache/bounded-cache 512))
 
+(defmacro ^:private with-cte-namespaces
+  "Re-establish the CTE name→namespace mapping while `body` runs.
+
+   UPDATE and DELETE keep their WHERE clause as a JSqlParser AST and
+   re-translate it at EXECUTE time, outside the dynamic scope parse-sql
+   established. Without the rebind, a CTE reference in that WHERE — or
+   in a subquery under it — resolves to a base table of the same name.
+   That is how `WITH t AS (SELECT 99 AS id) DELETE FROM t WHERE id IN
+   (SELECT id FROM t)` deleted every row of the real table."
+  [parsed & body]
+  `(binding [sql-ctx/*relation-namespaces* (or (:cte-namespaces ~parsed) {})]
+     ~@body))
+
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
@@ -2472,7 +2486,7 @@
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (build-delete-tx db schema parsed)
+          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-delete-tx db schema parsed))
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
@@ -2650,7 +2664,7 @@
              (update :tx-data into tx-data))))
      {:eids [] :tx-data []}
      rows)
-    (build-update-tx-for-bindings db schema parsed nil)))
+    (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil))))
 
 (defn- check-update-identity-collisions!
   "Pre-flight check: before running tx-data from build-update-tx, scan
@@ -2769,7 +2783,7 @@
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (build-update-tx db schema parsed)
+          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-update-tx db schema parsed))
           _ (check-update-identity-collisions! db schema tx-data)
           _ (check-not-null-on-update! db tx-data)
           _ (check-updates-against-row-constraints!
@@ -5560,7 +5574,7 @@
               {:keys [eids tx-data]}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (build-update-tx spec-db schema parsed)
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db))
@@ -5612,7 +5626,7 @@
               {:keys [eids]}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (build-delete-tx spec-db schema parsed)
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db))

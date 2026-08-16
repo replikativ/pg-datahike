@@ -480,6 +480,20 @@
                              (params/where-param-oids (.getExpression si) schema tns aliases))))))
     (catch Throwable _ nil)))
 
+(defn cte-namespace
+  "The synthetic storage namespace for the `n`th CTE named `cte-name`.
+
+   Deterministic — a pure function of the SQL text — because the parse
+   caches key on `[sql (hash schema)]`, and a gensym/nanoTime namespace
+   would change the enriched schema on every parse and turn every CTE
+   query into a total cache miss.
+
+   The `__cte` prefix is reserved: `datahike.pg.schema/internal-attr?`
+   filters it so a CTE can never surface as a table in pg_class or
+   information_schema."
+  [n cte-name]
+  (str "__cte" n "__" cte-name))
+
 (defn- materialize-withs!
   "Run the WITH-list fold for any statement type. Returns
    [enriched-db enriched-schema deferred-recursive-ctes] with the
@@ -504,8 +518,13 @@
   (let [withs (stmt-with-items stmt)]
     (if (and db (seq withs))
       (reduce
-       (fn [[curr-db curr-schema deferred] ^net.sf.jsqlparser.statement.select.WithItem wi]
-         (let [cte-name   (str/trim (str (.getAlias wi)))
+       (fn [[curr-db curr-schema deferred ns-map] ^net.sf.jsqlparser.statement.select.WithItem wi]
+         (let [raw-name   (str/trim (str (.getAlias wi)))
+               ;; Unquote + fold, so `WITH "MyCte"` and `WITH MyCte`
+               ;; both reach `FROM mycte` the way PostgreSQL's identifier
+               ;; rules say they should.
+               cte-name   (params/unquote-ident raw-name)
+               cte-ns     (cte-namespace (inc (count ns-map)) cte-name)
                recursive? (.isRecursive wi)
                body       (try (.getParenthesedStatement wi)
                                (catch Throwable _ nil))
@@ -518,7 +537,7 @@
            (cond
              ;; Recursive WITH on UPDATE — leave to translate-update.
              (and recursive? (instance? Update stmt))
-             [curr-db curr-schema deferred]
+             [curr-db curr-schema deferred ns-map]
 
              recursive?
              (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
@@ -538,24 +557,29 @@
                (if m
                  ;; A parameterised recursive CTE enriches only the schema
                  ;; now and carries a `:deferred` spec for Execute-time data.
+                 ;; Recursive CTEs keep their own name as the namespace
+                 ;; for now — the rule/iterative evaluators thread
+                 ;; :target-name end-to-end into Execute, so relocating
+                 ;; them is a larger change. Tracked separately.
                  [(:db m) (:schema m)
-                  (cond-> deferred (:deferred m) (conj (:deferred m)))]
-                 [curr-db curr-schema deferred]))
+                  (cond-> deferred (:deferred m) (conj (:deferred m)))
+                  ns-map]
+                 [curr-db curr-schema deferred ns-map]))
 
              (some? inner)
-             (if-let [m (stmt/materialize-set-op! inner cte-name curr-db curr-schema)]
-               [(:db m) (:schema m) deferred]
-               [curr-db curr-schema deferred])
+             (if-let [m (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name)]
+               [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
+               [curr-db curr-schema deferred ns-map])
 
              ;; Data-modifying CTE body or shape we don't recognise —
              ;; skip rather than crash. The outer translate-* will
              ;; surface a clearer error if the body's results are
              ;; actually needed.
              :else
-             [curr-db curr-schema deferred])))
-       [db schema []]
+             [curr-db curr-schema deferred ns-map])))
+       [db schema [] {}]
        withs)
-      [db schema []])))
+      [db schema [] {}])))
 
 (defn- parse-sql*
   "Inner parse-sql implementation — does the actual work. Public
@@ -804,7 +828,7 @@
                                     (keep (fn [^net.sf.jsqlparser.statement.select.WithItem wi]
                                             (some-> (.getAlias wi) str str/trim str/lower-case not-empty)))
                                     (stmt-with-items stmt))
-                [db schema deferred-rec-ctes] (materialize-withs! stmt db schema)
+                [db schema deferred-rec-ctes cte-ns-map] (materialize-withs! stmt db schema)
                 ;; Did the CTE fold materialise anything? If not, the only
                 ;; enrichment is catalog data — which the server can safely
                 ;; re-resolve at execute (stale-prepared-statement fix). With
@@ -912,7 +936,16 @@
                 ;; Expose CTE names to translate-select's undefined-table
                 ;; (42P01) check so `FROM <cte>` is never mistaken for a
                 ;; missing relation — including skipped data-modifying CTEs.
-                (binding [stmt/*cte-relations* cte-relations]
+                ;; MERGE, don't replace: parse-sql recurses for IN /
+                ;; EXISTS subqueries, and an inner statement with no WITH
+                ;; list would otherwise clear the outer CTE mapping and
+                ;; resolve `FROM <cte>` back to the base table. PostgreSQL
+                ;; scopes a CTE to its own level AND all inner ones
+                ;; (scanNameSpaceForCTE walks outward), so merging is the
+                ;; faithful rule as well as the safe one.
+                (binding [stmt/*cte-relations* (into stmt/*cte-relations* cte-relations)
+                          stmt/*cte-namespaces* (merge stmt/*cte-namespaces* cte-ns-map)
+                          ctx/*relation-namespaces* (merge ctx/*relation-namespaces* cte-ns-map)]
                   (cond
           ;; SELECT (may have CTEs — WITH ... AS)
                     (instance? PlainSelect stmt)
@@ -1410,12 +1443,21 @@
           ;; UPDATE
                     (instance? Update stmt)
                     (cond-> (translate-update ^Update stmt schema db)
-                      (not (identical? db orig-db)) (assoc :enriched-db db))
+                      (not (identical? db orig-db)) (assoc :enriched-db db)
+                      ;; UPDATE/DELETE re-translate their WHERE at EXECUTE
+                      ;; time, outside this binding, so the CTE namespace
+                      ;; map has to travel on the parsed map. Without it
+                      ;; the re-translation resolves a CTE reference to
+                      ;; the base table — which is how
+                      ;; `WITH t AS (…) DELETE FROM t WHERE id IN
+                      ;; (SELECT id FROM t)` deleted the real rows.
+                      (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map))
 
           ;; DELETE
                     (instance? Delete stmt)
                     (cond-> (translate-delete ^Delete stmt schema)
-                      (not (identical? db orig-db)) (assoc :enriched-db db))
+                      (not (identical? db orig-db)) (assoc :enriched-db db)
+                      (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map))
 
           ;; CREATE TABLE
                     (instance? CreateTable stmt)
