@@ -1563,6 +1563,41 @@
                              :param-oids {}))))
                 (catch Throwable _ nil)))))))))
 
+(def ^:private unsupported-op-chars
+  "Characters that can only appear in an OPERATOR position and that we
+   have no operator for.
+
+   `#` is PG's integer/bit XOR and the `#>` / `#>>` / `#-` jsonb path
+   operators. `$` outside a `$N` placeholder or a `$…$` dollar-quoted
+   string is not valid PG syntax at all.
+
+   Neither is legal inside an unquoted PG identifier, but JSqlParser's
+   lexer accepts both there — so `SELECT 42#` parsed as a COLUMN named
+   `42#`, resolved to nothing, and answered zero rows instead of the
+   syntax error PostgreSQL raises (issue #29). Catching it lexically
+   also keeps a future `#` operator honest: the check is over `:op`
+   tokens, so it disappears the moment one is implemented."
+  #{\# \$})
+
+(defn- unsupported-operator-error
+  "An `{:type :error}` map when `sql` uses an operator character we do
+   not implement, else nil.
+
+   The tokeniser already excludes string literals, dollar-quoted
+   strings, quoted identifiers and comments, and classifies `$N` as
+   :param — so only a genuine operator position reaches here. Gated on
+   a substring test first: tokenising every statement would put a scan
+   on the hot path for a case that essentially never fires."
+  [^String sql]
+  (when (or (<= 0 (.indexOf sql "#")) (<= 0 (.indexOf sql "$")))
+    (when-let [bad (first (filter (fn [{:keys [type text]}]
+                                    (and (= :op type)
+                                         (some unsupported-op-chars text)))
+                                  (cls/tokenize-all sql)))]
+      {:type :error
+       :sqlstate "42601"
+       :message (str "syntax error at or near \"" (:text bad) "\"")})))
+
 (defn parse-sql
   "Parse a SQL statement and return a translation result.
 
@@ -1608,7 +1643,11 @@
        cached cached
 
        :else
-       (or (templated-parse sql schema db)
+       ;; Lexical validation runs BEFORE templating: parameterize-numbers
+       ;; would rewrite `SELECT 42#` to `SELECT $1#` and hand JSqlParser
+       ;; a shape whose `#` is even harder to see.
+       (or (unsupported-operator-error sql)
+           (templated-parse sql schema db)
            (let [parsed (parse-sql* sql schema db)]
              (when (and cache (cacheable-parse? parsed))
                (cache-put! cache cache-key parsed))
