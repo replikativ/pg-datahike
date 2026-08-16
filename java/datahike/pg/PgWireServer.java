@@ -77,6 +77,9 @@ public final class PgWireServer {
     public static final int OID_TIMESTAMP   = 1114; // timestamp without time zone
     public static final int OID_TIMESTAMPTZ = 1184; // timestamp with time zone
     public static final int OID_NUMERIC     = 1700;
+    public static final int OID_REGTYPE     = 2206; // pg_typeof()'s result
+    public static final int OID_INTERVAL    = 1186;
+    public static final int OID_TIMETZ      = 1266; // time with time zone
     public static final int OID_UUID        = 2950;
     public static final int OID_JSONB       = 3802;
 
@@ -1865,10 +1868,31 @@ public final class PgWireServer {
                     "prepared statement \"" + name + "\" does not exist");
             }
             // Statement Describe always starts with ParameterDescription.
-            int[] oids = (stmt.parsed == null)
-                ? stmt.paramOids
-                : handler.describeParams(stmt.parsed);
-            if (oids == null) oids = stmt.paramOids;
+            //
+            // stmt.paramOids is ALREADY the effective list: handleParse
+            // merged the client's declared OIDs over our inferred ones
+            // ("declared non-zero wins", matching PG's parse_analyze).
+            // Re-deriving it from handler.describeParams here would throw
+            // that merge away and answer the inferred/TEXT type for every
+            // parameter — the client then sees its own `setString`
+            // varchar(1043) come back as text(25) (pgjdbc: "Can't change
+            // resolved type for param"), and a declared int2 param comes
+            // back as text (issue #27).
+            int[] oids = stmt.paramOids;
+            if (oids == null) oids = new int[0];
+            // Never advertise OID 0 — see describeParams in server.clj:
+            // asyncpg recurses into introspection on an unknown type and
+            // dies with RecursionError. PG always resolves to a concrete
+            // type, defaulting to text.
+            for (int i = 0; i < oids.length; i++) {
+                if (oids[i] == 0) {
+                    oids = oids.clone();
+                    for (int j = i; j < oids.length; j++) {
+                        if (oids[j] == 0) oids[j] = OID_TEXT;
+                    }
+                    break;
+                }
+            }
             out.writeByte('t');
             out.writeInt(4 + 2 + oids.length * 4);
             out.writeShort(oids.length);
@@ -2452,18 +2476,38 @@ public final class PgWireServer {
     // Helpers
     // ========================================================================
 
+    /**
+     * pg_type.typlen for the OIDs we advertise, as RowDescription's
+     * "data type size" field. -1 means variable-length, which is also
+     * the right answer for anything not listed (all varlena types and
+     * every array type).
+     *
+     * Clients read this alongside the OID: pgjdbc sizes its binary
+     * buffers from it and asyncpg uses it to pick a decoder, so a -1
+     * against a fixed-width OID (int2 described as -1 — issue #27) is a
+     * protocol-level inconsistency even when the OID itself is right.
+     */
     private static short typeSize(int oid) {
         return switch (oid) {
             case OID_BOOL -> 1;
             case OID_CHAR -> 1;
+            case OID_NAME -> 64;
+            case OID_INT2 -> 2;
             case OID_INT4 -> 4;
             case OID_INT8 -> 8;
+            case OID_OID -> 4;
             case OID_FLOAT4 -> 4;
             case OID_FLOAT8 -> 8;
-            case OID_TEXT, OID_VARCHAR -> -1;
             case OID_DATE -> 4;
+            case OID_TIME -> 8;
             case OID_TIMESTAMP -> 8;
+            case OID_TIMESTAMPTZ -> 8;
+            case OID_TIMETZ -> 12;   // int64 time + int32 zone offset
+            case OID_INTERVAL -> 16; // int64 time + int32 day + int32 month
             case OID_UUID -> 16;
+            case OID_REGTYPE -> 4;
+            // text, varchar, bytea, numeric, json/jsonb, bit/varbit and
+            // every array type are varlena.
             default -> -1;
         };
     }

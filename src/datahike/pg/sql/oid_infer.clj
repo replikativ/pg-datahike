@@ -18,6 +18,7 @@
        column, subquery, etc.) — callers fall back to TEXT (OID 25),
        matching the pre-existing behavior."
   (:require [clojure.string :as str]
+            [datahike.pg.bits :as bits]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -30,13 +31,15 @@
             NullValue Parenthesis SignedExpression StringValue TimeKeyExpression
             TimestampValue TimeValue DateValue WhenClause]
            [net.sf.jsqlparser.expression.operators.arithmetic
-            Addition Concat Division Modulo Multiplication Subtraction]
+            Addition BitwiseAnd BitwiseLeftShift BitwiseOr BitwiseRightShift
+            BitwiseXor Concat Division Modulo Multiplication Subtraction]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression LikeExpression
-            MinorThan MinorThanEquals NotEqualsTo RegExpMatchOperator]))
+            MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
+            RegExpMatchOperator]))
 
 ;; ---------------------------------------------------------------------------
 ;; Function return-type registry — keyed by lowercased SQL name.
@@ -491,6 +494,10 @@
       ;; --- Literals -----------------------------------------------------
       (instance? LongValue expr)      types/oid-int8
       (instance? DoubleValue expr)    types/oid-float8
+      ;; Bit-string literals MUST precede StringValue — JSqlParser also
+      ;; uses StringValue for `B'1001000'` (prefix "B"). PG types both
+      ;; `B'…'` and `X'…'` as bit (1560), not text (issue #28).
+      (bits/bit-string-literal? expr)  types/oid-bit
       (instance? StringValue expr)    types/oid-text
       (instance? NullValue expr)      types/oid-text
       (instance? BooleanValue expr)   types/oid-bool
@@ -547,8 +554,34 @@
       (instance? Division expr)       types/oid-float8  ; PG: integer div is exact
       (instance? Modulo expr)         (binary-arith-oid expr env)
 
-      ;; --- String concat (||) -------------------------------------------
-      (instance? Concat expr) types/oid-text
+      ;; --- Bitwise operators ---------------------------------------------
+      ;; `& | << >>` return the operand type: bit for bit operands (PG
+      ;; declares them only on bit, so even varbit operands yield bit),
+      ;; otherwise the promoted integer type.
+      (or (instance? BitwiseAnd expr) (instance? BitwiseOr expr)
+          (instance? BitwiseLeftShift expr) (instance? BitwiseRightShift expr))
+      (let [^BinaryExpression e expr
+            l (expr-oid (.getLeftExpression e) env)]
+        (if (or (= l types/oid-bit) (= l types/oid-varbit))
+          types/oid-bit
+          (binary-arith-oid e env)))
+
+      ;; `^` is exponentiation, not xor — float8 for integer operands,
+      ;; matching PG's preference for float8 over numeric when neither
+      ;; `^(float8,float8)` nor `^(numeric,numeric)` matches exactly.
+      (instance? BitwiseXor expr) types/oid-float8
+
+      ;; --- Concat (||) ---------------------------------------------------
+      ;; bit || bit is `bitcat`, whose result is always bit varying (the
+      ;; widths add, so no fixed-width type fits) — PG resolves the
+      ;; varbit operator, not the text one. Everything else concatenates
+      ;; as text.
+      (instance? Concat expr)
+      (let [^BinaryExpression e expr]
+        (if (and (some-> (.getLeftExpression e) (expr-oid env) (= types/oid-bit))
+                 (some-> (.getRightExpression e) (expr-oid env) (= types/oid-bit)))
+          types/oid-varbit
+          types/oid-text))
 
       ;; --- Array constructor / subscript --------------------------------
       ;; ARRAY[…] → T[] where T is the LUB of element OIDs; fall back
@@ -616,8 +649,41 @@
           (str/includes? (or k "") "time") types/oid-timestamptz
           :else types/oid-timestamptz))
 
-      ;; --- Placeholders — bind params use the param-oid hint -----------
+      ;; --- Placeholders -------------------------------------------------
+      ;; A bare `$N` has no statically inferable type here: PG types it
+      ;; from the Parse message's declared OID, which is per-statement
+      ;; and therefore can't live in the (SQL-keyed) parse cache. We
+      ;; return nil and let describeResult resolve it via
+      ;; `param-placeholder-index` below. See issue #27.
       (instance? JdbcParameter expr)        nil
       (instance? JdbcNamedParameter expr)   nil
 
       :else nil)))
+
+(defn param-placeholder-index
+  "The 1-based `$N` index when `expr` is a bare parameter placeholder,
+   else nil.
+
+   Only a *bare* placeholder qualifies. `$1::int4` is a CastExpression
+   whose type `cast-oid` already resolves, and `$1 + 1` gets its type
+   from the arithmetic rule — in both cases PG takes the type from the
+   expression, not from the parameter declaration, so reporting an index
+   there would let a declared OID override a correctly inferred one.
+
+   Parenthesised placeholders are unwrapped: PG's exprType sees through
+   parens, so `SELECT ($1)` types the same as `SELECT $1`. JSqlParser
+   spells a parenthesised expression two ways — `Parenthesis`, and
+   `ParenthesedExpressionList` (a one-element list) for a select item —
+   so both are unwrapped, repeatedly for `SELECT (($1))`."
+  [expr]
+  (loop [expr expr]
+    (cond
+      (instance? Parenthesis expr)
+      (recur (.getExpression ^Parenthesis expr))
+
+      (and (instance? ParenthesedExpressionList expr)
+           (= 1 (.size ^ParenthesedExpressionList expr)))
+      (recur (.get ^ParenthesedExpressionList expr 0))
+
+      (instance? JdbcParameter expr)
+      (.getIndex ^JdbcParameter expr))))

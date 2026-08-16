@@ -534,6 +534,35 @@
             (aset-int typmods i (int tm)))))
       (when @any? [toids attnums typmods]))))
 
+(defn- effective-item-oids
+  "`:select-item-oids` with bare-`$N` output columns resolved from the
+   Parse message's declared parameter OIDs.
+
+   oid-infer can't type a bare placeholder statically — `SELECT $1` has
+   no expression context — so PG takes the type straight from the Parse
+   declaration. `:select-item-param-idx` records which output columns
+   are bare placeholders at parse time (cacheable, since it's a property
+   of the SQL text); the declared OIDs are per-Parse-message and get
+   merged in here. Returns nil unchanged for the simple-query path,
+   which has neither key. See issue #27.
+
+   Both Describe and Execute go through this so the RowDescription OID
+   and the OID the DataRow is encoded under agree — a mismatch corrupts
+   binary-format decoding on the client."
+  [parsed]
+  (let [item-oids (:select-item-oids parsed)
+        param-idx (:select-item-param-idx parsed)
+        declared  (:declared-param-oids parsed)]
+    (if (and item-oids (seq param-idx) (seq declared))
+      (vec (map-indexed
+            (fn [i o]
+              (or o
+                  (when-let [p (nth param-idx i nil)]
+                    (let [d (get declared p)]
+                      (when (and d (pos? d)) d)))))
+            item-oids))
+      item-oids)))
+
 (defn- compute-schema-oids
   "Resolve the PG OID for each :find element of a parsed SELECT.
 
@@ -670,6 +699,23 @@
 
 (defn- empty-result [tag]
   (PgWireServer$QueryResult/empty tag))
+
+(defn- insert-affected-count
+  "Row count for an INSERT's CommandComplete tag.
+
+   `:count` is the parse-time number of VALUES rows, which is right for
+   a plain INSERT but not for ON CONFLICT: PG counts only the rows the
+   statement actually inserted or updated, so a DO NOTHING that hit a
+   conflict reports `INSERT 0 0` and a three-row VALUES with one
+   conflict reports `INSERT 0 2`. The upsert tx-fn tallies the real
+   number into `:affected-count` as it runs.
+
+   Falls back to `:count` for every non-upsert INSERT, which has no
+   such atom."
+  [parsed]
+  (if-let [a (:affected-count parsed)]
+    @a
+    (:count parsed)))
 
 (defn- error-result
   "Build an error QueryResult. Optional sqlstate defaults to \"XX000\".
@@ -2309,7 +2355,7 @@
                           (filterv has-row? ordered-eids)
                           (filterv has-row? (vals tempids)))]
           (build-returning-result returning db data-eids table-name schema))
-        (empty-result (str "INSERT 0 " (:count parsed)))))
+        (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
@@ -3439,6 +3485,7 @@
     :pg-keywords            {:names ["string_agg"]                 :oids [PgWireServer/OID_TEXT]}
     :nextval                {:names ["nextval"]                    :oids [PgWireServer/OID_INT8]}
     :currval                {:names ["currval"]                    :oids [PgWireServer/OID_INT8]}
+    :lastval                {:names ["lastval"]                    :oids [PgWireServer/OID_INT8]}
     :setval                 {:names ["setval"]                     :oids [PgWireServer/OID_INT8]}
     :set-config             {:names ["set_config"]                 :oids [PgWireServer/OID_TEXT]}
     :advisory-lock          {:names ["pg_advisory_lock"]           :oids [OID_VOID]}
@@ -4378,9 +4425,22 @@
 
 (defn- handle-nextval
   "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
-  [{:keys [conn]} parsed]
+  [{:keys [conn session-state]} parsed]
   (try
-    (single-row-result "nextval" PgWireServer/OID_INT8 (str (nextval! conn (:seq-name parsed))))
+    (let [v (nextval! conn (:seq-name parsed))]
+      ;; Remember which sequence this session last advanced so lastval()
+      ;; can answer. PG scopes lastval to the session for exactly this
+      ;; reason — it is the "what id did my INSERT just get" idiom, and
+      ;; a global answer would hand back another connection's value.
+      (when session-state
+        (swap! session-state
+               (fn [st]
+                 (-> st
+                     (assoc :last-sequence (:seq-name parsed))
+                     ;; currval is only defined for sequences THIS
+                     ;; session has advanced.
+                     (update :seq-called (fnil conj #{}) (:seq-name parsed))))))
+      (single-row-result "nextval" PgWireServer/OID_INT8 (str v)))
     (catch Exception e
       ;; No prefix: every error reachable here is already PG-shaped
       ;; ("relation \"s\" does not exist", "nextval: reached maximum
@@ -4388,46 +4448,109 @@
       (classified-error "" e))))
 
 (defn- handle-currval
-  "SELECT currval('seq_name') — read current value. PG raises 55000 if
-   nextval hasn't fired in this session; we return 0 instead (simpler
-   and good enough for the common idempotent-seed pattern)."
-  [{:keys [conn tx-state]} parsed]
+  "SELECT currval('seq_name') — the value this SESSION last obtained
+   from the sequence.
+
+   PG scopes currval to the connection and raises 55000 when the
+   session hasn't called nextval (or a 3-arg setval with is_called
+   true) on that sequence yet. We used to return the sequence's stored
+   value — or 0 for a never-advanced one — which is a different
+   function: it hands back whatever another connection did last. That
+   is precisely the value currval exists to NOT give you, since the
+   caller reads it as \"the id my insert just got\"."
+  [{:keys [conn tx-state session-state]} parsed]
   (try
     (let [seq-name (some-> (:seq-name parsed)
                            (#(if (clojure.string/includes? % ".")
-                               (last (clojure.string/split % #"\." 2)) %)))
-          lookup-db (if (:in-tx? @tx-state)
-                      (:speculative-db @tx-state)
-                      (d/db conn))
-          curr-val (ffirst (d/q '{:find [?v]
-                                  :where [[?e :__seq__/name ?n]
-                                          [?e :__seq__/value ?v]]
-                                  :in [$ ?n]}
-                                lookup-db seq-name))]
-      (single-row-result "currval" PgWireServer/OID_INT8 (str (or curr-val 0))))
+                               (last (clojure.string/split % #"\." 2)) %)))]
+      (when-not (contains? (:seq-called @session-state #{}) seq-name)
+        ;; ex-info with an explicit :sqlstate rather than errors/pg-error:
+        ;; the latter's :detail also lands in the ErrorResponse's D field,
+        ;; and PG sends no DETAIL for this one.
+        (throw (ex-info (str "currval of sequence \"" seq-name
+                             "\" is not yet defined in this session")
+                        {:sqlstate "55000"})))
+      (let [lookup-db (if (:in-tx? @tx-state)
+                        (:speculative-db @tx-state)
+                        (d/db conn))
+            curr-val (ffirst (d/q '{:find [?v]
+                                    :where [[?e :__seq__/name ?n]
+                                            [?e :__seq__/value ?v]]
+                                    :in [$ ?n]}
+                                  lookup-db seq-name))]
+        (single-row-result "currval" PgWireServer/OID_INT8 (str curr-val))))
     (catch Exception e
-      (classified-error "currval error: " e))))
+      (classified-error "" e))))
+
+(defn- handle-lastval
+  "SELECT lastval() — the value nextval most recently returned in this
+   session.
+
+   PG raises 55000 when nextval hasn't run yet on this connection, and
+   that error is the point of the function: it is how a client learns
+   its \"give me the id I just inserted\" call had nothing to report,
+   rather than silently receiving someone else's number. (currval is
+   laxer here for historical reasons — see handle-currval.)"
+  [{:keys [conn tx-state session-state]} _parsed]
+  (try
+    (let [seq-name (:last-sequence @session-state)]
+      (when-not seq-name
+        (throw (ex-info "lastval is not yet defined in this session"
+                        {:sqlstate "55000"})))
+      (let [lookup-db (if (:in-tx? @tx-state)
+                        (:speculative-db @tx-state)
+                        (d/db conn))
+            v (ffirst (d/q '{:find [?v]
+                             :where [[?e :__seq__/name ?n]
+                                     [?e :__seq__/value ?v]]
+                             :in [$ ?n]}
+                           lookup-db seq-name))]
+        (single-row-result "lastval" PgWireServer/OID_INT8 (str v))))
+    (catch Exception e
+      (classified-error "" e))))
 
 (defn- handle-setval
   "SELECT setval('seq_name', N[, is_called]) — force the sequence to N.
-   Returns the new value; PG's 3-arg form's is_called flag controls
-   whether the NEXT nextval returns N or N+increment, which we ignore
-   (we just persist N)."
-  [{:keys [conn tx-state]} parsed]
+
+   Returns N. The 3-arg form's `is_called` decides what the NEXT
+   nextval produces: with true (and for the 2-arg form) it is
+   N + increment, with false it is N itself. We store the last value
+   HANDED OUT, so `is_called false` persists `N - increment` — ignoring
+   the flag, as this used to, made `setval(s,10,false)` followed by
+   `nextval(s)` answer 11 where PG answers 10.
+
+   Also range-checks N against the sequence's MINVALUE/MAXVALUE (PG:
+   22003) instead of silently storing an out-of-range position."
+  [{:keys [conn tx-state session-state]} parsed]
   (try
     (let [seq-name (some-> (:seq-name parsed)
                            (#(if (clojure.string/includes? % ".")
                                (last (clojure.string/split % #"\." 2)) %)))
           new-val (:new-value parsed)
+          is-called? (get parsed :is-called true)
           lookup-db (if (:in-tx? @tx-state)
                       (:speculative-db @tx-state)
                       (d/db conn))
           seq-eid (ffirst (d/q '{:find [?e]
                                  :where [[?e :__seq__/name ?n]]
                                  :in [$ ?n]}
-                               lookup-db seq-name))]
+                               lookup-db seq-name))
+          seq-ent (when seq-eid (d/pull lookup-db '[*] seq-eid))
+          increment (get seq-ent :__seq__/increment 1)
+          minv (get seq-ent :__seq__/minvalue Long/MIN_VALUE)
+          maxv (get seq-ent :__seq__/maxvalue Long/MAX_VALUE)]
+      (when (and seq-eid (or (< new-val minv) (> new-val maxv)))
+        (throw (ex-info (str "setval: value " new-val
+                             " is out of bounds for sequence \"" seq-name
+                             "\" (" minv ".." maxv ")")
+                        {:sqlstate "22003"})))
       (if seq-eid
-        (let [setval-tx [[:db/add seq-eid :__seq__/value new-val]]]
+        (let [stored (if is-called? new-val (- new-val increment))
+              setval-tx [[:db/add seq-eid :__seq__/value stored]]]
+          ;; setval(…, true) defines currval for this session, exactly
+          ;; as a nextval would; setval(…, false) does not.
+          (when (and session-state is-called?)
+            (swap! session-state update :seq-called (fnil conj #{}) seq-name))
           (if (:in-tx? @tx-state)
             (let [spec-report (dc/with (:speculative-db @tx-state) setval-tx)]
               (swap! tx-state (fn [st]
@@ -4438,7 +4561,7 @@
           (single-row-result "setval" PgWireServer/OID_INT8 (str new-val)))
         (error-result (str "Sequence not found: " seq-name))))
     (catch Exception e
-      (classified-error "setval error: " e))))
+      (classified-error "" e))))
 
 ;; ============================================================================
 ;; Per-type executors — each handles one (:type parsed) value.
@@ -4673,6 +4796,7 @@
       ;; Sequence functions (classify supplies :seq-name / :new-value)
       :nextval           (handle-nextval ctx parsed)
       :currval           (handle-currval ctx parsed)
+      :lastval           (handle-lastval ctx parsed)
       :setval            (handle-setval ctx parsed)
 
       ;; datahike.* branching / versioning
@@ -4843,7 +4967,7 @@
           keep-n (- (count (:find query)) hidden)
           parsed-with-shape (assoc parsed :find-aliases aliases :query query)
           schema-oids (compute-schema-oids parsed-with-shape db)
-          item-oids (:select-item-oids parsed)
+          item-oids (effective-item-oids parsed)
           schema-oids (if (and item-oids (seq aliases))
                         (let [n (count aliases)
                               out (int-array n)]
@@ -4940,7 +5064,7 @@
       ;; (via a synthetic schema-oids array keyed by
       ;; -1 sentinel) so SELECT TRUE reports BOOL even when
       ;; value inference would look at a String.
-      (let [item-oids (:select-item-oids parsed)
+      (let [item-oids (effective-item-oids parsed)
             schema-oids (when item-oids
                           (int-array
                            (map #(int (or % -1)) item-oids)))]
@@ -5250,7 +5374,7 @@
               ;; CAST / literal columns keep the
               ;; correct type when value inference
               ;; would otherwise fall back to TEXT.
-                  item-oids (:select-item-oids parsed)
+                  item-oids (effective-item-oids parsed)
                   schema-oids (if (and item-oids (seq find-aliases))
                                 (let [n (count find-aliases)
                                       out (int-array n)]
@@ -5379,7 +5503,7 @@
                               (filterv has-row? ordered-eids)
                               (filterv has-row? (vals tempids-map)))]
               (build-returning-result returning db-after data-eids table-name (:schema db-after)))
-            (empty-result (str "INSERT 0 " (:count parsed)))))
+            (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
@@ -6502,7 +6626,7 @@
 
       ;; --- Extended Query protocol methods -------------------------------
 
-      (parse [_ sql _param-oids]
+      (parse [_ sql param-oids]
         ;; Translate once, return the parsed map as opaque state. The
         ;; wire layer caches it under the Parse stmt name and feeds it
         ;; back via executePrepared. Note: `db` captured at parse time
@@ -6540,7 +6664,19 @@
                   ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                   ;; working even though parse-sql may not have set it for
                   ;; non-system types.
-                  parsed (assoc parsed :sql sql)]
+                  ;;
+                  ;; :declared-param-oids carries the Parse message's own
+                  ;; type declarations (1-indexed to match `$N`; 0 = "you
+                  ;; infer it"). They are attached HERE rather than passed
+                  ;; into parse-sql because the parse cache is keyed by SQL
+                  ;; text alone — baking per-statement declarations into a
+                  ;; shared cached map would let one client's `$1::int2`
+                  ;; leak into another's `$1::text`. describeParams and
+                  ;; describeResult read them back off this map.
+                  parsed (assoc parsed :sql sql
+                                :declared-param-oids
+                                (into {} (map-indexed (fn [i o] [(inc i) o]))
+                                      (seq param-oids)))]
               (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
@@ -6568,13 +6704,22 @@
         ;; until Python's RecursionError. Defaulting to TEXT matches PG and
         ;; the bind path (an oid-0 param was already decoded as a text
         ;; string), so binding behaviour is unchanged.
+        ;; A client-declared non-zero OID wins over our inference, the
+        ;; same precedence handleParse applies — PG only resolves the
+        ;; slots the client left as 0. Without this a `$1` the client
+        ;; declared as int2 would describe as text (issue #27).
         (let [n (or (:param-count parsed) 0)
               hints (:param-oids parsed)
+              declared (:declared-param-oids parsed)
               arr (int-array n)]
           (when (pos? n)
             (dotimes [i n]
-              (aset arr i (int (let [o (get hints (inc i))]
-                                 (if (and o (pos? o)) o PgWireServer/OID_TEXT))))))
+              (aset arr i (int (let [d (get declared (inc i))
+                                     o (get hints (inc i))]
+                                 (cond
+                                   (and d (pos? d)) d
+                                   (and o (pos? o)) o
+                                   :else PgWireServer/OID_TEXT))))))
           arr))
 
       (describeResult [_ parsed]        ;; Return the column metadata for a prepared SELECT without
@@ -6648,7 +6793,10 @@
                 ;; they cover literals, aggregates, CAST, function
                 ;; calls, and arithmetic — shapes that have no schema
                 ;; attribute. See datahike.pg.sql.oid-infer.
-                item-oids (:select-item-oids parsed)
+                ;; Bare `$N` output columns are typed from the Parse
+                ;; message's declared OID — see effective-item-oids
+                ;; (issue #27).
+                item-oids (effective-item-oids parsed)
                 oids (int-array
                       (for [i (range (count aliases))]
                         (let [schema-oid (aget ^ints resolved i)
@@ -6799,275 +6947,288 @@
                 "current transaction is aborted, commands ignored until end of transaction block"
                 "25P02")
                tx-state)
-              (try
-                (when on-query (on-query sql))
-                (let [;; Check for temporal SET commands first
-                      temporal-set (parse-temporal-set sql)
-                      timeout-ms  (when-not temporal-set (parse-statement-timeout sql))]
-                  (cond
-                    temporal-set
-                    (let [[k v] temporal-set]
-                      (if v
-                        (swap! session-state assoc k
-                               (case k
-                                 :history   true
-                                 :branch    (keyword v)
-                                 :commit-id (try (java.util.UUID/fromString v)
-                                                 (catch Exception _
-                                                   (throw (ex-info "invalid commit UUID"
-                                                                   {:error :invalid-text-representation
-                                                                    :type "uuid"
-                                                                    :value v}))))
-                                 (parse-instant v)))
-                        (swap! session-state dissoc k))
-                      (empty-result "SET"))
-                    timeout-ms
-                    (do (if (zero? timeout-ms)
-                          (swap! session-state dissoc :statement-timeout)
-                          (swap! session-state assoc :statement-timeout timeout-ms))
+              ;; A `$N` in Simple Query has nothing to bind to — PG
+              ;; raises 42P02 rather than executing. Checked here rather
+              ;; than in parse-sql because the extended path shares that
+              ;; function and resolves placeholders at Bind.
+              ;;
+              ;; `execute` serves BOTH protocols — executePrepared
+              ;; delegates here with *cached-parsed* bound — so that
+              ;; binding is what distinguishes them. Without the guard
+              ;; every prepared statement with a parameter would be
+              ;; rejected.
+              (if-let [pe (and (nil? *cached-parsed*)
+                               (sql/simple-query-param-error sql))]
+                (error-result (:message pe) (:sqlstate pe))
+                (try
+                  (when on-query (on-query sql))
+                  (let [;; Check for temporal SET commands first
+                        temporal-set (parse-temporal-set sql)
+                        timeout-ms  (when-not temporal-set (parse-statement-timeout sql))]
+                    (cond
+                      temporal-set
+                      (let [[k v] temporal-set]
+                        (if v
+                          (swap! session-state assoc k
+                                 (case k
+                                   :history   true
+                                   :branch    (keyword v)
+                                   :commit-id (try (java.util.UUID/fromString v)
+                                                   (catch Exception _
+                                                     (throw (ex-info "invalid commit UUID"
+                                                                     {:error :invalid-text-representation
+                                                                      :type "uuid"
+                                                                      :value v}))))
+                                   (parse-instant v)))
+                          (swap! session-state dissoc k))
                         (empty-result "SET"))
-                    :else
-                    (let [;; SQL:2011 `FOR VALID_TIME …` per-statement
-                          ;; preprocessor: strip the clause and apply its
-                          ;; override to apply-temporal for this query only.
-                          ;; Session-state is untouched. See
-                          ;; `datahike.pg.sql.temporal/preprocess`.
-                          {stripped-sql :sql per-stmt-override :override}
-                          (sql-temporal/preprocess sql)
-                          sql stripped-sql
-                          ;; FETCH from a cursor binds *snapshot-db* so the
-                    ;; SELECT sees the state captured at DECLARE, not
-                    ;; whatever committed since. Non-cursor paths get
-                    ;; the normal live db.
-                          real-db (or *snapshot-db*
-                                      (apply-temporal (d/db conn) session-state per-stmt-override))
-                          db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
-                               (or (:speculative-db @tx-state) real-db)
-                               real-db)
-                          ;; Use the IDB protocol method, not keyword
-                          ;; access. AsOfDB / SinceDB / HistoricalDB are
-                          ;; defrecords with only [origin-db time-point]
-                          ;; fields; `(:schema wrapper)` returns nil
-                          ;; because defrecord ILookup never reaches the
-                          ;; protocol. `(dbi/-schema wrapper)` correctly
-                          ;; delegates to origin-db's schema (datahike's
-                          ;; `db.cljc:553`). Without this, SELECT under
-                          ;; `SET datahike.as_of = …` collapses to errors
-                          ;; like \"Query for unknown vars\" because
-                          ;; column-info / derive-virtual-tables receive
-                          ;; an empty schema map. Note: the schema
-                          ;; returned is the *current* schema cached on
-                          ;; the origin-db, not a true historical schema —
-                          ;; columns added after the as-of timestamp are
-                          ;; visible to the translator but contain no
-                          ;; data at that time. A real historical schema
-                          ;; would require a `schema-as-of` upstream in
-                          ;; datahike (see TODO).
-                          schema (dbi/-schema db)
-                    ;; Prepared-statement path: reuse the Parse-time result
-                    ;; and resolve ParamRef placeholders against the bound
-                    ;; values decoded by the wire layer. Simple Query and
-                    ;; non-parameterized prepared statements re-parse — bump
-                    ;; the dispatch counter only on the re-parse branch
-                    ;; (Extended-Query Parse already counted at this.parse).
-                          {parsed :parsed templated-bound :bound}
-                          (if-let [cached *cached-parsed*]
-                            {:parsed
-                             (if-let [bound *cached-bound*]
-                               ;; Re-coerce INSERT values after ParamRef
-                               ;; substitution so untyped text params
-                               ;; (e.g. node-postgres "270" → int column)
-                               ;; narrow to the column's :db/valueType.
-                               (coerce-insert-tx-data
-                                (resolve-param-refs cached bound) schema)
-                               cached)}
-                            ;; Simple-protocol plan stability: rewrite
-                            ;; bare number literals to $N so every cache
-                            ;; layer (AST, parse result, datalog parse,
-                            ;; plan) keys on ONE shape per statement
-                            ;; family, then execute like a one-shot
-                            ;; prepared statement. Any parse error on
-                            ;; the templated form falls back to the
-                            ;; original SQL untouched. Only reachable
-                            ;; with *cached-parsed* nil (this if-let's
-                            ;; else-branch), so the extended-query path
-                            ;; never re-templates its $N statements.
-                            (or (when-let [{tsql :sql tvals :params}
-                                           (template/parameterize-numbers sql)]
-                                  (let [p (sql/parse-sql tsql schema db)]
-                                    (when (and p (not= :error (:type p))
-                                               (contains? #{:select :update :delete}
-                                                          (:type p)))
-                                      (when bump-dispatch! (bump-dispatch! p))
-                                      ;; ParamRefs are 1-indexed; prepend
-                                      ;; an unused slot like the wire path.
-                                      (let [bound (into [nil] tvals)]
-                                        {:parsed (resolve-param-refs p bound)
-                                         ;; UPDATE/DELETE re-translate their
-                                         ;; WHERE AST at execute time and eval
-                                         ;; SET expressions against
-                                         ;; *cached-bound* — carry the values
-                                         ;; to the dispatch arms below, exactly
-                                         ;; as executePrepared's binding does.
-                                         ;; SELECT is fully resolved by the
-                                         ;; substitution above. :insert never
-                                         ;; reaches here (own templater), so
-                                         ;; skipping coerce-insert-tx-data —
-                                         ;; :insert-gated — is a no-op.
-                                         :bound (when (not= :select (:type p))
-                                                  bound)}))))
-                                {:parsed (let [p (sql/parse-sql sql schema db)]
-                                           (when bump-dispatch! (bump-dispatch! p))
-                                           p)}))
-                          ;; Sibling pass to ParamRef substitution: any
-                          ;; `nextval('s')` markers left in tx-data/in-args
-                          ;; resolve here against the live conn (PG's
-                          ;; non-transactional nextval semantics).
-                          ;;
-                          ;; MUST run before freshen-tx-tempids: translate-
-                          ;; insert puts the SAME marker object in both the
-                          ;; `:db.fn/call` unique-check arg and the outer
-                          ;; entity-map, and resolve-nextvals! dedups by
-                          ;; object identity so one textual `nextval(...)`
-                          ;; advances the sequence once. freshen-tx-tempids
-                          ;; postwalk-rebuilds tx-data, which clones the
-                          ;; marker into two distinct objects — running it
-                          ;; first would defeat the dedup and double-bump.
-                          parsed (resolve-nextval-markers parsed conn)
-                          ;; Give a reused INSERT a fresh tempid per
-                          ;; execution. parse-sql is LRU-cached and
-                          ;; prepared statements are reused, so the cached
-                          ;; gensym tempid would otherwise repeat across
-                          ;; rows committed together in one implicit-tx
-                          ;; group (executemany) and collapse them onto a
-                          ;; single entity. See freshen-tx-tempids.
-                          parsed (freshen-tx-tempids parsed)]
-                      ;; ctx is the dispatch context shared across every
-                      ;; per-type executor. Keys:
-                      ;;   :conn           — Datahike conn for THIS db
-                      ;;   :session-id     — UUID, unique per pgwire connection
-                      ;;   :session-state  — atom of session GUCs / temporal vars
-                      ;;   :tx-state       — atom of {:in-tx? :aborted? :tx-buffer …}
-                      ;;   :sql-prepared   — atom of session-scope PREPAREd stmts
-                      ;;   :cursors        — atom of session-scope DECLAREd cursors
-                      ;;   :silently-accept — set of reject-kinds to swallow as success
-                      ;;   :handler        — the QueryHandler reify (for re-entrancy)
-                      ;;   :sql            — the original SQL string
-                      ;;   :db             — speculative or live Datahike db value
-                      ;;   :schema         — (dbi/-schema db); cached to avoid repeated reach-in
-                      ;;   :on-create-database / :on-delete-database
-                      ;;                   — operator-supplied provisioning hooks for SQL
-                      ;;                     CREATE/DROP DATABASE; nil → 0A000
-                      ;;   :registry-atom  — server-level {name → conn} atom; CREATE/DROP
-                      ;;                     DATABASE swap! through it
-                      ;;   :copy-state     — atom holding the COPY-IN session
-                      ;;                     (decoder, decoder fns, target table, batch
-                      ;;                     accumulator, rows-committed counter); set
-                      ;;                     by exec-copy-from-stdin, mutated by
-                      ;;                     copyChunk/copyComplete/copyAbort callbacks
-                      (let [ctx {:conn conn
-                                 :session-id session-id
-                                 :session-state session-state
-                                 :tx-state tx-state
-                                 :sql-prepared sql-prepared
-                                 :cursors cursors
-                                 :copy-state copy-state
-                                 :temp-tables temp-tables
-                                 :batch-state batch-state
-                                 :silently-accept silently-accept
-                                 :handler this
-                                 :sql sql
-                                 :db db
-                                 :schema schema
-                                 :on-create-database on-create-database
-                                 :on-delete-database on-delete-database
-                                 :registry-atom registry-atom
-                                 ;; Optional `(fn [tx-data] -> tx-data)`
-                                 ;; called BEFORE every INSERT/UPDATE/
-                                 ;; DELETE's d/transact. Lets framework
-                                 ;; consumers (e.g. datahike-accounting)
-                                 ;; inject [:db.fn/call validate tx-data]
-                                 ;; so their transactor-side validators
-                                 ;; fire for SQL writes too. Default:
-                                 ;; identity (no wrap).
-                                 ;;
-                                 ;; SCOPE: fires on auto-commit paths
-                                 ;; (typical psql Simple Query) — both
-                                 ;; the regular and batchable INSERT
-                                 ;; flows. NOT yet wrapping in-tx
-                                 ;; (BEGIN/COMMIT) writes, which buffer
-                                 ;; via dc/with against a speculative
-                                 ;; db and flush at commit; that path
-                                 ;; would need wrap firing both
-                                 ;; speculatively per-statement and at
-                                 ;; commit. Track-issue follow-up.
-                                 :tx-wrap (or tx-wrap identity)}]
-                        ;; Implicit-transaction (extended-query groups):
-                        ;; a write outside an explicit BEGIN opens an
-                        ;; implicit tx so the rest of its message group
-                        ;; (up to Sync) commits/rolls-back atomically.
-                        ;; See open-implicit-tx! / commitImplicit and
-                        ;; doc/design-alignment.md.
-                        (when (and *implicit-tx-allowed*
-                                   (not *snapshot-db*)
-                                   (not (:in-tx? @tx-state))
-                                   (contains? write-parse-types (:type parsed)))
-                          (open-implicit-tx! ctx))
-                        (case (:type parsed)
-                          :system                (exec-system ctx parsed)
-                          :select                (exec-select ctx parsed)
-                          :insert                (exec-insert ctx parsed)
-                          :update-with-recursive (exec-update-with-recursive ctx parsed)
-                          ;; Templated simple-protocol UPDATE/DELETE ride
-                          ;; the prepared-statement machinery: the exec
-                          ;; paths re-translate WHERE and evaluate SET
-                          ;; against *cached-bound* (1-indexed, slot 0
-                          ;; unused), so bind the templater's captured
-                          ;; literals here. `or` keeps the real
-                          ;; executePrepared binding when not templated.
-                          :update                (binding [*cached-bound*
-                                                           (or templated-bound *cached-bound*)]
-                                                   (exec-update ctx parsed))
-                          :delete                (binding [*cached-bound*
-                                                           (or templated-bound *cached-bound*)]
-                                                   (exec-delete ctx parsed))
-                          :truncate              (exec-truncate ctx parsed)
-                          ;; Every DDL exec-* invalidates the per-schema cache.
-                          ;; PG metadata (`:pg/not-null` etc.) lives on schema-
-                          ;; attribute entities but not in `(dbi/-schema db)`, so
-                          ;; identity-keyed caches can't detect a constraint
-                          ;; add via ALTER TABLE without an explicit bust.
-                          :ddl-create            (do (invalidate-schema-cache!)
-                                                     (exec-ddl-create ctx parsed))
-                          :ddl-create-sequence   (do (invalidate-schema-cache!)
-                                                     (exec-ddl-create-sequence ctx parsed))
-                          :ddl-alter-sequence    (do (invalidate-schema-cache!)
-                                                     (exec-ddl-alter-sequence ctx parsed))
-                          :ddl-create-enum       (do (invalidate-schema-cache!)
-                                                     (exec-ddl-create-enum ctx parsed))
-                          :ddl-create-composite  (do (invalidate-schema-cache!)
-                                                     (exec-ddl-create-composite ctx parsed))
-                          :ddl-create-domain     (do (invalidate-schema-cache!)
-                                                     (exec-ddl-create-domain ctx parsed))
-                          :savepoint             (exec-savepoint ctx parsed)
-                          :release-savepoint     (exec-release-savepoint ctx parsed)
-                          :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
-                          :ddl-create-index      (do (invalidate-schema-cache!)
-                                                     (exec-ddl-create-index ctx parsed))
-                          :ddl-alter             (do (invalidate-schema-cache!)
-                                                     (exec-ddl-alter ctx parsed))
-                          :ddl-drop              (do (invalidate-schema-cache!)
-                                                     (exec-ddl-drop ctx parsed))
-                          :ddl-drop-sequence     (do (invalidate-schema-cache!)
-                                                     (exec-ddl-drop-sequence ctx parsed))
-                          :set-operation         (exec-set-operation ctx parsed)
-                          :full-join             (exec-full-join ctx parsed)
-                          :error                 (exec-error ctx parsed)
-                          ;; fallback
-                          (error-result (str "Unknown parse result type: " (:type parsed))))))))
-                (catch Exception e
-                  (when (:in-tx? @tx-state) (swap! tx-state assoc :aborted? true))
-                  (classified-error "" e))))))))))
+                      timeout-ms
+                      (do (if (zero? timeout-ms)
+                            (swap! session-state dissoc :statement-timeout)
+                            (swap! session-state assoc :statement-timeout timeout-ms))
+                          (empty-result "SET"))
+                      :else
+                      (let [;; SQL:2011 `FOR VALID_TIME …` per-statement
+                            ;; preprocessor: strip the clause and apply its
+                            ;; override to apply-temporal for this query only.
+                            ;; Session-state is untouched. See
+                            ;; `datahike.pg.sql.temporal/preprocess`.
+                            {stripped-sql :sql per-stmt-override :override}
+                            (sql-temporal/preprocess sql)
+                            sql stripped-sql
+                            ;; FETCH from a cursor binds *snapshot-db* so the
+                      ;; SELECT sees the state captured at DECLARE, not
+                      ;; whatever committed since. Non-cursor paths get
+                      ;; the normal live db.
+                            real-db (or *snapshot-db*
+                                        (apply-temporal (d/db conn) session-state per-stmt-override))
+                            db (if (and (not *snapshot-db*) (:in-tx? @tx-state))
+                                 (or (:speculative-db @tx-state) real-db)
+                                 real-db)
+                            ;; Use the IDB protocol method, not keyword
+                            ;; access. AsOfDB / SinceDB / HistoricalDB are
+                            ;; defrecords with only [origin-db time-point]
+                            ;; fields; `(:schema wrapper)` returns nil
+                            ;; because defrecord ILookup never reaches the
+                            ;; protocol. `(dbi/-schema wrapper)` correctly
+                            ;; delegates to origin-db's schema (datahike's
+                            ;; `db.cljc:553`). Without this, SELECT under
+                            ;; `SET datahike.as_of = …` collapses to errors
+                            ;; like \"Query for unknown vars\" because
+                            ;; column-info / derive-virtual-tables receive
+                            ;; an empty schema map. Note: the schema
+                            ;; returned is the *current* schema cached on
+                            ;; the origin-db, not a true historical schema —
+                            ;; columns added after the as-of timestamp are
+                            ;; visible to the translator but contain no
+                            ;; data at that time. A real historical schema
+                            ;; would require a `schema-as-of` upstream in
+                            ;; datahike (see TODO).
+                            schema (dbi/-schema db)
+                      ;; Prepared-statement path: reuse the Parse-time result
+                      ;; and resolve ParamRef placeholders against the bound
+                      ;; values decoded by the wire layer. Simple Query and
+                      ;; non-parameterized prepared statements re-parse — bump
+                      ;; the dispatch counter only on the re-parse branch
+                      ;; (Extended-Query Parse already counted at this.parse).
+                            {parsed :parsed templated-bound :bound}
+                            (if-let [cached *cached-parsed*]
+                              {:parsed
+                               (if-let [bound *cached-bound*]
+                                 ;; Re-coerce INSERT values after ParamRef
+                                 ;; substitution so untyped text params
+                                 ;; (e.g. node-postgres "270" → int column)
+                                 ;; narrow to the column's :db/valueType.
+                                 (coerce-insert-tx-data
+                                  (resolve-param-refs cached bound) schema)
+                                 cached)}
+                              ;; Simple-protocol plan stability: rewrite
+                              ;; bare number literals to $N so every cache
+                              ;; layer (AST, parse result, datalog parse,
+                              ;; plan) keys on ONE shape per statement
+                              ;; family, then execute like a one-shot
+                              ;; prepared statement. Any parse error on
+                              ;; the templated form falls back to the
+                              ;; original SQL untouched. Only reachable
+                              ;; with *cached-parsed* nil (this if-let's
+                              ;; else-branch), so the extended-query path
+                              ;; never re-templates its $N statements.
+                              (or (when-let [{tsql :sql tvals :params}
+                                             (template/parameterize-numbers sql)]
+                                    (let [p (sql/parse-sql tsql schema db)]
+                                      (when (and p (not= :error (:type p))
+                                                 (contains? #{:select :update :delete}
+                                                            (:type p)))
+                                        (when bump-dispatch! (bump-dispatch! p))
+                                        ;; ParamRefs are 1-indexed; prepend
+                                        ;; an unused slot like the wire path.
+                                        (let [bound (into [nil] tvals)]
+                                          {:parsed (resolve-param-refs p bound)
+                                           ;; UPDATE/DELETE re-translate their
+                                           ;; WHERE AST at execute time and eval
+                                           ;; SET expressions against
+                                           ;; *cached-bound* — carry the values
+                                           ;; to the dispatch arms below, exactly
+                                           ;; as executePrepared's binding does.
+                                           ;; SELECT is fully resolved by the
+                                           ;; substitution above. :insert never
+                                           ;; reaches here (own templater), so
+                                           ;; skipping coerce-insert-tx-data —
+                                           ;; :insert-gated — is a no-op.
+                                           :bound (when (not= :select (:type p))
+                                                    bound)}))))
+                                  {:parsed (let [p (sql/parse-sql sql schema db)]
+                                             (when bump-dispatch! (bump-dispatch! p))
+                                             p)}))
+                            ;; Sibling pass to ParamRef substitution: any
+                            ;; `nextval('s')` markers left in tx-data/in-args
+                            ;; resolve here against the live conn (PG's
+                            ;; non-transactional nextval semantics).
+                            ;;
+                            ;; MUST run before freshen-tx-tempids: translate-
+                            ;; insert puts the SAME marker object in both the
+                            ;; `:db.fn/call` unique-check arg and the outer
+                            ;; entity-map, and resolve-nextvals! dedups by
+                            ;; object identity so one textual `nextval(...)`
+                            ;; advances the sequence once. freshen-tx-tempids
+                            ;; postwalk-rebuilds tx-data, which clones the
+                            ;; marker into two distinct objects — running it
+                            ;; first would defeat the dedup and double-bump.
+                            parsed (resolve-nextval-markers parsed conn)
+                            ;; Give a reused INSERT a fresh tempid per
+                            ;; execution. parse-sql is LRU-cached and
+                            ;; prepared statements are reused, so the cached
+                            ;; gensym tempid would otherwise repeat across
+                            ;; rows committed together in one implicit-tx
+                            ;; group (executemany) and collapse them onto a
+                            ;; single entity. See freshen-tx-tempids.
+                            parsed (freshen-tx-tempids parsed)]
+                        ;; ctx is the dispatch context shared across every
+                        ;; per-type executor. Keys:
+                        ;;   :conn           — Datahike conn for THIS db
+                        ;;   :session-id     — UUID, unique per pgwire connection
+                        ;;   :session-state  — atom of session GUCs / temporal vars
+                        ;;   :tx-state       — atom of {:in-tx? :aborted? :tx-buffer …}
+                        ;;   :sql-prepared   — atom of session-scope PREPAREd stmts
+                        ;;   :cursors        — atom of session-scope DECLAREd cursors
+                        ;;   :silently-accept — set of reject-kinds to swallow as success
+                        ;;   :handler        — the QueryHandler reify (for re-entrancy)
+                        ;;   :sql            — the original SQL string
+                        ;;   :db             — speculative or live Datahike db value
+                        ;;   :schema         — (dbi/-schema db); cached to avoid repeated reach-in
+                        ;;   :on-create-database / :on-delete-database
+                        ;;                   — operator-supplied provisioning hooks for SQL
+                        ;;                     CREATE/DROP DATABASE; nil → 0A000
+                        ;;   :registry-atom  — server-level {name → conn} atom; CREATE/DROP
+                        ;;                     DATABASE swap! through it
+                        ;;   :copy-state     — atom holding the COPY-IN session
+                        ;;                     (decoder, decoder fns, target table, batch
+                        ;;                     accumulator, rows-committed counter); set
+                        ;;                     by exec-copy-from-stdin, mutated by
+                        ;;                     copyChunk/copyComplete/copyAbort callbacks
+                        (let [ctx {:conn conn
+                                   :session-id session-id
+                                   :session-state session-state
+                                   :tx-state tx-state
+                                   :sql-prepared sql-prepared
+                                   :cursors cursors
+                                   :copy-state copy-state
+                                   :temp-tables temp-tables
+                                   :batch-state batch-state
+                                   :silently-accept silently-accept
+                                   :handler this
+                                   :sql sql
+                                   :db db
+                                   :schema schema
+                                   :on-create-database on-create-database
+                                   :on-delete-database on-delete-database
+                                   :registry-atom registry-atom
+                                   ;; Optional `(fn [tx-data] -> tx-data)`
+                                   ;; called BEFORE every INSERT/UPDATE/
+                                   ;; DELETE's d/transact. Lets framework
+                                   ;; consumers (e.g. datahike-accounting)
+                                   ;; inject [:db.fn/call validate tx-data]
+                                   ;; so their transactor-side validators
+                                   ;; fire for SQL writes too. Default:
+                                   ;; identity (no wrap).
+                                   ;;
+                                   ;; SCOPE: fires on auto-commit paths
+                                   ;; (typical psql Simple Query) — both
+                                   ;; the regular and batchable INSERT
+                                   ;; flows. NOT yet wrapping in-tx
+                                   ;; (BEGIN/COMMIT) writes, which buffer
+                                   ;; via dc/with against a speculative
+                                   ;; db and flush at commit; that path
+                                   ;; would need wrap firing both
+                                   ;; speculatively per-statement and at
+                                   ;; commit. Track-issue follow-up.
+                                   :tx-wrap (or tx-wrap identity)}]
+                          ;; Implicit-transaction (extended-query groups):
+                          ;; a write outside an explicit BEGIN opens an
+                          ;; implicit tx so the rest of its message group
+                          ;; (up to Sync) commits/rolls-back atomically.
+                          ;; See open-implicit-tx! / commitImplicit and
+                          ;; doc/design-alignment.md.
+                          (when (and *implicit-tx-allowed*
+                                     (not *snapshot-db*)
+                                     (not (:in-tx? @tx-state))
+                                     (contains? write-parse-types (:type parsed)))
+                            (open-implicit-tx! ctx))
+                          (case (:type parsed)
+                            :system                (exec-system ctx parsed)
+                            :select                (exec-select ctx parsed)
+                            :insert                (exec-insert ctx parsed)
+                            :update-with-recursive (exec-update-with-recursive ctx parsed)
+                            ;; Templated simple-protocol UPDATE/DELETE ride
+                            ;; the prepared-statement machinery: the exec
+                            ;; paths re-translate WHERE and evaluate SET
+                            ;; against *cached-bound* (1-indexed, slot 0
+                            ;; unused), so bind the templater's captured
+                            ;; literals here. `or` keeps the real
+                            ;; executePrepared binding when not templated.
+                            :update                (binding [*cached-bound*
+                                                             (or templated-bound *cached-bound*)]
+                                                     (exec-update ctx parsed))
+                            :delete                (binding [*cached-bound*
+                                                             (or templated-bound *cached-bound*)]
+                                                     (exec-delete ctx parsed))
+                            :truncate              (exec-truncate ctx parsed)
+                            ;; Every DDL exec-* invalidates the per-schema cache.
+                            ;; PG metadata (`:pg/not-null` etc.) lives on schema-
+                            ;; attribute entities but not in `(dbi/-schema db)`, so
+                            ;; identity-keyed caches can't detect a constraint
+                            ;; add via ALTER TABLE without an explicit bust.
+                            :ddl-create            (do (invalidate-schema-cache!)
+                                                       (exec-ddl-create ctx parsed))
+                            :ddl-create-sequence   (do (invalidate-schema-cache!)
+                                                       (exec-ddl-create-sequence ctx parsed))
+                            :ddl-alter-sequence    (do (invalidate-schema-cache!)
+                                                       (exec-ddl-alter-sequence ctx parsed))
+                            :ddl-create-enum       (do (invalidate-schema-cache!)
+                                                       (exec-ddl-create-enum ctx parsed))
+                            :ddl-create-composite  (do (invalidate-schema-cache!)
+                                                       (exec-ddl-create-composite ctx parsed))
+                            :ddl-create-domain     (do (invalidate-schema-cache!)
+                                                       (exec-ddl-create-domain ctx parsed))
+                            :savepoint             (exec-savepoint ctx parsed)
+                            :release-savepoint     (exec-release-savepoint ctx parsed)
+                            :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
+                            :ddl-create-index      (do (invalidate-schema-cache!)
+                                                       (exec-ddl-create-index ctx parsed))
+                            :ddl-alter             (do (invalidate-schema-cache!)
+                                                       (exec-ddl-alter ctx parsed))
+                            :ddl-drop              (do (invalidate-schema-cache!)
+                                                       (exec-ddl-drop ctx parsed))
+                            :ddl-drop-sequence     (do (invalidate-schema-cache!)
+                                                       (exec-ddl-drop-sequence ctx parsed))
+                            :set-operation         (exec-set-operation ctx parsed)
+                            :full-join             (exec-full-join ctx parsed)
+                            :error                 (exec-error ctx parsed)
+                            ;; fallback
+                            (error-result (str "Unknown parse result type: " (:type parsed))))))))
+                  (catch Exception e
+                    (when (:in-tx? @tx-state) (swap! tx-state assoc :aborted? true))
+                    (classified-error "" e)))))))))))
 
 ;; ============================================================================
 ;; Server lifecycle

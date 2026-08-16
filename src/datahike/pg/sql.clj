@@ -100,6 +100,17 @@
 (def sql-*   fns/sql-*)
 (def sql-div fns/sql-div)
 (def sql-mod fns/sql-mod)
+
+;; Bitwise operators. Re-exported here because the translator emits
+;; fully-qualified `datahike.pg.sql/...` symbols that Datahike's
+;; resolve-fn looks up at execute time.
+(def sql-bit-and         fns/sql-bit-and)
+(def sql-bit-or          fns/sql-bit-or)
+(def sql-bit-xor         fns/sql-bit-xor)
+(def sql-bit-not         fns/sql-bit-not)
+(def sql-bit-shift-left  fns/sql-bit-shift-left)
+(def sql-bit-shift-right fns/sql-bit-shift-right)
+(def sql-power           fns/sql-power)
 (def null-safe fns/null-safe)
 
 ;; Context primitives moved to datahike.pg.sql.ctx. Re-export at old names
@@ -229,7 +240,18 @@
           sorted-names (sort (remove #(contains? existing (pgs/row-marker-attr %))
                                      catalog-names))
           cache *catalog-cache*
-          cache-key [(hash existing) sorted-names]]
+          ;; The schema hash alone does not identify the catalog CONTENT
+          ;; for sequence-backed tables: `nextval` moves :__seq__/value
+          ;; and a second CREATE SEQUENCE adds a row, neither of which
+          ;; touches the schema (the :__seq__/* attrs are installed by
+          ;; the FIRST CREATE SEQUENCE and never change after). Without
+          ;; this component, `SELECT last_value FROM pg_sequences` re-run
+          ;; after a nextval was served from the cache and reported the
+          ;; pre-advance value. Only paid when such a table is actually
+          ;; being materialised.
+          seq-fingerprint (when (some catalog/sequence-backed-catalogs sorted-names)
+                            (hash (catalog/sequence-state db)))
+          cache-key [(hash existing) sorted-names seq-fingerprint]]
       (cond
         (empty? sorted-names) db
         :else
@@ -1144,6 +1166,15 @@
                                                        val (cond
                                                              (instance? LongValue expr) (.getValue ^LongValue expr)
                                                              (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+                                                            ;; Bit-string literals before StringValue —
+                                                            ;; JSqlParser spells `B'1001000'` as a
+                                                            ;; StringValue with prefix "B". Returning the
+                                                            ;; bare digits here made `SELECT B'1001000'`
+                                                            ;; a text value (issue #28) and skipped the
+                                                            ;; digit validation, so `B'102'` came back as
+                                                            ;; "102" instead of raising 22P02.
+                                                             (pg-bits/bit-string-literal? expr)
+                                                             (pg-bits/bit-string-literal-value expr)
                                                              (instance? StringValue expr) (.getNotExcapedValue ^StringValue expr)
                                                              (instance? NullValue expr) :__null__
                                                             ;; Bare TRUE/FALSE — JSqlParser 5.x emits a
@@ -1180,6 +1211,14 @@
                                                                    raw (cond
                                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
                                                                          (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
+                                                                        ;; Before StringValue — see above. A bit
+                                                                        ;; source also changes what the cast MEANS:
+                                                                        ;; `B'101'::int` reinterprets the bits (5),
+                                                                        ;; it does not read the digits as decimal
+                                                                        ;; (101). cast-scalar already does that,
+                                                                        ;; but only for a PgBit input.
+                                                                         (pg-bits/bit-string-literal? inner)
+                                                                         (pg-bits/bit-string-literal-value inner)
                                                                          (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
                                                                          :else (str inner))]
                                                                (cond
@@ -1236,7 +1275,12 @@
                                                                            :else (str e)))]
                                                                (fmt expr))
                                                              :else (str expr))
-                                                       alias (or alias-str (str expr))]
+                                                       ;; PG's naming rules, not the
+                                                       ;; expression's SQL text — which is
+                                                       ;; what gave `SELECT B'1001000'` the
+                                                       ;; column name `B'1001000'`.
+                                                       alias (or alias-str
+                                                                 (stmt/figure-colname expr))]
                                                    [val alias]))
                                                select-items)]
                                      {:type :select
@@ -1546,6 +1590,69 @@
                              :param-oids {}))))
                 (catch Throwable _ nil)))))))))
 
+(def ^:private unsupported-op-chars
+  "Characters that can only appear in an OPERATOR position and that we
+   have no operator for.
+
+   `#` is PG's integer/bit XOR and the `#>` / `#>>` / `#-` jsonb path
+   operators. `$` outside a `$N` placeholder or a `$…$` dollar-quoted
+   string is not valid PG syntax at all.
+
+   Neither is legal inside an unquoted PG identifier, but JSqlParser's
+   lexer accepts both there — so `SELECT 42#` parsed as a COLUMN named
+   `42#`, resolved to nothing, and answered zero rows instead of the
+   syntax error PostgreSQL raises (issue #29). Catching it lexically
+   also keeps a future `#` operator honest: the check is over `:op`
+   tokens, so it disappears the moment one is implemented."
+  #{\# \$})
+
+(defn- unsupported-operator-error
+  "An `{:type :error}` map when `sql` uses an operator character we do
+   not implement, else nil.
+
+   The tokeniser already excludes string literals, dollar-quoted
+   strings, quoted identifiers and comments, and classifies `$N` as
+   :param — so only a genuine operator position reaches here. Gated on
+   a substring test first: tokenising every statement would put a scan
+   on the hot path for a case that essentially never fires."
+  [^String sql]
+  (when (or (<= 0 (.indexOf sql "#")) (<= 0 (.indexOf sql "$")))
+    (when-let [bad (first (filter (fn [{:keys [type text]}]
+                                    (and (= :op type)
+                                         (some unsupported-op-chars text)))
+                                  (cls/tokenize-all sql)))]
+      {:type :error
+       :sqlstate "42601"
+       :message (str "syntax error at or near \"" (:text bad) "\"")})))
+
+(defn simple-query-param-error
+  "An `{:type :error}` map when `sql` uses a `$N` placeholder in the
+   SIMPLE query protocol, else nil.
+
+   Simple Query has no Bind step, so there is nothing a placeholder
+   could refer to and PostgreSQL raises 42P02. We used to translate the
+   statement anyway and let the unresolved placeholder reach the client:
+   `SELECT $1` answered with the internal ParamRef record rendered as
+   `{\"idx\":1}` — leaking a representation detail as if it were data.
+
+   Only reachable from the simple path; the extended path resolves
+   placeholders at Bind. Gated on an indexOf so statements without a
+   `$` never pay for tokenising, and driven off the tokeniser's `:param`
+   classification so a `$` inside a string, a dollar-quoted body or a
+   quoted identifier doesn't count."
+  [^String sql]
+  (when (and (<= 0 (.indexOf sql "$"))
+             ;; PREPARE/EXECUTE are the SQL-level prepared-statement
+             ;; commands: `PREPARE p AS SELECT $1` is a placeholder in a
+             ;; TEMPLATE, bound later by EXECUTE, and is legal in Simple
+             ;; Query exactly as it is in PG.
+             (not (contains? #{:prepare :execute-prepared :deallocate}
+                             (:kind (cls/classify sql)))))
+    (when-let [p (first (filter #(= :param (:type %)) (cls/tokenize-all sql)))]
+      {:type :error
+       :sqlstate "42P02"
+       :message (str "there is no parameter " (:text p))})))
+
 (defn parse-sql
   "Parse a SQL statement and return a translation result.
 
@@ -1591,7 +1698,11 @@
        cached cached
 
        :else
-       (or (templated-parse sql schema db)
+       ;; Lexical validation runs BEFORE templating: parameterize-numbers
+       ;; would rewrite `SELECT 42#` to `SELECT $1#` and hand JSqlParser
+       ;; a shape whose `#` is even harder to see.
+       (or (unsupported-operator-error sql)
+           (templated-parse sql schema db)
            (let [parsed (parse-sql* sql schema db)]
              (when (and cache (cacheable-parse? parsed))
                (cache-put! cache cache-key parsed))

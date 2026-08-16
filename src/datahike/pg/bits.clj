@@ -35,7 +35,24 @@
 
 (set! *warn-on-reflection* true)
 
-(defrecord PgBit [bits varying?])
+(defrecord PgBit [bits varying?]
+  ;; PG orders bit strings by a memcmp of the left-aligned bytes with a
+  ;; zero pad, then breaks ties on length (varbit.c:817). Comparing the
+  ;; digit strings lexicographically gives the same answer — the zero
+  ;; pad behaves exactly like trailing '0' characters — and the length
+  ;; tie-break covers the proper-prefix case, so `B'0' < B'00'`.
+  ;;
+  ;; Implemented on the record itself because every ordering path
+  ;; (ORDER BY, <, >, BETWEEN, min/max) reaches values through
+  ;; java.lang.Comparable; without it a bit value in a comparison threw
+  ;; "PgBit cannot be cast to java.lang.Comparable".
+  Comparable
+  (compareTo [_ other]
+    (let [^PgBit o other
+          c (compare bits (:bits o))]
+      (if (zero? c)
+        (compare (count bits) (count (:bits o)))
+        c))))
 
 (defn pg-bit?
   "True iff v is a PgBit."
@@ -99,6 +116,126 @@
                 (invalid-digit (str ch) "binary")))
             body))
       varying?))))
+
+(defn- same-size!
+  "PG refuses bitwise operations on bit strings of different widths
+   (varbit.c:1230) rather than padding — the width is part of the value,
+   so padding would silently change one operand."
+  [op ^PgBit a ^PgBit b]
+  (when-not (= (count (:bits a)) (count (:bits b)))
+    ;; 22026, not the 22001 the width-coercion path uses — PG separates
+    ;; "these two operands don't line up" from "this value is too long
+    ;; for its declared width".
+    (throw (errors/pg-error
+            :string-data-length-mismatch
+            {:detail (str "cannot " op " bit strings of different sizes")}))))
+
+(defn- zipwith-bits
+  "Combine two equal-width bit strings position by position.
+
+   The result is always `bit`, never `bit varying`: PG declares
+   `&`/`|`/`#`/`~`/`<<`/`>>` only on bit, with a bit result, and a varbit
+   operand reaches them through the implicit binary cast — so
+   `pg_typeof(varbit & varbit)` is `bit`. (`||` is the mirror image: it
+   is declared only on varbit and always returns varbit.)"
+  [f ^PgBit a ^PgBit b]
+  (make-bit (apply str (map (fn [x y] (if (f (= x \1) (= y \1)) \1 \0))
+                            (:bits a) (:bits b)))
+            false))
+
+(defn and-bits
+  "`&` — bitwise AND of two equal-width bit strings."
+  [a b] (same-size! "AND" a b) (zipwith-bits #(and %1 %2) a b))
+
+(defn or-bits
+  "`|` — bitwise OR of two equal-width bit strings."
+  [a b] (same-size! "OR" a b) (zipwith-bits #(or %1 %2) a b))
+
+(defn xor-bits
+  "`#` — bitwise XOR of two equal-width bit strings."
+  [a b] (same-size! "XOR" a b) (zipwith-bits not= a b))
+
+(defn not-bits
+  "`~` — bitwise NOT. Width is preserved; the result is `bit` (see
+   zipwith-bits on why never varbit)."
+  [^PgBit b]
+  (make-bit (apply str (map {\0 \1, \1 \0} (:bits b))) false))
+
+(defn shift-bits
+  "`<<` / `>>` on a bit string — shift WITHIN the existing width, zero
+   filling (varbit.c:1310). The result is the same width as the input,
+   so `B'1100' << 1` is `1000`, not `11000`. A shift at least as wide as
+   the value yields all zeros. A negative distance shifts the other way,
+   as PG's does."
+  [^PgBit b n]
+  (let [w (count (:bits b))
+        n (long n)]
+    (make-bit
+     (cond
+       (>= (Math/abs n) w) (apply str (repeat w \0))
+       (pos? n) (str (subs (:bits b) n) (apply str (repeat n \0)))
+       (neg? n) (let [n (- n)]
+                  (str (apply str (repeat n \0)) (subs (:bits b) 0 (- w n))))
+       :else (:bits b))
+     false)))
+
+(defn concat-bits
+  "`||` on two bit strings — PG's `bitcat` (varbit.c:1180).
+
+   The result is always `bit varying`, whatever the inputs were: the
+   widths add up, so no fixed-width type could describe it."
+  [^PgBit a ^PgBit b]
+  (make-bit (str (:bits a) (:bits b)) true))
+
+;; ---------------------------------------------------------------------------
+;; SQL literals
+;;
+;; `B'1001000'` and `X'4A'` are the SQL standard's bit-string literals.
+;; PG types both as `bit` (1560) — `SELECT B'1001000'` describes as bit
+;; and `pg_typeof` answers `bit`. We used to hand the digits back as a
+;; bare String, i.e. text (25), which is issue #28 and also silently
+;; dropped the width that makes bit comparison and ordering correct.
+;;
+;; These live here rather than in the expression translator because
+;; oid-infer needs the same predicate to type the column at Describe
+;; time, and it cannot depend on the translator (the translator already
+;; depends on it).
+
+(def ^:private hex-bit-literal-re
+  ;; The quoted form only. JSqlParser also produces HexValue for the
+  ;; `0x4A` spelling, which PostgreSQL does not accept at all, so
+  ;; matching it here would invent syntax rather than mirror PG.
+  #"(?i)^x'[0-9a-f]*'$")
+
+(defn bit-string-literal?
+  "True for a SQL bit-string literal — `B'1001000'` or `X'4A'`.
+
+   JSqlParser spells the two differently: `B'…'` is a StringValue
+   carrying prefix \"B\", `X'…'` is a HexValue."
+  [expr]
+  (or (and (instance? net.sf.jsqlparser.expression.StringValue expr)
+           (let [p (.getPrefix ^net.sf.jsqlparser.expression.StringValue expr)]
+             (and p (.equalsIgnoreCase ^String p "B"))))
+      (and (instance? net.sf.jsqlparser.expression.HexValue expr)
+           (some? (re-matches
+                   hex-bit-literal-re
+                   (str (.getValue ^net.sf.jsqlparser.expression.HexValue expr)))))))
+
+(defn bit-string-literal-value
+  "The PgBit for a literal accepted by `bit-string-literal?`.
+
+   Both spellings produce type `bit`, not `bit varying`: PG's grammar
+   builds a BitString constant that `bit_in` types as bit, so the width
+   is exactly what was written. Hex expands to four bits per digit,
+   leading zeros included — `X'4A'` is the 8-bit `01001010`."
+  [expr]
+  (if (instance? net.sf.jsqlparser.expression.StringValue expr)
+    (parse-bit-literal
+     (.getNotExcapedValue ^net.sf.jsqlparser.expression.StringValue expr) false)
+    ;; HexValue's getValue keeps the `x'…'` wrapper; parse-bit-literal
+    ;; wants the prefix but not the quotes.
+    (let [s (str (.getValue ^net.sf.jsqlparser.expression.HexValue expr))]
+      (parse-bit-literal (str "x" (subs s 2 (dec (count s)))) false))))
 
 ;; ---------------------------------------------------------------------------
 ;; Width coercion

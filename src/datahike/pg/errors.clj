@@ -260,6 +260,14 @@
               (when table
                 (str "could not obtain lock on row in relation \"" table "\"")))}
 
+   ;; PG's ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE — raised when an
+   ;; object exists but the session hasn't put it in a usable state.
+   ;; `lastval()` before any `nextval()` on this connection is the case
+   ;; we hit (sequence.c:lastval).
+   :object-not-in-prerequisite-state
+   {:sqlstate "55000"
+    :format (fn [{:keys [detail]}] detail)}
+
    ;; --- generic fallbacks ---------------------------------------------
    :invalid-parameter-value
    {:sqlstate "22023"

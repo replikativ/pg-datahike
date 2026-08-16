@@ -46,6 +46,12 @@
   #{"pg_type" "pg_class" "pg_tables" "pg_views" "pg_matviews" "pg_attribute"
     "pg_namespace" "pg_database" "pg_proc"
     "pg_indexes"
+    ;; pg_sequences — the user-facing view over every sequence's
+    ;; parameters and current position (issue #26). Distinct from
+    ;; information_schema.sequences, which omits last_value and is the
+    ;; SQL-standard spelling; both are populated from the same
+    ;; :__seq__/* entities.
+    "pg_sequences"
     ;; pg_index is PG's internal index catalog (distinct from the
     ;; user-facing pg_indexes view). pgjdbc's PK probe joins it by oid.
     ;; pg_attrdef tracks per-column default expressions — we never emit
@@ -392,6 +398,24 @@
      {:db/ident :pg_tables/hastriggers :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_tables/rowsecurity :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_tables") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    ;; pg_sequences — one row per sequence. Column names and types
+    ;; follow PG's own view (see src/backend/catalog/system_views.sql):
+    ;; the identifier columns are `name`, the numeric ones int8, and
+    ;; `data_type` is a regtype. `last_value` is the one nullable
+    ;; column — NULL until the sequence has actually been advanced.
+    "pg_sequences"
+    [{:db/ident :pg_sequences/schemaname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/sequencename :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/sequenceowner :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/data_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/start_value :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/min_value :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/max_value :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/increment_by :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/cycle :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/cache_size :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_sequences/last_value :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_sequences") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     ;; pg_views — list of all user-defined views. We don't store views
     ;; so this is always empty, but ORMs (Metabase, pgAdmin) union it
     ;; with pg_tables during table discovery; not having it raises.
@@ -485,6 +509,64 @@
      {:db/ident :information_schema_key_column_usage/position_in_unique_constraint :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "information_schema_key_column_usage") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     nil))
+
+(def ^:private sequence-defaults
+  "Fallbacks for sequences transacted before an attribute existed —
+   notably the implicit sequences translate-create-table installs for
+   IDENTITY / serial columns, which only ever set name/value/increment.
+   These are PG's own defaults for a bigint sequence."
+  {:__seq__/increment 1
+   :__seq__/minvalue 1
+   :__seq__/maxvalue Long/MAX_VALUE
+   :__seq__/cache 1
+   :__seq__/cycle false
+   :__seq__/start 1
+   :__seq__/type "bigint"})
+
+(defn sequence-entities
+  "Every sequence in `db` as a map of its :__seq__/* attributes, merged
+   over `sequence-defaults`, sorted by name.
+
+   Shared by pg_sequences, information_schema.sequences and the
+   relkind='S' rows in pg_class so the three cannot disagree."
+  [db]
+  (->> (d/q '{:find [(pull ?e [*])]
+              :where [[?e :__seq__/name _]]}
+            db)
+       (map first)
+       (map #(merge sequence-defaults %))
+       (sort-by :__seq__/name)
+       vec))
+
+(def sequence-backed-catalogs
+  "Catalog tables whose rows come from :__seq__/* entities, and whose
+   content can therefore change without the user schema changing. The
+   catalog cache keys on the schema hash, so these need an extra
+   component — see `sequence-state`."
+  #{"pg_sequences" "information_schema_sequences" "pg_class"})
+
+(defn sequence-state
+  "A cheap value that changes whenever any sequence is created, dropped
+   or advanced. Deliberately just the name/value pairs: the other
+   parameters are fixed at CREATE time, so a sequence whose name and
+   position are unchanged has unchanged catalog rows."
+  [db]
+  (sort (d/q '{:find [?n ?v]
+               :where [[?e :__seq__/name ?n]
+                       [?e :__seq__/value ?v]]}
+             db)))
+
+(defn sequence-last-value
+  "PG's `last_value`: the value most recently handed out, or nil when
+   the sequence has never been advanced.
+
+   We store the last value handed out, so a never-called sequence holds
+   `start - increment` (see ddl/sequence-entity). PG models the same
+   state as last_value + is_called=false and reports last_value as NULL
+   in pg_sequences until the first nextval."
+  [{:__seq__/keys [value start increment]}]
+  (when-not (= value (- start increment))
+    value))
 
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
@@ -698,14 +780,27 @@
      ;; composite types get a pg_class row (relkind 'c'); asyncpg joins
      ;; pg_type → pg_class on `reltype = type-oid`, and pg_attribute on
      ;; `attrelid = pg_class.oid`. We use the type OID for both.
-     (mapv (fn [{:keys [name oid]}]
-             {:pg_class/oid oid
-              :pg_class/relname name
-              :pg_class/relnamespace 2200
-              :pg_class/relkind "c"
-              :pg_class/reltype oid
-              (pgs/row-marker-attr "pg_class") true})
-           (pgs/composite-types cte-db)))
+     (into
+      (mapv (fn [{:keys [name oid]}]
+              {:pg_class/oid oid
+               :pg_class/relname name
+               :pg_class/relnamespace 2200
+               :pg_class/relkind "c"
+               :pg_class/reltype oid
+               (pgs/row-marker-attr "pg_class") true})
+            (pgs/composite-types cte-db))
+      ;; Sequences are relations in PG (relkind 'S'), which is how
+      ;; pg_dump, psql's \ds and ORM introspection find them at all —
+      ;; without a row here a sequence is invisible to anything that
+      ;; walks pg_class (issue #26).
+      (mapv (fn [s]
+              (let [nm (:__seq__/name s)]
+                {:pg_class/oid (long (Math/abs (.hashCode ^String nm)))
+                 :pg_class/relname nm
+                 :pg_class/relnamespace 2200
+                 :pg_class/relkind "S"
+                 (pgs/row-marker-attr "pg_class") true}))
+            (sequence-entities cte-db))))
     "pg_tables"
     (mapv (fn [t]
             {:pg_tables/schemaname "public"
@@ -828,23 +923,41 @@
              :information_schema_tables/table_type "BASE TABLE"
              (pgs/row-marker-attr "information_schema_tables") true})
           (pgs/table-names user-schema))
+    "pg_sequences"
+    (mapv (fn [s]
+            (cond-> {:pg_sequences/schemaname "public"
+                     :pg_sequences/sequencename (:__seq__/name s)
+                     :pg_sequences/sequenceowner "datahike"
+                     :pg_sequences/data_type (:__seq__/type s)
+                     :pg_sequences/start_value (:__seq__/start s)
+                     :pg_sequences/min_value (:__seq__/minvalue s)
+                     :pg_sequences/max_value (:__seq__/maxvalue s)
+                     :pg_sequences/increment_by (:__seq__/increment s)
+                     :pg_sequences/cycle (:__seq__/cycle s)
+                     :pg_sequences/cache_size (:__seq__/cache s)
+                     (pgs/row-marker-attr "pg_sequences") true}
+              ;; Omit rather than store nil — an absent attribute is how
+              ;; this layer spells SQL NULL, and last_value is NULL until
+              ;; the sequence has been advanced.
+              (sequence-last-value s)
+              (assoc :pg_sequences/last_value (sequence-last-value s))))
+          (sequence-entities cte-db))
     "information_schema_sequences"
-    (let [q-fn d/q
-          seq-results (q-fn '{:find [?n ?v ?i]
-                              :where [[?e :__seq__/name ?n]
-                                      [?e :__seq__/value ?v]
-                                      [?e :__seq__/increment ?i]]}
-                            cte-db)]
-      (mapv (fn [[sname _sval sincr]]
-              {:information_schema_sequences/sequence_catalog "datahike"
-               :information_schema_sequences/sequence_schema "public"
-               :information_schema_sequences/sequence_name sname
-               :information_schema_sequences/start_value "1"
-               :information_schema_sequences/minimum_value "1"
-               :information_schema_sequences/maximum_value "9223372036854775807"
-               :information_schema_sequences/increment (str sincr)
-               (pgs/row-marker-attr "information_schema_sequences") true})
-            seq-results))
+    ;; Same source as pg_sequences. This used to hardcode
+    ;; start/minimum/maximum to the bigint defaults, which stopped being
+    ;; true once CREATE SEQUENCE started storing the real parameters
+    ;; (issue #21) — `CREATE SEQUENCE s START 5 MAXVALUE 100` reported
+    ;; start 1, max 2^63-1.
+    (mapv (fn [s]
+            {:information_schema_sequences/sequence_catalog "datahike"
+             :information_schema_sequences/sequence_schema "public"
+             :information_schema_sequences/sequence_name (:__seq__/name s)
+             :information_schema_sequences/start_value (str (:__seq__/start s))
+             :information_schema_sequences/minimum_value (str (:__seq__/minvalue s))
+             :information_schema_sequences/maximum_value (str (:__seq__/maxvalue s))
+             :information_schema_sequences/increment (str (:__seq__/increment s))
+             (pgs/row-marker-attr "information_schema_sequences") true})
+          (sequence-entities cte-db))
     "pg_indexes"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))]
       (vec
@@ -1301,7 +1414,7 @@
     ;; isolation that SHOW transaction_isolation must report back.
     :set-session-isolation :set-transaction-isolation
     :version :now :current-schema :current-database
-    :pg-keywords :nextval :currval :setval
+    :pg-keywords :nextval :currval :lastval :setval
     :try-advisory-xact-lock :try-advisory-lock
     :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
     :pg-backend-pid :txid-current :pg-sleep :pg-notify
