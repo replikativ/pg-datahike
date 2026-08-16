@@ -205,10 +205,21 @@
     (is (= "SELECT 1 AS \"when\""   (quote-alias "SELECT 1 AS when")))
     (is (= "SELECT 1 AS \"join\""   (quote-alias "SELECT 1 AS join")))))
 
-(deftest quote-reserved-alias-preserves-case
-  (testing "Double-quoted aliases are case-sensitive; preserve original text"
-    (is (= "SELECT 1 AS \"Select\"" (quote-alias "SELECT 1 AS Select")))
-    (is (= "SELECT 1 AS \"SELECT\"" (quote-alias "SELECT 1 AS SELECT")))))
+(deftest quote-reserved-alias-folds-case
+  ;; This assertion is REVERSED from what it used to be, and the old
+  ;; expectation was wrong on its own terms: its inputs are UNQUOTED
+  ;; aliases, which PostgreSQL folds to lower case. The rewrite adds
+  ;; quotes purely to get a reserved word past the parser; treating those
+  ;; synthetic quotes as the user's own made `SELECT 1 AS Select` come
+  ;; back labelled `Select` where PostgreSQL says `select`. The old
+  ;; docstring — "double-quoted aliases are case-sensitive" — described
+  ;; an input the test never had, and contradicted
+  ;; pg-column-naming-test/unquoted-alias-is-down-cased.
+  (testing "an unquoted reserved-word alias folds, like any unquoted identifier"
+    (is (= "SELECT 1 AS \"select\"" (quote-alias "SELECT 1 AS Select")))
+    (is (= "SELECT 1 AS \"select\"" (quote-alias "SELECT 1 AS SELECT"))))
+  (testing "a genuinely quoted alias keeps its case — it never reaches this rule"
+    (is (= "SELECT 1 AS \"Select\"" (quote-alias "SELECT 1 AS \"Select\"")))))
 
 (deftest quote-reserved-alias-skip-cast
   (testing "`CAST(x AS int)` — AS introduces type, not alias, leave it"

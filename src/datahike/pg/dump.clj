@@ -220,8 +220,11 @@
    in doubt the dump output gets a quoted ident, which is always safe
    except for the small gotcha that `\"col\"` and `\"COL\"` are
    distinct identifiers in PG (lowercase-ident-folding only happens
-   for unquoted names). pg-datahike lowers everything internally, so
-   we always emit lower-case quoted idents."
+   for unquoted names). We emit the name as STORED: for a database
+   created by a current pg-datahike that is already folded, but a
+   database predating the fold keeps `MixedCase` and a Datalog-native
+   one keeps `firstName`. Quoting verbatim is what makes those restore
+   unchanged — at the cost that dump/restore does NOT normalise case."
   #{"order" "user" "table" "select" "from" "where" "group"
     "by" "and" "or" "not" "in" "is" "null" "true" "false"
     "primary" "key" "foreign" "references" "unique" "check"

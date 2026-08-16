@@ -230,12 +230,12 @@
                                                           (:table-aliases ctx)
                                                           (:default-table ctx)
                                                           (:col-overrides ctx)
-                                                          (:derived-aliases ctx))
+                                                          (:derived-aliases ctx) (:ci-index ctx))
                       array-resolved (ctx/resolve-column ^Column array
                                                          (:table-aliases ctx)
                                                          (:default-table ctx)
                                                          (:col-overrides ctx)
-                                                         (:derived-aliases ctx))
+                                                         (:derived-aliases ctx) (:ci-index ctx))
                       bare-attr (fn [r] (if (vector? r) (nth r 2) r))
                       schema (:schema ctx)
                       m2m-attr (when-not (and (vector? array-resolved)
@@ -275,8 +275,8 @@
             (let [^EqualsTo eq expr
                   left (.getLeftExpression eq)
                   right (.getRightExpression eq)
-                  left-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
-                  right-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
+                  left-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+                  right-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
                   schema (:schema ctx)
                   hints  (:hints ctx)
                   ;; Pull target-unique fact for an attr: true when the
@@ -433,8 +433,8 @@
                 ;; emits plain patterns for right-side columns referenced
                 ;; here.
                   (let [l-var (expr/translate-expr ctx left)
-                        l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
-                        r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx))
+                        l-resolved (ctx/resolve-column ^Column left (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+                        r-resolved (ctx/resolve-column ^Column right (:table-aliases ctx) (:default-table ctx) (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
                       ;; Right-side attr is the one from THIS join's right
                       ;; table (== right-alias). The previous heuristic
                       ;; compared l-ns to (:default-table ctx) (the FROM
@@ -884,7 +884,9 @@
   (let [talias (when-let [a (.getAlias tf)]
                  (unquote-ident (str/trim (.getName ^Alias a))))
         fname  (str/lower-case (or (.getName (.getFunction tf)) "tf"))
-        sub-name (or talias (str fname "_" (System/nanoTime)))]
+        ;; Storage namespace, not the user's alias — see
+        ;; materialize-derived-select! for why they must differ.
+        sub-name (str "__srf__" (or talias fname))]
     (when-let [{:keys [aliases rows vtypes pg-types]} (materialize-table-function tf)]
       (let [aliases (if (and talias (= 1 (count aliases))) [talias] aliases)
             schema-tx (mapv (fn [a vt pt]
@@ -904,7 +906,7 @@
                           rows)
             spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
         {:db spec-db2 :schema (:schema spec-db2)
-         :name sub-name :alias sub-name :aliases aliases}))))
+         :name sub-name :alias (or talias sub-name) :aliases aliases}))))
 
 (defn- sequence->virtual-table
   "Materialise `FROM <sequence-name>` into a one-row virtual table.
@@ -976,7 +978,15 @@
   [^ParenthesedSelect ps db schema]
   (let [sub-alias (when-let [a (.getAlias ps)]
                     (unquote-ident (str/trim (.getName ^Alias a))))
-        sub-name (or sub-alias (str "derived_" (System/nanoTime)))
+        ;; Storage namespace, deliberately NOT the user's alias: a
+        ;; derived table aliased to an existing table's name used to be
+        ;; materialised into that table's namespace, and the two merged
+        ;; instead of the derived table shadowing it — `SELECT x FROM
+        ;; (SELECT 1 AS x) AS t` returned the base table's rows too.
+        ;; Deterministic (not gensym/nanoTime) because the parse caches
+        ;; key on the enriched schema; a fresh name per parse would make
+        ;; every derived-table query a cache miss.
+        sub-name (str "__sub__" (or sub-alias "anon"))
         with-fn d/db-with
         inner (.getSelect ps)
         inner-ps (when (instance? PlainSelect inner) inner)
@@ -1007,14 +1017,14 @@
           {:db      spec-db2
            :schema  (:schema spec-db2)
            :name    sub-name
-           :alias   sub-name
+           :alias   (or sub-alias sub-name)
            :aliases aliases}))
 
       ;; (SELECT … FROM real-table …) AS t — run the inner select.
       ;; Inner may also be a SetOperationList (UNION/INTERSECT/EXCEPT) —
       ;; handle that by translating each branch, executing, and combining.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
-      (materialize-set-op! inner sub-name db schema)
+      (materialize-set-op! inner sub-name db schema sub-alias)
 
       :else nil)))
 
@@ -1128,45 +1138,51 @@
    Used by both the derived-table path (FROM (...) AS t) and the CTE
    path (WITH t AS (...)), since SQL set operations over heterogeneous
    tables can't be expressed natively in Datalog — we have to flatten
-   them into a single virtual table."
-  [inner target-name db schema]
-  (let [with-fn d/db-with
-        is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
-        branch-parsed
-        (if is-union?
-          (let [^net.sf.jsqlparser.statement.select.SetOperationList sol inner
-                branches (.getSelects sol)
-                ops (.getOperations sol)
-                op-kind (when (seq ops)
-                          (let [op (first ops)]
-                            (cond
-                              (instance? net.sf.jsqlparser.statement.select.UnionOp op)
-                              (if (.isAll ^net.sf.jsqlparser.statement.select.UnionOp op)
-                                :union-all :union)
-                              (instance? net.sf.jsqlparser.statement.select.IntersectOp op)
-                              :intersect
-                              (instance? net.sf.jsqlparser.statement.select.ExceptOp op)
-                              :except
-                              :else :union)))
-                parsed (mapv (fn [s]
-                               (when (instance? PlainSelect s)
-                                 (translate-select ^PlainSelect s schema db)))
-                             branches)]
-            {:op op-kind :branches parsed})
-          {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
-        sub-parsed (first (:branches branch-parsed))
-        sub-aliases (:find-aliases sub-parsed)
+   them into a single virtual table.
+
+   `target-name` is the NAMESPACE the rows are stored under; `alias` is
+   the name the user wrote. They differ for CTEs, where the namespace is
+   synthetic so a CTE cannot collide with a real table of the same name
+   — see `datahike.pg.sql/cte-namespace`."
+  ([inner target-name db schema] (materialize-set-op! inner target-name db schema nil))
+  ([inner target-name db schema alias]
+   (let [with-fn d/db-with
+         is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
+         branch-parsed
+         (if is-union?
+           (let [^net.sf.jsqlparser.statement.select.SetOperationList sol inner
+                 branches (.getSelects sol)
+                 ops (.getOperations sol)
+                 op-kind (when (seq ops)
+                           (let [op (first ops)]
+                             (cond
+                               (instance? net.sf.jsqlparser.statement.select.UnionOp op)
+                               (if (.isAll ^net.sf.jsqlparser.statement.select.UnionOp op)
+                                 :union-all :union)
+                               (instance? net.sf.jsqlparser.statement.select.IntersectOp op)
+                               :intersect
+                               (instance? net.sf.jsqlparser.statement.select.ExceptOp op)
+                               :except
+                               :else :union)))
+                 parsed (mapv (fn [s]
+                                (when (instance? PlainSelect s)
+                                  (translate-select ^PlainSelect s schema db)))
+                              branches)]
+             {:op op-kind :branches parsed})
+           {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
+         sub-parsed (first (:branches branch-parsed))
+         sub-aliases (:find-aliases sub-parsed)
         ;; Per-column expected OID from the inner translate-select's
         ;; oid-infer pass. Used as a default when the materialised
         ;; rows are empty or numerically-mixed (samples alone can't
         ;; pick a type then). Aligns the speculative-db's
         ;; :db/valueType with what describeResult will tell clients.
-        sub-oids (:select-item-oids sub-parsed)
-        q-fn d/q
-        run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
-                     (let [q (cond-> query
-                               (:limit p)  (assoc :limit (:limit p))
-                               (:offset p) (assoc :offset (:offset p)))
+         sub-oids (:select-item-oids sub-parsed)
+         q-fn d/q
+         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
+                      (let [q (cond-> query
+                                (:limit p)  (assoc :limit (:limit p))
+                                (:offset p) (assoc :offset (:offset p)))
                            ;; If translate-select materialized derived
                            ;; tables (FROM (…) AS sub) or catalog refs
                            ;; under it, the resulting query references
@@ -1174,32 +1190,32 @@
                            ;; in :enriched-db. Run against that, falling
                            ;; back to the outer db when the branch was
                            ;; a plain table reference.
-                           exec-db (or (:enriched-db p) db)
-                           raw (if (seq in-args)
-                                 (apply q-fn q exec-db in-args)
-                                 (q-fn q exec-db))
-                           raw (cond->> raw
-                                 sql-offset (drop sql-offset)
-                                 sql-limit  (take sql-limit))
-                           hc (or hidden-count 0)
-                           visible (- (count (:find query)) hc)]
-                       (if (pos? hc)
-                         (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
-                         raw)))
-        branch-rows (mapv run-branch (:branches branch-parsed))
-        sub-results (case (:op branch-parsed)
-                      :union-all (mapcat identity branch-rows)
-                      :union     (distinct (mapcat identity branch-rows))
-                      :intersect (let [sets (map set branch-rows)]
-                                   (apply clojure.set/intersection sets))
-                      :except    (let [[a & bs] branch-rows]
-                                   (reduce (fn [acc r] (apply disj acc r))
-                                           (set a) bs))
+                            exec-db (or (:enriched-db p) db)
+                            raw (if (seq in-args)
+                                  (apply q-fn q exec-db in-args)
+                                  (q-fn q exec-db))
+                            raw (cond->> raw
+                                  sql-offset (drop sql-offset)
+                                  sql-limit  (take sql-limit))
+                            hc (or hidden-count 0)
+                            visible (- (count (:find query)) hc)]
+                        (if (pos? hc)
+                          (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                          raw)))
+         branch-rows (mapv run-branch (:branches branch-parsed))
+         sub-results (case (:op branch-parsed)
+                       :union-all (mapcat identity branch-rows)
+                       :union     (distinct (mapcat identity branch-rows))
+                       :intersect (let [sets (map set branch-rows)]
+                                    (apply clojure.set/intersection sets))
+                       :except    (let [[a & bs] branch-rows]
+                                    (reduce (fn [acc r] (apply disj acc r))
+                                            (set a) bs))
                       ;; nil → not a UNION, single branch
-                      (first branch-rows))
-        sub-results (cond->> sub-results
-                      (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
-                      (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
+                       (first branch-rows))
+         sub-results (cond->> sub-results
+                       (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
+                       (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
         ;; Resolve deferred correlated subqueries (Slice A / Layer 1) so a
         ;; derived table whose SELECT contains a correlated CASE subquery
         ;; (asyncpg's {typeinfo} attrtypoids/attrnames) materialises the
@@ -1208,16 +1224,16 @@
         ;; the branch has no correlated subqueries. (Single-branch only; the
         ;; UNION branches keep their raw shape — correlated subqueries inside
         ;; a set-op branch are not a shape we materialise.)
-        corr-resolved (when (and (nil? (:op branch-parsed))
-                                 (:correlated-subqueries sub-parsed))
-                        (resolve-correlated-rows params/*parse-sql* sub-parsed
-                                                 sub-results db schema))
-        sub-results (if corr-resolved (first corr-resolved) sub-results)
-        sub-aliases (if corr-resolved (second corr-resolved) sub-aliases)
+         corr-resolved (when (and (nil? (:op branch-parsed))
+                                  (:correlated-subqueries sub-parsed))
+                         (resolve-correlated-rows params/*parse-sql* sub-parsed
+                                                  sub-results db schema))
+         sub-results (if corr-resolved (first corr-resolved) sub-results)
+         sub-aliases (if corr-resolved (second corr-resolved) sub-aliases)
         ;; Correlated-subquery columns carry their declared OID (e.g. oid[] for
         ;; array_agg(atttypid)); use it to type array columns instead of the
         ;; runtime value class. Visible columns stay nil (value-sampled).
-        sub-oids    (if corr-resolved (nth corr-resolved 2) sub-oids)
+         sub-oids    (if corr-resolved (nth corr-resolved 2) sub-oids)
         ;; Walk every row rather than just the first — UNION across
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have
@@ -1230,75 +1246,75 @@
         ;; the :else string branch and reject the row at transact
         ;; time. The data-tx step coerces each value to the inferred
         ;; type's expected class (see col-coerce).
-        fits-long? (fn [^Number n]
-                     (and (<= Long/MIN_VALUE (.longValue n))
-                          (<= (.longValue n) Long/MAX_VALUE)))
-        sample-rows (fn [col-idx]
-                      (keep (fn [row]
-                              (let [vs (if (sequential? row) (vec row) [row])
-                                    v  (nth vs col-idx nil)]
-                                (when (and (some? v) (not= :__null__ v)) v)))
-                            sub-results))
+         fits-long? (fn [^Number n]
+                      (and (<= Long/MIN_VALUE (.longValue n))
+                           (<= (.longValue n) Long/MAX_VALUE)))
+         sample-rows (fn [col-idx]
+                       (keep (fn [row]
+                               (let [vs (if (sequential? row) (vec row) [row])
+                                     v  (nth vs col-idx nil)]
+                                 (when (and (some? v) (not= :__null__ v)) v)))
+                             sub-results))
         ;; PG-style numeric LUB for mixed integer/float/numeric
         ;; samples. Mirrors a small slice of select_common_type_from_oids
         ;; in PG's parser/parse_coerce.c — wider/more-precise wins.
-        numeric-lub (fn [vs]
-                      (let [has-bigdec? (some #(instance? java.math.BigDecimal %) vs)
-                            has-float?  (some #(or (instance? Double %)
-                                                   (instance? Float %)) vs)
-                            has-bigint? (some #(and (instance? java.math.BigInteger %)
-                                                    (not (fits-long? %)))
-                                              vs)]
-                        (cond
-                          has-bigdec? :db.type/bigdec
-                          has-bigint? :db.type/bigdec  ; promote to numeric to keep precision
-                          has-float?  :db.type/double
-                          :else       :db.type/long)))
+         numeric-lub (fn [vs]
+                       (let [has-bigdec? (some #(instance? java.math.BigDecimal %) vs)
+                             has-float?  (some #(or (instance? Double %)
+                                                    (instance? Float %)) vs)
+                             has-bigint? (some #(and (instance? java.math.BigInteger %)
+                                                     (not (fits-long? %)))
+                                               vs)]
+                         (cond
+                           has-bigdec? :db.type/bigdec
+                           has-bigint? :db.type/bigdec  ; promote to numeric to keep precision
+                           has-float?  :db.type/double
+                           :else       :db.type/long)))
         ;; PG-style type categorisation per `select_common_type_from_oids`
         ;; (src/backend/parser/parse_coerce.c). Mixed values within a
         ;; category promote per category rules; cross-category falls to
         ;; :db.type/string with a warning (PG would error 42804 — we
         ;; soft-fail for compatibility with the existing EAV-as-NULL
         ;; design where ad-hoc UNIONs across types are tolerated).
-        value-category (fn [v]
-                         (cond
-                           (boolean? v)                              :boolean
-                           (instance? java.util.Date v)              :datetime
-                           (instance? java.util.UUID v)              :uuid
-                           (number? v)                               :numeric
-                           (or (string? v) (keyword? v) (symbol? v)) :string
-                           :else                                     :unknown))
-        col-vtype (fn [col-idx]
-                    (let [samples (sample-rows col-idx)
+         value-category (fn [v]
+                          (cond
+                            (boolean? v)                              :boolean
+                            (instance? java.util.Date v)              :datetime
+                            (instance? java.util.UUID v)              :uuid
+                            (number? v)                               :numeric
+                            (or (string? v) (keyword? v) (symbol? v)) :string
+                            :else                                     :unknown))
+         col-vtype (fn [col-idx]
+                     (let [samples (sample-rows col-idx)
                           ;; OID-hint default — used when samples are
                           ;; empty, or to disambiguate between equally
                           ;; plausible types (a single Long sample for
                           ;; a column declared NUMERIC by oid-infer
                           ;; should pick :db.type/bigdec, not :long).
-                          hint-vtype (some-> (nth sub-oids col-idx nil)
-                                             types/dh-type-for-oid)]
-                      (cond
+                           hint-vtype (some-> (nth sub-oids col-idx nil)
+                                              types/dh-type-for-oid)]
+                       (cond
                         ;; No samples — trust the OID hint, else string.
-                        (empty? samples)
-                        (or hint-vtype :db.type/string)
+                         (empty? samples)
+                         (or hint-vtype :db.type/string)
 
-                        :else
-                        (let [cats (into #{} (map value-category) samples)]
-                          (cond
+                         :else
+                         (let [cats (into #{} (map value-category) samples)]
+                           (cond
                             ;; Single-category — straightforward mapping.
-                            (= cats #{:boolean})  :db.type/boolean
-                            (= cats #{:datetime}) :db.type/instant
-                            (= cats #{:uuid})     :db.type/uuid
-                            (= cats #{:string})   :db.type/string
+                             (= cats #{:boolean})  :db.type/boolean
+                             (= cats #{:datetime}) :db.type/instant
+                             (= cats #{:uuid})     :db.type/uuid
+                             (= cats #{:string})   :db.type/string
 
-                            (= cats #{:numeric})
-                            (let [lub (numeric-lub samples)]
-                              (cond
-                                (and (= lub :db.type/long)
-                                     (= hint-vtype :db.type/bigdec)) :db.type/bigdec
-                                (and (= lub :db.type/long)
-                                     (= hint-vtype :db.type/double)) :db.type/double
-                                :else lub))
+                             (= cats #{:numeric})
+                             (let [lub (numeric-lub samples)]
+                               (cond
+                                 (and (= lub :db.type/long)
+                                      (= hint-vtype :db.type/bigdec)) :db.type/bigdec
+                                 (and (= lub :db.type/long)
+                                      (= hint-vtype :db.type/double)) :db.type/double
+                                 :else lub))
 
                             ;; Cross-category. PG would raise
                             ;; ERRCODE_DATATYPE_MISMATCH (42804). We
@@ -1308,8 +1324,8 @@
                             ;; if the OID hint is set, trust it (callers
                             ;; that ran oid-infer have a more
                             ;; authoritative answer than sampled rows).
-                            :else
-                            (or hint-vtype :db.type/string))))))
+                             :else
+                             (or hint-vtype :db.type/string))))))
         ;; Coercion to the runtime class Datahike's schema spec
         ;; demands. Without this, Integer values (e.g. COUNT result)
         ;; pass type inference but are rejected by `db-with` because
@@ -1319,28 +1335,28 @@
         ;; can promote samples (e.g. Long → BigDecimal when another
         ;; row's value was BigDecimal); the coercer makes that
         ;; promotion concrete at the data-tx step.
-        col-coerce (fn [vtype]
-                     (case vtype
-                       :db.type/long    (fn [v]
-                                          (cond
-                                            (instance? Long v) v
-                                            (instance? java.math.BigInteger v) (.longValueExact ^java.math.BigInteger v)
-                                            :else (long v)))
-                       :db.type/double  (fn [v] (if (instance? Double v) v (double v)))
-                       :db.type/bigdec  (fn [v]
-                                          (cond
-                                            (instance? java.math.BigDecimal v) v
-                                            (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                                            (integer? v) (java.math.BigDecimal/valueOf (long v))
-                                            (float? v)   (java.math.BigDecimal/valueOf (double v))
-                                            :else        (java.math.BigDecimal. (str v))))
-                       :db.type/string  str
-                       identity))
+         col-coerce (fn [vtype]
+                      (case vtype
+                        :db.type/long    (fn [v]
+                                           (cond
+                                             (instance? Long v) v
+                                             (instance? java.math.BigInteger v) (.longValueExact ^java.math.BigInteger v)
+                                             :else (long v)))
+                        :db.type/double  (fn [v] (if (instance? Double v) v (double v)))
+                        :db.type/bigdec  (fn [v]
+                                           (cond
+                                             (instance? java.math.BigDecimal v) v
+                                             (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+                                             (integer? v) (java.math.BigDecimal/valueOf (long v))
+                                             (float? v)   (java.math.BigDecimal/valueOf (double v))
+                                             :else        (java.math.BigDecimal. (str v))))
+                        :db.type/string  str
+                        identity))
         ;; Always emit a row-existence marker so `t.*` expansion in
         ;; the OUTER select has an entity anchor even when every
         ;; non-marker column is NULL on a given row (e.g. Metabase's
         ;; `NULL as role` projection in build_privilege_map).
-        row-marker (pgs/row-marker-attr target-name)
+         row-marker (pgs/row-marker-attr target-name)
         ;; Per-column array element kw. A column whose samples are PgArrays
         ;; (or whose OID hint is a T[] OID) is materialised the way a real
         ;; array column is: :db.type/string holding canonical PG text
@@ -1354,67 +1370,67 @@
         ;; → oid[]) over the value-sampled element type (which can only see the
         ;; runtime class, e.g. Long → int8, losing the oid distinction asyncpg
         ;; relies on). Fall back to the sample when oid-infer can't decide.
-        col-array-elem (mapv (fn [i]
-                               (or (some-> (nth sub-oids i nil)
-                                           types/array-oid->element-oid
-                                           types/oid->elem-kw)
-                                   (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)))
-                             (range (count sub-aliases)))
+         col-array-elem (mapv (fn [i]
+                                (or (some-> (nth sub-oids i nil)
+                                            types/array-oid->element-oid
+                                            types/oid->elem-kw)
+                                    (some-> (first (filter pg-arr/array? (sample-rows i))) :elem-type)))
+                              (range (count sub-aliases)))
         ;; :pg/type to preserve the read-back OID for types whose datahike
         ;; valueType would otherwise report the wrong OID: arrays ("_T"), and
         ;; the OID-preserving scalars char(18)/oid(26) (dh-type-for-oid → string/
         ;; long → would report text/int8). asyncpg's typeinfo decodes typtype as
         ;; "char" → bytes b'c'; if we send it as text it sees the str 'c' and
         ;; `kind == b'c'` fails, so it never builds the composite codec.
-        col-pg-type (mapv (fn [i]
-                            (if-let [ae (nth col-array-elem i)]
-                              (str "_" (name ae))
-                              (get types/oid-preserving-pg-name (nth sub-oids i nil))))
-                          (range (count sub-aliases)))
+         col-pg-type (mapv (fn [i]
+                             (if-let [ae (nth col-array-elem i)]
+                               (str "_" (name ae))
+                               (get types/oid-preserving-pg-name (nth sub-oids i nil))))
+                           (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
-        col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))
-                        (range (count sub-aliases)))
-        col-coercions (mapv (fn [i]
-                              (if (nth col-array-elem i)
-                                (fn [v] (cond
-                                          (pg-arr/array? v) (pg-arr/to-pg-text v)
-                                          (string? v)       v
-                                          :else             (str v)))
-                                (col-coerce (nth col-types i))))
-                            (range (count sub-aliases)))
-        schema-tx (conj
-                   (vec (for [[i a] (map-indexed vector sub-aliases)]
-                          (cond-> {:db/ident (keyword target-name a)
-                                   :db/valueType (nth col-types i)
-                                   :db/cardinality :db.cardinality/one}
+         col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))
+                         (range (count sub-aliases)))
+         col-coercions (mapv (fn [i]
+                               (if (nth col-array-elem i)
+                                 (fn [v] (cond
+                                           (pg-arr/array? v) (pg-arr/to-pg-text v)
+                                           (string? v)       v
+                                           :else             (str v)))
+                                 (col-coerce (nth col-types i))))
+                             (range (count sub-aliases)))
+         schema-tx (conj
+                    (vec (for [[i a] (map-indexed vector sub-aliases)]
+                           (cond-> {:db/ident (keyword target-name a)
+                                    :db/valueType (nth col-types i)
+                                    :db/cardinality :db.cardinality/one}
                             ;; :pg/type drives oid-infer's read-back OID (array
                             ;; "_T" or OID-preserving scalar char/oid).
-                            (nth col-pg-type i)   (assoc :pg/type (nth col-pg-type i))
+                             (nth col-pg-type i)   (assoc :pg/type (nth col-pg-type i))
                             ;; :pg/array-elem drives canonical-text array decode.
-                            (nth col-array-elem i) (assoc :pg/array-elem (nth col-array-elem i)))))
-                   {:db/ident       row-marker
-                    :db/valueType   :db.type/boolean
-                    :db/cardinality :db.cardinality/one})
-        spec-db (with-fn db schema-tx)
-        data-tx (vec (for [row sub-results]
-                       (let [vals (if (sequential? row) (vec row) [row])
-                             cols (into {} (keep-indexed
-                                            (fn [i a]
-                                              (let [v (nth vals i nil)]
-                                                (when (and (some? v) (not= :__null__ v))
-                                                  [(keyword target-name a)
-                                                   ((nth col-coercions i) v)])))
-                                            sub-aliases))]
+                             (nth col-array-elem i) (assoc :pg/array-elem (nth col-array-elem i)))))
+                    {:db/ident       row-marker
+                     :db/valueType   :db.type/boolean
+                     :db/cardinality :db.cardinality/one})
+         spec-db (with-fn db schema-tx)
+         data-tx (vec (for [row sub-results]
+                        (let [vals (if (sequential? row) (vec row) [row])
+                              cols (into {} (keep-indexed
+                                             (fn [i a]
+                                               (let [v (nth vals i nil)]
+                                                 (when (and (some? v) (not= :__null__ v))
+                                                   [(keyword target-name a)
+                                                    ((nth col-coercions i) v)])))
+                                             sub-aliases))]
                          ;; Always include the row marker so the
                          ;; entity exists even if every projected
                          ;; column was NULL.
-                         (assoc cols row-marker true))))
-        spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
-    {:db      spec-db2
-     :schema  (:schema spec-db2)
-     :name    target-name
-     :alias   target-name
-     :aliases sub-aliases}))
+                          (assoc cols row-marker true))))
+         spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
+     {:db      spec-db2
+      :schema  (:schema spec-db2)
+      :name    target-name
+      :alias   (or alias target-name)
+      :aliases sub-aliases})))
 
 (defn- agg-cast-inner
   "If `expr` is a CAST (or parenthesised CAST) wrapping an aggregate —
@@ -1444,6 +1460,34 @@
                   (instance? net.sf.jsqlparser.expression.AnalyticExpression i))
           i)))))
 
+(def ^:dynamic *cte-namespaces*
+  "`{cte-name -> synthetic-namespace}` for the WITH items in scope.
+
+   A CTE is materialised into a speculative db as ordinary attributes,
+   and the namespace used to be the CTE's own name — so a CTE whose name
+   matched a real table wrote into that table's namespace. The two then
+   MERGED rather than the CTE shadowing the table: scans saw the union of
+   both relations' rows, `SELECT *` listed the union of their columns,
+   and a CTE row whose primary key matched a base row UPSERTED onto it.
+   `WITH t AS (...) DELETE FROM t WHERE id IN (SELECT id FROM t)` deleted
+   the real table's rows.
+
+   Giving each CTE a synthetic namespace and keeping its user-visible
+   name as an ALIAS routes the whole thing through the same path as
+   `FROM emp e`, which already resolves alias-to-relation correctly. It
+   also leaves the base table's namespace untouched, so PostgreSQL's
+   escape hatch — a schema-qualified `public.t` still reaching the real
+   table — keeps working.
+
+   Bound by parse-sql around translation, and re-bound by the
+   execute-time UPDATE/DELETE re-translation, which resolves the WHERE
+   clause afresh and would otherwise lose the mapping."
+  {})
+
+;; The translator binds ctx/*relation-namespaces* from this so that
+;; extract-table-info — the one place every FROM item passes through —
+;; performs the redirect.
+
 (def ^:dynamic *cte-relations*
   "Lowercased names of CTEs (WITH items) in scope for the statement being
    translated. Bound by parse-sql* so the undefined-table 42P01 check
@@ -1470,7 +1514,13 @@
             (str/starts-with? t "information_schema")
             (str/includes? t ".")            ; schema-qualified catalog ref
             (contains? *cte-relations* t)
-            (some (fn [[k _]] (and (keyword? k) (= (namespace k) tname)))
+            ;; Case-insensitive: the reference has been folded, but a
+            ;; database created before folding — or a Datalog-native one —
+            ;; stores `:MixedCase/...`. This also fixes a latent
+            ;; inconsistency: `t` was lowercased above and then compared
+            ;; against the RAW `tname`.
+            (some (fn [[k _]] (and (keyword? k)
+                                   (= (str/lower-case (namespace k)) t)))
                   schema)))))
 
 (defn correlated-subquery-refs
@@ -1637,8 +1687,17 @@
           ;; Regular table
           :else
           (let [{tname :name talias :alias} (when (instance? Table from-item)
-                                              (ctx/extract-table-info ^Table from-item))]
-            [db schema tname talias]))
+                                              (ctx/extract-table-info ^Table from-item))
+                ;; The reference has been case-folded; storage may not be.
+                ;; A database created before folding holds `:MixedCase/*`,
+                ;; and a Datalog-native one holds whatever its attributes
+                ;; were named. Resolve the folded name back to the stored
+                ;; one — identity when they already agree, i.e. the common
+                ;; path.
+                stored (when tname
+                         (let [c (pgs/canonical-table (pgs/ci-index schema) tname)]
+                           (if (pgs/ambiguous? c) tname c)))]
+            [db schema (or stored tname) (or talias tname)]))
         ;; default-table is the alias key used for entity-var lookup.
         default-table (or alias name)
 
@@ -1771,8 +1830,25 @@
         group-by-element (.getGroupBy select)
         group-by (when group-by-element
                    (seq (.getGroupByExpressions ^GroupByElement group-by-element)))
+        ;; PostgreSQL resolves a bare name in GROUP BY as: a local FROM
+        ;; column first, then an OUTPUT-COLUMN ALIAS, then an outer
+        ;; column (parse_clause.c's findTargetlistEntrySQL92). So
+        ;; `SELECT a AS x FROM t GROUP BY x` is legal and groups by the
+        ;; aliased expression. Translating such an item as a column
+        ;; would report it as undefined.
+        select-alias-names (into #{} (keep select-item-alias) (.getSelectItems select))
         _ (when (seq group-by)
-            (doseq [g group-by] (expr/translate-expr ctx g)))
+            (doseq [g group-by]
+              (let [alias-only? (and (instance? Column g)
+                                     (nil? (.getTable ^Column g))
+                                     (contains? select-alias-names
+                                                (unquote-ident (.getColumnName ^Column g)))
+                                     ;; a real column of the table wins
+                                     (nil? (get schema
+                                                (keyword (or default-table "")
+                                                         (unquote-ident (.getColumnName ^Column g))))))]
+                (when-not alias-only?
+                  (expr/translate-expr ctx g)))))
 
         ;; HAVING clause
         having-expr (.getHaving select)
@@ -1883,10 +1959,23 @@
 
                 ;; SELECT * — expand to all user columns (exclude db_id)
                 (instance? AllColumns expr)
-                (let [cols (pgs/column-info schema default-table db)]
+                ;; `default-table` is the query's ALIAS for the relation,
+                ;; which is not the relation's name whenever the two
+                ;; differ — `FROM emp e`, and every CTE / derived table /
+                ;; table function, whose rows live in a synthetic
+                ;; namespace. Resolving it is what the `t.*` branch above
+                ;; already does; without it here, `SELECT * FROM emp e`
+                ;; returned a row with ZERO columns.
+                (let [real (get table-aliases default-table default-table)
+                      cols (pgs/column-info schema real db)]
                   (doseq [col cols
                           :when (not= "db_id" (:name col))]
-                    (let [v (ctx/col-var! ctx (:attr col))]
+                    ;; Route through the [:aliased …] form so the column
+                    ;; binds against the alias's entity var, matching the
+                    ;; `t.*` expansion.
+                    (let [v (ctx/col-var! ctx (if (= real default-table)
+                                                (:attr col)
+                                                [:aliased default-table (:attr col)]))]
                       (swap! find-elements conj v)
                       (swap! find-aliases conj (or alias-str (:name col))))))
 
@@ -2306,7 +2395,8 @@
                        [(into v (map :oid) picked)
                         (into pv (repeat (count picked) nil))])
                      (instance? AllColumns expr)
-                     (let [cols (pgs/column-info schema default-table db)
+                     (let [cols (pgs/column-info
+                                 schema (get table-aliases default-table default-table) db)
                            picked (remove #(= "db_id" (:name %)) cols)]
                        [(into v (map :oid) picked)
                         (into pv (repeat (count picked) nil))])
@@ -4110,6 +4200,29 @@
 
         :else nil))))
 
+(defn- canonical-relation
+  "Resolve a folded table name back to the name it is STORED under, and
+   each column name likewise.
+
+   References arrive case-folded (PostgreSQL folds unquoted identifiers),
+   but storage may not be: a database created before folding landed holds
+   `:MixedCase/ColA`, and a Datalog-native one holds whatever its
+   attributes were named. Identity when the two already agree, which is
+   every database created by a current pg-datahike.
+
+   The WRITE paths need this as much as the read paths do, and more
+   urgently: an INSERT that folded without resolving would assert
+   `:mixedcase/cola` alongside an existing `:MixedCase/ColA` and split
+   the table in two, with half the rows invisible to any single query and
+   no error at any point."
+  [schema tname col-names]
+  (let [ci (pgs/ci-index schema)
+        t (let [c (pgs/canonical-table ci tname)] (if (pgs/ambiguous? c) tname c))]
+    [t (mapv (fn [c]
+               (let [a (pgs/canonical-attr ci t c)]
+                 (if (and a (not (pgs/ambiguous? a))) (name a) c)))
+             col-names)]))
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
@@ -4117,14 +4230,15 @@
   [^Insert insert schema db]
   (let [schema (enrich-schema-with-pg-array-meta schema db)
         table (.getTable insert)
-        table-name (unquote-ident (.getName ^Table table))
-        ns table-name
+        raw-table (unquote-ident (.getName ^Table table))
         columns (.getColumns insert)
-        col-names (if (seq columns)
-                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
-                    (or (pgs/column-order-from-db db table-name)
-                        (when-let [cols (pgs/column-info schema table-name)]
-                          (mapv :name (rest cols)))))
+        raw-cols (if (seq columns)
+                   (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
+                   (or (pgs/column-order-from-db db raw-table)
+                       (when-let [cols (pgs/column-info schema raw-table)]
+                         (mapv :name (rest cols)))))
+        [table-name col-names] (canonical-relation schema raw-table raw-cols)
+        ns table-name
         select (.getSelect insert)
         ;; ON CONFLICT handling
         ^net.sf.jsqlparser.statement.insert.InsertConflictAction
@@ -4156,6 +4270,15 @@
                            (.getSelect ^ParenthesedSelect select)
                            select)
             inner-parsed (params/*parse-sql* (str inner-select) schema db)
+            ;; parse-sql CATCHES: a source SELECT that failed to
+            ;; translate comes back as {:type :error}, not as a throw.
+            ;; Ignoring that carried a nil :query into d/q, whose
+            ;; "Query should be a vector or a map" then replaced the
+            ;; real diagnosis — so `INSERT INTO t (id) SELECT nope FROM
+            ;; t` reported XX000 instead of the inner 42703.
+            _ (when (= :error (:type inner-parsed))
+                (throw (ex-info (str (:message inner-parsed))
+                                {:sqlstate (or (:sqlstate inner-parsed) "XX000")})))
             inner-query (:query inner-parsed)
             inner-in-args (:in-args inner-parsed)
             q-fn d/q
@@ -4756,9 +4879,9 @@
 
 (defn translate-delete
   "Translate a DELETE statement to Datahike retraction query + tx-data."
-  [^Delete delete _schema]
+  [^Delete delete schema]
   (let [table (.getTable delete)
-        table-name (unquote-ident (.getName ^Table table))
+        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name
@@ -4846,7 +4969,7 @@
    and target table info for the server to execute."
   [^Update update schema db]
   (let [table (.getTable update)
-        table-name (unquote-ident (.getName ^Table table))
+        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name

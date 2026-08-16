@@ -17,7 +17,8 @@
 
    Callers: sql/preprocess-sql."
   (:require [clojure.string :as str]
-            [datahike.pg.sql.classify :as cls]))
+            [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.params :as params]))
 
 ;; ============================================================================
 ;; Core rewriter
@@ -380,14 +381,18 @@
                   nt-kw (kw-text next-t)]
               (if (and nt-kw
                        (contains? alias-reserved-kws nt-kw)
-                       ;; Preserve original capitalisation of the token
-                       ;; so the quoted alias still equals the user's
-                       ;; intent ("Select" vs "select" vs "SELECT").
                        (not (inside-cast-parens? toks (inc i))))
                 (let [start (:pos next-t)
                       end (:end next-t)
-                      original-text (:text next-t)
-                      quoted (str "\"" original-text "\"")]
+                      ;; FOLD before quoting. The source token is
+                      ;; unquoted, so PostgreSQL would have lower-cased
+                      ;; it; quoting it verbatim here would make the
+                      ;; synthetic quotes preserve a case the user never
+                      ;; asked to preserve, and `SELECT 1 AS Select`
+                      ;; would be labelled `Select` where PG says
+                      ;; `select`. The quotes exist only to get the
+                      ;; reserved word past the parser.
+                      quoted (str "\"" (params/fold-identifier (:text next-t)) "\"")]
                   (recur (+ i 2)
                          (conj acc [start end quoted])))
                 (recur (inc i) acc)))))))))

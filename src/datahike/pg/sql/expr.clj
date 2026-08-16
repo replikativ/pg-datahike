@@ -2031,7 +2031,7 @@
                                            (:table-aliases ctx)
                                            (:default-table ctx)
                                            (:col-overrides ctx)
-                                           (:derived-aliases ctx))]
+                                           (:derived-aliases ctx) (:ci-index ctx))]
           (ctx/col-var! ctx resolved))))
 
     (instance? AllColumns expr)
@@ -2624,7 +2624,7 @@
                                                (:table-aliases ctx)
                                                (:default-table ctx)
                                                (:col-overrides ctx)
-                                               (:derived-aliases ctx))
+                                               (:derived-aliases ctx) (:ci-index ctx))
                            (catch Throwable _ nil))]
     (let [attr (cond (keyword? resolved) resolved
                      (and (vector? resolved) (= 3 (count resolved))) (nth resolved 2)
@@ -2722,7 +2722,7 @@
                                                    (:table-aliases ctx)
                                                    (:default-table ctx)
                                                    (:col-overrides ctx)
-                                                   (:derived-aliases ctx))
+                                                   (:derived-aliases ctx) (:ci-index ctx))
                                (catch Throwable _ nil))
              l-res (resolve-col left)
              r-res (resolve-col right)]
@@ -2914,7 +2914,7 @@
                                              (:table-aliases ctx)
                                              (:default-table ctx)
                                              (:col-overrides ctx)
-                                             (:derived-aliases ctx))
+                                             (:derived-aliases ctx) (:ci-index ctx))
                 pv (translate-expr ctx right)]
             (cond
               (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
@@ -2935,7 +2935,7 @@
                                                (:table-aliases ctx)
                                                (:default-table ctx)
                                                (:col-overrides ctx)
-                                               (:derived-aliases ctx))
+                                               (:derived-aliases ctx) (:ci-index ctx))
                 ;; PG-style unknown-literal coercion: `<typed-col> = '<lit>'`
                 ;; routes the literal through the column's typinput when
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
@@ -3047,7 +3047,7 @@
                                            (:table-aliases ctx)
                                            (:default-table ctx)
                                            (:col-overrides ctx)
-                                           (:derived-aliases ctx))]
+                                           (:derived-aliases ctx) (:ci-index ctx))]
           (cond
             ;; db_id IS NULL doesn't make sense
             (and (vector? resolved) (= :db-id (first resolved)))
@@ -3060,9 +3060,14 @@
                   [alias-key kw]
                   (cond
                     (and (vector? resolved) (= :aliased (first resolved)))
-                    [(nth resolved 1) (nth resolved 2)]
+                    [(nth resolved 1) (ctx/attr-of ctx resolved)]
                     :else
-                    [(namespace resolved) resolved])
+                    ;; INHERITS: this branch did no resolution at all, so
+                    ;; `WHERE inherited_col IS NULL` was inverted — the
+                    ;; child-namespace attr is always absent, making the
+                    ;; test true for every row.
+                    [(namespace resolved) (ctx/attr-of ctx resolved)])
+                  _ (ctx/validate-column! ctx kw)
                   evar (ctx/entity-var! ctx alias-key)
                   val-var (ctx/fresh-var! ctx)
                   ;; Ensure the entity var is bound by an anchor pattern.
@@ -3894,7 +3899,7 @@
                                        (:table-aliases ctx)
                                        (:default-table ctx)
                                        (:col-overrides ctx)
-                                       (:derived-aliases ctx))
+                                       (:derived-aliases ctx) (:ci-index ctx))
           col-var (ctx/col-var! ctx resolved)]
       [[(list '= col-var true)]])
 

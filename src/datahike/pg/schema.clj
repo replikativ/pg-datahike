@@ -808,6 +808,76 @@
            (vreset! dvt-last-cache [schema hints v])
            v))))))
 
+(def ^:private ambiguous ::ambiguous)
+
+(defn- fold-name
+  "ASCII-only case fold, matching datahike.pg.sql.params/fold-identifier.
+   Duplicated rather than required: params.clj sits above this namespace
+   in the load order."
+  [^String s]
+  (when s
+    (let [n (.length s) sb (StringBuilder. n)]
+      (dotimes [i n]
+        (let [c (.charAt s i)]
+          (.append sb (if (and (>= (int c) (int \A)) (<= (int c) (int \Z)))
+                        (char (+ (int c) 32)) c))))
+      (.toString sb))))
+
+(defn- ci-index*
+  [tables]
+  {:tables  (reduce (fn [m tname]
+                      (let [k (fold-name tname)]
+                        (if (contains? m k) (assoc m k ambiguous) (assoc m k tname))))
+                    {} (keys tables))
+   :columns (reduce-kv (fn [m tname {:keys [attrs]}]
+                         (assoc m tname
+                                (reduce-kv (fn [cm cname attr]
+                                             (let [k (fold-name cname)]
+                                               (if (contains? cm k)
+                                                 (assoc cm k ambiguous)
+                                                 (assoc cm k attr))))
+                                           {} attrs)))
+                       {} tables)})
+
+(defn ci-index
+  "A case-folding index over the schema:
+   `{:tables {folded-name -> real-name} :columns {real-table {folded-col -> attr}}}`.
+
+   PostgreSQL folds unquoted identifiers, so after that fold a reference
+   carries the lower-cased name. Storage may not: a database created
+   before folding landed holds `:MixedCase/ColA`, and a Datalog-native
+   database — the serve-an-existing-Datahike-db case —
+   holds whatever its attributes were named, typically camelCase like
+   `:person/firstName`. This index is what lets a folded reference reach
+   either.
+
+   A folded name claimed by two different storage names maps to
+   ::ambiguous rather than picking one; the caller raises 42702 (column)
+   or 42P01 (table). Guessing there would silently read or write the
+   wrong column.
+
+   Derived from the already-memoised `derive-virtual-tables` result, so
+   it costs one pass over that map and inherits its caching. Its `:attrs`
+   already has `:datahike.pg/column` renames applied, so hint-renamed
+   columns get covered for free."
+  ([schema] (ci-index schema nil))
+  ([schema hints] (ci-index* (derive-virtual-tables schema hints))))
+
+(defn canonical-table
+  "The stored name for `tname`, or `tname` when nothing else claims it.
+   Returns ::ambiguous when two stored names fold together."
+  [ci tname]
+  (or (get-in ci [:tables (fold-name tname)]) tname))
+
+(defn canonical-attr
+  "The stored attribute for column `cname` of table `tname`, or nil when
+   the table has no such column (the caller then falls back to
+   `(keyword tname cname)`, preserving NULL-for-unknown-column)."
+  [ci tname cname]
+  (get-in ci [:columns tname (fold-name cname)]))
+
+(defn ambiguous? [x] (= ambiguous x))
+
 (defn table-names
   "Return sorted list of virtual table names for a schema."
   [schema]

@@ -32,6 +32,7 @@
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
+            [datahike.pg.sql.ctx :as sql-ctx]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -881,7 +882,27 @@
                     (first (errors/classify-exception e))))
       (.printStackTrace e ^java.io.PrintWriter *err*)))
   (let [[sqlstate msg fields] (errors/classify-exception e)
-        ^PgWireServer$QueryResult result (error-result (str prefix msg) sqlstate)]
+        ;; Same rule parse-sql* applies to its own "SQL parse error: "
+        ;; prefix: an error that already carries a SQLSTATE or a
+        ;; registered category was raised deliberately and its message
+        ;; is already PG-shaped, so prefixing it only makes it diverge —
+        ;; `UPDATE error: column "c" does not exist` where PostgreSQL
+        ;; says `column "c" does not exist`. The prefix stays for
+        ;; unclassified failures, where naming the statement kind is the
+        ;; only context the client gets.
+        data (ex-data e)
+        structured? (or (:sqlstate data)
+                        (and (:error data)
+                             (contains? errors/error-categories (:error data)))
+                        ;; Datahike's own exceptions carry ex-data we did
+                        ;; not choose, but classify-exception rewrites the
+                        ;; ones it recognises into PG's exact wording (a
+                        ;; :transact/schema failure becomes `column "c" of
+                        ;; relation "t" does not exist`). Landing on a
+                        ;; specific SQLSTATE is the signal that happened.
+                        (not= "XX000" sqlstate))
+        ^PgWireServer$QueryResult result
+        (error-result (str (when-not structured? prefix) msg) sqlstate)]
     (if fields (.withErrorFields result fields) result)))
 
 (defn- rewrite-cursor-page
@@ -2403,6 +2424,19 @@
    ParamRefs stay unresolved in :in-args-raw; values substitute per call."
   (pg-cache/bounded-cache 512))
 
+(defmacro ^:private with-cte-namespaces
+  "Re-establish the CTE name→namespace mapping while `body` runs.
+
+   UPDATE and DELETE keep their WHERE clause as a JSqlParser AST and
+   re-translate it at EXECUTE time, outside the dynamic scope parse-sql
+   established. Without the rebind, a CTE reference in that WHERE — or
+   in a subquery under it — resolves to a base table of the same name.
+   That is how `WITH t AS (SELECT 99 AS id) DELETE FROM t WHERE id IN
+   (SELECT id FROM t)` deleted every row of the real table."
+  [parsed & body]
+  `(binding [sql-ctx/*relation-namespaces* (or (:cte-namespaces ~parsed) {})]
+     ~@body))
+
 (defn- build-delete-tx
   "Build entity IDs and tx-data for a DELETE against `db`.
    Returns {:eids [...] :tx-data [...]} using real entity IDs — callers
@@ -2472,7 +2506,7 @@
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (build-delete-tx db schema parsed)
+          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-delete-tx db schema parsed))
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
@@ -2650,7 +2684,7 @@
              (update :tx-data into tx-data))))
      {:eids [] :tx-data []}
      rows)
-    (build-update-tx-for-bindings db schema parsed nil)))
+    (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil))))
 
 (defn- check-update-identity-collisions!
   "Pre-flight check: before running tx-data from build-update-tx, scan
@@ -2769,7 +2803,7 @@
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (build-update-tx db schema parsed)
+          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-update-tx db schema parsed))
           _ (check-update-identity-collisions! db schema tx-data)
           _ (check-not-null-on-update! db tx-data)
           _ (check-updates-against-row-constraints!
@@ -2952,8 +2986,17 @@
    created table carries. More reliable than scanning for individual
    column attrs, which may have been ALTER TABLE-added separately."
   [db table-name]
-  (let [marker (pgs/row-marker-attr table-name)]
-    (boolean (get (dbi/-schema db) marker))))
+  (let [schema (dbi/-schema db)]
+    (or (boolean (get schema (pgs/row-marker-attr table-name)))
+        ;; Case-insensitively too: the name arrives folded, but a
+        ;; database created before folding stores `:MixedCase/*`. Without
+        ;; this, `CREATE TABLE MixedCase` against such a database sees no
+        ;; `:mixedcase/db-row-exists`, skips the 42P07, and mints a
+        ;; lowercase TWIN of a table that already exists.
+        (let [c (pgs/canonical-table (pgs/ci-index schema) table-name)]
+          (and (not (pgs/ambiguous? c))
+               (not= c table-name)
+               (boolean (get schema (pgs/row-marker-attr c))))))))
 
 (defn- sequence-exists?
   "True when a sequence entity with this name is already present in
@@ -5560,7 +5603,7 @@
               {:keys [eids tx-data]}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (build-update-tx spec-db schema parsed)
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db))
@@ -5612,7 +5655,7 @@
               {:keys [eids]}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (build-delete-tx spec-db schema parsed)
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db))

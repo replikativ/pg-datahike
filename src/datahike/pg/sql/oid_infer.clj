@@ -253,17 +253,6 @@
 
 (declare expr-oid)
 
-(defn- unquote-ident
-  "Strip surrounding single/double quotes from a SQL identifier."
-  [s]
-  (when s
-    (let [s (str s)]
-      (if (and (>= (count s) 2)
-               (or (and (str/starts-with? s "\"") (str/ends-with? s "\""))
-                   (and (str/starts-with? s "`")  (str/ends-with? s "`"))))
-        (subs s 1 (dec (count s)))
-        s))))
-
 (defn- column-oid
   "Resolve a Column reference to an OID via the live schema. Returns nil
    if we can't find the attribute (derived tables, catalog views, etc.);
@@ -280,10 +269,10 @@
    parsed as an array on the client side."
   [^Column col {:keys [db schema table-aliases default-table hints]}]
   (when schema
-    (let [col-name   (unquote-ident (.getColumnName col))
+    (let [col-name   (params/unquote-ident (.getColumnName col))
           col-table  (when-let [t (.getTable col)]
-                       (or (unquote-ident (.getName t))
-                           (unquote-ident (.getAlias t))))
+                       (or (params/unquote-ident (.getName t))
+                           (params/unquote-ident (.getAlias t))))
           table-real (or (get table-aliases col-table col-table)
                          default-table)
           hint-attr (when (and hints col-table)
