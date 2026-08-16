@@ -53,7 +53,7 @@
 (def ^:dynamic *handler* nil)
 
 (defn pg-test-fixture [f]
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? true}]
     (d/create-database cfg)
@@ -453,7 +453,7 @@
 (deftest test-pg-constraint-check-and-fk
   (testing "CHECK and FK constraints surface via pg_constraint after DDL"
     ;; New connection — fixture has only person/department.
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write}
           _ (d/create-database cfg)
           conn (d/connect cfg)
@@ -1045,7 +1045,7 @@
             either coerce-insert-value silently drops the columns, or
             the ref-target FK projection on the INSERT … SELECT path
             consumes its arg and returns nil for the ref column."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1129,7 +1129,7 @@
               `INSERT … account=143` → `[:account/path 143]` →
               datahike: \"Nothing found for entity id\" because path
               is a string and 143 is a long."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1178,7 +1178,7 @@
             statement bound to a java.time.LocalDate (the usual
             jdbc default for `:date` columns) errors with cryptic
             'value does not match schema definition'."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1215,7 +1215,7 @@
             instead of rejecting. This matters for parameterized
             INSERTs where the wire layer decoded a typed literal, and
             for INSERT … SELECT pulling already-typed datahike values."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1253,7 +1253,7 @@
             on INSERT (`'draft'` → `:draft`) and surface them as their
             string form on SELECT. SQL clients have no keyword literal,
             so the string ↔ keyword bridge belongs in the wire layer."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1302,7 +1302,7 @@
             has a person. The empty department should surface with
             count(p.db_id) = 0. Pre-fix: the empty department row is
             absent from the result entirely."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1355,7 +1355,7 @@
             This test uses a simple Clojure-side wrap that throws
             on negative `widget/qty` values, demonstrating the hook
             is reached by INSERT, UPDATE, and DELETE paths."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1431,7 +1431,7 @@
             hook must fire on this path too — otherwise framework-
             installed validators see only the slower / RETURNING /
             ON CONFLICT inserts, missing the bulk of writes."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1467,7 +1467,7 @@
 (deftest test-tx-wrap-default-identity-no-op
   (testing "Without :tx-wrap, the handler behaves identically — the
             default is identity and adds no overhead."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1494,7 +1494,7 @@
             account-tag aggregation). Datalog-side is naturally a plain
             data pattern over the M2M ref attr — translator just needs
             to recognize the SQL form and emit the right pattern."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1565,7 +1565,7 @@
             namespace `account`, while the rest of the query was
             using ?a_eid for the alias `a`. Two ungrounded eids;
             the M2M emitter's source-eid arg landed unbound."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)
@@ -1618,7 +1618,7 @@
             namespace appears AND that namespace has a
             :db.unique/identity attr, use it. The cardinality marker
             keeps the [pk :many] shape for many-refs."
-    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+    (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                :schema-flexibility :write
                :keep-history? true}
           _ (d/create-database cfg)

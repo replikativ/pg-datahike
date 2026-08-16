@@ -21,7 +21,7 @@
 (defn- in-memory-fixture [f]
   (Class/forName "org.postgresql.Driver")
   (pg/reset-lock-registry!)
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? false}]
     (d/create-database cfg)
@@ -223,7 +223,7 @@
         sql (dump-text)
 
         ;; Spin up a SECOND fresh pg-datahike, replay the dump, verify
-        target-cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+        target-cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                     :schema-flexibility :write :keep-history? false}
         _ (d/create-database target-cfg)
         target-conn (d/connect target-cfg)

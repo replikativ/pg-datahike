@@ -18,7 +18,7 @@
 (def ^:dynamic *h* nil)
 
 (defn- fixture [f]
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? true}]
     (d/create-database cfg)
@@ -179,7 +179,7 @@
 ;; ============================================================================
 
 (defn- fresh-handler [opts]
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? true}]
     (d/create-database cfg)

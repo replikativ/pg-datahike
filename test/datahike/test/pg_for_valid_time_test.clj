@@ -173,7 +173,7 @@
 (def ^:dynamic *db-conn* nil)
 
 (defn- temporal-fixture [f]
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write
              :keep-history? true}]
     (d/create-database cfg)

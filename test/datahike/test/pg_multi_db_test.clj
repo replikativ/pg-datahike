@@ -13,7 +13,7 @@
 (def ^:dynamic *registry* nil)
 
 (defn- fresh-cfg []
-  {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
    :schema-flexibility :write
    :keep-history? false})
 

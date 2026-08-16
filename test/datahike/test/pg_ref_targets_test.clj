@@ -9,7 +9,7 @@
 (defn- make-db
   ([schema] (make-db schema []))
   ([schema data]
-   (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+   (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
               :schema-flexibility :write
               :keep-history? false}]
      (d/create-database cfg)

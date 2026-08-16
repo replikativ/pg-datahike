@@ -22,7 +22,7 @@
 (defn- enum-domain-fixture [f]
   (Class/forName "org.postgresql.Driver")
   (pg/reset-lock-registry!)
-  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
              :schema-flexibility :write :keep-history? false}]
     (d/create-database cfg)
     (let [conn (d/connect cfg)
@@ -253,7 +253,7 @@
     (exec! c "INSERT INTO film VALUES (2, 'sad',   1990)")
     (let [src-rows (query-rows c "SELECT id, m, y FROM film ORDER BY id")
           sql (dump/dump-to-string *conn*)
-          tgt-cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+          tgt-cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)} :max-string-length 0
                    :schema-flexibility :write :keep-history? false}]
       (d/create-database tgt-cfg)
       (let [tgt-conn (d/connect tgt-cfg)
