@@ -103,6 +103,44 @@
             attr))       ;; not found in parent either, return original
         attr))))
 
+(defn attr-of
+  "The Datahike attribute a `resolve-column` result denotes, with
+   INHERITS resolution applied — or nil for the `[:db-id …]` form,
+   which denotes an entity rather than an attribute.
+
+   `resolve-column` returns two attribute-bearing shapes, `:ns/col` and
+   `[:aliased alias :ns/col]`, and inheritance has to be resolved for
+   BOTH: an INHERITS child stores its parent's columns under the PARENT
+   namespace on the same entity (`:par/pname`, not `:chi/pname`), so a
+   reference that keeps the child namespace binds nothing and reads as
+   NULL.
+
+   Every consumer used to do this itself and every one of them handled
+   only the keyword shape, so `SELECT c.pname FROM child c` — and any
+   other aliased reference to an inherited column — silently returned
+   NULL where PostgreSQL returns the value. Routing all of them through
+   here is what keeps the two shapes from drifting apart again."
+  [ctx resolved]
+  (let [kw (cond
+             (keyword? resolved) resolved
+             (and (vector? resolved) (= :aliased (first resolved))) (nth resolved 2)
+             :else nil)]
+    (when kw
+      (if-let [db (:db ctx)]
+        (resolve-inherited-attr kw (:schema ctx) db)
+        kw))))
+
+(defn with-resolved-attr
+  "`resolved` with its attribute replaced by `attr-of`, preserving the
+   shape. Use when the caller needs to pass the whole resolve-column
+   result onward rather than just the attribute."
+  [ctx resolved]
+  (if-let [a (attr-of ctx resolved)]
+    (if (vector? resolved)
+      [:aliased (nth resolved 1) a]
+      a)
+    resolved))
+
 ;; ---------------------------------------------------------------------------
 ;; Context constructor + primitives
 
@@ -286,15 +324,8 @@
     (entity-var! ctx (second attr))
 
     :else
-    (let [[alias-key resolved-attr]
-          (cond
-            (and (vector? attr) (= :aliased (first attr)))
-            [(nth attr 1) (nth attr 2)]
-            :else
-            [(namespace attr)
-             (if-let [db (:db ctx)]
-               (resolve-inherited-attr attr (:schema ctx) db)
-               attr)])
+    (let [alias-key (if (vector? attr) (nth attr 1) (namespace attr))
+          resolved-attr (attr-of ctx attr)
           cache-key [alias-key resolved-attr :__eid__]
           cvars (:col->var ctx)]
       (or (get @cvars cache-key)
@@ -378,7 +409,7 @@
     ;; with "Bad format for attribute in pattern".
     (and (vector? attr) (= :aliased (first attr)))
     (let [alias-key (nth attr 1)
-          kw (nth attr 2)
+          kw (attr-of ctx attr)
           cache-key [alias-key kw]
           cvars (:col->var ctx)
           ref-target-entry (get (:ref-targets ctx) kw)
@@ -418,11 +449,7 @@
     ;; Regular keyword :ns/col
     :else
     (let [alias-key (namespace attr)
-          ;; Resolve inherited attributes: if :child/col doesn't exist in schema
-          ;; but :parent/col does (via __inherit__), use the parent namespace
-          resolved-attr (if-let [db (:db ctx)]
-                          (resolve-inherited-attr attr (:schema ctx) db)
-                          attr)
+          resolved-attr (attr-of ctx attr)
           cache-key [alias-key resolved-attr]
           cvars (:col->var ctx)
           ref-target-entry (get (:ref-targets ctx) resolved-attr)
@@ -494,13 +521,8 @@
   [ctx resolved]
   (let [[alias-key attr]
         (cond
-          (keyword? resolved)
-          [(namespace resolved)
-           (if-let [db (:db ctx)]
-             (resolve-inherited-attr resolved (:schema ctx) db)
-             resolved)]
-          (and (vector? resolved) (= :aliased (first resolved)))
-          [(nth resolved 1) (nth resolved 2)]
+          (keyword? resolved)                                   [(namespace resolved) (attr-of ctx resolved)]
+          (and (vector? resolved) (= :aliased (first resolved))) [(nth resolved 1) (attr-of ctx resolved)]
           :else nil)]
     (when (and alias-key (keyword? attr)
                (nil? (get (:ref-targets ctx) attr))

@@ -3060,9 +3060,13 @@
                   [alias-key kw]
                   (cond
                     (and (vector? resolved) (= :aliased (first resolved)))
-                    [(nth resolved 1) (nth resolved 2)]
+                    [(nth resolved 1) (ctx/attr-of ctx resolved)]
                     :else
-                    [(namespace resolved) resolved])
+                    ;; INHERITS: this branch did no resolution at all, so
+                    ;; `WHERE inherited_col IS NULL` was inverted — the
+                    ;; child-namespace attr is always absent, making the
+                    ;; test true for every row.
+                    [(namespace resolved) (ctx/attr-of ctx resolved)])
                   evar (ctx/entity-var! ctx alias-key)
                   val-var (ctx/fresh-var! ctx)
                   ;; Ensure the entity var is bound by an anchor pattern.
