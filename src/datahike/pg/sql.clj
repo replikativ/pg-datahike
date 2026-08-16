@@ -1625,6 +1625,34 @@
        :sqlstate "42601"
        :message (str "syntax error at or near \"" (:text bad) "\"")})))
 
+(defn simple-query-param-error
+  "An `{:type :error}` map when `sql` uses a `$N` placeholder in the
+   SIMPLE query protocol, else nil.
+
+   Simple Query has no Bind step, so there is nothing a placeholder
+   could refer to and PostgreSQL raises 42P02. We used to translate the
+   statement anyway and let the unresolved placeholder reach the client:
+   `SELECT $1` answered with the internal ParamRef record rendered as
+   `{\"idx\":1}` — leaking a representation detail as if it were data.
+
+   Only reachable from the simple path; the extended path resolves
+   placeholders at Bind. Gated on an indexOf so statements without a
+   `$` never pay for tokenising, and driven off the tokeniser's `:param`
+   classification so a `$` inside a string, a dollar-quoted body or a
+   quoted identifier doesn't count."
+  [^String sql]
+  (when (and (<= 0 (.indexOf sql "$"))
+             ;; PREPARE/EXECUTE are the SQL-level prepared-statement
+             ;; commands: `PREPARE p AS SELECT $1` is a placeholder in a
+             ;; TEMPLATE, bound later by EXECUTE, and is legal in Simple
+             ;; Query exactly as it is in PG.
+             (not (contains? #{:prepare :execute-prepared :deallocate}
+                             (:kind (cls/classify sql)))))
+    (when-let [p (first (filter #(= :param (:type %)) (cls/tokenize-all sql)))]
+      {:type :error
+       :sqlstate "42P02"
+       :message (str "there is no parameter " (:text p))})))
+
 (defn parse-sql
   "Parse a SQL statement and return a translation result.
 

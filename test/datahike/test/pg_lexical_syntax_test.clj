@@ -45,6 +45,14 @@
        (catch PgWireServer$PgProtocolException e
          [(.-sqlstate e) (.getMessage e)])))
 
+(defn- parse-err-exec
+  "[sqlstate message] from EXECUTING `sql` (not merely parsing it) — the
+   Simple Query path is where the placeholder check lives."
+  [sql]
+  (let [^PgWireServer$QueryResult r (.execute *handler* sql)]
+    (when-let [e (.-error r)]
+      [(.-sqlstate r) e])))
+
 (defn- rows [sql]
   (let [^PgWireServer$QueryResult r (.execute *handler* sql)]
     (mapv vec (.-rows r))))
@@ -97,3 +105,21 @@
     (.execute *handler* "CREATE TABLE t$1 (a$b int)")
     (is (nil? (parse-err "SELECT a$b FROM t$1")))
     (is (= [] (rows "SELECT a$b FROM t$1")))))
+
+;; ---------------------------------------------------------------------------
+;; `$N` in Simple Query
+;; ---------------------------------------------------------------------------
+
+(deftest placeholder-in-simple-query-raises
+  (testing "Simple Query has no Bind step, so a `$N` refers to nothing.
+            It used to translate anyway and hand the client the internal
+            ParamRef record rendered as {\"idx\":1}, as if it were data."
+    (is (= ["42P02" "there is no parameter $1"] (parse-err-exec "SELECT $1")))
+    (is (= ["42P02" "there is no parameter $1"] (parse-err-exec "SELECT $1 + 1")))
+    (is (= ["42P02" "there is no parameter $2"]
+           (parse-err-exec "SELECT 1 WHERE 1 = $2"))))
+  (testing "a `$` that is not a placeholder is untouched"
+    (is (nil? (parse-err-exec "SELECT '$1'")))
+    (is (= [["$1"]] (rows "SELECT '$1'"))))
+  (testing "PREPARE's template placeholders are legal — they bind at EXECUTE"
+    (is (nil? (parse-err-exec "PREPARE pq AS SELECT $1")))))

@@ -400,10 +400,16 @@
 (deftest classify-sequence-functions-carry-args
   (is (= {:kind :nextval :seq-name "s1"} (c/classify "SELECT nextval('s1')")))
   (is (= {:kind :currval :seq-name "s1"} (c/classify "SELECT currval('s1')")))
-  (is (= {:kind :setval :seq-name "s1" :new-value 100}
-         (c/classify "SELECT setval('s1', 100)")))
-  (testing "setval 3-arg form (is_called flag) — still extracts name + new-value"
-    (is (= "s1" (:seq-name (c/classify "SELECT setval('s1', 100, true)"))))))
+  (is (= {:kind :setval :seq-name "s1" :new-value 100 :is-called true}
+         (c/classify "SELECT setval('s1', 100)"))
+      "the 2-arg form means is_called = true")
+  (testing "setval 3-arg form carries the is_called flag — it decides whether
+            the next nextval returns N or N+increment, so dropping it made
+            the sequence hand out the wrong value"
+    (is (= "s1" (:seq-name (c/classify "SELECT setval('s1', 100, true)"))))
+    (is (true? (:is-called (c/classify "SELECT setval('s1', 100, true)"))))
+    (is (false? (:is-called (c/classify "SELECT setval('s1', 100, false)"))))
+    (is (false? (:is-called (c/classify "SELECT setval('s1', 100, FALSE)"))))))
 
 ;; ============================================================================
 ;; pg_dump utility-statement support (tier 1)

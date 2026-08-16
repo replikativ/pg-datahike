@@ -577,7 +577,20 @@
       (fn-name=? t1 "setval")
       {:kind :setval
        :seq-name (first (extract-fn-string-args rest-args))
-       :new-value (first (extract-fn-numeric-args rest-args))}
+       :new-value (first (extract-fn-numeric-args rest-args))
+       ;; The 3-arg form's is_called flag. It decides whether the NEXT
+       ;; nextval returns `n` or `n + increment`, so dropping it makes
+       ;; the sequence hand out the wrong value — `setval(s,10,false)`
+       ;; then `nextval(s)` must be 10, not 11. Defaults to true, which
+       ;; is what the 2-arg form means.
+       :is-called (let [b (first (keep (fn [{:keys [type text]}]
+                                         (when (= :ident type)
+                                           (case (str/lower-case text)
+                                             "false" false
+                                             "true" true
+                                             nil)))
+                                       rest-args))]
+                    (if (some? b) b true))}
       (fn-name=? t1 "pg_get_keywords") {:kind :pg-keywords}
       :else {:kind :generic-sql})))
 

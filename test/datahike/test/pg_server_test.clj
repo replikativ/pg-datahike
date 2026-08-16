@@ -855,12 +855,28 @@
 ;; ============================================================================
 
 (deftest test-semantic-errors
-  (testing "Unknown column returns NULL values (EAV: missing attribute = NULL)"
-    ;; In EAV, a non-existent column maps to a non-existent attribute.
-    ;; get-else returns :__null__ sentinel which displays as NULL.
-    ;; This is consistent behavior, not an error.
+  (testing "Unknown column on a known table raises 42703"
+    ;; This assertion is REVERSED from what it used to be. The old
+    ;; behaviour treated a non-existent column as a non-existent
+    ;; attribute, which `get-else` reads as the `:__null__` sentinel —
+    ;; internally consistent, but it meant a typo'd column name returned
+    ;; a row of NULLs, and `WHERE nosuchcol = 1` returned no rows, with
+    ;; no indication anything was wrong. PostgreSQL rejects it at
+    ;; parse-analyze, and an application cannot tell "this column is
+    ;; empty" from "this column does not exist" without that.
+    ;;
+    ;; The EAV permissiveness that IS still wanted — a row that simply
+    ;; lacks a value for a column it does have — is unaffected: that
+    ;; column is in the schema, so it still reads as NULL.
     (let [r (.execute *handler* "SELECT nonexistent_column FROM person")]
-      (is (nil? (err r)))))
+      (is (= "column \"nonexistent_column\" does not exist" (err r)))))
+
+  (testing "a column the table DOES have still reads as NULL when unset"
+    (.execute *handler* "CREATE TABLE sparse (id INTEGER, maybe TEXT)")
+    (.execute *handler* "INSERT INTO sparse (id) VALUES (1)")
+    (let [r (.execute *handler* "SELECT id, maybe FROM sparse")]
+      (is (nil? (err r)))
+      (is (= [["1" nil]] (mapv vec (.-rows r))))))
 
   (testing "Type mismatch in INSERT"
     ;; Try inserting string into INTEGER column via DDL table
