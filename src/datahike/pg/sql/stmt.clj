@@ -2081,46 +2081,59 @@
         ;; compound — both inferences are sound. Padding to
         ;; find-aliases length absorbs extra entries those features
         ;; add to :find that don't map 1:1 to a select-item.
-        select-item-oids
-        (let [acc (reduce
-                   (fn [v ^SelectItem item]
-                     (let [expr (.getExpression item)]
-                       (cond
+        ;; Accumulates TWO index-aligned vectors in one pass — the OID
+        ;; per output column, and the 1-based `$N` index when the column
+        ;; is a bare parameter placeholder. They must be built together:
+        ;; a `*` select item contributes N entries to both, so computing
+        ;; them separately would drift out of alignment.
+        ;;
+        ;; The param index (not its type) is what gets cached, because
+        ;; the parse cache is keyed by SQL text while the parameter's
+        ;; declared type is per-Parse-message. describeResult resolves
+        ;; index → OID against :declared-param-oids at Describe time.
+        [select-item-oids* select-item-param-idx*]
+        (let [[oids idxs]
+              (reduce
+               (fn [[v pv] ^SelectItem item]
+                 (let [expr (.getExpression item)]
+                   (cond
                            ;; AllTableColumns must come BEFORE AllColumns
                            ;; (it's a subclass).
-                         (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
-                         (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
-                               ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
-                               raw-name (when tbl
-                                          (str/lower-case
-                                           (or (when-let [a (.getAlias tbl)]
-                                                 (.getName ^Alias a))
-                                               (.getName tbl))))
-                               real (or (get table-aliases raw-name) raw-name)
-                               cols (pgs/column-info schema real db)]
-                           (into v (keep (fn [col]
-                                           (when (not= "db_id" (:name col))
-                                             (:oid col)))
-                                         cols)))
-                         (instance? AllColumns expr)
-                         (let [cols (pgs/column-info schema default-table db)]
-                           (into v (keep (fn [col]
-                                           (when (not= "db_id" (:name col))
-                                             (:oid col)))
-                                         cols)))
-                         :else
-                         (conj v (oid/expr-oid expr oid-env)))))
-                   []
+                     (instance? net.sf.jsqlparser.statement.select.AllTableColumns expr)
+                     (let [^net.sf.jsqlparser.statement.select.AllTableColumns atc expr
+                           ^net.sf.jsqlparser.schema.Table tbl (.getTable atc)
+                           raw-name (when tbl
+                                      (str/lower-case
+                                       (or (when-let [a (.getAlias tbl)]
+                                             (.getName ^Alias a))
+                                           (.getName tbl))))
+                           real (or (get table-aliases raw-name) raw-name)
+                           cols (pgs/column-info schema real db)
+                           picked (remove #(= "db_id" (:name %)) cols)]
+                       [(into v (map :oid) picked)
+                        (into pv (repeat (count picked) nil))])
+                     (instance? AllColumns expr)
+                     (let [cols (pgs/column-info schema default-table db)
+                           picked (remove #(= "db_id" (:name %)) cols)]
+                       [(into v (map :oid) picked)
+                        (into pv (repeat (count picked) nil))])
+                     :else
+                     [(conj v (oid/expr-oid expr oid-env))
+                      (conj pv (oid/param-placeholder-index expr))])))
+               [[] []]
                    ;; loop-items excludes deferred correlated subqueries, so
                    ;; these OIDs line up with the non-subquery part of
                    ;; find-aliases (the __corr_ tail pads to nil below).
-                   loop-items)
+               loop-items)
                 ;; find-aliases may be longer than acc when SELECT
                 ;; contains JOIN-driven entity vars added to :find
                 ;; for :with semantics. Pad with nil so the vector
                 ;; lines up index-for-index with find-aliases.
-              n (count @find-aliases)]
-          (vec (take n (concat acc (repeat nil)))))
+              n (count @find-aliases)
+              pad (fn [acc] (vec (take n (concat acc (repeat nil)))))]
+          [(pad oids) (pad idxs)])
+        select-item-oids select-item-oids*
+        select-item-param-idx select-item-param-idx*
 
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
         ;; from different entity combinations that produce identical values.
@@ -2918,6 +2931,11 @@
              ;; fall back to value-based inference at Execute time (via
              ;; compute-schema-oids) or TEXT when neither path resolves.
              :select-item-oids select-item-oids
+             ;; Index-aligned with :select-item-oids — the 1-based `$N`
+             ;; for output columns that are a bare placeholder, so
+             ;; describeResult can type them from the Parse message's
+             ;; declared OID (issue #27).
+             :select-item-param-idx select-item-param-idx
              :has-aggregates? @has-aggregates?
              :has-distinct?   has-distinct?
              :in-args         in-args

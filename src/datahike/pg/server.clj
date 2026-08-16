@@ -534,6 +534,35 @@
             (aset-int typmods i (int tm)))))
       (when @any? [toids attnums typmods]))))
 
+(defn- effective-item-oids
+  "`:select-item-oids` with bare-`$N` output columns resolved from the
+   Parse message's declared parameter OIDs.
+
+   oid-infer can't type a bare placeholder statically — `SELECT $1` has
+   no expression context — so PG takes the type straight from the Parse
+   declaration. `:select-item-param-idx` records which output columns
+   are bare placeholders at parse time (cacheable, since it's a property
+   of the SQL text); the declared OIDs are per-Parse-message and get
+   merged in here. Returns nil unchanged for the simple-query path,
+   which has neither key. See issue #27.
+
+   Both Describe and Execute go through this so the RowDescription OID
+   and the OID the DataRow is encoded under agree — a mismatch corrupts
+   binary-format decoding on the client."
+  [parsed]
+  (let [item-oids (:select-item-oids parsed)
+        param-idx (:select-item-param-idx parsed)
+        declared  (:declared-param-oids parsed)]
+    (if (and item-oids (seq param-idx) (seq declared))
+      (vec (map-indexed
+            (fn [i o]
+              (or o
+                  (when-let [p (nth param-idx i nil)]
+                    (let [d (get declared p)]
+                      (when (and d (pos? d)) d)))))
+            item-oids))
+      item-oids)))
+
 (defn- compute-schema-oids
   "Resolve the PG OID for each :find element of a parsed SELECT.
 
@@ -4843,7 +4872,7 @@
           keep-n (- (count (:find query)) hidden)
           parsed-with-shape (assoc parsed :find-aliases aliases :query query)
           schema-oids (compute-schema-oids parsed-with-shape db)
-          item-oids (:select-item-oids parsed)
+          item-oids (effective-item-oids parsed)
           schema-oids (if (and item-oids (seq aliases))
                         (let [n (count aliases)
                               out (int-array n)]
@@ -4940,7 +4969,7 @@
       ;; (via a synthetic schema-oids array keyed by
       ;; -1 sentinel) so SELECT TRUE reports BOOL even when
       ;; value inference would look at a String.
-      (let [item-oids (:select-item-oids parsed)
+      (let [item-oids (effective-item-oids parsed)
             schema-oids (when item-oids
                           (int-array
                            (map #(int (or % -1)) item-oids)))]
@@ -5250,7 +5279,7 @@
               ;; CAST / literal columns keep the
               ;; correct type when value inference
               ;; would otherwise fall back to TEXT.
-                  item-oids (:select-item-oids parsed)
+                  item-oids (effective-item-oids parsed)
                   schema-oids (if (and item-oids (seq find-aliases))
                                 (let [n (count find-aliases)
                                       out (int-array n)]
@@ -6502,7 +6531,7 @@
 
       ;; --- Extended Query protocol methods -------------------------------
 
-      (parse [_ sql _param-oids]
+      (parse [_ sql param-oids]
         ;; Translate once, return the parsed map as opaque state. The
         ;; wire layer caches it under the Parse stmt name and feeds it
         ;; back via executePrepared. Note: `db` captured at parse time
@@ -6540,7 +6569,19 @@
                   ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                   ;; working even though parse-sql may not have set it for
                   ;; non-system types.
-                  parsed (assoc parsed :sql sql)]
+                  ;;
+                  ;; :declared-param-oids carries the Parse message's own
+                  ;; type declarations (1-indexed to match `$N`; 0 = "you
+                  ;; infer it"). They are attached HERE rather than passed
+                  ;; into parse-sql because the parse cache is keyed by SQL
+                  ;; text alone — baking per-statement declarations into a
+                  ;; shared cached map would let one client's `$1::int2`
+                  ;; leak into another's `$1::text`. describeParams and
+                  ;; describeResult read them back off this map.
+                  parsed (assoc parsed :sql sql
+                                :declared-param-oids
+                                (into {} (map-indexed (fn [i o] [(inc i) o]))
+                                      (seq param-oids)))]
               (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
@@ -6568,13 +6609,22 @@
         ;; until Python's RecursionError. Defaulting to TEXT matches PG and
         ;; the bind path (an oid-0 param was already decoded as a text
         ;; string), so binding behaviour is unchanged.
+        ;; A client-declared non-zero OID wins over our inference, the
+        ;; same precedence handleParse applies — PG only resolves the
+        ;; slots the client left as 0. Without this a `$1` the client
+        ;; declared as int2 would describe as text (issue #27).
         (let [n (or (:param-count parsed) 0)
               hints (:param-oids parsed)
+              declared (:declared-param-oids parsed)
               arr (int-array n)]
           (when (pos? n)
             (dotimes [i n]
-              (aset arr i (int (let [o (get hints (inc i))]
-                                 (if (and o (pos? o)) o PgWireServer/OID_TEXT))))))
+              (aset arr i (int (let [d (get declared (inc i))
+                                     o (get hints (inc i))]
+                                 (cond
+                                   (and d (pos? d)) d
+                                   (and o (pos? o)) o
+                                   :else PgWireServer/OID_TEXT))))))
           arr))
 
       (describeResult [_ parsed]        ;; Return the column metadata for a prepared SELECT without
@@ -6648,7 +6698,10 @@
                 ;; they cover literals, aggregates, CAST, function
                 ;; calls, and arithmetic — shapes that have no schema
                 ;; attribute. See datahike.pg.sql.oid-infer.
-                item-oids (:select-item-oids parsed)
+                ;; Bare `$N` output columns are typed from the Parse
+                ;; message's declared OID — see effective-item-oids
+                ;; (issue #27).
+                item-oids (effective-item-oids parsed)
                 oids (int-array
                       (for [i (range (count aliases))]
                         (let [schema-oid (aget ^ints resolved i)

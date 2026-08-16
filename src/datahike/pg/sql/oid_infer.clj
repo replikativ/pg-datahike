@@ -36,7 +36,8 @@
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression LikeExpression
-            MinorThan MinorThanEquals NotEqualsTo RegExpMatchOperator]))
+            MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
+            RegExpMatchOperator]))
 
 ;; ---------------------------------------------------------------------------
 ;; Function return-type registry — keyed by lowercased SQL name.
@@ -616,8 +617,41 @@
           (str/includes? (or k "") "time") types/oid-timestamptz
           :else types/oid-timestamptz))
 
-      ;; --- Placeholders — bind params use the param-oid hint -----------
+      ;; --- Placeholders -------------------------------------------------
+      ;; A bare `$N` has no statically inferable type here: PG types it
+      ;; from the Parse message's declared OID, which is per-statement
+      ;; and therefore can't live in the (SQL-keyed) parse cache. We
+      ;; return nil and let describeResult resolve it via
+      ;; `param-placeholder-index` below. See issue #27.
       (instance? JdbcParameter expr)        nil
       (instance? JdbcNamedParameter expr)   nil
 
       :else nil)))
+
+(defn param-placeholder-index
+  "The 1-based `$N` index when `expr` is a bare parameter placeholder,
+   else nil.
+
+   Only a *bare* placeholder qualifies. `$1::int4` is a CastExpression
+   whose type `cast-oid` already resolves, and `$1 + 1` gets its type
+   from the arithmetic rule — in both cases PG takes the type from the
+   expression, not from the parameter declaration, so reporting an index
+   there would let a declared OID override a correctly inferred one.
+
+   Parenthesised placeholders are unwrapped: PG's exprType sees through
+   parens, so `SELECT ($1)` types the same as `SELECT $1`. JSqlParser
+   spells a parenthesised expression two ways — `Parenthesis`, and
+   `ParenthesedExpressionList` (a one-element list) for a select item —
+   so both are unwrapped, repeatedly for `SELECT (($1))`."
+  [expr]
+  (loop [expr expr]
+    (cond
+      (instance? Parenthesis expr)
+      (recur (.getExpression ^Parenthesis expr))
+
+      (and (instance? ParenthesedExpressionList expr)
+           (= 1 (.size ^ParenthesedExpressionList expr)))
+      (recur (.get ^ParenthesedExpressionList expr 0))
+
+      (instance? JdbcParameter expr)
+      (.getIndex ^JdbcParameter expr))))
