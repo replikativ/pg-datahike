@@ -492,6 +492,8 @@
        validated
        all-cards))))
 
+(def ^:const row-marker-col "db-row-exists")
+
 (defn- schema-hints*
   [db]
   (let [q-fn d/q
@@ -531,11 +533,35 @@
         pg-types (q-fn '{:find [?ident ?pt]
                          :where [[?e :db/ident ?ident]
                                  [?e :pg/type ?pt]]}
-                       db)]
-    (reduce (fn [acc [ident pt]]
-              (update acc ident assoc :pg-type pt))
-            ident-hints
-            pg-types)))
+                       db)
+        ;; Column ORDER, by schema-entity id — which is CREATE TABLE
+        ;; order. Collected here rather than per-call because everything
+        ;; attnum-shaped needs it and they were disagreeing:
+        ;; `column-info` reordered via `column-order-from-db`, while
+        ;; `pg_attribute`, `column-attnum`, `pg_index.indkey` and
+        ;; `pg_constraint.conkey` all read `derive-virtual-tables`
+        ;; directly and got Clojure hash-map order. Drivers key field
+        ;; metadata on attnum, so those must agree.
+        ;;
+        ;; Stored under ONE namespaced sentinel key, not per-ident, so
+        ;; the hint map stays small — it is the cache key at
+        ;; `schema-hints`, and every other consumer only ever looks up
+        ;; an attribute ident, so a non-ident key is inert.
+        ordered-idents (q-fn '{:find [?e ?ident]
+                               :where [[?e :db/ident ?ident]]
+                               :order-by [?e :asc]}
+                             db)
+        column-order (reduce (fn [acc [_ ident]]
+                               (if (and (keyword? ident) (namespace ident)
+                                        (not= (name ident) row-marker-col))
+                                 (update acc (namespace ident) (fnil conj []) (name ident))
+                                 acc))
+                             {} ordered-idents)]
+    (assoc (reduce (fn [acc [ident pt]]
+                     (update acc ident assoc :pg-type pt))
+                   ident-hints
+                   pg-types)
+           ::column-order column-order)))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -554,8 +580,6 @@
             (.put m db v)
             v)))
     :else (schema-hints* db)))
-
-(def ^:const row-marker-col "db-row-exists")
 
 (defn row-marker-attr
   "Return the row-existence marker attribute for a table.
@@ -735,6 +759,28 @@
                                    (assoc-in [table-name :attrs col-name] ident))))
                            {}
                            user-attrs)
+        ;; Put each table's columns in CREATE TABLE order, so every
+        ;; attnum-shaped consumer agrees by construction rather than by
+        ;; each one remembering to reorder: pg_attribute, column-attnum,
+        ;; pg_index.indkey, pg_constraint.conkey and column-info all read
+        ;; this. Columns with no recorded order (INHERITS parents,
+        ;; Datalog-native attrs that never went through CREATE TABLE)
+        ;; keep their relative position at the end.
+        col-order (::column-order hints)
+        tables-from-attrs
+        (if-not col-order
+          tables-from-attrs
+          (reduce-kv
+           (fn [acc tname t]
+             (let [order (into {} (map-indexed (fn [i c] [c i]))
+                               (get col-order tname))
+                   n (count order)]
+               (assoc acc tname
+                      (update t :columns
+                              (fn [cols]
+                                (vec (sort-by (fn [c] (get order (name (:attr c)) n))
+                                              cols)))))))
+           {} tables-from-attrs))
          ;; Also surface tables that exist in the schema but have NO own
          ;; user columns — typically INHERITS children whose columns all
          ;; live in the parent's namespace. Without this, pg_class doesn't
@@ -902,7 +948,12 @@
      (for [[tname {:keys [columns]}] (sort-by key tables)
            [idx col] (map-indexed vector (cons {:name "db_id" :valuetype :db.type/long} columns))]
        ["datahike" "public" tname (:name col) (str (inc idx))
-        (pg-type-name (:valuetype col)) "YES" nil]))))
+        ;; From the column's declared OID, not its storage valueType —
+        ;; the same correction pg_attribute.atttypid needed. A `date`
+        ;; column reported `timestamp without time zone` here because
+        ;; :db.type/instant is what carries both.
+        (or (get types/oid->pg-name (:oid col)) (pg-type-name (:valuetype col)))
+        "YES" nil]))))
 
 (defn column-order-from-db
   "Derive column creation order for a table from schema entity IDs.

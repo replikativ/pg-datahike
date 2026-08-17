@@ -381,8 +381,8 @@
 ;; PostgreSQL OID → type name (for format_type() catalog function)
 ;; ============================================================================
 
-(def oid->pg-name
-  "Map PostgreSQL type OID to canonical type name string."
+(def ^:private oid->pg-name-scalar
+  "Scalar type OID -> canonical name. See `oid->pg-name` for the full map."
   {oid-bool       "boolean"
    oid-int2       "smallint"
    oid-int4       "integer"
@@ -406,7 +406,21 @@
    oid-uuid       "uuid"
    oid-json       "json"
    oid-jsonb      "jsonb"
-   oid-oid        "oid"})
+   oid-oid        "oid"}
+
+  ;; Array OIDs, derived rather than listed so the two maps cannot drift.
+  ;; Without them `format_type(1007, -1)` fell through to "text", so an
+  ;; `int[]` column reported the right OID (1007) and the wrong NAME.
+  ;; PG spells these `integer[]`.
+  )
+
+(def oid->pg-name
+  "Map PostgreSQL type OID to canonical type name string, arrays included."
+  (into oid->pg-name-scalar
+        (keep (fn [[arr-oid elem-oid]]
+                (when-let [n (get oid->pg-name-scalar elem-oid)]
+                  [arr-oid (str n "[]")])))
+        array-oid->element-oid))
 
 ;; ============================================================================
 ;; SQL CAST type classification (for translate-cast-expr)

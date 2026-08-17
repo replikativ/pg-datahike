@@ -834,7 +834,11 @@
                          FROM information_schema.columns
                         WHERE table_name = 'person' AND column_name = 'age'")]
       (is (nil? (err r)))
-      (is (= [["1"]] (rows r)) "age is the 2nd person column → ordinal_position-1 = 1")))
+      ;; Columns are reported in schema-declaration order now, not the
+      ;; schema map's hash order. This fixture transacts :person/name
+      ;; before :person/age, so age is the 2nd declared column and the
+      ;; 3rd counting our synthetic db_id.
+      (is (= [["2"]] (rows r)) "age is the 2nd person column → ordinal_position-1 = 2")))
 
   (testing "information_schema.columns udt_schema = pg_catalog (Metabase type inference)"
     (let [r (.execute *handler*
