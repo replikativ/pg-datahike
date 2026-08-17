@@ -3120,6 +3120,17 @@
               ;; matching-typed constant → value-bound data pattern
               ;; [?e :attr v]: an indexable clause instead of a
               ;; get-else scan + equality predicate over every row.
+                ;; jsonb `=` compares VALUES, and PostgreSQL's is
+                ;; numeric-scale insensitive, so it cannot be a datom
+                ;; pattern or a plain `=` on the canonical text — those
+                ;; answer false for `1.00` vs `1`. Emit the structural
+                ;; predicate instead; it fast-paths on text equality, and
+                ;; nothing is lost by skipping the value-bound pattern
+                ;; because jsonb attributes are never `:db/index`ed.
+                (jsonb-column? ctx left)
+                (let [v (ctx/col-var! ctx resolved)]
+                  [[(list 'datahike.pg.sql/jsonb-eq? v val)]])
+
                 (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
                 []
               ;; Regular column = value (including aliased columns)

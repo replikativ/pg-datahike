@@ -350,6 +350,24 @@
 ;; Operators: containment and existence
 ;; ============================================================================
 
+(defn jsonb-eq?
+  "PostgreSQL's jsonb `=`, which compares VALUES and is numeric-scale
+   INSENSITIVE: `'1.00'::jsonb = '1'::jsonb` is true even though the two
+   render differently. Comparing our canonical text alone is therefore
+   too STRICT — it is a canonical form for structure, not for numbers,
+   because PostgreSQL keeps display scale on purpose.
+
+   Text equality is the fast path and is sound in one direction: equal
+   canonical text implies equal values, so only differing text has to be
+   parsed. That confines the cost to exactly the case that was wrong.
+
+   Structural comparison is then just `=` on the parsed trees: numbers
+   are uniformly BigDecimal in the value model, and Clojure's `=` on
+   BigDecimal is scale-insensitive, which is `numeric_eq`."
+  [a b]
+  (or (= a b)
+      (= (parse-jsonb a) (parse-jsonb b))))
+
 (defn jsonb-contains?
   "PostgreSQL @> operator: does left contain right?"
   [left right]
@@ -489,7 +507,8 @@
 
    Adding an operator is one entry here plus, for the ones the parser
    currently rejects, a narrowing of `sql/unsupported-op-chars`."
-  {"->"  jsonb-get
+  {"="   jsonb-eq?
+   "->"  jsonb-get
    "->>" jsonb-get-text
    "#>"  jsonb-get-path
    "#>>" jsonb-get-path-text

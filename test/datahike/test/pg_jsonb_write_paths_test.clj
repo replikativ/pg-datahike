@@ -316,3 +316,26 @@
     (is (= "9" (v "SELECT d->'obj'->>'k' FROM ar")))
     (is (= "9" (v "SELECT d->'obj'->'k' FROM ar")))
     (is (= "2" (v "SELECT d->'arr'->>1 FROM ar")))))
+
+(deftest equality-is-structural-not-textual
+  (run "CREATE TABLE sc (id int PRIMARY KEY, d jsonb)")
+  (run "INSERT INTO sc VALUES (1,'{\"a\":1.00}'),(2,'{\"a\":1}'),(3,'{\"a\":1.0}')")
+  (testing "PostgreSQL keeps display scale but IGNORES it when comparing,
+            so its stored form is deliberately not canonical for its own
+            equality. Comparing our canonical text was therefore too
+            strict — the three rows below are one value in PostgreSQL."
+    (is (= [["{\"a\": 1.00}"] ["{\"a\": 1}"] ["{\"a\": 1.0}"]]
+           (rows "SELECT d FROM sc ORDER BY id"))
+        "display is unchanged — scale still survives")
+    (is (= [["3"]] (rows "SELECT count(*) FROM sc WHERE d = '{\"a\":1}'"))
+        "all three match, whatever scale the literal was written with")
+    (is (= [["3"]] (rows "SELECT count(*) FROM sc WHERE d = '{\"a\":1.000}'"))))
+  (testing "genuinely different values still differ"
+    (is (= [["0"]] (rows "SELECT count(*) FROM sc WHERE d = '{\"a\":2}'")))
+    (is (= [["0"]] (rows "SELECT count(*) FROM sc WHERE d = '{\"b\":1}'"))))
+  (testing "and the text fast path still handles the ordinary case —
+            equal canonical text implies equal values, so only differing
+            text is ever parsed"
+    (run "CREATE TABLE sc2 (id int PRIMARY KEY, d jsonb)")
+    (run "INSERT INTO sc2 VALUES (1,'{\"b\":2,\"a\":1}')")
+    (is (= [["1"]] (rows "SELECT count(*) FROM sc2 WHERE d = '{ \"a\":1, \"b\":2 }'")))))
