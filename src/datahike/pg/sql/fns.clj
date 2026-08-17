@@ -349,22 +349,30 @@
     (if (empty? vs) :__null__ vs)))
 
 (defn- akey-compare
-  "Null-safe comparator for array_agg `ORDER BY` keys. A key is a scalar or a
-   vector (multiple ORDER BY columns, compared lexicographically). NULLs sort
-   last (PG's default NULLS LAST for ASC)."
+  "Null-safe comparator for in-aggregate `ORDER BY` keys. A key is a
+   scalar or a vector (multiple ORDER BY columns, compared
+   lexicographically). NULLs sort last (PG's default NULLS LAST for
+   ASC).
+
+   `:__null__` counts as NULL, not just `nil`. SQL NULL is carried as
+   that sentinel everywhere else in this namespace, and it is what a
+   nullable ORDER BY column actually binds to — so ordering by one threw
+   `class clojure.lang.Keyword cannot be cast to class java.lang.String`
+   rather than sorting it last."
   [a b]
-  (cond
-    (and (vector? a) (vector? b))
-    (loop [a a b b]
-      (cond (and (empty? a) (empty? b)) 0
-            (empty? a) -1
-            (empty? b) 1
-            :else (let [c (akey-compare (first a) (first b))]
-                    (if (zero? c) (recur (subvec a 1) (subvec b 1)) c))))
-    (= a b) 0
-    (nil? a) 1
-    (nil? b) -1
-    :else (compare a b)))
+  (let [null? (fn [x] (or (nil? x) (= :__null__ x)))]
+    (cond
+      (and (vector? a) (vector? b))
+      (loop [a a b b]
+        (cond (and (empty? a) (empty? b)) 0
+              (empty? a) -1
+              (empty? b) 1
+              :else (let [c (akey-compare (first a) (first b))]
+                      (if (zero? c) (recur (subvec a 1) (subvec b 1)) c))))
+      (= a b) 0
+      (null? a) 1
+      (null? b) -1
+      :else (compare a b))))
 
 (defn filter-array-agg-ordered
   "SQL array_agg(expr ORDER BY … ASC) — `coll` is a collection of
@@ -520,6 +528,46 @@
     (if (empty? ps)
       :__null__
       (into {} (map (fn [p] [(str (first p)) (second p)])) ps))))
+
+(defn filter-string-agg
+  "SQL `string_agg(expr, delimiter)` — ONE string over the whole group.
+
+   Was a per-row function that stringified its value and DISCARDED the
+   delimiter, so `string_agg(nm, ',')` returned one row per input row
+   instead of the single joined string. Registering it in
+   `sql-aggregate->datalog` is what makes datalog fold it over the
+   group; `jsonb_agg` next door had the same defect and the same fix.
+
+   Input is a collection of `[value delimiter]` pairs — the shape the
+   two-argument aggregate path already produces for CORR and the object
+   aggregates. The delimiter is per-row only because that is how it
+   reaches the aggregate; every row carries the same one, so the first
+   is taken.
+
+   PostgreSQL SKIPS null inputs and answers NULL for an all-null or
+   empty group."
+  [pairs]
+  (let [ps (remove (fn [p] (let [v (first p)] (or (nil? v) (= :__null__ v)))) pairs)]
+    (if (empty? ps)
+      :__null__
+      (let [d (second (first ps))]
+        (str/join (if (or (nil? d) (= :__null__ d)) "" (str d))
+                  (map (comp str first) ps))))))
+
+(defn filter-string-agg-ordered
+  "SQL `string_agg(expr, delim ORDER BY … ASC)` — `coll` is a collection
+   of `[sort-key value delimiter]` triples; sort ascending by sort-key,
+   then join. Separate from the array_agg pair shape because the
+   delimiter has to ride along too."
+  [coll]
+  (filter-string-agg (map (fn [t] [(nth t 1) (nth t 2)])
+                          (sort-by first akey-compare coll))))
+
+(defn filter-string-agg-ordered-desc
+  "Descending counterpart of `filter-string-agg-ordered`."
+  [coll]
+  (filter-string-agg (map (fn [t] [(nth t 1) (nth t 2)])
+                          (sort-by first (fn [a b] (akey-compare b a)) coll))))
 
 (defn filter-json-object-agg
   "SQL `json_object_agg(k, v)` — the text-faithful sibling.
@@ -1129,6 +1177,7 @@
    "var_pop"        'variance
    "median"         'median
    "corr"           'datahike.pg.sql/filter-corr
+   "string_agg"     'datahike.pg.sql/filter-string-agg
    "jsonb_object_agg" 'datahike.pg.sql/filter-jsonb-object-agg
    "json_object_agg"  'datahike.pg.sql/filter-json-object-agg
    "array_agg"      'datahike.pg.sql/filter-array-agg

@@ -2353,19 +2353,50 @@
                       ;; Multi-argument aggregates (CORR)
                       ;; Two-argument aggregates: CORR(y,x) and the
                       ;; object-aggs, which all fold over [a b] pairs.
+                      ;; string_agg folds over [value delimiter] pairs, the
+                      ;; same two-argument shape CORR and the object
+                      ;; aggregates already use — it was a per-row fn that
+                      ;; stringified one value and dropped the delimiter, so
+                      ;; it returned one row per input row.
                       (if (and (contains? #{'datahike.pg.sql/filter-corr
                                             'datahike.pg.sql/filter-jsonb-object-agg
-                                            'datahike.pg.sql/filter-json-object-agg}
+                                            'datahike.pg.sql/filter-json-object-agg
+                                            'datahike.pg.sql/filter-string-agg}
                                           agg-sym)
                                params (= 2 (count params)))
                         (let [v1 (expr/translate-expr ctx (first params))
                               v2 (expr/translate-expr ctx (second params))
                               v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
                               v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
-                              pair-var (ctx/fresh-var! ctx)]
-                          (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
+                              pair-var (ctx/fresh-var! ctx)
+                              ;; string_agg(expr, delim ORDER BY …) — element
+                              ;; order is observable in the joined string, so
+                              ;; it needs the same treatment array_agg gets.
+                              ;; The triple carries the delimiter along with
+                              ;; the sort key and the value.
+                              order-els (when (= agg-sym 'datahike.pg.sql/filter-string-agg)
+                                          (seq (.getOrderByElements f)))]
                           (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
-                          (swap! find-elements conj (list agg-sym pair-var))
+                          (if order-els
+                            (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                   (let [kv (expr/translate-expr ctx (.getExpression o))]
+                                                     (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                                 order-els)
+                                  sort-key (if (= 1 (count key-vars))
+                                             (first key-vars)
+                                             (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
+                                  all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                      (not (.isAsc o)))
+                                                    order-els)]
+                              (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
+                              (swap! find-elements conj
+                                     (list (if all-desc?
+                                             'datahike.pg.sql/filter-string-agg-ordered-desc
+                                             'datahike.pg.sql/filter-string-agg-ordered)
+                                           pair-var)))
+                            (do
+                              (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
+                              (swap! find-elements conj (list agg-sym pair-var))))
                           (swap! find-aliases conj (or alias-str fname)))
                         ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
                         (let [inner-expr (first params)
