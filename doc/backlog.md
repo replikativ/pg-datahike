@@ -33,6 +33,8 @@ the tab reached the JSON parser already unescaped.
 
 ### jsonb `->` drops the row
 
+> **FIXED (7b2b618)**
+
 `jsonb-get` returns `nil` for a missing key, and a datalog
 function-binding that yields `nil` filters the row out of the result.
 `SELECT p->'missing', p->>'missing' FROM t` returns **zero rows** where
@@ -61,15 +63,21 @@ unfixable because btree indexes depend on it.
 
 ### `||` on jsonb is string concatenation in SELECT and WHERE
 
+> **FIXED (ff6e28d)**
+
 `SELECT p || '{"z":9}'` yields `{"a":1}{"z":9}`. Only the UPDATE SET
 path has the jsonb branch.
 
 ### `?|` and `?&` return zero rows against `array[...]`
 
+> **FIXED (ff6e28d)**
+
 The right-hand side arrives as a `PgArray` record and the implementation
 iterates it as a map, so every test fails.
 
 ### `jsonb_agg` / `jsonb_object_agg` are not aggregates
+
+> **jsonb_agg FIXED (ff6e28d); jsonb_object_agg still open**
 
 `SELECT jsonb_agg(id) FROM t` returns one row per input row instead of
 one array. They are per-row functions and are absent from
@@ -89,6 +97,8 @@ correct, so this is specific to the VALUES row path.
 
 ### jsonb canonical form differs from PostgreSQL
 
+> **FIXED (7b2b618)**
+
 Key order is alphabetical, PostgreSQL is **length-first then bytewise
 over UTF-8**; separators are compact, PostgreSQL emits `": "` and `", "`;
 numbers go through doubles, PostgreSQL keeps `numeric` scale (`1e3` →
@@ -102,6 +112,8 @@ land alone — see the equality entry above; the two must change together.
 ## S2 — wrong errors
 
 ### `json` accepts operators PostgreSQL does not have
+
+> **FIXED (496a1da + follow-up)**
 
 PostgreSQL has **no** `=`, `<>`, `<`, `>`, `@>`, `?` on `json` — the type
 has no btree/hash opclass at all. We accept them silently. PostgreSQL
@@ -117,6 +129,8 @@ storage-representation change reversible. Small function, high leverage.
 
 ### A value-size cap surfaces as XX000 with a raw Clojure exception
 
+> **FIXED (496a1da)**
+
 `:db/maxLength` / `:max-string-length` fire correctly but emerge as
 `XX000: INSERT error: clojure.lang.ExceptionInfo: String value for
 :cap/d exceeds max length 512 (was 2008) {:error :transact/max-length,
@@ -125,6 +139,8 @@ is 54000 `program_limit_exceeded`. Until this is mapped, the per-column
 cap is not usable by clients.
 
 ### Unknown functions leak internal errors
+
+> **FIXED (496a1da)**
 
 `SELECT json_build_object('a',1)` →
 `ERROR: Unknown function 'json_build_object in [(json_build_object "a" 1) ?v1]`.
@@ -153,8 +169,8 @@ plausible wrong answer rather than an error.
 
 ## S3 — missing
 
-- `#>`, `#>>` — **parse fine** as `JsonExpression`; blocked only by the
-  `#` operator-character check in `sql/unsupported-op-chars`. Cheap.
+- ~~`#>`, `#>>`~~ — **FIXED (496a1da)**. The check now excludes those two
+  exact tokens rather than the `#` character.
 - `#-`, `@?` — do **not** parse; need a pre-parse rewrite or a parser
   change. Different cost tier.
 - The whole `json_*` function family (`json_build_object`, `json_agg`,
