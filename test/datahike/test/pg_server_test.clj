@@ -341,6 +341,22 @@
       (is (some? (err r))
           "unknown setting without missing_ok must error"))))
 
+(deftest test-pg-set-config
+  ;; set_config returns the NEW VALUE as text. asyncpg turns `jit` off
+  ;; around type introspection and reads the answer back, so returning
+  ;; an empty string here is a hard connect failure, not a cosmetic gap.
+  (testing "standalone set_config echoes the value"
+    (is (= [["off"]] (rows (.execute *handler* "SELECT set_config('jit', 'off', false)"))))
+    (is (= [[""]]    (rows (.execute *handler* "SELECT pg_catalog.set_config('search_path', '', false)")))))
+
+  (testing "set_config alongside current_setting — asyncpg's _introspect_types probe"
+    ;; `cur` is "off" where PostgreSQL says "on": we have no JIT, so we
+    ;; report it off rather than copying PostgreSQL's default. See the
+    ;; settings map in sql/expr.clj.
+    (is (= [["off" "off"]]
+           (rows (.execute *handler*
+                           "SELECT current_setting('jit') AS cur, set_config('jit', 'off', false) AS new"))))))
+
 (deftest test-pg-format-type
   (testing "format_type maps OIDs to canonical type names"
     (is (= [["integer"]]            (rows (.execute *handler* "SELECT format_type(23, -1)"))))

@@ -301,7 +301,17 @@
                       "application_name"           "datahike"
                       "transaction_isolation"      "read committed"
                       "transaction_read_only"      "off"
-                      "default_transaction_isolation" "read committed"}
+                      "default_transaction_isolation" "read committed"
+                      ;; asyncpg probes `jit` during type introspection —
+                      ;; `SELECT current_setting('jit'), set_config('jit',
+                      ;; 'off', false)` — and a 42704 there breaks its
+                      ;; codec pipeline, not just the probe.
+                      ;; DELIBERATE DIVERGENCE: PostgreSQL defaults this
+                      ;; to `on`; we have no JIT at all, so `off` is the
+                      ;; truthful answer. A client that reads this to
+                      ;; decide whether to apply a JIT workaround gets
+                      ;; the right answer from us, not a copied default.
+                      "jit"                        "off"}
             impl-fn (fn [name & [missing-ok]]
                       (or (get settings (str name))
                           (when missing-ok :__null__)
@@ -309,6 +319,32 @@
                                           {:error :undefined-object
                                            :kind "configuration parameter"
                                            :name name}))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; set_config(name, value, is_local) — assign a run-time parameter
+      ;; and RETURN the new value as text.
+      ;;
+      ;; asyncpg turns `jit` off around its type-introspection query and
+      ;; reads the result back, so this is on the path of every codec
+      ;; lookup rather than a corner. It used to pass through as an
+      ;; unresolved datalog symbol; once unknown functions started
+      ;; raising 42883 that became a hard failure during PREPARE, which
+      ;; asyncpg does not recover from.
+      ;;
+      ;; The value is accepted and echoed rather than stored: none of the
+      ;; parameters a client sets this way changes how we execute, and
+      ;; answering with the value the client just supplied is what makes
+      ;; its read-back consistent.
+      (= fname "set_config")
+      (let [fn-param (symbol (str "?set-config" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [_name value & _]
+                      (if (or (nil? value) (= :__null__ value))
+                        :__null__
+                        (str value)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj

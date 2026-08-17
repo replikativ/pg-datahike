@@ -4691,11 +4691,13 @@
 
       :set-config
       ;; SELECT pg_catalog.set_config('search_path', '', false) —
-      ;; pg_dump session-prelude. We don't honor the GUC (no
-      ;; equivalent in Datahike); just synthesize a 1-row result so
-      ;; the SELECT completes cleanly. The 3-arg form returns the
-      ;; new value as text; we return empty-string.
-      (single-row-result "set_config" PgWireServer/OID_TEXT "")
+      ;; pg_dump session-prelude, and asyncpg's `jit` toggle around type
+      ;; introspection. We don't honor the GUC (no equivalent in
+      ;; Datahike), but PostgreSQL returns the NEW VALUE as text and
+      ;; asyncpg reads it back, so returning empty-string was not
+      ;; harmless: echo the value argument.
+      (single-row-result "set_config" PgWireServer/OID_TEXT
+                         (or (second (:args parsed)) ""))
 
       :copy-from-stdin
       ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
