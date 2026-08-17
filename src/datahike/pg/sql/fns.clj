@@ -207,6 +207,23 @@
                  rscale
                  java.math.RoundingMode/HALF_UP)))))
 
+(defn sql-null?
+  "SQL NULL, however it is carried. NULL travels as the `:__null__`
+   sentinel rather than nil, because a datalog function binding that
+   yields nil FILTERS THE ROW — so every NULL-producing fn returns the
+   sentinel instead. Both spellings must count.
+
+   A single predicate rather than `(not (contains? …))`: datahike reads
+   a nested `(not <seq>)` inside a function-binding clause as
+   negation-as-failure, which filters instead of binding."
+  [v]
+  (or (nil? v) (= :__null__ v)))
+
+(defn sql-not-null?
+  "Complement of `sql-null?`, as one predicate — see the note there."
+  [v]
+  (not (or (nil? v) (= :__null__ v))))
+
 (defn filter-min
   "MIN that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
   [coll]

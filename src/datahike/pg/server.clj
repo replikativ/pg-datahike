@@ -316,6 +316,10 @@
    (cond
      (nil? v)           nil
      (= :__null__ v)    nil  ;; LEFT JOIN sentinel → SQL NULL
+     ;; jsonb's JSON-null is a VALUE whose text form is `null`, distinct
+     ;; from SQL NULL above. It must be tested BEFORE the generic
+     ;; keyword branch, which would otherwise print the sentinel's name.
+     (= jb/json-null v) "null"
     ;; PgArray → PG canonical array text format `{…}` (see
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
@@ -376,7 +380,6 @@
      (uuid? v)    (str v)
      (symbol? v)  (str v)
      (bytes? v)   (str "\\x" (apply str (map #(format "%02x" (bit-and % 0xff)) v)))
-    ;; Maps and vectors (jsonb values) → serialize as JSON
      (map? v)     (jb/serialize-jsonb v)
      (vector? v)  (jb/serialize-jsonb v)
      :else        (str v))))

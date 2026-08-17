@@ -51,16 +51,15 @@
 (defn- rows [sql] (mapv vec (.-rows ^PgWireServer$QueryResult (run sql))))
 (defn- v [sql] (ffirst (rows sql)))
 
-;; The canonical form this suite asserts is the CURRENT one (compact,
-;; alphabetical). Making it match PostgreSQL byte-for-byte — length-first
-;; key order, `": "` separators, numeric-not-double numbers — is a
-;; separate, format-changing commit. What matters here is that whatever
-;; the canonical form is, every write path produces it.
+;; The canonical form asserted here is PostgreSQL's own: keys ordered
+;; length-first then bytewise, `": "` after a key and `", "` between
+;; pairs. What this suite is really pinning is that EVERY write path
+;; produces it, whatever it is.
 
 (deftest canonicalizes-on-the-literal-insert-path
   (run "CREATE TABLE j1 (id int PRIMARY KEY, p jsonb)")
   (run "INSERT INTO j1 VALUES (1, '{\"b\":2,\"a\":1}')")
-  (is (= "{\"a\":1,\"b\":2}" (v "SELECT p FROM j1 WHERE id = 1"))))
+  (is (= "{\"a\": 1, \"b\": 2}" (v "SELECT p FROM j1 WHERE id = 1"))))
 
 (deftest canonicalizes-on-the-update-path
   (testing "UPDATE stored the text verbatim — the tx builder coerced
@@ -68,10 +67,10 @@
     (run "CREATE TABLE j2 (id int PRIMARY KEY, p jsonb)")
     (run "INSERT INTO j2 VALUES (1, '{\"a\":1}')")
     (run "UPDATE j2 SET p = '{\"d\":4,\"c\":3}' WHERE id = 1")
-    (is (= "{\"c\":3,\"d\":4}" (v "SELECT p FROM j2 WHERE id = 1"))))
+    (is (= "{\"c\": 3, \"d\": 4}" (v "SELECT p FROM j2 WHERE id = 1"))))
   (testing "and duplicate keys still collapse last-wins on UPDATE"
     (run "UPDATE j2 SET p = '{\"a\":1,\"a\":9}' WHERE id = 1")
-    (is (= "{\"a\":9}" (v "SELECT p FROM j2 WHERE id = 1")))))
+    (is (= "{\"a\": 9}" (v "SELECT p FROM j2 WHERE id = 1")))))
 
 (deftest canonicalizes-on-the-prepared-insert-path
   (testing "a parameterised INSERT defers coercion to Execute, which ran
@@ -79,7 +78,7 @@
     (run "CREATE TABLE j3 (id int PRIMARY KEY, p jsonb)")
     (run "PREPARE ins AS INSERT INTO j3 VALUES ($1, $2)")
     (run "EXECUTE ins (1, '{\"b\":2,\"a\":1}')")
-    (is (= "{\"a\":1,\"b\":2}" (v "SELECT p FROM j3 WHERE id = 1")))))
+    (is (= "{\"a\": 1, \"b\": 2}" (v "SELECT p FROM j3 WHERE id = 1")))))
 
 (deftest json-is-never-canonicalized-on-any-path
   (testing "PG `json` is the text-faithful type: whitespace, key order
@@ -136,7 +135,7 @@
           (with-open [st (.createStatement c)
                       rs (.executeQuery st "SELECT p FROM jw WHERE id = 1")]
             (.next rs)
-            (is (= "{\"c\":3,\"d\":4}" (.getString rs 1))))
+            (is (= "{\"c\": 3, \"d\": 4}" (.getString rs 1))))
           (testing "and a parameterised INSERT that is never updated"
             (with-open [ps (.prepareStatement c "INSERT INTO jw VALUES (?, ?)")]
               (.setInt ps 1 2)
@@ -145,5 +144,5 @@
             (with-open [st (.createStatement c)
                         rs (.executeQuery st "SELECT p FROM jw WHERE id = 2")]
               (.next rs)
-              (is (= "{\"y\":2,\"z\":1}" (.getString rs 1))))))
+              (is (= "{\"y\": 2, \"z\": 1}" (.getString rs 1))))))
         (finally (.stop server) (d/release conn) (d/delete-database cfg))))))

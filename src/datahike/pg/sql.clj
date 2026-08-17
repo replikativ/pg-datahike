@@ -82,6 +82,8 @@
 (def filter-sum-numeric    fns/filter-sum-numeric)
 (def filter-avg            fns/filter-avg)
 (def filter-avg-numeric    fns/filter-avg-numeric)
+(def sql-null?             fns/sql-null?)
+(def sql-not-null?         fns/sql-not-null?)
 (def filter-min            fns/filter-min)
 (def filter-max            fns/filter-max)
 (def filter-count          fns/filter-count)

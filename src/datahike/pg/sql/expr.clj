@@ -1280,11 +1280,16 @@
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? IsNullExpression expr)
+    ;; SQL NULL is carried as the `:__null__` sentinel, not nil — a
+    ;; datalog function binding that yields nil filters the row, so
+    ;; every NULL-producing fn returns the sentinel. `nil?` therefore
+    ;; answered false for a value that IS NULL: `SELECT p->'missing' IS
+    ;; NULL` said false where PostgreSQL says true.
     (let [^IsNullExpression e expr
           v (translate-expr ctx (.getLeftExpression e))]
       (if (.isNot e)
-        (list 'some? v)
-        (list 'nil? v)))
+        (list 'datahike.pg.sql/sql-not-null? v)
+        (list 'datahike.pg.sql/sql-null? v)))
 
     (instance? NotExpression expr)
     (let [^NotExpression e expr
@@ -2631,6 +2636,34 @@
                      :else nil)]
       (when attr (get-in (:schema ctx) [attr :db/valueType])))))
 
+(defn- jsonb-canonical-operand
+  "Canonicalize a literal being compared against a `jsonb` column.
+
+   PostgreSQL's jsonb `=` compares VALUES; ours compares the stored
+   CANONICAL TEXT. That works only if both sides are in the same
+   canonical form, and until now only the stored side was — so
+   `WHERE p = '{ \"b\":1, \"a\":2 }'` answered zero rows against a
+   stored `{\"a\": 1, \"b\": 2}`, turning an equality into a test of
+   how the literal happened to be spelled.
+
+   `:pg/type` is an ident-entity fact rather than a `:db/*` key, so it
+   is absent from the schema map unless enriched; fall back to the
+   query, as `coerce-insert-value` does, or a column would silently
+   read as not-jsonb here too.
+
+   Residual gap: canonical TEXT equality is still finer than
+   PostgreSQL's, which ignores numeric scale (`1.00` = `1`). Closing
+   that needs structural comparison; see doc/jsonb-plan.md."
+  [ctx resolved v]
+  (if-not (string? v)
+    v
+    (let [attr (ctx/attr-of ctx resolved)]
+      (if (and attr
+               (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
+                              (params/pg-type-of-attr (:db ctx) attr))))
+        (jb/serialize-jsonb v)
+        v))))
+
 (defn- coerce-unknown-literal
   "If `lit` is a `StringValue` and `col` resolves to a Datahike-typed
    schema attribute, return the typinput-coerced value (long, double,
@@ -2915,7 +2948,7 @@
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx) (:ci-index ctx))
-                pv (translate-expr ctx right)]
+                pv (jsonb-canonical-operand ctx resolved (translate-expr ctx right))]
             (cond
               (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
               (and (not (symbol? pv)) (ctx/bind-col-value! ctx resolved pv)) []
@@ -2941,7 +2974,8 @@
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
                   coerced (coerce-unknown-literal ctx left right)
-                  val (or coerced (translate-expr ctx right))]
+                  val (jsonb-canonical-operand
+                       ctx resolved (or coerced (translate-expr ctx right)))]
               (cond
                 (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
@@ -3093,11 +3127,19 @@
                 [[(list 'not= val-var :__null__)]]
                 ;; IS NULL → value is the sentinel
                 [[(list '= val-var :__null__)]]))))
-        ;; Non-column IS NULL — fallback
-        (let [v (translate-expr ctx inner)]
+        ;; Non-column IS NULL — e.g. `(p->'k') IS NULL`.
+        ;;
+        ;; SQL NULL arrives here as the `:__null__` sentinel, not as
+        ;; nil: a datalog function binding that yields nil filters the
+        ;; row, so every fn that can produce NULL returns the sentinel
+        ;; instead. Testing `nil?` therefore answered FALSE for a value
+        ;; that IS SQL NULL — `p->'missing' IS NULL` said false where
+        ;; PostgreSQL says true. Accept both.
+        (let [v (translate-expr ctx inner)
+              v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
           (if not-null?
-            [[(list 'some? v)]]
-            [[(list 'nil? v)]]))))
+            [[(list 'datahike.pg.sql/sql-not-null? v)]]
+            [[(list 'datahike.pg.sql/sql-null? v)]]))))
 
     ;; col IS TRUE / col IS FALSE / col IS NOT TRUE / col IS NOT FALSE
     (instance? IsBooleanExpression expr)

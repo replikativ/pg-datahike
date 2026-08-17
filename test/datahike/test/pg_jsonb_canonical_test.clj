@@ -4,7 +4,7 @@
    jsonb normalizes on input — object key order is dropped, insignificant
    whitespace removed, and only the LAST of duplicate keys is kept — so equality,
    DISTINCT and GROUP BY compare by STRUCTURE, not by the input text. pg-datahike
-   used to store the raw input string, so `'{\"a\":1,\"b\":2}'::jsonb =
+   used to store the raw input string, so `'{\"a\": 1, \"b\": 2}'::jsonb =
    '{\"b\":2,\"a\":1}'::jsonb` was FALSE (two different strings) where Postgres
    returns TRUE. Canonicalizing on ingest (recursive key-sort, whitespace-normalize,
    duplicate-collapse) fixes it. json (the text-faithful type) is NOT normalized."
@@ -54,14 +54,15 @@
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE t (id int, payload jsonb)")
     (exec! c "INSERT INTO t (id, payload) VALUES (1, '{\"b\":2,\"a\":1}')")
-    (exec! c "INSERT INTO t (id, payload) VALUES (2, '{\"a\":1,\"b\":2}')")
-    (is (= [["{\"a\":1,\"b\":2}"] ["{\"a\":1,\"b\":2}"]]
+    (exec! c "INSERT INTO t (id, payload) VALUES (2, '{\"a\": 1, \"b\": 2}')")
+    (is (= [["{\"a\": 1, \"b\": 2}"] ["{\"a\": 1, \"b\": 2}"]]
            (rows c "SELECT payload FROM t ORDER BY id"))
         "both round-trip to the SAME canonical text, whatever the input order")
     (is (= [["1"] ["2"]]
-           (rows c "SELECT id FROM t WHERE payload = '{\"a\":1,\"b\":2}' ORDER BY id"))
-        "row 1 (inserted as {b,a}) matches an {a,b} literal — equality is structural")
-    (is (= [["{\"a\":1,\"b\":2}"]]
+           (rows c "SELECT id FROM t WHERE payload = '{ \"b\":2, \"a\":1 }' ORDER BY id"))
+        "a literal in ANY spelling matches — the literal is canonicalized
+         before comparison, so equality is not a test of how it was typed")
+    (is (= [["{\"a\": 1, \"b\": 2}"]]
            (rows c "SELECT DISTINCT payload FROM t"))
         "DISTINCT collapses the two — they are one jsonb value")))
 
@@ -69,7 +70,7 @@
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE t (id int, payload jsonb)")
     (exec! c "INSERT INTO t (id, payload) VALUES (1, '{\"a\":1,\"a\":2}')")
-    (is (= [["{\"a\":2}"]]
+    (is (= [["{\"a\": 2}"]]
            (rows c "SELECT payload FROM t"))
         "duplicate keys collapse, last wins (Postgres jsonb semantics)")))
 
@@ -77,7 +78,7 @@
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE t (id int, payload jsonb)")
     (exec! c "INSERT INTO t (id, payload) VALUES (1, '{ \"z\" : { \"y\":1, \"x\":2 } , \"a\":3 }')")
-    (is (= [["{\"a\":3,\"z\":{\"x\":2,\"y\":1}}"]]
+    (is (= [["{\"a\": 3, \"z\": {\"x\": 2, \"y\": 1}}"]]
            (rows c "SELECT payload FROM t"))
         "whitespace stripped and keys sorted recursively")))
 
@@ -85,6 +86,6 @@
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE t (id int, payload jsonb)")
     (exec! c "INSERT INTO t (id, payload) VALUES (1, '[3,1,2]')")
-    (is (= [["[3,1,2]"]]
+    (is (= [["[3, 1, 2]"]]
            (rows c "SELECT payload FROM t"))
         "arrays are ordered — element order is preserved, only object keys sort")))
