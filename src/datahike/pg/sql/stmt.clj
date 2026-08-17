@@ -825,6 +825,40 @@
     (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
     :else ::corr))
 
+(defn- coldef-pg-type
+  "The `:pg/type` to advertise for a column-definition-list entry like
+   `a int`. Datahike collapses every integer onto :db.type/long and
+   every temporal onto :db.type/instant, so without this an
+   `AS r(a int)` column would report int8 rather than int4.
+
+   Deliberately narrow: only the cases where the storage valueType is
+   ambiguous. `datahike.pg.sql.ddl/pg-type-hint` makes the same decision
+   for CREATE TABLE and ALTER TABLE; these should be unified once both
+   land."
+  [^String t]
+  (let [t (some-> t str/lower-case str/trim (str/replace #"\s*\([^)]*\)" ""))]
+    (cond
+      (#{"smallint" "int2"} t) "int2"
+      (#{"integer" "int" "int4"} t) "int4"
+      (#{"date" "time" "timestamp" "timestamptz" "json" "jsonb"} t) t
+      (= "timestamp without time zone" t) "timestamp"
+      (= "timestamp with time zone" t) "timestamptz"
+      :else nil)))
+
+(def ^:private known-srf-names
+  "Function names `materialize-table-function` knows how to turn into a
+   relation. Used only to tell an UNKNOWN function in FROM apart from a
+   known one whose arguments we could not evaluate (a correlated LATERAL
+   argument): the first is 42883, the second is not."
+  #{"unnest" "generate_series" "pg_get_keywords"
+    "jsonb_array_elements" "json_array_elements"
+    "jsonb_array_elements_text" "json_array_elements_text"
+    "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
+    "jsonb_object_keys" "json_object_keys"
+    "regexp_split_to_table" "string_to_table"
+    "now" "current_timestamp" "transaction_timestamp"
+    "statement_timestamp" "clock_timestamp"})
+
 (defn- srf-base-name
   "The bare, lower-cased name of a function call, with any schema
    qualifier removed: `pg_catalog.generate_series` -> `generate_series`.
@@ -854,8 +888,9 @@
    eval-fn that resolves correlated arguments per outer row — see
    srf-const-eval's note. That is why arguments flow through eval-fn here
    rather than being pattern-matched as literals inline."
-  ([tf] (materialize-table-function tf srf-const-eval))
-  ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn]
+  ([tf] (materialize-table-function tf srf-const-eval nil))
+  ([tf eval-fn] (materialize-table-function tf eval-fn nil))
+  ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn coldefs]
    (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
          ;; Strip a schema qualifier: PostgreSQL resolves `pg_catalog.foo()`
          ;; and `foo()` to the same function through search_path, and pgjdbc
@@ -918,6 +953,87 @@
                    (mapv (fn [v] [(long v)]) vals)
                    [:db.type/long] ["int4"]))))))
 
+       ;; json_to_recordset / jsonb_to_recordset expand an ARRAY of
+       ;; objects into typed rows; the *_record forms take one object.
+       ;; Their shape comes entirely from the `AS r(a int, b text)`
+       ;; column-definition list -- PostgreSQL raises 42601 without one
+       ;; -- which is why the alias' colDataType had to be threaded in
+       ;; here rather than only its name.
+       (contains? #{"json_to_recordset" "jsonb_to_recordset"
+                    "json_to_record" "jsonb_to_record"} fname)
+       (when (seq coldefs)
+         (let [v (eval-fn (first params))
+               parsed (jb/parse-jsonb v)
+               maps (if (str/ends-with? fname "recordset")
+                      (if (sequential? parsed) parsed [])
+                      [parsed])
+               names (mapv first coldefs)
+               types (mapv second coldefs)
+               cell (fn [m t nm]
+                      (let [raw (when (map? m) (get m nm))]
+                        (when (some? raw)
+                          (try (sql-cast/cast-scalar raw t {:explicit? true})
+                               (catch Throwable _ raw)))))]
+           (with-ordinality names
+             (mapv (fn [m] (mapv (fn [t nm] (cell m t nm)) types names)) maps)
+             (mapv (fn [t] (or (get types/sql-name->dh-type (str/lower-case t))
+                               :db.type/string))
+                   types)
+             (mapv coldef-pg-type types))))
+
+       ;; The json/jsonb expansion family. Every implementation already
+       ;; existed in datahike.pg.jsonb and was wired for the SELECT-list
+       ;; path, where it SERIALISES the whole collection into one cell;
+       ;; in FROM position it has to become rows. Without an entry here
+       ;; the FROM item materialised to nothing and the query answered
+       ;; ZERO ROWS silently -- or, with count(*), the internal
+       ;; `Query for unknown vars: [?_eid]`.
+       ;;
+       ;; The `json_` and `jsonb_` spellings differ only in the
+       ;; punctuation of a returned document: json_each gives
+       ;; `{"x":1}` where jsonb_each gives `{"x": 1}`.
+       (contains? #{"jsonb_array_elements" "json_array_elements"} fname)
+       (let [json? (str/starts-with? fname "json_")
+             ser (if json? jb/serialize-json jb/serialize-jsonb)]
+         (with-ordinality ["value"]
+           (mapv (fn [x] [(ser x)]) (jb/jsonb-array-elements (eval-fn (first params))))
+           [:db.type/string] [(if json? "json" "jsonb")]))
+
+       (contains? #{"jsonb_array_elements_text" "json_array_elements_text"} fname)
+       (with-ordinality ["value"]
+         (mapv vector (jb/jsonb-array-elements-text (eval-fn (first params))))
+         [:db.type/string] ["text"])
+
+       (contains? #{"jsonb_each" "json_each"} fname)
+       (let [json? (str/starts-with? fname "json_")
+             ser (if json? jb/serialize-json jb/serialize-jsonb)]
+         (with-ordinality ["key" "value"]
+           (mapv (fn [[k v]] [k (ser v)]) (jb/jsonb-each (eval-fn (first params))))
+           [:db.type/string :db.type/string] ["text" (if json? "json" "jsonb")]))
+
+       (contains? #{"jsonb_each_text" "json_each_text"} fname)
+       (with-ordinality ["key" "value"]
+         (mapv vec (jb/jsonb-each-text (eval-fn (first params))))
+         [:db.type/string :db.type/string] ["text" "text"])
+
+       (contains? #{"jsonb_object_keys" "json_object_keys"} fname)
+       ;; PG names the column after the function, not "value".
+       (with-ordinality [fname]
+         (mapv vector (jb/jsonb-object-keys (eval-fn (first params))))
+         [:db.type/string] ["text"])
+
+       ;; regexp_split_to_table(string, pattern) / string_to_table(string,
+       ;; delimiter) — the difference is regex vs literal separator.
+       (contains? #{"regexp_split_to_table" "string_to_table"} fname)
+       (let [[sv dv] (mapv eval-fn (take 2 params))]
+         (when (and (string? sv) (string? dv))
+           (with-ordinality [fname]
+             (mapv vector
+                   (if (= fname "regexp_split_to_table")
+                     (str/split sv (re-pattern dv))
+                     (str/split sv (re-pattern (java.util.regex.Pattern/quote dv)))))
+             [:db.type/string] ["text"])))
+
        ;; pg_get_keywords() — a real catalog SRF. pgjdbc calls it on
        ;; every connection through getSQLKeywords(); without it the
        ;; aggregate over a missing relation answered one NULL row, and
@@ -960,6 +1076,15 @@
                      (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
                                   (unquote-ident (.-name c)))
                                 (or (.getAliasColumns ^Alias a) []))))
+        ;; `AS r(a int, b text)` carries a TYPE per column as well as a
+        ;; name. Only the names were read, so the record-shaping SRFs --
+        ;; whose entire shape comes from this list -- had nothing to
+        ;; build from.
+        alias-coldefs (when-let [a (.getAlias tf)]
+                        (seq (keep (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                     (when-let [t (.-colDataType c)]
+                                       [(unquote-ident (.-name c)) (str t)]))
+                                   (or (.getAliasColumns ^Alias a) []))))
         fname  (or (srf-base-name (.getName (.getFunction tf))) "tf")
         ;; Storage namespace, not the user's alias — see
         ;; materialize-derived-select! for why they must differ.
@@ -990,7 +1115,8 @@
                                         (eval-corr-scalar pf (str e) false
                                                           (:schema db) db))]
                           r
-                          ::corr))))))]
+                          ::corr)))))
+                alias-coldefs)]
       (let [_ (when (and alias-cols (> (count alias-cols) (count aliases)))
                 (throw (ex-info (str "table \"" (or talias "") "\" has " (count aliases)
                                      " columns available but " (count alias-cols)
@@ -1801,7 +1927,24 @@
                    (table-fn->virtual-table
                     ^net.sf.jsqlparser.statement.select.TableFunction from-item db)]
             [vdb vschema vname valias]
-            [db schema nil nil])
+            ;; An unrecognised function in FROM used to fall through to
+            ;; "no relation", so `SELECT * FROM nosuchfunc(1)` answered
+            ;; ZERO ROWS and `count(*)` raised the internal
+            ;; `Query for unknown vars: [?_eid]`. PostgreSQL raises
+            ;; 42883. A name we DO know but could not materialise is a
+            ;; different case -- a correlated LATERAL argument -- and
+            ;; keeps the old behaviour until LATERAL lands.
+            (let [fname (srf-base-name
+                         (.getName (.getFunction
+                                    ^net.sf.jsqlparser.statement.select.TableFunction from-item)))]
+              (if (contains? known-srf-names fname)
+                [db schema nil nil]
+                (throw (errors/pg-error
+                        :undefined-function
+                        {:function (str fname "()")
+                         :hint (str "No function matches the given name and "
+                                    "argument types. You might need to add "
+                                    "explicit type casts.")})))))
 
           ;; A sequence is a relation in PG: `SELECT * FROM myseq` reads
           ;; its position. Materialise the three-column form so the rest

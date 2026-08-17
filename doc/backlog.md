@@ -254,9 +254,15 @@ plausible wrong answer rather than an error.
   `to_json`, `row_to_json`, `json_each`, …). PostgreSQL mirrors every
   `jsonb_*` name; we have none.
 - SQL/JSON path: `jsonb_path_query` and friends, `@@`.
-- `jsonb_each`, `jsonb_array_elements` and friends are not
-  set-returning; they serialize the whole collection into one cell.
-- `jsonb_object_keys` returns a JSON array string rather than rows.
+- ~~`jsonb_each`, `jsonb_array_elements` and friends are not
+  set-returning~~ — **FIXED on `feat/srf-catalog`** for FROM position:
+  they now materialise into rows, along with the `json_*` spellings,
+  `regexp_split_to_table`, `string_to_table` and the record-shaping
+  `json/jsonb_to_record(set)`. In the SELECT LIST they still serialise
+  the whole collection into one cell; that is PG's ProjectSet and needs
+  the same per-row expansion LATERAL does.
+- ~~`jsonb_object_keys` returns a JSON array string rather than rows~~ —
+  **FIXED on `feat/srf-catalog`** in FROM position, same caveat.
 - `chr()`.
 - `CREATE INDEX` is accepted and discarded — `(empty-result "CREATE
   INDEX")`. No GIN analogue exists, and the current operator lowering
