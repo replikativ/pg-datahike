@@ -85,7 +85,7 @@
 ;; ---------------------------------------------------------------------------
 ;; Forward declarations for the mutually-recursive translate-* family.
 
-(declare jsonb-column?)
+(declare jsonb-column? json-column? reject-json-operator!)
 
 (declare translate-expr
          translate-predicate
@@ -2330,6 +2330,8 @@
                    (.getStringExpression ^JsonOperator expr)
                    (instance? DoubleAnd expr) "&&")
           ^net.sf.jsqlparser.expression.BinaryExpression be expr
+          _ (reject-json-operator! ctx op-str
+                                   (.getLeftExpression be) (.getRightExpression be))
           l (translate-expr ctx (.getLeftExpression be))
           r (translate-expr ctx (.getRightExpression be))
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
@@ -2701,6 +2703,37 @@
         (and attr
              (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
                             (params/pg-type-of-attr (:db ctx) attr)))))))))
+
+(defn- json-column?
+  "Whether `expr` is a column of the text-faithful `json` type.
+
+   PostgreSQL gives `json` SIX operators — `->`, `->>`, `#>`, `#>>` and
+   their int variants — and nothing else. It has no `=`, no `<`, no
+   `@>`, no `?`, and no btree or hash operator class at all, so
+   `'1'::json = '1'::json` is 42883 there. We accepted all of them
+   silently, comparing the stored text."
+  [ctx expr]
+  (boolean
+   (when (instance? Column expr)
+     (let [resolved (ctx/resolve-column ^Column expr
+                                        (:table-aliases ctx)
+                                        (:default-table ctx)
+                                        (:col-overrides ctx)
+                                        (:derived-aliases ctx) (:ci-index ctx))
+           attr (ctx/attr-of ctx resolved)]
+       (and attr
+            (= "json" (or (get-in (:schema ctx) [attr :pg/type])
+                          (params/pg-type-of-attr (:db ctx) attr))))))))
+
+(defn- reject-json-operator!
+  "PostgreSQL has no such operator on `json`; raise as it does."
+  [ctx op-str l r]
+  (when (or (json-column? ctx l) (json-column? ctx r))
+    (throw (ex-info (str "operator does not exist: json " op-str " json")
+                    {:error :undefined-function
+                     :sqlstate "42883"
+                     :hint (str "No operator matches the given name and argument "
+                                "types. You might need to add explicit type casts.")}))))
 
 (defn- jsonb-canonical-operand
   "Canonicalize a literal being compared against a `jsonb` column.
@@ -3877,6 +3910,8 @@
     (instance? JsonOperator expr)
     (let [^JsonOperator jo expr
           op-str (.getStringExpression jo)
+          _ (reject-json-operator! ctx op-str
+                                   (.getLeftExpression jo) (.getRightExpression jo))
           left   (translate-expr ctx (.getLeftExpression jo))
           right  (translate-expr ctx (.getRightExpression jo))
           left   (if (seq? left)  (ctx/materialize-arg! ctx left)  left)

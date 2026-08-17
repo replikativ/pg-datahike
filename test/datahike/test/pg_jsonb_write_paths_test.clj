@@ -234,3 +234,20 @@
     (is (= [[nil]] (rows "SELECT d #> '{nope}' FROM pj"))))
   (testing "bare # is still PostgreSQL's XOR and still unsupported"
     (is (= "42601" (state "SELECT 42#")))))
+
+(deftest json-has-no-comparison-or-containment-operators
+  (testing "PostgreSQL gives `json` exactly six operators — ->, ->>, #>,
+            #>> and their int variants — and no btree or hash operator
+            class at all, so @> and ? are 42883 there. We accepted them
+            silently, comparing the stored text."
+    (run "CREATE TABLE jc (id int PRIMARY KEY, j json, b jsonb)")
+    (run "INSERT INTO jc VALUES (1, '{\"a\":1}', '{\"a\":1}')")
+    (is (= "42883" (state "SELECT count(*) FROM jc WHERE j @> '{\"a\":1}'")))
+    (is (re-find #"operator does not exist: json @> json"
+                 (or (err "SELECT count(*) FROM jc WHERE j @> '{\"a\":1}'") "")))
+    (is (= "42883" (state "SELECT count(*) FROM jc WHERE j ? 'a'"))))
+  (testing "the same operators on jsonb are unaffected"
+    (is (= [["1"]] (rows "SELECT count(*) FROM jc WHERE b @> '{\"a\":1}'")))
+    (is (= [["1"]] (rows "SELECT count(*) FROM jc WHERE b ? 'a'"))))
+  (testing "and json keeps the six it does have"
+    (is (= "1" (v "SELECT j->>'a' FROM jc")))))
