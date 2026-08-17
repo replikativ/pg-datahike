@@ -295,6 +295,8 @@ invariant.
 
 ### Casting NULL to a string type yields the empty string
 
+> **FIXED on `fix/null-string-cast` (PR #38)**
+
 `SELECT NULL::text IS NULL` answers **false**. NULL cast to `text`,
 `varchar` or `char` becomes `''` rather than staying NULL, so every
 NULL-aware construct downstream silently takes the wrong branch:
@@ -316,6 +318,38 @@ Found via asyncpg's `test_prepare_03`, which prepares
 `SELECT CASE WHEN $1::text IS NULL THEN <default> ELSE $1::text END`
 and gets the ELSE branch for a NULL argument. Reproduces without any
 parameter, so it is a cast bug rather than a protocol one.
+
+### Three-valued logic is wrong in scalar position
+
+A comparison or boolean operator in the SELECT list does not propagate
+NULL. PostgreSQL answers NULL for all but one of these; we answer a
+definite boolean:
+
+                      ours   PG
+    NULL = NULL         t    NULL
+    1 = NULL            f    NULL
+    NULL <> 1           t    NULL
+    NOT NULL            t    NULL
+    true AND NULL       f    NULL
+    false AND NULL      t    f
+    true OR NULL      NULL   t
+
+Note the last two are wrong in the *other* direction: `false AND NULL`
+is FALSE in SQL (the false operand decides it) and `true OR NULL` is
+TRUE, and we get both backwards.
+
+`WHERE` is mostly right, because the datalog lowering prepends
+`(not= ?v :__null__)` guards — `v = 10`, `v <> 10`, `v = NULL` and
+`v IS NULL` all match PostgreSQL. Two defects remain there:
+
+- `WHERE NOT (v = 10)` **includes** the NULL row; PostgreSQL excludes
+  it (UNKNOWN negates to UNKNOWN, not TRUE).
+- Projecting a comparison, `SELECT v = 10`, yields `false` for a NULL
+  input where PostgreSQL yields NULL.
+
+Found while fixing the NULL-cast bug above. Bigger than it looks: it
+touches every comparison and boolean operator, and the WHERE and
+projection paths lower differently, so they need fixing together.
 
 ### The asyncpg suite gives different answers in CI and locally
 
