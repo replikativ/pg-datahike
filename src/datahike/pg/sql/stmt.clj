@@ -46,6 +46,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
@@ -824,6 +825,19 @@
     (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
     :else ::corr))
 
+(defn- srf-base-name
+  "The bare, lower-cased name of a function call, with any schema
+   qualifier removed: `pg_catalog.generate_series` -> `generate_series`.
+
+   PostgreSQL resolves the qualified and unqualified forms to the same
+   function through search_path, and we serve one schema, so the last
+   dot-separated segment is the name."
+  [^String n]
+  (when n
+    (let [n (str/lower-case n)
+          i (.lastIndexOf n ".")]
+      (if (neg? i) n (subs n (inc i))))))
+
 (defn materialize-table-function
   "Produce rows for a `TableFunction` FROM item. Supports the common
    constant-arg set-returning functions:
@@ -843,7 +857,13 @@
   ([tf] (materialize-table-function tf srf-const-eval))
   ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn]
    (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
-         fname (str/lower-case (or (.getName f) ""))
+         ;; Strip a schema qualifier: PostgreSQL resolves `pg_catalog.foo()`
+         ;; and `foo()` to the same function through search_path, and pgjdbc
+         ;; writes the qualified form. Matching the raw name meant EVERY
+         ;; schema-qualified SRF in FROM missed this cond, returned nil, and
+         ;; surfaced as the internal `Query for unknown vars: [?_eid]` --
+         ;; `pg_catalog.generate_series(1,3)` included.
+         fname (srf-base-name (.getName f))
          params (vec (or (.getParameters f) []))
          with-ord? (some-> (.getWithClause tf) str
                            (->> (= "ORDINALITY")))
@@ -898,6 +918,18 @@
                    (mapv (fn [v] [(long v)]) vals)
                    [:db.type/long] ["int4"]))))))
 
+       ;; pg_get_keywords() — a real catalog SRF. pgjdbc calls it on
+       ;; every connection through getSQLKeywords(); without it the
+       ;; aggregate over a missing relation answered one NULL row, and
+       ;; pgjdbc's castNonNull turns that into an AssertionError, which
+       ;; Hibernate's catch(SQLException) fallback does not catch.
+       (= fname "pg_get_keywords")
+       (with-ordinality ["word" "catcode" "barelabel" "catdesc" "baredesc"]
+         pg-kw/keyword-rows
+         [:db.type/string :db.type/string :db.type/boolean
+          :db.type/string :db.type/string]
+         ["text" "char" "bool" "text" "text"])
+
        (contains? #{"now" "current_timestamp" "transaction_timestamp"
                     "statement_timestamp" "clock_timestamp"} fname)
        ;; Scalar function used as a one-row table. The timestamp is
@@ -928,7 +960,7 @@
                      (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
                                   (unquote-ident (.-name c)))
                                 (or (.getAliasColumns ^Alias a) []))))
-        fname  (str/lower-case (or (.getName (.getFunction tf)) "tf"))
+        fname  (or (srf-base-name (.getName (.getFunction tf))) "tf")
         ;; Storage namespace, not the user's alias — see
         ;; materialize-derived-select! for why they must differ.
         sub-name (str "__srf__" (or talias fname))]

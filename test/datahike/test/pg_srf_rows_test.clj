@@ -53,3 +53,49 @@
   (testing "and the SELECT alone still works, which is what made the
             no-op hard to notice"
     (is (= 5 (count (rows "SELECT g, g*2 FROM generate_series(1,5) g"))))))
+
+;; ---------------------------------------------------------------------------
+;; Schema-qualified SRFs, and pg_get_keywords
+
+(deftest schema-qualified-srf-in-from
+  ;; `materialize-table-function` matched the RAW function name, so
+  ;; `pg_catalog.generate_series(1,3)` missed its cond, returned nil, and
+  ;; surfaced as the internal `Query for unknown vars: [?_eid]`.
+  ;; PostgreSQL resolves the qualified and unqualified forms to the same
+  ;; function through search_path, and pgjdbc writes the qualified one.
+  (testing "generate_series resolves with or without the schema"
+    (is (= [["3"]] (rows "SELECT count(*) FROM generate_series(1,3)")))
+    (is (= [["3"]] (rows "SELECT count(*) FROM pg_catalog.generate_series(1,3)"))))
+
+  (testing "the rows are the same either way"
+    (is (= (rows "SELECT * FROM generate_series(1,3) AS g(n) ORDER BY n")
+           (rows "SELECT * FROM pg_catalog.generate_series(1,3) AS g(n) ORDER BY n")))))
+
+(deftest pg-get-keywords
+  ;; pgjdbc calls this on every connection via getSQLKeywords():
+  ;;   select string_agg(word, ',') from pg_catalog.pg_get_keywords()
+  ;;   where word <> ALL ('{...}'::text[])
+  ;; and passes the result through castNonNull. With the function missing
+  ;; the aggregate answered ONE NULL ROW, and castNonNull raises an
+  ;; AssertionError -- which Hibernate's catch(SQLException) fallback
+  ;; does not catch, so every SessionFactory build failed.
+  (testing "the function exists and has PG's five columns"
+    (is (= [["abort" "U" "t" "unreserved" "can be bare label"]]
+           (rows "SELECT * FROM pg_get_keywords() WHERE word = 'abort'"))))
+
+  (testing "it is a real relation with many rows"
+    (let [n (Long/parseLong (ffirst (rows "SELECT count(*) FROM pg_get_keywords()")))]
+      (is (> n 400) (str "expected the full keyword list, got " n))))
+
+  (testing "reachable schema-qualified, which is how pgjdbc writes it"
+    (is (= (rows "SELECT count(*) FROM pg_get_keywords()")
+           (rows "SELECT count(*) FROM pg_catalog.pg_get_keywords()"))))
+
+  (testing "the pgjdbc shape yields a non-null string"
+    ;; The exact exclusion list is 400+ entries; a short one exercises the
+    ;; same path. What matters is that it is NOT NULL.
+    (let [v (ffirst (rows (str "SELECT string_agg(word, ',') "
+                               "FROM pg_catalog.pg_get_keywords() "
+                               "WHERE word <> ALL ('{a,abs}'::text[])")))]
+      (is (some? v))
+      (is (re-find #"abort" v)))))

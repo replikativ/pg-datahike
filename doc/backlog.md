@@ -419,6 +419,19 @@ Found while fixing the NULL-cast bug above. Bigger than it looks: it
 touches every comparison and boolean operator, and the WHERE and
 projection paths lower differently, so they need fixing together.
 
+### Schema-qualified set-returning functions in FROM fail
+
+> **FIXED on `fix/string-agg`**
+
+`SELECT count(*) FROM pg_catalog.generate_series(1,3)` raised the
+internal `Query for unknown vars: [?_eid]`. `materialize-table-function`
+matched the RAW function name, so anything schema-qualified missed its
+`cond`, returned nil, and left the FROM item with no relation at all —
+`count(*)` then emitted an entity var nothing bound.
+
+PostgreSQL resolves the qualified and unqualified forms to the same
+function through search_path, and pgjdbc writes the qualified one.
+
 ### Unordered aggregates do not preserve input order
 
 `array_agg(id)` over rows 1..4 gives `{1,4,2,3}`; PostgreSQL gives
