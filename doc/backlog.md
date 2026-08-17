@@ -319,6 +319,40 @@ Found via asyncpg's `test_prepare_03`, which prepares
 and gets the ELSE branch for a NULL argument. Reproduces without any
 parameter, so it is a cast bug rather than a protocol one.
 
+### MIN/MAX/GREATEST/LEAST crash on every non-numeric type
+
+> **FIXED on `fix/order-aggregates`**
+
+`SELECT max(name) FROM users` raised
+`class java.lang.String cannot be cast to class java.lang.Number`.
+`filter-min`/`filter-max` were `clojure.core/min`/`max` and
+`greatest`/`least` mapped straight to them; all four are numeric-only.
+Text, date, timestamp and time all died.
+
+It survived the suite because it only fires when two or more values are
+actually compared — `apply max` on a one-element seq returns it
+untouched, so single-row groups and WHERE-narrowed aggregates passed.
+
+The same change fixes an error-class bug: for the types PostgreSQL has
+no min/max aggregate for we raised a ClassCastException where PG raises
+42883. Those are `boolean` and `uuid` (absent on 17 and still absent on
+master) and `bytea` (absent on 17, added later). A jsonb value is a
+String by then and indistinguishable from text, so `max(jsonb)` answers
+instead of raising — closing that needs the declared column type at the
+aggregate layer, which it does not carry.
+
+### DDL loses date-ness and integer width
+
+`CREATE TABLE t (id int, d date)` reports `d` as `timestamp without
+time zone` and `id` as `bigint` through `format_type`/`pg_attribute`,
+so `SELECT d` renders `2020-01-01 00:00:00` where PostgreSQL renders
+`2020-01-01`. An explicit `d::date` is correct, so the cast path knows
+the type and the column path does not.
+
+Drivers read these OIDs to pick codecs, so this is more than cosmetic.
+Found while fixing MIN/MAX, where `max(d)` inherited the same wrong
+rendering as the bare column.
+
 ### Three-valued logic is wrong in scalar position
 
 A comparison or boolean operator in the SELECT list does not propagate

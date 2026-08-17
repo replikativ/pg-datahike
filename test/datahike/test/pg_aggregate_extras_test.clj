@@ -140,3 +140,64 @@
 
   (testing "empty → :__null__"
     (is (= :__null__ (fns/filter-avg-numeric [])))))
+
+;; ---------------------------------------------------------------------------
+;; MIN/MAX ordering — every type SQL orders, not just numbers
+
+(deftest min-max-orders-non-numeric-types
+  (testing "text compares as text, not as a number"
+    (is (= "apple" (fns/filter-min ["pear" "apple" "fig"])))
+    (is (= "pear"  (fns/filter-max ["pear" "apple" "fig"]))))
+
+  (testing "dates and timestamps"
+    (let [d1 (java.time.LocalDate/parse "2020-01-01")
+          d2 (java.time.LocalDate/parse "2021-06-15")]
+      (is (= d1 (fns/filter-min [d2 d1])))
+      (is (= d2 (fns/filter-max [d2 d1]))))
+    (let [t1 (java.util.Date. 1000000000000)
+          t2 (java.util.Date. 2000000000000)]
+      (is (= t1 (fns/filter-min [t2 t1])))
+      (is (= t2 (fns/filter-max [t2 t1])))))
+
+  (testing "numbers still work, including mixed width and BigDecimal"
+    (is (= 1 (fns/filter-min [3 1 2])))
+    (is (= 3 (fns/filter-max [3 1 2])))
+    (is (= 0 (compare 2.5M (fns/filter-max [1.5M 2.5M])))))
+
+  (testing "NULL sentinels are skipped; all-NULL is NULL"
+    (is (= "a" (fns/filter-min [:__null__ "a" :__null__])))
+    (is (= :__null__ (fns/filter-max [:__null__ :__null__])))
+    (is (= :__null__ (fns/filter-min []))))
+
+  (testing "a single value needs no comparison and is returned as-is"
+    (is (= "only" (fns/filter-max ["only"])))))
+
+(deftest min-max-rejects-types-postgres-has-no-aggregate-for
+  ;; PostgreSQL has no max(bool) / max(uuid), on 17 or on master, and no
+  ;; max(bytea) on 17. Raise 42883 as PG does rather than letting a
+  ;; ClassCastException escape.
+  (doseq [[tname vs] {"boolean" [true false]
+                      "uuid"    [(java.util.UUID/randomUUID) (java.util.UUID/randomUUID)]
+                      "bytea"   [(byte-array [1]) (byte-array [2])]}]
+    (testing (str "max(" tname ") raises undefined_function")
+      ;; :error is the codebase's error key; errors.clj maps
+      ;; :undefined-function to SQLSTATE 42883 at the wire boundary.
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (fns/filter-max vs)))
+            d (ex-data e)]
+        (is (= :undefined-function (:error d)) (str tname ": " (pr-str d)))
+        (is (= (str "max(" tname ")") (:function d)))))))
+
+;; ---------------------------------------------------------------------------
+;; GREATEST / LEAST — scalar, not aggregates, and defined over any ordering
+
+(deftest greatest-least-order-non-numeric-types
+  (let [greatest (get fns/sql-fn->clj-fn "greatest")
+        least    (get fns/sql-fn->clj-fn "least")]
+    (is (= "b" (greatest "a" "b")))
+    (is (= "a" (least "a" "b")))
+    (is (= 2 (greatest 1 2)))
+    (is (= 1 (least 1 2)))
+    (let [d1 (java.time.LocalDate/parse "2020-01-01")
+          d2 (java.time.LocalDate/parse "2021-01-01")]
+      (is (= d2 (greatest d1 d2)))
+      (is (= d1 (least d1 d2))))))

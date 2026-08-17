@@ -224,17 +224,67 @@
   [v]
   (not (or (nil? v) (= :__null__ v))))
 
+(defn- no-order-agg!
+  "PostgreSQL has no min/max aggregate for these types — not an oversight
+   on our side, and still absent on master (pg_aggregate.dat lists text,
+   bpchar, the numerics, date/time/timestamp(tz), interval, inet, money,
+   oid, record, anyarray and anyenum, but never bool, uuid or jsonb).
+   Raise 42883 as PostgreSQL does rather than a ClassCastException."
+  [fname tname]
+  (throw (errors/pg-error
+          :undefined-function
+          {:function (str fname "(" tname ")")
+           :hint (str "No function matches the given name and argument types. "
+                      "You might need to add explicit type casts.")})))
+
+(defn- order-agg-type-name
+  "The PG type name to report when a value has no min/max aggregate, or
+   nil when the value is orderable. bytea is rejected because our target
+   is PostgreSQL 17, which has no `max(bytea)` — it arrived later, and a
+   `byte[]` is not Comparable anyway so it could only ever have thrown.
+
+   A jsonb value is a String at this point and so is indistinguishable
+   from text; `max(jsonb)` therefore answers instead of raising. Closing
+   that needs the declared column type down here, which this layer does
+   not carry."
+  [v]
+  (cond
+    (instance? Boolean v)      "boolean"
+    (instance? java.util.UUID v) "uuid"
+    (bytes? v)                 "bytea"
+    :else nil))
+
+(defn- order-agg
+  "Reduce with `compare` rather than `clojure.core/min`/`max`, which are
+   NUMERIC-ONLY — they cast to Number, so MIN/MAX over any other type
+   died with a raw `class java.lang.String cannot be cast to class
+   java.lang.Number`. SQL orders every scalar type, and `max(name)` is
+   ordinary SQL.
+
+   This only ever fired when two or more values were actually compared:
+   `apply max` on a one-element seq returns it untouched, so single-row
+   groups and `WHERE`-narrowed aggregates looked fine.
+
+   String comparison is Java's UTF-16 code-unit order, i.e. C collation
+   — the same choice already made and documented for jsonb ordering."
+  [fname pick coll]
+  (let [vs (remove #(= :__null__ %) coll)]
+    (if (empty? vs)
+      :__null__
+      (do
+        (when-let [tname (order-agg-type-name (first vs))]
+          (no-order-agg! fname tname))
+        (reduce (fn [a b] (if (pick (compare b a)) b a)) vs)))))
+
 (defn filter-min
   "MIN that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
   [coll]
-  (let [vs (remove #(= :__null__ %) coll)]
-    (if (empty? vs) :__null__ (apply min vs))))
+  (order-agg "min" neg? coll))
 
 (defn filter-max
   "MAX that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
   [coll]
-  (let [vs (remove #(= :__null__ %) coll)]
-    (if (empty? vs) :__null__ (apply max vs))))
+  (order-agg "max" pos? coll))
 
 (defn filter-count
   "SQL COUNT(col) — counts non-NULL values. Unlike COUNT(*), which counts
@@ -1105,8 +1155,12 @@
    "ltrim"    str/triml
    "rtrim"    str/trimr
    "replace"  str/replace
-   "greatest" clojure.core/max
-   "least"    clojure.core/min
+   ;; Not clojure.core/max|min: those are numeric-only and threw a raw
+   ;; ClassCastException on `greatest('a','b')` or two dates. Unlike
+   ;; MIN/MAX these are not aggregates and PostgreSQL defines them over
+   ;; any type with an ordering, so there is nothing to reject here.
+   "greatest" (fn [& args] (reduce (fn [a b] (if (pos? (compare b a)) b a)) args))
+   "least"    (fn [& args] (reduce (fn [a b] (if (neg? (compare b a)) b a)) args))
    "mod"      rem
 
    ;; --- Math: PG semantics, see the "Math function implementations"
