@@ -19,6 +19,8 @@ feature need different urgency.
 
 ### String literals escape-process backslashes
 
+> **FIXED on `fix/backslash-literals`**
+
 `SELECT length('a\tb')` → **3**, PostgreSQL → **4**.
 
 With `standard_conforming_strings = on` — which we report — a backslash
@@ -30,6 +32,21 @@ everywhere, so any literal containing them is silently corrupted:
 Not JSON-specific — this affects every string literal. It is also what
 made one case of the jsonb canonical-form differential disagree, since
 the tab reached the JSON parser already unescaped.
+
+ROOT CAUSE was in the Java wire layer, not the SQL translator:
+`PgWireServer/stripComments` rewrote the text it was about to EXECUTE,
+replacing `\n`/`\r`/`\t` inside a literal with a SPACE — not even the
+control character it claimed to decode, which is why `'C:\temp'` came
+back as `C: emp`. A REAL tab or newline was replaced too, justified by
+a comment saying jsqlparser could not lex them; it can (verified on
+5.2: `'a<TAB>b'` parses to bytes [97 9 98]). Both rules dated from the
+initial commit with no bug behind them.
+
+Removing them exposed the mirror-image gap: `E'...'` had no decoder at
+all and had only ever looked correct because the space substitution
+collapsed two characters into one. `decode-e-string` now implements
+scan.l's grammar exactly (octal, `\xNN`, `\uXXXX`/`\UXXXXXXXX`, the
+`b f n r t v` set, and PG's fallthrough for anything else).
 
 ### jsonb `->` drops the row
 
