@@ -79,6 +79,12 @@
    "quote_ident"   types/oid-text
    "quote_literal" types/oid-text
    "format"        types/oid-text
+   ;; The json family returns json (114), not jsonb (3802) — a client
+   ;; that gets 3802 for row_to_json picks the jsonb codec and reads the
+   ;; wrong punctuation back.
+   "to_json"       types/oid-json
+   "row_to_json"   types/oid-json
+   "json_agg"      types/oid-json
    ;; Length functions → INT4
    "length"        types/oid-int4
    "char_length"   types/oid-int4

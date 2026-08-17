@@ -213,8 +213,13 @@
             fail at execute time, so the client saw our internals:
             `Unknown function 'json_build_object in [(json_build_object
             \"a\" 1) ?v1]` under XX000"
+    ;; row_to_json is implemented now, but is declared
+    ;; `row_to_json(record)`, so a non-composite argument is still 42883
+    ;; in PostgreSQL — `function row_to_json(integer) does not exist`.
+    ;; We report the runtime-inferred type, so `bigint` where PG says
+    ;; `integer`; that width gap is tracked separately in the backlog.
     (is (= "42883" (state "SELECT row_to_json(1)")))
-    (is (re-find #"function row_to_json does not exist"
+    (is (re-find #"function row_to_json\(\w+\) does not exist"
                  (or (err "SELECT row_to_json(1)") "")))
     (is (= "42883" (state "SELECT jsonb_path_query('{}'::jsonb, '$.a')"))))
   (testing "implemented functions are unaffected"

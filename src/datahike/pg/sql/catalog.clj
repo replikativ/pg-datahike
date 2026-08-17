@@ -736,6 +736,7 @@
            ["coalesce" "i" 2 2276 "2276 2276"]
            ["nullif" "i" 2 2276 "2276 2276"]
            ["jsonb_build_object" "i" 2 3802 "2276 2276"]
+           ["row_to_json" "i" 1 114 "2249"] ["to_json" "i" 1 114 "2276"]
            ["jsonb_build_array" "i" 1 3802 "2276"]
            ["jsonb_set" "i" 3 3802 "3802 1009 3802"]
            ["jsonb_insert" "i" 3 3802 "3802 1009 3802"]

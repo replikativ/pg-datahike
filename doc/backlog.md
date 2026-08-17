@@ -385,6 +385,38 @@ Found while fixing the NULL-cast bug above. Bigger than it looks: it
 touches every comparison and boolean operator, and the WHERE and
 projection paths lower differently, so they need fixing together.
 
+### `string_agg` is not an aggregate
+
+`SELECT string_agg(nm, ',') FROM t` returns ONE ROW PER INPUT ROW
+(`a`, `b`) instead of the single concatenated `a,b`, and the ORDER BY
+inside it is ignored. Same defect `jsonb_agg` had before it was
+registered in `sql-aggregate->datalog` — it is a per-row function that
+was never folded over the group.
+
+`array_agg`, `json_agg` and `jsonb_agg` all handle `ORDER BY` inside
+the aggregate correctly, so the ordered-aggregate machinery exists and
+`string_agg` just is not wired into it.
+
+### `json_agg` over composites omits PostgreSQL's newline
+
+PostgreSQL separates `json_agg` elements with `", "`, and adds a
+further `"\n "` when the element category is ARRAY or COMPOSITE
+(`json_agg_transfn`, json.c: "add some whitespace if structured type
+and not first item"). So `json_agg(t)` over a table is
+
+    [{"id":1,"nm":"a"}, \n {"id":2,"nm":"b"}]
+
+and ours is that without the newline. Scalar elements are unaffected
+and already match. Cosmetic, but it is text a client can compare.
+
+### Whole-row references
+
+> **FIXED on `feat/whole-row-refs`**
+
+`SELECT t FROM t` returned NULL rather than the composite `(1,a)`, and
+`to_json(t)`, `row_to_json(t)` and `json_agg(t)` inherited it —
+`json_agg(t)` answering `[null, null]`.
+
 ### The asyncpg suite gives different answers in CI and locally
 
 Same commit, freshly restarted server: **95 passed / 74 failed locally,

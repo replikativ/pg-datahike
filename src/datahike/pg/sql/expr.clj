@@ -944,16 +944,44 @@
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
-      ;; to_jsonb(any) → parse/pass-through
-      (contains? #{"to_jsonb" "to_json"} fname)
-      (let [fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))
+      ;; to_jsonb(any) / to_json(any) / row_to_json(record) →
+      ;; parse/pass-through. `row_to_json` is `to_json` restricted to a
+      ;; composite; with whole-row references producing a PgRecord it
+      ;; needs no separate implementation, and it is the call PostgREST
+      ;; puts on every read.
+      (contains? #{"to_jsonb" "to_json" "row_to_json"} fname)
+      (let [json-family? (contains? #{"to_json" "row_to_json"} fname)
+            fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))
             ;; to_jsonb does NOT parse its argument: a text value becomes
             ;; a json STRING. Only an argument that already IS json/jsonb
             ;; passes through, and at runtime both are Clojure strings —
             ;; so the column type decides, as it does for `||` and `-`.
             already-json? (jsonb-column? ctx (first params))]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj #(jb/to-jsonb % already-json?))
+        (swap! (:in-args ctx) conj
+               (cond
+                 ;; row_to_json is declared `row_to_json(record)`, so
+                 ;; PostgreSQL rejects a non-composite argument at
+                 ;; lookup: `row_to_json(1)` is
+                 ;; `function row_to_json(integer) does not exist`.
+                 ;; to_json takes `anyelement` and accepts it.
+                 (= fname "row_to_json")
+                 (fn [v]
+                   (when-not (or (nil? v) (= :__null__ v) (pg-rec/record? v))
+                     (throw (errors/pg-error
+                             :undefined-function
+                             {:function (str "row_to_json("
+                                             (get types/oid->pg-name
+                                                  (types/infer-oid-from-value v)
+                                                  "unknown")
+                                             ")")
+                              :hint (str "No function matches the given name "
+                                         "and argument types. You might need "
+                                         "to add explicit type casts.")})))
+                   (jb/to-json v already-json?))
+
+                 json-family? #(jb/to-json % already-json?)
+                 :else        #(jb/to-jsonb % already-json?)))
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
@@ -2063,6 +2091,65 @@
                       :else (str ident))]
         {:base base :chain [[key-val (first ops)]]}))))
 
+(defn- whole-row-ref-alias
+  "The table alias a bare identifier denotes as a PostgreSQL WHOLE-ROW
+   reference, or nil when it is an ordinary column.
+
+   PostgreSQL resolves a bare name as a COLUMN first and only then as a
+   relation, so a table that happens to have a column of its own name
+   keeps the column meaning. `ctx/relation-in-scope?` makes the same
+   test for the 42703 exemption; this is the value side of it."
+  [ctx expr]
+  (when (instance? Column expr)
+    (let [^Column col expr]
+      (when (nil? (.getTable col))
+        (let [nm (unquote-ident (.getColumnName col))
+              aliases (:table-aliases ctx)]
+          (when (or (contains? aliases nm) (= nm (:default-table ctx)))
+            (let [attr (ctx/attr-of ctx (ctx/resolve-column
+                                         col aliases (:default-table ctx)))]
+              (when-not (and attr (get (:schema ctx) attr))
+                nm))))))))
+
+(defn- translate-whole-row-ref
+  "Bind a var to a PgRecord holding every column of `alias-name`'s table,
+   in CREATE TABLE order.
+
+   `db_id` is dropped: it is our surrogate for the entity, and
+   PostgreSQL's whole-row value contains only the declared columns —
+   including it would put an extra leading field in `(1,a)` and an extra
+   key in `row_to_json`.
+
+   Field `:name` is what makes `to_json`/`row_to_json` render
+   `{\"id\":1,\"nm\":\"a\"}` — jsonb/normalize-tree reads it, falling back
+   to positional `f1`, `f2` without it."
+  [ctx alias-name]
+  (let [table-name (get (:table-aliases ctx) alias-name alias-name)
+        cols (remove #(= :db/id (:attr %))
+                     (pgs/column-info (:schema ctx) table-name (:db ctx)))
+        ;; `[:aliased …]` means specifically "the alias differs from the
+        ;; table name"; using it unconditionally mis-resolves the plain
+        ;; `FROM t` case.
+        attr-ref (fn [c] (if (= alias-name table-name)
+                           (:attr c)
+                           [:aliased alias-name (:attr c)]))
+        vars (mapv #(ctx/col-var! ctx (attr-ref %)) cols)
+        meta-cols (mapv #(select-keys % [:name :oid]) cols)
+        rec-fn (fn [& vals]
+                 (pg-rec/->PgRecord
+                  2249
+                  (mapv (fn [c v]
+                          {:oid (:oid c)
+                           :name (:name c)
+                           :value (when-not (= :__null__ v) v)})
+                        meta-cols vals)))
+        fn-param (symbol (str "?wholerow" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj rec-fn)
+    (ctx/add-clause! ctx [(cons fn-param vars) result-var])
+    result-var))
+
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
    Returns a Datalog-compatible value or variable symbol."
@@ -2082,6 +2169,15 @@
          (contains? #{"current_user" "session_user" "user" "system_user"}
                     (str/lower-case (.getColumnName ^Column expr))))
     "datahike"
+
+    ;; A bare identifier naming a table in scope is a PostgreSQL
+    ;; WHOLE-ROW REFERENCE: `SELECT t FROM t` yields the composite
+    ;; `(1,a)`, not NULL. `relation-in-scope?` already stopped this from
+    ;; raising 42703, but nothing then produced a value, so it bound
+    ;; nothing and read as NULL — and `to_json(t)` / `json_agg(t)`
+    ;; inherited that silently.
+    (whole-row-ref-alias ctx expr)
+    (translate-whole-row-ref ctx (whole-row-ref-alias ctx expr))
 
     (instance? Column expr)
     (let [^Column col-expr expr
