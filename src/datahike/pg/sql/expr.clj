@@ -1054,11 +1054,26 @@
                [(apply list fn-param tmpl-arg value-args) result-var])
         result-var)
 
-      ;; Unknown function — pass through as symbol
+      ;; Unknown function.
+      ;;
+      ;; This used to emit a datalog clause naming the symbol and let
+      ;; execution fail, so a client got `Unknown function
+      ;; 'json_build_object in [(json_build_object "a" 1) ?v1]` — our
+      ;; internals, under XX000. PostgreSQL rejects an unresolvable
+      ;; function at parse time with 42883.
+      ;;
+      ;; Names datalog CAN resolve are still passed through: that is how
+      ;; a caller reaches a Clojure fn we did not enumerate, and turning
+      ;; those into errors would remove working behaviour.
       :else
-      (do (swap! (:where-clauses ctx) conj
-                 [(apply list (symbol fname) args) result-var])
-          result-var))))
+      (if (resolve (symbol fname))
+        (do (swap! (:where-clauses ctx) conj
+                   [(apply list (symbol fname) args) result-var])
+            result-var)
+        (throw (ex-info (str "function " fname " does not exist")
+                        {:error :undefined-function
+                         :sqlstate "42883"
+                         :function fname}))))))
 
 (defn interpret-form
   "Interpret a Clojure-like form against a variable bindings map.

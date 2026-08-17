@@ -50,6 +50,12 @@
 (defn- run [sql] (.execute *handler* sql))
 (defn- rows [sql] (mapv vec (.-rows ^PgWireServer$QueryResult (run sql))))
 (defn- v [sql] (ffirst (rows sql)))
+(defn- state [sql]
+  (try (.-sqlstate ^PgWireServer$QueryResult (run sql))
+       (catch Exception e (:sqlstate (ex-data e)))))
+(defn- err [sql]
+  (try (.-error ^PgWireServer$QueryResult (run sql))
+       (catch Exception e (ex-message e))))
 
 ;; The canonical form asserted here is PostgreSQL's own: keys ordered
 ;; length-first then bytewise, `": "` after a key and `", "` between
@@ -197,3 +203,34 @@
     (is (= [["t"]] (rows "SELECT (d->>'jn') IS NULL FROM nn"))
         "but ->> collapses it to SQL NULL")
     (is (= [["1"]] (rows "SELECT count(*) FROM nn WHERE d->'nope' IS NULL")))))
+
+;; ---------------------------------------------------------------------------
+;; Error surface and path operators
+;; ---------------------------------------------------------------------------
+
+(deftest unknown-functions-raise-42883
+  (testing "an unresolvable function used to emit a datalog clause and
+            fail at execute time, so the client saw our internals:
+            `Unknown function 'json_build_object in [(json_build_object
+            \"a\" 1) ?v1]` under XX000"
+    (is (= "42883" (state "SELECT json_build_object('a',1)")))
+    (is (re-find #"function json_build_object does not exist"
+                 (or (err "SELECT json_build_object('a',1)") "")))
+    (is (= "42883" (state "SELECT jsonb_path_query('{}'::jsonb, '$.a')"))))
+  (testing "implemented functions are unaffected"
+    (is (= "3" (v "SELECT abs(-3)")))
+    (is (= "{\"a\": 1}" (v "SELECT jsonb_build_object('a',1)")))))
+
+(deftest path-operators
+  (run "CREATE TABLE pj (id int PRIMARY KEY, d jsonb)")
+  (run "INSERT INTO pj VALUES (1, '{\"a\":{\"b\":[10,20]},\"z\":1}')")
+  (testing "#> and #>> were rejected at the parser front door by the `#`
+            operator-character check, even though jsqlparser parses them
+            as the same JsonExpression node `->`/`->>` produce"
+    (is (= "20" (v "SELECT d #> '{a,b,1}' FROM pj")))
+    (is (= "20" (v "SELECT d #>> '{a,b,1}' FROM pj")))
+    (is (= "{\"b\": [10, 20]}" (v "SELECT d #> '{a}' FROM pj"))))
+  (testing "a missing path is SQL NULL, not a dropped row"
+    (is (= [[nil]] (rows "SELECT d #> '{nope}' FROM pj"))))
+  (testing "bare # is still PostgreSQL's XOR and still unsupported"
+    (is (= "42601" (state "SELECT 42#")))))

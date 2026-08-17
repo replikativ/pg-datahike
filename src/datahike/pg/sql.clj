@@ -1679,7 +1679,15 @@
   (when (or (<= 0 (.indexOf sql "#")) (<= 0 (.indexOf sql "$")))
     (when-let [bad (first (filter (fn [{:keys [type text]}]
                                     (and (= :op type)
-                                         (some unsupported-op-chars text)))
+                                         (some unsupported-op-chars text)
+                                         ;; `#>` and `#>>` ARE implemented —
+                                         ;; they parse as JsonExpression, the
+                                         ;; same node `->`/`->>` produce, and
+                                         ;; are in jb/op. Only bare `#` (PG's
+                                         ;; XOR) and `#-` remain unsupported,
+                                         ;; so the check narrows to the exact
+                                         ;; tokens rather than the character.
+                                         (not (contains? #{"#>" "#>>"} text))))
                                   (cls/tokenize-all sql)))]
       {:type :error
        :sqlstate "42601"

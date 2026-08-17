@@ -266,11 +266,44 @@
       (some? result) (str result)
       :else :__null__)))
 
+(defn- ->path-seq
+  "The step list for `#>` / `#>>`.
+
+   PostgreSQL types the right operand `text[]`, and it reaches us either
+   as a PgArray record or — for the common literal form `'{a,b,1}'` — as
+   the raw array TEXT. Reducing over that string walked its characters,
+   so `d #> '{a,b,1}'` descended into `{`, `a`, `,` … and found nothing.
+
+   Steps stay strings: `jsonb-get` already treats a string step as a key
+   and PostgreSQL's own `#>` uses text elements, resolving `1` against
+   an array by position through the same path."
+  [path]
+  (cond
+    (record? path)     (mapv str (or (:elements path) []))
+    (sequential? path) (mapv str path)
+    (string? path)     (let [t (str/trim path)]
+                         (if (and (str/starts-with? t "{") (str/ends-with? t "}"))
+                           (let [inner (subs t 1 (dec (count t)))]
+                             (if (str/blank? inner)
+                               []
+                               (mapv str/trim (str/split inner #","))))
+                           [t]))
+    (nil? path)        []
+    :else              [path]))
+
 (defn jsonb-get-path
-  "PostgreSQL #> operator: extract jsonb at path.
-   Path is a sequence of text keys."
+  "PostgreSQL #> operator: extract jsonb at path."
   [v path]
-  (reduce jsonb-get (parse-jsonb v) path))
+  (let [steps (->path-seq path)]
+    (reduce (fn [acc k]
+              (if (= acc :__null__)
+                :__null__
+                ;; A numeric step indexes an array; jsonb-get dispatches
+                ;; on the step's type, so hand it a long when it is one.
+                (jsonb-get acc (if (re-matches #"-?\d+" (str k))
+                                 (parse-long (str k))
+                                 k))))
+            (parse-jsonb v) steps)))
 
 (defn jsonb-get-path-text
   "PostgreSQL #>> operator: extract text at path.
@@ -279,9 +312,11 @@
   [v path]
   (let [result (jsonb-get-path v path)]
     (cond
-      (nil? result) :__null__
-      (string? result) result
-      :else (json/write-value-as-string result))))
+      (nil? result)         :__null__
+      (= :__null__ result)  :__null__
+      (= json-null result)  :__null__
+      (string? result)      result
+      :else                 (serialize-jsonb result))))
 
 ;; ============================================================================
 ;; Operators: containment and existence

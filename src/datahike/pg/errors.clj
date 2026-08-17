@@ -396,6 +396,21 @@
          (str "column \"" column "\" of relation \"" table "\" does not exist")
          {:table table :column column}])
 
+      ;; "String value for :ns/col exceeds max length N (was M)" —
+      ;; datahike's per-attribute / per-database value-size cap. It
+      ;; surfaced as XX000 carrying a raw ExceptionInfo and its ex-data
+      ;; map, which made the cap unusable by a client. PostgreSQL's
+      ;; class for a size ceiling is 54000 program_limit_exceeded, and
+      ;; its own jsonb ceiling ("string too long to represent as jsonb
+      ;; string") uses exactly that.
+      (re-find #"(?:String|Bytes) value for :([^/\s]+)/([^\s]+) exceeds max length (\d+)" msg)
+      (let [[_ table column limit]
+            (re-find #"(?:String|Bytes) value for :([^/\s]+)/([^\s]+) exceeds max length (\d+)" msg)]
+        ["54000"
+         (str "value too long for column \"" column "\" of relation \"" table
+              "\" (maximum " limit ")")
+         {:table table :column column}])
+
       ;; "Bad entity value <v> at <stmt>, value '<v>' is not match schema"
       ;; (kept as 22P02 — value-doesn't-match-type — but tightened message
       ;; if we can extract attribute and value)
