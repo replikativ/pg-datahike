@@ -1047,19 +1047,6 @@
 
       ;; Set-returning functions — when used in SELECT, serialize result
       ;; jsonb_object_agg(key, value) — builds jsonb object from key-value pairs
-      ;; NOTE: True GROUP BY aggregation requires custom Datahike aggregate
-      ;; support. This handles the scalar/subquery case where it receives
-      ;; already-grouped data.
-      ;; string_agg(value, delimiter) — concatenates strings with delimiter
-      (= fname "string_agg")
-      (let [[val-arg delim-arg] args
-            fn-param (symbol (str "?stragg" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj (fn [v _d] (str v)))
-        (swap! (:where-clauses ctx) conj [(list fn-param val-arg delim-arg) result-var])
-        result-var)
-
       ;; array_agg is handled by the aggregate path (sql-aggregate->datalog
       ;; now includes it; stmt.clj routes it through translate-select's
       ;; aggregate branch which collects values across rows into a PgArray

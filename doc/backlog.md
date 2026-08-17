@@ -419,9 +419,42 @@ Found while fixing the NULL-cast bug above. Bigger than it looks: it
 touches every comparison and boolean operator, and the WHERE and
 projection paths lower differently, so they need fixing together.
 
+### Schema-qualified set-returning functions in FROM fail
+
+> **FIXED on `fix/string-agg`**
+
+`SELECT count(*) FROM pg_catalog.generate_series(1,3)` raised the
+internal `Query for unknown vars: [?_eid]`. `materialize-table-function`
+matched the RAW function name, so anything schema-qualified missed its
+`cond`, returned nil, and left the FROM item with no relation at all —
+`count(*)` then emitted an entity var nothing bound.
+
+PostgreSQL resolves the qualified and unqualified forms to the same
+function through search_path, and pgjdbc writes the qualified one.
+
+### Unordered aggregates do not preserve input order
+
+`array_agg(id)` over rows 1..4 gives `{1,4,2,3}`; PostgreSQL gives
+`{1,2,3,4}`. Same for `json_agg`, `jsonb_agg` and `string_agg`. The
+order varies between runs, so it is set/bag iteration order rather than
+a fixed permutation.
+
+SQL leaves this UNSPECIFIED without an in-aggregate `ORDER BY`, and
+PostgreSQL's own order is incidental (a parallel plan changes it), so
+this is not a correctness defect — but clients do rely on it in
+practice, and every differential test of an unordered aggregate will
+flag it. Adding `ORDER BY` inside the aggregate gives the right answer
+today.
+
+Making it match would mean ordering the collected values by entity id,
+which costs a sort on every aggregate for a guarantee PostgreSQL does
+not itself make.
+
 ### `string_agg` is not an aggregate
 
-`SELECT string_agg(nm, ',') FROM t` returns ONE ROW PER INPUT ROW
+> **FIXED on `fix/string-agg`**
+
+`SELECT string_agg(nm, ',') FROM t` returned ONE ROW PER INPUT ROW
 (`a`, `b`) instead of the single concatenated `a,b`, and the ORDER BY
 inside it is ignored. Same defect `jsonb_agg` had before it was
 registered in `sql-aggregate->datalog` — it is a per-row function that

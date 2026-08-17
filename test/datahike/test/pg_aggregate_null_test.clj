@@ -178,3 +178,33 @@
 
   (testing "still correct when a group holds exactly one value"
     (is (= "B" (cell "SELECT MAX(grp) FROM t WHERE id = 4")))))
+
+;; ============================================================================
+;; string_agg over a real group
+;; ============================================================================
+
+(deftest test-string-agg-is-an-aggregate
+  ;; Was a per-row function that stringified its value and DISCARDED the
+  ;; delimiter, so this returned one row per input row instead of one
+  ;; joined string. Every assertion uses ORDER BY: without it the order
+  ;; of concatenation is unspecified in SQL, and our set-based engine
+  ;; does not reproduce PostgreSQL's incidental insertion order.
+  (testing "one row for the whole group"
+    (is (= "A,A,B,B" (cell "SELECT string_agg(grp, ',' ORDER BY grp) FROM t"))))
+
+  (testing "the delimiter is honoured"
+    (is (= "A-A-B-B" (cell "SELECT string_agg(grp, '-' ORDER BY grp) FROM t"))))
+
+  (testing "descending"
+    (is (= "B,B,A,A" (cell "SELECT string_agg(grp, ',' ORDER BY grp DESC) FROM t"))))
+
+  (testing "NULLs are skipped — id=3 has no grp"
+    (is (= "A,A" (cell "SELECT string_agg(grp, ',' ORDER BY grp) FROM t WHERE id IN (1,2,3)"))))
+
+  (testing "an all-NULL group is SQL NULL"
+    (is (nil? (cell "SELECT string_agg(grp, ',') FROM t WHERE id = 3"))))
+
+  (testing "per group under GROUP BY"
+    (is (= [["A" "A,A"] ["B" "B,B"]]
+           (:rows (ex "SELECT grp, string_agg(grp, ',' ORDER BY grp) FROM t
+                       WHERE grp IS NOT NULL GROUP BY grp ORDER BY grp"))))))

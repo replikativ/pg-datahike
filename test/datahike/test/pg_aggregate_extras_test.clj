@@ -208,3 +208,41 @@
           d2 (java.time.LocalDate/parse "2021-01-01")]
       (is (= d2 (greatest d1 d2)))
       (is (= d1 (least d1 d2))))))
+
+;; ---------------------------------------------------------------------------
+;; string_agg — a real aggregate, folding [value delimiter] pairs
+
+(deftest string-agg-folds-the-whole-group
+  (testing "joins with the delimiter carried on each pair"
+    (is (= "a,b,c" (fns/filter-string-agg [["a" ","] ["b" ","] ["c" ","]])))
+    (is (= "a-b"   (fns/filter-string-agg [["a" "-"] ["b" "-"]]))))
+
+  (testing "NULL inputs are skipped, not stringified"
+    ;; Was `(str v)` per row, which rendered the sentinel.
+    (is (= "a,b" (fns/filter-string-agg [["a" ","] [:__null__ ","] ["b" ","]])))
+    (is (= "a"   (fns/filter-string-agg [[nil ","] ["a" ","]]))))
+
+  (testing "an all-NULL or empty group is SQL NULL"
+    (is (= :__null__ (fns/filter-string-agg [[:__null__ ","]])))
+    (is (= :__null__ (fns/filter-string-agg []))))
+
+  (testing "a NULL delimiter joins with nothing rather than rendering"
+    (is (= "ab" (fns/filter-string-agg [["a" :__null__] ["b" :__null__]]))))
+
+  (testing "non-string values are stringified, as PG's text coercion does"
+    (is (= "1,2" (fns/filter-string-agg [[1 ","] [2 ","]])))))
+
+(deftest string-agg-ordered
+  ;; Triples are [sort-key value delimiter].
+  (testing "ascending"
+    (is (= "a,b,c" (fns/filter-string-agg-ordered
+                    [["b" "b" ","] ["a" "a" ","] ["c" "c" ","]]))))
+  (testing "descending"
+    (is (= "c,b,a" (fns/filter-string-agg-ordered-desc
+                    [["b" "b" ","] ["a" "a" ","] ["c" "c" ","]]))))
+  (testing "a NULL sort key sorts last, rather than throwing"
+    ;; akey-compare knew `nil` but not the :__null__ sentinel a nullable
+    ;; ORDER BY column actually binds to, so this threw
+    ;; `Keyword cannot be cast to String`. array_agg shared the bug.
+    (is (= "a,b" (fns/filter-string-agg-ordered
+                  [[:__null__ nil ","] ["a" "a" ","] ["b" "b" ","]])))))
