@@ -1626,6 +1626,19 @@
       (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
       ;; Constant value — cast at translation time
         (cond
+          ;; Casting NULL yields NULL for every target type. Without this
+          ;; the folds below stringify nil — `(str nil)` is "" — so
+          ;; `NULL::text` became the EMPTY STRING and every NULL-aware
+          ;; construct downstream took the wrong branch:
+          ;;   NULL::text IS NULL          -> false
+          ;;   coalesce(NULL::text, 'x')   -> ''
+          ;;   length(NULL::text)          -> 0
+          ;; and `NULL::bool` raised `invalid input syntax for type
+          ;; boolean: ""`, which is the empty string being parsed back.
+          ;; The runtime (non-constant) branches below all guard with
+          ;; `(when v ...)` already; only this compile-time fold did not,
+          ;; and `cast-scalar` makes the same check for the same reason.
+          (or (nil? inner-raw) (= :__null__ inner-raw)) inner-raw
           is-int?  (coerce/coerce-numeric inner-raw :long)
           is-float? (coerce/coerce-numeric inner-raw :double)
           ;; ::numeric keeps arbitrary precision — parse via the string
