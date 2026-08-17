@@ -293,6 +293,30 @@ invariant.
 
 ---
 
+### Casting NULL to a string type yields the empty string
+
+`SELECT NULL::text IS NULL` answers **false**. NULL cast to `text`,
+`varchar` or `char` becomes `''` rather than staying NULL, so every
+NULL-aware construct downstream silently takes the wrong branch:
+
+    length(NULL::text)                  -> 0    PG: NULL
+    NULL::text = ''                     -> true PG: NULL
+    coalesce(NULL::text, 'FELLBACK')    -> ''   PG: 'FELLBACK'
+    NULL::varchar IS NULL               -> f    PG: t
+    CASE WHEN NULL::text IS NULL
+         THEN 'a' ELSE 'b' END          -> 'b'  PG: 'a'
+
+`NULL::bool` proves the mechanism: it raises `invalid input syntax for
+type boolean: ""`, i.e. NULL was stringified to `''` and that was then
+parsed as a boolean. `NULL::int`, `::numeric`, `::date` and `::jsonb`
+are all correct, and bare `NULL IS NULL` is correct — it is specific to
+the string casts.
+
+Found via asyncpg's `test_prepare_03`, which prepares
+`SELECT CASE WHEN $1::text IS NULL THEN <default> ELSE $1::text END`
+and gets the ELSE branch for a NULL argument. Reproduces without any
+parameter, so it is a cast bug rather than a protocol one.
+
 ### The asyncpg suite gives different answers in CI and locally
 
 Same commit, freshly restarted server: **95 passed / 74 failed locally,
