@@ -109,6 +109,24 @@ land alone — see the equality entry above; the two must change together.
 
 ---
 
+### We accept JSON that PostgreSQL rejects
+
+Running a 110-line slice of PostgreSQL's own `src/test/regress/sql/jsonb.sql`
+found **27 statements where we return a value and PostgreSQL raises
+22P02**. Our parser is Jackson, which is lenient exactly where
+PostgreSQL's is strict:
+
+    '"abc'::jsonb        unclosed quote        -> we return `"abc`
+    '"abc\ndef"'::jsonb  unescaped newline     -> we return it
+    '"\v"'::jsonb        invalid escape        -> we return it
+    '01'::jsonb          leading zero          -> we return `01`
+
+PostgreSQL's rules are in `src/common/jsonapi.c`: the valid escape set
+is exactly `" \ / b f n r t u`, a raw byte below 0x20 inside a string
+must be escaped, and the number grammar is strict RFC 8259. Accepting
+malformed input is how invalid documents reach storage, so this is a
+gate rather than a cosmetic gap.
+
 ## S2 — wrong errors
 
 ### `json` accepts operators PostgreSQL does not have
