@@ -7,7 +7,9 @@
    Implements PostgreSQL jsonb operators and functions as pure Clojure
    functions that can be used as Datalog predicates or post-processing."
   (:require [jsonista.core :as json]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.records :as records]))
 
 (set! *warn-on-reflection* true)
 
@@ -15,55 +17,247 @@
 ;; JSON parsing / serialization
 ;; ============================================================================
 
-(def ^:private mapper (json/object-mapper {:decode-key-fn str}))
-
-;; Canonical mapper — writes object keys in sorted order at every level, so two
-;; jsonb values that differ only in key order (or whitespace) serialize identically.
-;; This is what makes stored jsonb behave like Postgres jsonb rather than json:
-;; jsonb DROPS key order and whitespace and keeps only the LAST of duplicate keys
-;; (Jackson does last-wins on parse), so `=`, DISTINCT and GROUP BY compare by
-;; structure, not by input text.
-(def ^:private canonical-mapper
+(def ^:private mapper
+  "Parse-side mapper. `USE_BIG_DECIMAL_FOR_FLOATS` is what makes number
+   fidelity possible at all: PostgreSQL's jsonb numbers are `numeric`,
+   and a Java double cannot represent `1.00` distinctly from `1`, nor
+   9007199254740993 exactly. Once a value has been through a double the
+   information is gone and no renderer can recover it."
   (doto ^com.fasterxml.jackson.databind.ObjectMapper
    (json/object-mapper {:decode-key-fn str})
-    (.configure com.fasterxml.jackson.databind.SerializationFeature/ORDER_MAP_ENTRIES_BY_KEYS
+    (.configure com.fasterxml.jackson.databind.DeserializationFeature/USE_BIG_DECIMAL_FOR_FLOATS
                 true)))
 
+(def json-null
+  "PostgreSQL's JSON `null` is a VALUE, distinct from SQL NULL: `IS NULL`
+   on it is false and `jsonb_typeof` answers \"null\". Representing it as
+   Clojure `nil` conflated the two, and because a datalog function
+   binding that yields nil FILTERS THE ROW, `SELECT p->'k'` on a JSON
+   null returned no rows at all where PostgreSQL returns one row.
+
+   Distinct from `:__null__`, which is this codebase's SQL-NULL
+   sentinel — `->>` collapses JSON null TO SQL NULL, so both exist and
+   they are not the same thing."
+  ::json-null)
+
+(def ^:private numeric-max-dscale
+  "PostgreSQL NUMERIC_DSCALE_MAX. Beyond it, 22003." 16383)
+
+(def ^:private numeric-max-int-digits
+  "PostgreSQL NUMERIC_WEIGHT_MAX * DEC_DIGITS. Beyond it, 22003." 131072)
+
+(defn- check-numeric-range!
+  "BigDecimal is strictly more permissive than PostgreSQL's numeric, so
+   without this we accept documents PostgreSQL rejects."
+  [^java.math.BigDecimal d]
+  (when (> (.scale d) numeric-max-dscale)
+    (throw (ex-info "value overflows numeric format"
+                    {:error :numeric-value-out-of-range :sqlstate "22003"})))
+  (when (> (- (.precision d) (.scale d)) numeric-max-int-digits)
+    (throw (ex-info "value overflows numeric format"
+                    {:error :numeric-value-out-of-range :sqlstate "22003"})))
+  d)
+
+(defn- normalize-tree
+  "Bring a freshly-parsed tree into the value model:
+
+     - EVERY number becomes a BigDecimal. Clojure's `=`/`hash` on
+       BigDecimal are scale-INsensitive, which reproduces PostgreSQL's
+       `numeric_eq` — and therefore DISTINCT and GROUP BY — for free.
+       That only holds if the representation is UNIFORM: `(= 1 1M)` is
+       false, so a tree mixing Long and BigDecimal compares wrong.
+     - JSON null becomes `json-null` rather than nil (see above).
+     - Objects keep unique keys; Jackson already applied last-wins.
+
+   Runs once per parse, alongside the parse we already pay for."
+  [v]
+  (cond
+    (nil? v)     json-null
+    ;; PostgreSQL dispatches to_json/to_jsonb on the argument's DECLARED
+    ;; TYPE (json_categorize_type, json.c) — an array becomes a JSON
+    ;; array, a composite becomes an object, a timestamp becomes
+    ;; ISO-8601. We dispatch on the runtime Clojure class, and PgArray /
+    ;; PgRecord are defrecords, so `map?` is TRUE for them: they fell
+    ;; into the object branch and leaked their internals as keys
+    ;; (`{":dims": [3], ":elements": …}`). These must be tested BEFORE
+    ;; the map branch.
+    (pg-arr/array? v) (mapv normalize-tree (:elements v))
+    (records/record? v)
+    (let [fs (:fields v)]
+      (persistent!
+       (reduce (fn [m [i f]]
+                 (assoc! m (or (:name f) (str "f" (inc i))) (normalize-tree (:value f))))
+               (transient {}) (map-indexed vector fs))))
+    ;; A temporal value is ISO-8601, not java.util.Date's .toString
+    ;; ("Sun Aug 16 19:00:16 PDT 2026").
+    ;; PostgreSQL's JsonEncodeDateTime renders the value AS STORED — a
+    ;; `timestamp` carries no zone, so it must not be shifted. Formatting
+    ;; in the default zone reproduces what PostgreSQL prints for the same
+    ;; value; converting to UTC moved it by the offset.
+    ;; The column output path renders an instant by stringifying it (UTC)
+    ;; and stripping the trailing Z, so a stored timestamp reads back as
+    ;; the wall clock it was written with. Use the SAME convention here,
+    ;; or `to_jsonb(t)` and `SELECT t` disagree about the same value —
+    ;; formatting in the system zone shifted it by the local offset.
+    (inst? v)    (let [^java.time.Instant inst (if (instance? java.time.Instant v)
+                                                 v
+                                                 (.toInstant ^java.util.Date v))]
+                   (str/replace (str inst) "Z" ""))
+    (instance? java.time.LocalDateTime v) (str v)
+    (instance? java.time.LocalDate v)     (str v)
+    (map? v)     (persistent! (reduce-kv (fn [m k x] (assoc! m (str k) (normalize-tree x)))
+                                         (transient {}) v))
+    (vector? v)  (mapv normalize-tree v)
+    (sequential? v) (mapv normalize-tree v)
+    (instance? java.math.BigDecimal v) (check-numeric-range! v)
+    (integer? v) (java.math.BigDecimal. (str v))
+    (float? v)   (check-numeric-range! (java.math.BigDecimal. (str v)))
+    :else        v))
+
 (defn parse-jsonb
-  "Parse a JSON string to a Clojure data structure.
+  "Parse a JSON string to the jsonb value model.
    Returns nil for nil input, passes through non-strings."
   [v]
   (cond
     (nil? v) nil
-    (string? v) (try (json/read-value v mapper)
+    (string? v) (try (normalize-tree (json/read-value v mapper))
+                     (catch clojure.lang.ExceptionInfo e (throw e))
                      (catch Exception _ v))
     :else v))
 
-(defn canonicalize-jsonb
-  "The canonical jsonb TEXT for a value — recursively key-sorted, whitespace-
-   normalized, duplicate keys collapsed to the last. This is the form stored and the
-   form a client reads back (Postgres normalizes jsonb on input). A string that is
-   valid JSON is re-emitted canonically; a string that is not JSON is a JSON string
-   scalar; a Clojure map/vector is written canonically. Returns nil for nil.
+;; ---------------------------------------------------------------------------
+;; The canonical writer — PostgreSQL's jsonb output, not Jackson's
+;; ---------------------------------------------------------------------------
 
-   NOTE: numeric normalization is Jackson's, not Postgres's — e.g. `1.00`/`1e3` may
-   not match PG's exact jsonb numeric canonical form. Structural (key/whitespace/
-   duplicate) canonicalization is exact; numeric is best-effort."
+(defn- pg-key-cmp
+  "PostgreSQL's jsonb object-key order: LENGTH FIRST, then bytewise over
+   the UTF-8 encoding (`lengthCompareJsonbString`, jsonb_util.c).
+
+   It is neither alphabetical nor collation-aware, which is why Jackson's
+   ORDER_MAP_ENTRIES_BY_KEYS is the wrong tool: `{\"z\":1,\"aa\":2,\"b\":3}`
+   is `{\"b\": 3, \"z\": 1, \"aa\": 2}` in PostgreSQL and
+   `{\"aa\":2,\"b\":3,\"z\":1}` under alphabetical order. Length is in
+   OCTETS, so a 2-byte `é` sorts with the 2-character keys."
+  ^long [^String a ^String b]
+  (let [ba (.getBytes a java.nio.charset.StandardCharsets/UTF_8)
+        bb (.getBytes b java.nio.charset.StandardCharsets/UTF_8)]
+    (if (not= (alength ba) (alength bb))
+      (- (alength ba) (alength bb))
+      (java.util.Arrays/compareUnsigned ba bb))))
+
+(defn- append-json-string!
+  "PostgreSQL's `escape_json`: escape exactly \b \f \n \r \t \" and
+   backslash; any other byte below 0x20 becomes a \\u escape with four LOWERCASE hex
+   digits; everything from 0x20 up is emitted raw — including `/`, DEL,
+   and all multi-byte UTF-8. PostgreSQL never emits a \\u escape for non-ASCII."
+  [^StringBuilder sb ^String s]
+  (.append sb \")
+  (dotimes [i (.length s)]
+    (let [c (.charAt s i)]
+      (case c
+        \backspace (.append sb "\\b")
+        \formfeed  (.append sb "\\f")
+        \newline   (.append sb "\\n")
+        \return    (.append sb "\\r")
+        \tab       (.append sb "\\t")
+        \"         (.append sb "\\\"")
+        \\        (.append sb "\\\\")
+        (if (< (int c) 0x20)
+          (.append sb (format "\\u%04x" (int c)))
+          (.append sb c)))))
+  (.append sb \"))
+
+(defn- append-number!
+  "PostgreSQL renders a jsonb number with `numeric_out`: plain positional
+   notation, never scientific, with exactly the literal's own scale.
+
+   `dscale = max(0, fraction-digits - exponent)`, which is what
+   BigDecimal's own `scale()` gives after parsing — `1e3` parses to scale
+   -3, so clamping at 0 reproduces PostgreSQL exactly: `1e3` → `1000`,
+   `1.00` → `1.00`, `1e-3` → `0.001`. `toPlainString` is required;
+   `toString` would emit `1E+3`."
+  [^StringBuilder sb v]
+  (.append sb
+           (cond
+             (instance? java.math.BigDecimal v)
+             (let [^java.math.BigDecimal d v]
+               (.toPlainString (if (neg? (.scale d)) (.setScale d 0) d)))
+             (instance? Double v)
+             (.toPlainString (java.math.BigDecimal/valueOf ^double v))
+             :else (str v))))
+
+(def ^:dynamic *json-style*
+  "Object punctuation for the writer.
+
+   PostgreSQL renders the two families differently, and the difference
+   is only in objects: `jsonb` emits `\": \"` after a key and `\", \"`
+   between pairs, while a `json` value that PostgreSQL BUILT (rather
+   than echoed verbatim) is compact — `{\"a\":1}`. Arrays are `[1, 2]`
+   in both."
+  {:pair ": " :sep ", "})
+
+(defn- emit!
+  [^StringBuilder sb v]
+  (cond
+    (nil? v)     (.append sb "null")
+    (= json-null v) (.append sb "null")
+    (map? v)     (do (.append sb \{)
+                     (reduce (fn [first? k]
+                               (when-not first? (.append sb (:sep *json-style*)))
+                               (append-json-string! sb (str k))
+                               (.append sb (:pair *json-style*))
+                               (emit! sb (get v k))
+                               false)
+                             true
+                             (sort pg-key-cmp (map str (keys v))))
+                     (.append sb \}))
+    (sequential? v) (do (.append sb \[)
+                        (reduce (fn [first? x]
+                                  (when-not first? (.append sb ", "))
+                                  (emit! sb x)
+                                  false)
+                                true v)
+                        (.append sb \]))
+    (string? v)  (append-json-string! sb v)
+    (boolean? v) (.append sb (if v "true" "false"))
+    (number? v)  (append-number! sb v)
+    :else        (append-json-string! sb (str v))))
+
+(defn serialize-jsonb
+  "The canonical jsonb TEXT for a value, byte-for-byte as PostgreSQL
+   renders it: keys length-first then bytewise, `\", \"` between pairs and
+   `\": \"` after each key, numbers via numeric semantics, duplicate keys
+   already collapsed last-wins by the parser.
+
+   This is both the stored form and the form a client reads back, because
+   PostgreSQL normalizes jsonb on input and has no memory of the original
+   text. `json` is the text-faithful type and must never come through
+   here.
+
+   A string that is valid JSON is re-emitted canonically; a string that is
+   not JSON becomes a JSON string scalar; a Clojure map/vector is written
+   directly. nil in, nil out."
   [v]
   (when (some? v)
     (let [data (if (string? v)
-                 (try (json/read-value v mapper)   ;; valid JSON text → its data
-                      (catch Exception _ v))       ;; not JSON → a string scalar
-                 v)]
-      (json/write-value-as-string data canonical-mapper))))
+                 (try (json/read-value v mapper)
+                      (catch Exception _ v))
+                 v)
+          sb (StringBuilder.)]
+      (emit! sb data)
+      (.toString sb))))
 
-(defn serialize-jsonb
-  "Serialize a value to canonical jsonb TEXT for storage. Alias of
-   `canonicalize-jsonb` — every write path canonicalizes, so stored jsonb is
-   structure-normalized regardless of how it arrived (map/vector from a Clojure
-   literal, or a `'…'::jsonb` string literal)."
+(defn serialize-json
+  "Canonical text in the `json` family's punctuation — compact objects,
+   as PostgreSQL renders a json value it constructed
+   (`json_strip_nulls('{\"a\":1,\"z\":null}')` -> `{\"a\":1}`)."
   [v]
-  (canonicalize-jsonb v))
+  (binding [*json-style* {:pair ":" :sep ","}]
+    (serialize-jsonb v)))
+
+(def canonicalize-jsonb
+  "Deprecated alias for `serialize-jsonb`; they were always the same fn."
+  serialize-jsonb)
 
 ;; ============================================================================
 ;; Operators: -> and ->> (field/element access)
@@ -75,21 +269,43 @@
    Returns :__null__ sentinel unchanged (NULL propagation for get-else)."
   [v key-or-idx]
   (if (= v :__null__) :__null__
-      (let [parsed (parse-jsonb v)]
+      (let [parsed (parse-jsonb v)
+            ;; MISSING is SQL NULL; a JSON null that is PRESENT is the
+            ;; jsonb value `null` and must survive as one.
+            ;;
+            ;; Returning bare nil for "missing" was a row-loss bug, not
+            ;; just a wrong type: this fn is invoked as a datalog
+            ;; function binding, and a binding that yields nil FILTERS
+            ;; THE ROW. `SELECT p->'nope' FROM t` returned zero rows
+            ;; where PostgreSQL returns one row of NULL. `:__null__` is
+            ;; the sentinel the rest of the pipeline renders as SQL NULL.
+            missing :__null__
+            ;; An array index can arrive as the STRING "1" — the chain
+            ;; emitter carries the ident as text, and PostgreSQL's own
+            ;; `#>` path is text[] too. Coerce for sequential targets so
+            ;; `d->'arr'->>1` reaches element 1 instead of falling
+            ;; through to "missing".
+            key-or-idx (if (and (sequential? parsed)
+                                (string? key-or-idx)
+                                (re-matches #"-?\d+" key-or-idx))
+                         (parse-long key-or-idx)
+                         key-or-idx)]
         (cond
           (and (map? parsed) (string? key-or-idx))
-          (get parsed key-or-idx)
+          (get parsed key-or-idx missing)
 
           (and (map? parsed) (integer? key-or-idx))
-          (get parsed (str key-or-idx))
+          (get parsed (str key-or-idx) missing)
 
           (and (sequential? parsed) (integer? key-or-idx))
           (let [idx (if (neg? key-or-idx)
                       (+ (count parsed) key-or-idx)
                       key-or-idx)]
-            (nth parsed idx nil))
+            (if (or (neg? idx) (>= idx (count parsed)))
+              missing
+              (nth parsed idx)))
 
-          :else nil))))
+          :else missing))))
 
 (defn jsonb-get-text
   "PostgreSQL ->> operator: get field/element as text string.
@@ -100,17 +316,56 @@
   (let [result (jsonb-get v key-or-idx)]
     (cond
       (= result :__null__) :__null__
-      (some? result)
-      (if (or (string? result) (number? result) (boolean? result))
-        (str result)
-        (json/write-value-as-string result))
+      ;; `->` yields the jsonb value `null`; `->>` collapses it to SQL
+      ;; NULL. That asymmetry is PostgreSQL's, and it is the reason both
+      ;; sentinels have to exist.
+      (= result json-null) :__null__
+      (string? result)  result
+      (boolean? result) (str result)
+      ;; A number renders through the canonical writer so it keeps its
+      ;; numeric scale — `->> ` on 1.00 is "1.00", not "1.0".
+      (or (number? result) (coll? result)) (serialize-jsonb result)
+      (some? result) (str result)
       :else :__null__)))
 
+(defn- ->path-seq
+  "The step list for `#>` / `#>>`.
+
+   PostgreSQL types the right operand `text[]`, and it reaches us either
+   as a PgArray record or — for the common literal form `'{a,b,1}'` — as
+   the raw array TEXT. Reducing over that string walked its characters,
+   so `d #> '{a,b,1}'` descended into `{`, `a`, `,` … and found nothing.
+
+   Steps stay strings: `jsonb-get` already treats a string step as a key
+   and PostgreSQL's own `#>` uses text elements, resolving `1` against
+   an array by position through the same path."
+  [path]
+  (cond
+    (record? path)     (mapv str (or (:elements path) []))
+    (sequential? path) (mapv str path)
+    (string? path)     (let [t (str/trim path)]
+                         (if (and (str/starts-with? t "{") (str/ends-with? t "}"))
+                           (let [inner (subs t 1 (dec (count t)))]
+                             (if (str/blank? inner)
+                               []
+                               (mapv str/trim (str/split inner #","))))
+                           [t]))
+    (nil? path)        []
+    :else              [path]))
+
 (defn jsonb-get-path
-  "PostgreSQL #> operator: extract jsonb at path.
-   Path is a sequence of text keys."
+  "PostgreSQL #> operator: extract jsonb at path."
   [v path]
-  (reduce jsonb-get (parse-jsonb v) path))
+  (let [steps (->path-seq path)]
+    (reduce (fn [acc k]
+              (if (= acc :__null__)
+                :__null__
+                ;; A numeric step indexes an array; jsonb-get dispatches
+                ;; on the step's type, so hand it a long when it is one.
+                (jsonb-get acc (if (re-matches #"-?\d+" (str k))
+                                 (parse-long (str k))
+                                 k))))
+            (parse-jsonb v) steps)))
 
 (defn jsonb-get-path-text
   "PostgreSQL #>> operator: extract text at path.
@@ -119,13 +374,33 @@
   [v path]
   (let [result (jsonb-get-path v path)]
     (cond
-      (nil? result) :__null__
-      (string? result) result
-      :else (json/write-value-as-string result))))
+      (nil? result)         :__null__
+      (= :__null__ result)  :__null__
+      (= json-null result)  :__null__
+      (string? result)      result
+      :else                 (serialize-jsonb result))))
 
 ;; ============================================================================
 ;; Operators: containment and existence
 ;; ============================================================================
+
+(defn jsonb-eq?
+  "PostgreSQL's jsonb `=`, which compares VALUES and is numeric-scale
+   INSENSITIVE: `'1.00'::jsonb = '1'::jsonb` is true even though the two
+   render differently. Comparing our canonical text alone is therefore
+   too STRICT — it is a canonical form for structure, not for numbers,
+   because PostgreSQL keeps display scale on purpose.
+
+   Text equality is the fast path and is sound in one direction: equal
+   canonical text implies equal values, so only differing text has to be
+   parsed. That confines the cost to exactly the case that was wrong.
+
+   Structural comparison is then just `=` on the parsed trees: numbers
+   are uniformly BigDecimal in the value model, and Clojure's `=` on
+   BigDecimal is scale-insensitive, which is `numeric_eq`."
+  [a b]
+  (or (= a b)
+      (= (parse-jsonb a) (parse-jsonb b))))
 
 (defn jsonb-contains?
   "PostgreSQL @> operator: does left contain right?"
@@ -162,17 +437,32 @@
       (sequential? parsed) (some #{key} parsed)
       :else false)))
 
+(defn- ->key-seq
+  "The key list for `?|` / `?&`.
+
+   PostgreSQL types their right operand `text[]`, so it arrives here as
+   a PgArray RECORD. `some`/`every?` over a record iterate its MAP
+   ENTRIES, so every key test compared a `[:elem-type …]` pair against a
+   string and `doc ?| array['a','b']` answered false for everything."
+  [ks]
+  (cond
+    (record? ks)     (or (:elements ks) [])
+    (string? ks)     [ks]
+    (sequential? ks) ks
+    (nil? ks)        []
+    :else            [ks]))
+
 (defn jsonb-exists-any?
   "PostgreSQL ?| operator: does any of the keys exist?"
   [v keys]
   (let [parsed (parse-jsonb v)]
-    (some #(jsonb-exists? parsed %) keys)))
+    (boolean (some #(jsonb-exists? parsed %) (->key-seq keys)))))
 
 (defn jsonb-exists-all?
   "PostgreSQL ?& operator: do all keys exist?"
   [v keys]
   (let [parsed (parse-jsonb v)]
-    (every? #(jsonb-exists? parsed %) keys)))
+    (every? #(jsonb-exists? parsed %) (->key-seq keys))))
 
 ;; ============================================================================
 ;; Operators: modification
@@ -232,6 +522,87 @@
 ;; Functions: builders
 ;; ============================================================================
 
+;; ============================================================================
+;; Operator registry
+;; ============================================================================
+
+(def op
+  "SQL operator string → the runtime fn implementing it.
+
+   THE registry. Every consumer — the SELECT emitter that lowers an
+   operator into a datalog function-call clause, and the UPDATE SET
+   interpreter that applies it eagerly to a materialised entity map —
+   looks the fn up here rather than carrying its own `if`. Those two
+   had already drifted: one wrapped the `->` result in
+   `serialize-jsonb` and the other did not, which is precisely the
+   divergence a shared table prevents. (That difference is preserved
+   at the UPDATE call site for now and resolved deliberately when the
+   operator semantics are fixed, not silently by this refactor.)
+
+   Adding an operator is one entry here plus, for the ones the parser
+   currently rejects, a narrowing of `sql/unsupported-op-chars`."
+  {"="   jsonb-eq?
+   "->"  jsonb-get
+   "->>" jsonb-get-text
+   "#>"  jsonb-get-path
+   "#>>" jsonb-get-path-text
+   "@>"  jsonb-contains?
+   "<@"  jsonb-contained?
+   "?"   jsonb-exists?
+   "?|"  jsonb-exists-any?
+   "?&"  jsonb-exists-all?
+   "||"  jsonb-concat
+   "-"   jsonb-delete-key})
+
+;; ---------------------------------------------------------------------------
+;; The `json_*` family — text-faithful, unlike `jsonb_*`
+;; ---------------------------------------------------------------------------
+
+(defn- emit-json-value!
+  "Render one value in `json` (not jsonb) form. Values reuse the jsonb
+   writer — the difference between the families is in the OBJECT
+   punctuation and in what is kept, not in how a scalar looks."
+  [^StringBuilder sb v]
+  (emit! sb (normalize-tree v)))
+
+(defn json-build-object
+  "PostgreSQL `json_build_object(k1, v1, …)`.
+
+   NOT `jsonb_build_object` with a different name. `json` is the
+   text-faithful type, so this preserves ARGUMENT ORDER and KEEPS
+   DUPLICATE KEYS, where the jsonb form sorts and takes the last:
+
+     json_build_object('b',1,'a',2,'a',3) -> {\"b\" : 1, \"a\" : 2, \"a\" : 3}
+     jsonb_build_object(same)             -> {\"a\": 3, \"b\": 1}
+
+   Which is why it builds TEXT straight from the arguments instead of
+   going through a Clojure map — a map cannot hold either property.
+   PostgreSQL's separator here is `\" : \"`, spaces on both sides
+   (json.c's composite_to_json), not the jsonb writer's `\": \"`."
+  [& args]
+  (let [sb (StringBuilder.)]
+    (.append sb \{)
+    (doseq [[i [k v]] (map-indexed vector (partition 2 args))]
+      (when (pos? i) (.append sb ", "))
+      (append-json-string! sb (str k))
+      (.append sb " : ")
+      (emit-json-value! sb v))
+    (.append sb \})
+    (.toString sb)))
+
+(defn json-build-array
+  "PostgreSQL `json_build_array(v1, …)`. Arrays render identically in
+   both families, so only the element order matters and it is preserved
+   by construction."
+  [& args]
+  (let [sb (StringBuilder.)]
+    (.append sb \[)
+    (doseq [[i v] (map-indexed vector args)]
+      (when (pos? i) (.append sb ", "))
+      (emit-json-value! sb v))
+    (.append sb \])
+    (.toString sb)))
+
 (defn jsonb-build-object
   "PostgreSQL jsonb_build_object(k1, v1, k2, v2, ...): build jsonb from pairs."
   [& args]
@@ -253,8 +624,11 @@
   (let [parsed (parse-jsonb v)]
     (cond
       (map? parsed)
+      ;; A JSON null is `json-null`, not nil — `some?` was true for it,
+      ;; so nothing was stripped. (Arrays keep their nulls in
+      ;; PostgreSQL; only object keys are removed.)
       (into {} (keep (fn [[k v]]
-                       (when (some? v)
+                       (when-not (or (nil? v) (= json-null v))
                          [k (jsonb-strip-nulls v)])))
             parsed)
 
@@ -305,6 +679,7 @@
   (let [parsed (parse-jsonb v)]
     (cond
       (nil? parsed)        "null"
+      (= json-null parsed) "null"
       (map? parsed)        "object"
       (sequential? parsed) "array"
       (string? parsed)     "string"
@@ -364,11 +739,6 @@
 ;; These are used as reduce functions in the SQL translator's aggregate handling
 ;; ============================================================================
 
-(defn jsonb-object-agg-step
-  "Accumulator step for jsonb_object_agg(key, value)."
-  [acc k v]
-  (assoc (or acc {}) (str k) v))
-
 ;; ============================================================================
 ;; Functions: misc
 ;; ============================================================================
@@ -380,24 +750,31 @@
     (json/write-value-as-string parsed (json/object-mapper {:pretty true}))))
 
 (defn to-jsonb
-  "PostgreSQL to_jsonb(any): convert any value to jsonb."
-  [v]
-  (cond
-    (nil? v) nil
-    (string? v) (try (json/read-value v mapper) (catch Exception _ v))
-    :else v))
+  "PostgreSQL `to_jsonb(anyelement)` / `to_json` — convert a SQL value
+   INTO a json value.
+
+   It does NOT parse its argument. `to_jsonb('{\"a\":1}'::text)` is the
+   json STRING `\"{\\\"a\\\":1}\"`, not an object — the text is a text
+   value being wrapped, not a document being read. We parsed it, so a
+   text column holding JSON silently became a structure.
+
+   Only an argument that is ALREADY json/jsonb passes through, and the
+   caller decides that from the column type, since at runtime both are
+   Clojure strings.
+
+   Returns canonical TEXT, so a json string renders quoted (`\"x\"`) the
+   way PostgreSQL prints it."
+  ([v] (to-jsonb v false))
+  ([v already-json?]
+   (cond
+     (nil? v)          nil
+     (= :__null__ v)   :__null__
+     already-json?     (serialize-jsonb v)
+     :else             (let [sb (StringBuilder.)]
+                         (emit! sb (normalize-tree v))
+                         (.toString sb)))))
 
 ;; ============================================================================
 ;; Wire protocol: formatting jsonb for transport
 ;; ============================================================================
 
-(defn format-jsonb-value
-  "Format a jsonb Clojure value for PgWire text protocol transport.
-   Returns a JSON string."
-  [v]
-  (when (some? v)
-    (if (string? v)
-      ;; Already a string — might be a raw scalar
-      (try (json/read-value v mapper) v
-           (catch Exception _ (json/write-value-as-string v)))
-      (json/write-value-as-string v))))

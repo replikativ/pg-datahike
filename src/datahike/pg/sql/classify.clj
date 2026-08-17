@@ -542,7 +542,11 @@
       ;; need to silently accept the call so the dump replays.
       ;; The 3-arg form is `set_config(name, value, is_local)`; we
       ;; accept any args.
-      (fn-name=? t1 "set_config") {:kind :set-config}
+      ;; PostgreSQL returns the NEW VALUE as text, and asyncpg reads it
+      ;; back when it turns `jit` off around type introspection — so an
+      ;; empty answer is not harmless here. Carry the value argument.
+      (fn-name=? t1 "set_config")
+      {:kind :set-config :args (extract-fn-string-args rest-args)}
       (fn-name=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (fn-name=? t1 "txid_current")  {:kind :txid-current}
       (fn-name=? t1 "pg_sleep")

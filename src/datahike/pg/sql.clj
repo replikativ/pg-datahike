@@ -32,6 +32,7 @@
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
+            [datahike.pg.jsonb]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
@@ -82,6 +83,12 @@
 (def filter-sum-numeric    fns/filter-sum-numeric)
 (def filter-avg            fns/filter-avg)
 (def filter-avg-numeric    fns/filter-avg-numeric)
+(def filter-jsonb-agg      fns/filter-jsonb-agg)
+(def filter-jsonb-object-agg fns/filter-jsonb-object-agg)
+(def filter-json-object-agg  fns/filter-json-object-agg)
+(def jsonb-eq?             datahike.pg.jsonb/jsonb-eq?)
+(def sql-null?             fns/sql-null?)
+(def sql-not-null?         fns/sql-not-null?)
 (def filter-min            fns/filter-min)
 (def filter-max            fns/filter-max)
 (def filter-count          fns/filter-count)
@@ -1676,7 +1683,15 @@
   (when (or (<= 0 (.indexOf sql "#")) (<= 0 (.indexOf sql "$")))
     (when-let [bad (first (filter (fn [{:keys [type text]}]
                                     (and (= :op type)
-                                         (some unsupported-op-chars text)))
+                                         (some unsupported-op-chars text)
+                                         ;; `#>` and `#>>` ARE implemented —
+                                         ;; they parse as JsonExpression, the
+                                         ;; same node `->`/`->>` produce, and
+                                         ;; are in jb/op. Only bare `#` (PG's
+                                         ;; XOR) and `#-` remain unsupported,
+                                         ;; so the check narrows to the exact
+                                         ;; tokens rather than the character.
+                                         (not (contains? #{"#>" "#>>"} text))))
                                   (cls/tokenize-all sql)))]
       {:type :error
        :sqlstate "42601"

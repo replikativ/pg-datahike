@@ -85,6 +85,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Forward declarations for the mutually-recursive translate-* family.
 
+(declare jsonb-column? json-column? reject-json-operator!)
+
 (declare translate-expr
          translate-predicate
          translate-case-expr
@@ -299,7 +301,17 @@
                       "application_name"           "datahike"
                       "transaction_isolation"      "read committed"
                       "transaction_read_only"      "off"
-                      "default_transaction_isolation" "read committed"}
+                      "default_transaction_isolation" "read committed"
+                      ;; asyncpg probes `jit` during type introspection —
+                      ;; `SELECT current_setting('jit'), set_config('jit',
+                      ;; 'off', false)` — and a 42704 there breaks its
+                      ;; codec pipeline, not just the probe.
+                      ;; DELIBERATE DIVERGENCE: PostgreSQL defaults this
+                      ;; to `on`; we have no JIT at all, so `off` is the
+                      ;; truthful answer. A client that reads this to
+                      ;; decide whether to apply a JIT workaround gets
+                      ;; the right answer from us, not a copied default.
+                      "jit"                        "off"}
             impl-fn (fn [name & [missing-ok]]
                       (or (get settings (str name))
                           (when missing-ok :__null__)
@@ -307,6 +319,32 @@
                                           {:error :undefined-object
                                            :kind "configuration parameter"
                                            :name name}))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; set_config(name, value, is_local) — assign a run-time parameter
+      ;; and RETURN the new value as text.
+      ;;
+      ;; asyncpg turns `jit` off around its type-introspection query and
+      ;; reads the result back, so this is on the path of every codec
+      ;; lookup rather than a corner. It used to pass through as an
+      ;; unresolved datalog symbol; once unknown functions started
+      ;; raising 42883 that became a hard failure during PREPARE, which
+      ;; asyncpg does not recover from.
+      ;;
+      ;; The value is accepted and echoed rather than stored: none of the
+      ;; parameters a client sets this way changes how we execute, and
+      ;; answering with the value the client just supplied is what makes
+      ;; its read-back consistent.
+      (= fname "set_config")
+      (let [fn-param (symbol (str "?set-config" (swap! (:var-counter ctx) inc)))
+            impl-fn (fn [_name value & _]
+                      (if (or (nil? value) (= :__null__ value))
+                        :__null__
+                        (str value)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -845,6 +883,20 @@
         result-var)
 
       ;; jsonb_build_object(k1, v1, k2, v2, ...) → in-param fn
+      (= fname "json_build_object")
+      (let [fn-param (symbol (str "?json-build-obj" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj jb/json-build-object)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
+      (= fname "json_build_array")
+      (let [fn-param (symbol (str "?json-build-arr" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj jb/json-build-array)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       (= fname "jsonb_build_object")
       (let [fn-param (symbol (str "?jsonb-build-obj" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
@@ -861,15 +913,23 @@
         result-var)
 
       ;; jsonb_strip_nulls(jsonb) → single-arg in-param fn
-      (= fname "jsonb_strip_nulls")
-      (let [fn-param (symbol (str "?jsonb-strip-nulls" (swap! (:var-counter ctx) inc)))]
+      (contains? #{"jsonb_strip_nulls" "json_strip_nulls"} fname)
+      (let [fn-param (symbol (str "?jsonb-strip-nulls" (swap! (:var-counter ctx) inc)))
+            ;; Same transformation, different RENDERING: a json result is
+            ;; compact where a jsonb one is spaced. Returning text here
+            ;; rather than a Clojure value is what lets the family decide,
+            ;; since the output path cannot tell them apart.
+            json? (= fname "json_strip_nulls")]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/jsonb-strip-nulls)
+        (swap! (:in-args ctx) conj
+               (if json?
+                 (comp jb/serialize-json jb/jsonb-strip-nulls)
+                 jb/jsonb-strip-nulls))
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
       ;; jsonb_typeof(jsonb) → string type name
-      (= fname "jsonb_typeof")
+      (contains? #{"jsonb_typeof" "json_typeof"} fname)
       (let [fn-param (symbol (str "?jsonb-typeof" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-typeof)
@@ -877,7 +937,7 @@
         result-var)
 
       ;; jsonb_array_length(jsonb) → integer
-      (= fname "jsonb_array_length")
+      (contains? #{"jsonb_array_length" "json_array_length"} fname)
       (let [fn-param (symbol (str "?jsonb-arr-len" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-array-length)
@@ -885,10 +945,15 @@
         result-var)
 
       ;; to_jsonb(any) → parse/pass-through
-      (= fname "to_jsonb")
-      (let [fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))]
+      (contains? #{"to_jsonb" "to_json"} fname)
+      (let [fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))
+            ;; to_jsonb does NOT parse its argument: a text value becomes
+            ;; a json STRING. Only an argument that already IS json/jsonb
+            ;; passes through, and at runtime both are Clojure strings —
+            ;; so the column type decides, as it does for `||` and `-`.
+            already-json? (jsonb-column? ctx (first params))]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/to-jsonb)
+        (swap! (:in-args ctx) conj #(jb/to-jsonb % already-json?))
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
@@ -910,7 +975,7 @@
 
       ;; jsonb_extract_path(target, key1, key2, ...) → jsonb
       ;; Equivalent to #> operator
-      (= fname "jsonb_extract_path")
+      (contains? #{"jsonb_extract_path" "json_extract_path"} fname)
       (let [target (first args)
             path (rest args)
             fn-param (symbol (str "?jsonb-path" (swap! (:var-counter ctx) inc)))
@@ -922,7 +987,7 @@
 
       ;; jsonb_extract_path_text(target, key1, key2, ...) → text
       ;; Same as jsonb_extract_path but returns text
-      (= fname "jsonb_extract_path_text")
+      (contains? #{"jsonb_extract_path_text" "json_extract_path_text"} fname)
       (let [target (first args)
             path (rest args)
             fn-param (symbol (str "?jsonb-pathtext" (swap! (:var-counter ctx) inc)))
@@ -943,7 +1008,7 @@
         result-var)
 
       ;; jsonb_object_keys(jsonb) → returns set of keys; serialized as JSON array string
-      (= fname "jsonb_object_keys")
+      (contains? #{"jsonb_object_keys" "json_object_keys"} fname)
       (let [target (first args)
             fn-param (symbol (str "?jsonb-keys" (swap! (:var-counter ctx) inc)))
             result-var (ctx/fresh-var! ctx)]
@@ -957,25 +1022,6 @@
       ;; NOTE: True GROUP BY aggregation requires custom Datahike aggregate
       ;; support. This handles the scalar/subquery case where it receives
       ;; already-grouped data.
-      (= fname "jsonb_object_agg")
-      (let [[key-arg val-arg] args
-            fn-param (symbol (str "?jsonb-oagg" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj (fn [k v] (jb/serialize-jsonb {(str k) v})))
-        (swap! (:where-clauses ctx) conj [(list fn-param key-arg val-arg) result-var])
-        result-var)
-
-      ;; jsonb_agg(value) — collects values into jsonb array
-      (= fname "jsonb_agg")
-      (let [target (first args)
-            fn-param (symbol (str "?jsonb-agg" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj (fn [v] (jb/serialize-jsonb [v])))
-        (swap! (:where-clauses ctx) conj [(list fn-param target) result-var])
-        result-var)
-
       ;; string_agg(value, delimiter) — concatenates strings with delimiter
       (= fname "string_agg")
       (let [[val-arg delim-arg] args
@@ -1062,11 +1108,26 @@
                [(apply list fn-param tmpl-arg value-args) result-var])
         result-var)
 
-      ;; Unknown function — pass through as symbol
+      ;; Unknown function.
+      ;;
+      ;; This used to emit a datalog clause naming the symbol and let
+      ;; execution fail, so a client got `Unknown function
+      ;; 'json_build_object in [(json_build_object "a" 1) ?v1]` — our
+      ;; internals, under XX000. PostgreSQL rejects an unresolvable
+      ;; function at parse time with 42883.
+      ;;
+      ;; Names datalog CAN resolve are still passed through: that is how
+      ;; a caller reaches a Clojure fn we did not enumerate, and turning
+      ;; those into errors would remove working behaviour.
       :else
-      (do (swap! (:where-clauses ctx) conj
-                 [(apply list (symbol fname) args) result-var])
-          result-var))))
+      (if (resolve (symbol fname))
+        (do (swap! (:where-clauses ctx) conj
+                   [(apply list (symbol fname) args) result-var])
+            result-var)
+        (throw (ex-info (str "function " fname " does not exist")
+                        {:error :undefined-function
+                         :sqlstate "42883"
+                         :function fname}))))))
 
 (defn interpret-form
   "Interpret a Clojure-like form against a variable bindings map.
@@ -1280,11 +1341,16 @@
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? IsNullExpression expr)
+    ;; SQL NULL is carried as the `:__null__` sentinel, not nil — a
+    ;; datalog function binding that yields nil filters the row, so
+    ;; every NULL-producing fn returns the sentinel. `nil?` therefore
+    ;; answered false for a value that IS NULL: `SELECT p->'missing' IS
+    ;; NULL` said false where PostgreSQL says true.
     (let [^IsNullExpression e expr
           v (translate-expr ctx (.getLeftExpression e))]
       (if (.isNot e)
-        (list 'some? v)
-        (list 'nil? v)))
+        (list 'datahike.pg.sql/sql-not-null? v)
+        (list 'datahike.pg.sql/sql-null? v)))
 
     (instance? NotExpression expr)
     (let [^NotExpression e expr
@@ -2251,6 +2317,31 @@
     ;; A leading `~` is re-associated inside translate-binary-arith —
     ;; PG's prefix `~` binds looser than these operators. See there.
     (instance? Addition expr) (translate-binary-arith ctx expr '+)
+    ;; `jsonb - key` / `jsonb - idx` deletes; only `-` on numbers is
+    ;; arithmetic. Routing everything to translate-binary-arith made
+    ;; `SELECT p - 'b'` throw a raw ClassCastException (String cannot be
+    ;; cast to Number). Same reasoning as `||`: the stored value is a
+    ;; string, so the column type decides, not the runtime value.
+    (and (instance? Subtraction expr)
+         (jsonb-column? ctx (.getLeftExpression ^net.sf.jsqlparser.expression.BinaryExpression expr)))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
+          l (translate-expr ctx (.getLeftExpression e))
+          r (translate-expr ctx (.getRightExpression e))
+          l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+          r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+          fn-param (symbol (str "?jb-del" (swap! (:var-counter ctx) inc)))
+          del-fn (fn [a k]
+                   (cond
+                     (integer? k) (jb/jsonb-delete-idx a k)
+                     (record? k)  (jb/jsonb-delete-keys a (or (:elements k) []))
+                     (sequential? k) (jb/jsonb-delete-keys a k)
+                     :else (jb/jsonb-delete-key a k)))
+          result-var (ctx/fresh-var! ctx)]
+      (swap! (:in-params ctx) conj fn-param)
+      (swap! (:in-args ctx) conj del-fn)
+      (swap! (:where-clauses ctx) conj [(list fn-param l r) result-var])
+      result-var)
+
     (instance? Subtraction expr) (translate-binary-arith ctx expr '-)
     (instance? Multiplication expr) (translate-binary-arith ctx expr '*)
     (instance? Division expr) (translate-binary-arith ctx expr '/)
@@ -2293,6 +2384,8 @@
                    (.getStringExpression ^JsonOperator expr)
                    (instance? DoubleAnd expr) "&&")
           ^net.sf.jsqlparser.expression.BinaryExpression be expr
+          _ (reject-json-operator! ctx op-str
+                                   (.getLeftExpression be) (.getRightExpression be))
           l (translate-expr ctx (.getLeftExpression be))
           r (translate-expr ctx (.getRightExpression be))
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
@@ -2334,8 +2427,14 @@
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
           fn-param (symbol (str "?pg-concat" (swap! (:var-counter ctx) inc)))
+          ;; `||` on jsonb is jsonb_concat, not string concatenation.
+          ;; Decided here rather than in the runtime cond because the
+          ;; stored value is a string either way — see jsonb-column?.
+          jsonb-concat? (or (jsonb-column? ctx (.getLeftExpression e))
+                            (jsonb-column? ctx (.getRightExpression e)))
           concat-fn (fn [a b]
                       (cond
+                        jsonb-concat? (jb/jsonb-concat a b)
                         (and (pg-arr/array? a) (pg-arr/array? b))
                         (pg-arr/concat-arrs a b)
                         ;; bit || bit is bitcat, not string concat — the
@@ -2446,18 +2545,36 @@
     ;; jsonb field/element access: col->'key', col->>'key', col->'a'->>'b'
     (instance? JsonExpression expr)
     (let [{:keys [base chain]} (flatten-json-chain ^JsonExpression expr)
-          base-val (translate-expr ctx base)]
-      (reduce
-       (fn [current [key-val op-str]]
-         (let [op-fn  (if (= op-str "->>") jb/jsonb-get-text jb/jsonb-get)
-               param  (symbol (str "?json-op" (swap! (:var-counter ctx) inc)))
-               result (ctx/fresh-var! ctx)]
-           (swap! (:in-params ctx) conj param)
-           (swap! (:in-args ctx) conj op-fn)
-           (swap! (:where-clauses ctx) conj [(list param current key-val) result])
-           result))
-       base-val
-       chain))
+          base-val (translate-expr ctx base)
+          ;; `->` and `#>` yield a JSON VALUE; `->>` and `#>>` yield text.
+          ;; A json string must therefore render QUOTED (`"x"`, not `x`),
+          ;; but the output path sees a Clojure string either way and
+          ;; cannot tell it from a SQL text value. Serialising the FINAL
+          ;; result of a value-returning chain settles it at the one
+          ;; place that knows — intermediate steps stay values, so
+          ;; `d->'a'->>'b'` is unaffected.
+          value-op? (contains? #{"->" "#>"} (second (last chain)))]
+      (cond-> (reduce
+               (fn [current [key-val op-str]]
+                 (let [op-fn  (jb/op op-str)
+                       param  (symbol (str "?json-op" (swap! (:var-counter ctx) inc)))
+                       result (ctx/fresh-var! ctx)]
+                   (swap! (:in-params ctx) conj param)
+                   (swap! (:in-args ctx) conj op-fn)
+                   (swap! (:where-clauses ctx) conj [(list param current key-val) result])
+                   result))
+               base-val
+               chain)
+        value-op?
+        (as-> v (let [param  (symbol (str "?json-render" (swap! (:var-counter ctx) inc)))
+                      result (ctx/fresh-var! ctx)]
+                  (swap! (:in-params ctx) conj param)
+                  (swap! (:in-args ctx) conj
+                         (fn [x] (if (or (nil? x) (= :__null__ x))
+                                   :__null__
+                                   (jb/serialize-jsonb x))))
+                  (swap! (:where-clauses ctx) conj [(list param v) result])
+                  result))))
 
     ;; expr AT TIME ZONE 'zone' — e.g. now() AT TIME ZONE 'UTC'
     (instance? TimezoneExpression expr)
@@ -2630,6 +2747,93 @@
                      (and (vector? resolved) (= 3 (count resolved))) (nth resolved 2)
                      :else nil)]
       (when attr (get-in (:schema ctx) [attr :db/valueType])))))
+
+(defn- jsonb-column?
+  "Whether `expr` is a column reference of `jsonb` type.
+
+   A stored jsonb value IS a string, so runtime dispatch cannot tell it
+   from `text` — `p || '{\"z\":9}'` looks like two strings and fell to
+   string concatenation. The type has to come from the schema, and
+   `:pg/type` is an ident-entity fact, so the lookup falls back to the
+   query exactly as `coerce-insert-value` does."
+  [ctx expr]
+  (boolean
+   (or
+    ;; An explicit `::jsonb` cast is a jsonb operand even though it is
+    ;; not a column — `'[1,2,3]'::jsonb - 1`.
+    (and (instance? CastExpression expr)
+         (contains? #{"json" "jsonb"}
+                    (some-> ^CastExpression expr .getColDataType .getDataType
+                            str/lower-case)))
+    (when (instance? Column expr)
+      (let [resolved (ctx/resolve-column ^Column expr
+                                         (:table-aliases ctx)
+                                         (:default-table ctx)
+                                         (:col-overrides ctx)
+                                         (:derived-aliases ctx) (:ci-index ctx))
+            attr (ctx/attr-of ctx resolved)]
+        (and attr
+             (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
+                            (params/pg-type-of-attr (:db ctx) attr)))))))))
+
+(defn- json-column?
+  "Whether `expr` is a column of the text-faithful `json` type.
+
+   PostgreSQL gives `json` SIX operators — `->`, `->>`, `#>`, `#>>` and
+   their int variants — and nothing else. It has no `=`, no `<`, no
+   `@>`, no `?`, and no btree or hash operator class at all, so
+   `'1'::json = '1'::json` is 42883 there. We accepted all of them
+   silently, comparing the stored text."
+  [ctx expr]
+  (boolean
+   (when (instance? Column expr)
+     (let [resolved (ctx/resolve-column ^Column expr
+                                        (:table-aliases ctx)
+                                        (:default-table ctx)
+                                        (:col-overrides ctx)
+                                        (:derived-aliases ctx) (:ci-index ctx))
+           attr (ctx/attr-of ctx resolved)]
+       (and attr
+            (= "json" (or (get-in (:schema ctx) [attr :pg/type])
+                          (params/pg-type-of-attr (:db ctx) attr))))))))
+
+(defn- reject-json-operator!
+  "PostgreSQL has no such operator on `json`; raise as it does."
+  [ctx op-str l r]
+  (when (or (json-column? ctx l) (json-column? ctx r))
+    (throw (ex-info (str "operator does not exist: json " op-str " json")
+                    {:error :undefined-function
+                     :sqlstate "42883"
+                     :hint (str "No operator matches the given name and argument "
+                                "types. You might need to add explicit type casts.")}))))
+
+(defn- jsonb-canonical-operand
+  "Canonicalize a literal being compared against a `jsonb` column.
+
+   PostgreSQL's jsonb `=` compares VALUES; ours compares the stored
+   CANONICAL TEXT. That works only if both sides are in the same
+   canonical form, and until now only the stored side was — so
+   `WHERE p = '{ \"b\":1, \"a\":2 }'` answered zero rows against a
+   stored `{\"a\": 1, \"b\": 2}`, turning an equality into a test of
+   how the literal happened to be spelled.
+
+   `:pg/type` is an ident-entity fact rather than a `:db/*` key, so it
+   is absent from the schema map unless enriched; fall back to the
+   query, as `coerce-insert-value` does, or a column would silently
+   read as not-jsonb here too.
+
+   Residual gap: canonical TEXT equality is still finer than
+   PostgreSQL's, which ignores numeric scale (`1.00` = `1`). Closing
+   that needs structural comparison; see doc/jsonb-plan.md."
+  [ctx resolved v]
+  (if-not (string? v)
+    v
+    (let [attr (ctx/attr-of ctx resolved)]
+      (if (and attr
+               (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
+                              (params/pg-type-of-attr (:db ctx) attr))))
+        (jb/serialize-jsonb v)
+        v))))
 
 (defn- coerce-unknown-literal
   "If `lit` is a `StringValue` and `col` resolves to a Datahike-typed
@@ -2915,7 +3119,7 @@
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx) (:ci-index ctx))
-                pv (translate-expr ctx right)]
+                pv (jsonb-canonical-operand ctx resolved (translate-expr ctx right))]
             (cond
               (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
               (and (not (symbol? pv)) (ctx/bind-col-value! ctx resolved pv)) []
@@ -2941,7 +3145,8 @@
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
                   coerced (coerce-unknown-literal ctx left right)
-                  val (or coerced (translate-expr ctx right))]
+                  val (jsonb-canonical-operand
+                       ctx resolved (or coerced (translate-expr ctx right)))]
               (cond
                 (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
@@ -2951,6 +3156,17 @@
               ;; matching-typed constant → value-bound data pattern
               ;; [?e :attr v]: an indexable clause instead of a
               ;; get-else scan + equality predicate over every row.
+                ;; jsonb `=` compares VALUES, and PostgreSQL's is
+                ;; numeric-scale insensitive, so it cannot be a datom
+                ;; pattern or a plain `=` on the canonical text — those
+                ;; answer false for `1.00` vs `1`. Emit the structural
+                ;; predicate instead; it fast-paths on text equality, and
+                ;; nothing is lost by skipping the value-bound pattern
+                ;; because jsonb attributes are never `:db/index`ed.
+                (jsonb-column? ctx left)
+                (let [v (ctx/col-var! ctx resolved)]
+                  [[(list 'datahike.pg.sql/jsonb-eq? v val)]])
+
                 (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
                 []
               ;; Regular column = value (including aliased columns)
@@ -3093,11 +3309,19 @@
                 [[(list 'not= val-var :__null__)]]
                 ;; IS NULL → value is the sentinel
                 [[(list '= val-var :__null__)]]))))
-        ;; Non-column IS NULL — fallback
-        (let [v (translate-expr ctx inner)]
+        ;; Non-column IS NULL — e.g. `(p->'k') IS NULL`.
+        ;;
+        ;; SQL NULL arrives here as the `:__null__` sentinel, not as
+        ;; nil: a datalog function binding that yields nil filters the
+        ;; row, so every fn that can produce NULL returns the sentinel
+        ;; instead. Testing `nil?` therefore answered FALSE for a value
+        ;; that IS SQL NULL — `p->'missing' IS NULL` said false where
+        ;; PostgreSQL says true. Accept both.
+        (let [v (translate-expr ctx inner)
+              v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
           (if not-null?
-            [[(list 'some? v)]]
-            [[(list 'nil? v)]]))))
+            [[(list 'datahike.pg.sql/sql-not-null? v)]]
+            [[(list 'datahike.pg.sql/sql-null? v)]]))))
 
     ;; col IS TRUE / col IS FALSE / col IS NOT TRUE / col IS NOT FALSE
     (instance? IsBooleanExpression expr)
@@ -3747,133 +3971,30 @@
                          :feature "multi-element ParenthesedExpressionList in WHERE"
                          :expr (str expr)}))))
 
-    ;; jsonb field access in WHERE: name->>'key' = 'value'
-    ;; JSqlParser folds the comparison into the JsonExpression's ident list
+    ;; A bare `d->'a'` standing alone as a WHERE predicate.
+    ;;
+    ;; This branch used to also carry ~110 lines that decomposed a
+    ;; comparison folded into the JsonExpression's ident list, on the
+    ;; premise recorded in its comment that "JSqlParser folds the
+    ;; comparison into the JsonExpression's ident list". jsqlparser 5.2
+    ;; does no such thing — `d->>'k' = 'x'` parses as an EqualsTo whose
+    ;; LEFT is the JsonExpression, so it reaches translate-expr through
+    ;; the comparison branch and never arrives here. Verified for `=`,
+    ;; `<>`, `>`, `>=`, `<`, `<=`, LIKE and IS NULL, and for chained
+    ;; access: the last ident of a JsonExpression is always a value or a
+    ;; nested JsonExpression, never a comparison. The guard could not
+    ;; fire, and the code behind it had a latent bug (it reused the LAST
+    ;; key for every step of a chain) that no test ever saw.
     (instance? JsonExpression expr)
-    (let [^JsonExpression je expr
-          idents (vec (.getIdents je))
-          operators (vec (.getOperators je))
-          last-ident (last idents)]
-      (if (or (instance? EqualsTo last-ident)
-              (instance? NotEqualsTo last-ident)
-              (instance? GreaterThan last-ident)
-              (instance? GreaterThanEquals last-ident)
-              (instance? MinorThan last-ident)
-              (instance? MinorThanEquals last-ident)
-              (instance? LikeExpression last-ident)
-              (instance? IsNullExpression last-ident))
-        ;; The comparison is folded into the json chain.
-        ;; Decompose: the left side of the comparison is the json key,
-        ;; the right side is the comparison value.
-        (let [comp-expr last-ident
-              ;; Build a synthetic JsonExpression for the left side (without the comparison)
-              ;; The json key is the left expression of the comparison
-              json-key (cond
-                         (instance? EqualsTo comp-expr) (.getLeftExpression ^EqualsTo comp-expr)
-                         (instance? NotEqualsTo comp-expr) (.getLeftExpression ^NotEqualsTo comp-expr)
-                         (instance? GreaterThan comp-expr) (.getLeftExpression ^GreaterThan comp-expr)
-                         (instance? GreaterThanEquals comp-expr) (.getLeftExpression ^GreaterThanEquals comp-expr)
-                         (instance? MinorThan comp-expr) (.getLeftExpression ^MinorThan comp-expr)
-                         (instance? MinorThanEquals comp-expr) (.getLeftExpression ^MinorThanEquals comp-expr)
-                         (instance? LikeExpression comp-expr) (.getLeftExpression ^LikeExpression comp-expr)
-                         (instance? IsNullExpression comp-expr) (.getLeftExpression ^IsNullExpression comp-expr))
-              ;; Extract the key string
-              key-str (cond
-                        (instance? StringValue json-key) (.getNotExcapedValue ^StringValue json-key)
-                        (instance? LongValue json-key) (.getValue ^LongValue json-key)
-                        :else (str json-key))
-              ;; Build the json access: translate base through all operators
-              base-val (translate-expr ctx (.getExpression je))
-              ;; Apply all json operators (there might be a chain before the comparison)
-              json-val (let [chain (map vector
-                                        (if (> (count idents) 1)
-                                          (conj (subvec idents 0 (dec (count idents))) json-key)
-                                          [json-key])
-                                        operators)]
-                         (reduce
-                          (fn [current [_ident op-str]]
-                            (let [op-fn (if (= op-str "->>") jb/jsonb-get-text jb/jsonb-get)
-                                  param (symbol (str "?json-w" (swap! (:var-counter ctx) inc)))
-                                  result (ctx/fresh-var! ctx)]
-                              (swap! (:in-params ctx) conj param)
-                              (swap! (:in-args ctx) conj op-fn)
-                              (swap! (:where-clauses ctx) conj [(list param current key-str) result])
-                              result))
-                          base-val
-                          chain))
-              ;; Now translate the comparison with the json-val as the left side
-              comp-right (cond
-                           (instance? EqualsTo comp-expr) (.getRightExpression ^EqualsTo comp-expr)
-                           (instance? NotEqualsTo comp-expr) (.getRightExpression ^NotEqualsTo comp-expr)
-                           (instance? GreaterThan comp-expr) (.getRightExpression ^GreaterThan comp-expr)
-                           (instance? GreaterThanEquals comp-expr) (.getRightExpression ^GreaterThanEquals comp-expr)
-                           (instance? MinorThan comp-expr) (.getRightExpression ^MinorThan comp-expr)
-                           (instance? MinorThanEquals comp-expr) (.getRightExpression ^MinorThanEquals comp-expr)
-                           (instance? LikeExpression comp-expr) (.getRightExpression ^LikeExpression comp-expr)
-                           :else nil)
-              right-val (when comp-right (translate-expr ctx comp-right))
-              right-val (when right-val
-                          (if (seq? right-val) (ctx/materialize-arg! ctx right-val) right-val))]
-          (cond
-            (instance? EqualsTo comp-expr)
-            [[(list '= json-val right-val)]]
-            (instance? NotEqualsTo comp-expr)
-            [[(list 'not= json-val right-val)]]
-            (instance? GreaterThan comp-expr)
-            [[(list '> json-val right-val)]]
-            (instance? GreaterThanEquals comp-expr)
-            [[(list '>= json-val right-val)]]
-            (instance? MinorThan comp-expr)
-            [[(list '< json-val right-val)]]
-            (instance? MinorThanEquals comp-expr)
-            [[(list '<= json-val right-val)]]
-            (instance? LikeExpression comp-expr)
-            ;; Build LIKE regex using the extracted json-val as subject
-            (let [^LikeExpression le comp-expr
-                  not-like? (.isNot le)
-                  case-insensitive? (.isCaseInsensitive le)
-                  pattern (translate-expr ctx (.getRightExpression le))
-                  ^Character escape-char (let [esc (.getEscape le)]
-                                           (if (and esc (not (str/blank? (str esc))))
-                                             (Character/valueOf (char (first (str esc))))
-                                             (Character/valueOf \\)))
-                  pat-str (str pattern)
-                  regex-sb (StringBuilder. "^")
-                  _ (loop [i 0]
-                      (when (< i (count pat-str))
-                        (let [c (.charAt ^String pat-str i)]
-                          (if (= c (.charValue escape-char))
-                            (if (< (inc i) (count pat-str))
-                              (let [next-c (.charAt ^String pat-str (inc i))]
-                                (.append regex-sb (java.util.regex.Pattern/quote (str next-c)))
-                                (recur (+ i 2)))
-                              (recur (inc i)))
-                            (case c
-                              \% (do (.append regex-sb ".*") (recur (inc i)))
-                              \_ (do (.append regex-sb ".") (recur (inc i)))
-                              (do (.append regex-sb (java.util.regex.Pattern/quote (str c)))
-                                  (recur (inc i))))))))
-                  _ (.append regex-sb "$")
-                  regex-str (str regex-sb)
-                  regex-str (if case-insensitive? (str "(?i)" regex-str) regex-str)
-                  pred (list 're-find (re-pattern regex-str) json-val)]
-              (if not-like?
-                [[(list 'not [pred])]]
-                [[pred]]))
-            (instance? IsNullExpression comp-expr)
-            (if (.isNot ^IsNullExpression comp-expr)
-              [[(list 'some? json-val)]]
-              [[(list 'nil? json-val)]])
-            :else
-            [[(list '= json-val right-val)]]))
-        ;; Not a comparison — just translate as expression (shouldn't reach predicate)
-        (let [v (translate-expr ctx expr)]
-          [[(list 'identity v)]])))
+    (let [v (translate-expr ctx expr)]
+      [[(list 'identity v)]])
 
     ;; jsonb operators: @>, <@, ?, ?|, ?&
     (instance? JsonOperator expr)
     (let [^JsonOperator jo expr
           op-str (.getStringExpression jo)
+          _ (reject-json-operator! ctx op-str
+                                   (.getLeftExpression jo) (.getRightExpression jo))
           left   (translate-expr ctx (.getLeftExpression jo))
           right  (translate-expr ctx (.getRightExpression jo))
           left   (if (seq? left)  (ctx/materialize-arg! ctx left)  left)

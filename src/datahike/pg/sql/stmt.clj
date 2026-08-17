@@ -961,15 +961,26 @@
                                                    aliases))
                       (and talias (= 1 (count aliases))) [talias]
                       :else aliases)
-            schema-tx (mapv (fn [a vt pt]
-                              (cond-> {:db/ident       (keyword sub-name a)
-                                       :db/valueType   vt
-                                       :db/cardinality :db.cardinality/one}
-                                pt (assoc :pg/type pt)))
-                            aliases vtypes (concat (or pg-types []) (repeat nil)))
+            ;; The row-existence marker. `count(*)` and `SELECT *` have no
+            ;; column to enumerate otherwise, so a scan returned ZERO rows
+            ;; even though the rows are there:
+            ;;   SELECT count(*) FROM generate_series(1,10) g  ->  0
+            ;; while `count(g)` correctly answered 10.
+            ;; sequence->virtual-table below already transacts one and its
+            ;; comment names this exact hazard.
+            marker (pgs/row-marker-attr sub-name)
+            schema-tx (conj (mapv (fn [a vt pt]
+                                    (cond-> {:db/ident       (keyword sub-name a)
+                                             :db/valueType   vt
+                                             :db/cardinality :db.cardinality/one}
+                                      pt (assoc :pg/type pt)))
+                                  aliases vtypes (concat (or pg-types []) (repeat nil)))
+                            {:db/ident       marker
+                             :db/valueType   :db.type/boolean
+                             :db/cardinality :db.cardinality/one})
             spec-db (d/db-with db schema-tx)
             data-tx (mapv (fn [row]
-                            (into {}
+                            (into {marker true}
                                   (keep-indexed
                                    (fn [i a]
                                      (let [v (nth row i nil)]
@@ -2330,14 +2341,22 @@
                           (swap! find-elements conj (list 'count evar)))
                         (swap! find-aliases conj (or alias-str "count")))
                       ;; Multi-argument aggregates (CORR)
-                      (if (and (= agg-sym 'datahike.pg.sql/filter-corr) params (= 2 (count params)))
+                      ;; Two-argument aggregates: CORR(y,x) and the
+                      ;; object-aggs, which all fold over [a b] pairs.
+                      (if (and (contains? #{'datahike.pg.sql/filter-corr
+                                            'datahike.pg.sql/filter-jsonb-object-agg
+                                            'datahike.pg.sql/filter-json-object-agg}
+                                          agg-sym)
+                               params (= 2 (count params)))
                         (let [v1 (expr/translate-expr ctx (first params))
                               v2 (expr/translate-expr ctx (second params))
+                              v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
+                              v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
                               pair-var (ctx/fresh-var! ctx)]
                           (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
                           (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
-                          (swap! find-elements conj (list 'datahike.pg.sql/filter-corr pair-var))
-                          (swap! find-aliases conj (or alias-str "corr")))
+                          (swap! find-elements conj (list agg-sym pair-var))
+                          (swap! find-aliases conj (or alias-str fname)))
                         ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
                         (let [inner-expr (first params)
                               v (expr/translate-expr ctx inner-expr)
@@ -3782,14 +3801,23 @@
    read and write FK semantics symmetric. Falls through to the raw
    value when no target is resolvable (hint-only refs without a
    threaded db, or genuinely-unmapped refs)."
-  [val attr schema]
+  [val attr schema & [db]]
   (when (some? val)
     (let [vtype     (get-in schema [attr :db/valueType])
           elem-kw   (get-in schema [attr :pg/array-elem])
           num-scale (get-in schema [attr :pg/numeric-scale])
-          ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it keeps
-          ;; key order, whitespace and duplicate keys — so it must NOT be canonicalized.
-          jsonb?    (= "jsonb" (get-in schema [attr :pg/type]))]
+          ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it
+          ;; keeps key order, whitespace and duplicate keys — so it must NOT
+          ;; be canonicalized.
+          ;;
+          ;; `:pg/type` is an ident-entity fact, not a `:db/*` key, so it is
+          ;; absent from Datahike's schema map unless the caller enriched it
+          ;; first. Exactly one of the three callers did, so canonicalization
+          ;; silently did NOT happen for UPDATE or for a parameterised INSERT
+          ;; — i.e. for every client that is not psql. Absent metadata has to
+          ;; mean "ask", not "not jsonb".
+          jsonb?    (= "jsonb" (or (get-in schema [attr :pg/type])
+                                   (params/pg-type-of-attr db attr)))]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
@@ -4251,9 +4279,12 @@
           base-val (eval-update-expr base entity-map ns-str schema)]
       (reduce
        (fn [current [key-val op-str]]
-         (if (= op-str "->>")
-           (jb/jsonb-get-text current key-val)
-           (jb/serialize-jsonb (jb/jsonb-get current key-val))))
+         (let [r ((jb/op op-str) current key-val)]
+           ;; `->` is serialised here and NOT in the SELECT emitter. That
+           ;; divergence predates the shared registry; it is preserved
+           ;; deliberately so this refactor stays behaviour-preserving,
+           ;; and is resolved when the operator semantics are fixed.
+           (if (= op-str "->>") r (jb/serialize-jsonb r))))
        base-val
        chain))
 
@@ -4593,12 +4624,22 @@
             ;; short-circuit; we mirror it here so INSERT … SELECT
             ;; routes the same data, otherwise running d/q on the
             ;; empty query returns `[[]]` and silently drops the row.
+            ;; A set-returning function in the source FROM is
+            ;; materialised into a SPECULATIVE db, handed back as
+            ;; `:enriched-db`. Running the inner query against the plain
+            ;; `db` scans a database where that virtual table does not
+            ;; exist, so `INSERT INTO t SELECT … FROM generate_series(…)`
+            ;; answered `INSERT 0 0` — the standard bulk-load idiom,
+            ;; silently a no-op, while the same SELECT run on its own
+            ;; returned its rows. Same `(or (:enriched-db …) …)` the
+            ;; correlated-scalar path already uses.
+            inner-db (or (:enriched-db inner-parsed) db)
             inner-results (cond
                             (:literal-rows inner-parsed) (:literal-rows inner-parsed)
                             (:literal-row  inner-parsed) [(:literal-row inner-parsed)]
                             (seq inner-in-args)
-                            (apply q-fn inner-query db inner-in-args)
-                            :else (q-fn inner-query db))
+                            (apply q-fn inner-query inner-db inner-in-args)
+                            :else (q-fn inner-query inner-db))
             rows (mapv (fn [row]
                          (if (sequential? row) (vec row) [row]))
                        inner-results)

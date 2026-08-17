@@ -126,7 +126,7 @@ echo "SUMMARY: ${P} passed, ${FAIL_TOTAL} failed, ${S} skipped"
 # regression; a listed test that now passes is a (non-fatal) nudge to prune.
 MANIFEST="${HERE}/expected-failures.txt"
 ACTUAL_TMP="$(mktemp)"; EXPECTED_TMP="$(mktemp)"
-trap 'rm -f "${ACTUAL_TMP}" "${EXPECTED_TMP}"' EXIT
+trap 'rm -f "${ACTUAL_TMP}" "${EXPECTED_TMP}" "${RAN_TMP:-}"' EXIT
 
 # Live failures: pytest -v prints "tests/x.py::Class::test FAILED|ERROR" (no
 # percentage suffix when stdout is not a TTY, as here under redirection).
@@ -137,7 +137,20 @@ grep -hoE '^tests/[^ ]+ (FAILED|ERROR)$' "${LOG}" \
 grep -E '^tests/' "${MANIFEST}" | sort -u > "${EXPECTED_TMP}"
 
 NEW="$(comm -23 "${ACTUAL_TMP}" "${EXPECTED_TMP}")"
-RESOLVED="$(comm -13 "${ACTUAL_TMP}" "${EXPECTED_TMP}")"
+
+# A manifest entry that is absent from the live FAILED set has two very
+# different explanations, and collapsing them made the nudge unusable:
+# the test now PASSES (prune it), or the test NEVER RAN (a coverage hole
+# — the gate silently stopped checking it). Separate them by first
+# collecting every test that produced ANY verdict this run.
+RAN_TMP="$(mktemp)"
+grep -hoE '^tests/[^ ]+ (PASSED|FAILED|ERROR|SKIPPED)$' "${LOG}" \
+  | sed -E 's/ (PASSED|FAILED|ERROR|SKIPPED)$//' | sort -u > "${RAN_TMP}"
+
+# In the manifest, ran, but not failing -> genuinely resolved.
+RESOLVED="$(comm -13 "${ACTUAL_TMP}" "${EXPECTED_TMP}" | comm -12 - "${RAN_TMP}")"
+# In the manifest and never ran -> not covered any more.
+MISSING="$(comm -13 "${RAN_TMP}" "${EXPECTED_TMP}")"
 
 rc=0
 if [[ ${#TIMED_OUT[@]} -gt 0 ]]; then
@@ -156,13 +169,18 @@ if [[ -n "${NEW}" ]]; then
 fi
 if [[ -n "${RESOLVED}" ]]; then
   echo
-  echo "NOTE: $(grep -c . <<<"${RESOLVED}") expected-failure(s) now pass or no"
-  echo "longer run — prune expected-failures.txt to keep the gate honest:"
+  echo "NOTE: $(grep -c . <<<"${RESOLVED}") expected-failure(s) now PASS —"
+  echo "prune expected-failures.txt to keep the gate honest:"
   sed 's/^/  /' <<<"${RESOLVED}"
 fi
-
-if [[ ${rc} -ne 0 ]]; then
+if [[ -n "${MISSING}" ]]; then
   echo
-  echo "Full output in ${LOG}"
+  echo "NOTE: $(grep -c . <<<"${MISSING}") expected-failure(s) DID NOT RUN. These"
+  echo "are not fixed — the gate has simply stopped checking them (renamed,"
+  echo "deselected, or the module died before reaching them):"
+  sed 's/^/  /' <<<"${MISSING}"
 fi
+
+echo
+echo "Full output in ${LOG}"
 exit ${rc}

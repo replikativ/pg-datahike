@@ -316,6 +316,10 @@
    (cond
      (nil? v)           nil
      (= :__null__ v)    nil  ;; LEFT JOIN sentinel → SQL NULL
+     ;; jsonb's JSON-null is a VALUE whose text form is `null`, distinct
+     ;; from SQL NULL above. It must be tested BEFORE the generic
+     ;; keyword branch, which would otherwise print the sentinel's name.
+     (= jb/json-null v) "null"
     ;; PgArray → PG canonical array text format `{…}` (see
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
@@ -376,7 +380,6 @@
      (uuid? v)    (str v)
      (symbol? v)  (str v)
      (bytes? v)   (str "\\x" (apply str (map #(format "%02x" (bit-and % 0xff)) v)))
-    ;; Maps and vectors (jsonb values) → serialize as JSON
      (map? v)     (jb/serialize-jsonb v)
      (vector? v)  (jb/serialize-jsonb v)
      :else        (str v))))
@@ -2651,8 +2654,13 @@
                                                               stmt/*eval-update-db* db]
                                                       (sql/eval-update-expr value-expr entity-map ns schema))
                                             resolved (resolve-param raw-val)
+                                            ;; `db` so coerce-insert-value can
+                                            ;; resolve :pg/type when the schema
+                                            ;; map does not carry it — without
+                                            ;; it every UPDATE to a jsonb column
+                                            ;; stored the text uncanonicalized.
                                             val (when (some? resolved)
-                                                  (#'sql/coerce-insert-value resolved attr schema))
+                                                  (#'sql/coerce-insert-value resolved attr schema db))
                                             old-val (get entity-map attr)]]
                                   (if (nil? val)
                                 ;; SET col = NULL → retract the attribute.
@@ -3347,7 +3355,7 @@
    CONFLICT upsert fn, the unique-check wrapper) precisely so the
    Execute-time passes can reach it, and those rows are the ones the
    transactor asserts."
-  [parsed schema]
+  [parsed schema & [db]]
   (if (and (= :insert (:type parsed)) (seq (:tx-data parsed)))
     (let [coerce-entity
           (fn [entry]
@@ -3362,7 +3370,7 @@
                    ;; a coerced `false`/`0`/empty is a real value.
                    ;; (if-let here would wrongly drop a boolean
                    ;; false, reading back as NULL.)
-                   :else (let [c (#'sql/coerce-insert-value v attr schema)]
+                   :else (let [c (#'sql/coerce-insert-value v attr schema db)]
                            (if (nil? c) m (assoc m attr c)))))
                {} entry)
               entry))
@@ -4683,11 +4691,13 @@
 
       :set-config
       ;; SELECT pg_catalog.set_config('search_path', '', false) —
-      ;; pg_dump session-prelude. We don't honor the GUC (no
-      ;; equivalent in Datahike); just synthesize a 1-row result so
-      ;; the SELECT completes cleanly. The 3-arg form returns the
-      ;; new value as text; we return empty-string.
-      (single-row-result "set_config" PgWireServer/OID_TEXT "")
+      ;; pg_dump session-prelude, and asyncpg's `jit` toggle around type
+      ;; introspection. We don't honor the GUC (no equivalent in
+      ;; Datahike), but PostgreSQL returns the NEW VALUE as text and
+      ;; asyncpg reads it back, so returning empty-string was not
+      ;; harmless: echo the value argument.
+      (single-row-result "set_config" PgWireServer/OID_TEXT
+                         (or (second (:args parsed)) ""))
 
       :copy-from-stdin
       ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
@@ -7082,8 +7092,11 @@
                                  ;; substitution so untyped text params
                                  ;; (e.g. node-postgres "270" → int column)
                                  ;; narrow to the column's :db/valueType.
+                                 ;; `db` lets coerce-insert-value resolve
+                                 ;; :pg/type; without it a parameterised INSERT
+                                 ;; into a jsonb column skipped canonicalization.
                                  (coerce-insert-tx-data
-                                  (resolve-param-refs cached bound) schema)
+                                  (resolve-param-refs cached bound) schema db)
                                  cached)}
                               ;; Simple-protocol plan stability: rewrite
                               ;; bare number literals to $N so every cache

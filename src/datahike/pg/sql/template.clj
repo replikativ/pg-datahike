@@ -606,6 +606,13 @@
                   (and (= :number type) (not skip-next-number?)
                        (not ordinal-pos?)
                        (zero? fn-depth)
+                       ;; A number after a json operator is an ARRAY INDEX
+                       ;; or a path step, not a value: `d->'a'->>1`.
+                       ;; Templating it to $1 turns the chain's ident into
+                       ;; a ParamRef, and the extraction silently answers
+                       ;; NULL — the query is well-formed, just wrong.
+                       (not (contains? #{"->" "->>" "#>" "#>>"}
+                                       (:text (nth toks (dec i) nil))))
                        ;; `1::bigint` — leave for the constant-fold cast
                        (not (= "::" (:text (nth toks (inc i) nil)))))
                   (let [prev (nth toks (dec i) nil)

@@ -152,6 +152,7 @@
    "version"       types/oid-text
    "format_type"   types/oid-text
    "current_setting" types/oid-text
+   "set_config"      types/oid-text
    "current_database" types/oid-name
    "current_schema"   types/oid-name
    "current_user"  types/oid-name

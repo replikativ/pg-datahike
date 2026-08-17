@@ -750,6 +750,7 @@
            ["current_user" "s" 0 19 ""]
            ["session_user" "s" 0 19 ""]
            ["current_setting" "s" 1 25 "25"]
+           ["set_config" "s" 3 25 "25 25 16"]
            ["pg_backend_pid" "s" 0 23 ""]
            ["pg_typeof" "s" 1 2206 "2276"]
            ["format_type" "s" 2 25 "26 23"]
