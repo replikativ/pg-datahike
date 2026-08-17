@@ -213,13 +213,48 @@
             fail at execute time, so the client saw our internals:
             `Unknown function 'json_build_object in [(json_build_object
             \"a\" 1) ?v1]` under XX000"
-    (is (= "42883" (state "SELECT json_build_object('a',1)")))
-    (is (re-find #"function json_build_object does not exist"
-                 (or (err "SELECT json_build_object('a',1)") "")))
+    (is (= "42883" (state "SELECT row_to_json(1)")))
+    (is (re-find #"function row_to_json does not exist"
+                 (or (err "SELECT row_to_json(1)") "")))
     (is (= "42883" (state "SELECT jsonb_path_query('{}'::jsonb, '$.a')"))))
   (testing "implemented functions are unaffected"
     (is (= "3" (v "SELECT abs(-3)")))
     (is (= "{\"a\": 1}" (v "SELECT jsonb_build_object('a',1)")))))
+
+(deftest the-json-family-is-text-faithful
+  (testing "json_* is NOT jsonb_* under another name: `json` preserves
+            argument order and KEEPS duplicate keys, and PostgreSQL's
+            separator there is \" : \" with spaces on both sides"
+    (is (= "{\"b\" : 1, \"a\" : 2, \"a\" : 3}"
+           (v "SELECT json_build_object('b',1,'a',2,'a',3)")))
+    (is (= "{\"a\": 3, \"b\": 1}"
+           (v "SELECT jsonb_build_object('b',1,'a',2,'a',3)"))
+        "the jsonb form sorts and takes the last"))
+  (testing "arrays render alike in both families"
+    (is (= "[1, \"x\", true]" (v "SELECT json_build_array(1,'x',true)"))))
+  (testing "to_json / to_jsonb do NOT parse their argument — a text value
+            becomes a json STRING, not a document"
+    (run "CREATE TABLE tj (id int PRIMARY KEY, t text, b jsonb)")
+    (run "INSERT INTO tj VALUES (1, '{\"a\":1}', '{\"a\":1}')")
+    (is (= "\"x\"" (v "SELECT to_json('x'::text)")))
+    (is (= "\"{\\\"a\\\":1}\"" (v "SELECT to_jsonb(t) FROM tj"))
+        "a text column holding JSON is wrapped, not read")
+    (is (= "{\"a\": 1}" (v "SELECT to_jsonb(b) FROM tj"))
+        "an argument that already IS jsonb passes through"))
+  (testing "the aliases that genuinely are aliases"
+    (run "CREATE TABLE ja (id int PRIMARY KEY, v int)")
+    (run "INSERT INTO ja VALUES (1,10),(2,20)")
+    (is (= 1 (count (rows "SELECT json_agg(v) FROM ja"))))
+    (is (= "3" (v "SELECT json_array_length('[1,2,3]'::json)"))))
+  (testing "a json result is COMPACT where a jsonb one is spaced — the
+            families differ in object punctuation, not just in what they
+            keep"
+    (is (= "{\"a\":1}" (v "SELECT json_strip_nulls('{\"a\":1,\"z\":null}'::json)")))
+    (is (= "{\"a\": 1}" (v "SELECT jsonb_strip_nulls('{\"a\":1,\"z\":null}'::jsonb)")))
+    (is (= "{\"a\": 1, \"n\": {\"r\": 2}}"
+           (v "SELECT jsonb_strip_nulls('{\"a\":1,\"z\":null,\"n\":{\"q\":null,\"r\":2}}'::jsonb)"))
+        "recursive, and JSON null is the sentinel now — `some?` was true
+         for it, so nothing was stripped")))
 
 (deftest path-operators
   (run "CREATE TABLE pj (id int PRIMARY KEY, d jsonb)")

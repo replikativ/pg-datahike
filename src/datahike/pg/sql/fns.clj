@@ -1034,6 +1034,9 @@
    "corr"           'datahike.pg.sql/filter-corr
    "array_agg"      'datahike.pg.sql/filter-array-agg
    "jsonb_agg"      'datahike.pg.sql/filter-jsonb-agg
+   ;; json_agg and jsonb_agg render identically for arrays — the
+   ;; families differ on OBJECT punctuation, not array punctuation.
+   "json_agg"       'datahike.pg.sql/filter-jsonb-agg
    ;; Ordered-set aggregates — `WITHIN GROUP (ORDER BY x)` syntax.
    ;; Translator routes them through the pair-aggregate path (like
    ;; corr) since the percentile fraction is a constant alongside

@@ -152,6 +152,16 @@
              (.toPlainString (java.math.BigDecimal/valueOf ^double v))
              :else (str v))))
 
+(def ^:dynamic *json-style*
+  "Object punctuation for the writer.
+
+   PostgreSQL renders the two families differently, and the difference
+   is only in objects: `jsonb` emits `\": \"` after a key and `\", \"`
+   between pairs, while a `json` value that PostgreSQL BUILT (rather
+   than echoed verbatim) is compact — `{\"a\":1}`. Arrays are `[1, 2]`
+   in both."
+  {:pair ": " :sep ", "})
+
 (defn- emit!
   [^StringBuilder sb v]
   (cond
@@ -159,9 +169,9 @@
     (= json-null v) (.append sb "null")
     (map? v)     (do (.append sb \{)
                      (reduce (fn [first? k]
-                               (when-not first? (.append sb ", "))
+                               (when-not first? (.append sb (:sep *json-style*)))
                                (append-json-string! sb (str k))
-                               (.append sb ": ")
+                               (.append sb (:pair *json-style*))
                                (emit! sb (get v k))
                                false)
                              true
@@ -202,6 +212,14 @@
           sb (StringBuilder.)]
       (emit! sb data)
       (.toString sb))))
+
+(defn serialize-json
+  "Canonical text in the `json` family's punctuation — compact objects,
+   as PostgreSQL renders a json value it constructed
+   (`json_strip_nulls('{\"a\":1,\"z\":null}')` -> `{\"a\":1}`)."
+  [v]
+  (binding [*json-style* {:pair ":" :sep ","}]
+    (serialize-jsonb v)))
 
 (def canonicalize-jsonb
   "Deprecated alias for `serialize-jsonb`; they were always the same fn."
@@ -473,6 +491,55 @@
    "||"  jsonb-concat
    "-"   jsonb-delete-key})
 
+;; ---------------------------------------------------------------------------
+;; The `json_*` family — text-faithful, unlike `jsonb_*`
+;; ---------------------------------------------------------------------------
+
+(defn- emit-json-value!
+  "Render one value in `json` (not jsonb) form. Values reuse the jsonb
+   writer — the difference between the families is in the OBJECT
+   punctuation and in what is kept, not in how a scalar looks."
+  [^StringBuilder sb v]
+  (emit! sb (normalize-tree v)))
+
+(defn json-build-object
+  "PostgreSQL `json_build_object(k1, v1, …)`.
+
+   NOT `jsonb_build_object` with a different name. `json` is the
+   text-faithful type, so this preserves ARGUMENT ORDER and KEEPS
+   DUPLICATE KEYS, where the jsonb form sorts and takes the last:
+
+     json_build_object('b',1,'a',2,'a',3) -> {\"b\" : 1, \"a\" : 2, \"a\" : 3}
+     jsonb_build_object(same)             -> {\"a\": 3, \"b\": 1}
+
+   Which is why it builds TEXT straight from the arguments instead of
+   going through a Clojure map — a map cannot hold either property.
+   PostgreSQL's separator here is `\" : \"`, spaces on both sides
+   (json.c's composite_to_json), not the jsonb writer's `\": \"`."
+  [& args]
+  (let [sb (StringBuilder.)]
+    (.append sb \{)
+    (doseq [[i [k v]] (map-indexed vector (partition 2 args))]
+      (when (pos? i) (.append sb ", "))
+      (append-json-string! sb (str k))
+      (.append sb " : ")
+      (emit-json-value! sb v))
+    (.append sb \})
+    (.toString sb)))
+
+(defn json-build-array
+  "PostgreSQL `json_build_array(v1, …)`. Arrays render identically in
+   both families, so only the element order matters and it is preserved
+   by construction."
+  [& args]
+  (let [sb (StringBuilder.)]
+    (.append sb \[)
+    (doseq [[i v] (map-indexed vector args)]
+      (when (pos? i) (.append sb ", "))
+      (emit-json-value! sb v))
+    (.append sb \])
+    (.toString sb)))
+
 (defn jsonb-build-object
   "PostgreSQL jsonb_build_object(k1, v1, k2, v2, ...): build jsonb from pairs."
   [& args]
@@ -494,8 +561,11 @@
   (let [parsed (parse-jsonb v)]
     (cond
       (map? parsed)
+      ;; A JSON null is `json-null`, not nil — `some?` was true for it,
+      ;; so nothing was stripped. (Arrays keep their nulls in
+      ;; PostgreSQL; only object keys are removed.)
       (into {} (keep (fn [[k v]]
-                       (when (some? v)
+                       (when-not (or (nil? v) (= json-null v))
                          [k (jsonb-strip-nulls v)])))
             parsed)
 
@@ -617,12 +687,29 @@
     (json/write-value-as-string parsed (json/object-mapper {:pretty true}))))
 
 (defn to-jsonb
-  "PostgreSQL to_jsonb(any): convert any value to jsonb."
-  [v]
-  (cond
-    (nil? v) nil
-    (string? v) (try (json/read-value v mapper) (catch Exception _ v))
-    :else v))
+  "PostgreSQL `to_jsonb(anyelement)` / `to_json` — convert a SQL value
+   INTO a json value.
+
+   It does NOT parse its argument. `to_jsonb('{\"a\":1}'::text)` is the
+   json STRING `\"{\\\"a\\\":1}\"`, not an object — the text is a text
+   value being wrapped, not a document being read. We parsed it, so a
+   text column holding JSON silently became a structure.
+
+   Only an argument that is ALREADY json/jsonb passes through, and the
+   caller decides that from the column type, since at runtime both are
+   Clojure strings.
+
+   Returns canonical TEXT, so a json string renders quoted (`\"x\"`) the
+   way PostgreSQL prints it."
+  ([v] (to-jsonb v false))
+  ([v already-json?]
+   (cond
+     (nil? v)          nil
+     (= :__null__ v)   :__null__
+     already-json?     (serialize-jsonb v)
+     :else             (let [sb (StringBuilder.)]
+                         (emit! sb (normalize-tree v))
+                         (.toString sb)))))
 
 ;; ============================================================================
 ;; Wire protocol: formatting jsonb for transport

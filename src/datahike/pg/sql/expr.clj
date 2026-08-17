@@ -847,6 +847,20 @@
         result-var)
 
       ;; jsonb_build_object(k1, v1, k2, v2, ...) → in-param fn
+      (= fname "json_build_object")
+      (let [fn-param (symbol (str "?json-build-obj" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj jb/json-build-object)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
+      (= fname "json_build_array")
+      (let [fn-param (symbol (str "?json-build-arr" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj jb/json-build-array)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       (= fname "jsonb_build_object")
       (let [fn-param (symbol (str "?jsonb-build-obj" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
@@ -863,15 +877,23 @@
         result-var)
 
       ;; jsonb_strip_nulls(jsonb) → single-arg in-param fn
-      (= fname "jsonb_strip_nulls")
-      (let [fn-param (symbol (str "?jsonb-strip-nulls" (swap! (:var-counter ctx) inc)))]
+      (contains? #{"jsonb_strip_nulls" "json_strip_nulls"} fname)
+      (let [fn-param (symbol (str "?jsonb-strip-nulls" (swap! (:var-counter ctx) inc)))
+            ;; Same transformation, different RENDERING: a json result is
+            ;; compact where a jsonb one is spaced. Returning text here
+            ;; rather than a Clojure value is what lets the family decide,
+            ;; since the output path cannot tell them apart.
+            json? (= fname "json_strip_nulls")]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/jsonb-strip-nulls)
+        (swap! (:in-args ctx) conj
+               (if json?
+                 (comp jb/serialize-json jb/jsonb-strip-nulls)
+                 jb/jsonb-strip-nulls))
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
       ;; jsonb_typeof(jsonb) → string type name
-      (= fname "jsonb_typeof")
+      (contains? #{"jsonb_typeof" "json_typeof"} fname)
       (let [fn-param (symbol (str "?jsonb-typeof" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-typeof)
@@ -879,7 +901,7 @@
         result-var)
 
       ;; jsonb_array_length(jsonb) → integer
-      (= fname "jsonb_array_length")
+      (contains? #{"jsonb_array_length" "json_array_length"} fname)
       (let [fn-param (symbol (str "?jsonb-arr-len" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj jb/jsonb-array-length)
@@ -887,10 +909,15 @@
         result-var)
 
       ;; to_jsonb(any) → parse/pass-through
-      (= fname "to_jsonb")
-      (let [fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))]
+      (contains? #{"to_jsonb" "to_json"} fname)
+      (let [fn-param (symbol (str "?to-jsonb" (swap! (:var-counter ctx) inc)))
+            ;; to_jsonb does NOT parse its argument: a text value becomes
+            ;; a json STRING. Only an argument that already IS json/jsonb
+            ;; passes through, and at runtime both are Clojure strings —
+            ;; so the column type decides, as it does for `||` and `-`.
+            already-json? (jsonb-column? ctx (first params))]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/to-jsonb)
+        (swap! (:in-args ctx) conj #(jb/to-jsonb % already-json?))
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
@@ -912,7 +939,7 @@
 
       ;; jsonb_extract_path(target, key1, key2, ...) → jsonb
       ;; Equivalent to #> operator
-      (= fname "jsonb_extract_path")
+      (contains? #{"jsonb_extract_path" "json_extract_path"} fname)
       (let [target (first args)
             path (rest args)
             fn-param (symbol (str "?jsonb-path" (swap! (:var-counter ctx) inc)))
@@ -924,7 +951,7 @@
 
       ;; jsonb_extract_path_text(target, key1, key2, ...) → text
       ;; Same as jsonb_extract_path but returns text
-      (= fname "jsonb_extract_path_text")
+      (contains? #{"jsonb_extract_path_text" "json_extract_path_text"} fname)
       (let [target (first args)
             path (rest args)
             fn-param (symbol (str "?jsonb-pathtext" (swap! (:var-counter ctx) inc)))
@@ -945,7 +972,7 @@
         result-var)
 
       ;; jsonb_object_keys(jsonb) → returns set of keys; serialized as JSON array string
-      (= fname "jsonb_object_keys")
+      (contains? #{"jsonb_object_keys" "json_object_keys"} fname)
       (let [target (first args)
             fn-param (symbol (str "?jsonb-keys" (swap! (:var-counter ctx) inc)))
             result-var (ctx/fresh-var! ctx)]
