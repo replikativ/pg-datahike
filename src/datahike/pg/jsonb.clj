@@ -250,9 +250,12 @@
                              true
                              (sort pg-key-cmp (map str (keys v))))
                      (.append sb \}))
+    ;; `(:sep …)`, not a hardcoded ", ": the two families differ on ARRAY
+    ;; punctuation as well as object punctuation. `to_json(ARRAY[1,2])`
+    ;; is `[1,2]` in PostgreSQL and was `[1, 2]` here.
     (sequential? v) (do (.append sb \[)
                         (reduce (fn [first? x]
-                                  (when-not first? (.append sb ", "))
+                                  (when-not first? (.append sb (:sep *json-style*)))
                                   (emit! sb x)
                                   false)
                                 true v)
@@ -281,7 +284,16 @@
     (let [data (if (string? v)
                  (try (json/read-value v mapper)
                       (catch Exception _ v))
-                 v)
+                 ;; A value that did NOT come from JSON text still has to
+                 ;; go through the value model: PgRecord and PgArray are
+                 ;; defrecords, so `map?` is true for them and `emit!`
+                 ;; wrote their INTERNALS —
+                 ;; `json_agg(t)` over a whole-row reference produced
+                 ;; `[{":fields": null, ":type-oid": null}, …]`.
+                 ;; `to_json`/`to_jsonb` normalise before calling here,
+                 ;; which is why they looked correct and every other
+                 ;; caller did not.
+                 (normalize-tree v))
           sb (StringBuilder.)]
       (emit! sb data)
       (.toString sb))))
@@ -812,6 +824,17 @@
      :else             (let [sb (StringBuilder.)]
                          (emit! sb (normalize-tree v))
                          (.toString sb)))))
+
+(defn to-json
+  "PostgreSQL `to_json` / `row_to_json` — `to_jsonb`'s sibling in the
+   `json` family, which differs ONLY in punctuation: compact objects and
+   arrays where jsonb spaces them. `to_json(ARRAY[1,2])` is `[1,2]` and
+   `to_jsonb(ARRAY[1,2])` is `[1, 2]`; both were rendering the jsonb
+   way because the two names shared one implementation."
+  ([v] (to-json v false))
+  ([v already-json?]
+   (binding [*json-style* {:pair ":" :sep ","}]
+     (to-jsonb v already-json?))))
 
 ;; ============================================================================
 ;; Wire protocol: formatting jsonb for transport
