@@ -339,3 +339,25 @@
     (run "CREATE TABLE sc2 (id int PRIMARY KEY, d jsonb)")
     (run "INSERT INTO sc2 VALUES (1,'{\"b\":2,\"a\":1}')")
     (is (= [["1"]] (rows "SELECT count(*) FROM sc2 WHERE d = '{ \"a\":1, \"b\":2 }'")))))
+
+(deftest to-jsonb-dispatches-on-type-not-clojure-class
+  (testing "PostgreSQL dispatches to_json/to_jsonb on the argument's
+            DECLARED TYPE (json_categorize_type). We dispatched on the
+            runtime Clojure class, and PgArray / PgRecord are defrecords
+            — so `map?` was true for them and they leaked their internals
+            as object keys."
+    (is (= "[1, 2, 3]" (v "SELECT to_jsonb(ARRAY[1,2,3])")))
+    (is (= "[\"a\", \"b\"]" (v "SELECT to_jsonb(ARRAY['a','b'])")))
+    (is (= "{\"f1\": 1, \"f2\": \"x\"}" (v "SELECT to_jsonb(ROW(1,'x'))"))))
+  (testing "a temporal value is ISO-8601, not java.util.Date's .toString,
+            and must NOT be shifted — a `timestamp` carries no zone"
+    (run "CREATE TABLE ts (id int PRIMARY KEY, t timestamp)")
+    (run "INSERT INTO ts VALUES (1, '2026-08-16 19:02:08')")
+    (is (= "\"2026-08-16T19:02:08\"" (v "SELECT to_jsonb(t) FROM ts"))))
+  (testing "numeric scale survives to_jsonb when the value HAS its scale
+            — a numeric column restores it even though a bare literal
+            currently does not (a separate, pre-existing gap)"
+    (run "CREATE TABLE nm (id int PRIMARY KEY, n numeric(10,2))")
+    (run "INSERT INTO nm VALUES (1, 1.10)")
+    (is (= "1.10" (v "SELECT n FROM nm")))
+    (is (= "1.10" (v "SELECT to_jsonb(n) FROM nm")))))

@@ -7,7 +7,9 @@
    Implements PostgreSQL jsonb operators and functions as pure Clojure
    functions that can be used as Datalog predicates or post-processing."
   (:require [jsonista.core :as json]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.records :as records]))
 
 (set! *warn-on-reflection* true)
 
@@ -71,6 +73,38 @@
   [v]
   (cond
     (nil? v)     json-null
+    ;; PostgreSQL dispatches to_json/to_jsonb on the argument's DECLARED
+    ;; TYPE (json_categorize_type, json.c) — an array becomes a JSON
+    ;; array, a composite becomes an object, a timestamp becomes
+    ;; ISO-8601. We dispatch on the runtime Clojure class, and PgArray /
+    ;; PgRecord are defrecords, so `map?` is TRUE for them: they fell
+    ;; into the object branch and leaked their internals as keys
+    ;; (`{":dims": [3], ":elements": …}`). These must be tested BEFORE
+    ;; the map branch.
+    (pg-arr/array? v) (mapv normalize-tree (:elements v))
+    (records/record? v)
+    (let [fs (:fields v)]
+      (persistent!
+       (reduce (fn [m [i f]]
+                 (assoc! m (or (:name f) (str "f" (inc i))) (normalize-tree (:value f))))
+               (transient {}) (map-indexed vector fs))))
+    ;; A temporal value is ISO-8601, not java.util.Date's .toString
+    ;; ("Sun Aug 16 19:00:16 PDT 2026").
+    ;; PostgreSQL's JsonEncodeDateTime renders the value AS STORED — a
+    ;; `timestamp` carries no zone, so it must not be shifted. Formatting
+    ;; in the default zone reproduces what PostgreSQL prints for the same
+    ;; value; converting to UTC moved it by the offset.
+    ;; The column output path renders an instant by stringifying it (UTC)
+    ;; and stripping the trailing Z, so a stored timestamp reads back as
+    ;; the wall clock it was written with. Use the SAME convention here,
+    ;; or `to_jsonb(t)` and `SELECT t` disagree about the same value —
+    ;; formatting in the system zone shifted it by the local offset.
+    (inst? v)    (let [^java.time.Instant inst (if (instance? java.time.Instant v)
+                                                 v
+                                                 (.toInstant ^java.util.Date v))]
+                   (str/replace (str inst) "Z" ""))
+    (instance? java.time.LocalDateTime v) (str v)
+    (instance? java.time.LocalDate v)     (str v)
     (map? v)     (persistent! (reduce-kv (fn [m k x] (assoc! m (str k) (normalize-tree x)))
                                          (transient {}) v))
     (vector? v)  (mapv normalize-tree v)

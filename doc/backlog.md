@@ -232,6 +232,23 @@ before concluding. If it does bite, the fix is a promotion threshold —
 schema note argues against it for structured data, and content-id
 identity would give byte equality rather than jsonb equality.
 
+### A numeric LITERAL loses its scale
+
+`SELECT 1.10::numeric` and `SELECT 1.10` both answer `1.1`; PostgreSQL
+answers `1.10`. A numeric literal is parsed as a double before anything
+else sees it. A numeric COLUMN is unaffected — its declared scale
+restores the value — and `to_jsonb` of such a column is correct, so this
+is a literal-parsing gap rather than a jsonb one. It does mean
+`to_jsonb(1.10::numeric)` is wrong today.
+
+### An ARRAY literal passed to jsonb_build_object leaks record internals
+
+`jsonb_build_object('a', ARRAY[1,2])` yields
+`{"a": {":dims": null, ":elements": null, …}}`. `to_jsonb(ARRAY[1,2])`
+is correct, so the dispatch is right; the value reaching the builder is
+an all-nil map rather than a PgArray, i.e. the ARRAY constructor is not
+materialised when it appears as a function-call argument.
+
 ### jsonb numeric limits are not enforced
 
 PostgreSQL's numeric caps display scale at 16383 and integer digits at
