@@ -1124,7 +1124,7 @@
                                          (cond
                                            (instance? LongValue e)    (.getValue ^LongValue e)
                                            (instance? DoubleValue e)  (.getValue ^DoubleValue e)
-                                           (instance? StringValue e)  (.getNotExcapedValue ^StringValue e)
+                                           (instance? StringValue e)  (expr/string-value-text ^StringValue e)
                                            (instance? NullValue e)    :__null__
                                            :else (str e)))
                           result (cond
@@ -1172,7 +1172,7 @@
                                                    raw (cond
                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
                                                          (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
-                                                         (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
+                                                         (instance? StringValue inner) (expr/string-value-text ^StringValue inner)
                                                          :else (str inner))]
                                                (case (types/cast-category type-str)
                                                  :integer (long raw)
@@ -1185,7 +1185,7 @@
                                                  raw))
                                              (instance? LongValue unnest-val) (.getValue ^LongValue unnest-val)
                                              (instance? DoubleValue unnest-val) (.getValue ^DoubleValue unnest-val)
-                                             (instance? StringValue unnest-val) (.getNotExcapedValue ^StringValue unnest-val)
+                                             (instance? StringValue unnest-val) (expr/string-value-text ^StringValue unnest-val)
                                              :else (str unnest-val))
                                          n (long unnest-count)]
                                      {:type :select
@@ -1231,7 +1231,7 @@
                                                             ;; "102" instead of raising 22P02.
                                                              (pg-bits/bit-string-literal? expr)
                                                              (pg-bits/bit-string-literal-value expr)
-                                                             (instance? StringValue expr) (.getNotExcapedValue ^StringValue expr)
+                                                             (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
                                                              (instance? NullValue expr) :__null__
                                                             ;; Bare TRUE/FALSE — JSqlParser 5.x emits a
                                                             ;; BooleanValue. Older versions emitted a
@@ -1275,7 +1275,7 @@
                                                                         ;; but only for a PgBit input.
                                                                          (pg-bits/bit-string-literal? inner)
                                                                          (pg-bits/bit-string-literal-value inner)
-                                                                         (instance? StringValue inner) (.getNotExcapedValue ^StringValue inner)
+                                                                         (instance? StringValue inner) (expr/string-value-text ^StringValue inner)
                                                                          :else (str inner))]
                                                                (cond
                                                               ;; Array-target cast: parse the canonical array text
@@ -1326,7 +1326,7 @@
                                                                            (instance? LongValue e) (str (.getValue ^LongValue e))
                                                                            (instance? DoubleValue e) (str (.getValue ^DoubleValue e))
                                                                            (instance? StringValue e)
-                                                                           (str "\"" (.getNotExcapedValue ^StringValue e) "\"")
+                                                                           (str "\"" (expr/string-value-text ^StringValue e) "\"")
                                                                            (instance? NullValue e) "NULL"
                                                                            :else (str e)))]
                                                                (fmt expr))

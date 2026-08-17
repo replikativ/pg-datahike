@@ -1647,23 +1647,24 @@ public final class PgWireServer {
                     continue;
                 }
             }
-            // Inside string literals: replace newlines/tabs with spaces
-            // (JSqlParser's lexer cannot handle these inside string literals)
-            if (inSingleQuote && (c == '\n' || c == '\r' || c == '\t')) {
-                sb.append(' ');
-                i++;
-                continue;
-            }
-            // Inside string literals: replace backslash escape sequences with spaces
-            // psycopg2 sends \n \r \t as literal characters in SQL strings
-            if (inSingleQuote && c == '\\' && i + 1 < len) {
-                char next = sql.charAt(i + 1);
-                if (next == 'n' || next == 'r' || next == 't') {
-                    sb.append(' ');
-                    i += 2;
-                    continue;
-                }
-            }
+            // NOTHING is rewritten inside a string literal. Two rules used
+            // to live here and both corrupted data, on every client, because
+            // this method's output is what actually gets EXECUTED (the
+            // simple-query loop and Parse both run it).
+            //
+            // 1. A real tab/newline/CR became a space, on the grounds that
+            //    "JSqlParser's lexer cannot handle these inside string
+            //    literals". It does: jsqlparser 5.2 parses 'a<TAB>b' and
+            //    'a<NL>b' and hands back bytes [97 9 98] / [97 10 98].
+            //
+            // 2. A BACKSLASH followed by n/r/t became a space. With
+            //    standard_conforming_strings = on -- which we report -- a
+            //    backslash in an ordinary literal is a literal backslash, so
+            //    `length('a\tb')` is 4 and `length('C:\temp')` is 7. We
+            //    answered 3 and 6, and note the replacement was a SPACE, not
+            //    even the tab it was pretending to decode: 'C:\temp' came
+            //    back as "C: emp". Escape processing belongs to E'...'
+            //    strings only, and jsqlparser already reports that prefix.
             sb.append(c);
             i++;
         }

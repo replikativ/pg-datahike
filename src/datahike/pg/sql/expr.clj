@@ -112,6 +112,112 @@
    outer-join ON) on the predicate path."
   false)
 
+(defn decode-e-string
+  "Decode a PostgreSQL `E'...'` string body, per src/backend/parser/scan.l.
+
+   Ordinary literals do NOT process escapes under
+   `standard_conforming_strings = on` — only `E''` strings do, and this
+   is the only place that difference is realised.
+
+   The grammar is exact, not approximate:
+     xeoctesc    \\[0-7]{1,3}
+     xehexesc    \\x[0-9A-Fa-f]{1,2}
+     xeunicode   \\uXXXX  |  \\UXXXXXXXX   (exactly 4 / exactly 8)
+     single char b f n r t v  ->  the control character
+     ANY other \\c          ->  c itself (PostgreSQL's documented
+                                fallthrough: E'a\\qb' is `aqb`)
+     ''                     ->  a single quote
+
+   Decodes the RAW body rather than JSqlParser's `getNotExcapedValue`,
+   because PostgreSQL accepts both `''` and `\\'` as a quote and the
+   pre-collapsed form has already lost the distinction."
+  ^String [^String body]
+  (let [n (count body)
+        sb (StringBuilder. n)
+        hex? (fn [^Character ch] (and ch (Character/isLetterOrDigit ch)
+                                      (>= (Character/digit (char ch) 16) 0)))
+        oct? (fn [^Character ch] (and ch (<= (int \0) (int ch) (int \7))))]
+    (loop [i 0]
+      (if (>= i n)
+        (.toString sb)
+        (let [c (.charAt body i)]
+          (cond
+            ;; '' -> '
+            (and (= c \') (< (inc i) n) (= (.charAt body (inc i)) \'))
+            (do (.append sb \') (recur (+ i 2)))
+
+            (not= c \\)
+            (do (.append sb c) (recur (inc i)))
+
+            (>= (inc i) n)
+            (do (.append sb c) (recur (inc i)))
+
+            :else
+            (let [d (.charAt body (inc i))]
+              (cond
+                ;; \uXXXX / \UXXXXXXXX — the digit count is exact, and a
+                ;; short one is an ERROR rather than a fallthrough.
+                (or (= d \u) (= d \U))
+                (let [want (if (= d \u) 4 8)
+                      start (+ i 2)
+                      end (+ start want)
+                      digits (when (<= end n) (subs body start end))]
+                  (if (and digits (every? #(hex? %) digits))
+                    (let [cp (Long/parseLong digits 16)]
+                      (when (zero? cp)
+                        (throw (ex-info "invalid byte sequence for encoding \"UTF8\": 0x00"
+                                        {:error :character-not-in-repertoire
+                                         :sqlstate "22021"})))
+                      (.appendCodePoint sb (int cp))
+                      (recur end))
+                    (throw (ex-info "invalid Unicode escape"
+                                    {:error :invalid-escape-sequence
+                                     :sqlstate "22025"
+                                     :hint "Unicode escapes must be \\uXXXX or \\UXXXXXXXX."}))))
+
+                ;; \xNN — one or two hex digits
+                (= d \x)
+                (let [d1 (when (< (+ i 2) n) (.charAt body (+ i 2)))
+                      d2 (when (< (+ i 3) n) (.charAt body (+ i 3)))
+                      ds (cond (and (hex? d1) (hex? d2)) (str d1 d2)
+                               (hex? d1) (str d1)
+                               :else nil)]
+                  (if ds
+                    (let [v (Integer/parseInt ds 16)]
+                      (when (zero? v)
+                        (throw (ex-info "invalid byte sequence for encoding \"UTF8\": 0x00"
+                                        {:error :character-not-in-repertoire
+                                         :sqlstate "22021"})))
+                      (.append sb (char v))
+                      (recur (+ i 2 (count ds))))
+                    ;; `\x` with no hex digit falls through to plain `x`
+                    (do (.append sb \x) (recur (+ i 2)))))
+
+                ;; \0 .. \377 — one to three octal digits
+                (oct? d)
+                (let [ds (loop [j (inc i) acc (StringBuilder.)]
+                           (if (and (< j n) (< (.length acc) 3) (oct? (.charAt body j)))
+                             (recur (inc j) (.append acc (.charAt body j)))
+                             (.toString acc)))
+                      v (Integer/parseInt ds 8)]
+                  (when (zero? v)
+                    (throw (ex-info "invalid byte sequence for encoding \"UTF8\": 0x00"
+                                    {:error :character-not-in-repertoire
+                                     :sqlstate "22021"})))
+                  (.append sb (char v))
+                  (recur (+ i 1 (count ds))))
+
+                :else
+                (do (.append sb (case d
+                                  \b \backspace
+                                  \f \formfeed
+                                  \n \newline
+                                  \r \return
+                                  \t \tab
+                                  \v (char 11)
+                                  d))
+                    (recur (+ i 2)))))))))))
+
 (defn string-value-text
   "Extract the text of a JSqlParser `StringValue`, applying SQL/PG
    semantics for the `N'...'` (national character) prefix.
@@ -130,10 +236,17 @@
   [^net.sf.jsqlparser.expression.StringValue sv]
   (let [v (.getNotExcapedValue sv)
         prefix (.getPrefix sv)]
-    (if (and v prefix (.equalsIgnoreCase ^String prefix "N"))
+    (cond
+      (and v prefix (.equalsIgnoreCase ^String prefix "N"))
       ;; CHAR-coerce: rstrip trailing ASCII spaces.
       (str/replace v #" +$" "")
-      v)))
+
+      ;; E'...' is the ONLY string form that processes escapes. Decode
+      ;; the raw body, not the `''`-collapsed one — see decode-e-string.
+      (and prefix (.equalsIgnoreCase ^String prefix "E"))
+      (decode-e-string (.getValue sv))
+
+      :else v)))
 
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
