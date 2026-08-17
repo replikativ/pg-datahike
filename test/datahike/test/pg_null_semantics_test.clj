@@ -308,3 +308,34 @@
     (let [r (.execute *h* "SELECT id FROM t WHERE flag IS NOT FALSE ORDER BY id")]
       (is (nil? (err r)))
       (is (= [1 2] (ids r))))))
+
+;; ============================================================================
+;; Casting NULL
+;; ============================================================================
+
+(deftest test-cast-of-null-is-null
+  ;; The compile-time constant fold in translate-cast-expr had no NULL
+  ;; guard, so it stringified nil: `(str nil)` is "", and NULL::text
+  ;; became the EMPTY STRING. Everything NULL-aware downstream then took
+  ;; the wrong branch, and ::bool raised `invalid input syntax for type
+  ;; boolean: ""` — the empty string being parsed back out.
+  (testing "IS NULL survives a cast to every scalar type"
+    (doseq [t ["text" "varchar" "char" "int" "bigint" "numeric" "bool"
+               "date" "timestamp" "uuid" "jsonb" "json"]]
+      (let [r (.execute *h* (str "SELECT NULL::" t " IS NULL"))]
+        (is (nil? (err r)) (str "NULL::" t " must not error"))
+        (is (= "t" (cell r)) (str "NULL::" t " IS NULL should be true")))))
+
+  (testing "a cast NULL stays absent rather than becoming a value"
+    (is (= "FELLBACK" (cell (.execute *h* "SELECT coalesce(NULL::text, 'FELLBACK')"))))
+    (is (nil? (cell (.execute *h* "SELECT length(NULL::text)"))))
+    (is (= "a" (cell (.execute *h*
+                               "SELECT CASE WHEN NULL::text IS NULL THEN 'a' ELSE 'b' END")))))
+
+  (testing "IS NOT NULL is correspondingly false"
+    (is (= "f" (cell (.execute *h* "SELECT NULL::text IS NOT NULL")))))
+
+  (testing "a non-NULL cast is unaffected"
+    (is (= "7"   (cell (.execute *h* "SELECT 7::text"))))
+    (is (= "f"   (cell (.execute *h* "SELECT 7::text IS NULL"))))
+    (is (= "abc" (cell (.execute *h* "SELECT 'abc'::text"))))))
