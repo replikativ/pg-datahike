@@ -239,9 +239,13 @@
 
 (defn- order-agg-type-name
   "The PG type name to report when a value has no min/max aggregate, or
-   nil when the value is orderable. bytea is rejected because our target
-   is PostgreSQL 17, which has no `max(bytea)` — it arrived later, and a
-   `byte[]` is not Comparable anyway so it could only ever have thrown.
+   nil when the value is orderable. Only `bool` and `uuid` qualify: they
+   have no min/max aggregate in pg_aggregate.dat on any release,
+   including master. `bytea` DOES have one upstream — we track upstream
+   rather than pinning to the version we advertise, since PostgreSQL
+   stays backwards compatible with clients, so implementing the newer
+   behaviour costs nothing while a client gating on server_version never
+   asks for it.
 
    A jsonb value is a String at this point and so is indistinguishable
    from text; `max(jsonb)` therefore answers instead of raising. Closing
@@ -251,11 +255,19 @@
   (cond
     (instance? Boolean v)      "boolean"
     (instance? java.util.UUID v) "uuid"
-    (bytes? v)                 "bytea"
     :else nil))
 
+(defn- order-cmp
+  "`compare`, except that a `byte[]` is not Comparable — PostgreSQL
+   orders bytea by unsigned byte value (`byteacmp`, varlena.c), which is
+   what compareUnsigned does."
+  ^long [a b]
+  (if (and (bytes? a) (bytes? b))
+    (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
+    (compare a b)))
+
 (defn- order-agg
-  "Reduce with `compare` rather than `clojure.core/min`/`max`, which are
+  "Reduce with `order-cmp` rather than `clojure.core/min`/`max`, which are
    NUMERIC-ONLY — they cast to Number, so MIN/MAX over any other type
    died with a raw `class java.lang.String cannot be cast to class
    java.lang.Number`. SQL orders every scalar type, and `max(name)` is
@@ -274,7 +286,7 @@
       (do
         (when-let [tname (order-agg-type-name (first vs))]
           (no-order-agg! fname tname))
-        (reduce (fn [a b] (if (pick (compare b a)) b a)) vs)))))
+        (reduce (fn [a b] (if (pick (order-cmp b a)) b a)) vs)))))
 
 (defn filter-min
   "MIN that ignores :__null__ sentinel values. Returns :__null__ if all filtered."
@@ -1159,8 +1171,8 @@
    ;; ClassCastException on `greatest('a','b')` or two dates. Unlike
    ;; MIN/MAX these are not aggregates and PostgreSQL defines them over
    ;; any type with an ordering, so there is nothing to reject here.
-   "greatest" (fn [& args] (reduce (fn [a b] (if (pos? (compare b a)) b a)) args))
-   "least"    (fn [& args] (reduce (fn [a b] (if (neg? (compare b a)) b a)) args))
+   "greatest" (fn [& args] (reduce (fn [a b] (if (pos? (order-cmp b a)) b a)) args))
+   "least"    (fn [& args] (reduce (fn [a b] (if (neg? (order-cmp b a)) b a)) args))
    "mod"      rem
 
    ;; --- Math: PG semantics, see the "Math function implementations"

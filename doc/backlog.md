@@ -335,8 +335,9 @@ untouched, so single-row groups and WHERE-narrowed aggregates passed.
 
 The same change fixes an error-class bug: for the types PostgreSQL has
 no min/max aggregate for we raised a ClassCastException where PG raises
-42883. Those are `boolean` and `uuid` (absent on 17 and still absent on
-master) and `bytea` (absent on 17, added later). A jsonb value is a
+42883. Those are `boolean` and `uuid`, absent on every release including
+master. `bytea` has an aggregate upstream and is supported, ordered by
+unsigned byte value as `byteacmp` does. A jsonb value is a
 String by then and indistinguishable from text, so `max(jsonb)` answers
 instead of raising — closing that needs the declared column type at the
 aggregate layer, which it does not carry.
