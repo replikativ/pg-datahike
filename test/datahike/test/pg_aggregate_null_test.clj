@@ -156,3 +156,25 @@
     (is (= 2 (count (:rows r))))
     (is (every? #(not (nil? (first %))) (:rows r))
         "HAVING with NULL predicate value must exclude that group")))
+
+;; ============================================================================
+;; MIN/MAX over a non-numeric column
+;; ============================================================================
+
+(deftest test-min-max-over-text
+  ;; filter-min/filter-max were clojure.core/min|max, which cast to
+  ;; Number, so MIN/MAX over any non-numeric column died with
+  ;; `class java.lang.String cannot be cast to class java.lang.Number`.
+  ;; It only fired when two or more values were actually compared, which
+  ;; is why single-row groups and WHERE-narrowed aggregates looked fine.
+  (testing "MIN/MAX over a text column"
+    (is (= "A" (cell "SELECT MIN(grp) FROM t")))
+    (is (= "B" (cell "SELECT MAX(grp) FROM t"))))
+
+  (testing "NULLs are skipped, not ordered"
+    ;; id=3 has no grp at all; PG ignores NULL input to MIN/MAX.
+    (is (= "A" (cell "SELECT MIN(grp) FROM t WHERE id IN (1,2,3)")))
+    (is (= "A" (cell "SELECT MAX(grp) FROM t WHERE id IN (1,2,3)"))))
+
+  (testing "still correct when a group holds exactly one value"
+    (is (= "B" (cell "SELECT MAX(grp) FROM t WHERE id = 4")))))
