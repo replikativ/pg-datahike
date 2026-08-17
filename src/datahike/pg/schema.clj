@@ -694,11 +694,19 @@
    sites call this helper.
 
    Returns nil when the table or column isn't known."
-  [schema table-name col-name]
-  (let [cols (get-in (derive-virtual-tables schema) [table-name :columns])]
-    (when (seq cols)
-      (some (fn [[i c]] (when (= col-name (:name c)) (inc i)))
-            (map-indexed vector cols)))))
+  ([schema table-name col-name] (column-attnum schema table-name col-name nil))
+  ([schema table-name col-name hints]
+   ;; `hints` is NOT optional in practice: it carries the CREATE TABLE
+   ;; column order, and without it this falls back to the schema map's
+   ;; hash order while `pg_attribute` — which always has hints — uses
+   ;; the declared one. pgjdbc's updatable ResultSet maps columns by
+   ;; (tableOid, attnum), so the two disagreeing sent an UPDATE's value
+   ;; to the wrong column: `invalid input syntax for numeric:
+   ;; "2014-12-23"` in ResultSetTest.testUpdateWithPGobject.
+   (let [cols (get-in (derive-virtual-tables schema hints) [table-name :columns])]
+     (when (seq cols)
+       (some (fn [[i c]] (when (= col-name (:name c)) (inc i)))
+             (map-indexed vector cols))))))
 
 (defn- internal-attr?
   "Return true if an attribute ident belongs to the internal Datahike schema

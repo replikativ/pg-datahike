@@ -531,6 +531,7 @@
                                        :where [[?e :db/ident ?ident]
                                                [?e :pg/typmod ?tm]]}
                                      db)))
+          rd-hints (when db (pgs/schema-hints db))
           n (count aliases)
           toids (int-array n)
           attnums (short-array n)
@@ -542,8 +543,12 @@
               tname (when attr (namespace attr))
               cname (when attr (name attr))
               toid (when tname (pgs/table-oid db tname))
+              ;; Pass hints: they carry the CREATE TABLE column order,
+              ;; and RowDescription's attnum must agree with
+              ;; pg_attribute's or pgjdbc's updatable ResultSet maps
+              ;; columns to the wrong positions.
               anum (when (and tname cname)
-                     (pgs/column-attnum schema tname cname))
+                     (pgs/column-attnum schema tname cname rd-hints))
               tm (when attr (get typmod-map attr))]
           (when (and toid anum)
             (reset! any? true)
