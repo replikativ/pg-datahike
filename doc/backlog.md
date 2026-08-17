@@ -41,16 +41,49 @@ function-binding that yields `nil` filters the row out of the result.
 PostgreSQL returns one row of two NULLs. `jsonb-get-text` has the
 `:__null__` guard; `jsonb-get` does not.
 
-### jsonb equality, DISTINCT and GROUP BY are text comparisons
+### jsonb DISTINCT and GROUP BY are still text comparisons
 
-PostgreSQL's jsonb `=` is **structural and numeric-scale-insensitive**:
-`'1.00'::jsonb = '1'::jsonb` is true, `jsonb_hash` agrees, and DISTINCT
-over `1.00 / 1.0 / 1` collapses to one row — while their *texts* differ.
-We compare canonical text, so we answer false for all of these.
+> Equality itself is **FIXED on `fix/jsonb-equality`** — see below. This
+> entry now covers only DISTINCT and GROUP BY.
 
-No canonical byte or text form can fix this: PostgreSQL deliberately
-preserves display scale while comparing scale-insensitively. Equality
-needs a structural comparator whatever we store.
+`SELECT count(DISTINCT j)` over `1.00` / `1` answers 2 where PostgreSQL
+answers 1, and `GROUP BY j` makes two groups where PostgreSQL makes
+one.
+
+Unlike `=`, this cannot be fixed by swapping in a comparator, because
+DISTINCT and GROUP BY are not predicates here: `has-distinct?` works by
+NOT adding the entity var to `:with-vars`, so deduplication is
+datalog's set semantics over the projected `:find` tuple — and the
+projected value is the canonical TEXT, in which `1.00` and `1` differ.
+
+Fixing it means projecting a scale-NORMALISED key and rendering a
+representative of the group, which needs a decision:
+
+- PostgreSQL displays a member of the group — `1.00` here, i.e. the
+  first encountered — but the choice is implementation-defined (hash
+  aggregation order), so any member is defensible.
+- Projecting the normalised key directly is the cheapest fix and gives
+  the right COUNT, but displays `1` where PostgreSQL displays `1.00`.
+- Full fidelity means a hidden normalised grouping key plus an
+  aggregate that picks the representative, on the same machinery
+  GROUP BY already uses for hidden find elements.
+
+The count being wrong is the real defect; which representative shows is
+cosmetic.
+
+### jsonb equality was reachable from only one operand shape
+
+> **FIXED on `fix/jsonb-equality`**
+
+`jsonb-eq?` was correct but wired in at exactly one site — the WHERE
+path taken when the right operand is a BARE literal. `j = '1'` was
+right; `j = '1'::jsonb` (a CastExpression), `'1'::jsonb = j`,
+`a.j = b.j` and any comparison in the SELECT list fell through to `=`
+on the canonical text and answered false. Equi-joins were worse than
+wrong-answer: they unified on a shared logic var, making the join key
+text equality.
+
+### jsonb ORDER BY / `<` / `>` / MIN / MAX use text order
 
 ### jsonb ORDER BY / `<` / `>` / MIN / MAX use text order
 

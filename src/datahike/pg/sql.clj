@@ -87,6 +87,7 @@
 (def filter-jsonb-object-agg fns/filter-jsonb-object-agg)
 (def filter-json-object-agg  fns/filter-json-object-agg)
 (def jsonb-eq?             datahike.pg.jsonb/jsonb-eq?)
+(def jsonb-ne?             datahike.pg.jsonb/jsonb-ne?)
 (def sql-null?             fns/sql-null?)
 (def sql-not-null?         fns/sql-not-null?)
 (def filter-min            fns/filter-min)

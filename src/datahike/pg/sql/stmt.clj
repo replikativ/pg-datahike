@@ -510,10 +510,20 @@
                 ;; not-null guards for each side so rows whose join-column
                 ;; is NULL are excluded. nil and the :__null__ sentinel are
                 ;; both treated as SQL NULL.
-                  (or (ctx/unify-inner-equijoin! ctx left-resolved right-resolved)
+                  ;; A jsonb join key must NOT unify on a shared logic
+                  ;; var: that makes the join TEXT equality, so
+                  ;; `1.00` and `1` fail to match where PostgreSQL
+                  ;; joins them. Fall through to the predicate.
+                  (or (and (not (or (expr/jsonb-column? ctx left)
+                                    (expr/jsonb-column? ctx right)))
+                           (ctx/unify-inner-equijoin! ctx left-resolved right-resolved))
                       (let [l-var (expr/translate-expr ctx left)
-                            r-var (expr/translate-expr ctx right)]
-                        (ctx/add-clause! ctx [(list '= l-var r-var)])
+                            r-var (expr/translate-expr ctx right)
+                            eq-fn (if (or (expr/jsonb-column? ctx left)
+                                          (expr/jsonb-column? ctx right))
+                                    'datahike.pg.sql/jsonb-eq?
+                                    '=)]
+                        (ctx/add-clause! ctx [(list eq-fn l-var r-var)])
                         (when (symbol? l-var)
                           (ctx/add-clause! ctx [(list 'not= l-var :__null__)])
                           (ctx/add-clause! ctx [(list 'not= l-var nil)]))
