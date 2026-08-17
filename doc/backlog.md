@@ -85,6 +85,10 @@ one array. They are per-row functions and are absent from
 
 ### `::jsonb` is a no-op cast
 
+> **FIXED** — `json`/`jsonb` are now a `cast-category`, handled in the
+> shared `cast-scalar`, so both the constant-folded literal path and
+> `translate-cast-expr` validate and (for jsonb) canonicalise.
+
 `cast-category` has no json branch, so the value passes through
 untouched while the wire OID is still set to 3802 — the value and its
 advertised type disagree.
@@ -110,6 +114,11 @@ land alone — see the equality entry above; the two must change together.
 ---
 
 ### We accept JSON that PostgreSQL rejects
+
+> **FIXED** — validation now runs on the cast and on the write path; the
+> regression slice went from 27 accepted-what-PG-rejects to 12, and from
+> 18 to 51 identical lines of 65. The remainder is the backslash-literal
+> bug below contaminating the JSON escape tests.
 
 Running a 110-line slice of PostgreSQL's own `src/test/regress/sql/jsonb.sql`
 found **27 statements where we return a value and PostgreSQL raises
@@ -283,6 +292,86 @@ Java-interop collection (`HashMap`, `HashSet`) silently breaks the
 invariant.
 
 ---
+
+### Casting NULL to a string type yields the empty string
+
+> **FIXED on `fix/null-string-cast` (PR #38)**
+
+`SELECT NULL::text IS NULL` answers **false**. NULL cast to `text`,
+`varchar` or `char` becomes `''` rather than staying NULL, so every
+NULL-aware construct downstream silently takes the wrong branch:
+
+    length(NULL::text)                  -> 0    PG: NULL
+    NULL::text = ''                     -> true PG: NULL
+    coalesce(NULL::text, 'FELLBACK')    -> ''   PG: 'FELLBACK'
+    NULL::varchar IS NULL               -> f    PG: t
+    CASE WHEN NULL::text IS NULL
+         THEN 'a' ELSE 'b' END          -> 'b'  PG: 'a'
+
+`NULL::bool` proves the mechanism: it raises `invalid input syntax for
+type boolean: ""`, i.e. NULL was stringified to `''` and that was then
+parsed as a boolean. `NULL::int`, `::numeric`, `::date` and `::jsonb`
+are all correct, and bare `NULL IS NULL` is correct — it is specific to
+the string casts.
+
+Found via asyncpg's `test_prepare_03`, which prepares
+`SELECT CASE WHEN $1::text IS NULL THEN <default> ELSE $1::text END`
+and gets the ELSE branch for a NULL argument. Reproduces without any
+parameter, so it is a cast bug rather than a protocol one.
+
+### Three-valued logic is wrong in scalar position
+
+A comparison or boolean operator in the SELECT list does not propagate
+NULL. PostgreSQL answers NULL for all but one of these; we answer a
+definite boolean:
+
+                      ours   PG
+    NULL = NULL         t    NULL
+    1 = NULL            f    NULL
+    NULL <> 1           t    NULL
+    NOT NULL            t    NULL
+    true AND NULL       f    NULL
+    false AND NULL      t    f
+    true OR NULL      NULL   t
+
+Note the last two are wrong in the *other* direction: `false AND NULL`
+is FALSE in SQL (the false operand decides it) and `true OR NULL` is
+TRUE, and we get both backwards.
+
+`WHERE` is mostly right, because the datalog lowering prepends
+`(not= ?v :__null__)` guards — `v = 10`, `v <> 10`, `v = NULL` and
+`v IS NULL` all match PostgreSQL. Two defects remain there:
+
+- `WHERE NOT (v = 10)` **includes** the NULL row; PostgreSQL excludes
+  it (UNKNOWN negates to UNKNOWN, not TRUE).
+- Projecting a comparison, `SELECT v = 10`, yields `false` for a NULL
+  input where PostgreSQL yields NULL.
+
+Found while fixing the NULL-cast bug above. Bigger than it looks: it
+touches every comparison and boolean operator, and the WHERE and
+projection paths lower differently, so they need fixing together.
+
+### The asyncpg suite gives different answers in CI and locally
+
+Same commit, freshly restarted server: **95 passed / 74 failed locally,
+45 / 127 in CircleCI**. Both are stable — CI produced byte-identical
+counts and the same six resolved tests on `main` (build 1279) and on
+`fix/jsonb-conformance` (1342), and two local runs agreed with each
+other.
+
+The two environments disagree in *both* directions, so neither is simply
+"more broken": six tests pass in CI and fail locally
+(`test_prepare_03`, `test_invalid_input`, the two `executemany` ones,
+two custom-codec ones), while `test_connect_params` does the reverse.
+One local failure is `test_prepare_03` asserting `'?v4' != 'aaa'` — a
+datalog variable reaching the client as a value, which is an S1-shaped
+symptom whatever causes the divergence.
+
+Until this is understood, `expected-failures.txt` tracks CI and a local
+run will report spurious regressions. Candidate causes not yet ruled
+out: a different asyncpg build (CI compiles it; the local `.venv` may
+not), Python 3.11 in CI vs 3.12 locally, and accumulated tables in the
+long-lived local database changing what introspection returns.
 
 ## Test-surface note
 

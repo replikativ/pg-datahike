@@ -58,6 +58,45 @@
                     {:error :numeric-value-out-of-range :sqlstate "22003"})))
   d)
 
+(def ^:private strict-mapper
+  "Parse mapper for the INPUT path. `FAIL_ON_TRAILING_TOKENS` is the one
+   strictness PostgreSQL has that Jackson does not by default: `json_in`
+   parses ONE complete document and rejects anything after it, while
+   Jackson stops at the first value — so `SELECT '1 2'::jsonb` and
+   `'{} {}'` were accepted, returning `1` and `{}`."
+  (doto ^com.fasterxml.jackson.databind.ObjectMapper
+   (json/object-mapper {:decode-key-fn str})
+    (.configure com.fasterxml.jackson.databind.DeserializationFeature/USE_BIG_DECIMAL_FOR_FLOATS
+                true)
+    (.configure com.fasterxml.jackson.databind.DeserializationFeature/FAIL_ON_TRAILING_TOKENS
+                true)))
+
+(defn validate-json!
+  "Parse `s` the way PostgreSQL's `json_in` does: a full RFC-8259 parse
+   that RAISES on anything malformed.
+
+   Both `json` and `jsonb` validate on input — `json` then stores the
+   original bytes, `jsonb` stores the parsed tree — so this gates both.
+
+   We were not validating at all: `parse-jsonb` catches its own parse
+   error and falls back to treating the text as a JSON string scalar,
+   which is right for `to_jsonb('some text')` and wrong for
+   `'...'::jsonb`. So `'\"abc'::jsonb` (unclosed quote) silently became
+   the string `\"abc`, and 27 statements in PostgreSQL's own
+   `jsonb.sql` returned a value where PostgreSQL raises.
+
+   Jackson is already strict about the rest — invalid escapes, raw
+   control bytes, leading zeros, `NaN`, unquoted keys, trailing commas,
+   uppercase literals — so this is about not SWALLOWING its verdict."
+  [^String s]
+  (try
+    (json/read-value s strict-mapper)
+    (catch Exception e
+      (throw (ex-info "invalid input syntax for type json"
+                      {:error :invalid-text-representation
+                       :sqlstate "22P02"
+                       :detail (.getMessage e)})))))
+
 (defn- normalize-tree
   "Bring a freshly-parsed tree into the value model:
 

@@ -1625,8 +1625,34 @@
         any-ts? (or is-ts? is-date? is-time?)
         is-uuid? (= :uuid cast-cat)
         is-bit? (or (= :bit cast-cat) (= :varbit cast-cat))
-        is-array? (= :array cast-cat)]
+        is-array? (= :array cast-cat)
+        ;; `::json` / `::jsonb`. `cast-category` has no json branch, so
+        ;; these fell through every arm and the value passed UNCHANGED —
+        ;; the cast was a no-op that only set the wire OID, so
+        ;; `'"abc'::jsonb` (unclosed quote) answered `"abc` where
+        ;; PostgreSQL raises 22P02, and `'{"b":1,"a":2}'::jsonb` was not
+        ;; canonicalised.
+        json-cast (get {"json" :json "jsonb" :jsonb} type-str)]
     (cond
+      ;; Both types VALIDATE on input; only jsonb normalises after.
+      json-cast
+      (if (string? inner-raw)
+        (do (jb/validate-json! inner-raw)
+            (if (= :jsonb json-cast) (jb/serialize-jsonb inner-raw) inner-raw))
+        (let [param (symbol (str "?json-cast" (swap! (:var-counter ctx) inc)))
+              result (ctx/fresh-var! ctx)
+              jsonb? (= :jsonb json-cast)]
+          (swap! (:in-params ctx) conj param)
+          (swap! (:in-args ctx) conj
+                 (fn [v]
+                   (cond
+                     (or (nil? v) (= :__null__ v)) :__null__
+                     (string? v) (do (jb/validate-json! v)
+                                     (if jsonb? (jb/serialize-jsonb v) v))
+                     :else (if jsonb? (jb/serialize-jsonb v) v))))
+          (swap! (:where-clauses ctx) conj [(list param inner-raw) result])
+          result))
+
       ;; CAST(<expr> AS bit(n) / bit varying(n)). Needed here as well as
       ;; in sql.clj's literal fast path: only a bare literal is folded
       ;; there, so `(-44)::bit(12)` (a SignedExpression) and any cast of
