@@ -961,15 +961,26 @@
                                                    aliases))
                       (and talias (= 1 (count aliases))) [talias]
                       :else aliases)
-            schema-tx (mapv (fn [a vt pt]
-                              (cond-> {:db/ident       (keyword sub-name a)
-                                       :db/valueType   vt
-                                       :db/cardinality :db.cardinality/one}
-                                pt (assoc :pg/type pt)))
-                            aliases vtypes (concat (or pg-types []) (repeat nil)))
+            ;; The row-existence marker. `count(*)` and `SELECT *` have no
+            ;; column to enumerate otherwise, so a scan returned ZERO rows
+            ;; even though the rows are there:
+            ;;   SELECT count(*) FROM generate_series(1,10) g  ->  0
+            ;; while `count(g)` correctly answered 10.
+            ;; sequence->virtual-table below already transacts one and its
+            ;; comment names this exact hazard.
+            marker (pgs/row-marker-attr sub-name)
+            schema-tx (conj (mapv (fn [a vt pt]
+                                    (cond-> {:db/ident       (keyword sub-name a)
+                                             :db/valueType   vt
+                                             :db/cardinality :db.cardinality/one}
+                                      pt (assoc :pg/type pt)))
+                                  aliases vtypes (concat (or pg-types []) (repeat nil)))
+                            {:db/ident       marker
+                             :db/valueType   :db.type/boolean
+                             :db/cardinality :db.cardinality/one})
             spec-db (d/db-with db schema-tx)
             data-tx (mapv (fn [row]
-                            (into {}
+                            (into {marker true}
                                   (keep-indexed
                                    (fn [i a]
                                      (let [v (nth row i nil)]
@@ -4613,12 +4624,22 @@
             ;; short-circuit; we mirror it here so INSERT … SELECT
             ;; routes the same data, otherwise running d/q on the
             ;; empty query returns `[[]]` and silently drops the row.
+            ;; A set-returning function in the source FROM is
+            ;; materialised into a SPECULATIVE db, handed back as
+            ;; `:enriched-db`. Running the inner query against the plain
+            ;; `db` scans a database where that virtual table does not
+            ;; exist, so `INSERT INTO t SELECT … FROM generate_series(…)`
+            ;; answered `INSERT 0 0` — the standard bulk-load idiom,
+            ;; silently a no-op, while the same SELECT run on its own
+            ;; returned its rows. Same `(or (:enriched-db …) …)` the
+            ;; correlated-scalar path already uses.
+            inner-db (or (:enriched-db inner-parsed) db)
             inner-results (cond
                             (:literal-rows inner-parsed) (:literal-rows inner-parsed)
                             (:literal-row  inner-parsed) [(:literal-row inner-parsed)]
                             (seq inner-in-args)
-                            (apply q-fn inner-query db inner-in-args)
-                            :else (q-fn inner-query db))
+                            (apply q-fn inner-query inner-db inner-in-args)
+                            :else (q-fn inner-query inner-db))
             rows (mapv (fn [row]
                          (if (sequential? row) (vec row) [row]))
                        inner-results)
