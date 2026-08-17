@@ -169,16 +169,23 @@
     (is (= :__null__ (fns/filter-max [:__null__ :__null__])))
     (is (= :__null__ (fns/filter-min []))))
 
+  (testing "bytea orders by unsigned byte value, as PG's byteacmp does"
+    ;; byte[] is not Comparable, so plain `compare` would throw. The
+    ;; unsigned part matters: (byte -1) is 0xFF and must sort ABOVE
+    ;; 0x01, where Java's signed byte comparison would put it below.
+    (is (= [0x01] (vec (fns/filter-min [(byte-array [0x01]) (byte-array [-1])]))))
+    (is (= [-1]   (vec (fns/filter-max [(byte-array [0x01]) (byte-array [-1])])))))
+
   (testing "a single value needs no comparison and is returned as-is"
     (is (= "only" (fns/filter-max ["only"])))))
 
 (deftest min-max-rejects-types-postgres-has-no-aggregate-for
-  ;; PostgreSQL has no max(bool) / max(uuid), on 17 or on master, and no
-  ;; max(bytea) on 17. Raise 42883 as PG does rather than letting a
-  ;; ClassCastException escape.
+  ;; PostgreSQL has no max(bool) and no max(uuid) on ANY release,
+  ;; master included. Raise 42883 as PG does rather than letting a
+  ;; ClassCastException escape. bytea is deliberately NOT here — it has
+  ;; an aggregate upstream and we track upstream.
   (doseq [[tname vs] {"boolean" [true false]
-                      "uuid"    [(java.util.UUID/randomUUID) (java.util.UUID/randomUUID)]
-                      "bytea"   [(byte-array [1]) (byte-array [2])]}]
+                      "uuid"    [(java.util.UUID/randomUUID) (java.util.UUID/randomUUID)]}]
     (testing (str "max(" tname ") raises undefined_function")
       ;; :error is the codebase's error key; errors.clj maps
       ;; :undefined-function to SQLSTATE 42883 at the wire boundary.
