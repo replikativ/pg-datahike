@@ -85,6 +85,10 @@ one array. They are per-row functions and are absent from
 
 ### `::jsonb` is a no-op cast
 
+> **FIXED** — `json`/`jsonb` are now a `cast-category`, handled in the
+> shared `cast-scalar`, so both the constant-folded literal path and
+> `translate-cast-expr` validate and (for jsonb) canonicalise.
+
 `cast-category` has no json branch, so the value passes through
 untouched while the wire OID is still set to 3802 — the value and its
 advertised type disagree.
@@ -110,6 +114,11 @@ land alone — see the equality entry above; the two must change together.
 ---
 
 ### We accept JSON that PostgreSQL rejects
+
+> **FIXED** — validation now runs on the cast and on the write path; the
+> regression slice went from 27 accepted-what-PG-rejects to 12, and from
+> 18 to 51 identical lines of 65. The remainder is the backslash-literal
+> bug below contaminating the JSON escape tests.
 
 Running a 110-line slice of PostgreSQL's own `src/test/regress/sql/jsonb.sql`
 found **27 statements where we return a value and PostgreSQL raises

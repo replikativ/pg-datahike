@@ -3816,8 +3816,16 @@
           ;; silently did NOT happen for UPDATE or for a parameterised INSERT
           ;; — i.e. for every client that is not psql. Absent metadata has to
           ;; mean "ask", not "not jsonb".
-          jsonb?    (= "jsonb" (or (get-in schema [attr :pg/type])
-                                   (params/pg-type-of-attr db attr)))]
+          pg-type   (or (get-in schema [attr :pg/type])
+                        (params/pg-type-of-attr db attr))
+          jsonb?    (= "jsonb" pg-type)
+          ;; PostgreSQL validates BOTH types on input — `json_in` does a
+          ;; full RFC-8259 parse and only then stores the original bytes.
+          ;; We validated neither, so malformed text reached storage:
+          ;; `'"abc'::jsonb` became the string `"abc`.
+          json-ish? (contains? #{"json" "jsonb"} pg-type)
+          _         (when (and json-ish? (string? val))
+                      (jb/validate-json! val))]
       (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
