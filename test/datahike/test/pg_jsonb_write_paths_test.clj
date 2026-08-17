@@ -146,3 +146,54 @@
               (.next rs)
               (is (= "{\"y\": 2, \"z\": 1}" (.getString rs 1))))))
         (finally (.stop server) (d/release conn) (d/delete-database cfg))))))
+
+;; ---------------------------------------------------------------------------
+;; Operators that were silently wrong. Each returned a plausible answer of the
+;; wrong kind rather than failing, which is why none of them had a test.
+;; ---------------------------------------------------------------------------
+
+(deftest operators-that-were-wrong-answers
+  (run "CREATE TABLE op (id int PRIMARY KEY, d jsonb, n int)")
+  (run "INSERT INTO op VALUES (1, '{\"a\":1,\"b\":2,\"kind\":\"x\"}', 10)")
+
+  (testing "?| and ?& against array[...] — the RHS arrives as a PgArray
+            record, and iterating a record yields its MAP ENTRIES, so
+            every key test compared a pair against a string and matched
+            nothing"
+    (is (= [["1"]] (rows "SELECT count(*) FROM op WHERE d ?| array['kind','zz']")))
+    (is (= [["1"]] (rows "SELECT count(*) FROM op WHERE d ?& array['a','b']")))
+    (is (= [["0"]] (rows "SELECT count(*) FROM op WHERE d ?& array['a','zz']")))
+    (is (= [["1"]] (rows "SELECT count(*) FROM op WHERE d ? 'a'"))))
+
+  (testing "|| was string concatenation outside UPDATE SET — a stored
+            jsonb value IS a string, so runtime dispatch cannot tell it
+            from text; the column type has to decide"
+    (is (= "{\"a\": 1, \"b\": 2, \"z\": 9, \"kind\": \"x\"}"
+           (v "SELECT d || '{\"z\":9}' FROM op"))))
+
+  (testing "- threw a raw ClassCastException in SELECT, because every
+            subtraction routed to numeric arithmetic"
+    (is (= "{\"a\": 1, \"kind\": \"x\"}" (v "SELECT d - 'b' FROM op")))
+    (is (= "[1, 3]" (v "SELECT '[1,2,3]'::jsonb - 1"))
+        "an explicit ::jsonb cast is a jsonb operand too, not just a column")
+    (is (= "7" (v "SELECT n - 3 FROM op")) "numeric subtraction is untouched"))
+
+  (testing "jsonb_agg was a per-row fn, so it returned one row per input
+            row instead of one array per group"
+    (run "CREATE TABLE ag (id int PRIMARY KEY, g text, v int)")
+    (run "INSERT INTO ag VALUES (1,'a',10),(2,'a',20),(3,'b',30)")
+    (is (= 1 (count (rows "SELECT jsonb_agg(v) FROM ag"))))
+    (is (= 2 (count (rows "SELECT g, jsonb_agg(v) FROM ag GROUP BY g"))))
+    (is (= "[30]" (v "SELECT jsonb_agg(v) FROM ag WHERE g = 'b'")))))
+
+(deftest is-null-sees-the-sql-null-sentinel
+  (testing "SQL NULL travels as :__null__, not nil, so `nil?` answered
+            false for a value that IS NULL"
+    (run "CREATE TABLE nn (id int PRIMARY KEY, d jsonb)")
+    (run "INSERT INTO nn VALUES (1, '{\"jn\":null,\"s\":\"x\"}')")
+    (is (= [["t"]] (rows "SELECT (d->'nope') IS NULL FROM nn")))
+    (is (= [["f"]] (rows "SELECT (d->'jn') IS NULL FROM nn"))
+        "a PRESENT JSON null is a value, not SQL NULL")
+    (is (= [["t"]] (rows "SELECT (d->>'jn') IS NULL FROM nn"))
+        "but ->> collapses it to SQL NULL")
+    (is (= [["1"]] (rows "SELECT count(*) FROM nn WHERE d->'nope' IS NULL")))))

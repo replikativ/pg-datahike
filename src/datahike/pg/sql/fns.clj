@@ -271,6 +271,21 @@
   [coll]
   (box-array-agg coll))
 
+(defn filter-jsonb-agg
+  "SQL `jsonb_agg(expr)` — ONE jsonb array over the whole group.
+
+   Was a per-row fn wrapping each value in its own array, so
+   `SELECT jsonb_agg(id) FROM t` returned one row per input row instead
+   of one row holding them all. Registering it in
+   `sql-aggregate->datalog` is what makes datalog fold it over the
+   group; `array_agg` next door is the same shape.
+
+   NULLs are kept — PostgreSQL's jsonb_agg emits JSON null for them,
+   unlike array_agg — and an empty group is SQL NULL."
+  [coll]
+  (let [vs (mapv (fn [v] (if (= :__null__ v) :datahike.pg.jsonb/json-null v)) coll)]
+    (if (empty? vs) :__null__ vs)))
+
 (defn- akey-compare
   "Null-safe comparator for array_agg `ORDER BY` keys. A key is a scalar or a
    vector (multiple ORDER BY columns, compared lexicographically). NULLs sort
@@ -1018,6 +1033,7 @@
    "median"         'median
    "corr"           'datahike.pg.sql/filter-corr
    "array_agg"      'datahike.pg.sql/filter-array-agg
+   "jsonb_agg"      'datahike.pg.sql/filter-jsonb-agg
    ;; Ordered-set aggregates — `WITHIN GROUP (ORDER BY x)` syntax.
    ;; Translator routes them through the pair-aggregate path (like
    ;; corr) since the percentile fraction is a constant alongside

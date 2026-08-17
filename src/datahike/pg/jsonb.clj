@@ -322,17 +322,32 @@
       (sequential? parsed) (some #{key} parsed)
       :else false)))
 
+(defn- ->key-seq
+  "The key list for `?|` / `?&`.
+
+   PostgreSQL types their right operand `text[]`, so it arrives here as
+   a PgArray RECORD. `some`/`every?` over a record iterate its MAP
+   ENTRIES, so every key test compared a `[:elem-type …]` pair against a
+   string and `doc ?| array['a','b']` answered false for everything."
+  [ks]
+  (cond
+    (record? ks)     (or (:elements ks) [])
+    (string? ks)     [ks]
+    (sequential? ks) ks
+    (nil? ks)        []
+    :else            [ks]))
+
 (defn jsonb-exists-any?
   "PostgreSQL ?| operator: does any of the keys exist?"
   [v keys]
   (let [parsed (parse-jsonb v)]
-    (some #(jsonb-exists? parsed %) keys)))
+    (boolean (some #(jsonb-exists? parsed %) (->key-seq keys)))))
 
 (defn jsonb-exists-all?
   "PostgreSQL ?& operator: do all keys exist?"
   [v keys]
   (let [parsed (parse-jsonb v)]
-    (every? #(jsonb-exists? parsed %) keys)))
+    (every? #(jsonb-exists? parsed %) (->key-seq keys))))
 
 ;; ============================================================================
 ;; Operators: modification

@@ -85,6 +85,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Forward declarations for the mutually-recursive translate-* family.
 
+(declare jsonb-column?)
+
 (declare translate-expr
          translate-predicate
          translate-case-expr
@@ -964,16 +966,6 @@
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj (fn [k v] (jb/serialize-jsonb {(str k) v})))
         (swap! (:where-clauses ctx) conj [(list fn-param key-arg val-arg) result-var])
-        result-var)
-
-      ;; jsonb_agg(value) — collects values into jsonb array
-      (= fname "jsonb_agg")
-      (let [target (first args)
-            fn-param (symbol (str "?jsonb-agg" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj (fn [v] (jb/serialize-jsonb [v])))
-        (swap! (:where-clauses ctx) conj [(list fn-param target) result-var])
         result-var)
 
       ;; string_agg(value, delimiter) — concatenates strings with delimiter
@@ -2256,6 +2248,31 @@
     ;; A leading `~` is re-associated inside translate-binary-arith —
     ;; PG's prefix `~` binds looser than these operators. See there.
     (instance? Addition expr) (translate-binary-arith ctx expr '+)
+    ;; `jsonb - key` / `jsonb - idx` deletes; only `-` on numbers is
+    ;; arithmetic. Routing everything to translate-binary-arith made
+    ;; `SELECT p - 'b'` throw a raw ClassCastException (String cannot be
+    ;; cast to Number). Same reasoning as `||`: the stored value is a
+    ;; string, so the column type decides, not the runtime value.
+    (and (instance? Subtraction expr)
+         (jsonb-column? ctx (.getLeftExpression ^net.sf.jsqlparser.expression.BinaryExpression expr)))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
+          l (translate-expr ctx (.getLeftExpression e))
+          r (translate-expr ctx (.getRightExpression e))
+          l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+          r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+          fn-param (symbol (str "?jb-del" (swap! (:var-counter ctx) inc)))
+          del-fn (fn [a k]
+                   (cond
+                     (integer? k) (jb/jsonb-delete-idx a k)
+                     (record? k)  (jb/jsonb-delete-keys a (or (:elements k) []))
+                     (sequential? k) (jb/jsonb-delete-keys a k)
+                     :else (jb/jsonb-delete-key a k)))
+          result-var (ctx/fresh-var! ctx)]
+      (swap! (:in-params ctx) conj fn-param)
+      (swap! (:in-args ctx) conj del-fn)
+      (swap! (:where-clauses ctx) conj [(list fn-param l r) result-var])
+      result-var)
+
     (instance? Subtraction expr) (translate-binary-arith ctx expr '-)
     (instance? Multiplication expr) (translate-binary-arith ctx expr '*)
     (instance? Division expr) (translate-binary-arith ctx expr '/)
@@ -2339,8 +2356,14 @@
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
           fn-param (symbol (str "?pg-concat" (swap! (:var-counter ctx) inc)))
+          ;; `||` on jsonb is jsonb_concat, not string concatenation.
+          ;; Decided here rather than in the runtime cond because the
+          ;; stored value is a string either way — see jsonb-column?.
+          jsonb-concat? (or (jsonb-column? ctx (.getLeftExpression e))
+                            (jsonb-column? ctx (.getRightExpression e)))
           concat-fn (fn [a b]
                       (cond
+                        jsonb-concat? (jb/jsonb-concat a b)
                         (and (pg-arr/array? a) (pg-arr/array? b))
                         (pg-arr/concat-arrs a b)
                         ;; bit || bit is bitcat, not string concat — the
@@ -2635,6 +2658,34 @@
                      (and (vector? resolved) (= 3 (count resolved))) (nth resolved 2)
                      :else nil)]
       (when attr (get-in (:schema ctx) [attr :db/valueType])))))
+
+(defn- jsonb-column?
+  "Whether `expr` is a column reference of `jsonb` type.
+
+   A stored jsonb value IS a string, so runtime dispatch cannot tell it
+   from `text` — `p || '{\"z\":9}'` looks like two strings and fell to
+   string concatenation. The type has to come from the schema, and
+   `:pg/type` is an ident-entity fact, so the lookup falls back to the
+   query exactly as `coerce-insert-value` does."
+  [ctx expr]
+  (boolean
+   (or
+    ;; An explicit `::jsonb` cast is a jsonb operand even though it is
+    ;; not a column — `'[1,2,3]'::jsonb - 1`.
+    (and (instance? CastExpression expr)
+         (contains? #{"json" "jsonb"}
+                    (some-> ^CastExpression expr .getColDataType .getDataType
+                            str/lower-case)))
+    (when (instance? Column expr)
+      (let [resolved (ctx/resolve-column ^Column expr
+                                         (:table-aliases ctx)
+                                         (:default-table ctx)
+                                         (:col-overrides ctx)
+                                         (:derived-aliases ctx) (:ci-index ctx))
+            attr (ctx/attr-of ctx resolved)]
+        (and attr
+             (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
+                            (params/pg-type-of-attr (:db ctx) attr)))))))))
 
 (defn- jsonb-canonical-operand
   "Canonicalize a literal being compared against a `jsonb` column.
