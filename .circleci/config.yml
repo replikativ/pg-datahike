@@ -286,6 +286,14 @@ jobs:
           name: asyncpg run
           command: bash test/integration/asyncpg/run.sh
           no_output_timeout: 20m
+      # run.sh redirects pytest's per-test output to a file and prints only
+      # the summary, so without this the console shows WHICH tests the gate
+      # flagged but not WHY — and a flagged test cannot be told apart from
+      # one that never ran. store_artifacts runs implicitly on failure too,
+      # which is the case that matters most here.
+      - store_artifacts:
+          path: test/integration/asyncpg/last-run.log
+          destination: asyncpg-last-run.log
 
   node-postgres-conformance:
     docker:
