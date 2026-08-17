@@ -1332,13 +1332,25 @@
           (swap! (:where-clauses ctx) conj
                  [(list fn-param col-val arr-val) result-var])
           result-var)
-        (list '= (translate-expr ctx (.getLeftExpression e))
-              (translate-expr ctx right))))
+        ;; jsonb `=` in VALUE position (a projection, a CASE test) has
+        ;; the same scale-insensitivity as in WHERE, and the same
+        ;; reason not to be `=` on the canonical text.
+        (let [l (.getLeftExpression e)]
+          (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
+                  'datahike.pg.sql/jsonb-eq?
+                  '=)
+                (translate-expr ctx l)
+                (translate-expr ctx right)))))
 
     (instance? NotEqualsTo expr)
-    (let [^NotEqualsTo e expr]
-      (list 'not= (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+    (let [^NotEqualsTo e expr
+          l (.getLeftExpression e)
+          r (.getRightExpression e)]
+      (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
+              'datahike.pg.sql/jsonb-ne?
+              'not=)
+            (translate-expr ctx l)
+            (translate-expr ctx r)))
 
     (instance? IsNullExpression expr)
     ;; SQL NULL is carried as the `:__null__` sentinel, not nil — a
@@ -2787,7 +2799,7 @@
                      :else nil)]
       (when attr (get-in (:schema ctx) [attr :db/valueType])))))
 
-(defn- jsonb-column?
+(defn jsonb-column?
   "Whether `expr` is a column reference of `jsonb` type.
 
    A stored jsonb value IS a string, so runtime dispatch cannot tell it
@@ -2957,10 +2969,15 @@
      ;; plain columns in a top-level conjunct: unify on a shared logic
      ;; var (hash join) instead of get-else + predicate (cross product).
      ;; Same machinery as the explicit INNER JOIN ON path.
+     ;; NOT for jsonb: unifying on a shared logic var makes the join
+     ;; key TEXT equality, which misses `1.00` = `1`. Fall through to
+     ;; the predicate below, which uses jsonb-eq?.
      (when (and (= op '=) *conjunctive-where*
                 (instance? Column left) (instance? Column right)
                 (nil? (.getArrayConstructor ^Column left))
-                (nil? (.getArrayConstructor ^Column right)))
+                (nil? (.getArrayConstructor ^Column right))
+                (not (jsonb-column? ctx left))
+                (not (jsonb-column? ctx right)))
        (let [resolve-col #(try (ctx/resolve-column ^Column %
                                                    (:table-aliases ctx)
                                                    (:default-table ctx)
@@ -2972,7 +2989,19 @@
          (when (and l-res r-res
                     (ctx/unify-inner-equijoin! ctx l-res r-res))
            [])))
-     (let [[left right] (coerce-comparison-operands ctx left right)
+     ;; jsonb `=` / `<>` compare VALUES and are numeric-scale
+     ;; INSENSITIVE, so they cannot lower to `=` on the canonical text:
+     ;; `'1.00'::jsonb = '1'::jsonb` is TRUE in PostgreSQL and the texts
+     ;; differ. There was already a jsonb branch, but only on the path
+     ;; taken when the right operand is a BARE literal — so `j = '1'`
+     ;; was right while `j = '1'::jsonb`, `'1'::jsonb = j` and
+     ;; column-to-column comparison all fell through to here and
+     ;; answered false. Decide it BEFORE coerce-comparison-operands,
+     ;; which replaces the AST nodes this test needs.
+     (let [jsonb-cmp? (and (contains? #{'= 'not=} op)
+                           (or (jsonb-column? ctx left)
+                               (jsonb-column? ctx right)))
+           [left right] (coerce-comparison-operands ctx left right)
            ;; Each side is either an AST node (translate-expr-bound) or
            ;; a pre-resolved typed Clojure value from coerce-unknown.
            l (if (instance? net.sf.jsqlparser.expression.Expression left)
@@ -2982,7 +3011,14 @@
            l (if (seq? l) (ctx/materialize-arg! ctx l) l)
            r (if (seq? r) (ctx/materialize-arg! ctx r) r)
            guards (ctx/null-guard-clauses ctx [l r])]
-       (conj guards [(list op l r)])))))
+       (conj guards
+             (cond
+               (and jsonb-cmp? (= op '=))
+               [(list 'datahike.pg.sql/jsonb-eq? l r)]
+               jsonb-cmp?
+               [(list 'datahike.pg.sql/jsonb-ne? l r)]
+               :else
+               [(list op l r)]))))))
 
 (defn translate-predicate
   "Translate a JSqlParser WHERE expression to Datalog :where clauses.

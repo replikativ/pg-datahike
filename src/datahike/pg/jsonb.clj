@@ -441,6 +441,12 @@
   (or (= a b)
       (= (parse-jsonb a) (parse-jsonb b))))
 
+(defn jsonb-ne?
+  "PostgreSQL's jsonb `<>`. Not `not=` on the canonical text: that
+   answers TRUE for `1.00` vs `1`, which are the same jsonb value."
+  [a b]
+  (not (jsonb-eq? a b)))
+
 (defn jsonb-contains?
   "PostgreSQL @> operator: does left contain right?"
   [left right]
