@@ -86,6 +86,21 @@
     v
     (let [cat (types/cast-category type-str)]
       (case cat
+        ;; Both json types VALIDATE on input — `json_in` does a full
+        ;; RFC-8259 parse and only then keeps the original bytes — and
+        ;; only jsonb normalises afterwards. Handled here rather than at
+        ;; either call site because a BARE literal cast is constant-folded
+        ;; in sql.clj while any other cast reaches translate-cast-expr,
+        ;; and both delegate here.
+        (:json :jsonb)
+        (if (string? v)
+          (do ((requiring-resolve 'datahike.pg.jsonb/validate-json!) v)
+              (if (= :jsonb cat)
+                ((requiring-resolve 'datahike.pg.jsonb/serialize-jsonb) v)
+                v))
+          (if (= :jsonb cat)
+            ((requiring-resolve 'datahike.pg.jsonb/serialize-jsonb) v)
+            v))
         ;; A bit value cast to a number is a REINTERPRETATION of its bits
         ;; (varbit.c:1598), not a decimal read of its digits, so this has
         ;; to come before the generic numeric branches — and a PgBit

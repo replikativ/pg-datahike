@@ -695,7 +695,7 @@
 (defn cast-category
   "Classify a SQL type name for CAST handling.
    Returns :integer, :float, :text, :boolean, :date, :time,
-   :timestamp, :uuid, :bytes, :array, or nil. :date and :time are
+   :timestamp, :uuid, :bytes, :array, :json, :jsonb, or nil. :date and :time are
    checked before :timestamp so callers can emit the
    display-appropriate Java type (LocalDate / LocalTime vs Instant).
    Any type-name ending in `[]` classifies as :array; the element
@@ -706,6 +706,13 @@
           base (clojure.string/replace sql-type-name #"\s*\([^)]*\)" "")]
       (cond
         (clojure.string/ends-with? base "[]") :array
+        ;; `json` / `jsonb`. Absent here, `::jsonb` fell through every
+        ;; arm of cast-scalar and returned its input UNCHANGED — the
+        ;; cast was a no-op that only set the wire OID, so a malformed
+        ;; literal was accepted and a well-formed one was not
+        ;; canonicalised.
+        (= base "json")                       :json
+        (= base "jsonb")                      :jsonb
         (contains? cast-integer-types base)   :integer
         (contains? cast-numeric-types base)   :numeric
         (contains? cast-float-types base)     :float
