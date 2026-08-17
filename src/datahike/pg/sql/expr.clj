@@ -986,15 +986,6 @@
       ;; NOTE: True GROUP BY aggregation requires custom Datahike aggregate
       ;; support. This handles the scalar/subquery case where it receives
       ;; already-grouped data.
-      (= fname "jsonb_object_agg")
-      (let [[key-arg val-arg] args
-            fn-param (symbol (str "?jsonb-oagg" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj (fn [k v] (jb/serialize-jsonb {(str k) v})))
-        (swap! (:where-clauses ctx) conj [(list fn-param key-arg val-arg) result-var])
-        result-var)
-
       ;; string_agg(value, delimiter) — concatenates strings with delimiter
       (= fname "string_agg")
       (let [[val-arg delim-arg] args
@@ -2518,18 +2509,36 @@
     ;; jsonb field/element access: col->'key', col->>'key', col->'a'->>'b'
     (instance? JsonExpression expr)
     (let [{:keys [base chain]} (flatten-json-chain ^JsonExpression expr)
-          base-val (translate-expr ctx base)]
-      (reduce
-       (fn [current [key-val op-str]]
-         (let [op-fn  (jb/op op-str)
-               param  (symbol (str "?json-op" (swap! (:var-counter ctx) inc)))
-               result (ctx/fresh-var! ctx)]
-           (swap! (:in-params ctx) conj param)
-           (swap! (:in-args ctx) conj op-fn)
-           (swap! (:where-clauses ctx) conj [(list param current key-val) result])
-           result))
-       base-val
-       chain))
+          base-val (translate-expr ctx base)
+          ;; `->` and `#>` yield a JSON VALUE; `->>` and `#>>` yield text.
+          ;; A json string must therefore render QUOTED (`"x"`, not `x`),
+          ;; but the output path sees a Clojure string either way and
+          ;; cannot tell it from a SQL text value. Serialising the FINAL
+          ;; result of a value-returning chain settles it at the one
+          ;; place that knows — intermediate steps stay values, so
+          ;; `d->'a'->>'b'` is unaffected.
+          value-op? (contains? #{"->" "#>"} (second (last chain)))]
+      (cond-> (reduce
+               (fn [current [key-val op-str]]
+                 (let [op-fn  (jb/op op-str)
+                       param  (symbol (str "?json-op" (swap! (:var-counter ctx) inc)))
+                       result (ctx/fresh-var! ctx)]
+                   (swap! (:in-params ctx) conj param)
+                   (swap! (:in-args ctx) conj op-fn)
+                   (swap! (:where-clauses ctx) conj [(list param current key-val) result])
+                   result))
+               base-val
+               chain)
+        value-op?
+        (as-> v (let [param  (symbol (str "?json-render" (swap! (:var-counter ctx) inc)))
+                      result (ctx/fresh-var! ctx)]
+                  (swap! (:in-params ctx) conj param)
+                  (swap! (:in-args ctx) conj
+                         (fn [x] (if (or (nil? x) (= :__null__ x))
+                                   :__null__
+                                   (jb/serialize-jsonb x))))
+                  (swap! (:where-clauses ctx) conj [(list param v) result])
+                  result))))
 
     ;; expr AT TIME ZONE 'zone' — e.g. now() AT TIME ZONE 'UTC'
     (instance? TimezoneExpression expr)

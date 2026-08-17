@@ -286,3 +286,33 @@
     (is (= [["1"]] (rows "SELECT count(*) FROM jc WHERE b ? 'a'"))))
   (testing "and json keeps the six it does have"
     (is (= "1" (v "SELECT j->>'a' FROM jc")))))
+
+(deftest object-aggregates
+  (run "CREATE TABLE oa (id int PRIMARY KEY, k text, v int, g text)")
+  (run "INSERT INTO oa VALUES (1,'b',1,'x'),(2,'a',2,'x'),(3,'c',3,'y')")
+  (testing "jsonb_object_agg was a per-row fn producing a one-key object
+            per row; it now folds over the group through the two-argument
+            aggregate path CORR already used"
+    (is (= "{\"a\": 2, \"b\": 1, \"c\": 3}" (v "SELECT jsonb_object_agg(k,v) FROM oa")))
+    (is (= 2 (count (rows "SELECT g, jsonb_object_agg(k,v) FROM oa GROUP BY g")))))
+  (testing "json_object_agg keeps insertion order and pads its braces,
+            which is PostgreSQL's own punctuation for that function"
+    (is (= "{ \"b\" : 1, \"a\" : 2, \"c\" : 3 }" (v "SELECT json_object_agg(k,v) FROM oa")))))
+
+(deftest arrow-returns-a-json-value
+  (run "CREATE TABLE ar (id int PRIMARY KEY, d jsonb)")
+  (run "INSERT INTO ar VALUES (1, '{\"s\":\"x\",\"n\":1.00,\"arr\":[1,2],\"obj\":{\"k\":9},\"jn\":null}')")
+  (testing "-> yields a json VALUE, so a string renders QUOTED — the
+            output path sees a Clojure string either way and cannot tell
+            it from SQL text, so the chain serialises its own result"
+    (is (= "\"x\"" (v "SELECT d->'s' FROM ar")))
+    (is (= "x" (v "SELECT d->>'s' FROM ar")) "->> is text, unquoted")
+    (is (= "1.00" (v "SELECT d->'n' FROM ar")) "and numeric scale survives")
+    (is (= "[1, 2]" (v "SELECT d->'arr' FROM ar")))
+    (is (= "{\"k\": 9}" (v "SELECT d->'obj' FROM ar")))
+    (is (= "null" (v "SELECT d->'jn' FROM ar"))))
+  (testing "chaining is unaffected — only the FINAL result of a
+            value-returning chain is serialised"
+    (is (= "9" (v "SELECT d->'obj'->>'k' FROM ar")))
+    (is (= "9" (v "SELECT d->'obj'->'k' FROM ar")))
+    (is (= "2" (v "SELECT d->'arr'->>1 FROM ar")))))

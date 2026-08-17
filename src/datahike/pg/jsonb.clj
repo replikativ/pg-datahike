@@ -245,7 +245,17 @@
             ;; THE ROW. `SELECT p->'nope' FROM t` returned zero rows
             ;; where PostgreSQL returns one row of NULL. `:__null__` is
             ;; the sentinel the rest of the pipeline renders as SQL NULL.
-            missing :__null__]
+            missing :__null__
+            ;; An array index can arrive as the STRING "1" — the chain
+            ;; emitter carries the ident as text, and PostgreSQL's own
+            ;; `#>` path is text[] too. Coerce for sequential targets so
+            ;; `d->'arr'->>1` reaches element 1 instead of falling
+            ;; through to "missing".
+            key-or-idx (if (and (sequential? parsed)
+                                (string? key-or-idx)
+                                (re-matches #"-?\d+" key-or-idx))
+                         (parse-long key-or-idx)
+                         key-or-idx)]
         (cond
           (and (map? parsed) (string? key-or-idx))
           (get parsed key-or-idx missing)

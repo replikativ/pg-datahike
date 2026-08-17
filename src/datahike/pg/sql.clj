@@ -83,6 +83,8 @@
 (def filter-avg            fns/filter-avg)
 (def filter-avg-numeric    fns/filter-avg-numeric)
 (def filter-jsonb-agg      fns/filter-jsonb-agg)
+(def filter-jsonb-object-agg fns/filter-jsonb-object-agg)
+(def filter-json-object-agg  fns/filter-json-object-agg)
 (def sql-null?             fns/sql-null?)
 (def sql-not-null?         fns/sql-not-null?)
 (def filter-min            fns/filter-min)

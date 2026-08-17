@@ -2330,14 +2330,22 @@
                           (swap! find-elements conj (list 'count evar)))
                         (swap! find-aliases conj (or alias-str "count")))
                       ;; Multi-argument aggregates (CORR)
-                      (if (and (= agg-sym 'datahike.pg.sql/filter-corr) params (= 2 (count params)))
+                      ;; Two-argument aggregates: CORR(y,x) and the
+                      ;; object-aggs, which all fold over [a b] pairs.
+                      (if (and (contains? #{'datahike.pg.sql/filter-corr
+                                            'datahike.pg.sql/filter-jsonb-object-agg
+                                            'datahike.pg.sql/filter-json-object-agg}
+                                          agg-sym)
+                               params (= 2 (count params)))
                         (let [v1 (expr/translate-expr ctx (first params))
                               v2 (expr/translate-expr ctx (second params))
+                              v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
+                              v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
                               pair-var (ctx/fresh-var! ctx)]
                           (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
                           (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
-                          (swap! find-elements conj (list 'datahike.pg.sql/filter-corr pair-var))
-                          (swap! find-aliases conj (or alias-str "corr")))
+                          (swap! find-elements conj (list agg-sym pair-var))
+                          (swap! find-aliases conj (or alias-str fname)))
                         ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
                         (let [inner-expr (first params)
                               v (expr/translate-expr ctx inner-expr)

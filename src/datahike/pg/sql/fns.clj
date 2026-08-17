@@ -445,6 +445,41 @@
   (let [v (filter-variance-samp coll)]
     (if (= :__null__ v) :__null__ (Math/sqrt (double v)))))
 
+(defn filter-jsonb-object-agg
+  "SQL `jsonb_object_agg(k, v)` — one object over the whole group.
+   Input is a collection of `[k v]` pairs, the shape the two-argument
+   aggregate path already produces for CORR.
+
+   jsonb semantics: keys are canonicalised and a duplicate key takes the
+   LAST value, which `into {}` gives directly. A NULL key is an error in
+   PostgreSQL; we drop the pair rather than produce a null key."
+  [pairs]
+  (let [ps (remove (fn [p] (let [k (first p)] (or (nil? k) (= :__null__ k)))) pairs)]
+    (if (empty? ps)
+      :__null__
+      (into {} (map (fn [p] [(str (first p)) (second p)])) ps))))
+
+(defn filter-json-object-agg
+  "SQL `json_object_agg(k, v)` — the text-faithful sibling.
+
+   `json` keeps insertion order and DUPLICATE keys, so this builds text
+   directly rather than a map. PostgreSQL pads this one:
+   `{ \"b\" : 1, \"a\" : 2 }` — braces spaced, colons spaced."
+  [pairs]
+  (let [ps (remove (fn [p] (let [k (first p)] (or (nil? k) (= :__null__ k)))) pairs)]
+    (if (empty? ps)
+      :__null__
+      (str "{ "
+           (clojure.string/join
+            ", " (map (fn [p]
+                        (str ((requiring-resolve 'datahike.pg.jsonb/serialize-jsonb)
+                              (str (first p)))
+                             " : "
+                             ((requiring-resolve 'datahike.pg.jsonb/serialize-jsonb)
+                              (second p))))
+                      ps))
+           " }"))))
+
 (defn filter-corr
   "SQL CORR(y, x) — Pearson correlation. Input is a collection of [x y]
    pairs (as produced by translate-select for two-arg CORR). Pairs where
@@ -1032,6 +1067,8 @@
    "var_pop"        'variance
    "median"         'median
    "corr"           'datahike.pg.sql/filter-corr
+   "jsonb_object_agg" 'datahike.pg.sql/filter-jsonb-object-agg
+   "json_object_agg"  'datahike.pg.sql/filter-json-object-agg
    "array_agg"      'datahike.pg.sql/filter-array-agg
    "jsonb_agg"      'datahike.pg.sql/filter-jsonb-agg
    ;; json_agg and jsonb_agg render identically for arrays — the
