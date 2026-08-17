@@ -293,6 +293,28 @@ invariant.
 
 ---
 
+### The asyncpg suite gives different answers in CI and locally
+
+Same commit, freshly restarted server: **95 passed / 74 failed locally,
+45 / 127 in CircleCI**. Both are stable — CI produced byte-identical
+counts and the same six resolved tests on `main` (build 1279) and on
+`fix/jsonb-conformance` (1342), and two local runs agreed with each
+other.
+
+The two environments disagree in *both* directions, so neither is simply
+"more broken": six tests pass in CI and fail locally
+(`test_prepare_03`, `test_invalid_input`, the two `executemany` ones,
+two custom-codec ones), while `test_connect_params` does the reverse.
+One local failure is `test_prepare_03` asserting `'?v4' != 'aaa'` — a
+datalog variable reaching the client as a value, which is an S1-shaped
+symptom whatever causes the divergence.
+
+Until this is understood, `expected-failures.txt` tracks CI and a local
+run will report spurious regressions. Candidate causes not yet ruled
+out: a different asyncpg build (CI compiles it; the local `.venv` may
+not), Python 3.11 in CI vs 3.12 locally, and accumulated tables in the
+long-lived local database changing what introspection returns.
+
 ## Test-surface note
 
 Before this round the entire JSON surface was **6 assertions**, all
