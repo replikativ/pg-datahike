@@ -254,9 +254,15 @@ plausible wrong answer rather than an error.
   `to_json`, `row_to_json`, `json_each`, …). PostgreSQL mirrors every
   `jsonb_*` name; we have none.
 - SQL/JSON path: `jsonb_path_query` and friends, `@@`.
-- `jsonb_each`, `jsonb_array_elements` and friends are not
-  set-returning; they serialize the whole collection into one cell.
-- `jsonb_object_keys` returns a JSON array string rather than rows.
+- ~~`jsonb_each`, `jsonb_array_elements` and friends are not
+  set-returning~~ — **FIXED on `feat/srf-catalog`** for FROM position:
+  they now materialise into rows, along with the `json_*` spellings,
+  `regexp_split_to_table`, `string_to_table` and the record-shaping
+  `json/jsonb_to_record(set)`. In the SELECT LIST they still serialise
+  the whole collection into one cell; that is PG's ProjectSet and needs
+  the same per-row expansion LATERAL does.
+- ~~`jsonb_object_keys` returns a JSON array string rather than rows~~ —
+  **FIXED on `feat/srf-catalog`** in FROM position, same caveat.
 - `chr()`.
 - `CREATE INDEX` is accepted and discarded — `(empty-result "CREATE
   INDEX")`. No GIN analogue exists, and the current operator lowering
@@ -475,6 +481,33 @@ Not specific to date, so it is not part of the DDL type-fidelity work.
 PostgreSQL adds days and answers a date. Date arithmetic generally
 (`date - date` -> integer, `date + interval` -> timestamp) is
 unimplemented.
+
+### A constant-argument SRF in JOIN position is dropped
+
+`SELECT count(*) FROM t, generate_series(1,3) AS g` answers the OUTER
+row count (2) where PostgreSQL answers 6, and projecting the SRF's
+column raises `missing FROM-clause entry`. The join reduce in
+`translate-select` handles `Table` and `ParenthesedSelect` right-items
+and silently drops anything else, so the relation never exists.
+
+CORRELATED arguments now work (`feat/lateral-srf`); this is the
+constant case, which takes the materialise-once path and has nowhere to
+be registered from a join position. Wiring it needs the derived-join
+machinery: an attempt that only registered the alias produced worse
+answers than the error it replaced — duplicate rows collapsed and an
+EMPTY srf failed to eliminate the outer rows — so it was reverted
+rather than half-landed.
+
+### Unqualified column names are not resolved across FROM items
+
+`SELECT tid FROM t, c WHERE c.tid = t.id` raises `column "tid" does not
+exist`; PostgreSQL resolves an unqualified name by searching every FROM
+item. `ctx/resolve-column` only consults `default-table`, so any
+multi-table query must qualify its columns.
+
+Not specific to joins or LATERAL — `SELECT v FROM t, (SELECT 1 AS v) s`
+fails the same way. It is why the correlated-SRF work covers `g.g` but
+not bare `g`.
 
 ### Unordered aggregates do not preserve input order
 

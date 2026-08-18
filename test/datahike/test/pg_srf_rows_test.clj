@@ -99,3 +99,97 @@
                                "WHERE word <> ALL ('{a,abs}'::text[])")))]
       (is (some? v))
       (is (re-find #"abort" v)))))
+
+;; ---------------------------------------------------------------------------
+;; The json/jsonb expansion family in FROM position
+
+(deftest json-expansion-srfs-produce-rows
+  ;; Every implementation already existed in datahike.pg.jsonb and was
+  ;; wired for the SELECT-list path, which SERIALISES the collection into
+  ;; one cell. In FROM position there was no entry at all, so the item
+  ;; materialised to nothing and the query answered ZERO ROWS silently —
+  ;; or, with count(*), raised the internal `Query for unknown vars`.
+  (testing "array elements"
+    (is (= [["1"] ["2"]] (rows "SELECT * FROM jsonb_array_elements('[1,2]'::jsonb)")))
+    (is (= [["3"]] (rows "SELECT count(*) FROM jsonb_array_elements('[1,2,3]'::jsonb)")))
+    (is (= [["a"] ["b"]]
+           (rows "SELECT * FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb)"))))
+
+  (testing "object expansion, key and value"
+    (is (= [["a" "1"] ["b" "2"]]
+           (rows "SELECT * FROM jsonb_each('{\"a\":1,\"b\":2}'::jsonb) ORDER BY key")))
+    (is (= [["a" "1"]]
+           (rows "SELECT * FROM jsonb_each_text('{\"a\":1}'::jsonb)"))))
+
+  (testing "object keys — PG names the column after the function"
+    (is (= [["a"] ["b"]]
+           (rows "SELECT jsonb_object_keys FROM jsonb_object_keys('{\"a\":1,\"b\":2}'::jsonb)
+                  ORDER BY 1"))))
+
+  (testing "an empty document yields no rows, not one empty row"
+    (is (= [] (rows "SELECT * FROM jsonb_array_elements('[]'::jsonb)")))
+    (is (= [] (rows "SELECT * FROM jsonb_each('{}'::jsonb)")))))
+
+(deftest json-and-jsonb-families-differ-in-punctuation
+  ;; The only difference between the two spellings is how a returned
+  ;; DOCUMENT is punctuated.
+  (is (= [["a" "{\"x\": 1}"]]
+         (rows "SELECT * FROM jsonb_each('{\"a\":{\"x\":1}}'::jsonb)")))
+  (is (= [["a" "{\"x\":1}"]]
+         (rows "SELECT * FROM json_each('{\"a\":{\"x\":1}}'::json)"))))
+
+(deftest split-srfs
+  (testing "regexp_split_to_table splits on a PATTERN"
+    (is (= [["a"] ["b"] ["c"]] (rows "SELECT * FROM regexp_split_to_table('a1b22c', '[0-9]+')"))))
+  (testing "string_to_table splits on a LITERAL — a regex would match everything"
+    (is (= [["a"] ["b"] ["c"]] (rows "SELECT * FROM string_to_table('a.b.c', '.')")))))
+
+;; ---------------------------------------------------------------------------
+;; Record-shaping SRFs, whose shape comes from the AS column list
+
+(deftest record-srfs-take-their-shape-from-the-alias
+  ;; `AS r(a int, b text)` carries a TYPE per column as well as a name.
+  ;; Only names were read, so these had nothing to build from and
+  ;; returned no rows.
+  (testing "recordset expands an array of objects"
+    (is (= [["1" "x"] ["2" "y"]]
+           (rows "SELECT * FROM jsonb_to_recordset('[{\"a\":1,\"b\":\"x\"},{\"a\":2,\"b\":\"y\"}]'::jsonb)
+                  AS r(a int, b text) ORDER BY a"))))
+
+  (testing "record takes a single object"
+    (is (= [["1" "x"]]
+           (rows "SELECT * FROM json_to_record('{\"a\":1,\"b\":\"x\"}') AS r(a int, b text)"))))
+
+  (testing "columns are projectable and countable by name"
+    (is (= [["1"] ["2"]]
+           (rows "SELECT a FROM jsonb_to_recordset('[{\"a\":1},{\"a\":2}]'::jsonb)
+                  AS r(a int) ORDER BY a")))
+    (is (= [["2"]]
+           (rows "SELECT count(*) FROM jsonb_to_recordset('[{\"a\":1},{\"a\":2}]'::jsonb)
+                  AS r(a int)"))))
+
+  (testing "a key absent from the document is NULL"
+    (is (= [["1" nil]]
+           (rows "SELECT * FROM jsonb_to_recordset('[{\"a\":1}]'::jsonb) AS r(a int, b text)")))))
+
+;; ---------------------------------------------------------------------------
+
+(deftest unknown-function-in-from-raises-42883
+  ;; Used to fall through to "no relation", so `SELECT * FROM
+  ;; nosuchfunc(1)` answered ZERO ROWS and count(*) raised the internal
+  ;; `Query for unknown vars: [?_eid]`. PostgreSQL raises 42883.
+  (let [^PgWireServer$QueryResult r (run "SELECT * FROM nosuchfunc(1)")]
+    (is (re-find #"function nosuchfunc\(\) does not exist" (or (.-error r) "")))))
+
+(deftest record-srf-temporal-and-narrow-int-columns
+  ;; The declared type has to reach BOTH the value and the catalog. A
+  ;; `date` coldef casts to a LocalDate, but the row is transacted into
+  ;; a :db.type/instant attribute that only accepts a java.util.Date —
+  ;; without normalising, the transaction rejected it outright.
+  (testing "a date column round-trips as a date"
+    (is (= [["2020-01-01"]]
+           (rows "SELECT * FROM jsonb_to_recordset('[{\"d\":\"2020-01-01\"}]'::jsonb)
+                  AS r(d date)"))))
+  (testing "a narrow integer keeps its declared width"
+    (is (= [["1"]]
+           (rows "SELECT * FROM jsonb_to_recordset('[{\"a\":1}]'::jsonb) AS r(a smallint)")))))

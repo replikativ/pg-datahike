@@ -48,6 +48,7 @@
             [datahike.pg.schema :as pgs]
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
+            [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
@@ -825,6 +826,36 @@
     (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
     :else ::corr))
 
+(defn- coldef-pg-type
+  "The `:pg/type` for a column-definition-list entry like `a int`.
+
+   Delegates to `ddl/pg-type-hint`, which makes the same decision for
+   CREATE TABLE and ALTER TABLE. This used to be a narrow local copy
+   because that function lived on an unmerged branch; keeping two would
+   have let the column-definition list and DDL drift apart on exactly
+   the types Datahike collapses (every integer onto :db.type/long,
+   every temporal onto :db.type/instant).
+
+   The `(n)` suffix is stripped here because `pg-type-hint`'s DDL caller
+   strips it before calling and so must this one — `numeric(10,2)` has
+   to reach it as `numeric`."
+  [^String t]
+  (some-> t (str/replace #"\s*\([^)]*\)" "") (ddl/pg-type-hint false)))
+
+(def ^:private known-srf-names
+  "Function names `materialize-table-function` knows how to turn into a
+   relation. Used only to tell an UNKNOWN function in FROM apart from a
+   known one whose arguments we could not evaluate (a correlated LATERAL
+   argument): the first is 42883, the second is not."
+  #{"unnest" "generate_series" "pg_get_keywords"
+    "jsonb_array_elements" "json_array_elements"
+    "jsonb_array_elements_text" "json_array_elements_text"
+    "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
+    "jsonb_object_keys" "json_object_keys"
+    "regexp_split_to_table" "string_to_table"
+    "now" "current_timestamp" "transaction_timestamp"
+    "statement_timestamp" "clock_timestamp"})
+
 (defn- srf-base-name
   "The bare, lower-cased name of a function call, with any schema
    qualifier removed: `pg_catalog.generate_series` -> `generate_series`.
@@ -854,8 +885,9 @@
    eval-fn that resolves correlated arguments per outer row — see
    srf-const-eval's note. That is why arguments flow through eval-fn here
    rather than being pattern-matched as literals inline."
-  ([tf] (materialize-table-function tf srf-const-eval))
-  ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn]
+  ([tf] (materialize-table-function tf srf-const-eval nil))
+  ([tf eval-fn] (materialize-table-function tf eval-fn nil))
+  ([^net.sf.jsqlparser.statement.select.TableFunction tf eval-fn coldefs]
    (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
          ;; Strip a schema qualifier: PostgreSQL resolves `pg_catalog.foo()`
          ;; and `foo()` to the same function through search_path, and pgjdbc
@@ -918,6 +950,104 @@
                    (mapv (fn [v] [(long v)]) vals)
                    [:db.type/long] ["int4"]))))))
 
+       ;; json_to_recordset / jsonb_to_recordset expand an ARRAY of
+       ;; objects into typed rows; the *_record forms take one object.
+       ;; Their shape comes entirely from the `AS r(a int, b text)`
+       ;; column-definition list -- PostgreSQL raises 42601 without one
+       ;; -- which is why the alias' colDataType had to be threaded in
+       ;; here rather than only its name.
+       (contains? #{"json_to_recordset" "jsonb_to_recordset"
+                    "json_to_record" "jsonb_to_record"} fname)
+       (when (seq coldefs)
+         (let [v (eval-fn (first params))
+               parsed (jb/parse-jsonb v)
+               maps (if (str/ends-with? fname "recordset")
+                      (if (sequential? parsed) parsed [])
+                      [parsed])
+               names (mapv first coldefs)
+               types (mapv second coldefs)
+               ;; The cast produces the value the DECLARED type implies —
+               ;; `date` gives a LocalDate — but the row is transacted
+               ;; into an attribute whose storage type is
+               ;; :db.type/instant, which only accepts a java.util.Date.
+               ;; Without this normalisation `AS r(d date)` failed the
+               ;; transaction with `invalid input syntax for column "d"`.
+               ->storage (fn [v]
+                           (condp instance? v
+                             java.time.LocalDate
+                             (java.util.Date/from
+                              (.toInstant (.atStartOfDay ^java.time.LocalDate v
+                                                         java.time.ZoneOffset/UTC)))
+                             java.time.LocalDateTime
+                             (java.util.Date/from
+                              (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC))
+                             v))
+               cell (fn [m t nm]
+                      (let [raw (when (map? m) (get m nm))]
+                        (when (some? raw)
+                          (->storage
+                           (try (sql-cast/cast-scalar raw t {:explicit? true})
+                                (catch Throwable _ raw))))))]
+           (with-ordinality names
+             (mapv (fn [m] (mapv (fn [t nm] (cell m t nm)) types names)) maps)
+             (mapv (fn [t] (or (get types/sql-name->dh-type (str/lower-case t))
+                               :db.type/string))
+                   types)
+             (mapv coldef-pg-type types))))
+
+       ;; The json/jsonb expansion family. Every implementation already
+       ;; existed in datahike.pg.jsonb and was wired for the SELECT-list
+       ;; path, where it SERIALISES the whole collection into one cell;
+       ;; in FROM position it has to become rows. Without an entry here
+       ;; the FROM item materialised to nothing and the query answered
+       ;; ZERO ROWS silently -- or, with count(*), the internal
+       ;; `Query for unknown vars: [?_eid]`.
+       ;;
+       ;; The `json_` and `jsonb_` spellings differ only in the
+       ;; punctuation of a returned document: json_each gives
+       ;; `{"x":1}` where jsonb_each gives `{"x": 1}`.
+       (contains? #{"jsonb_array_elements" "json_array_elements"} fname)
+       (let [json? (str/starts-with? fname "json_")
+             ser (if json? jb/serialize-json jb/serialize-jsonb)]
+         (with-ordinality ["value"]
+           (mapv (fn [x] [(ser x)]) (jb/jsonb-array-elements (eval-fn (first params))))
+           [:db.type/string] [(if json? "json" "jsonb")]))
+
+       (contains? #{"jsonb_array_elements_text" "json_array_elements_text"} fname)
+       (with-ordinality ["value"]
+         (mapv vector (jb/jsonb-array-elements-text (eval-fn (first params))))
+         [:db.type/string] ["text"])
+
+       (contains? #{"jsonb_each" "json_each"} fname)
+       (let [json? (str/starts-with? fname "json_")
+             ser (if json? jb/serialize-json jb/serialize-jsonb)]
+         (with-ordinality ["key" "value"]
+           (mapv (fn [[k v]] [k (ser v)]) (jb/jsonb-each (eval-fn (first params))))
+           [:db.type/string :db.type/string] ["text" (if json? "json" "jsonb")]))
+
+       (contains? #{"jsonb_each_text" "json_each_text"} fname)
+       (with-ordinality ["key" "value"]
+         (mapv vec (jb/jsonb-each-text (eval-fn (first params))))
+         [:db.type/string :db.type/string] ["text" "text"])
+
+       (contains? #{"jsonb_object_keys" "json_object_keys"} fname)
+       ;; PG names the column after the function, not "value".
+       (with-ordinality [fname]
+         (mapv vector (jb/jsonb-object-keys (eval-fn (first params))))
+         [:db.type/string] ["text"])
+
+       ;; regexp_split_to_table(string, pattern) / string_to_table(string,
+       ;; delimiter) — the difference is regex vs literal separator.
+       (contains? #{"regexp_split_to_table" "string_to_table"} fname)
+       (let [[sv dv] (mapv eval-fn (take 2 params))]
+         (when (and (string? sv) (string? dv))
+           (with-ordinality [fname]
+             (mapv vector
+                   (if (= fname "regexp_split_to_table")
+                     (str/split sv (re-pattern dv))
+                     (str/split sv (re-pattern (java.util.regex.Pattern/quote dv)))))
+             [:db.type/string] ["text"])))
+
        ;; pg_get_keywords() — a real catalog SRF. pgjdbc calls it on
        ;; every connection through getSQLKeywords(); without it the
        ;; aggregate over a missing relation answered one NULL row, and
@@ -960,6 +1090,15 @@
                      (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
                                   (unquote-ident (.-name c)))
                                 (or (.getAliasColumns ^Alias a) []))))
+        ;; `AS r(a int, b text)` carries a TYPE per column as well as a
+        ;; name. Only the names were read, so the record-shaping SRFs --
+        ;; whose entire shape comes from this list -- had nothing to
+        ;; build from.
+        alias-coldefs (when-let [a (.getAlias tf)]
+                        (seq (keep (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                     (when-let [t (.-colDataType c)]
+                                       [(unquote-ident (.-name c)) (str t)]))
+                                   (or (.getAliasColumns ^Alias a) []))))
         fname  (or (srf-base-name (.getName (.getFunction tf))) "tf")
         ;; Storage namespace, not the user's alias — see
         ;; materialize-derived-select! for why they must differ.
@@ -990,7 +1129,8 @@
                                         (eval-corr-scalar pf (str e) false
                                                           (:schema db) db))]
                           r
-                          ::corr))))))]
+                          ::corr)))))
+                alias-coldefs)]
       (let [_ (when (and alias-cols (> (count alias-cols) (count aliases)))
                 (throw (ex-info (str "table \"" (or talias "") "\" has " (count aliases)
                                      " columns available but " (count alias-cols)
@@ -1032,6 +1172,131 @@
             spec-db2 (if (seq data-tx) (d/db-with spec-db data-tx) spec-db)]
         {:db spec-db2 :schema (:schema spec-db2)
          :name sub-name :alias (or talias sub-name) :aliases aliases}))))
+
+(def ^:private correlated-srf-shapes
+  "Column shape for the SRFs we can evaluate PER OUTER ROW.
+
+   A correlated SRF cannot be materialised once, so its columns have to
+   be declared without looking at the data — that is the only thing this
+   map is for. `:cols` are the default column names PostgreSQL uses,
+   `:vtypes` their Datahike storage types, `:pg-types` the declared type
+   to advertise (nil = derive from the storage type).
+
+   Deliberately smaller than `known-srf-names`: an SRF whose output type
+   depends on its INPUT data (unnest of an arbitrary array, the json
+   expansions) cannot state a static shape, so it stays on the
+   materialise-once path and a correlated use of it still raises."
+  {"generate_series" {:cols ["generate_series"] :vtypes [:db.type/long]
+                      :pg-types ["int4"]}
+   "regexp_split_to_table" {:cols ["regexp_split_to_table"] :vtypes [:db.type/string]
+                            :pg-types ["text"]}
+   "string_to_table" {:cols ["string_to_table"] :vtypes [:db.type/string]
+                      :pg-types ["text"]}})
+
+(defn- srf-rows-fn
+  "Runtime row producer for a correlated SRF: a fn of the evaluated
+   arguments returning a VECTOR OF TUPLES.
+
+   Must never return nil. `bind-by-fn` drops the outer tuple when the fn
+   answers nil (query.cljc: `:when (not (nil? val))`), which is
+   indistinguishable from an empty result for an inner LATERAL but would
+   be wrong for an outer one — and a nil here would silently swallow
+   rows rather than raise."
+  [fname]
+  (case fname
+    "generate_series"
+    (fn [& args]
+      (let [[start stop step] (map #(when (number? %) (long %)) args)
+            step (or step 1)]
+        (if (or (nil? start) (nil? stop) (zero? step))
+          []
+          (mapv vector (range start (if (pos? step) (inc stop) (dec stop)) step)))))
+
+    ("regexp_split_to_table" "string_to_table")
+    (fn [sv dv]
+      (if-not (and (string? sv) (string? dv))
+        []
+        (mapv vector
+              (if (= fname "regexp_split_to_table")
+                (str/split sv (re-pattern dv))
+                (str/split sv (re-pattern (java.util.regex.Pattern/quote dv)))))))
+    nil))
+
+(defn- correlated-table-fn->spec
+  "A `TableFunction` FROM item whose arguments reference outer columns —
+   `FROM t, LATERAL generate_series(1, t.n)`.
+
+   It cannot be materialised once, because its rows depend on the outer
+   row. But Datahike's function binding already IS a parameterized nested
+   loop: `bind-by-fn` applies the fn once per production tuple and
+   expands the result through the binding form, so
+
+     [(f ?n) [[?v ?ord]]]
+
+   yields one row per element PER OUTER ROW inside the ordinary flat
+   `:where`. No second query, no speculative data, no nested-loop step
+   outside the single Datalog query.
+
+   What still has to exist is the RELATION: `SELECT *`, `count(*)` and
+   OID inference all read the schema. So register the columns (with no
+   data) in a speculative db and hand back the vars the emitter will
+   bind, which `ctx/col-var!` is pre-seeded with so a column reference
+   resolves to the bound var instead of emitting an attribute lookup.
+
+   Returns nil when this is not a correlated SRF we can shape."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf db var-counter]
+  (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
+        fname (srf-base-name (.getName f))
+        shape (get correlated-srf-shapes fname)
+        params (vec (or (.getParameters f) []))
+        ;; Correlated iff an argument IS a column reference. This is a
+        ;; SYNTACTIC test on purpose. Evaluating instead does not
+        ;; discriminate: `srf-const-eval` answers ::corr for a constant
+        ;; EXPRESSION too (`array_upper(current_schemas(false), 1)` --
+        ;; the pgjdbc TypeInfoCache shape), and the widened evaluation
+        ;; the materialise-once path uses goes the other way, happily
+        ;; resolving `t.n` against some arbitrary row and reporting it
+        ;; constant. A Column argument is exactly what "correlated"
+        ;; means, and a function-call argument can never be one.
+        corr? (some #(instance? Column %) params)]
+    (when (and shape corr? (seq params))
+      (let [talias (when-let [a (.getAlias tf)]
+                     (unquote-ident (.getName ^Alias a)))
+            alias-cols (when-let [a (.getAlias tf)]
+                         (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                      (unquote-ident (.-name c)))
+                                    (or (.getAliasColumns ^Alias a) []))))
+            base-cols (:cols shape)
+            ;; `AS g(x)` renames positionally; a single-column SRF also
+            ;; takes the bare alias as its column name, as PG does for
+            ;; `generate_series(1,3) AS foo`.
+            cols (cond
+                   alias-cols (vec (map-indexed (fn [i c] (or (nth alias-cols i nil) c))
+                                                base-cols))
+                   (and talias (= 1 (count base-cols))) [talias]
+                   :else base-cols)
+            sub-name (str "__lsrf__" (or talias fname))
+            marker (pgs/row-marker-attr sub-name)
+            schema-tx (conj (mapv (fn [c vt pt]
+                                    (cond-> {:db/ident (keyword sub-name c)
+                                             :db/valueType vt
+                                             :db/cardinality :db.cardinality/one}
+                                      pt (assoc :pg/type pt)))
+                                  cols (:vtypes shape)
+                                  (concat (or (:pg-types shape) []) (repeat nil)))
+                            {:db/ident marker
+                             :db/valueType :db.type/boolean
+                             :db/cardinality :db.cardinality/one})
+            spec-db (d/db-with db schema-tx)
+            vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
+            ;; Ordinality is NOT a column here: it exists so Datalog's SET
+            ;; semantics cannot collapse duplicate rows. `unnest(ARRAY[1,1,1])`
+            ;; returns ONE row without it, verified against the engine.
+            ord-var (symbol (str "?" sub-name "_ord" (swap! var-counter inc)))]
+        {:db spec-db :schema (:schema spec-db)
+         :name sub-name :alias (or talias sub-name)
+         :cols cols :vars vars :ord-var ord-var
+         :marker marker :fname fname :params params}))))
 
 (defn- sequence->virtual-table
   "Materialise `FROM <sequence-name>` into a one-row virtual table.
@@ -1778,6 +2043,16 @@
         ;; FROM item is a bare relation name (issue #26).
         seq-vt (when (and db (instance? Table from-item))
                  (sequence->virtual-table ^Table from-item db))
+        ;; A correlated SRF in FROM — `FROM t, LATERAL generate_series(1, t.n)`.
+        ;; Detected here so the relation exists for SELECT * / count(*)
+        ;; / OID inference; the actual per-outer-row binding is emitted
+        ;; after `ctx` exists (search lsrf-spec below).
+        lsrf-var-counter (atom 0)
+        lsrf-spec (when (and db (instance? net.sf.jsqlparser.statement.select.TableFunction
+                                           from-item))
+                    (correlated-table-fn->spec
+                     ^net.sf.jsqlparser.statement.select.TableFunction from-item
+                     db lsrf-var-counter))
         ;; Handle derived tables: FROM (SELECT ...) AS sub, including
         ;; table-function forms like (SELECT * FROM unnest(ARRAY[…])
         ;; WITH ORDINALITY) AS sub.
@@ -1796,12 +2071,33 @@
           ;; virtual table the rest of the query scans normally. Correlated
           ;; (LATERAL) table functions are future work — see
           ;; doc/design-alignment.md.
+          ;; Correlated SRF: relation registered, rows bound per outer row.
+          lsrf-spec
+          [(:db lsrf-spec) (:schema lsrf-spec) (:name lsrf-spec) (:alias lsrf-spec)]
+
           (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
           (if-let [{vdb :db vschema :schema vname :name valias :alias}
                    (table-fn->virtual-table
                     ^net.sf.jsqlparser.statement.select.TableFunction from-item db)]
             [vdb vschema vname valias]
-            [db schema nil nil])
+            ;; An unrecognised function in FROM used to fall through to
+            ;; "no relation", so `SELECT * FROM nosuchfunc(1)` answered
+            ;; ZERO ROWS and `count(*)` raised the internal
+            ;; `Query for unknown vars: [?_eid]`. PostgreSQL raises
+            ;; 42883. A name we DO know but could not materialise is a
+            ;; different case -- a correlated LATERAL argument -- and
+            ;; keeps the old behaviour until LATERAL lands.
+            (let [fname (srf-base-name
+                         (.getName (.getFunction
+                                    ^net.sf.jsqlparser.statement.select.TableFunction from-item)))]
+              (if (contains? known-srf-names fname)
+                [db schema nil nil]
+                (throw (errors/pg-error
+                        :undefined-function
+                        {:function (str fname "()")
+                         :hint (str "No function matches the given name and "
+                                    "argument types. You might need to add "
+                                    "explicit type casts.")})))))
 
           ;; A sequence is a relation in PG: `SELECT * FROM myseq` reads
           ;; its position. Materialise the three-column form so the rest
@@ -1852,18 +2148,33 @@
         ;; materialize it into the db and register its alias. The JOIN
         ;; is then handled as an ordinary table join in translate-join.
         joins (.getJoins select)
-        [db schema join-aliases derived-joins]
+        [db schema join-aliases derived-joins lsrf-specs]
         (reduce
-         (fn [[db schema aliases derived] ^Join j]
+         (fn [[db schema aliases derived lsrfs] ^Join j]
            (let [rt (.getRightItem j)]
              (cond
+               ;; A correlated SRF is ALWAYS in a join/comma position —
+               ;; it has to have an outer row to correlate WITH — so this
+               ;; branch, not the FROM-item one, is what actually fires
+               ;; for `FROM t, LATERAL generate_series(1, t.n)`.
+               (and db (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+                    (correlated-table-fn->spec
+                     ^net.sf.jsqlparser.statement.select.TableFunction rt db lsrf-var-counter))
+               (let [spec (correlated-table-fn->spec
+                           ^net.sf.jsqlparser.statement.select.TableFunction rt
+                           db lsrf-var-counter)]
+                 [(:db spec) (:schema spec)
+                  (assoc aliases (:alias spec) (:name spec))
+                  derived
+                  (conj lsrfs spec)])
+
                (instance? Table rt)
                (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
                  [db schema
                   (cond-> aliases
                     (and jn ja) (assoc ja jn)
                     jn          (assoc jn jn))
-                  derived])
+                  derived lsrfs])
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
@@ -1871,12 +2182,13 @@
                                           ^ParenthesedSelect rt db schema)]
                  [spec-db spec-schema
                   (assoc aliases sub-name sub-name)
-                  (conj derived {:join j :alias sub-name})]
-                 [db schema aliases derived])
+                  (conj derived {:join j :alias sub-name})
+                  lsrfs]
+                 [db schema aliases derived lsrfs])
 
                :else
-               [db schema aliases derived])))
-         [db schema {} []]
+               [db schema aliases derived lsrfs])))
+         [db schema {} [] []]
          joins)
         table-aliases (merge table-aliases join-aliases)
 
@@ -1898,6 +2210,58 @@
                            :ref-targets (pgs/validate-ref-targets!
                                          db schema
                                          (pgs/derive-ref-targets schema hints))})
+
+        ;; Correlated SRF: bind its rows PER OUTER ROW.
+        ;;
+        ;; Pre-seeding `:col->var` is what makes this work without a new
+        ;; resolution concept — `ctx/col-var!` returns a cached var
+        ;; without emitting the `get-else` attribute lookup it would
+        ;; otherwise produce, so every column reference, `SELECT *`
+        ;; expansion and ORDER BY resolves to the fn-bound var.
+        ;;
+        ;; The ordinality var goes into `:with`: Datalog is set-based, so
+        ;; without it a function returning [7 7 7] collapses to ONE row.
+        _ (doseq [lsrf-spec (cond-> (vec lsrf-specs) lsrf-spec (conj lsrf-spec))]
+            (let [{:keys [cols vars ord-var fname params name marker]} lsrf-spec
+                  rows-fn (srf-rows-fn fname)
+                  arg-vals (mapv (fn [e]
+                                   (let [v (srf-const-eval e)]
+                                     (if (not= ::corr v)
+                                       v
+                                       ;; A correlated argument resolves
+                                       ;; to the OUTER column's var, which
+                                       ;; is exactly what makes the fn run
+                                       ;; once per outer row.
+                                       (expr/translate-expr ctx e))))
+                                 params)
+                  fn-param (symbol (str "?lsrf-fn" (swap! (:var-counter ctx) inc)))
+                  ;; [[?c1 ?c2 … ?ord]] — a RELATION binding, so one
+                  ;; produced tuple becomes one row.
+                  binding-form [(conj (vec vars) ord-var)]]
+              (doseq [[c v] (map vector cols vars)]
+                (swap! (:col->var ctx) assoc [(:alias lsrf-spec) (keyword name c)] v)
+                (swap! (:col->var ctx) assoc (keyword name c) v))
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj
+                     (fn [& as]
+                       (let [rs (apply rows-fn as)]
+                         ;; NEVER nil: bind-by-fn drops the outer tuple on
+                         ;; nil, which would swallow rows silently.
+                         (vec (map-indexed (fn [i r] (conj (vec r) (long (inc i))))
+                                           (or rs []))))))
+              (ctx/add-clause! ctx [(apply list fn-param arg-vals) binding-form])
+              ;; `:with` preserves bag multiplicity, which is the whole
+              ;; point here — but that is exactly what DISTINCT must not
+              ;; have. `has-distinct?` works by WITHHOLDING the entity
+              ;; var from :with-vars, so adding the ordinality
+              ;; unconditionally re-introduced the duplicates DISTINCT
+              ;; was asked to remove.
+              (when-not (some? (.getDistinct select))
+                (swap! (:with-vars ctx) conj ord-var))
+              ;; The row marker never gets a datom (there is no data), so
+              ;; anything that scans for it must not be emitted.
+              (swap! (:col->var ctx) assoc (keyword name (clojure.core/name marker))
+                     (first vars))))
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins

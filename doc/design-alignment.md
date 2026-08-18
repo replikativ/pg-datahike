@@ -59,11 +59,19 @@ Capabilities implemented and exercised by the conformance suites:
 
 These need execution beyond one `d/q` over one snapshot:
 
-- **LATERAL joins / correlated set-returning functions**. PostgreSQL evaluates
+- **LATERAL subqueries** (`JOIN LATERAL (SELECT …)`). PostgreSQL evaluates
   LATERAL as a parameterized nested loop: for each outer row, the inner item is
-  evaluated with the outer columns bound. The single flat `:where` cannot
-  express a per-outer-row inner evaluation; this requires a nested-loop step on
-  the SELECT path. (`LATERAL generate_series(1, t.n)`, `JOIN LATERAL (subquery)`.)
+  evaluated with the outer columns bound. A subquery is a relational expression
+  rather than a function of its arguments, so this still needs either a
+  nested-loop step or de-correlated materialisation.
+
+  **Correlated set-returning functions are NOT in this category** — that was a
+  mistaken reading of the engine. Datahike's `bind-by-fn` applies a function
+  once per production tuple and expands the result through the binding form, so
+  `[(f ?n) [[?v ?ord]]]` already evaluates per outer row inside the ordinary
+  flat `:where`. `FROM t, LATERAL generate_series(1, t.n)` compiles to one
+  Datalog query with no speculative data, which is why it keeps the parse cache
+  and fast-select lanes a materialisation approach would forfeit.
 - **Portal streaming / row limits**. Extended-protocol `Execute` with a row cap
   (`PortalSuspended`) — driver `fetchSize`, server-side cursors over large
   results. Today all rows materialise from one `d/q`.
