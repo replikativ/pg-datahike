@@ -180,3 +180,16 @@
   ;; `Query for unknown vars: [?_eid]`. PostgreSQL raises 42883.
   (let [^PgWireServer$QueryResult r (run "SELECT * FROM nosuchfunc(1)")]
     (is (re-find #"function nosuchfunc\(\) does not exist" (or (.-error r) "")))))
+
+(deftest record-srf-temporal-and-narrow-int-columns
+  ;; The declared type has to reach BOTH the value and the catalog. A
+  ;; `date` coldef casts to a LocalDate, but the row is transacted into
+  ;; a :db.type/instant attribute that only accepts a java.util.Date —
+  ;; without normalising, the transaction rejected it outright.
+  (testing "a date column round-trips as a date"
+    (is (= [["2020-01-01"]]
+           (rows "SELECT * FROM jsonb_to_recordset('[{\"d\":\"2020-01-01\"}]'::jsonb)
+                  AS r(d date)"))))
+  (testing "a narrow integer keeps its declared width"
+    (is (= [["1"]]
+           (rows "SELECT * FROM jsonb_to_recordset('[{\"a\":1}]'::jsonb) AS r(a smallint)")))))

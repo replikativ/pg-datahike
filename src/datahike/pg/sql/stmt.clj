@@ -48,6 +48,7 @@
             [datahike.pg.schema :as pgs]
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
+            [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.expr :as expr]
@@ -826,24 +827,20 @@
     :else ::corr))
 
 (defn- coldef-pg-type
-  "The `:pg/type` to advertise for a column-definition-list entry like
-   `a int`. Datahike collapses every integer onto :db.type/long and
-   every temporal onto :db.type/instant, so without this an
-   `AS r(a int)` column would report int8 rather than int4.
+  "The `:pg/type` for a column-definition-list entry like `a int`.
 
-   Deliberately narrow: only the cases where the storage valueType is
-   ambiguous. `datahike.pg.sql.ddl/pg-type-hint` makes the same decision
-   for CREATE TABLE and ALTER TABLE; these should be unified once both
-   land."
+   Delegates to `ddl/pg-type-hint`, which makes the same decision for
+   CREATE TABLE and ALTER TABLE. This used to be a narrow local copy
+   because that function lived on an unmerged branch; keeping two would
+   have let the column-definition list and DDL drift apart on exactly
+   the types Datahike collapses (every integer onto :db.type/long,
+   every temporal onto :db.type/instant).
+
+   The `(n)` suffix is stripped here because `pg-type-hint`'s DDL caller
+   strips it before calling and so must this one — `numeric(10,2)` has
+   to reach it as `numeric`."
   [^String t]
-  (let [t (some-> t str/lower-case str/trim (str/replace #"\s*\([^)]*\)" ""))]
-    (cond
-      (#{"smallint" "int2"} t) "int2"
-      (#{"integer" "int" "int4"} t) "int4"
-      (#{"date" "time" "timestamp" "timestamptz" "json" "jsonb"} t) t
-      (= "timestamp without time zone" t) "timestamp"
-      (= "timestamp with time zone" t) "timestamptz"
-      :else nil)))
+  (some-> t (str/replace #"\s*\([^)]*\)" "") (ddl/pg-type-hint false)))
 
 (def ^:private known-srf-names
   "Function names `materialize-table-function` knows how to turn into a
@@ -969,11 +966,28 @@
                       [parsed])
                names (mapv first coldefs)
                types (mapv second coldefs)
+               ;; The cast produces the value the DECLARED type implies —
+               ;; `date` gives a LocalDate — but the row is transacted
+               ;; into an attribute whose storage type is
+               ;; :db.type/instant, which only accepts a java.util.Date.
+               ;; Without this normalisation `AS r(d date)` failed the
+               ;; transaction with `invalid input syntax for column "d"`.
+               ->storage (fn [v]
+                           (condp instance? v
+                             java.time.LocalDate
+                             (java.util.Date/from
+                              (.toInstant (.atStartOfDay ^java.time.LocalDate v
+                                                         java.time.ZoneOffset/UTC)))
+                             java.time.LocalDateTime
+                             (java.util.Date/from
+                              (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC))
+                             v))
                cell (fn [m t nm]
                       (let [raw (when (map? m) (get m nm))]
                         (when (some? raw)
-                          (try (sql-cast/cast-scalar raw t {:explicit? true})
-                               (catch Throwable _ raw)))))]
+                          (->storage
+                           (try (sql-cast/cast-scalar raw t {:explicit? true})
+                                (catch Throwable _ raw))))))]
            (with-ordinality names
              (mapv (fn [m] (mapv (fn [t nm] (cell m t nm)) types names)) maps)
              (mapv (fn [t] (or (get types/sql-name->dh-type (str/lower-case t))
