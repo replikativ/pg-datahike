@@ -648,8 +648,21 @@
               ;; cache key. Mirrors the OID inference in
               ;; oid-infer/column-oid.
           :pg_attribute/atttypid
-          (long (let [base (pgs/oid-for-valuetype (:valuetype col))]
-                  (if (= :db.cardinality/many (:cardinality col))
+          ;; `(:oid col)`, NOT a fresh derivation from :valuetype. The
+          ;; column map already carries the authoritative OID from
+          ;; `declared-col-oid`, which honours the `:pg/type` recorded at
+          ;; CREATE TABLE. Recomputing from storage type collapsed every
+          ;; declared type back onto its Datahike carrier: a `date`
+          ;; column reported `timestamp without time zone` (1114) and an
+          ;; `int` column reported `bigint` (20). Drivers read this to
+          ;; pick a codec, so it is not cosmetic — and a date column's
+          ;; binary encode then failed and silently shipped text bytes
+          ;; labelled as binary.
+          (long (let [base (:oid col)]
+                  (if (and (= :db.cardinality/many (:cardinality col))
+                           ;; `_int4` already resolved to 1007 via
+                           ;; :pg/type; promoting again would give int[][].
+                           (not (contains? types/array-oid->element-oid base)))
                     (get types/element-oid->array-oid base types/oid-text-array)
                     base)))
           :pg_attribute/attnum (long (inc idx))
@@ -900,7 +913,13 @@
                :information_schema_columns/ordinal_position       pos
                :information_schema_columns/column_default         nil
                :information_schema_columns/is_nullable            (if identity? "NO" "YES")
-               :information_schema_columns/data_type              (pgs/pg-type-name vtype)
+               ;; From the column's DECLARED OID, not its storage
+               ;; valueType — the same correction pg_attribute.atttypid
+               ;; needed. :db.type/instant carries date, time and
+               ;; timestamp alike, so a `date` column reported
+               ;; `timestamp without time zone` here.
+               :information_schema_columns/data_type
+               (or (get types/oid->pg-name (:oid col)) (pgs/pg-type-name vtype))
                :information_schema_columns/character_maximum_length nil
                :information_schema_columns/character_octet_length nil
                :information_schema_columns/numeric_precision      (numeric-precision vtype (:attr col))

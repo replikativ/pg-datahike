@@ -365,6 +365,22 @@
      (instance? java.time.LocalTime v) (str v)       ;; "14:25:48.130861"
      (instance? java.time.LocalDateTime v)           ;; "2017-03-13 14:25:48.130861"
      (-> (str v) (str/replace "T" " "))
+     ;; A `date` COLUMN stores a java.util.Date (Datahike has only
+     ;; :db.type/instant), so it fell to the generic instant branch below
+     ;; and rendered "2020-01-01 00:00:00". A `::date` CAST produces a
+     ;; LocalDate and was already right, which is why the cast path
+     ;; looked correct and the column path did not. The declared OID is
+     ;; what distinguishes them.
+     ;;
+     ;; Not cosmetic: PgParamCodec binary-encodes OID 1082 with
+     ;; LocalDate.parse, which throws on "2020-01-01 00:00:00"; the
+     ;; exception was swallowed and TEXT bytes went out labelled as
+     ;; binary, so every binary-format client read garbage from a date
+     ;; column.
+     (and (inst? v) (= oid PgWireServer/OID_DATE))
+     (-> ^java.util.Date v .toInstant
+         (.atZone java.time.ZoneOffset/UTC) .toLocalDate str)
+
      (inst? v)    (let [^java.time.Instant inst
                         (if (instance? java.util.Date v)
                           (.toInstant ^java.util.Date v)
@@ -515,6 +531,7 @@
                                        :where [[?e :db/ident ?ident]
                                                [?e :pg/typmod ?tm]]}
                                      db)))
+          rd-hints (when db (pgs/schema-hints db))
           n (count aliases)
           toids (int-array n)
           attnums (short-array n)
@@ -526,8 +543,12 @@
               tname (when attr (namespace attr))
               cname (when attr (name attr))
               toid (when tname (pgs/table-oid db tname))
+              ;; Pass hints: they carry the CREATE TABLE column order,
+              ;; and RowDescription's attnum must agree with
+              ;; pg_attribute's or pgjdbc's updatable ResultSet maps
+              ;; columns to the wrong positions.
               anum (when (and tname cname)
-                     (pgs/column-attnum schema tname cname))
+                     (pgs/column-attnum schema tname cname rd-hints))
               tm (when attr (get typmod-map attr))]
           (when (and toid anum)
             (reset! any? true)
@@ -6092,8 +6113,14 @@
                                 (cond-> {:db/ident (keyword table name)
                                          :db/valueType dh-type
                                          :db/cardinality :db.cardinality/one}
-                                  (#{"jsonb" "json"} base-type)
-                                  (assoc :pg/type base-type)))
+                                  ;; The SAME hint CREATE TABLE records.
+                                  ;; This used to cover json/jsonb only,
+                                  ;; so a column added by ALTER as `date`
+                                  ;; or `smallint` reported its storage
+                                  ;; type (timestamp / int8) forever.
+                                  (ddl/pg-type-hint base-type false)
+                                  (assoc :pg/type
+                                         (ddl/pg-type-hint base-type false))))
                               ;; PK/UNIQUE on an existing column: upgrade the
                               ;; attribute — datahike's index-backfill migration
                               ;; populates AVET for pre-existing datoms and

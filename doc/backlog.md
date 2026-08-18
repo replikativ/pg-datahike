@@ -394,6 +394,8 @@ aggregate layer, which it does not carry.
 
 ### DDL loses date-ness and integer width
 
+> **FIXED on `fix/ddl-type-fidelity`**
+
 `CREATE TABLE t (id int, d date)` reports `d` as `timestamp without
 time zone` and `id` as `bigint` through `format_type`/`pg_attribute`,
 so `SELECT d` renders `2020-01-01 00:00:00` where PostgreSQL renders
@@ -448,6 +450,31 @@ matched the RAW function name, so anything schema-qualified missed its
 
 PostgreSQL resolves the qualified and unqualified forms to the same
 function through search_path, and pgjdbc writes the qualified one.
+
+### Casting a temporal to text renders java.util.Date.toString
+
+`SELECT ts::text` answers `Wed Jan 01 02:00:00 PST 2020` where
+PostgreSQL answers `2020-01-01 10:00:00` — RFC-822-ish AND shifted into
+the local zone. `d::text`, `d::varchar` and `concat(d, '')` are the
+same. `cast-scalar`'s `:text` branch falls through to `(str v)` for a
+`java.util.Date`.
+
+Two parts to a fix, and the second is the awkward one: rendering the
+instant in ISO form is easy, but telling `date` from `timestamp`
+requires the SOURCE type, which `cast-scalar` does not receive. The
+column path solves this from the declared OID; the cast path would need
+`oid-infer/expr-oid` on the operand, the way `pg_typeof` already does
+(`expr.clj`).
+
+Not specific to date, so it is not part of the DDL type-fidelity work.
+
+### `date + integer` is not implemented
+
+`SELECT d + 1` on a date column raises
+`class java.util.Date cannot be cast to class java.lang.Number`.
+PostgreSQL adds days and answers a date. Date arithmetic generally
+(`date - date` -> integer, `date + interval` -> timestamp) is
+unimplemented.
 
 ### Unordered aggregates do not preserve input order
 

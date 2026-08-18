@@ -335,6 +335,49 @@
               (str/replace #"\)$" "")
               str/trim))))))
 
+(defn pg-type-hint
+  "The `:pg/type` a column of SQL type `base-type` should record, or nil
+   when the storage valueType already implies the right OID.
+
+   Datahike collapses whole families onto one carrier — every integer is
+   :db.type/long, every temporal is :db.type/instant, jsonb and bit are
+   :db.type/string — so this hint is the ONLY thing that lets the
+   catalog report `date` rather than `timestamp`, or `int4` rather than
+   `int8`. Drivers pick codecs off those OIDs.
+
+   Extracted so `ALTER TABLE ... ADD COLUMN` records the same hints
+   CREATE TABLE does. It previously recorded them only for json/jsonb,
+   so a column added by ALTER as `date` or `smallint` reported the
+   storage type forever after.
+
+   `array?` suppresses the scalar hints: an `int[]` column has base-type
+   \"int\" too and its array `:pg/type` (\"_int4\") is set elsewhere."
+  [^String base-type array?]
+  (let [bt (some-> base-type str/lower-case str/trim)]
+    (cond
+      (nil? bt) nil
+
+      (#{"jsonb" "json"} bt) bt
+
+      (#{"date" "time" "timestamp" "timestamptz"
+         "timestamp without time zone" "timestamp with time zone"
+         "time without time zone" "time with time zone"} bt)
+      (cond
+        (= "timestamp without time zone" bt) "timestamp"
+        (= "timestamp with time zone" bt)    "timestamptz"
+        (#{"time without time zone" "time with time zone"} bt) "time"
+        :else bt)
+
+      array? nil
+
+      (#{:bit :varbit} (types/cast-category bt))
+      (if (= :varbit (types/cast-category bt)) "varbit" "bit")
+
+      (#{"smallint" "int2" "smallserial" "serial2"} bt) "int2"
+      (#{"integer" "int" "int4" "serial" "serial4"} bt) "int4"
+      (= "oid" bt) "oid"
+      :else nil)))
+
 (defn translate-create-table
   "Translate a CREATE TABLE statement to Datahike schema transaction data.
    Also returns :table-name, :column-order, :identity-cols, and :inherits."
