@@ -1159,6 +1159,131 @@
         {:db spec-db2 :schema (:schema spec-db2)
          :name sub-name :alias (or talias sub-name) :aliases aliases}))))
 
+(def ^:private correlated-srf-shapes
+  "Column shape for the SRFs we can evaluate PER OUTER ROW.
+
+   A correlated SRF cannot be materialised once, so its columns have to
+   be declared without looking at the data — that is the only thing this
+   map is for. `:cols` are the default column names PostgreSQL uses,
+   `:vtypes` their Datahike storage types, `:pg-types` the declared type
+   to advertise (nil = derive from the storage type).
+
+   Deliberately smaller than `known-srf-names`: an SRF whose output type
+   depends on its INPUT data (unnest of an arbitrary array, the json
+   expansions) cannot state a static shape, so it stays on the
+   materialise-once path and a correlated use of it still raises."
+  {"generate_series" {:cols ["generate_series"] :vtypes [:db.type/long]
+                      :pg-types ["int4"]}
+   "regexp_split_to_table" {:cols ["regexp_split_to_table"] :vtypes [:db.type/string]
+                            :pg-types ["text"]}
+   "string_to_table" {:cols ["string_to_table"] :vtypes [:db.type/string]
+                      :pg-types ["text"]}})
+
+(defn- srf-rows-fn
+  "Runtime row producer for a correlated SRF: a fn of the evaluated
+   arguments returning a VECTOR OF TUPLES.
+
+   Must never return nil. `bind-by-fn` drops the outer tuple when the fn
+   answers nil (query.cljc: `:when (not (nil? val))`), which is
+   indistinguishable from an empty result for an inner LATERAL but would
+   be wrong for an outer one — and a nil here would silently swallow
+   rows rather than raise."
+  [fname]
+  (case fname
+    "generate_series"
+    (fn [& args]
+      (let [[start stop step] (map #(when (number? %) (long %)) args)
+            step (or step 1)]
+        (if (or (nil? start) (nil? stop) (zero? step))
+          []
+          (mapv vector (range start (if (pos? step) (inc stop) (dec stop)) step)))))
+
+    ("regexp_split_to_table" "string_to_table")
+    (fn [sv dv]
+      (if-not (and (string? sv) (string? dv))
+        []
+        (mapv vector
+              (if (= fname "regexp_split_to_table")
+                (str/split sv (re-pattern dv))
+                (str/split sv (re-pattern (java.util.regex.Pattern/quote dv)))))))
+    nil))
+
+(defn- correlated-table-fn->spec
+  "A `TableFunction` FROM item whose arguments reference outer columns —
+   `FROM t, LATERAL generate_series(1, t.n)`.
+
+   It cannot be materialised once, because its rows depend on the outer
+   row. But Datahike's function binding already IS a parameterized nested
+   loop: `bind-by-fn` applies the fn once per production tuple and
+   expands the result through the binding form, so
+
+     [(f ?n) [[?v ?ord]]]
+
+   yields one row per element PER OUTER ROW inside the ordinary flat
+   `:where`. No second query, no speculative data, no nested-loop step
+   outside the single Datalog query.
+
+   What still has to exist is the RELATION: `SELECT *`, `count(*)` and
+   OID inference all read the schema. So register the columns (with no
+   data) in a speculative db and hand back the vars the emitter will
+   bind, which `ctx/col-var!` is pre-seeded with so a column reference
+   resolves to the bound var instead of emitting an attribute lookup.
+
+   Returns nil when this is not a correlated SRF we can shape."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf db var-counter]
+  (let [^net.sf.jsqlparser.expression.Function f (.getFunction tf)
+        fname (srf-base-name (.getName f))
+        shape (get correlated-srf-shapes fname)
+        params (vec (or (.getParameters f) []))
+        ;; Correlated iff an argument IS a column reference. This is a
+        ;; SYNTACTIC test on purpose. Evaluating instead does not
+        ;; discriminate: `srf-const-eval` answers ::corr for a constant
+        ;; EXPRESSION too (`array_upper(current_schemas(false), 1)` --
+        ;; the pgjdbc TypeInfoCache shape), and the widened evaluation
+        ;; the materialise-once path uses goes the other way, happily
+        ;; resolving `t.n` against some arbitrary row and reporting it
+        ;; constant. A Column argument is exactly what "correlated"
+        ;; means, and a function-call argument can never be one.
+        corr? (some #(instance? Column %) params)]
+    (when (and shape corr? (seq params))
+      (let [talias (when-let [a (.getAlias tf)]
+                     (unquote-ident (.getName ^Alias a)))
+            alias-cols (when-let [a (.getAlias tf)]
+                         (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                      (unquote-ident (.-name c)))
+                                    (or (.getAliasColumns ^Alias a) []))))
+            base-cols (:cols shape)
+            ;; `AS g(x)` renames positionally; a single-column SRF also
+            ;; takes the bare alias as its column name, as PG does for
+            ;; `generate_series(1,3) AS foo`.
+            cols (cond
+                   alias-cols (vec (map-indexed (fn [i c] (or (nth alias-cols i nil) c))
+                                                base-cols))
+                   (and talias (= 1 (count base-cols))) [talias]
+                   :else base-cols)
+            sub-name (str "__lsrf__" (or talias fname))
+            marker (pgs/row-marker-attr sub-name)
+            schema-tx (conj (mapv (fn [c vt pt]
+                                    (cond-> {:db/ident (keyword sub-name c)
+                                             :db/valueType vt
+                                             :db/cardinality :db.cardinality/one}
+                                      pt (assoc :pg/type pt)))
+                                  cols (:vtypes shape)
+                                  (concat (or (:pg-types shape) []) (repeat nil)))
+                            {:db/ident marker
+                             :db/valueType :db.type/boolean
+                             :db/cardinality :db.cardinality/one})
+            spec-db (d/db-with db schema-tx)
+            vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
+            ;; Ordinality is NOT a column here: it exists so Datalog's SET
+            ;; semantics cannot collapse duplicate rows. `unnest(ARRAY[1,1,1])`
+            ;; returns ONE row without it, verified against the engine.
+            ord-var (symbol (str "?" sub-name "_ord" (swap! var-counter inc)))]
+        {:db spec-db :schema (:schema spec-db)
+         :name sub-name :alias (or talias sub-name)
+         :cols cols :vars vars :ord-var ord-var
+         :marker marker :fname fname :params params}))))
+
 (defn- sequence->virtual-table
   "Materialise `FROM <sequence-name>` into a one-row virtual table.
 
@@ -1904,6 +2029,16 @@
         ;; FROM item is a bare relation name (issue #26).
         seq-vt (when (and db (instance? Table from-item))
                  (sequence->virtual-table ^Table from-item db))
+        ;; A correlated SRF in FROM — `FROM t, LATERAL generate_series(1, t.n)`.
+        ;; Detected here so the relation exists for SELECT * / count(*)
+        ;; / OID inference; the actual per-outer-row binding is emitted
+        ;; after `ctx` exists (search lsrf-spec below).
+        lsrf-var-counter (atom 0)
+        lsrf-spec (when (and db (instance? net.sf.jsqlparser.statement.select.TableFunction
+                                           from-item))
+                    (correlated-table-fn->spec
+                     ^net.sf.jsqlparser.statement.select.TableFunction from-item
+                     db lsrf-var-counter))
         ;; Handle derived tables: FROM (SELECT ...) AS sub, including
         ;; table-function forms like (SELECT * FROM unnest(ARRAY[…])
         ;; WITH ORDINALITY) AS sub.
@@ -1922,6 +2057,10 @@
           ;; virtual table the rest of the query scans normally. Correlated
           ;; (LATERAL) table functions are future work — see
           ;; doc/design-alignment.md.
+          ;; Correlated SRF: relation registered, rows bound per outer row.
+          lsrf-spec
+          [(:db lsrf-spec) (:schema lsrf-spec) (:name lsrf-spec) (:alias lsrf-spec)]
+
           (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
           (if-let [{vdb :db vschema :schema vname :name valias :alias}
                    (table-fn->virtual-table
@@ -1995,18 +2134,33 @@
         ;; materialize it into the db and register its alias. The JOIN
         ;; is then handled as an ordinary table join in translate-join.
         joins (.getJoins select)
-        [db schema join-aliases derived-joins]
+        [db schema join-aliases derived-joins lsrf-specs]
         (reduce
-         (fn [[db schema aliases derived] ^Join j]
+         (fn [[db schema aliases derived lsrfs] ^Join j]
            (let [rt (.getRightItem j)]
              (cond
+               ;; A correlated SRF is ALWAYS in a join/comma position —
+               ;; it has to have an outer row to correlate WITH — so this
+               ;; branch, not the FROM-item one, is what actually fires
+               ;; for `FROM t, LATERAL generate_series(1, t.n)`.
+               (and db (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+                    (correlated-table-fn->spec
+                     ^net.sf.jsqlparser.statement.select.TableFunction rt db lsrf-var-counter))
+               (let [spec (correlated-table-fn->spec
+                           ^net.sf.jsqlparser.statement.select.TableFunction rt
+                           db lsrf-var-counter)]
+                 [(:db spec) (:schema spec)
+                  (assoc aliases (:alias spec) (:name spec))
+                  derived
+                  (conj lsrfs spec)])
+
                (instance? Table rt)
                (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
                  [db schema
                   (cond-> aliases
                     (and jn ja) (assoc ja jn)
                     jn          (assoc jn jn))
-                  derived])
+                  derived lsrfs])
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
@@ -2014,12 +2168,13 @@
                                           ^ParenthesedSelect rt db schema)]
                  [spec-db spec-schema
                   (assoc aliases sub-name sub-name)
-                  (conj derived {:join j :alias sub-name})]
-                 [db schema aliases derived])
+                  (conj derived {:join j :alias sub-name})
+                  lsrfs]
+                 [db schema aliases derived lsrfs])
 
                :else
-               [db schema aliases derived])))
-         [db schema {} []]
+               [db schema aliases derived lsrfs])))
+         [db schema {} [] []]
          joins)
         table-aliases (merge table-aliases join-aliases)
 
@@ -2041,6 +2196,58 @@
                            :ref-targets (pgs/validate-ref-targets!
                                          db schema
                                          (pgs/derive-ref-targets schema hints))})
+
+        ;; Correlated SRF: bind its rows PER OUTER ROW.
+        ;;
+        ;; Pre-seeding `:col->var` is what makes this work without a new
+        ;; resolution concept — `ctx/col-var!` returns a cached var
+        ;; without emitting the `get-else` attribute lookup it would
+        ;; otherwise produce, so every column reference, `SELECT *`
+        ;; expansion and ORDER BY resolves to the fn-bound var.
+        ;;
+        ;; The ordinality var goes into `:with`: Datalog is set-based, so
+        ;; without it a function returning [7 7 7] collapses to ONE row.
+        _ (doseq [lsrf-spec (cond-> (vec lsrf-specs) lsrf-spec (conj lsrf-spec))]
+            (let [{:keys [cols vars ord-var fname params name marker]} lsrf-spec
+                  rows-fn (srf-rows-fn fname)
+                  arg-vals (mapv (fn [e]
+                                   (let [v (srf-const-eval e)]
+                                     (if (not= ::corr v)
+                                       v
+                                       ;; A correlated argument resolves
+                                       ;; to the OUTER column's var, which
+                                       ;; is exactly what makes the fn run
+                                       ;; once per outer row.
+                                       (expr/translate-expr ctx e))))
+                                 params)
+                  fn-param (symbol (str "?lsrf-fn" (swap! (:var-counter ctx) inc)))
+                  ;; [[?c1 ?c2 … ?ord]] — a RELATION binding, so one
+                  ;; produced tuple becomes one row.
+                  binding-form [(conj (vec vars) ord-var)]]
+              (doseq [[c v] (map vector cols vars)]
+                (swap! (:col->var ctx) assoc [(:alias lsrf-spec) (keyword name c)] v)
+                (swap! (:col->var ctx) assoc (keyword name c) v))
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj
+                     (fn [& as]
+                       (let [rs (apply rows-fn as)]
+                         ;; NEVER nil: bind-by-fn drops the outer tuple on
+                         ;; nil, which would swallow rows silently.
+                         (vec (map-indexed (fn [i r] (conj (vec r) (long (inc i))))
+                                           (or rs []))))))
+              (ctx/add-clause! ctx [(apply list fn-param arg-vals) binding-form])
+              ;; `:with` preserves bag multiplicity, which is the whole
+              ;; point here — but that is exactly what DISTINCT must not
+              ;; have. `has-distinct?` works by WITHHOLDING the entity
+              ;; var from :with-vars, so adding the ordinality
+              ;; unconditionally re-introduced the duplicates DISTINCT
+              ;; was asked to remove.
+              (when-not (some? (.getDistinct select))
+                (swap! (:with-vars ctx) conj ord-var))
+              ;; The row marker never gets a datom (there is no data), so
+              ;; anything that scans for it must not be emitted.
+              (swap! (:col->var ctx) assoc (keyword name (clojure.core/name marker))
+                     (first vars))))
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
