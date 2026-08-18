@@ -455,6 +455,33 @@ matched the RAW function name, so anything schema-qualified missed its
 PostgreSQL resolves the qualified and unqualified forms to the same
 function through search_path, and pgjdbc writes the qualified one.
 
+### A constant-argument SRF in JOIN position is dropped
+
+`SELECT count(*) FROM t, generate_series(1,3) AS g` answers the OUTER
+row count (2) where PostgreSQL answers 6, and projecting the SRF's
+column raises `missing FROM-clause entry`. The join reduce in
+`translate-select` handles `Table` and `ParenthesedSelect` right-items
+and silently drops anything else, so the relation never exists.
+
+CORRELATED arguments now work (`feat/lateral-srf`); this is the
+constant case, which takes the materialise-once path and has nowhere to
+be registered from a join position. Wiring it needs the derived-join
+machinery: an attempt that only registered the alias produced worse
+answers than the error it replaced — duplicate rows collapsed and an
+EMPTY srf failed to eliminate the outer rows — so it was reverted
+rather than half-landed.
+
+### Unqualified column names are not resolved across FROM items
+
+`SELECT tid FROM t, c WHERE c.tid = t.id` raises `column "tid" does not
+exist`; PostgreSQL resolves an unqualified name by searching every FROM
+item. `ctx/resolve-column` only consults `default-table`, so any
+multi-table query must qualify its columns.
+
+Not specific to joins or LATERAL — `SELECT v FROM t, (SELECT 1 AS v) s`
+fails the same way. It is why the correlated-SRF work covers `g.g` but
+not bare `g`.
+
 ### Unordered aggregates do not preserve input order
 
 `array_agg(id)` over rows 1..4 gives `{1,4,2,3}`; PostgreSQL gives
