@@ -538,6 +538,27 @@ The fix is to translate the inner ONCE with the correlated references
 as parameters and re-bind them per row, rather than substituting them
 into the text. Correctness first; this is the performance follow-up.
 
+### COPY could not decode timestamptz or bytea
+
+> **FIXED on `fix/wrong-answers-and-blockers`**
+
+A default-format `pg_dump` restored ZERO rows. Two decoder gaps, both
+only reachable through COPY:
+
+- `timestamptz` in PostgreSQL's OUTPUT form —
+  `2022-01-28 17:58:52.222594-08`, a space separator and an hour-only
+  offset. Neither `OffsetDateTime/parse` nor `LocalDateTime/parse`
+  accepts it, so all 380 of pagila's were rejected with
+  `invalid timestamp`.
+- `bytea` hex (`\x1e3d…`) reached the transactor as a String and
+  datahike rejected it.
+
+Both survived because the vendored pagila fixture was dumped with
+`--inserts`, which goes through a different parser — the DEFAULT COPY
+format was exercised by nothing. `test/integration/pgdump` now closes
+that: it generates the dump with the real `pg_dump` and compares
+per-table row counts against the source.
+
 ### Unordered aggregates do not preserve input order
 
 NARROWED by the datahike 0.8.1784 bump. `array_agg(id)` and
