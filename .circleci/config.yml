@@ -275,12 +275,13 @@ jobs:
       - checkout
       - attach_workspace:
           at: /home/circleci
+      # cimg/openjdk ships neither the Clojure CLI nor babashka.
+      - install-clj-tools
       - run:
-          name: Install psql + pg_dump + babashka
+          name: Install psql + pg_dump
           command: |
             sudo apt-get update && sudo apt-get install -y --no-install-recommends \
               postgresql-client netcat-openbsd
-            curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
           name: Wait for the source PostgreSQL
           command: |
