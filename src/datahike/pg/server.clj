@@ -6371,7 +6371,20 @@
   [ctx parsed]
   (let [{:keys [schema copy-state conn]} ctx
         {:keys [ns table columns options]} parsed
-        ns (or ns table)
+        ;; The attribute namespace is the TABLE name, never the schema
+        ;; qualifier. This read `(or ns table)`, so `COPY public.emp`
+        ;; built `:public/id` instead of `:emp/id` and the transaction
+        ;; failed with "Bad entity attribute" — while `:row-marker` on
+        ;; the next line already used `table`, so the two disagreed.
+        ;;
+        ;; It matters because pg_dump ALWAYS emits the qualified form:
+        ;; restoring a real PostgreSQL dump into us failed on its first
+        ;; COPY block. We serve one schema, so the qualifier carries no
+        ;; information — SELECT/INSERT/UPDATE/DELETE already ignore it.
+        _ (when (and ns (not= ns "public") (not= ns (str/lower-case (or table ""))))
+            (throw (ex-info (str "schema \"" ns "\" does not exist")
+                            {:error :undefined-table :table (str ns "." table)})))
+        ns table
         col-names (or columns
                       (columns-from-schema schema ns
                                            (when conn (d/db conn))))]

@@ -81,6 +81,22 @@
       (is (= 3 n) "COPY should report 3 rows")
       (is (= 3 (count (query-rows c "SELECT id, name FROM users")))))))
 
+(deftest copy-accepts-a-schema-qualified-table
+  ;; `COPY public.users` built its attributes in the `public` namespace
+  ;; — `:public/id` instead of `:users/id` — so the transaction failed
+  ;; with "Bad entity attribute". The row-marker line right next to it
+  ;; already used the table name, so the two disagreed.
+  ;;
+  ;; It matters because pg_dump ALWAYS emits the qualified form:
+  ;; restoring a real PostgreSQL dump died on its first COPY block.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [n (copy-in-text c "COPY public.users (id, name, email, active) FROM stdin"
+                          (str "1\talice\talice@example.com\tt\n"
+                               "2\tbob\tbob@example.com\tf\n"))]
+      (is (= 2 n) "a schema-qualified COPY should load its rows")
+      (is (= [[1 "alice"] [2 "bob"]]
+             (query-rows c "SELECT id, name FROM users ORDER BY id"))))))
+
 (deftest copy-text-format-with-null
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (let [n (copy-in-text c "COPY users (id, name, email, active) FROM stdin"

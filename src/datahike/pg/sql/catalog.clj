@@ -40,11 +40,22 @@
 ;; resolves without rewriting each call site.
 (def ^:private unquote-ident params/unquote-ident)
 
+(def ^:const pg-role-oid
+  "OID of the single role we expose. 10 is what a stock PostgreSQL gives
+   its bootstrap superuser, so anything keying off it sees a familiar
+   value."
+  10)
+
+(def ^:const pg-role-name
+  "The role every connection authenticates as — see server.clj, which
+   answers the same name for current_user / session_user."
+  "datahike")
+
 (def ^:private built-in-catalog-tables
   "Virtual catalog tables this layer materializes on demand. Extension
    tables are added via register-catalog-table! and don't appear here."
   #{"pg_type" "pg_class" "pg_tables" "pg_views" "pg_matviews" "pg_attribute"
-    "pg_namespace" "pg_database" "pg_proc"
+    "pg_namespace" "pg_database" "pg_proc" "pg_roles"
     "pg_indexes"
     ;; pg_sequences — the user-facing view over every sequence's
     ;; parameters and current position (issue #26). Distinct from
@@ -249,9 +260,27 @@
      {:db/ident :pg_attribute/attisdropped :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_attribute") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_namespace"
+    ;; nspowner/nspacl exist for pg_dump, which selects them and then
+    ;; looks the owner up in its role map. A NULL owner resolved to OID
+    ;; 0 and it aborted with "role with OID 0 does not exist".
     [{:db/ident :pg_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_namespace/nspname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_namespace/nspowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_namespace") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    ;; A single role, the one every connection authenticates as. We have
+    ;; no privilege system; this exists so ownership resolves.
+    "pg_roles"
+    [{:db/ident :pg_roles/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolsuper :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolinherit :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolcreaterole :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolcreatedb :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolcanlogin :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolreplication :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolbypassrls :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolconnlimit :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_roles") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_database"
     [{:db/ident :pg_database/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_database/datdba :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -674,7 +703,15 @@
           (pgs/row-marker-attr "pg_attribute") true})))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
+      :pg_namespace/nspowner pg-role-oid
       (pgs/row-marker-attr "pg_namespace") true}]
+    "pg_roles"
+    [{:pg_roles/oid pg-role-oid :pg_roles/rolname pg-role-name
+      :pg_roles/rolsuper true :pg_roles/rolinherit true
+      :pg_roles/rolcreaterole true :pg_roles/rolcreatedb true
+      :pg_roles/rolcanlogin true :pg_roles/rolreplication false
+      :pg_roles/rolbypassrls true :pg_roles/rolconnlimit -1
+      (pgs/row-marker-attr "pg_roles") true}]
     "pg_database"
     ;; PG always ships with template0, template1, plus each real db.
     ;; Tools (pgjdbc's DatabaseMetaData tests, Odoo's boot, pg_dump) look
@@ -765,7 +802,7 @@
            ["session_user" "s" 0 19 ""]
            ["current_setting" "s" 1 25 "25"]
            ["set_config" "s" 3 25 "25 25 16"]
-           ["pg_backend_pid" "s" 0 23 ""]
+           ["pg_backend_pid" "s" 0 23 ""] ["pg_is_in_recovery" "s" 0 16 ""]
            ["pg_typeof" "s" 1 2206 "2276"]
            ["format_type" "s" 2 25 "26 23"]
            ["pg_get_userbyid" "s" 1 19 "26"]
