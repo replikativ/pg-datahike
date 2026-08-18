@@ -1340,7 +1340,8 @@
     (fn [& outer-vals]
       (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
                        {} (map vector corr-refs outer-vals))]
-        (binding [params/*from-bindings* fb]
+        (binding [params/*from-bindings* fb
+                  params/*lateral-outer-aliases* (set (map first corr-refs))]
           (or (try
                 (let [p (when parse-fn (parse-fn inner-sql inner-schema query-db))
                       q (:query p)

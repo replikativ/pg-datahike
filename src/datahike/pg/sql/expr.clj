@@ -3182,10 +3182,18 @@
                 ;; it would unify `c.tid = t.id` into a join against the
                 ;; real table `t` and never substitute the binding —
                 ;; which made a LATERAL inner answer no rows.
+                ;; ...and neither side names a LATERAL outer alias.
+                ;; Inside a correlated LATERAL inner, `c.tid = t.id` is a
+                ;; filter against a per-row CONSTANT, not a join against
+                ;; the relation `t` — unifying them here would run before
+                ;; translate-expr and the binding would never be
+                ;; substituted. Gated on the lateral-specific var, not on
+                ;; *from-bindings* itself: keying it off the latter
+                ;; changed behaviour for every other user of it and cost
+                ;; 37 asyncpg tests.
                 (not (some (fn [^Column c]
                              (when-let [t (some-> (.getTable c) .getName unquote-ident)]
-                               (and params/*from-bindings*
-                                    (contains? params/*from-bindings* t))))
+                               (contains? (or params/*lateral-outer-aliases* #{}) t)))
                            [left right])))
        (let [resolve-col #(try (ctx/resolve-column ^Column %
                                                    (:table-aliases ctx)
