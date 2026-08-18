@@ -414,10 +414,38 @@
 
 (defn- null-sentinel? [v] (or (= v text-null) (= v csv-null)))
 
+(defn- pg-timestamptz->iso
+  "Normalise PostgreSQL's `timestamp with time zone` OUTPUT form to
+   ISO-8601, or nil when `s` is not in that form.
+
+   COPY text format is what `pg_dump` writes, and it differs from
+   ISO-8601 in exactly two ways:
+
+       2022-01-28 17:58:52.222594-08
+                 ^ space, not T      ^ hour-only offset, not -08:00
+
+   Neither `OffsetDateTime/parse` nor `LocalDateTime/parse` accepts it,
+   so every timestamptz column in a default-format dump was rejected
+   with `invalid timestamp` — 380 of them in pagila, which is why a
+   real pg_dump restored zero rows. The `--inserts` form went through a
+   different parser and was unaffected, which is how this survived."
+  [^String s]
+  (when-let [[_ date time off] (re-matches
+                                #"(\d{4}-\d{2}-\d{2})[ T]([\d:.]+)([+-]\d{2}(?::?\d{2})?)"
+                                s)]
+    (str date "T" time
+         (cond
+           ;; -08 -> -08:00
+           (= 3 (count off)) (str off ":00")
+           ;; -0800 -> -08:00
+           (= 5 (count off)) (str (subs off 0 3) ":" (subs off 3))
+           :else off))))
+
 (defn- parse-instant
   "Parse an ISO-8601 / PG-timestamp string to a java.util.Date.
    Tolerant: accepts `2024-01-15`, `2024-01-15 10:00:00`,
-   `2024-01-15T10:00:00Z`, with or without timezone."
+   `2024-01-15T10:00:00Z`, PostgreSQL's `2024-01-15 10:00:00-08`, with
+   or without timezone."
   ^java.util.Date [^String s]
   (try
     (.parse (java.time.format.DateTimeFormatter/ISO_INSTANT) s
@@ -425,7 +453,8 @@
     (catch Throwable _
       (try
         (java.util.Date/from
-         (.toInstant (java.time.OffsetDateTime/parse s)))
+         (.toInstant (java.time.OffsetDateTime/parse
+                      (or (pg-timestamptz->iso s) s))))
         (catch Throwable _
           (try
             (let [ldt (java.time.LocalDateTime/parse
@@ -477,6 +506,23 @@
           :db.type/keyword   (keyword raw)
           :db.type/symbol    (symbol raw)
           :db.type/uuid      (java.util.UUID/fromString raw)
+          ;; PG's bytea OUTPUT form, which is what COPY carries:
+          ;; `\x` followed by hex pairs. Without this the raw STRING
+          ;; reached the transactor and datahike rejected it —
+          ;; "value does not match schema definition. Must be conform
+          ;; to: bytes?" — on pagila's staff.picture.
+          :db.type/bytes     (if (and (> (count raw) 1)
+                                      (= "\\x" (subs raw 0 2)))
+                               (let [hex (subs raw 2)
+                                     n (quot (count hex) 2)
+                                     ba (byte-array n)]
+                                 (dotimes [i n]
+                                   (aset-byte ba i
+                                              (unchecked-byte
+                                               (Integer/parseInt
+                                                (subs hex (* 2 i) (+ 2 (* 2 i))) 16))))
+                                 ba)
+                               (.getBytes raw java.nio.charset.StandardCharsets/UTF_8))
           :db.type/instant   (or (parse-instant raw)
                                  (throw (ex-info (str "invalid timestamp: " raw)
                                                  {:error :invalid-text-representation

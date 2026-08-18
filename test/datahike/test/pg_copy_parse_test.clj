@@ -189,3 +189,47 @@
       (is (= :csv  (:format (:options r))))
       (is (= ","   (:delimiter (:options r))))
       (is (= :true (:header (:options r)))))))
+
+;; ============================================================================
+;; Value coercion — the shapes a default-format pg_dump actually writes
+;; ============================================================================
+
+(deftest pg-timestamptz-text-form-is-accepted
+  ;; `pg_dump`'s COPY text differs from ISO-8601 in exactly two ways:
+  ;;
+  ;;     2022-01-28 17:58:52.222594-08
+  ;;               ^ space, not T      ^ hour-only offset, not -08:00
+  ;;
+  ;; Neither OffsetDateTime/parse nor LocalDateTime/parse accepts that,
+  ;; so EVERY timestamptz column in a default-format dump was rejected
+  ;; with "invalid timestamp" — 380 of them in pagila, which is why a
+  ;; real pg_dump restored zero rows. The `--inserts` form goes through
+  ;; a different parser, which is how this survived.
+  (let [p #(#'copy/parse-instant %)]
+    (testing "hour-only offset, with and without fractional seconds"
+      (is (= (java.util.Date. (- (.getTime #inst "2022-01-29T01:58:52.222Z") 0))
+             (p "2022-01-28 17:58:52.222594-08")))
+      (is (= #inst "2022-02-15T14:34:33.000Z" (p "2022-02-15 09:34:33-05"))))
+
+    (testing "four-digit offset"
+      (is (= #inst "2022-01-29T01:58:52.000Z" (p "2022-01-28 17:58:52-0800"))))
+
+    (testing "the forms that already worked still do"
+      (is (some? (p "2024-01-15T10:00:00Z")))
+      (is (= #inst "2024-01-15T10:00:00.000Z" (p "2024-01-15 10:00:00")))
+      (is (= #inst "2024-01-15T00:00:00.000Z" (p "2024-01-15"))))
+
+    (testing "genuine rubbish is still rejected"
+      (is (nil? (p "not-a-timestamp"))))))
+
+(deftest bytea-hex-is-decoded
+  ;; PG's bytea OUTPUT form is `\x` + hex pairs, which is what COPY
+  ;; carries. The raw STRING used to reach the transactor, and datahike
+  ;; rejected it: "value does not match schema definition. Must be
+  ;; conform to: bytes?" — on pagila's staff.picture.
+  (let [schema {:t/b {:db/valueType :db.type/bytes}}
+        coerce #(#'copy/coerce-string-to-attr-type % :t/b schema)]
+    (is (= [0x1e 0x3d] (mapv #(bit-and % 0xff) (coerce "\\x1e3d"))))
+    (is (= [] (vec (coerce "\\x"))))
+    (testing "a non-hex value falls back to its UTF-8 bytes rather than throwing"
+      (is (= (vec (.getBytes "plain" "UTF-8")) (vec (coerce "plain")))))))

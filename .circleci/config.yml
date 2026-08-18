@@ -252,6 +252,79 @@ jobs:
   # fails the job; everything else stays green. (The one hanging asyncpg
   # test — server-side cursor streaming — is deselected, see run.sh.)
 
+  pgdump-roundtrip:
+    # Round-trip pagila through PostgreSQL's OWN pg_dump and restore the
+    # result into pg-datahike.
+    #
+    # The sidecar is the SOURCE database, and the dump is generated here
+    # rather than vendored. That is the point: the repo already had a
+    # real pg_dump of pagila, but taken with `--inserts`, so the DEFAULT
+    # format (COPY) went untested and two decoding bugs survived it —
+    # timestamptz in PG's output form and bytea hex. Generating the dump
+    # tracks whatever pg_dump the image ships, so the next format drift
+    # fails here instead of waiting for someone to regenerate a fixture.
+    docker:
+      - image: cimg/openjdk:21.0
+      - image: cimg/postgres:16.0
+        environment:
+          POSTGRES_USER: pgtest
+          POSTGRES_PASSWORD: pgtest
+          POSTGRES_DB: postgres
+    resource_class: medium
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci
+      # cimg/openjdk ships neither the Clojure CLI nor babashka.
+      - install-clj-tools
+      - run:
+          name: Install psql + pg_dump (matching the sidecar's major version)
+          command: |
+            # Ubuntu's default postgresql-client is older than the
+            # postgres:16 sidecar, and pg_dump REFUSES to dump a server
+            # newer than itself — it exits non-zero with an empty dump,
+            # which reads as "0 COPY blocks" rather than as a version
+            # error. Take the client from PGDG so the majors match.
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+              curl ca-certificates gnupg netcat-openbsd
+            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+              | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+            echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-16
+            pg_dump --version
+      - run:
+          name: Wait for the source PostgreSQL
+          command: |
+            for i in $(seq 1 60); do
+              nc -z 127.0.0.1 5432 && exit 0
+              sleep 2
+            done
+            echo "source PostgreSQL never came up" >&2; exit 1
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - start-pgwire-and-wait
+      - run:
+          name: pg_dump round-trip
+          command: bash test/integration/pgdump/run.sh
+          environment:
+            PGDUMP_SRC_HOST: 127.0.0.1
+            PGDUMP_SRC_PORT: "5432"
+            PGDUMP_SRC_USER: pgtest
+            PGDUMP_SRC_PASSWORD: pgtest
+            PGDUMP_SRC_DB: postgres
+          no_output_timeout: 20m
+      # The restore log is where a data-decoding failure is legible; the
+      # console prints only counts.
+      - store_artifacts:
+          path: test/integration/pgdump/last-restore.log
+          destination: pgdump-last-restore.log
+      - store_artifacts:
+          path: test/integration/pgdump/pagila-default-format.sql
+          destination: pagila-default-format.sql
+
   asyncpg-conformance:
     docker:
       - image: cimg/python:3.11
@@ -499,6 +572,10 @@ workflows:
           requires:
             - build
       - sqlalchemy-conformance:
+          context: ghcr-read-package
+          requires:
+            - build
+      - pgdump-roundtrip:
           context: ghcr-read-package
           requires:
             - build

@@ -233,12 +233,13 @@
   "Function markers translate-* may emit for SQL constructs that must
    be re-evaluated per execute (i.e. NOT cacheable as a parse-time
    value). Resolved by `resolve-nextvals!` against a per-fn resolver."
-  #{:nextval :now})
+  #{:nextval :now :eval})
 
 (defn call-marker?
   "True if v is a deferred function-call marker emitted by translate-*
-   (currently `:nextval` and `:now`). These must survive the result-
-   cache intact and be resolved per execute."
+   (`:nextval`, `:now`, and `:eval` — an arbitrary scalar expression in
+   INSERT VALUES). These must survive the result-cache intact and be
+   resolved per execute."
   [v]
   (and (map? v) (contains? call-fns (:fn v))))
 
@@ -261,7 +262,8 @@
    Sibling shape to `substitute-params`: leaves functions, records,
    and other opaque values alone, recurses into map values / vectors /
    seqs."
-  [x nextval-fn]
+  ([x nextval-fn] (resolve-nextvals! x nextval-fn nil))
+  ([x nextval-fn eval-fn]
   ;; Identity-track: the same marker object can appear in multiple
   ;; parts of tx-data (e.g. inside a `:db.fn/call` arg AND in an
   ;; outer entity-map via `assoc`). Resolving it twice would advance
@@ -274,25 +276,33 @@
   ;;
   ;; The function table here is intentionally minimal — extend by
   ;; adding to call-fns above and a clause here.
-  (let [seen (java.util.IdentityHashMap.)
-        resolve-marker
-        (fn [v]
-          (or (.get seen v)
-              (let [resolved
-                    (case (:fn v)
-                      :nextval (nextval-fn (:seq-name v))
-                      :now     (java.util.Date.))]
-                (.put seen v resolved)
-                resolved)))]
-    (letfn [(walk [v]
-              (cond
-                (call-marker? v) (resolve-marker v)
-                (map? v)         (reduce-kv (fn [m k x] (assoc m k (walk x)))
-                                            {} v)
-                (vector? v)      (mapv walk v)
-                (seq? v)         (map walk v)
-                :else            v))]
-      (walk x))))
+   (let [seen (java.util.IdentityHashMap.)
+         resolve-marker
+         (fn [v]
+           (or (.get seen v)
+               (let [resolved
+                     (case (:fn v)
+                       :nextval (nextval-fn (:seq-name v))
+                       :now     (java.util.Date.)
+                      ;; An arbitrary scalar expression in INSERT
+                      ;; VALUES. Deferred rather than folded at parse
+                      ;; time for the same reason `now()` is: the parse
+                      ;; is cached, and a volatile function folded there
+                      ;; would freeze on the first execution.
+                       :eval    (if eval-fn
+                                  (eval-fn (:sql v))
+                                  (:sql v)))]
+                 (.put seen v resolved)
+                 resolved)))]
+     (letfn [(walk [v]
+               (cond
+                 (call-marker? v) (resolve-marker v)
+                 (map? v)         (reduce-kv (fn [m k x] (assoc m k (walk x)))
+                                             {} v)
+                 (vector? v)      (mapv walk v)
+                 (seq? v)         (map walk v)
+                 :else            v))]
+       (walk x)))))
 
 ;; ---------------------------------------------------------------------------
 ;; AST parameter-index walker

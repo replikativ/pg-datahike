@@ -1068,6 +1068,28 @@
 ;; `\dF`, `\dD` all gate their list queries on these. We don't model
 ;; per-namespace visibility (everything lives in `public`), so they
 ;; mirror pg_table_is_visible's stub.
+(defn pg-is-in-recovery
+  "PostgreSQL `pg_is_in_recovery()` — true on a standby still replaying
+   WAL. We are never a standby, so this is always false.
+
+   Worth having for one specific reason: it is the FIRST query real
+   `pg_dump` sends, so without it pg_dump aborts before doing anything
+   at all. Our own dump command is unaffected — this is about the
+   standard client tool being able to talk to us."
+  [] false)
+
+(defn acldefault
+  "PostgreSQL `acldefault(type, ownerId)` — the built-in default access
+   privileges for an object kind. We have no privilege system, so this
+   answers SQL NULL, which pg_dump reads as \"ACLs are default\" and so
+   emits no GRANT/REVOKE statements.
+
+   Returning NULL rather than a synthesised aclitem[] is deliberate: a
+   fabricated ACL would have to be kept in step with a privilege model
+   we do not have, and pg_dump compares it against the object's own
+   (also absent) acl column."
+  [& _] :__null__)
+
 (def pg-function-is-visible (constantly true))
 (def pg-type-is-visible (constantly true))
 (def pg-namespace-is-visible (constantly true))
@@ -1282,6 +1304,8 @@
    "bit_length"   sql-bit-length
    "position"     sql-position
    "strpos"       sql-position
+   "pg_is_in_recovery"        pg-is-in-recovery
+   "acldefault"               acldefault
    "pg_table_is_visible"      pg-table-is-visible
    "pg_function_is_visible"   pg-function-is-visible
    "pg_type_is_visible"       pg-type-is-visible

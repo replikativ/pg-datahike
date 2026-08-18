@@ -145,6 +145,8 @@ advertised type disagree.
 
 ### Function calls in INSERT … VALUES are not evaluated
 
+> **FIXED on `fix/wrong-answers-and-blockers`**
+
 `INSERT INTO t VALUES (1, repeat('x',10000))` stores the 18-character
 string `repeat('x',10000)`. `SELECT repeat('x',10)` on its own is
 correct, so this is specific to the VALUES row path.
@@ -196,13 +198,29 @@ PostgreSQL has **no** `=`, `<>`, `<`, `>`, `@>`, `?` on `json` — the type
 has no btree/hash opclass at all. We accept them silently. PostgreSQL
 raises 42883, or 42704 for an index attempt.
 
-### `pg_dump` cannot run against us
+### `pg_dump` cannot READ from us (restoring INTO us now works)
 
-`pg_dump` fails immediately on `pg_catalog.pg_is_in_recovery()`, which
-is unimplemented. Our own dump command works and round-trips json
-verbatim and jsonb canonically, but `pg_dump` is the interop path most
-users reach for — and dump/restore fidelity is what makes any future
-storage-representation change reversible. Small function, high leverage.
+> Partly fixed on `fix/wrong-answers-and-blockers`.
+
+Two different directions, and only one was ever broken in both:
+
+**Restoring a real PostgreSQL dump INTO us — FIXED.** It failed on the
+first COPY block, because pg_dump always schema-qualifies
+(`COPY public.emp`) and the COPY executor used the SCHEMA as the
+attribute namespace, building `:public/id` instead of `:emp/id`. A real
+`pg_dump` file now restores with byte-identical rows.
+
+**`pg_dump` reading FROM us — still blocked, but further along.** Its
+first query is `SELECT pg_catalog.pg_is_in_recovery()`, which now
+answers; then `acldefault`, which now answers; then it needs a role to
+own objects, which now exists (`pg_roles`, `pg_namespace.nspowner`).
+The next wall is its main `pg_class` query, which uses
+`(d.deptype = 'i') IS TRUE` — a `IsBooleanExpression` the translator
+does not support — and there will be more after it. Each step is small;
+the tail is unknown.
+
+Our OWN dump was never affected: `datahike.pg.dump/dump` emits portable
+SQL that replays into either engine, verified in both directions.
 
 ### A value-size cap surfaces as XX000 with a raw Clojure exception
 
@@ -519,6 +537,27 @@ the AST, so the cached shape would be wrong for the next row.
 The fix is to translate the inner ONCE with the correlated references
 as parameters and re-bind them per row, rather than substituting them
 into the text. Correctness first; this is the performance follow-up.
+
+### COPY could not decode timestamptz or bytea
+
+> **FIXED on `fix/wrong-answers-and-blockers`**
+
+A default-format `pg_dump` restored ZERO rows. Two decoder gaps, both
+only reachable through COPY:
+
+- `timestamptz` in PostgreSQL's OUTPUT form —
+  `2022-01-28 17:58:52.222594-08`, a space separator and an hour-only
+  offset. Neither `OffsetDateTime/parse` nor `LocalDateTime/parse`
+  accepts it, so all 380 of pagila's were rejected with
+  `invalid timestamp`.
+- `bytea` hex (`\x1e3d…`) reached the transactor as a String and
+  datahike rejected it.
+
+Both survived because the vendored pagila fixture was dumped with
+`--inserts`, which goes through a different parser — the DEFAULT COPY
+format was exercised by nothing. `test/integration/pgdump` now closes
+that: it generates the dump with the real `pg_dump` and compares
+per-table row counts against the source.
 
 ### Unordered aggregates do not preserve input order
 

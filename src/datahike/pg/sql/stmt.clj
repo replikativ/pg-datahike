@@ -4251,6 +4251,36 @@
                 (when (seq n) (Math/abs (.hashCode ^String n)))
                 0))})))))
 
+(defn- widen-integral
+  "Widen a narrow integral result to Long. `length()` answers an
+   Integer (its PG type is int4), and Datahike's :db.type/long rejects
+   anything but a Long — so an evaluated `length('hello')` failed the
+   transaction with \"invalid input syntax\" while `abs(-7)`, which
+   already answers a Long, went through."
+  [v]
+  (if (and (integer? v) (not (instance? Long v)) (not (instance? clojure.lang.BigInt v))
+           (not (instance? java.math.BigInteger v)))
+    (long v)
+    v))
+
+(defn- eval-const-expr
+  "Evaluate a constant scalar expression by running it as a one-row
+   SELECT. Returns nil when it cannot be evaluated — an unimplemented
+   function, or no parse hook in scope — so callers can fall back."
+  [e schema db]
+  (try
+    (when-let [pf params/*parse-sql*]
+      (when (and schema db)
+        (let [p (pf (str "SELECT " e) schema db)]
+          (if-let [q (:query p)]
+            (let [ia (:in-args p)
+                  qdb (or (:enriched-db p) db)
+                  r (first (if (seq ia) (apply d/q q qdb ia) (d/q q qdb)))]
+              (widen-integral (if (sequential? r) (first r) r)))
+            (let [lr (:literal-row p)]
+              (widen-integral (if (sequential? lr) (first lr) lr)))))))
+    (catch Throwable _ nil)))
+
 (defn extract-value
   "Extract a Clojure value from a JSqlParser expression for INSERT VALUES.
    Optional schema+db params enable scalar subquery evaluation.
@@ -4353,7 +4383,25 @@
             "localtimestamp" "localtime" "current_date" "current_time"} fname)
          {:fn :now}
 
-         :else (str e)))
+         ;; Any other function. This was `(str e)`, which stored the SQL
+         ;; TEXT: `INSERT INTO t VALUES (1, repeat('x',5))` put the
+         ;; 14-character string `repeat('x', 5)` in the column.
+         ;;
+         ;; Evaluate it HERE, at parse time, rather than deferring a
+         ;; marker to execute time. The volatile functions — nextval,
+         ;; now and friends — are already handled above precisely
+         ;; because folding them into a cached parse would freeze them;
+         ;; everything reaching this branch is deterministic, so folding
+         ;; is safe. It also keeps the value inside `coerce-insert-value`,
+         ;; which a deferred marker escapes: a resolved marker arrived
+         ;; uncoerced and `length('hello')` into an int column failed
+         ;; with "invalid input syntax".
+         ;;
+         ;; Falls back to the old text behaviour when the expression
+         ;; cannot be evaluated (an unimplemented function), rather than
+         ;; storing nil — which would turn a wrong value into a failed
+         ;; INSERT.
+         :else (or (eval-const-expr e schema db) (str e))))
     ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
     ;; parse as TimeKeyExpression, not Function — same marker as the
     ;; function forms above; without this branch the keyword fell
@@ -4427,9 +4475,16 @@
    threaded db, or genuinely-unmapped refs)."
   [val attr schema & [db]]
   (when (some? val)
-    (let [vtype     (get-in schema [attr :db/valueType])
-          elem-kw   (get-in schema [attr :pg/array-elem])
-          num-scale (get-in schema [attr :pg/numeric-scale])
+    ;; A deferred call marker is NOT a value yet — `{:fn :nextval …}`,
+    ;; `{:fn :now}`, `{:fn :eval …}` are resolved per execute, after
+    ;; this. Coercing one here would treat the marker MAP as data: for a
+    ;; jsonb or text column it serialised to `{":fn": ":eval", …}` and
+    ;; that reached the transactor.
+    (if (params/call-marker? val)
+      val
+      (let [vtype     (get-in schema [attr :db/valueType])
+            elem-kw   (get-in schema [attr :pg/array-elem])
+            num-scale (get-in schema [attr :pg/numeric-scale])
           ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it
           ;; keeps key order, whitespace and duplicate keys — so it must NOT
           ;; be canonicalized.
@@ -4440,17 +4495,17 @@
           ;; silently did NOT happen for UPDATE or for a parameterised INSERT
           ;; — i.e. for every client that is not psql. Absent metadata has to
           ;; mean "ask", not "not jsonb".
-          pg-type   (or (get-in schema [attr :pg/type])
-                        (params/pg-type-of-attr db attr))
-          jsonb?    (= "jsonb" pg-type)
+            pg-type   (or (get-in schema [attr :pg/type])
+                          (params/pg-type-of-attr db attr))
+            jsonb?    (= "jsonb" pg-type)
           ;; PostgreSQL validates BOTH types on input — `json_in` does a
           ;; full RFC-8259 parse and only then stores the original bytes.
           ;; We validated neither, so malformed text reached storage:
           ;; `'"abc'::jsonb` became the string `"abc`.
-          json-ish? (contains? #{"json" "jsonb"} pg-type)
-          _         (when (and json-ish? (string? val))
-                      (jb/validate-json! val))]
-      (cond
+            json-ish? (contains? #{"json" "jsonb"} pg-type)
+            _         (when (and json-ish? (string? val))
+                        (jb/validate-json! val))]
+        (cond
         ;; ParamRef is a defrecord placeholder for a `?` parameter
         ;; resolved at Bind time. Don't coerce it here — the branches
         ;; below would incorrectly treat it as a Clojure map (records
@@ -4460,34 +4515,34 @@
         ;; it with the decoded wire value, which already has the right
         ;; type from Bind. (Must precede the jsonb branch below, or a
         ;; jsonb `?` param would be serialized as its placeholder record.)
-        (params/param-ref? val) val
+          (params/param-ref? val) val
 
         ;; jsonb columns are :db.type/string, so a `'{…}'::jsonb` STRING literal would
         ;; otherwise be stored verbatim (non-canonical → equality/DISTINCT wrong,
         ;; behaving like PG `json`). Canonicalize every jsonb write here — string
         ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
-        jsonb? (jb/serialize-jsonb val)
+          jsonb? (jb/serialize-jsonb val)
 
         ;; Native PG array column (`:pg/array-elem` recorded by DDL)
         ;; — Option C storage: serialize a PgArray (or coerce a
         ;; sequential value into one) to canonical PG text. Strings
         ;; that already look like array text pass through unchanged.
-        (some? elem-kw)
-        (cond
-          (pg-arr/array? val)
-          (pg-arr/to-pg-text val)
-          (and (string? val)
-               (clojure.string/starts-with? (clojure.string/triml val) "{"))
-          val
-          (sequential? val)
-          (pg-arr/to-pg-text (pg-arr/array elem-kw (vec val)))
-          :else
+          (some? elem-kw)
+          (cond
+            (pg-arr/array? val)
+            (pg-arr/to-pg-text val)
+            (and (string? val)
+                 (clojure.string/starts-with? (clojure.string/triml val) "{"))
+            val
+            (sequential? val)
+            (pg-arr/to-pg-text (pg-arr/array elem-kw (vec val)))
+            :else
           ;; Last-ditch: string-coerce. Lets clients send a single
           ;; element to an array column and have it stored as a
           ;; 1-element array (PG would reject this; we tolerate to
           ;; mirror the permissive behaviour of `:db.type/string`
           ;; coercion above).
-          (pg-arr/to-pg-text (pg-arr/array elem-kw [val])))
+            (pg-arr/to-pg-text (pg-arr/array elem-kw [val])))
         ;; :db.type/ref column with a numeric/string PK value →
         ;; lookup-ref. Already-vector values (explicit `[:k v]`) pass
         ;; through unchanged. Convention-based target resolution
@@ -4501,112 +4556,112 @@
         ;; entity-id reference. The read-side surfaces ref columns
         ;; as raw entity-ids when no PK target is resolvable, so this
         ;; symmetric write path keeps round-trips honest.
-        (and (= vtype :db.type/ref)
-             (not (vector? val))
-             (some? val))
-        (let [target-entry (get (pgs/derive-ref-targets schema {}) attr)
-              target-pk-attr (if (vector? target-entry) (first target-entry) target-entry)
-              target-vtype (when target-pk-attr
-                             (get-in schema [target-pk-attr :db/valueType]))
-              val-matches-pk?
-              (case target-vtype
-                :db.type/string  (string? val)
-                :db.type/long    (integer? val)
-                :db.type/uuid    (or (instance? java.util.UUID val) (string? val))
-                :db.type/keyword (or (keyword? val) (string? val))
+          (and (= vtype :db.type/ref)
+               (not (vector? val))
+               (some? val))
+          (let [target-entry (get (pgs/derive-ref-targets schema {}) attr)
+                target-pk-attr (if (vector? target-entry) (first target-entry) target-entry)
+                target-vtype (when target-pk-attr
+                               (get-in schema [target-pk-attr :db/valueType]))
+                val-matches-pk?
+                (case target-vtype
+                  :db.type/string  (string? val)
+                  :db.type/long    (integer? val)
+                  :db.type/uuid    (or (instance? java.util.UUID val) (string? val))
+                  :db.type/keyword (or (keyword? val) (string? val))
                 ;; No target or unknown PK type: treat as entity-id.
-                false)]
-          (if (and target-pk-attr val-matches-pk?)
-            [target-pk-attr val]
-            val))
+                  false)]
+            (if (and target-pk-attr val-matches-pk?)
+              [target-pk-attr val]
+              val))
         ;; BigInteger / BigInt lands here when a SQL literal overflows
         ;; Long; routed through `coerce/coerce-numeric` so :db.type/long
         ;; raises 22003 instead of silently wrapping via .longValue,
         ;; while float/double/bigdec land at finite/±Infinity/exact as
         ;; PG does.
-        (or (instance? java.math.BigInteger val)
-            (instance? clojure.lang.BigInt val))
-        (case vtype
-          :db.type/float  (coerce/coerce-numeric val :float)
-          :db.type/double (coerce/coerce-numeric val :double)
-          :db.type/bigdec (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
-          :db.type/long   (coerce/coerce-numeric val :long)
-          val)
+          (or (instance? java.math.BigInteger val)
+              (instance? clojure.lang.BigInt val))
+          (case vtype
+            :db.type/float  (coerce/coerce-numeric val :float)
+            :db.type/double (coerce/coerce-numeric val :double)
+            :db.type/bigdec (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
+            :db.type/long   (coerce/coerce-numeric val :long)
+            val)
         ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
         ;; — handles both the string→number and number→number paths.
         ;; `coerce-numeric` raises 22003/22P02 with the right SQLSTATE.
-        (and (= vtype :db.type/long)
-             (or (string? val) (instance? Double val)))
-        (coerce/coerce-numeric val :long)
-        (and (= vtype :db.type/double) (or (string? val) (integer? val)))
-        (coerce/coerce-numeric val :double)
-        (and (= vtype :db.type/float) (or (string? val) (integer? val)))
-        (coerce/coerce-numeric val :float)
+          (and (= vtype :db.type/long)
+               (or (string? val) (instance? Double val)))
+          (coerce/coerce-numeric val :long)
+          (and (= vtype :db.type/double) (or (string? val) (integer? val)))
+          (coerce/coerce-numeric val :double)
+          (and (= vtype :db.type/float) (or (string? val) (integer? val)))
+          (coerce/coerce-numeric val :float)
         ;; PG boolin: 't'/'yes'/'on'/'1' etc. — Boolean/parseBoolean
         ;; would silently turn '1' into false (issue #12).
-        (and (= vtype :db.type/boolean) (string? val))
-        (let [b (coerce/parse-bool-token val)]
-          (when (nil? b)
-            (throw (errors/pg-error :invalid-text-representation
-                                    {:type "boolean" :value val})))
-          b)
+          (and (= vtype :db.type/boolean) (string? val))
+          (let [b (coerce/parse-bool-token val)]
+            (when (nil? b)
+              (throw (errors/pg-error :invalid-text-representation
+                                      {:type "boolean" :value val})))
+            b)
         ;; :db.type/keyword: SQL has no keyword literal, so clients
         ;; send the bare name as a string. Coerce 'draft' → :draft and
         ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
         ;; forms). Empty / blank strings stay as-is so datahike's
         ;; rejection still surfaces (an empty keyword `:` is invalid).
-        (and (= vtype :db.type/keyword) (string? val))
-        (if (clojure.string/blank? val) val (keyword val))
+          (and (= vtype :db.type/keyword) (string? val))
+          (if (clojure.string/blank? val) val (keyword val))
         ;; Already-keyword passes through. Symbols coerce to keywords.
-        (and (= vtype :db.type/keyword) (keyword? val)) val
-        (and (= vtype :db.type/keyword) (symbol? val)) (keyword val)
+          (and (= vtype :db.type/keyword) (keyword? val)) val
+          (and (= vtype :db.type/keyword) (symbol? val)) (keyword val)
         ;; :db.type/symbol — analogous to keyword, no SQL literal.
-        (and (= vtype :db.type/symbol) (string? val))
-        (if (clojure.string/blank? val) val (symbol val))
-        (and (= vtype :db.type/symbol) (symbol? val)) val
-        (and (= vtype :db.type/symbol) (keyword? val))
-        (symbol (namespace val) (name val))
+          (and (= vtype :db.type/symbol) (string? val))
+          (if (clojure.string/blank? val) val (symbol val))
+          (and (= vtype :db.type/symbol) (symbol? val)) val
+          (and (= vtype :db.type/symbol) (keyword? val))
+          (symbol (namespace val) (name val))
         ;; :db.type/uuid — accept already-UUID values (param-bound or
         ;; from CAST) directly. String parse handled below by
         ;; falling through to coerce-unknown.
-        (and (= vtype :db.type/uuid) (instance? java.util.UUID val)) val
-        (and (= vtype :db.type/uuid) (string? val))
-        (try (java.util.UUID/fromString val) (catch Exception _ val))
+          (and (= vtype :db.type/uuid) (instance? java.util.UUID val)) val
+          (and (= vtype :db.type/uuid) (string? val))
+          (try (java.util.UUID/fromString val) (catch Exception _ val))
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
-        (and (= vtype :db.type/string) (or (map? val) (sequential? val)))
-        (jb/serialize-jsonb val)
-        (and (= vtype :db.type/string) (not (string? val))) (str val)
+          (and (= vtype :db.type/string) (or (map? val) (sequential? val)))
+          (jb/serialize-jsonb val)
+          (and (= vtype :db.type/string) (not (string? val))) (str val)
         ;; bytea: decode PG `\xHEX` hex literal to byte array; fall back to
         ;; raw UTF-8 bytes for non-hex strings so the value stays representable.
-        (and (= vtype :db.type/bytes) (string? val))
-        (or (parse-bytea-hex val) (.getBytes ^String val "UTF-8"))
-        (and (= vtype :db.type/bytes) (bytes? val)) val
+          (and (= vtype :db.type/bytes) (string? val))
+          (or (parse-bytea-hex val) (.getBytes ^String val "UTF-8"))
+          (and (= vtype :db.type/bytes) (bytes? val)) val
         ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
         ;; bad-syntax strings instead of silently keeping the original.
-        (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
-        (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
-        (and (= vtype :db.type/instant) (string? val))
-        (expr/parse-timestamp-string val)
-        (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
+          (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
+          (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
+          (and (= vtype :db.type/instant) (string? val))
+          (expr/parse-timestamp-string val)
+          (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
         ;; java.time.* — produced by SQL casts (`::date`, `::timestamp`)
         ;; and by parameterized queries when the wire layer decodes
         ;; PG's date/timestamp/timestamptz types. Datahike's
         ;; :db.type/instant requires java.util.Date specifically.
-        (and (= vtype :db.type/instant) (instance? java.time.Instant val))
-        (java.util.Date/from ^java.time.Instant val)
-        (and (= vtype :db.type/instant) (instance? java.time.LocalDate val))
-        (java.util.Date/from
-         (.toInstant (.atStartOfDay ^java.time.LocalDate val
-                                    (java.time.ZoneOffset/UTC))))
-        (and (= vtype :db.type/instant) (instance? java.time.LocalDateTime val))
-        (java.util.Date/from
-         (.toInstant ^java.time.LocalDateTime val
-                     (java.time.ZoneOffset/UTC)))
-        (and (= vtype :db.type/instant) (instance? java.time.OffsetDateTime val))
-        (java.util.Date/from (.toInstant ^java.time.OffsetDateTime val))
-        (and (= vtype :db.type/instant) (instance? java.time.ZonedDateTime val))
-        (java.util.Date/from (.toInstant ^java.time.ZonedDateTime val))
-        :else val))))
+          (and (= vtype :db.type/instant) (instance? java.time.Instant val))
+          (java.util.Date/from ^java.time.Instant val)
+          (and (= vtype :db.type/instant) (instance? java.time.LocalDate val))
+          (java.util.Date/from
+           (.toInstant (.atStartOfDay ^java.time.LocalDate val
+                                      (java.time.ZoneOffset/UTC))))
+          (and (= vtype :db.type/instant) (instance? java.time.LocalDateTime val))
+          (java.util.Date/from
+           (.toInstant ^java.time.LocalDateTime val
+                       (java.time.ZoneOffset/UTC)))
+          (and (= vtype :db.type/instant) (instance? java.time.OffsetDateTime val))
+          (java.util.Date/from (.toInstant ^java.time.OffsetDateTime val))
+          (and (= vtype :db.type/instant) (instance? java.time.ZonedDateTime val))
+          (java.util.Date/from (.toInstant ^java.time.ZonedDateTime val))
+          :else val)))))
 
 (declare eval-update-expr)
 
