@@ -522,10 +522,14 @@ into the text. Correctness first; this is the performance follow-up.
 
 ### Unordered aggregates do not preserve input order
 
-`array_agg(id)` over rows 1..4 gives `{1,4,2,3}`; PostgreSQL gives
-`{1,2,3,4}`. Same for `json_agg`, `jsonb_agg` and `string_agg`. The
-order varies between runs, so it is set/bag iteration order rather than
-a fixed permutation.
+NARROWED by the datahike 0.8.1784 bump. `array_agg(id)` and
+`json_agg(id)` over integer rows now match PostgreSQL — on 0.8.1770 the
+same query answered `{3,2,1,4}` — almost certainly from "Values with no
+order of their own get one" (datahike #955). `string_agg` over TEXT
+still does not: `a,b,c,d` comes back as `a,c,d,b`.
+
+The order still varies between runs, so what remains is set/bag
+iteration order rather than a fixed permutation.
 
 SQL leaves this UNSPECIFIED without an in-aggregate `ORDER BY`, and
 PostgreSQL's own order is incidental (a parallel plan changes it), so
