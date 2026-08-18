@@ -59,19 +59,22 @@ Capabilities implemented and exercised by the conformance suites:
 
 These need execution beyond one `d/q` over one snapshot:
 
-- **LATERAL subqueries** (`JOIN LATERAL (SELECT …)`). PostgreSQL evaluates
-  LATERAL as a parameterized nested loop: for each outer row, the inner item is
-  evaluated with the outer columns bound. A subquery is a relational expression
-  rather than a function of its arguments, so this still needs either a
-  nested-loop step or de-correlated materialisation.
+- **OUTER LATERAL** (`LEFT JOIN LATERAL (…) ON true`). An outer lateral keeps
+  the outer row with NULLs when the inner is empty; an empty collection binding
+  DROPS it, which is precisely the inner-join semantics the lateral support
+  relies on. Reproducing the outer form needs the `or-join` construction the
+  other OUTER joins use. Refused explicitly (0A000) rather than answered wrong.
 
-  **Correlated set-returning functions are NOT in this category** — that was a
-  mistaken reading of the engine. Datahike's `bind-by-fn` applies a function
-  once per production tuple and expands the result through the binding form, so
+  **LATERAL itself is no longer a structural gap** — that was a mistaken
+  reading of the engine. Datahike's `bind-by-fn` applies a function once per
+  production tuple and expands the result through the binding form, so
   `[(f ?n) [[?v ?ord]]]` already evaluates per outer row inside the ordinary
-  flat `:where`. `FROM t, LATERAL generate_series(1, t.n)` compiles to one
-  Datalog query with no speculative data, which is why it keeps the parse cache
-  and fast-select lanes a materialisation approach would forfeit.
+  flat `:where`. Both `FROM t, LATERAL generate_series(1, t.n)` and
+  `JOIN LATERAL (SELECT … WHERE x = t.id) s ON true` compile to ONE Datalog
+  query with no speculative data — the subquery case by running the inner
+  through that same binding, with `*from-bindings*` holding the outer values.
+  That is why they keep the parse cache and fast-select lanes a
+  materialisation approach would forfeit.
 - **Portal streaming / row limits**. Extended-protocol `Execute` with a row cap
   (`PortalSuspended`) — driver `fetchSize`, server-side cursors over large
   results. Today all rows materialise from one `d/q`.

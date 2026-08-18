@@ -1298,6 +1298,138 @@
          :cols cols :vars vars :ord-var ord-var
          :marker marker :fname fname :params params}))))
 
+(defn- select-item-col-name
+  "Output column name for one inner SELECT item, as PostgreSQL names it:
+   the explicit alias, else a plain column's own name, else the function
+   name, else a positional `?column?`-style fallback."
+  [^net.sf.jsqlparser.statement.select.SelectItem si i]
+  (or (when-let [a (.getAlias si)] (unquote-ident (str/trim (.getName ^Alias a))))
+      (let [e (.getExpression si)]
+        (cond
+          (instance? Column e) (str/lower-case (unquote-ident (.getColumnName ^Column e)))
+          (instance? net.sf.jsqlparser.expression.Function e)
+          (str/lower-case (srf-base-name (.getName ^net.sf.jsqlparser.expression.Function e)))
+          :else nil))
+      (str "column" (inc i))))
+
+(declare correlated-subquery-refs)
+
+(defn- lateral-rows-fn
+  "Row producer for a correlated LATERAL subquery: given the outer
+   values (in `corr-refs` order), run the inner and return its rows as a
+   vector of tuples.
+
+   NEVER returns nil — `bind-by-fn` drops the outer tuple on nil, which
+   would silently swallow rows rather than raise. An empty result IS the
+   right answer for an inner LATERAL: PostgreSQL eliminates the outer
+   row, and an empty collection binding does exactly that.
+
+   The inner is parsed per invocation. `sql/parse-sql` refuses to cache
+   a parse made under `*from-bindings*` (the bindings are substituted
+   into the AST), so hoisting the parse out of the loop would need the
+   bindings threaded as parameters instead — worth doing, and noted in
+   the backlog, but correctness first."
+  [inner-sql corr-refs inner-schema query-db n-cols]
+  ;; Capture the parse fn NOW. `*parse-sql*` is bound during
+  ;; TRANSLATION; this closure runs during query EXECUTION, by which
+  ;; time the binding is gone. Reading it there yielded nil, so every
+  ;; invocation returned no rows — and because an empty LATERAL
+  ;; eliminates its outer row, the whole query answered empty rather
+  ;; than failing.
+  (let [parse-fn params/*parse-sql*]
+    (fn [& outer-vals]
+      (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
+                       {} (map vector corr-refs outer-vals))]
+        (binding [params/*from-bindings* fb
+                  params/*lateral-outer-aliases* (set (map first corr-refs))]
+          (or (try
+                (let [p (when parse-fn (parse-fn inner-sql inner-schema query-db))
+                      q (:query p)
+                      ia (:in-args p)
+                      qdb (or (:enriched-db p) query-db)]
+                  (when q
+                    (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))]
+                      ;; TAKE the visible columns. The inner's `:find`
+                      ;; carries trailing bookkeeping vars — the entity
+                      ;; var for ordering/bag semantics, and any hidden
+                      ;; grouping keys — which are stripped at the wire
+                      ;; layer, not here. Passing them through made the
+                      ;; produced tuple wider than the binding form, so
+                      ;; the relation binding matched nothing.
+                      (vec (map-indexed
+                            (fn [i r]
+                              (conj (vec (take n-cols (if (sequential? r) r [r])))
+                                    (long (inc i))))
+                            res)))))
+                (catch Throwable _ nil))
+              []))))))
+
+(defn- lateral-subselect->spec
+  "`JOIN LATERAL (SELECT …) s ON true` whose inner references an outer
+   column.
+
+   Same shape as a correlated SRF: the inner is run once per outer row
+   through a function binding, so the whole thing stays inside one
+   Datalog query. The difference is that the \"function\" is a SQL
+   subquery, executed with `*from-bindings*` holding the outer values —
+   the mechanism `run-correlated-spec` already uses for correlated
+   scalar subqueries in the SELECT list.
+
+   The relation's COLUMN SHAPE has to be known at translate time, and
+   the inner cannot be executed to find it (that is what being
+   correlated means). Names come from the inner's select items, as
+   PostgreSQL derives them. Types are best-effort: a plain column
+   reference resolves against the schema, anything else defaults to
+   text. Nothing is ever transacted into these attributes — they exist
+   so `SELECT *`, `count(*)` and OID inference have a relation to read —
+   so a wrong guess costs a reported OID, not a wrong value.
+
+   Returns nil for an UNcorrelated derived table, which belongs on the
+   existing materialise-once path."
+  [^net.sf.jsqlparser.statement.select.LateralSubSelect ls db schema
+   outer-aliases var-counter]
+  (let [inner (.getSelect ls)
+        corr-refs (seq (correlated-subquery-refs inner outer-aliases))]
+    (when (and corr-refs (instance? PlainSelect inner))
+      (let [talias (when-let [a (.getAlias ls)]
+                     (unquote-ident (str/trim (.getName ^Alias a))))
+            items (vec (.getSelectItems ^PlainSelect inner))
+            cols (vec (map-indexed (fn [i si] (select-item-col-name si i)) items))
+            ;; Best-effort storage type: a bare column reference keeps
+            ;; the type it has in the schema.
+            vtype-of (fn [^net.sf.jsqlparser.statement.select.SelectItem si]
+                       (let [e (.getExpression si)]
+                         (or (when (instance? Column e)
+                               (let [^Column c e
+                                     t (some-> (.getTable c) .getName unquote-ident
+                                               str/lower-case)
+                                     n (str/lower-case (unquote-ident (.getColumnName c)))]
+                                 (when t (get-in schema [(keyword t n) :db/valueType]))))
+                             :db.type/string)))
+            vtypes (mapv vtype-of items)
+            sub-name (str "__lsub__" (or talias "anon"))
+            ;; NO row marker. Every other virtual table declares one so
+            ;; `count(*)` and `SELECT *` have something to enumerate, but
+            ;; those all carry DATA. This relation's rows are produced by
+            ;; a function binding, so a declared marker only lets the
+            ;; alias-anchor pass emit `[?s_eid :__lsub__s/db-row-exists
+            ;; true]` — which matches nothing and makes the whole query
+            ;; unsatisfiable.
+            schema-tx (mapv (fn [c vt]
+                              {:db/ident (keyword sub-name c)
+                               :db/valueType vt
+                               :db/cardinality :db.cardinality/one})
+                            cols vtypes)
+            spec-db (d/db-with db schema-tx)]
+        {:db spec-db :schema (:schema spec-db)
+         :name sub-name :alias (or talias sub-name)
+         :cols cols
+         :vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
+         :ord-var (symbol (str "?" sub-name "_ord" (swap! var-counter inc)))
+         :corr-refs (vec corr-refs)
+         :inner-sql (str inner)
+         :n-cols (count cols)}))))
+
 (defn- sequence->virtual-table
   "Materialise `FROM <sequence-name>` into a one-row virtual table.
 
@@ -2148,6 +2280,12 @@
         ;; materialize it into the db and register its alias. The JOIN
         ;; is then handled as an ordinary table join in translate-join.
         joins (.getJoins select)
+        ;; Aliases a LATERAL inner can correlate WITH. Only the FROM
+        ;; item is in scope here; PostgreSQL also allows correlating to
+        ;; an EARLIER join item, which would need this to grow as the
+        ;; reduce walks the joins.
+        outer-alias-set (into #{} (comp (keep identity) (map str/lower-case))
+                              [name alias])
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
@@ -2175,6 +2313,31 @@
                     (and jn ja) (assoc ja jn)
                     jn          (assoc jn jn))
                   derived lsrfs])
+
+               ;; LateralSubSelect EXTENDS ParenthesedSelect, so this must
+               ;; come first or a LATERAL subquery is mistaken for an
+               ;; ordinary derived table and materialised once with the
+               ;; outer column unbound.
+               (and db (instance? net.sf.jsqlparser.statement.select.LateralSubSelect rt)
+                    (lateral-subselect->spec rt db schema outer-alias-set lsrf-var-counter))
+               (let [spec (lateral-subselect->spec rt db schema outer-alias-set
+                                                   lsrf-var-counter)]
+                 ;; An OUTER lateral has to preserve the outer row with
+                 ;; NULLs when the inner is empty, but an empty
+                 ;; collection binding DROPS it — that is exactly the
+                 ;; inner-join semantics this relies on. Reproducing the
+                 ;; outer form needs the or-join construction the other
+                 ;; OUTER joins use. Refuse explicitly: without this the
+                 ;; or-join pass reached the fn-binding clause and raised
+                 ;; the datalog-internal `Cannot parse rule-vars`.
+                 (when (or (.isLeft j) (.isRight j) (.isFull j) (.isOuter j))
+                   (throw (errors/pg-error
+                           :feature-not-supported
+                           {:feature "OUTER JOIN LATERAL (subquery)"})))
+                 [(:db spec) (:schema spec)
+                  (assoc aliases (:alias spec) (:name spec))
+                  derived
+                  (conj lsrfs spec)])
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
@@ -2207,6 +2370,9 @@
                            :parse-sql params/*parse-sql*
                            :hints hints
                            :derived-aliases derived-alias-set
+                           :computed-aliases (into #{} (map :alias)
+                                                   (cond-> (vec lsrf-specs)
+                                                     lsrf-spec (conj lsrf-spec)))
                            :ref-targets (pgs/validate-ref-targets!
                                          db schema
                                          (pgs/derive-ref-targets schema hints))})
@@ -2222,18 +2388,33 @@
         ;; The ordinality var goes into `:with`: Datalog is set-based, so
         ;; without it a function returning [7 7 7] collapses to ONE row.
         _ (doseq [lsrf-spec (cond-> (vec lsrf-specs) lsrf-spec (conj lsrf-spec))]
-            (let [{:keys [cols vars ord-var fname params name marker]} lsrf-spec
-                  rows-fn (srf-rows-fn fname)
-                  arg-vals (mapv (fn [e]
-                                   (let [v (srf-const-eval e)]
-                                     (if (not= ::corr v)
-                                       v
+            (let [{:keys [cols vars ord-var fname params name marker
+                          inner-sql corr-refs]} lsrf-spec
+                  subquery? (some? inner-sql)
+                  rows-fn (if subquery?
+                            (lateral-rows-fn inner-sql corr-refs schema db
+                                             (:n-cols lsrf-spec))
+                            (srf-rows-fn fname))
+                  arg-vals (if subquery?
+                             ;; The outer columns the inner correlates
+                             ;; with, in the order lateral-rows-fn
+                             ;; rebuilds *from-bindings* from. Binding
+                             ;; them as function ARGUMENTS is what makes
+                             ;; the engine run the inner once per outer
+                             ;; row.
+                             (mapv (fn [[a c]]
+                                     (ctx/col-var! ctx (keyword a c)))
+                                   corr-refs)
+                             (mapv (fn [e]
+                                     (let [v (srf-const-eval e)]
+                                       (if (not= ::corr v)
+                                         v
                                        ;; A correlated argument resolves
                                        ;; to the OUTER column's var, which
                                        ;; is exactly what makes the fn run
                                        ;; once per outer row.
-                                       (expr/translate-expr ctx e))))
-                                 params)
+                                         (expr/translate-expr ctx e))))
+                                   params))
                   fn-param (symbol (str "?lsrf-fn" (swap! (:var-counter ctx) inc)))
                   ;; [[?c1 ?c2 … ?ord]] — a RELATION binding, so one
                   ;; produced tuple becomes one row.
@@ -2260,8 +2441,9 @@
                 (swap! (:with-vars ctx) conj ord-var))
               ;; The row marker never gets a datom (there is no data), so
               ;; anything that scans for it must not be emitted.
-              (swap! (:col->var ctx) assoc (keyword name (clojure.core/name marker))
-                     (first vars))))
+              (when marker
+                (swap! (:col->var ctx) assoc (keyword name (clojure.core/name marker))
+                       (first vars)))))
 
         ;; Process JOIN ON conditions and track join types
         join-infos (when joins
@@ -3000,8 +3182,12 @@
             (let [right-aliases (set (map :alias join-infos))
                   left-join? (some #(= :left (:join-type %)) join-infos)]
               (doseq [[alias-key evar] @(:entity-vars ctx)]
-                (when (or (not left-join?)
-                          (not (contains? right-aliases alias-key)))
+                (when (and (or (not left-join?)
+                               (not (contains? right-aliases alias-key)))
+                           ;; A computed relation has no entities; its
+                           ;; entity var is never bound, so putting it in
+                           ;; :with makes the query unsatisfiable.
+                           (not (contains? (:computed-aliases ctx) alias-key)))
                   (swap! (:with-vars ctx) conj evar)))))
 
         ;; Anchor for the default-table entity var. If every clause
@@ -3512,7 +3698,8 @@
                                             join-infos))
                 entity-has-anchor (atom #{})
                 _ (doseq [[alias-key evar] @(:entity-vars ctx)]
-                    (when-not (contains? optional-aliases alias-key)
+                    (when-not (or (contains? optional-aliases alias-key)
+                                  (contains? (:computed-aliases ctx) alias-key))
                       (let [tname (get (:table-aliases ctx) alias-key alias-key)
                             marker (pgs/row-marker-attr tname)]
                         (when (get schema marker)

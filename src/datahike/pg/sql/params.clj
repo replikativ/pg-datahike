@@ -156,6 +156,20 @@
    for references like `__tmp.col` to the VALUES alias."
   nil)
 
+(def ^:dynamic *lateral-outer-aliases*
+  "When bound (by the correlated-LATERAL row producer), the set of OUTER
+   alias names whose columns are supplied per row through
+   `*from-bindings*`.
+
+   Separate from `*from-bindings*` on purpose. Both carry per-row
+   substitutions, but only a LATERAL inner needs the implicit-join
+   branch suppressed: `c.tid = t.id` there is a filter against a
+   constant, not a join against the relation `t`. Keying that
+   suppression off `*from-bindings*` itself changed behaviour for every
+   other user of it — including the correlated scalar subqueries
+   asyncpg's introspection leans on — and cost 37 of its tests."
+  nil)
+
 ;; ---------------------------------------------------------------------------
 ;; ParamRef substitution
 
