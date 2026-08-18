@@ -64,12 +64,25 @@ src -q -f "${FIXTURES}/pagila-schema.sql" >>"${LOG}" 2>&1
 src -q -f "${FIXTURES}/pagila-data.sql"   >>"${LOG}" 2>&1
 
 echo "[2/4] pg_dump (DEFAULT format — COPY, not --inserts)"
-pg_dump -h "${SRC_HOST}" -p "${SRC_PORT}" -U "${SRC_USER}" -d "${SRC_DB}" \
-        --no-owner --no-privileges > "${DUMP}" 2>>"${LOG}"
+dump_err="${HERE}/last-pgdump.err"
+if ! pg_dump -h "${SRC_HOST}" -p "${SRC_PORT}" -U "${SRC_USER}" -d "${SRC_DB}" \
+             --no-owner --no-privileges > "${DUMP}" 2>"${dump_err}"; then
+  # Print it. Swallowing pg_dump's stderr into the shared log cost a CI
+  # round trip: the failure surfaced only as "0 COPY blocks", which
+  # looks like a format problem rather than a client/server version
+  # mismatch.
+  echo "ERROR: pg_dump failed:" >&2
+  sed 's/^/    /' "${dump_err}" >&2
+  echo "    pg_dump version: $(pg_dump --version 2>&1)" >&2
+  echo "    server version:  $(src -At -c 'SHOW server_version' 2>&1 | head -1)" >&2
+  exit 1
+fi
+cat "${dump_err}" >> "${LOG}"
 copy_blocks=$(grep -c '^COPY ' "${DUMP}")
 echo "      $(wc -l < "${DUMP}") lines, ${copy_blocks} COPY blocks"
 if [[ "${copy_blocks}" -lt 10 ]]; then
   echo "ERROR: dump has ${copy_blocks} COPY blocks — expected the default format" >&2
+  sed 's/^/    /' "${dump_err}" >&2
   exit 1
 fi
 

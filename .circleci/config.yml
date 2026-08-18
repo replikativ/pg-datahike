@@ -278,10 +278,22 @@ jobs:
       # cimg/openjdk ships neither the Clojure CLI nor babashka.
       - install-clj-tools
       - run:
-          name: Install psql + pg_dump
+          name: Install psql + pg_dump (matching the sidecar's major version)
           command: |
+            # Ubuntu's default postgresql-client is older than the
+            # postgres:16 sidecar, and pg_dump REFUSES to dump a server
+            # newer than itself — it exits non-zero with an empty dump,
+            # which reads as "0 COPY blocks" rather than as a version
+            # error. Take the client from PGDG so the majors match.
             sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-              postgresql-client netcat-openbsd
+              curl ca-certificates gnupg netcat-openbsd
+            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+              | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+            echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-16
+            pg_dump --version
       - run:
           name: Wait for the source PostgreSQL
           command: |
