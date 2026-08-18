@@ -2341,11 +2341,21 @@
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
-                         sub-name :name} (materialize-derived-select!
-                                          ^ParenthesedSelect rt db schema)]
+                         sub-name :name sub-alias :alias}
+                        (materialize-derived-select! ^ParenthesedSelect rt db schema)]
                  [spec-db spec-schema
-                  (assoc aliases sub-name sub-name)
-                  (conj derived {:join j :alias sub-name})
+                  ;; Register the USER'S alias too, not just the storage
+                  ;; namespace. Only `sub-name` was registered, so
+                  ;; `FROM t JOIN (SELECT …) s ON …` left `s` naming
+                  ;; nothing and every reference to it raised
+                  ;; "missing FROM-clause entry for table s". The
+                  ;; from-item path always registered both, which is why
+                  ;; `FROM (SELECT …) s JOIN t` worked and the same
+                  ;; subquery on the right did not.
+                  (cond-> (assoc aliases sub-name sub-name)
+                    (and sub-alias (not= sub-alias sub-name))
+                    (assoc sub-alias sub-name))
+                  (conj derived {:join j :alias (or sub-alias sub-name)})
                   lsrfs]
                  [db schema aliases derived lsrfs])
 
@@ -2362,6 +2372,29 @@
         ;; speculative db; we have to JOIN them by value, not by
         ;; entity-id unification.
         derived-alias-set (into #{} (map :alias) derived-joins)
+
+        ;; The relations in FROM ORDER, as `SELECT *` must expand them.
+        ;; `table-aliases` is a MAP — it has no order and it also holds a
+        ;; `{name -> name}` entry per item — so star expansion used only
+        ;; `default-table` and silently dropped every joined relation:
+        ;; `SELECT * FROM t JOIN c` returned t's columns alone.
+        star-relations
+        (into (if default-table
+                [[default-table (get table-aliases default-table default-table)]]
+                [])
+              (keep (fn [^Join j]
+                      (let [rt (.getRightItem j)]
+                        (cond
+                          (instance? Table rt)
+                          (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
+                            (when jn [(or ja jn) jn]))
+                          ;; A derived table or SRF in join position: its
+                          ;; alias is registered above; find it by looking
+                          ;; for the entry whose value is a synthetic ns.
+                          :else
+                          (when-let [a (some (fn [{al :alias}] al) derived-joins)]
+                            (when-let [tn (get join-aliases a)] [a tn]))))))
+              (or joins []))
 
         ;; Create context
         hints (pgs/schema-hints db)
@@ -2683,16 +2716,19 @@
                 ;; namespace. Resolving it is what the `t.*` branch above
                 ;; already does; without it here, `SELECT * FROM emp e`
                 ;; returned a row with ZERO columns.
-                (let [real (get table-aliases default-table default-table)
-                      cols (pgs/column-info schema real db)]
-                  (doseq [col cols
+                ;; EVERY relation in FROM order, not just the default
+                ;; table. `SELECT * FROM t JOIN c` used to return t's
+                ;; columns alone — a silently narrower row, which is
+                ;; worse than an error because the client cannot tell.
+                (doseq [[ali real] star-relations]
+                  (doseq [col (pgs/column-info schema real db)
                           :when (not= "db_id" (:name col))]
                     ;; Route through the [:aliased …] form so the column
                     ;; binds against the alias's entity var, matching the
                     ;; `t.*` expansion.
-                    (let [v (ctx/col-var! ctx (if (= real default-table)
+                    (let [v (ctx/col-var! ctx (if (= real ali)
                                                 (:attr col)
-                                                [:aliased default-table (:attr col)]))]
+                                                [:aliased ali (:attr col)]))]
                       (swap! find-elements conj v)
                       (swap! find-aliases conj (or alias-str (:name col))))))
 
