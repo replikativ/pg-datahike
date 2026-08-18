@@ -79,6 +79,12 @@
                   (str "column \"" column "\" of relation \"" table "\" does not exist")
                   (str "column \"" column "\" does not exist"))))}
 
+   :ambiguous-column
+   {:sqlstate "42702"
+    :format (fn [{:keys [column]}]
+              (when column
+                (str "column reference \"" column "\" is ambiguous")))}
+
    :undefined-table
    {:sqlstate "42P01"
     :format (fn [{:keys [table]}]

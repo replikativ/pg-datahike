@@ -64,7 +64,58 @@
   ([^Column col table-aliases default-table col-overrides derived-aliases ci]
    (let [table-ref (.getTable col)
          table-alias (when table-ref (params/unquote-ident (.getName ^Table table-ref)))
-         alias-key (or table-alias default-table)
+         col-name0 (params/unquote-ident (.getColumnName col))
+         ;; An UNQUALIFIED name is resolved against every relation in
+         ;; scope, not just the default table. PostgreSQL searches all
+         ;; FROM items and raises 42702 when more than one claims the
+         ;; name; we only ever looked at `default-table`, so
+         ;; `SELECT tid FROM t, c WHERE c.tid = t.id` answered
+         ;; "column tid does not exist" — and worse, when BOTH relations
+         ;; had the column we silently picked the default table's,
+         ;; which is a wrong answer rather than an error.
+         ;;
+         ;; Only consulted when the name is unqualified and there is
+         ;; more than one relation; a single-table query resolves
+         ;; exactly as before. Relations absent from `ci` (catalog and
+         ;; speculative tables) simply do not become candidates, so this
+         ;; can only ever turn a failure into a resolution.
+         owner (when (and (nil? table-alias) ci (not= "db_id" col-name0)
+                          (> (count (set (vals table-aliases))) 1))
+                 ;; Group by the resolved ATTRIBUTE, not by alias.
+                 ;; `table-aliases` registers BOTH `{alias -> name}` and
+                 ;; `{name -> name}` for ONE from item, so `FROM pg_type t`
+                 ;; yields two alias keys for a single relation — counting
+                 ;; those as two candidates made every SQLAlchemy
+                 ;; introspection query fail with `typnamespace is
+                 ;; ambiguous`, a column that exists on pg_type alone.
+                 ;;
+                 ;; The cost is that a SELF-join (`FROM t a, t b`) is not
+                 ;; reported ambiguous, because both sides resolve to the
+                 ;; same attribute and we cannot tell one from-item
+                 ;; registered twice from two of them. PostgreSQL does
+                 ;; raise there. Narrow, and the alternative is a false
+                 ;; positive on every aliased single-table query.
+                 (let [by-attr (reduce (fn [m [ak tn]]
+                                         (if-let [a (pgs/canonical-attr ci tn col-name0)]
+                                           (if (pgs/ambiguous? a)
+                                             m
+                                             (update m a (fnil conj #{}) ak))
+                                           m))
+                                       {} table-aliases)]
+                   (cond
+                     (= 1 (count by-attr))
+                     (let [aks (val (first by-attr))]
+                       ;; Prefer the default table's own alias when it is
+                       ;; one of them, so the emitted form stays the plain
+                       ;; keyword rather than an `[:aliased …]` wrapper.
+                       (if (contains? aks default-table) default-table (first aks)))
+
+                     (> (count by-attr) 1)
+                     (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
+                                     {:error :ambiguous-column :column col-name0}))
+
+                     :else nil)))
+         alias-key (or table-alias owner default-table)
          table-name (get table-aliases alias-key alias-key)
          col-name (params/unquote-ident (.getColumnName col))
          derived? (contains? (or derived-aliases #{}) alias-key)]

@@ -518,14 +518,23 @@ rather than half-landed.
 
 ### Unqualified column names are not resolved across FROM items
 
+> **FIXED on `fix/unqualified-column-resolution`**
+
 `SELECT tid FROM t, c WHERE c.tid = t.id` raises `column "tid" does not
 exist`; PostgreSQL resolves an unqualified name by searching every FROM
 item. `ctx/resolve-column` only consults `default-table`, so any
 multi-table query must qualify its columns.
 
-Not specific to joins or LATERAL — `SELECT v FROM t, (SELECT 1 AS v) s`
-fails the same way. It is why the correlated-SRF work covers `g.g` but
-not bare `g`.
+Not specific to joins or LATERAL. Resolution now searches every
+relation in scope and raises 42702 when more than one claims the name —
+which PostgreSQL does and we did NOT: we silently answered with the
+default table's column.
+
+`SELECT v FROM t, (SELECT 1 AS v) s` still fails, but for a different
+and pre-existing reason: a DERIVED table joined to a real table has no
+bound entity var, so even the qualified `SELECT s.v FROM t, (…) s`
+raises "missing FROM-clause entry". Same gap as a constant-argument SRF
+in join position.
 
 ### The inner of a correlated LATERAL is re-parsed per outer row
 
@@ -558,6 +567,24 @@ Both survived because the vendored pagila fixture was dumped with
 format was exercised by nothing. `test/integration/pgdump` now closes
 that: it generates the dump with the real `pg_dump` and compares
 per-table row counts against the source.
+
+### A self-join's unqualified column is not reported ambiguous
+
+`SELECT count(id) FROM t a, t b` answers 4 where PostgreSQL raises
+42702 `column reference "id" is ambiguous`.
+
+Unqualified names now resolve across FROM items, and candidates are
+grouped by the resolved ATTRIBUTE rather than by alias. They have to
+be: `table-aliases` registers BOTH `{alias -> name}` and
+`{name -> name}` for a SINGLE from item, so `FROM pg_type t` looks like
+two relations. Counting aliases made every SQLAlchemy introspection
+query fail with `typnamespace is ambiguous` — a column that exists on
+pg_type alone.
+
+Grouping by attribute fixes that and costs the self-join case, where
+both sides genuinely resolve to the same attribute and we cannot tell
+one from-item registered twice from two of them. Closing it means
+tracking real FROM items separately from the alias map.
 
 ### Unordered aggregates do not preserve input order
 
