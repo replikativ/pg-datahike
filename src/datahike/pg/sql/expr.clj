@@ -3173,7 +3173,20 @@
                 (nil? (.getArrayConstructor ^Column left))
                 (nil? (.getArrayConstructor ^Column right))
                 (not (jsonb-column? ctx left))
-                (not (jsonb-column? ctx right)))
+                (not (jsonb-column? ctx right))
+                ;; NOT when either side names a table bound in
+                ;; *from-bindings*. Those columns are CONSTANTS supplied
+                ;; per outer row (UPDATE ... FROM (VALUES …), and a
+                ;; correlated LATERAL inner), not a relation to join
+                ;; against. This branch runs before translate-expr, so
+                ;; it would unify `c.tid = t.id` into a join against the
+                ;; real table `t` and never substitute the binding —
+                ;; which made a LATERAL inner answer no rows.
+                (not (some (fn [^Column c]
+                             (when-let [t (some-> (.getTable c) .getName unquote-ident)]
+                               (and params/*from-bindings*
+                                    (contains? params/*from-bindings* t))))
+                           [left right])))
        (let [resolve-col #(try (ctx/resolve-column ^Column %
                                                    (:table-aliases ctx)
                                                    (:default-table ctx)

@@ -121,3 +121,90 @@
   (is (= [["1"] ["2"] ["3"]]
          (rows "SELECT * FROM generate_series(1, array_upper(current_schemas(false), 1) + 2)")))
   (is (= [["1"] ["2"]] (rows "SELECT * FROM generate_series(1,2)"))))
+
+;; ---------------------------------------------------------------------------
+;; LATERAL SUBQUERIES — `JOIN LATERAL (SELECT …) s ON true`
+
+(defn- seed2! []
+  (run "CREATE TABLE c (tid int, v int)")
+  (run "INSERT INTO c VALUES (1,10),(1,11),(2,20)"))
+
+(deftest correlated-lateral-subquery
+  ;; Same mechanism as a correlated SRF — the inner runs once per outer
+  ;; row through a function binding — except the "function" is a SQL
+  ;; subquery executed with *from-bindings* holding the outer values.
+  (seed!) (seed2!)
+  (testing "JOIN LATERAL ... ON true"
+    (is (= [["1" "10"] ["1" "11"] ["2" "20"]]
+           (rows "SELECT t.id, s.v FROM t JOIN LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s ON true
+                  ORDER BY t.id, s.v"))))
+
+  (testing "the comma form is the same relation"
+    (is (= [["1" "10"] ["1" "11"] ["2" "20"]]
+           (rows "SELECT t.id, s.v FROM t, LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s
+                  ORDER BY t.id, s.v"))))
+
+  (testing "aggregates over the lateral column"
+    (is (= "3"  (v "SELECT count(*) FROM t, LATERAL
+                      (SELECT v FROM c WHERE c.tid = t.id) s")))
+    (is (= "41" (v "SELECT sum(s.v) FROM t, LATERAL
+                      (SELECT v FROM c WHERE c.tid = t.id) s"))))
+
+  (testing "an aggregate INSIDE the inner"
+    (is (= [["1" "11"] ["2" "20"]]
+           (rows "SELECT t.id, s.mx FROM t, LATERAL
+                    (SELECT max(v) AS mx FROM c WHERE c.tid = t.id) s
+                  ORDER BY t.id"))))
+
+  (testing "multiple aliased inner columns"
+    (is (= [["1" "1" "10"] ["1" "1" "11"] ["2" "2" "20"]]
+           (rows "SELECT t.id, s.a, s.b FROM t, LATERAL
+                    (SELECT tid AS a, v AS b FROM c WHERE c.tid = t.id) s
+                  ORDER BY t.id, s.b"))))
+
+  (testing "WHERE, GROUP BY and DISTINCT compose"
+    (is (= [["1" "11"] ["2" "20"]]
+           (rows "SELECT t.id, s.v FROM t, LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s
+                  WHERE s.v > 10 ORDER BY t.id, s.v")))
+    (is (= [["1" "2"] ["2" "1"]]
+           (rows "SELECT t.id, count(*) FROM t, LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s
+                  GROUP BY t.id ORDER BY t.id")))
+    (is (= [["1"] ["2"]]
+           (rows "SELECT DISTINCT t.id FROM t, LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s ORDER BY t.id")))))
+
+(deftest an-empty-inner-eliminates-the-outer-row
+  (seed!) (seed2!)
+  (run "INSERT INTO t VALUES (9,1)")
+  ;; tid=9 has no rows in c, so PostgreSQL drops it for an INNER lateral.
+  (is (= "3" (v "SELECT count(*) FROM t, LATERAL
+                   (SELECT v FROM c WHERE c.tid = t.id) s")))
+  (is (= [["1"] ["2"]]
+         (rows "SELECT DISTINCT t.id FROM t, LATERAL
+                  (SELECT v FROM c WHERE c.tid = t.id) s ORDER BY t.id"))))
+
+(deftest outer-lateral-subquery-is-refused
+  ;; An OUTER lateral must keep the outer row with NULLs when the inner
+  ;; is empty, but an empty collection binding DROPS it — which is the
+  ;; inner-join semantics the rest of this relies on. Refuse explicitly
+  ;; rather than let the or-join pass reach the fn-binding clause and
+  ;; raise the datalog-internal `Cannot parse rule-vars`.
+  ;; Only LEFT is meaningful: PostgreSQL rejects RIGHT and FULL LATERAL
+  ;; outright ("invalid reference to FROM-clause entry"), because the
+  ;; inner cannot reference a table it is outer-joined from the left of.
+  (seed!) (seed2!)
+  (let [e (.-error ^PgWireServer$QueryResult
+           (run "SELECT t.id FROM t LEFT JOIN LATERAL
+                           (SELECT v FROM c WHERE c.tid = t.id) s ON true"))]
+    (is (re-find #"OUTER JOIN LATERAL" (or e "")))))
+
+(deftest an-uncorrelated-derived-table-is-untouched
+  ;; Only a LATERAL whose inner references an outer column takes the new
+  ;; path; a plain derived table still materialises once.
+  (seed2!)
+  (is (= [["10"] ["11"] ["20"]]
+         (rows "SELECT s.v FROM (SELECT v FROM c) s ORDER BY s.v"))))

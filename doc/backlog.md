@@ -509,6 +509,17 @@ Not specific to joins or LATERAL — `SELECT v FROM t, (SELECT 1 AS v) s`
 fails the same way. It is why the correlated-SRF work covers `g.g` but
 not bare `g`.
 
+### The inner of a correlated LATERAL is re-parsed per outer row
+
+`lateral-rows-fn` parses the inner SQL on every invocation, so a LATERAL
+over N outer rows does N parses. `sql/parse-sql` refuses to cache a
+parse made under `*from-bindings*` — the bindings are substituted into
+the AST, so the cached shape would be wrong for the next row.
+
+The fix is to translate the inner ONCE with the correlated references
+as parameters and re-bind them per row, rather than substituting them
+into the text. Correctness first; this is the performance follow-up.
+
 ### Unordered aggregates do not preserve input order
 
 `array_agg(id)` over rows 1..4 gives `{1,4,2,3}`; PostgreSQL gives
