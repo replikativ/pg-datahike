@@ -81,16 +81,39 @@
          ;; can only ever turn a failure into a resolution.
          owner (when (and (nil? table-alias) ci (not= "db_id" col-name0)
                           (> (count (set (vals table-aliases))) 1))
-                 (let [cands (into #{}
-                                   (keep (fn [[ak tn]]
-                                           (when-let [a (pgs/canonical-attr ci tn col-name0)]
-                                             (when-not (pgs/ambiguous? a) ak))))
-                                   table-aliases)]
+                 ;; Group by the resolved ATTRIBUTE, not by alias.
+                 ;; `table-aliases` registers BOTH `{alias -> name}` and
+                 ;; `{name -> name}` for ONE from item, so `FROM pg_type t`
+                 ;; yields two alias keys for a single relation — counting
+                 ;; those as two candidates made every SQLAlchemy
+                 ;; introspection query fail with `typnamespace is
+                 ;; ambiguous`, a column that exists on pg_type alone.
+                 ;;
+                 ;; The cost is that a SELF-join (`FROM t a, t b`) is not
+                 ;; reported ambiguous, because both sides resolve to the
+                 ;; same attribute and we cannot tell one from-item
+                 ;; registered twice from two of them. PostgreSQL does
+                 ;; raise there. Narrow, and the alternative is a false
+                 ;; positive on every aliased single-table query.
+                 (let [by-attr (reduce (fn [m [ak tn]]
+                                         (if-let [a (pgs/canonical-attr ci tn col-name0)]
+                                           (if (pgs/ambiguous? a)
+                                             m
+                                             (update m a (fnil conj #{}) ak))
+                                           m))
+                                       {} table-aliases)]
                    (cond
-                     (= 1 (count cands)) (first cands)
-                     (> (count cands) 1)
+                     (= 1 (count by-attr))
+                     (let [aks (val (first by-attr))]
+                       ;; Prefer the default table's own alias when it is
+                       ;; one of them, so the emitted form stays the plain
+                       ;; keyword rather than an `[:aliased …]` wrapper.
+                       (if (contains? aks default-table) default-table (first aks)))
+
+                     (> (count by-attr) 1)
                      (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
                                      {:error :ambiguous-column :column col-name0}))
+
                      :else nil)))
          alias-key (or table-alias owner default-table)
          table-name (get table-aliases alias-key alias-key)

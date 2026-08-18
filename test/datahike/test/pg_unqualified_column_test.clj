@@ -90,3 +90,15 @@
   ;; through the cross-relation search.
   (seed!)
   (is (= "2" (v "SELECT count(db_id) FROM t"))))
+
+(deftest an-aliased-single-table-is-not-ambiguous
+  ;; `table-aliases` registers BOTH `{alias -> name}` and `{name -> name}`
+  ;; for ONE from item, so `FROM t x` looks like two relations. Counting
+  ;; aliases rather than resolved attributes made every SQLAlchemy
+  ;; introspection query fail with `typnamespace is ambiguous` — a
+  ;; column that exists on pg_type alone.
+  (seed!)
+  (is (= [["1"] ["2"]] (rows "SELECT id FROM t x ORDER BY id")))
+  (is (= [["a"] ["b"]] (rows "SELECT nm FROM t x ORDER BY nm")))
+  (testing "the catalog shape that actually broke"
+    (is (some? (v "SELECT count(*) FROM pg_type t WHERE typnamespace = 2200")))))

@@ -568,6 +568,24 @@ format was exercised by nothing. `test/integration/pgdump` now closes
 that: it generates the dump with the real `pg_dump` and compares
 per-table row counts against the source.
 
+### A self-join's unqualified column is not reported ambiguous
+
+`SELECT count(id) FROM t a, t b` answers 4 where PostgreSQL raises
+42702 `column reference "id" is ambiguous`.
+
+Unqualified names now resolve across FROM items, and candidates are
+grouped by the resolved ATTRIBUTE rather than by alias. They have to
+be: `table-aliases` registers BOTH `{alias -> name}` and
+`{name -> name}` for a SINGLE from item, so `FROM pg_type t` looks like
+two relations. Counting aliases made every SQLAlchemy introspection
+query fail with `typnamespace is ambiguous` — a column that exists on
+pg_type alone.
+
+Grouping by attribute fixes that and costs the self-join case, where
+both sides genuinely resolve to the same attribute and we cannot tell
+one from-item registered twice from two of them. Closing it means
+tracking real FROM items separately from the alias map.
+
 ### Unordered aggregates do not preserve input order
 
 NARROWED by the datahike 0.8.1784 bump. `array_agg(id)` and
