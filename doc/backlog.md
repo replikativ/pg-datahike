@@ -430,6 +430,24 @@ Drivers read these OIDs to pick codecs, so this is more than cosmetic.
 Found while fixing MIN/MAX, where `max(d)` inherited the same wrong
 rendering as the bare column.
 
+### `NOT` of a conjunction whose OTHER operand is also UNKNOWN
+
+`SELECT id FROM t WHERE NOT (val = 10 AND tag = 'zzz')` on a row where
+BOTH val and tag are NULL returns the row; PostgreSQL excludes it
+(UNKNOWN AND UNKNOWN is UNKNOWN, and NOT UNKNOWN is UNKNOWN).
+
+Negation of a bare comparison and of an OR-tree is FIXED — those hoist
+their operands' null-guards out of the negation, which is exactly the
+SQL rule since both are FALSE only when every operand is non-null. A
+CONJUNCTION is not: `NOT (val = 10 AND id = 999)` is TRUE as soon as
+one conjunct is FALSE, whatever the other is, and that case is correct
+today. Hoisting there would break it.
+
+Getting the remaining case right needs real three-valued EVALUATION
+rather than guard placement — the same machinery the scalar-position
+entry below wants. The boundary is exact: wrong only when the conjunct
+that would make the AND false is itself UNKNOWN.
+
 ### Three-valued logic is wrong in scalar position
 
 A comparison or boolean operator in the SELECT list does not propagate
@@ -453,8 +471,9 @@ TRUE, and we get both backwards.
 `(not= ?v :__null__)` guards — `v = 10`, `v <> 10`, `v = NULL` and
 `v IS NULL` all match PostgreSQL. Two defects remain there:
 
-- `WHERE NOT (v = 10)` **includes** the NULL row; PostgreSQL excludes
-  it (UNKNOWN negates to UNKNOWN, not TRUE).
+- ~~`WHERE NOT (v = 10)` includes the NULL row~~ — **FIXED on
+  `fix/not-null-semantics`** for bare comparisons and OR-trees; see the
+  entry above for the conjunction case that remains.
 - Projecting a comparison, `SELECT v = 10`, yields `false` for a NULL
   input where PostgreSQL yields NULL.
 

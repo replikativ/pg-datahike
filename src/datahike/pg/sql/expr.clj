@@ -3237,6 +3237,36 @@
                :else
                [(list op l r)]))))))
 
+(defn- guard-clause?
+  "A null-guard emitted by `ctx/null-guard-clauses`."
+  [c]
+  (and (vector? c) (= 1 (count c)) (seq? (first c))
+       (= 'not= (ffirst c))
+       (contains? #{:__null__ nil} (nth (first c) 2 ::none))))
+
+(defn- empty-after-guard-strip?
+  "True when every clause is a null-guard, so stripping them would leave
+   an EMPTY negation. `IS NOT NULL` translates to exactly one
+   guard-shaped clause, and `NOT (v IS NOT NULL)` then produced a bare
+   `(not)` — which datalog rejects with \"Cannot parse 'not' clause\"."
+  [clauses]
+  (every? guard-clause? clauses))
+
+(defn- and-free?
+  "True when the expression tree contains no AND. Decides whether a NOT
+   may hoist its operands' null-guards out of the negation — see the
+   NotExpression branch of translate-predicate."
+  [e]
+  (cond
+    (nil? e) true
+    (instance? net.sf.jsqlparser.expression.operators.conditional.AndExpression e) false
+    (instance? net.sf.jsqlparser.expression.operators.conditional.OrExpression e)
+    (let [^net.sf.jsqlparser.expression.operators.conditional.OrExpression o e]
+      (and (and-free? (.getLeftExpression o)) (and-free? (.getRightExpression o))))
+    (instance? Parenthesis e) (and-free? (.getExpression ^Parenthesis e))
+    (instance? NotExpression e) (and-free? (.getExpression ^NotExpression e))
+    :else true))
+
 (defn translate-predicate
   "Translate a JSqlParser WHERE expression to Datalog :where clauses.
    Returns a vector of clause forms."
@@ -3802,7 +3832,35 @@
         ;; the outer query, not the negated branch) — predicate paths only.
         (let [inner (binding [*conjunctive-where* false]
                       (translate-predicate ctx inner-expr))]
-          [(concat ['not] inner)])))
+          (if (and (and-free? inner-expr) (not (empty-after-guard-strip? inner)))
+            ;; SQL: `NOT x` is TRUE only when x is FALSE, and a
+            ;; comparison with a NULL operand is UNKNOWN, not FALSE. The
+            ;; null-guards were INSIDE the `not`, so for a NULL row the
+            ;; guarded conjunction was false and `not` made it true:
+            ;; `WHERE NOT (v = 10)` returned the v-IS-NULL row, which
+            ;; PostgreSQL excludes.
+            ;;
+            ;; Hoisting the guards out of the negation says "operand is
+            ;; not null AND not(comparison)", which is the SQL meaning.
+            ;;
+            ;; Only when the inner tree has no AND. For a disjunction the
+            ;; same rule holds — an OR is FALSE only if every disjunct is
+            ;; FALSE, so every operand must be non-null. For a
+            ;; CONJUNCTION it does not: `NOT (v = 10 AND s = 'zzz')` is
+            ;; TRUE when s <> 'zzz' whatever v is, and hoisting v's guard
+            ;; would wrongly drop that row. That case is already correct
+            ;; today, so leaving AND-trees alone keeps it correct.
+            (let [body (remove guard-clause? inner)
+                  ;; DERIVE the guards from the operand vars rather than
+                  ;; only hoisting the ones already present. The equality
+                  ;; path emits none — a NULL equals nothing, so the
+                  ;; guard is redundant until you negate it — so
+                  ;; `NOT (v = 10)` had nothing to hoist and kept
+                  ;; returning the NULL row.
+                  vars   (into #{} (filter symbol?) (flatten (seq body)))
+                  guards (ctx/null-guard-clauses ctx vars)]
+              (conj (vec guards) (concat ['not] body)))
+            [(concat ['not] inner)]))))
 
     (instance? InExpression expr)
     (let [^InExpression e expr
