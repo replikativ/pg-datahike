@@ -586,6 +586,26 @@ both sides genuinely resolve to the same attribute and we cannot tell
 one from-item registered twice from two of them. Closing it means
 tracking real FROM items separately from the alias map.
 
+### `SELECT *` returned only the first relation's columns
+
+> **FIXED on `fix/derived-table-join`**
+
+`SELECT * FROM t JOIN c ON c.tid = t.id` returned t's columns alone —
+a silently narrower row, which a client cannot detect. Star expansion
+read `default-table` only. `table-aliases` is a MAP, with no order and
+a `{name -> name}` entry per item, so the expansion now walks an
+explicitly ordered list of the relations in FROM order.
+
+### A derived table on the RIGHT of a join was unreachable
+
+> **FIXED on `fix/derived-table-join`**
+
+`FROM t JOIN (SELECT …) s ON …` — the shape every ORM emits — raised
+`missing FROM-clause entry for table "s"`, while
+`FROM (SELECT …) s JOIN t ON …` worked. The join branch registered only
+the storage namespace (`__sub__s`) and never the user's alias; the
+from-item path always registered both.
+
 ### Unordered aggregates do not preserve input order
 
 NARROWED by the datahike 0.8.1784 bump. `array_agg(id)` and
