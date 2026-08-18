@@ -518,14 +518,23 @@ rather than half-landed.
 
 ### Unqualified column names are not resolved across FROM items
 
+> **FIXED on `fix/unqualified-column-resolution`**
+
 `SELECT tid FROM t, c WHERE c.tid = t.id` raises `column "tid" does not
 exist`; PostgreSQL resolves an unqualified name by searching every FROM
 item. `ctx/resolve-column` only consults `default-table`, so any
 multi-table query must qualify its columns.
 
-Not specific to joins or LATERAL — `SELECT v FROM t, (SELECT 1 AS v) s`
-fails the same way. It is why the correlated-SRF work covers `g.g` but
-not bare `g`.
+Not specific to joins or LATERAL. Resolution now searches every
+relation in scope and raises 42702 when more than one claims the name —
+which PostgreSQL does and we did NOT: we silently answered with the
+default table's column.
+
+`SELECT v FROM t, (SELECT 1 AS v) s` still fails, but for a different
+and pre-existing reason: a DERIVED table joined to a real table has no
+bound entity var, so even the qualified `SELECT s.v FROM t, (…) s`
+raises "missing FROM-clause entry". Same gap as a constant-argument SRF
+in join position.
 
 ### The inner of a correlated LATERAL is re-parsed per outer row
 
