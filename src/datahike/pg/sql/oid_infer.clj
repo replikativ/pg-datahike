@@ -570,8 +570,20 @@
         (when (= 1 (.size pel))
           (expr-oid (.get pel 0) env)))
 
+      ;; PostgreSQL folds a unary sign INTO the constant before typing it
+      ;; (gram.y doNegate), so `-2147483648` is int4 even though 2147483648
+      ;; alone is int8. Typing the operand and ignoring the sign made
+      ;; `abs(-2147483648)` an int8 abs, which succeeds, where PostgreSQL
+      ;; raises 22003.
       (instance? SignedExpression expr)
-      (expr-oid (.getExpression ^SignedExpression expr) env)
+      (let [^SignedExpression se expr
+            inner (.getExpression se)]
+        (if (and (= \- (.getSign se)) (instance? LongValue inner))
+          (let [v (- (.getValue ^LongValue inner))]
+            (if (and (>= v Integer/MIN_VALUE) (<= v Integer/MAX_VALUE))
+              types/oid-int4
+              types/oid-int8))
+          (expr-oid inner env)))
 
       ;; --- Boolean operators → BOOL -------------------------------------
       (instance? NotExpression expr)     types/oid-bool
@@ -706,7 +718,12 @@
       ;; and therefore can't live in the (SQL-keyed) parse cache. We
       ;; return nil and let describeResult resolve it via
       ;; `param-placeholder-index` below. See issue #27.
-      (instance? JdbcParameter expr)        nil
+      ;; A `$N` is typed from the declared parameter types when we have
+      ;; them -- which is how PostgreSQL types a Param, and which is the
+      ;; only way an expression over a rewritten literal can be typed at
+      ;; all. nil when undeclared, so the caller still falls back.
+      (instance? JdbcParameter expr)
+      (get params/*declared-param-oids* (.getIndex ^JdbcParameter expr))
       (instance? JdbcNamedParameter expr)   nil
 
       :else nil)))

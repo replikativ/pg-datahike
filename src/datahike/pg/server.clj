@@ -7201,9 +7201,22 @@
                               ;; with *cached-parsed* nil (this if-let's
                               ;; else-branch), so the extended-query path
                               ;; never re-templates its $N statements.
-                              (or (when-let [{tsql :sql tvals :params}
+                              (or (when-let [{tsql :sql tvals :params
+                                              toids :param-oids}
                                              (template/parameterize-numbers sql)]
-                                    (let [p (sql/parse-sql tsql schema db)]
+                                    ;; The literals' types have to be in
+                                    ;; scope for the translation, not
+                                    ;; recovered afterwards -- see
+                                    ;; params/*declared-param-oids*. They are
+                                    ;; also part of the parse-cache key, so
+                                    ;; two statements that template alike but
+                                    ;; typed differently do not share a plan.
+                                    (let [p (binding [params/*declared-param-oids*
+                                                      (when (seq toids)
+                                                        (into {} (map-indexed
+                                                                  (fn [i o] [(inc i) o]))
+                                                              toids))]
+                                              (sql/parse-sql tsql schema db))]
                                       (when (and p (not= :error (:type p))
                                                  (contains? #{:select :update :delete}
                                                             (:type p)))

@@ -550,6 +550,11 @@
     "in" "any" "all" "case" "coalesce" "nullif" "distinct" "union"
     "intersect" "except" "group"})
 
+(def ^:private ^java.math.BigInteger int32-min (java.math.BigInteger/valueOf Integer/MIN_VALUE))
+(def ^:private ^java.math.BigInteger int32-max (java.math.BigInteger/valueOf Integer/MAX_VALUE))
+(def ^:private ^java.math.BigInteger int64-min (java.math.BigInteger/valueOf Long/MIN_VALUE))
+(def ^:private ^java.math.BigInteger int64-max (java.math.BigInteger/valueOf Long/MAX_VALUE))
+
 (defn parameterize-numbers
   "Rewrite bare number literals in `sql` to $N placeholders. Returns
    {:sql <templated> :params [v ...]} (params 0-indexed, Long/Double)
@@ -566,6 +571,7 @@
                            toks))
         (let [sb (StringBuilder.)
               params (java.util.ArrayList.)
+              param-oids (java.util.ArrayList.)
               n (count toks)]
           ;; A bare integer in ORDER BY / GROUP BY is a 1-based ORDINAL
           ;; into the select list, not a value. Templating it to $N
@@ -585,7 +591,8 @@
             (if (= i n)
               (do (.append sb (subs sql last-end))
                   (when (pos? (.size params))
-                    {:sql (.toString sb) :params (vec params)}))
+                    {:sql (.toString sb) :params (vec params)
+                     :param-oids (vec param-oids)}))
               (let [{:keys [type text pos end] :as tok} (nth toks i)
                     ;; $N placeholders already present → mixing ours in
                     ;; would renumber theirs; bail entirely.
@@ -624,10 +631,18 @@
                         ;; unary sign: +/- whose own predecessor cannot
                         ;; end an expression (operator, '(', ',', or a
                         ;; keyword) — fold it into the value.
+                        ;; A CLOSING bracket ends an expression, so a
+                        ;; sign after one is binary: `sum(x)+1` is an
+                        ;; addition, not `sum(x)` followed by `+1`. Reading
+                        ;; it as unary emitted `SELECT sum(x)$1` -- malformed
+                        ;; SQL, so the parse failed and the caller silently
+                        ;; fell back. Answers stayed correct, but `sum(x)+1`,
+                        ;; `count(*)-1` and `max(x)*2` never reached any cache.
                         unary? (and prev (= :op (:type prev))
                                     (#{"-" "+"} (:text prev))
                                     (or (nil? prev2)
-                                        (#{:op :punct} (:type prev2))
+                                        (and (#{:op :punct} (:type prev2))
+                                             (not (#{")" "]"} (:text prev2))))
                                         (and (= :punct (:type prev2))
                                              (#{"(" ","} (:text prev2)))
                                         (= :ident (:type prev2))))
@@ -647,11 +662,37 @@
                         ;; `SELECT 1.10` came back 1.1 and `0.1 + 0.2`
                         ;; came back 0.30000000000000004, no matter what
                         ;; the literal paths downstream did.
-                        v (if (re-find #"[.eE]" text)
-                            (types/decimal-literal raw (Double/parseDouble raw))
-                            (Long/parseLong raw))]
+                        ;; The literal's TYPE has to travel with its
+                        ;; value. Rewriting to `$N` happens before the
+                        ;; translator ever sees the token, so without this
+                        ;; every translate-time type decision goes blind --
+                        ;; which is why `3 / 2` reported int8, and why
+                        ;; integer overflow could not be detected on
+                        ;; all-literal arithmetic.
+                        ;;
+                        ;; PostgreSQL's own rule (parse_node.c make_const):
+                        ;; an integer literal is int4 if it fits int32,
+                        ;; else int8, else NUMERIC. That last branch also
+                        ;; rescues literals wider than int64, which used to
+                        ;; make Long/parseLong throw and take the whole
+                        ;; templater down -- JSqlParser then choked on the
+                        ;; raw literal and the statement was a parse error.
+                        [v oid]
+                        (if (re-find #"[.eE]" text)
+                          [(types/decimal-literal raw (Double/parseDouble raw))
+                           types/oid-numeric]
+                          (let [bi (java.math.BigInteger. ^String raw)]
+                            (cond
+                              (and (>= (.compareTo bi int32-min) 0)
+                                   (<= (.compareTo bi int32-max) 0))
+                              [(.longValue bi) types/oid-int4]
+                              (and (>= (.compareTo bi int64-min) 0)
+                                   (<= (.compareTo bi int64-max) 0))
+                              [(.longValue bi) types/oid-int8]
+                              :else [(java.math.BigDecimal. bi) types/oid-numeric])))]
                     (.append sb (subs sql last-end start))
                     (.add params v)
+                    (.add param-oids oid)
                     (.append sb (str "$" (.size params)))
                     (recur (inc i) (long end) false fn-depth' paren-stack'
                            false in-sort-list?))
