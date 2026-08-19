@@ -3080,8 +3080,19 @@
                           (fn [agg-marker]
                             (when (:aggregate agg-marker)
                               (let [{:keys [fn params]} agg-marker
-                                    agg-sym (get fns/sql-aggregate->datalog fn)
                                     inner (when params (first params))
+                                    ;; Same per-input-type selection the plain
+                                    ;; and FILTER aggregate paths make: an
+                                    ;; aggregate whose result is numeric needs
+                                    ;; the exact BigDecimal runtime. Without
+                                    ;; it this path always took the float8
+                                    ;; variant, so `avg(n)` was exact but
+                                    ;; `avg(n) * 1` came back as a double.
+                                    agg-sym (or (when inner
+                                                  (pick-precision-variant
+                                                   fn (try (oid/expr-oid inner agg-oid-env)
+                                                           (catch Throwable _ nil))))
+                                                (get fns/sql-aggregate->datalog fn))
                                     iv (when inner (expr/translate-expr ctx inner))
                                     ;; `count(*)` translates its argument to
                                     ;; the keyword :*, which is not a datalog

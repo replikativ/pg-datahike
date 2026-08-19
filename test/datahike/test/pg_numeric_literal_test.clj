@@ -179,3 +179,61 @@
     (is (= "1.28333333333333333333" (one c "SELECT sum(n) / count(*) FROM w"))
         "division under an aggregate uses the same scale rule -- 20
          decimals here because the quotient is below 1")))
+
+(deftest exponent-literals-have-no-negative-scale
+  (with-open [c (jdbc)]
+    (testing "PostgreSQL's numeric never carries a negative display scale;
+              BigDecimal does -- `1e2` parses to unscaled 1 at scale -2.
+              Multiply is the operator that propagates it, since its result
+              scale is s1+s2 while add/subtract take a max and divide
+              clamps at zero."
+      (is (= "125.00" (one c "SELECT 1e2 * 1.25")))
+      (is (= "3750.0" (one c "SELECT 1.5e3 * 2.5")))
+      (is (= "150.0000000" (one c "SELECT 1e-7 * 1.5e9")))
+      (is (= "5000000000.0" (one c "SELECT 1e10 * 0.5"))))
+    (testing "the other operators were already unaffected"
+      (is (= "101.25" (one c "SELECT 1e2 + 1.25")))
+      (is (= "25.0000000000000000" (one c "SELECT 1e2 / 4"))
+          "division clamps the negative scale at zero, then select_div_scale
+           applies as usual"))))
+
+(deftest mod-promotes-against-a-numeric-operand
+  (with-open [c (jdbc)]
+    (is (= "1.0" (one c "SELECT mod(1, 3.0)"))
+        "the mod FUNCTION was wired to bare `rem`, which neither promotes
+         the integer operand nor raises PostgreSQL's division-by-zero")
+    (is (= "1.5" (one c "SELECT mod(5.5, 2)")))
+    (is (= "1.00" (one c "SELECT mod(5.5, 2.25)")))
+    (is (= "1" (one c "SELECT mod(7, 2)")))
+    (is (= "-1" (one c "SELECT mod(-7, 2)")))
+    (is (thrown-with-msg? java.sql.SQLException #"division by zero"
+                          (one c "SELECT mod(1, 0)")))))
+
+(deftest arithmetic-over-a-numeric-aggregate-stays-exact
+  (with-open [c (jdbc)]
+    (seed! c)
+    (testing "the compound-aggregate path selects the runtime variant by
+              input type, like the plain and FILTER paths -- it used to
+              always take float8, so avg(n) was exact but avg(n)*1 was not"
+      (is (= "1.28333333333333333333" (one c "SELECT avg(n) FROM w")))
+      (is (= "1.28333333333333333333" (one c "SELECT avg(n) * 1 FROM w")))
+      (is (= "7.70" (one c "SELECT sum(n) * 2 FROM w"))))))
+
+(deftest decimal-expressions-report-numeric-to-a-driver
+  (with-open [c (jdbc)]
+    (testing "the simple protocol rewrites literals to $N before the
+              translator sees them, so expr-oid cannot type them and the
+              OID comes from the runtime value. A BigDecimal had no branch
+              there and reported text; and promoted-numeric claimed int8
+              from ONE typed side, so `i4 + 1.0` advertised int8 over the
+              text 11.0 -- psycopg2 raised ValueError on int(\"11.0\")."
+      (exec! c "CREATE TABLE d (id int, i4 int)")
+      (exec! c "INSERT INTO d VALUES (1, 10)")
+      (with-open [st (.createStatement c)
+                  rs (.executeQuery st "SELECT i4 + 1.0 FROM d")]
+        (is (= "numeric" (.getColumnTypeName (.getMetaData rs) 1)))
+        (.next rs)
+        (is (= "11.0" (.getString rs 1))))
+      (with-open [st (.createStatement c)
+                  rs (.executeQuery st "SELECT 2.0")]
+        (is (= "numeric" (.getColumnTypeName (.getMetaData rs) 1)))))))

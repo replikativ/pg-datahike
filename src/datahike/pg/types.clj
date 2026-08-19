@@ -795,6 +795,11 @@
     (instance? Double v)  oid-float8
     (instance? Float v)   oid-float4
     (float? v)            oid-float8
+    ;; BigDecimal is `numeric`. Without this it fell to the :else text
+    ;; branch, which only stayed invisible while decimal literals were
+    ;; doubles -- once they became numeric, every value-inferred decimal
+    ;; reported as text (25).
+    (decimal? v)          oid-numeric
     (boolean? v)          oid-bool
     (inst? v)             oid-timestamp
     ;; ::date / ::time cast results are java.time locals (issue #13);
@@ -880,5 +885,13 @@
    parse, so a caller can keep its previous behaviour."
   ([token] (decimal-literal token nil))
   ([token fallback]
-   (try (java.math.BigDecimal. (str/trim (str token)))
-        (catch Exception _ fallback))))
+   (try
+     (let [bd (java.math.BigDecimal. (str/trim (str token)))]
+       ;; PostgreSQL's numeric never carries a NEGATIVE display scale --
+       ;; set_var_from_str normalises it away. BigDecimal does not:
+       ;; `1e2` parses to unscaled 1 at scale -2. Multiply is the one
+       ;; operator that propagates it (its result scale is s1+s2, where
+       ;; add/subtract take a max and divide clamps at 0), so `1e2 *
+       ;; 1.25` answered 125 where PostgreSQL answers 125.00.
+       (if (neg? (.scale bd)) (.setScale bd 0) bd))
+     (catch Exception _ fallback))))
