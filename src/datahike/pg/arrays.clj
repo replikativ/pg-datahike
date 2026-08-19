@@ -403,6 +403,11 @@
   (cond
     (nil? v)        "NULL"
     (boolean? v)    (if v "t" "f")
+    ;; PostgreSQL's float text form inside an array too -- `array_out`
+    ;; calls the element type's own output function, so `{1.0E7}` was
+    ;; wrong for the same reason a bare float8 was.
+    (or (instance? Float v) (instance? Double v))
+    ((requiring-resolve 'datahike.pg.types/float->pg-text) v (instance? Float v))
     (number? v)     (str v)
     (array? v)      (to-pg-text v)
     (sequential? v) (if (empty? v)
