@@ -1899,13 +1899,21 @@
           ;; `(when v ...)` already; only this compile-time fold did not,
           ;; and `cast-scalar` makes the same check for the same reason.
           (or (nil? inner-raw) (= :__null__ inner-raw)) inner-raw
-          is-int?  (coerce/coerce-numeric inner-raw :long)
-          is-float? (coerce/coerce-numeric inner-raw :double)
-          ;; ::numeric keeps arbitrary precision — parse via the string
-          ;; form so a literal's scale survives (0.001000 → scale 6),
-          ;; never via double (which would drop trailing zeros).
-          is-numeric? (try (java.math.BigDecimal. (str/trim (str inner-raw)))
-                           (catch Exception _ inner-raw))
+          ;; Delegate rather than re-implement. The runtime branch below
+          ;; already routes these three through cast-scalar; this fold
+          ;; kept its own copy, so a NESTED cast -- which reaches here
+          ;; rather than sql.clj's bare-literal fast path -- missed
+          ;; everything cast-scalar knows. `2.5::numeric::int4` truncated
+          ;; to 2 (PostgreSQL rounds to 3) and `99999999999::int8::int4`
+          ;; passed through unchecked.
+          ;;
+          ;; ::numeric still keeps arbitrary precision: cast-scalar parses
+          ;; via the string form so a literal's scale survives (0.001000 →
+          ;; scale 6), never via double.
+          (or is-int? is-float? is-numeric?)
+          (sql-cast/cast-scalar inner-raw type-str
+                                {:explicit? true
+                                 :parse-timestamp parse-timestamp-string})
           is-text? (types/->pg-text inner-raw src-oid)
           is-bool? (if (instance? Boolean inner-raw)
                      inner-raw
@@ -2070,13 +2078,17 @@
             ;; Never route through double, which drops precision.
             is-numeric?
             (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
+                  ;; Through cast-scalar, like the int/float branch below.
+                  ;; Its own copy of the coercion could not see the
+                  ;; `numeric(p,s)` modifier, so a typmod cast on a COLUMN
+                  ;; was a no-op while the same cast on a literal (folded
+                  ;; above) applied it.
                   cast-fn (fn [v]
                             (when (and (some? v) (not= :__null__ v))
-                              (cond
-                                (instance? java.math.BigDecimal v) v
-                                (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                                (integer? v) (java.math.BigDecimal/valueOf (long v))
-                                :else (java.math.BigDecimal. (str/trim (str v))))))]
+                              (sql-cast/cast-scalar
+                               v type-str
+                               {:explicit? true
+                                :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj cast-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))

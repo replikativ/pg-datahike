@@ -4540,13 +4540,22 @@
 
      :else (str e))))
 
-(defn- apply-numeric-scale
-  "PG NUMERIC(p,s) rounds/pads a value to scale `s` on input (e.g. 1 →
-   1.00, 1.239 → 1.24). `scale` nil (unconstrained NUMERIC) leaves the
-   value's own scale untouched. Only acts on BigDecimals."
-  [v scale]
-  (if (and scale (instance? java.math.BigDecimal v))
-    (.setScale ^java.math.BigDecimal v (int scale) java.math.RoundingMode/HALF_UP)
+(defn- apply-numeric-typmod
+  "PG NUMERIC(p,s) on input: round/pad to scale `s` (1 → 1.00, 1.239 →
+   1.24) AND reject a value whose integer part no longer fits precision
+   `p`. Unconstrained NUMERIC (both nil) leaves the value untouched.
+   Only acts on BigDecimals.
+
+   The precision half was missing entirely: `p` was decoded and then
+   discarded, so 22003 numeric field overflow was never raised on any
+   write path."
+  [v p scale]
+  (if (instance? java.math.BigDecimal v)
+    (cond
+      (and p scale) (sql-cast/apply-numeric-typmod v p scale)
+      scale         (.setScale ^java.math.BigDecimal v (int scale)
+                               java.math.RoundingMode/HALF_UP)
+      :else         v)
     v))
 
 (defn coerce-insert-value
@@ -4572,7 +4581,17 @@
       val
       (let [vtype     (get-in schema [attr :db/valueType])
             elem-kw   (get-in schema [attr :pg/array-elem])
-            num-scale (get-in schema [attr :pg/numeric-scale])
+            ;; Both of these describe the DECLARED SQL type, and both live
+            ;; on the ident entity rather than in Datahike's schema map, so
+            ;; both need the db fallback. The enriched `:pg/numeric-scale`
+            ;; only ever reached the INSERT translator, which is why
+            ;; `numeric(p,s)` rounded on INSERT but not on UPDATE.
+            typmod    (or (get-in schema [attr :pg/typmod])
+                          (params/pg-typmod-of-attr db attr))
+            num-scale (or (second (when typmod (types/decode-numeric-typmod typmod)))
+                          (get-in schema [attr :pg/numeric-scale]))
+            num-prec  (or (first (when typmod (types/decode-numeric-typmod typmod)))
+                          (get-in schema [attr :pg/numeric-precision]))
           ;; ONLY jsonb normalizes. PG `json` is the text-faithful type — it
           ;; keeps key order, whitespace and duplicate keys — so it must NOT
           ;; be canonicalized.
@@ -4586,6 +4605,8 @@
             pg-type   (or (get-in schema [attr :pg/type])
                           (params/pg-type-of-attr db attr))
             jsonb?    (= "jsonb" pg-type)
+            ;; The declared integer width, when the column has one.
+            int-type  (when (contains? #{"int2" "int4" "int8"} pg-type) pg-type)
           ;; PostgreSQL validates BOTH types on input — `json_in` does a
           ;; full RFC-8259 parse and only then stores the original bytes.
           ;; We validated neither, so malformed text reached storage:
@@ -4672,7 +4693,8 @@
           (case vtype
             :db.type/float  (coerce/coerce-numeric val :float)
             :db.type/double (coerce/coerce-numeric val :double)
-            :db.type/bigdec (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
+            :db.type/bigdec (apply-numeric-typmod
+                             (coerce/coerce-numeric val :bigdec) num-prec num-scale)
             :db.type/long   (coerce/coerce-numeric val :long)
             val)
         ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
@@ -4683,15 +4705,24 @@
           ;; into a float8 column now hands a BigDecimal to a branch that
           ;; only knew Double and Long, and the raw value reached the
           ;; transactor as `1.5M`.
+          ;; Through the cast implementation, so a write gets the same
+          ;; width discipline a CAST does: PostgreSQL ROUNDS on the way to
+          ;; an integer (and rounds float and numeric sources differently)
+          ;; and raises 22003 when the value does not fit the declared
+          ;; width. We truncated and never range-checked, so the catalog
+          ;; advertised `smallint` over stored values of 100000.
+          ;; `integer?` too, not just the fractional/string cases: a Long
+          ;; that is simply too large for a declared int2/int4 column has
+          ;; nothing to coerce but everything to reject.
           (and (= vtype :db.type/long)
-               (or (string? val) (instance? Double val) (decimal? val)))
-          (coerce/coerce-numeric val :long)
+               (or (string? val) (number? val)))
+          (sql-cast/cast-to-integer val (or int-type "int8"))
           (and (= vtype :db.type/double)
                (or (string? val) (integer? val) (decimal? val)))
           (coerce/coerce-numeric val :double)
           (and (= vtype :db.type/float)
                (or (string? val) (integer? val) (decimal? val)))
-          (coerce/coerce-numeric val :float)
+          (sql-cast/cast-to-float val "real")
         ;; PG boolin: 't'/'yes'/'on'/'1' etc. — Boolean/parseBoolean
         ;; would silently turn '1' into false (issue #12).
           (and (= vtype :db.type/boolean) (string? val))
@@ -4734,7 +4765,7 @@
         ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
         ;; bad-syntax strings instead of silently keeping the original.
           (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
-          (apply-numeric-scale (coerce/coerce-numeric val :bigdec) num-scale)
+          (apply-numeric-typmod (coerce/coerce-numeric val :bigdec) num-prec num-scale)
           (and (= vtype :db.type/instant) (string? val))
           (expr/parse-timestamp-string val)
           (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
@@ -5039,7 +5070,13 @@
     (let [^Division e value-expr
           l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
           r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
-      (when (and (number? l) (number? r) (not (zero? r))) (/ l r)))
+      ;; fns/sql-div, not `/`, and NO zero guard. Skipping a zero divisor
+      ;; produced nil, which this function's caller reads as `SET col =
+      ;; NULL` -- so `UPDATE t SET c = x/0` reported success and RETRACTED
+      ;; the column, where PostgreSQL raises 22012 and leaves the row
+      ;; alone. sql-div also brings integer division, so `SET i = 7/2`
+      ;; stores 3 rather than the Ratio 7/2.
+      (when (and (number? l) (number? r)) (fns/sql-div l r)))
 
     ;; String/jsonb concatenation: col || '...'::jsonb merges jsonb; string concat otherwise
     (instance? Concat value-expr)
@@ -5187,11 +5224,16 @@
         ;; round/pad values to it (PG numeric(p,s) input semantics). Only
         ;; constrained columns carry :pg/typmod; unconstrained `numeric`
         ;; has none, so its scale is left intact.
+        ;; Precision as well as scale. `p` was decoded here and thrown
+        ;; away, which is why 22003 numeric field overflow was never
+        ;; raised on the INSERT path -- the value was rounded to scale
+        ;; and then stored however big it was.
         scale-meta (try
                      (into {}
                            (keep (fn [[ident typmod]]
-                                   (let [[_p s] (types/decode-numeric-typmod typmod)]
-                                     (when s [ident {:pg/numeric-scale s}]))))
+                                   (let [[p s] (types/decode-numeric-typmod typmod)]
+                                     (when s [ident (cond-> {:pg/numeric-scale s}
+                                                      p (assoc :pg/numeric-precision p))]))))
                            (d/q
                             '{:find  [?ident ?typmod]
                               :where [[?e :db/ident ?ident]

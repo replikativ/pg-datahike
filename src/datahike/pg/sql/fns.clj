@@ -865,13 +865,13 @@
   (and (number? x) (Double/isNaN (double x))))
 
 (defn- throw-power-domain [detail]
-  (throw (errors/pg-error :invalid-argument-for-power-function {:detail detail})))
+  (throw (errors/pg-error :invalid-argument-for-power-function {:message detail})))
 
 (defn- throw-log-domain [detail]
-  (throw (errors/pg-error :invalid-argument-for-logarithm {:detail detail})))
+  (throw (errors/pg-error :invalid-argument-for-logarithm {:message detail})))
 
 (defn- throw-out-of-range [detail]
-  (throw (errors/pg-error :numeric-value-out-of-range {:detail detail})))
+  (throw (errors/pg-error :numeric-value-out-of-range {:message detail})))
 
 (defn- finite-range
   "PG's float.c overflow/underflow guard idiom, applied verbatim:
@@ -1069,7 +1069,7 @@
       (.abs (.divide (.multiply x y) (.gcd x y))))))
 
 (defn- throw-width-bucket [detail]
-  (throw (errors/pg-error :invalid-argument-for-width-bucket {:detail detail})))
+  (throw (errors/pg-error :invalid-argument-for-width-bucket {:message detail})))
 
 (defn- sql-width-bucket
   "SQL WIDTH_BUCKET(operand, low, high, count) — 1-based histogram

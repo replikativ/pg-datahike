@@ -154,13 +154,22 @@
 
    :numeric-value-out-of-range
    {:sqlstate "22003"
-    :format (fn [{:keys [type value detail]}]
+    :format (fn [{:keys [type value message detail]}]
               (cond
                 (and type value)
                 (str "value " (pr-str value) " out of range for type " type)
-                ;; Math-function range failures carry a ready-made message
-                ;; ("input is out of range", "value out of range: overflow")
-                ;; rather than a type/value pair.
+                ;; Math-function range failures and width overflows carry a
+                ;; ready-made message ("input is out of range", "integer out
+                ;; of range") rather than a type/value pair. It arrives under
+                ;; :message, NOT :detail -- :detail is emitted verbatim as
+                ;; the wire DETAIL field, so using it as the message made
+                ;; every one of these errors repeat itself:
+                ;;   ERROR:  cannot take square root of a negative number
+                ;;   DETAIL: cannot take square root of a negative number
+                ;; PostgreSQL sends no DETAIL for those, and a real one
+                ;; ("A field with precision 5, scale 2 must round to …") for
+                ;; numeric field overflow.
+                message message
                 detail detail
                 :else nil))}
 
@@ -175,34 +184,34 @@
    ;; datahike.pg.sql.fns for the call sites.
    :invalid-argument-for-power-function
    {:sqlstate "2201F"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    :invalid-argument-for-logarithm
    {:sqlstate "2201E"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    ;; width_bucket has its OWN code — its argument failures are 2201G,
    ;; not the 22003 the surrounding float code uses (float.c:4190).
    :invalid-argument-for-width-bucket
    {:sqlstate "2201G"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    ;; Bit-string width coercion. PG uses two distinct codes: a fixed-width
    ;; `bit(n)` mismatch is 22026, an over-long `bit varying(n)` is 22001
    ;; (varbit.c:404, :755).
    :string-data-length-mismatch
    {:sqlstate "22026"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    :string-data-right-truncation
    {:sqlstate "22001"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    ;; nextval past MAXVALUE / MINVALUE on a non-CYCLE sequence
    ;; (sequence.c:736). PG names the sequence and the bound it hit.
    :sequence-generator-limit-exceeded
    {:sqlstate "2200H"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    :undefined-function
    {:sqlstate "42883"
@@ -218,7 +227,7 @@
    ;; --- syntax / structural -------------------------------------------
    :syntax-error
    {:sqlstate "42601"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    :feature-not-supported
    {:sqlstate "0A000"
@@ -227,11 +236,11 @@
 
    :grouping-error
    {:sqlstate "42803"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    :wrong-object-type
    {:sqlstate "42809"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    ;; --- transaction / concurrency -------------------------------------
    :serialization-failure
@@ -272,12 +281,12 @@
    ;; we hit (sequence.c:lastval).
    :object-not-in-prerequisite-state
    {:sqlstate "55000"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    ;; --- generic fallbacks ---------------------------------------------
    :invalid-parameter-value
    {:sqlstate "22023"
-    :format (fn [{:keys [detail]}] detail)}
+    :format (fn [{:keys [message detail]}] (or message detail))}
 
    :connection-failure
    {:sqlstate "08006" :format nil}

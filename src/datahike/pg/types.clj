@@ -437,6 +437,24 @@
     ;; TEXT-displayed (regtype → 'int4'), so they are deliberately excluded.
     "oid"})
 
+(def integer-type-width
+  "Which of PostgreSQL's three integer widths a cast target names.
+   `cast-category` folds them all to :integer, but the width decides
+   both the range check and the name in the overflow message, so it has
+   to be recovered from the type string. `oid` is unsigned-32 but PG
+   reports its overflows against the same 32-bit boundary."
+  {"int2" :int2 "smallint" :int2 "serial2" :int2 "smallserial" :int2
+   "int8" :int8 "bigint" :int8 "serial8" :int8 "bigserial" :int8
+   "integer" :int4 "int" :int4 "int4" :int4 "serial" :int4 "serial4" :int4
+   "oid" :int4})
+
+(def integer-width-limits
+  "`[min max type-name]` per width; the name is the one PostgreSQL uses
+   in \"<name> out of range\"."
+  {:int2 [-32768 32767 "smallint"]
+   :int4 [-2147483648 2147483647 "integer"]
+   :int8 [Long/MIN_VALUE Long/MAX_VALUE "bigint"]})
+
 (def cast-float-types
   "SQL type names that cast to floating point (Clojure double)."
   #{"double precision" "double" "float" "float4" "float8"

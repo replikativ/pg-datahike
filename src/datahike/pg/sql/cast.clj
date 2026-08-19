@@ -43,6 +43,94 @@
   (or (some-> (re-find #"\((\d+)\)" type-str) second Integer/parseInt)
       (when-not varying? 1)))
 
+(defn- base-type-name
+  "The cast target with its `(…)` modifier stripped, lower-cased."
+  [type-str]
+  (-> (str type-str) (clojure.string/replace #"\s*\([^)]*\)" "")
+      clojure.string/trim clojure.string/lower-case))
+
+(defn- out-of-range! [tname]
+  (throw (errors/pg-error :numeric-value-out-of-range
+                          {:message (str tname " out of range")})))
+
+(defn numeric-typmod
+  "`[precision scale]` from a `numeric(p[,s])` target, or nil for bare
+   `numeric`. A modifier with no scale means scale 0 -- `numeric(10)`
+   truncates to an integer, which is easy to miss."
+  [type-str]
+  (when-let [m (re-find #"\(\s*(\d+)\s*(?:,\s*(-?\d+)\s*)?\)" (str type-str))]
+    [(Integer/parseInt (nth m 1))
+     (if (nth m 2) (Integer/parseInt (nth m 2)) 0)]))
+
+(defn apply-numeric-typmod
+  "PostgreSQL's apply_typmod (numeric.c): round to the declared scale,
+   then reject anything whose integer part no longer fits the declared
+   precision.
+
+   Both halves were missing. The scale is why `123.456::numeric(10,1)`
+   answered 123.456 instead of 123.5, and the precision is why
+   `123456::numeric(5,2)` was accepted at all -- 22003 numeric field
+   overflow was never raised on any path."
+  [^java.math.BigDecimal v p s]
+  (let [scaled (.setScale v (int s) java.math.RoundingMode/HALF_UP)
+        ;; PG's own test: |value| must be < 10^(p-s).
+        limit (.pow (java.math.BigDecimal. "10") (int (- p s)))]
+    (if (>= (.compareTo (.abs scaled) limit) 0)
+      (throw (errors/pg-error
+              :numeric-value-out-of-range
+              ;; PostgreSQL puts the arithmetic in DETAIL, not the message.
+              {:message "numeric field overflow"
+               :detail (str "A field with precision " p ", scale " s
+                            " must round to an absolute value less than 10^"
+                            (- p s) ".")}))
+      scaled)))
+
+(defn cast-to-integer
+  "Cast to one of PostgreSQL's three integer widths.
+
+   Two things this has to do that a plain `coerce-numeric … :long` does
+   not. It ROUNDS rather than truncates -- and the two source families
+   round DIFFERENTLY, which is not a detail we get to smooth over:
+
+     float  -> int   rint, half to EVEN          (float.c dtoi4)
+     numeric-> int   half AWAY FROM ZERO         (numeric.c round_var)
+
+   so `2.5::float8::int` is 2 while `2.5::numeric::int` is 3. And it
+   RANGE-CHECKS against the target width: every integer target used to
+   collapse to Java long, so `100000::int2` and `99999999999::int4`
+   passed through unchanged where PostgreSQL raises 22003."
+  [v type-str]
+  (let [w (get types/integer-type-width (base-type-name type-str) :int8)
+        [lo hi tname] (get types/integer-width-limits w)
+        rounded (cond
+                  (integer? v)      v
+                  (decimal? v)      (.setScale ^java.math.BigDecimal v 0
+                                               java.math.RoundingMode/HALF_UP)
+                  (number? v)       (Math/rint (double v))
+                  :else             (coerce/coerce-numeric v :long))]
+    ;; Compare before narrowing: `(long 1e30)` saturates silently, so a
+    ;; range test on the narrowed value would pass.
+    (if (number? rounded)
+      (let [cmp (bigdec rounded)]
+        (if (or (neg? (compare cmp (bigdec lo)))
+                (pos? (compare cmp (bigdec hi))))
+          (out-of-range! tname)
+          (long rounded)))
+      rounded)))
+
+(defn cast-to-float
+  "float4 and float8. `real` is a DISTINCT type, not a spelling of
+   double precision: `1.1::real` is 1.100000023841858, and a value that
+   does not fit is an error rather than an Infinity."
+  [v type-str]
+  (let [d (coerce/coerce-numeric v :double)]
+    (if (= :float4 (get {"float4" :float4 "real" :float4} (base-type-name type-str)))
+      (let [f (float d)]
+        (if (and (Double/isFinite (double d)) (Float/isInfinite f))
+          (out-of-range! "real")
+          f))
+      d)))
+
 (defn cast-to-bit
   "int / text / bit → bit(n) or bit varying(n).
 
@@ -113,9 +201,12 @@
           (let [n (pg-bits/to-long v)]
             (case cat :float (double n) n))
           (case cat
-            :integer (coerce/coerce-numeric v :long)
-            :float   (coerce/coerce-numeric v :double)
-            :numeric (coerce/coerce-numeric v :bigdec)))
+            :integer (cast-to-integer v type-str)
+            :float   (cast-to-float v type-str)
+            :numeric (let [bd (coerce/coerce-numeric v :bigdec)]
+                       (if-let [[p sc] (numeric-typmod type-str)]
+                         (apply-numeric-typmod bd p sc)
+                         bd))))
 
         ;; `str` on a temporal value is java.util.Date.toString, which is
         ;; both the wrong format and rendered in the JVM's default time
