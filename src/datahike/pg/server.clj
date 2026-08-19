@@ -347,17 +347,16 @@
     ;; normalization. pgjdbc's getBoolean on a float column routes
     ;; through string parsing in text protocol and only accepts
     ;; "0"/"1"/"true"/... — never "0.0"/"1.0".
-     (and (or (instance? Float v) (instance? Double v))
-          (let [d (double v)]
-            (and (Double/isFinite d)
-                 (== d (Math/rint d))
-                 (< (Math/abs d) 1e15))))
-     (let [d (double v)
-          ;; Normalize -0.0 to 0.0 for both Float and Double (pgjdbc's
-          ;; boolean/number parsers accept "0" but not "-0").
-           v (if (zero? d) 0.0 v)
-           s (str v)]
-       (if (str/ends-with? s ".0") (subs s 0 (- (count s) 2)) s))
+     ;; PostgreSQL's float text form -- see types/float->pg-text. This
+     ;; used to strip a trailing ".0" from whole-valued floats below
+     ;; 1e15 and otherwise fall through to Java's `str`, so every float
+     ;; above ~1e7 or below 1e-4 went out as `1.0E7` / `1.0E-5`, a syntax
+     ;; PostgreSQL never emits.
+     ;;
+     ;; Zero still renders as "0" for -0.0 as well: pgjdbc's boolean and
+     ;; number parsers accept "0" but not "-0".
+     (or (instance? Float v) (instance? Double v))
+     (types/float->pg-text v (instance? Float v))
     ;; CAST results carry a Java type that encodes the source SQL type,
     ;; so we can emit the PG-correct text form without dragging the
     ;; timestamp through a lossy date-only conversion.

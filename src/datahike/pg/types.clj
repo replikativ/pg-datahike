@@ -838,6 +838,50 @@
 ;; Temporal text rendering
 ;; ============================================================================
 
+(defn float->pg-text
+  "PostgreSQL's text form of a float. `float4?` selects the narrower
+   rules for `real`.
+
+   PostgreSQL prints shortest-round-trip digits (float.c
+   float8out_internal, via Ryu, whenever extra_float_digits > 0 -- and
+   its default is 1). Java's `Double.toString` since JDK 19 also
+   produces shortest-round-trip digits, so the DIGITS already agree; what
+   differs is entirely the presentation, in three ways:
+
+     - the fixed-vs-scientific threshold. PostgreSQL uses fixed point iff
+       the scientific exponent is in [-4, 15) for float8 and [-4, 6) for
+       float4 (d2s.c to_chars, f2s.c); Java switches at 1e7 / 1e-3. So
+       `1e7` is 10000000 in PostgreSQL and \"1.0E7\" in Java.
+     - the exponent spelling: lowercase `e`, an explicit sign, and at
+       least two digits -- `1e+300`, `1e-05` -- against Java's `E300`.
+     - Java always keeps at least two significant digits (\"1.0E7\");
+       PostgreSQL's mantissa is minimal (`1e+15`).
+
+   Every float above ~1e7 or below 1e-4 was therefore emitted in a
+   syntax PostgreSQL never produces."
+  [v float4?]
+  (let [d (double v)]
+    (cond
+      (Double/isNaN d)      "NaN"
+      (Double/isInfinite d) (if (pos? d) "Infinity" "-Infinity")
+      (zero? d)             "0"
+      :else
+      (let [s (if float4? (Float/toString (float v)) (Double/toString d))
+            minus? (str/starts-with? s "-")
+            bd (.stripTrailingZeros (java.math.BigDecimal. ^String (if minus? (subs s 1) s)))
+            digits (.toString (.unscaledValue bd))
+            ;; scientific exponent: the power of ten of the leading digit
+            exp (- (.precision bd) (.scale bd) 1)
+            fixed? (and (>= exp -4) (< exp (if float4? 6 15)))
+            body (if fixed?
+                   (.toPlainString bd)
+                   (str (subs digits 0 1)
+                        (when (> (count digits) 1) (str "." (subs digits 1)))
+                        "e" (if (neg? exp) "-" "+")
+                        (let [a (Math/abs exp)]
+                          (if (< a 10) (str "0" a) (str a)))))]
+        (if minus? (str "-" body) body)))))
+
 (defn temporal->pg-text
   "PostgreSQL's text rendering of a temporal value, or nil if `v` is not
    temporal.
@@ -892,6 +936,9 @@
      ;; negative-scale BigDecimal produces an exponent form PostgreSQL
      ;; never emits.
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
+     ;; Same PostgreSQL float form the wire renderer uses.
+     (or (instance? Float v) (instance? Double v))
+     (float->pg-text v (instance? Float v))
      :else (or (temporal->pg-text v src-oid) (str v)))))
 
 (defn decimal-literal
