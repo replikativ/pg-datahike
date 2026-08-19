@@ -33,6 +33,7 @@
 (def oid-int8      20)
 (def oid-text      25)
 (def oid-float8   701)
+(def oid-numeric 1700)
 (def oid-timestamptz 1184)
 (def oid-date     1082)
 
@@ -110,9 +111,12 @@
   (testing "SELECT 1 AS n -> INT8"
     (is (= [oid-int8] (describe-oids "SELECT 1 AS n")))))
 
-(deftest describe-float-literal
-  (testing "SELECT 1.5 -> FLOAT8"
-    (is (= [oid-float8] (describe-oids "SELECT 1.5")))))
+(deftest describe-decimal-literal
+  (testing "SELECT 1.5 -> NUMERIC, not FLOAT8: PostgreSQL types an
+            unadorned decimal literal as numeric"
+    (is (= [oid-numeric] (describe-oids "SELECT 1.5"))))
+  (testing "SELECT 1.5::float8 -> FLOAT8"
+    (is (= [oid-float8] (describe-oids "SELECT 1.5::float8")))))
 
 (deftest describe-string-literal
   (testing "SELECT 'hello' -> TEXT"

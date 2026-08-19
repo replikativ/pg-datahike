@@ -106,6 +106,10 @@
 (def filter-percentile-cont fns/filter-percentile-cont)
 (def filter-percentile-disc fns/filter-percentile-disc)
 (def filter-mode            fns/filter-mode)
+(def seek-key fns/seek-key)
+(def sql-eq? fns/sql-eq?)
+(def sql-ne? fns/sql-ne?)
+(def sql-in? fns/sql-in?)
 (def sql-+   fns/sql-+)
 (def sql--   fns/sql--)
 (def sql-date+ fns/sql-date+)
@@ -1176,7 +1180,7 @@
                                                    type-str (str/lower-case (str (.getDataType (.getColDataType c-expr))))
                                                    raw (cond
                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
-                                                         (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
+                                                         (instance? DoubleValue inner) (types/decimal-literal inner (.getValue ^DoubleValue inner))
                                                          (instance? StringValue inner) (expr/string-value-text ^StringValue inner)
                                                          :else (str inner))]
                                                (case (types/cast-category type-str)
@@ -1226,7 +1230,7 @@
                                                        alias-str (select-item-alias item)
                                                        val (cond
                                                              (instance? LongValue expr) (.getValue ^LongValue expr)
-                                                             (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+                                                             (instance? DoubleValue expr) (types/decimal-literal expr (.getValue ^DoubleValue expr))
                                                             ;; Bit-string literals before StringValue —
                                                             ;; JSqlParser spells `B'1001000'` as a
                                                             ;; StringValue with prefix "B". Returning the
@@ -1271,7 +1275,7 @@
                                                                    array? (and ad (pos? (.size ^java.util.List ad)))
                                                                    raw (cond
                                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
-                                                                         (instance? DoubleValue inner) (.getValue ^DoubleValue inner)
+                                                                         (instance? DoubleValue inner) (types/decimal-literal inner (.getValue ^DoubleValue inner))
                                                                         ;; Before StringValue — see above. A bit
                                                                         ;; source also changes what the cast MEANS:
                                                                         ;; `B'101'::int` reinterprets the bits (5),

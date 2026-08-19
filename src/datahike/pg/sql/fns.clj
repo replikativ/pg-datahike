@@ -645,6 +645,81 @@
        :__null__
        (apply f a b c more)))))
 
+(def seek-no-match
+  "Sentinel for a comparison constant that cannot equal ANY value of the
+   attribute's stored type -- `intcol = 2.5`. Used as the seek key so the
+   index lookup correctly finds nothing."
+  ::seek-no-match)
+
+(defn seek-key
+  "Narrow a comparison constant to an attribute's stored type so that
+   `col = <const>` can stay an INDEX SEEK rather than a scan.
+
+   A datom pattern matches by value equality, which is type-sensitive,
+   so the seek key has to be the type the column actually stores.
+   PostgreSQL gets there by resolving the operator and casting the
+   constant; this is the same step. It matters because a decimal literal
+   is `numeric`: `WHERE f = 1.5` on a float8 column now arrives as a
+   BigDecimal and would match nothing.
+
+   Returns `seek-no-match` when the constant is not exactly
+   representable in the stored type -- `intcol = 2.5` is false for every
+   row, and a seek on a key nothing equals says precisely that.
+   Non-numeric types pass through untouched."
+  [v vtype]
+  (cond
+    (or (nil? v) (= :__null__ v)) v
+    (not (number? v)) v
+    :else
+    (case vtype
+      :db.type/long   (cond
+                        (integer? v) v
+                        ;; exactly integral -> the integer it equals
+                        (== v (Math/rint (double v))) (long v)
+                        :else seek-no-match)
+      :db.type/double (double v)
+      :db.type/float  (float v)
+      :db.type/bigdec (bigdec v)
+      v)))
+
+(defn sql-eq?
+  "SQL `=`. Numbers compare BY VALUE across types.
+
+   PostgreSQL resolves a cross-type numeric comparison by promoting to
+   the wider type, so `1.5::numeric = 1.5::float8` and `2 = 2.0` are both
+   true. Clojure's `=` is type-sensitive for numbers -- `(= 1.5M 1.5)` is
+   FALSE -- so every such comparison answered no rows:
+
+     WHERE n = 1.5   (n numeric)  -> no rows
+     WHERE i = 2.0   (i integer)  -> no rows
+     WHERE n = f     (numeric vs float8) -> no rows
+
+   `==` is the value comparison, and it promotes the same way PostgreSQL
+   does (`(== 0.1M 0.1)` is true, matching `0.1::numeric = 0.1::float8`).
+   Anything that is not a pair of numbers keeps `=`, including the
+   `:__null__` sentinel -- three-valued logic is decided by the null
+   guards around the predicate, not here.
+
+   The ordering comparisons never had this problem: Clojure's `<` `>`
+   `<=` `>=` are already cross-type."
+  [a b]
+  (if (and (number? a) (number? b)) (== a b) (= a b)))
+
+(defn sql-ne?
+  "SQL `<>`. The complement of `sql-eq?`; see there."
+  [a b]
+  (not (sql-eq? a b)))
+
+(defn sql-in?
+  "SQL `IN` over a literal list. `contains?` on a set is `=`-based and so
+   inherits the cross-type numeric blindness described in `sql-eq?`;
+   `WHERE n IN (1.5)` missed a numeric 1.5 for the same reason
+   `WHERE n = 1.5` did. Falls back to a linear scan with `sql-eq?` only
+   when the O(1) hit misses, so the common same-type case stays O(1)."
+  [vals v]
+  (or (contains? vals v)
+      (boolean (some #(sql-eq? % v) vals))))
+
 (def sql-+ (null-safe +))
 (def sql-- (null-safe -))
 (def sql-* (null-safe *))
@@ -707,6 +782,60 @@
 (defn- throw-division-by-zero []
   (throw (errors/pg-error :division-by-zero {})))
 
+(def ^:private ^:const numeric-min-sig-digits 16)   ;; NUMERIC_MIN_SIG_DIGITS
+(def ^:private ^:const numeric-max-display-scale 1000) ;; = NUMERIC_MAX_PRECISION
+(def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS, NBASE = 10000
+
+(defn- nbase-weight+first
+  "PostgreSQL stores a numeric as base-10000 digit groups. Return
+   `[weight firstdigit]` -- the exponent of the leading group and its
+   value -- which is the form select_div_scale is defined in, so the
+   division result scale cannot be derived without reconstructing them."
+  [^java.math.BigDecimal v]
+  (if (zero? (.signum v))
+    [0 0]
+    (let [digits (.toString (.abs (.unscaledValue v)))
+          p (count digits)
+          ;; decimal exponent of the leading significant digit
+          e (- p (.scale v) 1)
+          weight (Math/floorDiv (long e) (long dec-digits))
+          ;; how many of the leading decimal digits fall in that group
+          k (int (inc (- e (* dec-digits weight))))
+          grp (if (<= k p)
+                (subs digits 0 k)
+                (apply str digits (repeat (- k p) \0)))]
+      [weight (Long/parseLong grp)])))
+
+(defn- div-result-scale
+  "PostgreSQL's select_div_scale (numeric.c): pick a result scale giving
+   at least NUMERIC_MIN_SIG_DIGITS significant digits -- so numeric
+   division is no less accurate than float8 -- but never fewer decimals
+   than either input already displays.
+
+   This is why `10.0 / 3` is 3.3333333333333333 and `1.0 / 3.0` is
+   0.33333333333333333333: the quotient's estimated weight, not the
+   inputs' scales, sets the digit count."
+  ^long [^java.math.BigDecimal a ^java.math.BigDecimal b]
+  (let [[w1 f1] (nbase-weight+first a)
+        [w2 f2] (nbase-weight+first b)
+        ;; Estimated weight of the quotient. When the leading groups are
+        ;; equal PostgreSQL cannot tell and assumes a < b.
+        qweight (cond-> (- (long w1) (long w2)) (<= (long f1) (long f2)) dec)]
+    (-> (- numeric-min-sig-digits (* qweight dec-digits))
+        (max (.scale a))
+        (max (.scale b))
+        (max 0)
+        (min numeric-max-display-scale)
+        long)))
+
+(defn- numeric-div
+  "PostgreSQL numeric division. BigDecimal's own `divide` raises
+   \"Non-terminating decimal expansion\" without an explicit scale, so
+   this is not optional once decimal literals are numeric -- `10.0 / 3`
+   would throw. Rounds half-up, as round_var does."
+  [^java.math.BigDecimal a ^java.math.BigDecimal b]
+  (.divide a b (int (div-result-scale a b)) java.math.RoundingMode/HALF_UP))
+
 (defn- int-div
   "PostgreSQL's int2div / int4div / int8div: integer over integer is
    integer, TRUNCATED TOWARD ZERO (-7 / 2 is -3, not -4). Clojure's `/`
@@ -734,7 +863,16 @@
    divides as it did."
   ([a b]
    (when (and (number? b) (zero? b)) (throw-division-by-zero))
-   (if (and (integer? a) (integer? b)) (int-div a b) (/ a b)))
+   (cond
+     (and (integer? a) (integer? b)) (int-div a b)
+     ;; numeric / numeric -- and numeric / integer, which PostgreSQL
+     ;; also resolves as numeric. A float on either side outranks
+     ;; numeric and falls through to Clojure's `/`, which yields a
+     ;; double, exactly as float8 division should.
+     (and (decimal? a) (or (decimal? b) (integer? b)))
+     (numeric-div a (bigdec b))
+     (and (decimal? b) (integer? a)) (numeric-div (bigdec a) b)
+     :else (/ a b)))
   ([a b & more]
    (when (some #(and (number? %) (zero? %)) (cons b more))
      (throw-division-by-zero))

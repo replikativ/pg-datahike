@@ -39,7 +39,8 @@
   (:require [clojure.string :as str]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
-            [datahike.pg.sql.stmt :as stmt])
+            [datahike.pg.sql.stmt :as stmt]
+            [datahike.pg.types :as types])
   (:import [java.util ArrayList HashMap]))
 
 (set! *warn-on-reflection* true)
@@ -379,8 +380,11 @@
         (= lc "true") true
         (= lc "false") false
         (re-matches #"-?\d+" t) (Long/parseLong t)
-        (re-matches #"-?\d+\.\d+([eE][+\-]?\d+)?" t) (Double/parseDouble t)
-        (re-matches #"-?\d+[eE][+\-]?\d+" t) (Double/parseDouble t)
+        ;; numeric, not float8 -- see types/decimal-literal. The
+        ;; column's :db/valueType still governs what is finally stored;
+        ;; coerce-insert-value narrows a numeric to a float8 column.
+        (re-matches #"-?\d+\.\d+([eE][+\-]?\d+)?" t) (types/decimal-literal t (Double/parseDouble t))
+        (re-matches #"-?\d+[eE][+\-]?\d+" t) (types/decimal-literal t (Double/parseDouble t))
 
         (or (.startsWith t "'") (.startsWith t "n'") (.startsWith t "N'"))
         ;; Strip the optional N prefix, then unwrap '...' (handling ''
@@ -636,8 +640,15 @@
                                     (not (= :ident (:type prev2))))
                         start (if unary? (:pos prev) pos)
                         raw (subs sql (if unary? (:pos prev) pos) end)
+                        ;; A decimal literal is `numeric` in PostgreSQL,
+                        ;; not float8. Parameterizing it as a Double
+                        ;; discarded both the exactness and the scale
+                        ;; before any translator could see the token --
+                        ;; `SELECT 1.10` came back 1.1 and `0.1 + 0.2`
+                        ;; came back 0.30000000000000004, no matter what
+                        ;; the literal paths downstream did.
                         v (if (re-find #"[.eE]" text)
-                            (Double/parseDouble raw)
+                            (types/decimal-literal raw (Double/parseDouble raw))
                             (Long/parseLong raw))]
                     (.append sb (subs sql last-end start))
                     (.add params v)

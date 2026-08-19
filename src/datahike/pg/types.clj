@@ -857,4 +857,28 @@
    value→text conversion that is not the wire renderer should go through
    here; see `temporal->pg-text` for why."
   ([v] (->pg-text v nil))
-  ([v src-oid] (or (temporal->pg-text v src-oid) (str v))))
+  ([v src-oid]
+   (cond
+     ;; See the same branch in the wire renderer: `.toString` on a
+     ;; negative-scale BigDecimal produces an exponent form PostgreSQL
+     ;; never emits.
+     (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
+     :else (or (temporal->pg-text v src-oid) (str v)))))
+
+(defn decimal-literal
+  "The value of an unadorned SQL decimal literal, built from its ORIGINAL
+   TOKEN rather than from JSqlParser's `.getValue`.
+
+   PostgreSQL types such a literal as `numeric`, not float8: `0.1 + 0.2`
+   is 0.3 and `1.10` keeps its trailing zero. `.getValue` has already
+   gone through a double by the time we see it, losing both the
+   exactness and the scale, so neither is recoverable there -- but the
+   token itself survives on the node.
+
+   Handles the exponent forms too (`1.0e3`, `1e-3`), which PostgreSQL
+   also types as numeric. `fallback` is returned if the token will not
+   parse, so a caller can keep its previous behaviour."
+  ([token] (decimal-literal token nil))
+  ([token fallback]
+   (try (java.math.BigDecimal. (str/trim (str token)))
+        (catch Exception _ fallback))))

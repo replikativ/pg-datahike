@@ -316,15 +316,21 @@
         :else base-oid))))
 
 (defn- promoted-numeric
-  "Numeric promotion for binary arithmetic, matching PG's simplified
-   implicit-cast rules: any FLOAT makes the result FLOAT8; otherwise
-   INT8. Returns nil if we can't type either side (let caller fall back)."
+  "Numeric promotion for binary arithmetic, matching PG's implicit-cast
+   rules: any FLOAT makes the result FLOAT8, else any NUMERIC makes it
+   NUMERIC, else INT8. Returns nil if we can't type either side (let
+   caller fall back).
+
+   numeric used to promote to float8, which was only invisible because
+   decimal LITERALS were float8 too. `numeric + integer` is numeric in
+   PostgreSQL; only float8 outranks it."
   [l-oid r-oid]
   (cond
     (or (= l-oid types/oid-float8) (= r-oid types/oid-float8)
-        (= l-oid types/oid-float4) (= r-oid types/oid-float4)
-        (= l-oid types/oid-numeric) (= r-oid types/oid-numeric))
+        (= l-oid types/oid-float4) (= r-oid types/oid-float4))
     types/oid-float8
+    (or (= l-oid types/oid-numeric) (= r-oid types/oid-numeric))
+    types/oid-numeric
     (or (= l-oid types/oid-int8) (= r-oid types/oid-int8)
         (= l-oid types/oid-int4) (= r-oid types/oid-int4)
         (= l-oid types/oid-int2) (= r-oid types/oid-int2))
@@ -505,7 +511,9 @@
     (cond
       ;; --- Literals -----------------------------------------------------
       (instance? LongValue expr)      types/oid-int8
-      (instance? DoubleValue expr)    types/oid-float8
+      ;; PostgreSQL types an unadorned decimal literal as numeric, not
+      ;; float8 -- including one written with an exponent (`1.0e3`).
+      (instance? DoubleValue expr)    types/oid-numeric
       ;; Bit-string literals MUST precede StringValue — JSqlParser also
       ;; uses StringValue for `B'1001000'` (prefix "B"). PG types both
       ;; `B'…'` and `X'…'` as bit (1560), not text (issue #28).

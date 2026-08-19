@@ -777,7 +777,8 @@
                     :else nil)
           value (cond
                   (instance? LongValue right) (.getValue ^LongValue right)
-                  (instance? DoubleValue right) (.getValue ^DoubleValue right)
+                  (instance? DoubleValue right) (types/decimal-literal
+                                                 right (.getValue ^DoubleValue right))
                   (instance? StringValue right) (expr/string-value-text ^StringValue right)
                   :else (str right))]
       {:op op :col-idx col-idx :value value})
@@ -818,7 +819,7 @@
   [expr]
   (cond
     (instance? LongValue expr)   (.getValue ^LongValue expr)
-    (instance? DoubleValue expr) (.getValue ^DoubleValue expr)
+    (instance? DoubleValue expr) (types/decimal-literal expr (.getValue ^DoubleValue expr))
     (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
     (instance? SignedExpression expr)
     (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
@@ -4386,7 +4387,7 @@
      (try (.getValue ^LongValue e)
           (catch NumberFormatException _
             (java.math.BigInteger. ^String (.getStringValue ^LongValue e))))
-     (instance? DoubleValue e) (.getValue ^DoubleValue e)
+     (instance? DoubleValue e) (types/decimal-literal e (.getValue ^DoubleValue e))
      (instance? StringValue e) (expr/string-value-text ^StringValue e)
      (instance? BooleanValue e) (.getValue ^BooleanValue e)
      (instance? NullValue e) nil
@@ -4666,12 +4667,19 @@
         ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
         ;; — handles both the string→number and number→number paths.
         ;; `coerce-numeric` raises 22003/22P02 with the right SQLSTATE.
+          ;; `decimal?` is in each of these because a decimal LITERAL is
+          ;; numeric, not float8 -- so `INSERT INTO t(f) VALUES (1.5)`
+          ;; into a float8 column now hands a BigDecimal to a branch that
+          ;; only knew Double and Long, and the raw value reached the
+          ;; transactor as `1.5M`.
           (and (= vtype :db.type/long)
-               (or (string? val) (instance? Double val)))
+               (or (string? val) (instance? Double val) (decimal? val)))
           (coerce/coerce-numeric val :long)
-          (and (= vtype :db.type/double) (or (string? val) (integer? val)))
+          (and (= vtype :db.type/double)
+               (or (string? val) (integer? val) (decimal? val)))
           (coerce/coerce-numeric val :double)
-          (and (= vtype :db.type/float) (or (string? val) (integer? val)))
+          (and (= vtype :db.type/float)
+               (or (string? val) (integer? val) (decimal? val)))
           (coerce/coerce-numeric val :float)
         ;; PG boolin: 't'/'yes'/'on'/'1' etc. — Boolean/parseBoolean
         ;; would silently turn '1' into false (issue #12).
@@ -4940,7 +4948,7 @@
     (.getValue ^LongValue value-expr)
 
     (instance? DoubleValue value-expr)
-    (.getValue ^DoubleValue value-expr)
+    (types/decimal-literal value-expr (.getValue ^DoubleValue value-expr))
 
     (instance? StringValue value-expr)
     (expr/string-value-text ^StringValue value-expr)
@@ -6020,7 +6028,7 @@
     (try (.getValue ^LongValue expr)
          (catch NumberFormatException _
            (java.math.BigInteger. ^String (.getStringValue ^LongValue expr))))
-    (instance? DoubleValue expr)  (.getValue ^DoubleValue expr)
+    (instance? DoubleValue expr)  (types/decimal-literal expr (.getValue ^DoubleValue expr))
     (instance? StringValue expr)  (.getNotExcapedValue ^StringValue expr)
     (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
     (instance? NullValue expr)    nil

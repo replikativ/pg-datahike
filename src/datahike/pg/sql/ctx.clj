@@ -816,10 +816,23 @@
   [ctx resolved pvar]
   (when (symbol? pvar)
     (when-let [c (plain-join-col ctx resolved)]
-      (add-clause! ctx [(:evar c) (:attr c) pvar])
-      (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) pvar])
-      (add-clause! ctx [(list 'some? pvar)])
-      true)))
+      (let [vtype (get-in (:schema ctx) [(:attr c) :db/valueType])
+            ;; A datom pattern matches by value equality, which is
+            ;; type-sensitive, so the seek key must be the type the
+            ;; column actually STORES. bind-col-value! has always known
+            ;; this -- it refuses the fast path outright when the
+            ;; constant's class disagrees -- but this parameter path had
+            ;; no check at all, and it is the one a rewritten literal
+            ;; takes. Once a decimal literal became numeric, `WHERE f =
+            ;; 1.5` on a float8 column seeked with a BigDecimal and
+            ;; matched nothing. Narrowing keeps the seek AND makes it
+            ;; correct; see fns/seek-key for the not-representable case.
+            kvar (fresh-var! ctx)]
+        (add-clause! ctx [(list 'datahike.pg.sql/seek-key pvar vtype) kvar])
+        (add-clause! ctx [(:evar c) (:attr c) kvar])
+        (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) kvar])
+        (add-clause! ctx [(list 'some? pvar)])
+        true))))
 
 ;; ---------------------------------------------------------------------------
 ;; Expression helpers

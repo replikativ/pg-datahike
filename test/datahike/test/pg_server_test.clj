@@ -374,7 +374,9 @@
   (testing "pg_typeof returns the type name of a literal expression"
     (is (= [["bigint"]]          (rows (.execute *handler* "SELECT pg_typeof(1)"))))
     (is (= [["text"]]            (rows (.execute *handler* "SELECT pg_typeof('hello')"))))
-    (is (= [["double precision"]] (rows (.execute *handler* "SELECT pg_typeof(1.5)"))))
+    ;; An unadorned decimal literal is numeric in PostgreSQL, not float8.
+    (is (= [["numeric"]]         (rows (.execute *handler* "SELECT pg_typeof(1.5)"))))
+    (is (= [["double precision"]] (rows (.execute *handler* "SELECT pg_typeof(1.5::float8)"))))
     (is (= [["boolean"]]         (rows (.execute *handler* "SELECT pg_typeof(true)")))))
 
   (testing "pg_typeof on a column resolves to the column's declared type"

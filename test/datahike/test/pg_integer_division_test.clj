@@ -93,10 +93,13 @@
 
 (deftest mixed-operands-keep-fractional-division
   (with-open [c (jdbc)]
-    (is (= "3.5" (one c "SELECT 7 / 2.0"))
+    (is (= "3.5000000000000000" (one c "SELECT 7 / 2.0"))
         "only integer-over-integer is integer division; the operand types
-         pick the operator, as PostgreSQL's function resolution does")
-    (is (= "3.5" (one c "SELECT 7.0 / 2")))))
+         pick the operator, as PostgreSQL's function resolution does. The
+         scale is select_div_scale's, not a tidied 3.5 -- a decimal
+         literal is numeric, and numeric division carries 16 significant
+         digits")
+    (is (= "3.5000000000000000" (one c "SELECT 7.0 / 2")))))
 
 (deftest division-by-zero-still-raises
   (with-open [c (jdbc)]
