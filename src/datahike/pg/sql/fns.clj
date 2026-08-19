@@ -696,9 +696,25 @@
   (or (contains? vals v)
       (boolean (some #(sql-eq? % v) vals))))
 
-(def sql-+ (null-safe +))
-(def sql-- (null-safe -))
-(def sql-* (null-safe *))
+(defn- int-width-error [tname]
+  (throw (errors/pg-error :numeric-value-out-of-range
+                          {:message (str tname " out of range")})))
+
+(defn- long-overflow->pg
+  "Clojure's `+`/`-`/`*` raise a bare ArithmeticException \"long
+   overflow\" at the int8 boundary; PostgreSQL raises 22003 \"bigint out
+   of range\". A client trapping SQLSTATE 22003 never saw ours."
+  [f]
+  (fn [& args]
+    (try (apply f args)
+         (catch ArithmeticException e
+           (if (= "long overflow" (.getMessage e))
+             (int-width-error "bigint")
+             (throw e))))))
+
+(def sql-+ (null-safe (long-overflow->pg +)))
+(def sql-- (null-safe (long-overflow->pg -)))
+(def sql-* (null-safe (long-overflow->pg *)))
 
 ;; ---------------------------------------------------------------------------
 ;; date arithmetic
@@ -766,6 +782,63 @@
   [^java.math.BigDecimal a ^java.math.BigDecimal b]
   (.divide a b (int (div-result-scale a b)) java.math.RoundingMode/HALF_UP))
 
+(defn- checked-int-arith
+  "Apply `f` at PostgreSQL's declared integer width, raising 22003 when
+   the result does not fit.
+
+   int2 and int4 do not exist at runtime -- Datahike stores every
+   integer as a Java long -- so the width has to come from the
+   TRANSLATOR, which knows the declared column type. Without it
+   `int4col + 1` on 2147483647 answered 2147483648: a value the column's
+   own type cannot hold and a binary client cannot read.
+
+   When the operands are NOT both integral the declared width no longer
+   governs -- PostgreSQL has promoted to numeric or float8 by then -- so
+   this falls through to the generic operator."
+  [width f generic a b]
+  (if (and (integer? a) (integer? b))
+    (let [[lo hi tname] (get types/integer-width-limits width)
+          r (try (f (long a) (long b))
+                 ;; long arithmetic itself overflowed: that is the int8
+                 ;; boundary, and Clojure raises a bare "long overflow"
+                 ;; where PostgreSQL raises 22003.
+                 (catch ArithmeticException _ (int-width-error tname)))]
+      (if (or (< r (long lo)) (> r (long hi)))
+        (int-width-error tname)
+        r))
+    (generic a b)))
+
+(def sql-int+
+  (null-safe (fn [width a b] (checked-int-arith width #(Math/addExact ^long %1 ^long %2) + a b))))
+(def sql-int-
+  (null-safe (fn [width a b] (checked-int-arith width #(Math/subtractExact ^long %1 ^long %2) - a b))))
+(def sql-int*
+  (null-safe (fn [width a b] (checked-int-arith width #(Math/multiplyExact ^long %1 ^long %2) * a b))))
+
+(def sql-int-neg
+  "Unary minus at a declared integer width. `-(-2147483648)` is out of
+   range for int4 in PostgreSQL; Java's `-` wraps back to itself."
+  (null-safe
+   (fn [width a]
+     (if (integer? a)
+       (let [[lo hi tname] (get types/integer-width-limits width)
+             r (try (Math/negateExact (long a))
+                    (catch ArithmeticException _ (int-width-error tname)))]
+         (if (or (< r (long lo)) (> r (long hi))) (int-width-error tname) r))
+       (- a)))))
+
+(def sql-int-abs
+  "abs at a declared integer width. `abs(-9223372036854775808)` returned
+   ITSELF -- a negative absolute value -- because Java's abs wraps."
+  (null-safe
+   (fn [width a]
+     (if (integer? a)
+       (let [[lo hi tname] (get types/integer-width-limits width)
+             r (try (Math/absExact (long a))
+                    (catch ArithmeticException _ (int-width-error tname)))]
+         (if (or (< r (long lo)) (> r (long hi))) (int-width-error tname) r))
+       (abs a)))))
+
 (defn- int-div
   "PostgreSQL's int2div / int4div / int8div: integer over integer is
    integer, TRUNCATED TOWARD ZERO (-7 / 2 is -3, not -4). Clojure's `/`
@@ -827,6 +900,26 @@
     (rem a b)))
 
 (def sql-div (null-safe checked-div))
+
+(def sql-int-div
+  "Integer division at a declared width. Only one case can overflow --
+   `INT_MIN / -1`, whose quotient is one past the maximum -- and Java
+   wraps it back to INT_MIN rather than raising."
+  (null-safe
+   (fn [width a b]
+     (when (and (number? b) (zero? b)) (throw-division-by-zero))
+     (if (and (integer? a) (integer? b))
+       (let [[lo hi tname] (get types/integer-width-limits width)
+             ;; divideExact, not quot: the ONE overflow case is
+             ;; INT_MIN / -1, whose quotient is one past the maximum,
+             ;; and Java's quot wraps it back to INT_MIN. At int8 the
+             ;; range check below cannot catch that -- INT_MIN is inside
+             ;; the int8 range.
+             r (try (Math/divideExact (long a) (long b))
+                    (catch ArithmeticException _ (int-width-error tname)))]
+         (if (or (< r (long lo)) (> r (long hi))) (int-width-error tname) r))
+       (checked-div a b)))))
+
 (def sql-mod (null-safe checked-mod))
 
 ;; ---------------------------------------------------------------------------

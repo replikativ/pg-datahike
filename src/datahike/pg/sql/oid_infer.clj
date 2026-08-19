@@ -343,8 +343,14 @@
       ;; a numeric: psycopg2 read the int8 OID, tried int("11.0") and
       ;; raised ValueError. Returning nil instead lets the caller fall
       ;; back to value-based inference, which sees the real type.
+      ;; Integer arithmetic keeps the WIDER operand's width -- int2+int2
+      ;; is int2pl and stays int2, int4+int8 is int48pl and becomes int8.
+      ;; Collapsing all three to int8 made every integer expression
+      ;; report bigint, so a binary client sized for int4 was handed an
+      ;; 8-byte payload.
       (and (int-oid? l-oid) (int-oid? r-oid))
-      types/oid-int8
+      (let [rank {types/oid-int2 0 types/oid-int4 1 types/oid-int8 2}]
+        (if (>= (rank l-oid) (rank r-oid)) l-oid r-oid))
       (and l-oid r-oid) types/oid-int8
       :else nil)))
 
@@ -520,7 +526,15 @@
   (when expr
     (cond
       ;; --- Literals -----------------------------------------------------
-      (instance? LongValue expr)      types/oid-int8
+      ;; PostgreSQL types an integer literal as the NARROWEST of int4 /
+      ;; int8 that holds it (scan.l -> make_const), not int8 always. It
+      ;; is why `SELECT 1` reports integer, and why `int4col + 1` stays
+      ;; int4 rather than widening to bigint.
+      (instance? LongValue expr)
+      (let [v (.getValue ^LongValue expr)]
+        (if (and (>= v Integer/MIN_VALUE) (<= v Integer/MAX_VALUE))
+          types/oid-int4
+          types/oid-int8))
       ;; PostgreSQL types an unadorned decimal literal as numeric, not
       ;; float8 -- including one written with an exponent (`1.0e3`).
       (instance? DoubleValue expr)    types/oid-numeric

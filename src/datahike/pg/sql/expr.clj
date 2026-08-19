@@ -265,6 +265,12 @@
   [ctx expr]
   (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
 
+(defn- int-width-of
+  "The declared integer width of a single expression, or nil."
+  [ctx e]
+  (get types/oid->integer-width
+       (try (oid-infer/expr-oid e (oid-env ctx)) (catch Throwable _ nil))))
+
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
    ops can index into it uniformly. Inputs come from four places:
@@ -549,6 +555,20 @@
       ;; expression's inferred OID so the result is a constant
       ;; string the planner can fold; falls back to "text" when the
       ;; argument is a derived expression we can't statically type.
+      ;; abs on a declared integer column is width-checked:
+      ;; abs(INT_MIN) is out of range in PostgreSQL, while Java's abs
+      ;; WRAPS and returns the negative input unchanged -- an absolute
+      ;; value that is negative.
+      (and (= fname "abs")
+           (= 1 (count args))
+           (int-width-of ctx (first params)))
+      (let [w (int-width-of ctx (first params))
+            fn-param (symbol (str "?abs-i" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj (fn [v] (fns/sql-int-abs w v)))
+        (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
+        result-var)
+
       (= fname "pg_typeof")
       (let [arg-expr (first params)
             oid-env {:db            (:db ctx)
@@ -2158,6 +2178,62 @@
    :default-table (:default-table ctx)
    :hints         (:hints ctx)})
 
+(defn- int-arith-width
+  "The declared integer width this arithmetic node must be checked at,
+   or nil when no integer width governs it.
+
+   int2 and int4 do not exist at runtime -- every integer is a Java long
+   -- so overflow can only be detected against the width the TRANSLATOR
+   can see. The rule mirrors PostgreSQL's operator resolution: the
+   widest integer operand wins, and any operand known to be numeric or
+   floating point takes the expression out of integer arithmetic
+   entirely.
+
+   An UNTYPED operand does not veto. By the time we get here the
+   plan-cache rewrite has turned literals into `$N` placeholders, so
+   `i4col + 1` presents one typed column and one unknown -- and refusing
+   to type that would give up on the single most common shape there is.
+   PostgreSQL would coerce the literal to the operator's type, which is
+   what taking the known side amounts to. It is safe because the runtime
+   op re-checks: a value that turns out NOT to be integral falls through
+   to the generic operator, so `i4col + 1.5` still promotes to numeric."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr]
+  (let [env (oid-env ctx)
+        oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
+        oids [(oid (.getLeftExpression expr)) (oid (.getRightExpression expr))]
+        known (keep #(when % (get types/oid->integer-width %)) oids)
+        non-int? (some (fn [o]
+                         (and o (nil? (get types/oid->integer-width o))))
+                       oids)
+        ;; An unknown operand counts as int4 -- PostgreSQL's type for a
+        ;; bare integer literal, which is what an unknown almost always
+        ;; is here. This is not a detail: `smallint + 1` is int24pl and
+        ;; yields INT4 in PostgreSQL, so taking the column's int2 width
+        ;; would reject 32767 + 1, which is perfectly legal.
+        ;;
+        ;; Only when SOMETHING is typed, though. Two unknowns give us no
+        ;; anchor at all, and guessing int4 there would report "integer
+        ;; out of range" for `9223372036854775807 + 1`, whose operands
+        ;; are int8.
+        widths (if (seq known)
+                 (concat known (repeat (count (filter nil? oids)) :int4))
+                 nil)]
+    (when (and (seq widths) (not non-int?))
+      (let [rank {:int2 2 :int4 4 :int8 8}]
+        (reduce (fn [a b] (if (> (rank b) (rank a)) b a)) widths)))))
+
+(defn- int-arith-op
+  "The width-checked runtime op for `op-sym`, or nil to use the generic
+   one."
+  [ctx expr op-sym]
+  (when-let [w (int-arith-width ctx expr)]
+    (when-let [sym (get '{+ datahike.pg.sql/sql-int+
+                          - datahike.pg.sql/sql-int-
+                          * datahike.pg.sql/sql-int*
+                          / datahike.pg.sql/sql-int-div}
+                        op-sym)]
+      [sym w])))
+
 (defn- date-arith-op
   "The date-arithmetic fn to emit for `expr`, or nil to use the numeric one.
 
@@ -2221,10 +2297,17 @@
     (if (or (map? l) (map? r))
       ;; Compound aggregate expression: return descriptor for SELECT handler
       {:compound-agg true :op op-sym :left l :right r :expr expr}
-      (let [emit-op (or (date-arith-op ctx expr op-sym)
+      (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
+            rv (if (seq? r) (ctx/materialize-arg! ctx r) r)
+            int-op (int-arith-op ctx expr op-sym)
+            emit-op (or (date-arith-op ctx expr op-sym)
+                        (first int-op)
                         (get arith-op->null-safe op-sym op-sym))
-            arith (list emit-op (if (seq? l) (ctx/materialize-arg! ctx l) l)
-                        (if (seq? r) (ctx/materialize-arg! ctx r) r))]
+            ;; The width travels as a leading constant argument rather
+            ;; than as nine separate fns.
+            arith (if (and int-op (= emit-op (first int-op)))
+                    (list emit-op (second int-op) lv rv)
+                    (list emit-op lv rv))]
         (if not-prefix?
           (list 'datahike.pg.sql/sql-bit-not (ctx/materialize-arg! ctx arith))
           arith)))))
@@ -2638,7 +2721,16 @@
           inner (translate-expr ctx (.getExpression se))
           inner (if (seq? inner) (ctx/materialize-arg! ctx inner) inner)]
       (case sign
-        \- (if (number? inner) (- inner) (list '* -1 inner))
+        ;; Width-checked when the operand has a declared integer type:
+        ;; negating INT_MIN is out of range in PostgreSQL, while Java's
+        ;; `-` wraps it back to itself. `(* -1 x)` could not express that
+        ;; because the multiplication carries no width.
+        \- (let [w (when-not (number? inner)
+                     (int-width-of ctx (.getExpression se)))]
+             (cond
+               (number? inner) (- inner)
+               w (list 'datahike.pg.sql/sql-int-neg w inner)
+               :else (list '* -1 inner)))
         ;; `~` — bitwise NOT, over integers and bit strings alike.
         ;; Previously fell through to the identity branch below, so
         ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,

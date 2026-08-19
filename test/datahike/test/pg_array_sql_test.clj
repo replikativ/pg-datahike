@@ -30,6 +30,7 @@
 (def oid-float8 701)
 (def oid-text-array 1009)
 (def oid-name-array 1003)
+(def oid-int4-array 1007)
 (def oid-int8-array 1016)
 (def oid-name 19)
 
@@ -110,8 +111,10 @@
   (is (= [["{}"]] (rows "SELECT ARRAY[]::int[]"))))
 
 (deftest array-literal-oid-reports-array-type
-  (testing "RowDescription OID for ARRAY[1,2,3] is int8[] (1016)"
-    (is (= [oid-int8-array] (describe-oids "SELECT ARRAY[1,2,3]"))))
+  (testing "RowDescription OID for ARRAY[1,2,3] is int4[] (1007) --
+            PostgreSQL types the integer literals as int4, so the array
+            is integer[] and not bigint[]"
+    (is (= [oid-int4-array] (describe-oids "SELECT ARRAY[1,2,3]"))))
   (is (= [oid-text-array] (describe-oids "SELECT ARRAY['a','b']"))))
 
 ;; ---------------------------------------------------------------------------
@@ -134,7 +137,7 @@
 
 (deftest subscript-oid-is-element-type
   (testing "RowDescription OID for arr[N] is the element OID, not array OID"
-    (is (= [oid-int8] (describe-oids "SELECT ARRAY[10,20,30][2]")))
+    (is (= [oid-int4] (describe-oids "SELECT ARRAY[10,20,30][2]")))
     (is (= [oid-text] (describe-oids "SELECT ARRAY['a','b','c'][1]")))))
 
 ;; ---------------------------------------------------------------------------
@@ -281,8 +284,9 @@
     (is (= [Types/ARRAY] (meta-types "SELECT ARRAY[1,2,3]")))))
 
 (deftest pgjdbc-subscript-element-type
-  (testing "pgjdbc reports element type (BIGINT) for arr[N]"
-    (is (= [Types/BIGINT] (meta-types "SELECT ARRAY[1,2,3][2]")))))
+  (testing "pgjdbc reports the element type for arr[N] -- INTEGER here,
+            because ARRAY[1,2,3] is integer[]"
+    (is (= [Types/INTEGER] (meta-types "SELECT ARRAY[1,2,3][2]")))))
 
 (deftest pgjdbc-getSchemas-idiom
   (testing "pgjdbc's DatabaseMetaData.getSchemas() probe — the Metabase blocker"

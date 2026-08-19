@@ -448,6 +448,12 @@
    "integer" :int4 "int" :int4 "int4" :int4 "serial" :int4 "serial4" :int4
    "oid" :int4})
 
+(def oid->integer-width
+  "The integer width an OID denotes, or absent for a non-integer type.
+   Absence is meaningful: it is how arithmetic decides an expression has
+   left integer territory."
+  {oid-int2 :int2 oid-int4 :int4 oid-int8 :int8})
+
 (def integer-width-limits
   "`[min max type-name]` per width; the name is the one PostgreSQL uses
    in \"<name> out of range\"."
