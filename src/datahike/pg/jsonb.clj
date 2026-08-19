@@ -560,20 +560,122 @@
       (let [i (if (neg? idx) (+ (count parsed) idx) idx)]
         (vec (concat (take i parsed) (drop (inc i) parsed)))))))
 
+(defn- jsonb-path-elems
+  "PostgreSQL types the path argument of `jsonb_set`, `jsonb_insert` and
+   `#-` as `text[]`. Depending on the call site we receive it already
+   parsed (a PgArray, or a plain collection from the `#>` lowering) or
+   still as the literal text jsqlparser handed us (`{a,b,1}`) — nothing
+   between the parser and here casts it. Normalise all three to a vector
+   of strings; a NULL element stays nil, which `setPathArray` reads as
+   \"append\"."
+  [path]
+  (letfn [(->s [x] (when (some? x) (str x)))]
+    (cond
+      (pg-arr/array? path) (mapv ->s (:elements path))
+      (sequential? path)   (mapv ->s path)
+      (nil? path)          []
+      (and (string? path) (str/starts-with? (str/triml path) "{"))
+      (mapv ->s (:elements (pg-arr/from-pg-text path :text)))
+      :else                [(str path)])))
+
+(def ^:private prepend-idx
+  "PostgreSQL's sentinel for \"negative index further from the end than
+   the array is long\" — setPathArray parks it at INT_MIN and the
+   create/insert branch reads that as prepend."
+  Integer/MIN_VALUE)
+
+(def ^:private create-or-insert #{:create :insert-before :insert-after})
+
+(defn- array-path-idx
+  "Resolve one path element against an array of `n` elements, following
+   setPathArray: negatives count back from the end, a negative that
+   overshoots becomes `prepend-idx`, and a positive past the end clamps
+   to `n` (where the caller's append branch picks it up)."
+  [elem level n]
+  (if (nil? elem)
+    n
+    (let [i (try (Integer/parseInt (str/trim ^String elem))
+                 (catch NumberFormatException _
+                   (throw (ex-info (str "path element at position " (inc level)
+                                        " is not an integer: \"" elem "\"")
+                                   {:error :invalid-text-representation
+                                    :sqlstate "22P02"}))))]
+      (cond
+        (and (neg? i) (> (Math/abs (long i)) n)) prepend-idx
+        (neg? i)  (+ n i)
+        (> i n)   n
+        :else     i))))
+
+(declare set-path)
+
+(defn- set-path-object [m path nv op level]
+  (let [last? (= level (dec (count path)))
+        k (nth path level)]
+    (cond
+      (contains? m k)
+      (if last?
+        (case op
+          (:insert-before :insert-after)
+          (throw (ex-info "cannot replace existing key"
+                          {:error :invalid-parameter-value
+                           :sqlstate "22023"
+                           :hint (str "Try using the function jsonb_set "
+                                      "to replace key value.")}))
+          :delete (dissoc m k)
+          (assoc m k nv))
+        (assoc m k (set-path (get m k) path nv op (inc level))))
+
+      ;; A key that is not there is only created at the last level, and
+      ;; only by the create/insert ops — `jsonb_set(..., false)` and `#-`
+      ;; leave the document alone. PostgreSQL does not build out missing
+      ;; intermediate levels either (that is jsonb_set_lax's FILL_GAPS).
+      (and last? (create-or-insert op)) (assoc m k nv)
+      :else m)))
+
+(defn- set-path-array [v path nv op level]
+  (let [xs    (vec v)
+        n     (count xs)
+        last? (= level (dec (count path)))
+        idx   (array-path-idx (nth path level) level n)]
+    (cond
+      (and last? (create-or-insert op) (or (= idx prepend-idx) (zero? n)))
+      (into [nv] xs)
+
+      (and last? (< -1 idx n))
+      (case op
+        :insert-before (into (conj (subvec xs 0 idx) nv) (subvec xs idx))
+        :insert-after  (into (conj (subvec xs 0 (inc idx)) nv) (subvec xs (inc idx)))
+        :delete        (into (subvec xs 0 idx) (subvec xs (inc idx)))
+        (assoc xs idx nv))
+
+      ;; Clamped past the end: create/insert append, replace is a no-op.
+      last? (if (create-or-insert op) (conj xs nv) xs)
+
+      (< -1 idx n) (assoc xs idx (set-path (nth xs idx) path nv op (inc level)))
+      :else xs)))
+
+(defn- set-path
+  "The shared engine behind `jsonb_set`, `jsonb_insert` and `#-`, ported
+   from setPath in PostgreSQL's jsonfuncs.c. `op` is one of :replace,
+   :create, :insert-before, :insert-after, :delete; `level` indexes into
+   `path` and doubles as the position in PostgreSQL's error messages.
+
+   These three had each grown their own partial traversal, which is why
+   they had each stopped short in a different place — one ignored array
+   indices, one ignored `insert_after`, all three treated the unparsed
+   `{a,b}` literal as a single key."
+  [target path nv op level]
+  (cond
+    (map? target)        (set-path-object target path nv op level)
+    (sequential? target) (set-path-array target path nv op level)
+    :else                target))
+
 (defn jsonb-delete-path
   "PostgreSQL #- operator: remove element at path."
   [v path]
-  (let [parsed (parse-jsonb v)]
-    (if (= (count path) 1)
-      (jsonb-delete-key parsed (first path))
-      (let [head (first path)
-            child (jsonb-get parsed head)]
-        (if child
-          (let [updated (jsonb-delete-path child (rest path))]
-            (if (map? parsed)
-              (assoc parsed head updated)
-              (assoc (vec parsed) (Long/parseLong head) updated)))
-          parsed)))))
+  (let [parsed (parse-jsonb v)
+        p (jsonb-path-elems path)]
+    (if (empty? p) parsed (set-path parsed p nil :delete 0))))
 
 ;; ============================================================================
 ;; Functions: builders
@@ -597,7 +699,10 @@
    operator semantics are fixed, not silently by this refactor.)
 
    Adding an operator is one entry here plus, for the ones the parser
-   currently rejects, a narrowing of `sql/unsupported-op-chars`."
+   currently rejects, a narrowing of `sql/unsupported-op-chars` — except
+   for `#-`, where that gate is not the blocker: JSqlParser's lexer
+   cannot read the token at all, so it would need a pre-parse rewrite to
+   `jsonb_delete_path(a, b)`. The engine behind it is already correct."
   {"="   jsonb-eq?
    "->"  jsonb-get
    "->>" jsonb-get-text
@@ -694,6 +799,14 @@
 
       :else parsed)))
 
+(defn- pg-bool
+  "The optional trailing flag of jsonb_set/jsonb_insert reaches us either
+   as a real boolean or as PostgreSQL's text rendering of one."
+  [x]
+  (if (string? x)
+    (contains? #{"t" "true" "y" "yes" "on" "1"} (str/lower-case x))
+    (boolean x)))
+
 (defn jsonb-set
   "PostgreSQL jsonb_set(target, path, new_value, create_missing?):
    Set value at path in jsonb."
@@ -701,30 +814,23 @@
   ([target path new-value create-missing?]
    (let [parsed (parse-jsonb target)
          nv (parse-jsonb new-value)
-         path-vec (if (sequential? path) (vec path) [path])]
-     (if (= (count path-vec) 1)
-       (let [k (first path-vec)]
-         (if (map? parsed)
-           (if (or create-missing? (contains? parsed k))
-             (assoc parsed k nv)
-             parsed)
-           parsed))
-       (let [head (first path-vec)
-             child (jsonb-get parsed head)
-             updated (jsonb-set (or child {}) (rest path-vec) nv create-missing?)]
-         (if (map? parsed)
-           (assoc parsed head updated)
-           (if (and (sequential? parsed) (integer? (parse-long head)))
-             (assoc (vec parsed) (parse-long head) updated)
-             parsed)))))))
+         p (jsonb-path-elems path)]
+     (if (empty? p)
+       parsed
+       (set-path parsed p nv (if (pg-bool create-missing?) :create :replace) 0)))))
 
 (defn jsonb-insert
   "PostgreSQL jsonb_insert(target, path, new_value, insert_after?):
    Insert value at path position in jsonb array."
   ([target path new-value] (jsonb-insert target path new-value false))
   ([target path new-value insert-after?]
-   ;; Simplified: delegates to jsonb-set for objects
-   (jsonb-set target path new-value true)))
+   (let [parsed (parse-jsonb target)
+         nv (parse-jsonb new-value)
+         p (jsonb-path-elems path)]
+     (if (empty? p)
+       parsed
+       (set-path parsed p nv
+                 (if (pg-bool insert-after?) :insert-after :insert-before) 0)))))
 
 ;; ============================================================================
 ;; Functions: introspection

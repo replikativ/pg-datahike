@@ -1140,12 +1140,15 @@
 
       ;; jsonb_insert(target, path, new_value [, insert_after])
       (= fname "jsonb_insert")
-      (let [[target path-arg new-val & [_insert-after]] args
-            fn-param (symbol (str "?jsonb-insert" (swap! (:var-counter ctx) inc)))
+      (let [fn-param (symbol (str "?jsonb-insert" (swap! (:var-counter ctx) inc)))
             result-var (ctx/fresh-var! ctx)]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj (fn [t p v] (jb/serialize-jsonb (jb/jsonb-insert t p v))))
-        (swap! (:where-clauses ctx) conj [(list fn-param target path-arg new-val) result-var])
+        ;; The optional `insert_after` flag has to reach jsonb-insert —
+        ;; dropping it silently turned every call into insert-before.
+        (swap! (:in-args ctx) conj
+               (fn ([t p v] (jb/serialize-jsonb (jb/jsonb-insert t p v)))
+                   ([t p v a] (jb/serialize-jsonb (jb/jsonb-insert t p v a)))))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
       ;; jsonb_object_keys(jsonb) → returns set of keys; serialized as JSON array string
