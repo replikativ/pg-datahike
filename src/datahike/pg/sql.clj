@@ -108,6 +108,8 @@
 (def filter-mode            fns/filter-mode)
 (def sql-+   fns/sql-+)
 (def sql--   fns/sql--)
+(def sql-date+ fns/sql-date+)
+(def sql-date- fns/sql-date-)
 (def sql-*   fns/sql-*)
 (def sql-div fns/sql-div)
 (def sql-mod fns/sql-mod)

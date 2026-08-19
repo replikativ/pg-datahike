@@ -333,8 +333,23 @@
     :else nil))
 
 (defn- binary-arith-oid [^BinaryExpression e env]
-  (promoted-numeric (expr-oid (.getLeftExpression e) env)
-                    (expr-oid (.getRightExpression e) env)))
+  (let [l (expr-oid (.getLeftExpression e) env)
+        r (expr-oid (.getRightExpression e) env)
+        date?    #(= % types/oid-date)
+        plus?    (instance? Addition e)
+        minus?   (instance? Subtraction e)]
+    (cond
+      ;; PostgreSQL's date operators do not follow numeric promotion:
+      ;; `date - date` is an integer count of days and `date +/- integer`
+      ;; stays a date. Promoting them numerically made the wire report
+      ;; int8 for a value the renderer emits as `2020-01-02`, which a
+      ;; binary-format client then failed to decode.
+      (and minus? (date? l) (date? r))     types/oid-int4
+      ;; Keyed off the date operand only — see date-arith-op in expr.clj
+      ;; for why the other one is not inspected.
+      (and (or plus? minus?) (date? l))    types/oid-date
+      (and plus? (date? r))                types/oid-date
+      :else (promoted-numeric l r))))
 
 (defn resolve-aggregate-result-oid
   "Given an aggregate name and the OID of its first argument, return

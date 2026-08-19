@@ -2108,6 +2108,48 @@
     / datahike.pg.sql/sql-div
     rem datahike.pg.sql/sql-mod})
 
+(defn- oid-env
+  "The environment `oid-infer/expr-oid` needs, pulled off a translation ctx."
+  [ctx]
+  {:db            (:db ctx)
+   :schema        (:schema ctx)
+   :table-aliases (:table-aliases ctx)
+   :default-table (:default-table ctx)
+   :hints         (:hints ctx)})
+
+(defn- date-arith-op
+  "The date-arithmetic fn to emit for `expr`, or nil to use the numeric one.
+
+   `date + integer`, `date - integer` and `date - date` are separate
+   operators in PostgreSQL (date_pli / date_mii / date_mi). The choice
+   has to be made HERE, from the declared column type, because Datahike
+   stores `date` and `timestamp` columns alike as java.util.Date — a
+   runtime type test cannot tell them apart, and PostgreSQL answers the
+   two differently (`timestamp - timestamp` is an interval, `date - date`
+   is a count of days). Typing it statically also keeps a timestamp
+   column raising rather than quietly acquiring date semantics.
+
+   Only the DATE operand is inspected. The other one deliberately is not:
+   by the time we get here the planner has rewritten literals to `$N`
+   placeholders for the plan cache, so `d + 1` presents an untyped
+   parameter and no amount of static inference will recover the `1`.
+   That costs nothing, because PostgreSQL gives `date` no other
+   right-hand operator to be confused with, and sql-date- dispatches
+   days-vs-difference on the runtime value anyway."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
+  (when (contains? #{'+ '-} op-sym)
+    (let [env (oid-env ctx)
+          oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
+          date? #(= (oid %) types/oid-date)
+          l (.getLeftExpression expr)
+          r (.getRightExpression expr)]
+      (cond
+        (date? l) (if (= op-sym '+) 'datahike.pg.sql/sql-date+ 'datahike.pg.sql/sql-date-)
+        ;; `integer + date` commutes. `integer - date` is not an operator
+        ;; in PostgreSQL, so only `+` picks the right-hand date up.
+        (and (= op-sym '+) (date? r)) 'datahike.pg.sql/sql-date+
+        :else nil))))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -2138,7 +2180,8 @@
     (if (or (map? l) (map? r))
       ;; Compound aggregate expression: return descriptor for SELECT handler
       {:compound-agg true :op op-sym :left l :right r :expr expr}
-      (let [emit-op (get arith-op->null-safe op-sym op-sym)
+      (let [emit-op (or (date-arith-op ctx expr op-sym)
+                        (get arith-op->null-safe op-sym op-sym))
             arith (list emit-op (if (seq? l) (ctx/materialize-arg! ctx l) l)
                         (if (seq? r) (ctx/materialize-arg! ctx r) r))]
         (if not-prefix?
