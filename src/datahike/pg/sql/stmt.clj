@@ -2631,11 +2631,19 @@
         pick-precision-variant
         (fn [agg-name input-oid]
           (let [result-oid (oid/resolve-aggregate-result-oid agg-name input-oid)]
-            (when (= result-oid types/oid-numeric)
+            (cond
+              (= result-oid types/oid-numeric)
               (case agg-name
                 "sum" 'datahike.pg.sql/filter-sum-numeric
                 "avg" 'datahike.pg.sql/filter-avg-numeric
-                nil))))
+                nil)
+              ;; sum(float4) accumulates at float4 precision (float4pl),
+              ;; so it needs its own runtime too.
+              (= result-oid types/oid-float4)
+              (case agg-name
+                "sum" 'datahike.pg.sql/filter-sum-float4
+                nil)
+              :else nil)))
 
         ;; --- Correlated scalar subqueries in the SELECT list (slice A of the
         ;; per-row / LATERAL executor — doc/design-alignment.md). A

@@ -59,6 +59,22 @@
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (reduce + 0 vs))))
 
+(defn filter-sum-float4
+  "SUM over a `real` column, accumulated AT float4 precision.
+
+   PostgreSQL's sum(float4) uses float4pl, so the running total is a
+   float4 throughout and the result is a float4. Reducing with Clojure's
+   `+` promotes to double on the first step, which is why `sum(r)` on a
+   single 1.1::real answered 1.100000023841858 -- the widened float --
+   rather than 1.1."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs)
+      :__null__
+      ;; Clojure has no float primitive, so the narrowing is explicit at
+      ;; each step -- which is exactly what float4pl does.
+      (reduce (fn [acc v] (float (+ (float acc) (float v)))) (float 0) vs))))
+
 (defn filter-sum-numeric
   "SUM with explicit BigDecimal accumulation. PG returns NUMERIC for
    SUM(int8) and SUM(numeric) to avoid overflow; this variant matches
@@ -233,14 +249,37 @@
     (instance? java.util.UUID v) "uuid"
     :else nil))
 
-(defn- order-cmp
-  "`compare`, except that a `byte[]` is not Comparable — PostgreSQL
-   orders bytea by unsigned byte value (`byteacmp`, varlena.c), which is
-   what compareUnsigned does."
+(defn nan-num? [x]
+  (and (number? x) (Double/isNaN (double x))))
+
+(defn order-cmp
+  "`compare`, with two corrections.
+
+   A `byte[]` is not Comparable — PostgreSQL orders bytea by unsigned
+   byte value (`byteacmp`, varlena.c), which is what compareUnsigned
+   does.
+
+   And NaN. PostgreSQL sorts NaN GREATER than every non-NaN and equal to
+   itself (float.c float8_cmp_internal), giving a total order. Clojure's
+   `compare` routes numbers through an `lt`-based comparison, so NaN
+   compares EQUAL to everything:
+
+     (compare ##NaN 1.0)          => 0
+     (compare 1.0 ##NaN)          => 0
+     (sort [1.0 ##NaN 0.5 2.0])   => (1.0 ##NaN 0.5 2.0)
+
+   -- not merely mis-ordered but silently unsorted, and a comparator
+   that is not transitive can also make a TimSort raise \"Comparison
+   method violates its general contract\". So this has to be right
+   BEFORE a NaN can reach a sort, which is why it lands with the change
+   that lets NaN into the system at all."
   ^long [a b]
-  (if (and (bytes? a) (bytes? b))
+  (cond
+    (and (bytes? a) (bytes? b))
     (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
-    (compare a b)))
+    (nan-num? a) (if (nan-num? b) 0 1)
+    (nan-num? b) -1
+    :else (compare a b)))
 
 (defn- order-agg
   "Reduce with `order-cmp` rather than `clojure.core/min`/`max`, which are
@@ -679,7 +718,39 @@
    The ordering comparisons never had this problem: Clojure's `<` `>`
    `<=` `>=` are already cross-type."
   [a b]
-  (if (and (number? a) (number? b)) (== a b) (= a b)))
+  (cond
+    ;; PostgreSQL's float and numeric comparisons treat NaN as EQUAL to
+    ;; itself (float.c float8_cmp_internal, numeric.c cmp_numerics) --
+    ;; unlike IEEE-754, and unlike Clojure's `==`, which answers false.
+    (and (number? a) (number? b)
+         (Double/isNaN (double a)) (Double/isNaN (double b)))
+    true
+    (and (number? a) (number? b)) (== a b)
+    :else (= a b)))
+
+(defn- nan-cmp-op
+  "PostgreSQL orders NaN ABOVE every non-NaN for float and numeric
+   comparison (float.c float8_cmp_internal), so `'NaN' > 'Infinity'` is
+   TRUE. IEEE-754 -- and so Clojure's `<` `>` `<=` `>=` -- answers false
+   for every comparison involving NaN, which made all four wrong the
+   moment a NaN could exist."
+  [pred]
+  (fn [a b]
+    (cond
+      ;; NOT null-safe: these are PREDICATES, and `null-safe` yields the
+      ;; :__null__ sentinel, which is TRUTHY in a datalog predicate
+      ;; position -- so a NULL operand let the row through instead of
+      ;; filtering it. SQL says UNKNOWN, and WHERE treats UNKNOWN as
+      ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
+      ;; sql-eq? already answers false the same way, via `=`.
+      (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
+      (or (nan-num? a) (nan-num? b)) (pred (order-cmp a b) 0)
+      :else (pred (compare a b) 0))))
+
+(def sql-lt? (nan-cmp-op <))
+(def sql-gt? (nan-cmp-op >))
+(def sql-le? (nan-cmp-op <=))
+(def sql-ge? (nan-cmp-op >=))
 
 (defn sql-ne?
   "SQL `<>`. The complement of `sql-eq?`; see there."
@@ -712,9 +783,47 @@
              (int-width-error "bigint")
              (throw e))))))
 
-(def sql-+ (null-safe (long-overflow->pg +)))
-(def sql-- (null-safe (long-overflow->pg -)))
-(def sql-* (null-safe (long-overflow->pg *)))
+(defn- float-inf? [x]
+  (and (number? x) (Double/isInfinite (double x))))
+
+(defn- checked-float
+  "PostgreSQL's float overflow / underflow checks (float.h float8_pl,
+   float8_mul, ...): a result that came out infinite from finite inputs
+   is 22003 `value out of range: overflow`, and for multiply and divide
+   a result that came out zero from non-zero inputs is 22003
+   `value out of range: underflow`.
+
+   IEEE-754 -- and so Java -- returns the infinity or the zero instead,
+   which then propagated through the rest of the query as a value.
+   PostgreSQL aborts the statement.
+
+   The `!isinf(operand)` exemption matters: `Infinity * 2` is Infinity in
+   PostgreSQL too, not an error. It is unreachable until infinities can
+   be constructed, and correct in advance."
+  [r a b underflow?]
+  (cond
+    (not (and (number? r) (Double/isInfinite (double r)) (not (float-inf? a)) (not (float-inf? b))))
+    (if (and underflow?
+             (number? r) (zero? (double r))
+             (number? a) (not (zero? (double a)))
+             (number? b) (not (zero? (double b)))
+             ;; only a FLOAT result can underflow; exact types cannot
+             (or (instance? Double r) (instance? Float r)))
+      (throw (errors/pg-error :numeric-value-out-of-range
+                              {:message "value out of range: underflow"}))
+      r)
+    :else
+    (throw (errors/pg-error :numeric-value-out-of-range
+                            {:message "value out of range: overflow"}))))
+
+(defn- float-checked
+  "Wrap a binary arithmetic op with PostgreSQL's float range checks."
+  [f underflow?]
+  (fn [a b] (checked-float (f a b) a b underflow?)))
+
+(def sql-+ (null-safe (long-overflow->pg (float-checked + false))))
+(def sql-- (null-safe (long-overflow->pg (float-checked - false))))
+(def sql-* (null-safe (long-overflow->pg (float-checked * true))))
 
 ;; ---------------------------------------------------------------------------
 ;; date arithmetic
@@ -900,6 +1009,26 @@
     (rem a b)))
 
 (def sql-div (null-safe checked-div))
+
+(defn- f4
+  "Narrow to float4 after computing. PostgreSQL's float4 operators
+   compute AT float4 precision (float.h float4_pl et al), so `r + r` on
+   1.1::real is 2.2 and not the 2.200000047683716 you get by widening
+   both operands to double first."
+  [x]
+  (let [v (float x)]
+    (if (and (Float/isInfinite v) (not (Double/isInfinite (double x))))
+      (throw (errors/pg-error :numeric-value-out-of-range
+                              {:message "value out of range: overflow"}))
+      v)))
+
+(def sql-f4+ (null-safe (fn [a b] (f4 (+ (float a) (float b))))))
+(def sql-f4- (null-safe (fn [a b] (f4 (- (float a) (float b))))))
+(def sql-f4* (null-safe (fn [a b] (f4 (* (float a) (float b))))))
+(def sql-f4div
+  (null-safe (fn [a b]
+               (when (and (number? b) (zero? b)) (throw-division-by-zero))
+               (f4 (/ (float a) (float b))))))
 
 (def sql-int-div
   "Integer division at a declared width. Only one case can overflow --

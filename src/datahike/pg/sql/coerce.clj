@@ -96,6 +96,22 @@
                      (str "cannot coerce " (class v) " to bigint")
                      {:value v}))))
 
+(defn special-float
+  "The float value a PostgreSQL special-value spelling denotes, or nil.
+
+   float8in accepts `NaN`, `Infinity`, `-Infinity`, `inf`, `-inf` and a
+   leading `+`, case-insensitively, with surrounding whitespace only
+   (float.c float8in_internal). numeric_in accepts the same set and says
+   so in a comment. `NaN` takes no sign."
+  [s]
+  (when (string? s)
+    (let [t (.toLowerCase (.trim ^String s))]
+      (case t
+        "nan"                                    Double/NaN
+        ("inf" "+inf" "infinity" "+infinity")    Double/POSITIVE_INFINITY
+        ("-inf" "-infinity")                     Double/NEGATIVE_INFINITY
+        nil))))
+
 (defn ^BigDecimal parse-decimal
   "Parse a string as BigDecimal — accepts scientific notation, trims
    whitespace. Raises `22P02` on unparseable input. Returns nil for
@@ -109,6 +125,27 @@
              (catch NumberFormatException _
                (throw (pg-error "22P02"
                                 (str "invalid input syntax for numeric: \"" t \")))))))))
+
+(defn float->numeric
+  "PostgreSQL's float -> numeric conversion, which is NOT
+   shortest-round-trip.
+
+   numeric.c float8_numeric / float4_numeric print the value with
+   `snprintf(\"%.*g\", DBL_DIG /* 15 */ or FLT_DIG /* 6 */, val)` and
+   feed that to the numeric parser -- so the cast deliberately drops the
+   digits beyond the type's guaranteed precision. This is why
+   `(0.1::float8 + 0.2::float8)::numeric` is 0.3 in PostgreSQL and not
+   0.30000000000000004, and why `1.1::real::numeric` is 1.1.
+
+   Java's `%g` keeps trailing zeros where C's strips them, hence the
+   stripTrailingZeros; the scale is then clamped at zero because
+   PostgreSQL's numeric never carries a negative display scale."
+  ^java.math.BigDecimal [v]
+  (let [digits (if (instance? Float v) 6 15)
+        s (String/format java.util.Locale/ROOT (str "%." digits "g")
+                         (object-array [(double v)]))
+        bd (.stripTrailingZeros (java.math.BigDecimal. ^String s))]
+    (if (neg? (.scale bd)) (.setScale bd 0) bd)))
 
 (defn coerce-numeric
   "Coerce `v` (number or string) to the requested numeric `target`.
@@ -151,6 +188,10 @@
       (cond
         (instance? Double v) v
         (number? v) (double v)
+        ;; NaN / +-Infinity before the decimal parser, which cannot
+        ;; represent them -- so they used to fail as 22P02 and PostgreSQL
+        ;; accepts every one.
+        (special-float v) (special-float v)
         (string? v) (.doubleValue (parse-decimal v))
         :else (throw (pg-error "22P02"
                                (str "cannot coerce " (class v) " to double")
@@ -163,6 +204,7 @@
       (cond
         (instance? Float v) v
         (number? v) (.floatValue ^Number v)
+        (special-float v) (float (special-float v))
         (string? v) (.floatValue ^Number (parse-decimal v))
         :else (throw (pg-error "22P02"
                                (str "cannot coerce " (class v) " to float")
