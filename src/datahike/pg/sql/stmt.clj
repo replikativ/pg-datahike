@@ -3081,10 +3081,18 @@
                               (let [{:keys [fn params]} agg-marker
                                     agg-sym (get fns/sql-aggregate->datalog fn)
                                     inner (when params (first params))
-                                    inner-var (if inner
-                                                (let [iv (expr/translate-expr ctx inner)]
-                                                  (if (seq? iv) (ctx/materialize-arg! ctx iv) iv))
-                                                (ctx/entity-var! ctx default-table))]
+                                    iv (when inner (expr/translate-expr ctx inner))
+                                    ;; `count(*)` translates its argument to
+                                    ;; the keyword :*, which is not a datalog
+                                    ;; variable -- it reached :find as
+                                    ;; `(count :*)` and the parser rejected the
+                                    ;; whole query. Counting rows is counting
+                                    ;; entities, same as the no-argument case.
+                                    inner-var (cond
+                                                (or (nil? inner) (= :* iv))
+                                                (ctx/entity-var! ctx default-table)
+                                                (seq? iv) (ctx/materialize-arg! ctx iv)
+                                                :else iv)]
                                 (reset! has-aggregates? true)
                                 (when (not= agg-sym 'count-distinct)
                                   (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
@@ -3092,11 +3100,43 @@
                                   (swap! find-elements conj (list agg-sym inner-var))
                                   (swap! find-aliases conj (str "__compound_" idx))
                                   idx))))
-                          {:keys [op left right]} v
-                          l-idx (add-agg! left)
-                          r-idx (add-agg! right)]
-                      (swap! compound-exprs conj {:alias (or alias-str (str (:expr v)))
-                                                  :op op :l-idx l-idx :r-idx r-idx}))
+                          ;; A constant operand may already have been
+                          ;; rewritten to a `$N` placeholder for the plan
+                          ;; cache, in which case what we hold is the datalog
+                          ;; symbol and not the value. Hand back the ParamRef
+                          ;; so the existing Execute-time substitution
+                          ;; resolves it, exactly as it does for :in-args.
+                          const-operand
+                          (fn [x]
+                            (if-let [idx (and (symbol? x)
+                                              (some (fn [[i sym]] (when (= sym x) i))
+                                                    @(:param-placeholders ctx)))]
+                              (params/->ParamRef idx)
+                              x))
+                          ;; The spec is a TREE, not a pair of column
+                          ;; indices. `sum(v) * 2 + 1` nests one compound
+                          ;; expression inside another and a flat
+                          ;; {:l-idx :r-idx} cannot say that, so it indexed
+                          ;; the row with nil and threw. An operand is one of
+                          ;; three things: an aggregate (a column index), a
+                          ;; constant, or another expression.
+                          operand
+                          (fn operand [x]
+                            (cond
+                              (:compound-agg x) {:op    (:op x)
+                                                 :left  (operand (:left x))
+                                                 :right (operand (:right x))}
+                              (:aggregate x)    {:idx (add-agg! x)}
+                              :else             {:const (const-operand x)}))
+                          tree (operand v)]
+                      (swap! compound-exprs conj
+                             ;; figure-colname, not the expression's text:
+                             ;; PostgreSQL names a computed column
+                             ;; `?column?`, and the raw text also leaked the
+                             ;; `$1` the plan-cache rewrite left behind
+                             ;; (`sum(v)/$1`). The non-compound path below
+                             ;; already names columns this way.
+                             (assoc tree :alias (or alias-str (figure-colname expr)))))
                     ;; Regular non-aggregate expression
                     (let [v (cond
                               (seq? v)            (ctx/materialize-arg! ctx v)
