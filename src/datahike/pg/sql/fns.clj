@@ -736,14 +736,21 @@
    moment a NaN could exist."
   [pred]
   (fn [a b]
-    (if (or (nan-num? a) (nan-num? b))
-      (pred (order-cmp a b) 0)
-      (pred (compare a b) 0))))
+    (cond
+      ;; NOT null-safe: these are PREDICATES, and `null-safe` yields the
+      ;; :__null__ sentinel, which is TRUTHY in a datalog predicate
+      ;; position -- so a NULL operand let the row through instead of
+      ;; filtering it. SQL says UNKNOWN, and WHERE treats UNKNOWN as
+      ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
+      ;; sql-eq? already answers false the same way, via `=`.
+      (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
+      (or (nan-num? a) (nan-num? b)) (pred (order-cmp a b) 0)
+      :else (pred (compare a b) 0))))
 
-(def sql-lt? (null-safe (nan-cmp-op <)))
-(def sql-gt? (null-safe (nan-cmp-op >)))
-(def sql-le? (null-safe (nan-cmp-op <=)))
-(def sql-ge? (null-safe (nan-cmp-op >=)))
+(def sql-lt? (nan-cmp-op <))
+(def sql-gt? (nan-cmp-op >))
+(def sql-le? (nan-cmp-op <=))
+(def sql-ge? (nan-cmp-op >=))
 
 (defn sql-ne?
   "SQL `<>`. The complement of `sql-eq?`; see there."

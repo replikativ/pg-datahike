@@ -136,3 +136,18 @@
       (is (= "1" (one c "SELECT string_agg(id::text, ',' ORDER BY id) FROM nx WHERE v = 'NaN'::float8")))
       (is (= "1" (one c "SELECT count(*)::text FROM nx WHERE v > 'Infinity'::float8"))
           "only NaN is above Infinity"))))
+
+(deftest comparison-predicates-still-filter-nulls
+  (with-open [c (jdbc)]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE cs (i int, f float8)")
+      (.execute st "INSERT INTO cs VALUES (1,10.1),(2,20.2),(3,0),(4,NULL)"))
+    (testing "the NaN-aware comparisons must NOT be null-safe-wrapped: that
+              wrapper yields the :__null__ sentinel, which is TRUTHY in a
+              datalog predicate position, so a NULL operand let the row
+              through instead of filtering it. SQL says UNKNOWN and WHERE
+              treats UNKNOWN as FALSE."
+      (is (= "2" (one c "SELECT string_agg(i::text, ',' ORDER BY i) FROM cs WHERE NULLIF(f, 10.1) > 0"))
+          "row 1 nullifies to NULL and row 4 is already NULL; neither passes")
+      (is (= "1,2" (one c "SELECT string_agg(i::text, ',' ORDER BY i) FROM cs WHERE f > 0")))
+      (is (nil? (one c "SELECT string_agg(i::text, ',' ORDER BY i) FROM cs WHERE f > NULL"))))))
