@@ -3328,6 +3328,11 @@
       (update :in-args sql/substitute-params fetch)
       (contains? parsed :tx-data)
       (update :tx-data sql/substitute-params fetch)
+      ;; A compound aggregate over a constant — `sum(x) / 2` — carries the
+      ;; constant in the spec rather than in a column, and a rewritten
+      ;; literal arrives here as a ParamRef like any other.
+      (contains? parsed :compound-exprs)
+      (update :compound-exprs sql/substitute-params fetch)
       (contains? parsed :sub-results)
       (update :sub-results
               (fn [subs]
@@ -5346,18 +5351,33 @@
             ;; We compute the derived value and replace the hidden agg columns.
             [results find-aliases]
             (if (seq compound-exprs)
-              (let [ops {'+ + '- - '* * '/ /}
+              ;; `/` here must be the same division the datalog path uses,
+              ;; or `sum(id) / 2` answers a Ratio where `id / 2` answers an
+              ;; integer. This is the second site that evaluates SQL
+              ;; arithmetic; sql/sql-div is the one implementation.
+              (let [ops {'+ + '- - '* * '/ sql/sql-div}
                     ;; Compute the compound values for each row
+                    ;; The spec is a tree: a node is an aggregate column
+                    ;; (:idx), a constant (:const), or an operation over two
+                    ;; more nodes. `sum(v) * 2 + 1` is the nested case. A
+                    ;; node with neither :idx nor :op is a constant, which
+                    ;; also covers `{}` — substitute-params drops nil map
+                    ;; values, so a NULL constant arrives as an empty node.
+                    eval-node
+                    (fn eval-node [row node]
+                      (cond
+                        (contains? node :idx) (nth row (:idx node) nil)
+                        (:op node)
+                        (let [l (eval-node row (:left node))
+                              r (eval-node row (:right node))
+                              op-fn (get ops (:op node))]
+                          (when (and l r op-fn (number? l) (number? r))
+                            (op-fn l r)))
+                        :else (:const node)))
                     new-results
                     (mapv (fn [row]
                             (let [rv (if (sequential? row) (vec row) [row])]
-                              (reduce (fn [r {:keys [op l-idx r-idx]}]
-                                        (let [lv (nth r l-idx nil)
-                                              rv-val (nth r r-idx nil)
-                                              op-fn (get ops op)]
-                                          (conj r (when (and lv rv-val op-fn
-                                                             (number? lv) (number? rv-val))
-                                                    (op-fn lv rv-val)))))
+                              (reduce (fn [r spec] (conj r (eval-node r spec)))
                                       rv compound-exprs)))
                           results)
                     ;; Build new aliases: keep originals + add compound aliases
@@ -6913,6 +6933,33 @@
                 ;; splice each subquery's alias/OID at its out-pos and drop
                 ;; the __corr_ columns — so RowDescription matches what
                 ;; exec-select streams.
+                ;; Arithmetic over aggregates: the parsed find-aliases
+                ;; describe the HIDDEN per-aggregate columns
+                ;; (`__compound_0`, `__compound_1`), not the one column the
+                ;; expression produces. Execute appends the computed value
+                ;; and drops the hidden ones, so without the same reshape
+                ;; here Describe advertised `__compound_0`/`__compound_1`
+                ;; and a client reading by the advertised count ran off the
+                ;; end of the row -- `SELECT max(v) - min(v)` was
+                ;; unreadable over the extended protocol, which is every
+                ;; client except psql's simple queries.
+                ;;
+                ;; The computed column is typed OID_TEXT, the same fallback
+                ;; the aggregate columns it is built from already use here.
+                [aliases oids]
+                (if-let [ces (:compound-exprs parsed)]
+                  (let [all-aliases (into (vec aliases) (map :alias) ces)
+                        all-oids (into (vec oids)
+                                       (repeat (count ces) PgWireServer/OID_TEXT))
+                        vis (into [] (keep-indexed
+                                      (fn [i a]
+                                        (when-not (and (string? a)
+                                                       (.startsWith ^String a "__compound_"))
+                                          i))
+                                      all-aliases))]
+                    [(mapv #(nth all-aliases %) vis)
+                     (int-array (map #(int (nth all-oids %)) vis))])
+                  [aliases oids])
                 [aliases oids]
                 (if-let [cs (:correlated-subqueries parsed)]
                   (let [{:keys [subqueries corr-col->idx n-output]} cs

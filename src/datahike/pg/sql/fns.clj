@@ -652,20 +652,39 @@
 (defn- throw-division-by-zero []
   (throw (errors/pg-error :division-by-zero {})))
 
+(defn- int-div
+  "PostgreSQL's int2div / int4div / int8div: integer over integer is
+   integer, TRUNCATED TOWARD ZERO (-7 / 2 is -3, not -4). Clojure's `/`
+   instead produces an exact Ratio, so `7 / 2` answered 3.5 and
+   `2147483647 / 2` answered \"1.0737418235E9\" — a Ratio rendered
+   through double, which is neither the right value nor a syntax any
+   client can read back.
+
+   `quot` is the truncating one; `//` and `Math/floorDiv` round toward
+   negative infinity and would disagree with PostgreSQL on every
+   negative operand."
+  [a b]
+  (quot a b))
+
 (defn- checked-div
   "Division that raises SQLSTATE 22012 (\"division by zero\") on a zero
    divisor. PG errors for integer, float, AND numeric division alike
    (int4div / float8div / numeric_div in postgres utils/adt), whereas
    Clojure `(/ 1.0 0.0)` silently returns ##Inf — so the zero check must
    run BEFORE dividing. NULL propagation is handled by the `null-safe`
-   wrapper around this fn, so NULL / 0 stays NULL as in PG."
+   wrapper around this fn, so NULL / 0 stays NULL as in PG.
+
+   The operand types pick the operator, exactly as PostgreSQL's function
+   resolution does: two integers divide as integers, anything else
+   divides as it did."
   ([a b]
    (when (and (number? b) (zero? b)) (throw-division-by-zero))
-   (/ a b))
+   (if (and (integer? a) (integer? b)) (int-div a b) (/ a b)))
   ([a b & more]
    (when (some #(and (number? %) (zero? %)) (cons b more))
      (throw-division-by-zero))
-   (apply / a b more)))
+   (reduce (fn [acc x] (if (and (integer? acc) (integer? x)) (int-div acc x) (/ acc x)))
+           a (cons b more))))
 
 (defn- checked-mod
   "Modulo that raises SQLSTATE 22012 on a zero modulus — PG's int4mod /
