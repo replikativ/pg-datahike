@@ -248,6 +248,23 @@
 
       :else v)))
 
+(defn- oid-env
+  "The environment `oid-infer/expr-oid` needs, pulled off a translation ctx."
+  [ctx]
+  {:db            (:db ctx)
+   :schema        (:schema ctx)
+   :table-aliases (:table-aliases ctx)
+   :default-table (:default-table ctx)
+   :hints         (:hints ctx)})
+
+(defn- source-oid
+  "The OID of `expr`'s value, when it can be inferred. Used to tell a
+   `date` from a `timestamp` when rendering to text: Datahike has only
+   :db.type/instant, so both columns arrive as java.util.Date and the
+   value itself carries no answer."
+  [ctx expr]
+  (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
+
 (defn- coerce-pg-array
   "Coerce a runtime value to a pg-arr record so the ANY/ALL/containment
    ops can index into it uniformly. Inputs come from four places:
@@ -861,9 +878,15 @@
 
       ;; CONCAT(a, b, ...) → [(str ?a ?b ...) ?result]
       (= fname "concat")
-      (do (swap! (:where-clauses ctx) conj
-                 [(list* 'str args) result-var])
-          result-var)
+      ;; Not `str`: a temporal argument renders as java.util.Date.toString
+      ;; that way. Same reason as `||` — see types/temporal->pg-text.
+      (let [oids (mapv #(source-oid ctx %) params)
+            fn-param (symbol (str "?pg-concat-fn" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj
+               (fn [& vs] (apply str (map types/->pg-text vs (concat oids (repeat nil))))))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
 
       ;; SUBSTR/SUBSTRING(s, start, len) → [(subs ?s (dec start) (+ (dec start) len)) ?result]
       (or (= fname "substr") (= fname "substring"))
@@ -1775,7 +1798,9 @@
         ;; `'"abc'::jsonb` (unclosed quote) answered `"abc` where
         ;; PostgreSQL raises 22P02, and `'{"b":1,"a":2}'::jsonb` was not
         ;; canonicalised.
-        json-cast (get {"json" :json "jsonb" :jsonb} type-str)]
+        json-cast (get {"json" :json "jsonb" :jsonb} type-str)
+        ;; Only the text targets consult this; see source-oid.
+        src-oid (when is-text? (source-oid ctx inner))]
     (cond
       ;; Both types VALIDATE on input; only jsonb normalises after.
       json-cast
@@ -1881,7 +1906,7 @@
           ;; never via double (which would drop trailing zeros).
           is-numeric? (try (java.math.BigDecimal. (str/trim (str inner-raw)))
                            (catch Exception _ inner-raw))
-          is-text? (str inner-raw)
+          is-text? (types/->pg-text inner-raw src-oid)
           is-bool? (if (instance? Boolean inner-raw)
                      inner-raw
                      (let [b (coerce/parse-bool-token (str inner-raw))]
@@ -2094,7 +2119,8 @@
                                :else              (sql-cast/cast-scalar
                                                    v type-str
                                                    {:explicit? true
-                                                    :parse-timestamp parse-timestamp-string})))]
+                                                    :parse-timestamp parse-timestamp-string
+                                                    :src-oid src-oid})))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj cast-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])))
@@ -2725,8 +2751,23 @@
           ;; stored value is a string either way — see jsonb-column?.
           jsonb-concat? (or (jsonb-column? ctx (.getLeftExpression e))
                             (jsonb-column? ctx (.getRightExpression e)))
+          ;; A temporal operand has to render the PostgreSQL way, and the
+          ;; date/timestamp distinction is only visible here — see
+          ;; types/temporal->pg-text.
+          l-oid (source-oid ctx (.getLeftExpression e))
+          r-oid (source-oid ctx (.getRightExpression e))
+          null? (fn [x] (or (nil? x) (= :__null__ x)))
           concat-fn (fn [a b]
                       (cond
+                        ;; `||` is STRICT: NULL on either side makes the
+                        ;; whole expression NULL. This is exactly where it
+                        ;; differs from concat(), which ignores its NULL
+                        ;; arguments -- and the reason PostgreSQL ships
+                        ;; both. Falling through to `str` treated a NULL as
+                        ;; the empty string, so `'a' || NULL` answered 'a'.
+                        ;; Strictness holds for the array and jsonb
+                        ;; overloads too, hence the guard ahead of them.
+                        (or (null? a) (null? b)) :__null__
                         jsonb-concat? (jb/jsonb-concat a b)
                         (and (pg-arr/array? a) (pg-arr/array? b))
                         (pg-arr/concat-arrs a b)
@@ -2741,7 +2782,8 @@
                         (pg-arr/array (:elem-type a) (conj (:elements a) b))
                         (pg-arr/array? b)
                         (pg-arr/array (:elem-type b) (into [a] (:elements b)))
-                        :else (str a b)))
+                        :else (str (types/->pg-text a l-oid)
+                                   (types/->pg-text b r-oid))))
           result-var (ctx/fresh-var! ctx)]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj concat-fn)
