@@ -393,6 +393,11 @@
                         (str/replace "T" " ")
                        ;; timestamptz keeps a UTC offset; timestamp drops it.
                         (str/replace "Z" (if (= oid PgWireServer/OID_TIMESTAMPTZ) "+00" ""))))
+     ;; toPlainString, not str: a numeric literal written with an
+     ;; exponent keeps a NEGATIVE scale (`1.0e3` is unscaled 10 at scale
+     ;; -1), and `.toString` renders that as "1.0E+3". PostgreSQL has no
+     ;; exponent form in its numeric output -- it answers 1000.
+     (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      (uuid? v)    (str v)
      (symbol? v)  (str v)
      (bytes? v)   (str "\\x" (apply str (map #(format "%02x" (bit-and % 0xff)) v)))

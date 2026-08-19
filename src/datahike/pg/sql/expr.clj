@@ -1371,7 +1371,7 @@
                          (let [when-val (.getWhenExpression wc)
                                then-val (.getThenExpression wc)
                                test (if switch-val
-                                      (list '= switch-val (translate-expr ctx when-val))
+                                      (list 'datahike.pg.sql/sql-eq? switch-val (translate-expr ctx when-val))
                                       (translate-predicate-expr ctx when-val))
                                then (translate-expr ctx then-val)]
                            ;; Detect unsupported: aggregate refs in CASE branches
@@ -1492,7 +1492,7 @@
         (let [l (.getLeftExpression e)]
           (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
                   'datahike.pg.sql/jsonb-eq?
-                  '=)
+                  'datahike.pg.sql/sql-eq?)
                 (translate-expr ctx l)
                 (translate-expr ctx right)))))
 
@@ -2425,8 +2425,14 @@
     (instance? LongValue expr)
     (.getValue ^LongValue expr)
 
+    ;; An unadorned decimal literal is `numeric` in PostgreSQL, not
+    ;; float8 -- `SELECT 0.1 + 0.2` is 0.3, not 0.30000000000000004, and
+    ;; `SELECT 1.10` keeps its trailing zero. `.getValue` has already
+    ;; gone through a double and lost both the exactness and the scale,
+    ;; so the literal is rebuilt from the ORIGINAL TOKEN, which
+    ;; JSqlParser preserves in the node's string form.
     (instance? DoubleValue expr)
-    (.getValue ^DoubleValue expr)
+    (types/decimal-literal expr (.getValue ^DoubleValue expr))
 
     ;; Bit-string literals — MUST precede the plain StringValue branch,
     ;; which JSqlParser also uses for `B'1001000'` (prefix "B").
@@ -3290,8 +3296,23 @@
                                                    (:derived-aliases ctx) (:ci-index ctx))
                                (catch Throwable _ nil))
              l-res (resolve-col left)
-             r-res (resolve-col right)]
-         (when (and l-res r-res
+             r-res (resolve-col right)
+             ;; Unifying on a shared logic var makes the join key VALUE
+             ;; equality, which is type-sensitive -- so two numeric
+             ;; columns of different storage types would never unify and
+             ;; `WHERE n = f` (numeric vs float8) answered no rows.
+             ;; PostgreSQL promotes and compares. Fall through to the
+             ;; predicate, which is sql-eq? and does exactly that.
+             numeric-vtypes #{:db.type/long :db.type/double
+                              :db.type/float :db.type/bigdec}
+             vtype-of (fn [res]
+                        (when-let [a (and (keyword? res) res)]
+                          (get-in (:schema ctx) [a :db/valueType])))
+             lv (vtype-of l-res)
+             rv (vtype-of r-res)
+             cross-numeric? (and lv rv (not= lv rv)
+                                 (numeric-vtypes lv) (numeric-vtypes rv))]
+         (when (and l-res r-res (not cross-numeric?)
                     (ctx/unify-inner-equijoin! ctx l-res r-res))
            [])))
      ;; jsonb `=` / `<>` compare VALUES and are numeric-scale
@@ -3323,7 +3344,14 @@
                jsonb-cmp?
                [(list 'datahike.pg.sql/jsonb-ne? l r)]
                :else
-               [(list op l r)]))))))
+               ;; `=` / `<>` compare numbers by VALUE across types; see
+               ;; fns/sql-eq?. The ordering operators are already
+               ;; cross-type in Clojure and pass through unchanged.
+               [(list (case op
+                        = 'datahike.pg.sql/sql-eq?
+                        not= 'datahike.pg.sql/sql-ne?
+                        op)
+                      l r)]))))))
 
 (defn- guard-clause?
   "A null-guard emitted by `ctx/null-guard-clauses`."
@@ -3479,9 +3507,9 @@
                 [[(list 'not= col col)]]
                 (let [in-clause (if (seq shared-vars)
                                   (concat ['or-join shared-vars]
-                                          (for [v non-null-vals] [(list '= col v)]))
+                                          (for [v non-null-vals] [(list 'datahike.pg.sql/sql-eq? col v)]))
                                   (concat ['or]
-                                          (for [v non-null-vals] [(list '= col v)])))]
+                                          (for [v non-null-vals] [(list 'datahike.pg.sql/sql-eq? col v)])))]
                   [in-clause])))
 
             ;; Literal ALL — AND of per-element equalities.
@@ -3489,7 +3517,7 @@
             (if (empty? array-elements)
               []  ;; x = ALL(<empty>) is TRUE per PG
               (let [col (translate-expr ctx left)]
-                (mapv (fn [v] [(list '= col v)]) array-elements)))
+                (mapv (fn [v] [(list 'datahike.pg.sql/sql-eq? col v)]) array-elements)))
 
             ;; Runtime array — bind and dispatch through pg-arr.
             :else
@@ -3539,7 +3567,7 @@
               ;; cached ?pN without duplicating :in-args).
               (let [v (ctx/col-var! ctx resolved)
                     guards (ctx/null-guard-clauses ctx [v])]
-                (conj guards [(list '= v pv)]))))
+                (conj guards [(list 'datahike.pg.sql/sql-eq? v pv)]))))
           (if (and (instance? Column left)
                    (nil? (.getArrayConstructor ^Column left))
                    (or (instance? LongValue right)
@@ -3582,7 +3610,7 @@
               ;; Regular column = value (including aliased columns)
                 :else
                 (let [v (ctx/col-var! ctx resolved)]
-                  [[(list '= v val)]])))
+                  [[(list 'datahike.pg.sql/sql-eq? v val)]])))
             (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e))))))
 
     (instance? NotEqualsTo expr)
@@ -4023,7 +4051,7 @@
         ;; col matches NOT IN iff every (not= col p_i) holds.
         (and not-in? has-param?)
         (into guards
-              (mapv (fn [v] [(list 'not= col v)]) non-null-vals))
+              (mapv (fn [v] [(list 'datahike.pg.sql/sql-ne? col v)]) non-null-vals))
 
         ;; NOT IN literal list — set-based predicate wrapped in `not`.
         ;; Using `(or-join ...)` with many branches explodes Datahike's
@@ -4047,7 +4075,7 @@
         (let [shared-vars (vec (distinct (concat (ctx/collect-vars col)
                                                  (filter symbol? non-null-vals))))
               branches (mapv (fn [v]
-                               (list 'and [(list '= col v)]))
+                               (list 'and [(list 'datahike.pg.sql/sql-eq? col v)]))
                              non-null-vals)]
           (conj guards (apply list 'or-join shared-vars branches)))
 
@@ -4055,7 +4083,7 @@
         ;; `(contains? #{...} :__null__)` returns false, so positive IN is already null-safe.
         :else
         (let [val-set (set non-null-vals)]
-          [[(list 'contains? val-set col)]])))
+          [[(list 'datahike.pg.sql/sql-in? val-set col)]])))
 
     ;; EXISTS / NOT EXISTS subquery
     (instance? ExistsExpression expr)
