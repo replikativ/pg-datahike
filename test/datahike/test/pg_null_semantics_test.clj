@@ -339,3 +339,42 @@
     (is (= "7"   (cell (.execute *h* "SELECT 7::text"))))
     (is (= "f"   (cell (.execute *h* "SELECT 7::text IS NULL"))))
     (is (= "abc" (cell (.execute *h* "SELECT 'abc'::text"))))))
+
+;; ============================================================================
+;; NOT and three-valued logic
+;; ============================================================================
+
+(deftest test-not-excludes-null-rows
+  ;; `NOT x` is TRUE only when x is FALSE, and a comparison with a NULL
+  ;; operand is UNKNOWN — not FALSE. The null-guards were emitted INSIDE
+  ;; the datalog `not`, so for a NULL row the guarded conjunction was
+  ;; false and `not` made it true: `WHERE NOT (val = 10)` returned the
+  ;; val-IS-NULL row (id=2), which PostgreSQL excludes.
+  ;;
+  ;; Fixture: id=1 val=10, id=2 all NULL, id=3 val=50.
+  ;; Every expectation here was taken from PostgreSQL 17 on the same rows.
+  (testing "a bare comparison under NOT"
+    (is (= [1 3] (ids (.execute *h* "SELECT id FROM t WHERE NOT (val = 99)")))
+        "the val-IS-NULL row must not survive negation")
+    (is (= [3] (ids (.execute *h* "SELECT id FROM t WHERE NOT (val = 10)")))))
+
+  (testing "under a disjunction — an OR is FALSE only if every disjunct is"
+    (is (= [3] (ids (.execute *h* "SELECT id FROM t WHERE NOT (val = 10 OR val = 20)")))))
+
+  (testing "a CONJUNCTION must NOT be tightened the same way"
+    ;; `NOT (a AND b)` is TRUE as soon as one conjunct is FALSE, whatever
+    ;; the other is — so the NULL row DOES belong here. Hoisting val's
+    ;; guard would wrongly drop it, which is why AND-trees are excluded.
+    (is (= [1 2 3] (ids (.execute *h* "SELECT id FROM t
+                                        WHERE NOT (val = 10 AND id = 999)")))))
+
+  (testing "IS NOT NULL under NOT still works"
+    ;; It translates to exactly one guard-shaped clause; stripping guards
+    ;; would leave a bare `(not)`, which datalog rejects outright.
+    (is (= [2] (ids (.execute *h* "SELECT id FROM t WHERE NOT (val IS NOT NULL)")))))
+
+  (testing "double negation"
+    (is (= [1] (ids (.execute *h* "SELECT id FROM t WHERE NOT (NOT (val = 10))")))))
+
+  (testing "a non-nullable column is unaffected"
+    (is (= [2 3] (ids (.execute *h* "SELECT id FROM t WHERE NOT (id = 1)"))))))
