@@ -1789,7 +1789,20 @@
          ;; both.
          flex-key (when cache
                     (try (:schema-flexibility (:config db)) (catch Throwable _ nil)))
-         cache-key (when cache [sql schema-key flex-key])
+         ;; The declared parameter types are part of the key, not
+         ;; incidental context. `SELECT 1 + 1` and `SELECT 1.5 + 1`
+         ;; template to the SAME `SELECT $1 + $2`, and what differs is not
+         ;; only the reported OIDs: the RUNTIME OPERATOR is chosen at
+         ;; translate time too (the width-checked integer add versus the
+         ;; generic one), and it is baked into the cached :query. Sharing
+         ;; one entry between them would hand the second statement the
+         ;; first one's plan -- a silently wrong answer, which is worse
+         ;; than the untyped behaviour this replaces.
+         ;;
+         ;; PostgreSQL keys a prepared plan on its declared parameter
+         ;; types for the same reason.
+         cache-key (when cache [sql schema-key flex-key
+                                params/*declared-param-oids*])
          cached (when cache (cache-get cache cache-key))]
      (cond
        cached cached

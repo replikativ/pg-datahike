@@ -428,6 +428,27 @@
 ;; ---------------------------------------------------------------------------
 ;; PG OID inference
 
+(def ^:dynamic *declared-param-oids*
+  "Map of 1-based `$N` index → PG OID for the parameters of the statement
+   being translated, or nil when unknown.
+
+   PostgreSQL treats the Parse message's declared parameter types as an
+   INPUT to parse analysis (nodeFuncs.c exprType types a Param from
+   paramTypes), not as something layered on afterwards -- so type
+   inference over an expression containing `$N` needs them at translate
+   time, not at Describe time.
+
+   It matters for the SIMPLE protocol too, because the plan-cache rewrite
+   turns every literal into a `$N` before the translator runs. Without
+   this, `3 / 2` reported int8 and integer overflow could not be detected
+   on all-literal arithmetic.
+
+   A dynamic var rather than an argument: parse-sql is re-entered
+   recursively for subqueries, CTEs and LATERAL bodies through the ctx's
+   :parse-sql slot, and `$N` numbering is statement-global -- so
+   inheritance is the correct semantics, not merely the convenient one."
+  nil)
+
 (defn pg-type-of-attr
   "Look up the :pg/type string attached to a schema ident entity.
    Datahike's (:schema db) only surfaces schema-governing attrs

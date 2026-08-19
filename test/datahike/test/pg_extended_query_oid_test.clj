@@ -283,8 +283,14 @@
 ;; Backwards compatibility — simple query should keep emitting same OIDs
 
 (deftest simple-query-literal-ok
-  (testing "Simple-Query SELECT 1 already returned INT8 via value inference"
-    (is (= [oid-int8] (exec-oids "SELECT 1")))))
+  (testing "Simple-Query SELECT 1 reports INT4, the same as the extended
+            path. It used to report INT8 from value-based inference on the
+            runtime Long, because the plan-cache rewrite turned the literal
+            into a $N before the translator could type it. The literal's
+            type now travels with its value."
+    (is (= [oid-int4] (exec-oids "SELECT 1"))))
+  (testing "and INT8 when the literal does not fit int4"
+    (is (= [oid-int8] (exec-oids "SELECT 2147483648")))))
 
 (deftest simple-query-bool-literal
   (testing "Simple-Query SELECT TRUE now returns BOOL (was TEXT)"
