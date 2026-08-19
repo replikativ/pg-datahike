@@ -100,78 +100,49 @@
    below BigDecimal's intrinsic limits."
   1000)
 
-(defn- decimal-weight
-  "Approximate PG `NumericVar.weight` for a BigDecimal: index in
-   DEC_DIGITS=4 base of the leading non-zero digit. Zero for
-   `|value| < 10000`, 1 for 10000..99999999, etc. Negative for pure
-   fractions (`0.0001..0.9999` is weight -1).
+(def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS, NBASE = 10000
 
-   Matches the integer-part-weight half of PG's weight formula. For
-   AVG, where we only care about the magnitude relationship, this is
-   sufficient."
+(defn- nbase-weight+first
+  "PostgreSQL stores a numeric as base-10000 digit groups. Return
+   `[weight firstdigit]` -- the exponent of the leading group and its
+   value -- which is the form select_div_scale is defined in, so the
+   division result scale cannot be derived without reconstructing them."
   [^java.math.BigDecimal v]
   (if (zero? (.signum v))
-    0
-    (let [int-digits (- (.precision v) (.scale v))]
-      ;; int-digits 1..4 → weight 0
-      ;; int-digits 5..8 → weight 1
-      ;; int-digits ≤ 0  → weight ≈ -ceil((-int-digits + 1) / 4) (fractional)
-      (if (pos? int-digits)
-        (long (Math/floor (/ (double (dec int-digits)) 4.0)))
-        (long (Math/floor (/ (double (dec int-digits)) 4.0)))))))
+    [0 0]
+    (let [digits (.toString (.abs (.unscaledValue v)))
+          p (count digits)
+          ;; decimal exponent of the leading significant digit
+          e (- p (.scale v) 1)
+          weight (Math/floorDiv (long e) (long dec-digits))
+          ;; how many of the leading decimal digits fall in that group
+          k (int (inc (- e (* dec-digits weight))))
+          grp (if (<= k p)
+                (subs digits 0 k)
+                (apply str digits (repeat (- k p) \0)))]
+      [weight (Long/parseLong grp)])))
 
-(defn- leading-dec-digit-chunk
-  "PG's leading NumericDigit: the base-10000 digit at position
-   `weight`, or 0 for zero. `select_div_scale` compares the dividend's
-   against the divisor's to decide whether the quotient lands one
-   digit below the naive estimate.
+(defn- div-result-scale
+  "PostgreSQL's select_div_scale (numeric.c): pick a result scale giving
+   at least NUMERIC_MIN_SIG_DIGITS significant digits -- so numeric
+   division is no less accurate than float8 -- but never fewer decimals
+   than either input already displays.
 
-   The base-10000 grouping is aligned to the DECIMAL POINT, not to the
-   leading significant digit, so the chunk is NOT simply the first four
-   digits. `120` is one digit of value 120 (not 1200); `12345` is
-   `[1, 2345]` with a leading digit of 1; `0.5` is `[5000]` at weight
-   -1. Left-aligning instead made AVG(int) pick a 20-digit scale where
-   PostgreSQL picks 16 whenever the sum's leading decimal digit
-   happened to be ≤ the count's — `sum 120 / count 3` compared 1200
-   against 3000 rather than 120 against 3.
-
-   The chunk therefore spans decimal exponents [4·weight, 4·weight+3],
-   which is `int-digits - 4·weight` digits taken from the leading
-   significant one, right-padded with zeros when the value has fewer."
-  [^java.math.BigDecimal v]
-  (if (zero? (.signum v))
-    0
-    (let [s (.toString (.unscaledValue (.abs v)))
-          int-digits (- (.precision v) (.scale v))
-          take-n (- int-digits (* 4 (decimal-weight v)))
-          chunk (if (>= (count s) take-n)
-                  (subs s 0 take-n)
-                  (str s (apply str (repeat (- take-n (count s)) \0))))]
-      (Long/parseLong chunk))))
-
-(defn- select-div-scale
-  "PG-faithful scale selection for division (matches `select_div_scale`
-   in src/backend/utils/adt/numeric.c).
-
-   `rscale = NUMERIC_MIN_SIG_DIGITS - qweight * DEC_DIGITS`
-     where qweight ≈ weight(sum) - weight(count) (- 1 when the
-     leading DEC_DIGITS chunk of the sum is ≤ the count's chunk —
-     the quotient might land one digit below the naive estimate).
-   Then floor by max of input dscales, by 0, ceiling by
-   NUMERIC_MAX_DISPLAY_SCALE."
-  [^java.math.BigDecimal sum-bd n-count]
-  (let [sum-scale (.scale sum-bd)
-        sum-w (decimal-weight sum-bd)
-        n-bd (java.math.BigDecimal/valueOf (long n-count))
-        n-w (decimal-weight n-bd)
-        sum-chunk (leading-dec-digit-chunk sum-bd)
-        n-chunk (leading-dec-digit-chunk n-bd)
-        qweight (cond-> (- sum-w n-w)
-                  (<= sum-chunk n-chunk) dec)
-        rscale (max (- numeric-min-sig-digits (* qweight 4))
-                    sum-scale
-                    0)]
-    (min rscale numeric-max-display-scale)))
+   This is why `10.0 / 3` is 3.3333333333333333 and `1.0 / 3.0` is
+   0.33333333333333333333: the quotient's estimated weight, not the
+   inputs' scales, sets the digit count."
+  ^long [^java.math.BigDecimal a ^java.math.BigDecimal b]
+  (let [[w1 f1] (nbase-weight+first a)
+        [w2 f2] (nbase-weight+first b)
+        ;; Estimated weight of the quotient. When the leading groups are
+        ;; equal PostgreSQL cannot tell and assumes a < b.
+        qweight (cond-> (- (long w1) (long w2)) (<= (long f1) (long f2)) dec)]
+    (-> (- numeric-min-sig-digits (* qweight dec-digits))
+        (max (.scale a))
+        (max (.scale b))
+        (max 0)
+        (min numeric-max-display-scale)
+        long)))
 
 (defn filter-avg-numeric
   "AVG with BigDecimal precision. Matches PG's AVG(int*)→numeric and
@@ -201,7 +172,12 @@
                         vs)
             n-count (count vs)
             n-bd (java.math.BigDecimal/valueOf (long n-count))
-            rscale (int (select-div-scale sum n-count))]
+            ;; The same select_div_scale port the `/` operator uses.
+            ;; This site used to carry its own AVG-specialised copy,
+            ;; with its own weight/leading-digit helpers and its own
+            ;; duplicate of the two PG constants -- two ports of one
+            ;; rule, free to drift.
+            rscale (int (div-result-scale sum n-bd))]
         (.divide ^java.math.BigDecimal sum
                  ^java.math.BigDecimal n-bd
                  rscale
@@ -782,52 +758,6 @@
 (defn- throw-division-by-zero []
   (throw (errors/pg-error :division-by-zero {})))
 
-(def ^:private ^:const numeric-min-sig-digits 16)   ;; NUMERIC_MIN_SIG_DIGITS
-(def ^:private ^:const numeric-max-display-scale 1000) ;; = NUMERIC_MAX_PRECISION
-(def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS, NBASE = 10000
-
-(defn- nbase-weight+first
-  "PostgreSQL stores a numeric as base-10000 digit groups. Return
-   `[weight firstdigit]` -- the exponent of the leading group and its
-   value -- which is the form select_div_scale is defined in, so the
-   division result scale cannot be derived without reconstructing them."
-  [^java.math.BigDecimal v]
-  (if (zero? (.signum v))
-    [0 0]
-    (let [digits (.toString (.abs (.unscaledValue v)))
-          p (count digits)
-          ;; decimal exponent of the leading significant digit
-          e (- p (.scale v) 1)
-          weight (Math/floorDiv (long e) (long dec-digits))
-          ;; how many of the leading decimal digits fall in that group
-          k (int (inc (- e (* dec-digits weight))))
-          grp (if (<= k p)
-                (subs digits 0 k)
-                (apply str digits (repeat (- k p) \0)))]
-      [weight (Long/parseLong grp)])))
-
-(defn- div-result-scale
-  "PostgreSQL's select_div_scale (numeric.c): pick a result scale giving
-   at least NUMERIC_MIN_SIG_DIGITS significant digits -- so numeric
-   division is no less accurate than float8 -- but never fewer decimals
-   than either input already displays.
-
-   This is why `10.0 / 3` is 3.3333333333333333 and `1.0 / 3.0` is
-   0.33333333333333333333: the quotient's estimated weight, not the
-   inputs' scales, sets the digit count."
-  ^long [^java.math.BigDecimal a ^java.math.BigDecimal b]
-  (let [[w1 f1] (nbase-weight+first a)
-        [w2 f2] (nbase-weight+first b)
-        ;; Estimated weight of the quotient. When the leading groups are
-        ;; equal PostgreSQL cannot tell and assumes a < b.
-        qweight (cond-> (- (long w1) (long w2)) (<= (long f1) (long f2)) dec)]
-    (-> (- numeric-min-sig-digits (* qweight dec-digits))
-        (max (.scale a))
-        (max (.scale b))
-        (max 0)
-        (min numeric-max-display-scale)
-        long)))
-
 (defn- numeric-div
   "PostgreSQL numeric division. BigDecimal's own `divide` raises
    \"Non-terminating decimal expansion\" without an explicit scale, so
@@ -881,10 +811,20 @@
 
 (defn- checked-mod
   "Modulo that raises SQLSTATE 22012 on a zero modulus — PG's int4mod /
-   float8mod / numeric_mod all raise \"division by zero\" there."
+   float8mod / numeric_mod all raise \"division by zero\" there.
+
+   A numeric operand makes the result numeric, at `max(s1,s2)` like
+   PostgreSQL's mod_var. Clojure's `rem` does not promote the other
+   operand, so `mod(1, 3.0)` answered `1` where PostgreSQL answers
+   `1.0`."
   [a b]
   (when (and (number? b) (zero? b)) (throw-division-by-zero))
-  (rem a b))
+  (if (and (or (decimal? a) (decimal? b)) (number? a) (number? b))
+    (let [^java.math.BigDecimal x (bigdec a)
+          ^java.math.BigDecimal y (bigdec b)]
+      (.setScale (.remainder x y) (max (.scale x) (.scale y))
+                 java.math.RoundingMode/UNNECESSARY))
+    (rem a b)))
 
 (def sql-div (null-safe checked-div))
 (def sql-mod (null-safe checked-mod))
@@ -1456,7 +1396,11 @@
    ;; any type with an ordering, so there is nothing to reject here.
    "greatest" (fn [& args] (reduce (fn [a b] (if (pos? (order-cmp b a)) b a)) args))
    "least"    (fn [& args] (reduce (fn [a b] (if (neg? (order-cmp b a)) b a)) args))
-   "mod"      rem
+   ;; sql-mod, not bare `rem`: `rem` neither raises PostgreSQL's
+   ;; "division by zero" on a zero modulus (it threw a raw Java
+   ;; "Divide by zero") nor promotes an integer operand against a
+   ;; numeric one, so `mod(1, 3.0)` answered 1 rather than 1.0.
+   "mod"      sql-mod
 
    ;; --- Math: PG semantics, see the "Math function implementations"
    ;; section above. Do NOT swap these back for bare Math/* methods —
