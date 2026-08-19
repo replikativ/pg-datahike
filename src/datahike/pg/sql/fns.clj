@@ -649,6 +649,61 @@
 (def sql-- (null-safe -))
 (def sql-* (null-safe *))
 
+;; ---------------------------------------------------------------------------
+;; date arithmetic
+;;
+;; `date + integer`, `date - integer` and `date - date` are their own
+;; operators in PostgreSQL (date_pli / date_mii / date_mi), not the
+;; numeric ones. Routing them through sql-+ / sql-- threw a raw
+;; ClassCastException ("java.util.Date cannot be cast to
+;; java.lang.Number"), so `d + 1` was an error rather than a date.
+;;
+;; Which operand is a date is decided by the TRANSLATOR from the
+;; declared column type, not here: Datahike stores a `date` and a
+;; `timestamp` column alike as java.util.Date, so a runtime type test
+;; cannot tell them apart, and PostgreSQL gives the two different
+;; answers (`timestamp - timestamp` is an interval, `date - date` is a
+;; count of days). Only expressions the translator has already typed as
+;; date reach these.
+
+(defn- ->local-date
+  "Narrow a date-typed value to a LocalDate. A `date` COLUMN arrives as
+   a java.util.Date at UTC midnight; a `::date` CAST already produces a
+   LocalDate."
+  ^java.time.LocalDate [v]
+  (cond
+    (instance? java.time.LocalDate v) v
+    (instance? java.time.LocalDateTime v) (.toLocalDate ^java.time.LocalDateTime v)
+    (instance? java.util.Date v) (-> ^java.util.Date v .toInstant
+                                     (.atZone java.time.ZoneOffset/UTC)
+                                     .toLocalDate)
+    (instance? java.time.Instant v) (-> ^java.time.Instant v
+                                        (.atZone java.time.ZoneOffset/UTC)
+                                        .toLocalDate)
+    (string? v) (java.time.LocalDate/parse ^String v)
+    :else (throw (errors/pg-error :invalid-text-representation
+                                  {:type "date" :value (str v)}))))
+
+;; Returning a LocalDate rather than a java.util.Date is deliberate: the
+;; wire renderer emits a LocalDate as `2020-01-02` on its own, without
+;; needing the declared OID to tell it this column is a date.
+(def sql-date+
+  (null-safe
+   (fn date-plus [a b]
+     (cond
+       (number? b) (.plusDays (->local-date a) (long b))
+       (number? a) (.plusDays (->local-date b) (long a))
+       :else (throw (errors/pg-error :undefined-function
+                                     {:name "date + date"}))))))
+
+(def sql-date-
+  (null-safe
+   (fn date-minus [a b]
+     (if (number? b)
+       (.plusDays (->local-date a) (- (long b)))
+       ;; date - date is a plain integer count of days, not an interval.
+       (- (.toEpochDay (->local-date a)) (.toEpochDay (->local-date b)))))))
+
 (defn- throw-division-by-zero []
   (throw (errors/pg-error :division-by-zero {})))
 
