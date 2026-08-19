@@ -1147,7 +1147,7 @@
         ;; dropping it silently turned every call into insert-before.
         (swap! (:in-args ctx) conj
                (fn ([t p v] (jb/serialize-jsonb (jb/jsonb-insert t p v)))
-                   ([t p v a] (jb/serialize-jsonb (jb/jsonb-insert t p v a)))))
+                 ([t p v a] (jb/serialize-jsonb (jb/jsonb-insert t p v a)))))
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
