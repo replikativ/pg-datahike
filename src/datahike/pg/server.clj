@@ -4973,9 +4973,15 @@
                     ;; NULLs last for ASC, first for DESC (PG default)
                     a-null? (if (= dir :asc) 1 -1)
                     b-null? (if (= dir :asc) -1 1)
+                    ;; sql/order-cmp, not `compare`: Clojure's compares
+                    ;; NaN EQUAL to everything, so a NaN in the sort key
+                    ;; left the result silently unsorted -- and a
+                    ;; non-transitive comparator can make TimSort raise
+                    ;; outright. PostgreSQL sorts NaN above every
+                    ;; non-NaN.
                     :else (if (= dir :desc)
-                            (compare vb va)
-                            (compare va vb)))]
+                            (sql/order-cmp vb va)
+                            (sql/order-cmp va vb)))]
             (if (zero? c)
               (recur (rest specs))
               c))

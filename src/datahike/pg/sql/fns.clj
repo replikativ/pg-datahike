@@ -249,14 +249,37 @@
     (instance? java.util.UUID v) "uuid"
     :else nil))
 
-(defn- order-cmp
-  "`compare`, except that a `byte[]` is not Comparable — PostgreSQL
-   orders bytea by unsigned byte value (`byteacmp`, varlena.c), which is
-   what compareUnsigned does."
+(defn nan-num? [x]
+  (and (number? x) (Double/isNaN (double x))))
+
+(defn order-cmp
+  "`compare`, with two corrections.
+
+   A `byte[]` is not Comparable — PostgreSQL orders bytea by unsigned
+   byte value (`byteacmp`, varlena.c), which is what compareUnsigned
+   does.
+
+   And NaN. PostgreSQL sorts NaN GREATER than every non-NaN and equal to
+   itself (float.c float8_cmp_internal), giving a total order. Clojure's
+   `compare` routes numbers through an `lt`-based comparison, so NaN
+   compares EQUAL to everything:
+
+     (compare ##NaN 1.0)          => 0
+     (compare 1.0 ##NaN)          => 0
+     (sort [1.0 ##NaN 0.5 2.0])   => (1.0 ##NaN 0.5 2.0)
+
+   -- not merely mis-ordered but silently unsorted, and a comparator
+   that is not transitive can also make a TimSort raise \"Comparison
+   method violates its general contract\". So this has to be right
+   BEFORE a NaN can reach a sort, which is why it lands with the change
+   that lets NaN into the system at all."
   ^long [a b]
-  (if (and (bytes? a) (bytes? b))
+  (cond
+    (and (bytes? a) (bytes? b))
     (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
-    (compare a b)))
+    (nan-num? a) (if (nan-num? b) 0 1)
+    (nan-num? b) -1
+    :else (compare a b)))
 
 (defn- order-agg
   "Reduce with `order-cmp` rather than `clojure.core/min`/`max`, which are
@@ -695,7 +718,39 @@
    The ordering comparisons never had this problem: Clojure's `<` `>`
    `<=` `>=` are already cross-type."
   [a b]
-  (if (and (number? a) (number? b)) (== a b) (= a b)))
+  (cond
+    ;; PostgreSQL's float and numeric comparisons treat NaN as EQUAL to
+    ;; itself (float.c float8_cmp_internal, numeric.c cmp_numerics) --
+    ;; unlike IEEE-754, and unlike Clojure's `==`, which answers false.
+    (and (number? a) (number? b)
+         (Double/isNaN (double a)) (Double/isNaN (double b)))
+    true
+    (and (number? a) (number? b)) (== a b)
+    :else (= a b)))
+
+(defn- nan-cmp-op
+  "PostgreSQL orders NaN ABOVE every non-NaN for float and numeric
+   comparison (float.c float8_cmp_internal), so `'NaN' > 'Infinity'` is
+   TRUE. IEEE-754 -- and so Clojure's `<` `>` `<=` `>=` -- answers false
+   for every comparison involving NaN, which made all four wrong the
+   moment a NaN could exist."
+  [pred]
+  (fn [a b]
+    (cond
+      ;; NOT null-safe: these are PREDICATES, and `null-safe` yields the
+      ;; :__null__ sentinel, which is TRUTHY in a datalog predicate
+      ;; position -- so a NULL operand let the row through instead of
+      ;; filtering it. SQL says UNKNOWN, and WHERE treats UNKNOWN as
+      ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
+      ;; sql-eq? already answers false the same way, via `=`.
+      (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
+      (or (nan-num? a) (nan-num? b)) (pred (order-cmp a b) 0)
+      :else (pred (compare a b) 0))))
+
+(def sql-lt? (nan-cmp-op <))
+(def sql-gt? (nan-cmp-op >))
+(def sql-le? (nan-cmp-op <=))
+(def sql-ge? (nan-cmp-op >=))
 
 (defn sql-ne?
   "SQL `<>`. The complement of `sql-eq?`; see there."

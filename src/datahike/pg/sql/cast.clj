@@ -102,6 +102,15 @@
   [v type-str]
   (let [w (get types/integer-type-width (base-type-name type-str) :int8)
         [lo hi tname] (get types/integer-width-limits w)
+        _ (when (and (number? v)
+                     (or (Double/isNaN (double v)) (Double/isInfinite (double v))))
+            ;; PostgreSQL reports these as a plain range failure for the
+            ;; target width; without the guard the JVM raised a raw
+            ;; "Infinite or NaN" out of BigDecimal.
+            (out-of-range! (nth (get types/integer-width-limits
+                                     (get types/integer-type-width
+                                          (base-type-name type-str) :int8))
+                                2)))
         rounded (cond
                   (integer? v)      v
                   (decimal? v)      (.setScale ^java.math.BigDecimal v 0
@@ -123,9 +132,45 @@
    double precision: `1.1::real` is 1.100000023841858, and a value that
    does not fit is an error rather than an Infinity."
   [v type-str]
+  (let [d (coerce/coerce-numeric v :double)
+        ;; A source that is ALREADY a special value is not an overflow --
+        ;; `'Infinity'::float8` is Infinity, not an error. That includes
+        ;; the string spellings, which is what this missed at first.
+        ;; A source that is ALREADY a special value is not an overflow --
+        ;; `'Infinity'::float8` is Infinity, not an error -- and that
+        ;; includes the string spellings. Only a Double or Float can BE
+        ;; infinite; a BigDecimal is exact however large, so testing it
+        ;; via `(double v)` would call the very overflow we are checking
+        ;; for a finite source."
+        src-finite? (and (nil? (coerce/special-float v))
+                         (not (and (or (instance? Double v) (instance? Float v))
+                                   (Double/isInfinite (double v)))))
+        tname (if (#{"float4" "real"} (base-type-name type-str))
+                "real" "double precision")]
+    ;; A literal too large or too small for the target is an ERROR in
+    ;; PostgreSQL (float8in_internal checks ERANGE), not an Infinity or a
+    ;; silent zero. `1e400::float8` answered Infinity, which then
+    ;; travelled through the rest of the query as a value.
+    (when (and src-finite? (Double/isInfinite (double d)))
+      (throw (errors/pg-error
+              :numeric-value-out-of-range
+              {:message (str "\"" (if (decimal? v) (.toPlainString ^java.math.BigDecimal v) v)
+                             "\" is out of range for type " tname)})))
+    (when (and src-finite? (zero? (double d))
+               (number? v)
+               ;; compare exactly, not through the double that just
+               ;; underflowed to zero
+               (not (zero? (.signum (bigdec v)))))
+      (throw (errors/pg-error
+              :numeric-value-out-of-range
+              {:message (str "\"" (if (decimal? v) (.toPlainString ^java.math.BigDecimal v) v)
+                             "\" is out of range for type " tname)}))))
   (let [d (coerce/coerce-numeric v :double)]
     (if (= :float4 (get {"float4" :float4 "real" :float4} (base-type-name type-str)))
-      (let [f (float d)]
+      ;; .floatValue, not Clojure's `float`, which range-checks and
+      ;; raises on an infinity -- and an infinity narrows to a float
+      ;; infinity perfectly well.
+      (let [f (.floatValue ^Number d)]
         (if (and (Double/isFinite (double d)) (Float/isInfinite f))
           (out-of-range! "real")
           f))
