@@ -1452,24 +1452,27 @@
             (translate-predicate-expr ctx (.getLeftExpression e))
             (translate-predicate-expr ctx (.getRightExpression e))))
 
+    ;; The NaN-aware comparisons, as in translate-comparison: PostgreSQL
+    ;; sorts NaN above everything, and IEEE-754 answers false for every
+    ;; comparison involving one.
     (instance? GreaterThan expr)
     (let [^GreaterThan e expr]
-      (list '> (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-gt? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? GreaterThanEquals expr)
     (let [^GreaterThanEquals e expr]
-      (list '>= (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-ge? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? MinorThan expr)
     (let [^MinorThan e expr]
-      (list '< (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-lt? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? MinorThanEquals expr)
     (let [^MinorThanEquals e expr]
-      (list '<= (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-le? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? EqualsTo expr)
@@ -3475,6 +3478,13 @@
                [(list (case op
                         = 'datahike.pg.sql/sql-eq?
                         not= 'datahike.pg.sql/sql-ne?
+                        ;; NaN sorts above everything in PostgreSQL, so
+                        ;; the ordering operators need it too -- IEEE-754
+                        ;; makes all four false for any NaN operand.
+                        < 'datahike.pg.sql/sql-lt?
+                        > 'datahike.pg.sql/sql-gt?
+                        <= 'datahike.pg.sql/sql-le?
+                        >= 'datahike.pg.sql/sql-ge?
                         op)
                       l r)]))))))
 

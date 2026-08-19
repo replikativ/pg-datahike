@@ -96,6 +96,22 @@
                      (str "cannot coerce " (class v) " to bigint")
                      {:value v}))))
 
+(defn special-float
+  "The float value a PostgreSQL special-value spelling denotes, or nil.
+
+   float8in accepts `NaN`, `Infinity`, `-Infinity`, `inf`, `-inf` and a
+   leading `+`, case-insensitively, with surrounding whitespace only
+   (float.c float8in_internal). numeric_in accepts the same set and says
+   so in a comment. `NaN` takes no sign."
+  [s]
+  (when (string? s)
+    (let [t (.toLowerCase (.trim ^String s))]
+      (case t
+        "nan"                                    Double/NaN
+        ("inf" "+inf" "infinity" "+infinity")    Double/POSITIVE_INFINITY
+        ("-inf" "-infinity")                     Double/NEGATIVE_INFINITY
+        nil))))
+
 (defn ^BigDecimal parse-decimal
   "Parse a string as BigDecimal — accepts scientific notation, trims
    whitespace. Raises `22P02` on unparseable input. Returns nil for
@@ -172,6 +188,10 @@
       (cond
         (instance? Double v) v
         (number? v) (double v)
+        ;; NaN / +-Infinity before the decimal parser, which cannot
+        ;; represent them -- so they used to fail as 22P02 and PostgreSQL
+        ;; accepts every one.
+        (special-float v) (special-float v)
         (string? v) (.doubleValue (parse-decimal v))
         :else (throw (pg-error "22P02"
                                (str "cannot coerce " (class v) " to double")
@@ -184,6 +204,7 @@
       (cond
         (instance? Float v) v
         (number? v) (.floatValue ^Number v)
+        (special-float v) (float (special-float v))
         (string? v) (.floatValue ^Number (parse-decimal v))
         :else (throw (pg-error "22P02"
                                (str "cannot coerce " (class v) " to float")
