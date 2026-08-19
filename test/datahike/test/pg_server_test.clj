@@ -372,7 +372,9 @@
 
 (deftest test-pg-typeof
   (testing "pg_typeof returns the type name of a literal expression"
-    (is (= [["bigint"]]          (rows (.execute *handler* "SELECT pg_typeof(1)"))))
+    ;; A small integer literal is int4 in PostgreSQL, not int8.
+    (is (= [["integer"]]         (rows (.execute *handler* "SELECT pg_typeof(1)"))))
+    (is (= [["bigint"]]          (rows (.execute *handler* "SELECT pg_typeof(2147483648)"))))
     (is (= [["text"]]            (rows (.execute *handler* "SELECT pg_typeof('hello')"))))
     ;; An unadorned decimal literal is numeric in PostgreSQL, not float8.
     (is (= [["numeric"]]         (rows (.execute *handler* "SELECT pg_typeof(1.5)"))))

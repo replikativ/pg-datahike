@@ -104,12 +104,17 @@
 ;; Table-free literal SELECTs — Metabase `can-connect?` path
 
 (deftest describe-int-literal
-  (testing "SELECT 1 -> INT8 (was TEXT; broke Metabase can-connect?)"
-    (is (= [oid-int8] (describe-oids "SELECT 1")))))
+  (testing "SELECT 1 -> INT4. PostgreSQL types an integer literal as the
+            narrowest of int4/int8 that holds it, so a small literal is
+            int4, not int8. (It was TEXT once, which broke Metabase's
+            can-connect? probe -- hence this test.)"
+    (is (= [oid-int4] (describe-oids "SELECT 1"))))
+  (testing "and int8 only when it does not fit int4"
+    (is (= [oid-int8] (describe-oids "SELECT 2147483648")))))
 
 (deftest describe-int-literal-with-alias
-  (testing "SELECT 1 AS n -> INT8"
-    (is (= [oid-int8] (describe-oids "SELECT 1 AS n")))))
+  (testing "SELECT 1 AS n -> INT4"
+    (is (= [oid-int4] (describe-oids "SELECT 1 AS n")))))
 
 (deftest describe-decimal-literal
   (testing "SELECT 1.5 -> NUMERIC, not FLOAT8: PostgreSQL types an
@@ -123,8 +128,8 @@
     (is (= [oid-text] (describe-oids "SELECT 'hello'")))))
 
 (deftest describe-mixed-literals
-  (testing "SELECT 'x' AS s, 2 AS m -> [TEXT, INT8]"
-    (is (= [oid-text oid-int8] (describe-oids "SELECT 'x' AS s, 2 AS m")))))
+  (testing "SELECT 'x' AS s, 2 AS m -> [TEXT, INT4]"
+    (is (= [oid-text oid-int4] (describe-oids "SELECT 'x' AS s, 2 AS m")))))
 
 (deftest describe-null-literal
   (testing "SELECT NULL -> TEXT (PG default for untyped NULL)"
@@ -203,8 +208,11 @@
 ;; Binary arithmetic — numeric promotion
 
 (deftest describe-add-long-long
-  (testing "SELECT 1 + 2 -> INT8"
-    (is (= [oid-int8] (describe-oids "SELECT 1 + 2")))))
+  (testing "SELECT 1 + 2 -> INT4: integer arithmetic keeps the wider
+            operand's width, and both operands here are int4"
+    (is (= [oid-int4] (describe-oids "SELECT 1 + 2"))))
+  (testing "and widens when an operand is int8"
+    (is (= [oid-int8] (describe-oids "SELECT 1 + 2147483648")))))
 
 (deftest describe-mul-schema-double
   (testing "SELECT salary * 2 FROM employee -> FLOAT8 (any-float promotes)"
@@ -267,8 +275,8 @@
             "SELECT CASE WHEN id > 1 THEN 'many' ELSE 'one' END FROM employee")))))
 
 (deftest describe-case-int
-  (testing "SELECT CASE WHEN id > 1 THEN 100 ELSE 200 END FROM employee -> INT8"
-    (is (= [oid-int8]
+  (testing "SELECT CASE WHEN id > 1 THEN 100 ELSE 200 END FROM employee -> INT4"
+    (is (= [oid-int4]
            (describe-oids
             "SELECT CASE WHEN id > 1 THEN 100 ELSE 200 END FROM employee")))))
 
@@ -320,14 +328,16 @@
                 ^ResultSet rs (.executeQuery ps)]
       (is (.next rs))
       (let [obj (.getObject rs 1)]
-        (is (instance? Long obj)
-            (str "expected Long, got " (some-> obj class .getName)
+        ;; int4 now, so pgjdbc hands back an Integer rather than a Long.
+        (is (instance? Integer obj)
+            (str "expected Integer, got " (some-> obj class .getName)
                  " with value " obj))
         (is (= 1 (long obj)))))))
 
 (deftest pgjdbc-extended-metadata-select-one
-  (testing "ResultSetMetaData reports BIGINT (Types/BIGINT) for SELECT 1"
-    (is (= [Types/BIGINT] (meta-types "SELECT 1")))))
+  (testing "ResultSetMetaData reports INTEGER for SELECT 1 -- PostgreSQL
+            types a small integer literal as int4"
+    (is (= [Types/INTEGER] (meta-types "SELECT 1")))))
 
 (deftest pgjdbc-extended-metadata-aggregate
   (testing "COUNT(*) reports BIGINT; SUM(salary) reports DOUBLE"
