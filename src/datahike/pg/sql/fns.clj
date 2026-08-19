@@ -59,6 +59,22 @@
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (reduce + 0 vs))))
 
+(defn filter-sum-float4
+  "SUM over a `real` column, accumulated AT float4 precision.
+
+   PostgreSQL's sum(float4) uses float4pl, so the running total is a
+   float4 throughout and the result is a float4. Reducing with Clojure's
+   `+` promotes to double on the first step, which is why `sum(r)` on a
+   single 1.1::real answered 1.100000023841858 -- the widened float --
+   rather than 1.1."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs)
+      :__null__
+      ;; Clojure has no float primitive, so the narrowing is explicit at
+      ;; each step -- which is exactly what float4pl does.
+      (reduce (fn [acc v] (float (+ (float acc) (float v)))) (float 0) vs))))
+
 (defn filter-sum-numeric
   "SUM with explicit BigDecimal accumulation. PG returns NUMERIC for
    SUM(int8) and SUM(numeric) to avoid overflow; this variant matches
@@ -712,9 +728,47 @@
              (int-width-error "bigint")
              (throw e))))))
 
-(def sql-+ (null-safe (long-overflow->pg +)))
-(def sql-- (null-safe (long-overflow->pg -)))
-(def sql-* (null-safe (long-overflow->pg *)))
+(defn- float-inf? [x]
+  (and (number? x) (Double/isInfinite (double x))))
+
+(defn- checked-float
+  "PostgreSQL's float overflow / underflow checks (float.h float8_pl,
+   float8_mul, ...): a result that came out infinite from finite inputs
+   is 22003 `value out of range: overflow`, and for multiply and divide
+   a result that came out zero from non-zero inputs is 22003
+   `value out of range: underflow`.
+
+   IEEE-754 -- and so Java -- returns the infinity or the zero instead,
+   which then propagated through the rest of the query as a value.
+   PostgreSQL aborts the statement.
+
+   The `!isinf(operand)` exemption matters: `Infinity * 2` is Infinity in
+   PostgreSQL too, not an error. It is unreachable until infinities can
+   be constructed, and correct in advance."
+  [r a b underflow?]
+  (cond
+    (not (and (number? r) (Double/isInfinite (double r)) (not (float-inf? a)) (not (float-inf? b))))
+    (if (and underflow?
+             (number? r) (zero? (double r))
+             (number? a) (not (zero? (double a)))
+             (number? b) (not (zero? (double b)))
+             ;; only a FLOAT result can underflow; exact types cannot
+             (or (instance? Double r) (instance? Float r)))
+      (throw (errors/pg-error :numeric-value-out-of-range
+                              {:message "value out of range: underflow"}))
+      r)
+    :else
+    (throw (errors/pg-error :numeric-value-out-of-range
+                            {:message "value out of range: overflow"}))))
+
+(defn- float-checked
+  "Wrap a binary arithmetic op with PostgreSQL's float range checks."
+  [f underflow?]
+  (fn [a b] (checked-float (f a b) a b underflow?)))
+
+(def sql-+ (null-safe (long-overflow->pg (float-checked + false))))
+(def sql-- (null-safe (long-overflow->pg (float-checked - false))))
+(def sql-* (null-safe (long-overflow->pg (float-checked * true))))
 
 ;; ---------------------------------------------------------------------------
 ;; date arithmetic
@@ -900,6 +954,26 @@
     (rem a b)))
 
 (def sql-div (null-safe checked-div))
+
+(defn- f4
+  "Narrow to float4 after computing. PostgreSQL's float4 operators
+   compute AT float4 precision (float.h float4_pl et al), so `r + r` on
+   1.1::real is 2.2 and not the 2.200000047683716 you get by widening
+   both operands to double first."
+  [x]
+  (let [v (float x)]
+    (if (and (Float/isInfinite v) (not (Double/isInfinite (double x))))
+      (throw (errors/pg-error :numeric-value-out-of-range
+                              {:message "value out of range: overflow"}))
+      v)))
+
+(def sql-f4+ (null-safe (fn [a b] (f4 (+ (float a) (float b))))))
+(def sql-f4- (null-safe (fn [a b] (f4 (- (float a) (float b))))))
+(def sql-f4* (null-safe (fn [a b] (f4 (* (float a) (float b))))))
+(def sql-f4div
+  (null-safe (fn [a b]
+               (when (and (number? b) (zero? b)) (throw-division-by-zero))
+               (f4 (/ (float a) (float b))))))
 
 (def sql-int-div
   "Integer division at a declared width. Only one case can overflow --

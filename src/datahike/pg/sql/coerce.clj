@@ -110,6 +110,27 @@
                (throw (pg-error "22P02"
                                 (str "invalid input syntax for numeric: \"" t \")))))))))
 
+(defn float->numeric
+  "PostgreSQL's float -> numeric conversion, which is NOT
+   shortest-round-trip.
+
+   numeric.c float8_numeric / float4_numeric print the value with
+   `snprintf(\"%.*g\", DBL_DIG /* 15 */ or FLT_DIG /* 6 */, val)` and
+   feed that to the numeric parser -- so the cast deliberately drops the
+   digits beyond the type's guaranteed precision. This is why
+   `(0.1::float8 + 0.2::float8)::numeric` is 0.3 in PostgreSQL and not
+   0.30000000000000004, and why `1.1::real::numeric` is 1.1.
+
+   Java's `%g` keeps trailing zeros where C's strips them, hence the
+   stripTrailingZeros; the scale is then clamped at zero because
+   PostgreSQL's numeric never carries a negative display scale."
+  ^java.math.BigDecimal [v]
+  (let [digits (if (instance? Float v) 6 15)
+        s (String/format java.util.Locale/ROOT (str "%." digits "g")
+                         (object-array [(double v)]))
+        bd (.stripTrailingZeros (java.math.BigDecimal. ^String s))]
+    (if (neg? (.scale bd)) (.setScale bd 0) bd)))
+
 (defn coerce-numeric
   "Coerce `v` (number or string) to the requested numeric `target`.
 

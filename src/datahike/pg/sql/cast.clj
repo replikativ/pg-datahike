@@ -203,7 +203,12 @@
           (case cat
             :integer (cast-to-integer v type-str)
             :float   (cast-to-float v type-str)
-            :numeric (let [bd (coerce/coerce-numeric v :bigdec)]
+            ;; A FLOAT source goes through PostgreSQL's own %g
+            ;; conversion, not through its shortest-round-trip text --
+            ;; see coerce/float->numeric.
+            :numeric (let [bd (if (or (instance? Float v) (instance? Double v))
+                                (coerce/float->numeric v)
+                                (coerce/coerce-numeric v :bigdec))]
                        (if-let [[p sc] (numeric-typmod type-str)]
                          (apply-numeric-typmod bd p sc)
                          bd))))

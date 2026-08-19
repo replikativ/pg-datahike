@@ -2222,6 +2222,26 @@
       (let [rank {:int2 2 :int4 4 :int8 8}]
         (reduce (fn [a b] (if (> (rank b) (rank a)) b a)) widths)))))
 
+(defn- float4-arith-op
+  "The float4 runtime op for `op-sym`, or nil.
+
+   PostgreSQL declares `float4 op float4 -> float4` and nothing mixed:
+   there is no float4-with-int4 operator, so `real * 2` resolves to
+   float8. Both operands must therefore be float4 for this to apply --
+   which is also why an untyped operand disqualifies it, unlike the
+   integer case where an unknown is PostgreSQL's int4 literal."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
+  (let [env (oid-env ctx)
+        oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
+        l (oid (.getLeftExpression expr))
+        r (oid (.getRightExpression expr))]
+    (when (and (= l types/oid-float4) (= r types/oid-float4))
+      (get '{+ datahike.pg.sql/sql-f4+
+             - datahike.pg.sql/sql-f4-
+             * datahike.pg.sql/sql-f4*
+             / datahike.pg.sql/sql-f4div}
+           op-sym))))
+
 (defn- int-arith-op
   "The width-checked runtime op for `op-sym`, or nil to use the generic
    one."
@@ -2302,6 +2322,7 @@
             int-op (int-arith-op ctx expr op-sym)
             emit-op (or (date-arith-op ctx expr op-sym)
                         (first int-op)
+                        (float4-arith-op ctx expr op-sym)
                         (get arith-op->null-safe op-sym op-sym))
             ;; The width travels as a leading constant argument rather
             ;; than as nine separate fns.

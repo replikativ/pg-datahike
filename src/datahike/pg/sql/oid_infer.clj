@@ -329,6 +329,11 @@
     (cond
       ;; float8 outranks everything, so one typed side settles it even
       ;; when the other is unknown.
+      ;; float4 op float4 stays float4 (there is only float4pl et al);
+      ;; anything mixed has no float4 operator and resolves to float8 --
+      ;; which is why `real * 2` is double precision in PostgreSQL.
+      (and (= l-oid types/oid-float4) (= r-oid types/oid-float4))
+      types/oid-float4
       (or (= l-oid types/oid-float8) (= r-oid types/oid-float8)
           (= l-oid types/oid-float4) (= r-oid types/oid-float4))
       types/oid-float8
@@ -466,7 +471,10 @@
                         (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
                         (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
                         :else                                                    types/oid-int4)
-           :float     types/oid-float8
+           ;; `real` is a DISTINCT type, not a spelling of double
+           ;; precision -- `1.1::real` is 1.100000023841858 as a float8
+           ;; and `pg_typeof` says real.
+           :float     (if (#{"real" "float4"} type-str) types/oid-float4 types/oid-float8)
            :numeric   types/oid-numeric
            :text      types/oid-text
            :boolean   types/oid-bool
