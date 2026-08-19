@@ -75,12 +75,15 @@
      :prefer-local-datetime? — return a LocalDateTime (microsecond
                         precision) rather than a Date for a timestamp
                         cast. See the :timestamp branch.
+     :src-oid         — the OID of the value being cast, when the caller
+                        knows it. Only `::text` uses it, to tell a date
+                        from a timestamp: both are java.util.Date here.
 
    Returns `v` unchanged for a target this doesn't classify, which is
    what every call site did before and keeps unknown types passing
    through rather than erroring."
   [v type-str {:keys [explicit? parse-timestamp resolve-regclass
-                      prefer-local-datetime?]
+                      prefer-local-datetime? src-oid]
                :or {explicit? true}}]
   (if (or (nil? v) (= :__null__ v))
     v
@@ -114,11 +117,14 @@
             :float   (coerce/coerce-numeric v :double)
             :numeric (coerce/coerce-numeric v :bigdec)))
 
+        ;; `str` on a temporal value is java.util.Date.toString, which is
+        ;; both the wrong format and rendered in the JVM's default time
+        ;; zone — see types/temporal->pg-text.
         :text (cond
                 (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
                 (pg-arr/array? v)   (pg-arr/to-pg-text v)
                 (string? v)         v
-                :else               (str v))
+                :else               (types/->pg-text v src-oid))
 
         :boolean (if (boolean? v)
                    v

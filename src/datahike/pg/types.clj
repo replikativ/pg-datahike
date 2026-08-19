@@ -804,3 +804,57 @@
     (instance? java.time.LocalDateTime v) oid-timestamp
     (uuid? v)             oid-uuid
     :else                 oid-text))
+
+;; ============================================================================
+;; Temporal text rendering
+;; ============================================================================
+
+(defn temporal->pg-text
+  "PostgreSQL's text rendering of a temporal value, or nil if `v` is not
+   temporal.
+
+   The wire renderer had its own copy of these rules, so anything that
+   converted a value to text by a route OTHER than the wire — `::text`,
+   `CAST(… AS varchar)`, `||`, `concat()` — fell through to Clojure's
+   `str` and emitted `java.util.Date.toString`:
+
+     SELECT ts::text  →  Wed Jan 01 02:00:00 PST 2020
+                         (want 2020-01-01 10:00:00)
+
+   which is not merely misformatted: it is rendered in the JVM's default
+   time zone and locale, so the same query answered differently on
+   different machines.
+
+   `src-oid` disambiguates `date` from `timestamp`. Datahike has only
+   :db.type/instant, so a `date` COLUMN and a `timestamp` COLUMN both
+   arrive here as java.util.Date at UTC and nothing about the value says
+   which is which. A `::date` CAST produces a LocalDate and needs no
+   hint. Absent a hint, an instant renders as a timestamp — the wider of
+   the two, and the one that loses no information."
+  ([v] (temporal->pg-text v nil))
+  ([v src-oid]
+   (cond
+     (instance? java.time.LocalDate v)     (str v)
+     (instance? java.time.LocalTime v)     (str v)
+     (instance? java.time.LocalDateTime v) (str/replace (str v) "T" " ")
+
+     (and (inst? v) (= src-oid oid-date))
+     (-> ^java.util.Date v .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalDate str)
+
+     (inst? v)
+     (let [^java.time.Instant inst (if (instance? java.time.Instant v)
+                                     v
+                                     (.toInstant ^java.util.Date v))]
+       (-> (str inst)
+           (str/replace "T" " ")
+           ;; timestamptz keeps a UTC offset; timestamp drops it.
+           (str/replace "Z" (if (= src-oid oid-timestamptz) "+00" ""))))
+
+     :else nil)))
+
+(defn ->pg-text
+  "`str`, except that temporal values render the PostgreSQL way. Every
+   value→text conversion that is not the wire renderer should go through
+   here; see `temporal->pg-text` for why."
+  ([v] (->pg-text v nil))
+  ([v src-oid] (or (temporal->pg-text v src-oid) (str v))))
