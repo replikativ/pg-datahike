@@ -5059,7 +5059,7 @@
                             (let [so (aget ^ints schema-oids i)
                                   io (when (< i (count item-oids))
                                        (nth item-oids i))]
-                              (aset out i (int (if (and (= so -1) io) io so)))))
+                              (aset out i (int (if io io so)))))
                           out)
                         schema-oids)
           sources (compute-column-sources parsed-with-shape db)]
@@ -5482,7 +5482,7 @@
                                           io (when (< i (count item-oids))
                                                (nth item-oids i))]
                                       (aset out i
-                                            (int (if (and (= so -1) io) io so)))))
+                                            (int (if io io so)))))
                                   out)
                                 schema-oids)
               ;; Correlated subqueries: the spliced columns aren't schema/
