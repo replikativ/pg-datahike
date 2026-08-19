@@ -325,18 +325,28 @@
    decimal LITERALS were float8 too. `numeric + integer` is numeric in
    PostgreSQL; only float8 outranks it."
   [l-oid r-oid]
-  (cond
-    (or (= l-oid types/oid-float8) (= r-oid types/oid-float8)
-        (= l-oid types/oid-float4) (= r-oid types/oid-float4))
-    types/oid-float8
-    (or (= l-oid types/oid-numeric) (= r-oid types/oid-numeric))
-    types/oid-numeric
-    (or (= l-oid types/oid-int8) (= r-oid types/oid-int8)
-        (= l-oid types/oid-int4) (= r-oid types/oid-int4)
-        (= l-oid types/oid-int2) (= r-oid types/oid-int2))
-    types/oid-int8
-    (and l-oid r-oid) types/oid-int8
-    :else nil))
+  (let [int-oid? #(contains? #{types/oid-int8 types/oid-int4 types/oid-int2} %)]
+    (cond
+      ;; float8 outranks everything, so one typed side settles it even
+      ;; when the other is unknown.
+      (or (= l-oid types/oid-float8) (= r-oid types/oid-float8)
+          (= l-oid types/oid-float4) (= r-oid types/oid-float4))
+      types/oid-float8
+      ;; numeric outranks every integer width, and an unknown operand
+      ;; here is a rewritten literal, which is never float8.
+      (or (= l-oid types/oid-numeric) (= r-oid types/oid-numeric))
+      types/oid-numeric
+      ;; Integers only when BOTH sides are typed. An untyped side is a
+      ;; literal the plan-cache rewrite turned into `$N`, and it may be
+      ;; a DECIMAL literal -- which is numeric and outranks int. Firing
+      ;; on one typed side reported int8 for `i4 + 1.0`, whose value is
+      ;; a numeric: psycopg2 read the int8 OID, tried int("11.0") and
+      ;; raised ValueError. Returning nil instead lets the caller fall
+      ;; back to value-based inference, which sees the real type.
+      (and (int-oid? l-oid) (int-oid? r-oid))
+      types/oid-int8
+      (and l-oid r-oid) types/oid-int8
+      :else nil)))
 
 (defn- binary-arith-oid [^BinaryExpression e env]
   (let [l (expr-oid (.getLeftExpression e) env)
@@ -571,7 +581,14 @@
       (instance? Addition expr)       (binary-arith-oid expr env)
       (instance? Subtraction expr)    (binary-arith-oid expr env)
       (instance? Multiplication expr) (binary-arith-oid expr env)
-      (instance? Division expr)       types/oid-float8  ; PG: integer div is exact
+      ;; Division consults its operands like every other arithmetic
+      ;; operator. It used to be hardcoded float8 under the comment "PG:
+      ;; integer div is exact" -- which is backwards: integer division in
+      ;; PostgreSQL is exact precisely BECAUSE it stays integral, so
+      ;; float8 is the one type it cannot be. `SELECT 3 / 2` sent the
+      ;; correct text `1` under a float8 OID, and every typed client
+      ;; turned it back into 1.0.
+      (instance? Division expr)       (binary-arith-oid expr env)
       (instance? Modulo expr)         (binary-arith-oid expr env)
 
       ;; --- Bitwise operators ---------------------------------------------

@@ -437,6 +437,24 @@
     ;; TEXT-displayed (regtype → 'int4'), so they are deliberately excluded.
     "oid"})
 
+(def integer-type-width
+  "Which of PostgreSQL's three integer widths a cast target names.
+   `cast-category` folds them all to :integer, but the width decides
+   both the range check and the name in the overflow message, so it has
+   to be recovered from the type string. `oid` is unsigned-32 but PG
+   reports its overflows against the same 32-bit boundary."
+  {"int2" :int2 "smallint" :int2 "serial2" :int2 "smallserial" :int2
+   "int8" :int8 "bigint" :int8 "serial8" :int8 "bigserial" :int8
+   "integer" :int4 "int" :int4 "int4" :int4 "serial" :int4 "serial4" :int4
+   "oid" :int4})
+
+(def integer-width-limits
+  "`[min max type-name]` per width; the name is the one PostgreSQL uses
+   in \"<name> out of range\"."
+  {:int2 [-32768 32767 "smallint"]
+   :int4 [-2147483648 2147483647 "integer"]
+   :int8 [Long/MIN_VALUE Long/MAX_VALUE "bigint"]})
+
 (def cast-float-types
   "SQL type names that cast to floating point (Clojure double)."
   #{"double precision" "double" "float" "float4" "float8"
@@ -795,6 +813,11 @@
     (instance? Double v)  oid-float8
     (instance? Float v)   oid-float4
     (float? v)            oid-float8
+    ;; BigDecimal is `numeric`. Without this it fell to the :else text
+    ;; branch, which only stayed invisible while decimal literals were
+    ;; doubles -- once they became numeric, every value-inferred decimal
+    ;; reported as text (25).
+    (decimal? v)          oid-numeric
     (boolean? v)          oid-bool
     (inst? v)             oid-timestamp
     ;; ::date / ::time cast results are java.time locals (issue #13);
@@ -880,5 +903,13 @@
    parse, so a caller can keep its previous behaviour."
   ([token] (decimal-literal token nil))
   ([token fallback]
-   (try (java.math.BigDecimal. (str/trim (str token)))
-        (catch Exception _ fallback))))
+   (try
+     (let [bd (java.math.BigDecimal. (str/trim (str token)))]
+       ;; PostgreSQL's numeric never carries a NEGATIVE display scale --
+       ;; set_var_from_str normalises it away. BigDecimal does not:
+       ;; `1e2` parses to unscaled 1 at scale -2. Multiply is the one
+       ;; operator that propagates it (its result scale is s1+s2, where
+       ;; add/subtract take a max and divide clamps at 0), so `1e2 *
+       ;; 1.25` answered 125 where PostgreSQL answers 125.00.
+       (if (neg? (.scale bd)) (.setScale bd 0) bd))
+     (catch Exception _ fallback))))

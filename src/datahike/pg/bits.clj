@@ -307,7 +307,7 @@
   (let [w (width b)]
     (when (> w 64)
       (throw (errors/pg-error :numeric-value-out-of-range
-                              {:detail "bigint out of range"})))
+                              {:message "bigint out of range"})))
     (if (zero? w)
       0
       (let [u (BigInteger. ^String (:bits b) 2)]

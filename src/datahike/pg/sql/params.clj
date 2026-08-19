@@ -444,6 +444,23 @@
                        [?e :pg/type ?pt]]}
              d attr))))
 
+(defn pg-typmod-of-attr
+  "The `:pg/typmod` attached to a schema ident entity, by the same route
+   `pg-type-of-attr` uses and for the same reason: it lives on the ident
+   entity, not in Datahike's schema map.
+
+   Reading it here rather than from a pre-enriched schema is what makes
+   `numeric(p,s)` behave the same on UPDATE as on INSERT -- the enriched
+   copy only ever reached the INSERT translator."
+  [db attr]
+  (when-let [d (or db *parse-db*)]
+    (ffirst (d/q
+             '{:find [?tm]
+               :in [$ ?ident]
+               :where [[?e :db/ident ?ident]
+                       [?e :pg/typmod ?tm]]}
+             d attr))))
+
 (defn infer-param-oid-for-column
   "Given a schema and a (table-namespace, column-name), return the PG
    OID that matches the attribute's :db/valueType, or nil if we don't
