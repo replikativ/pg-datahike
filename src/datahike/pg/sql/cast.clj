@@ -316,8 +316,15 @@
                  :else               (types/->pg-text v src-oid))
                type-str explicit?)
 
-        :boolean (if (boolean? v)
-                   v
+        :boolean (cond
+                   (boolean? v) v
+                   ;; PostgreSQL has an int -> bool cast (bool.c int4_bool):
+                   ;; zero is false, anything else true. We stringified the
+                   ;; number and handed it to the TEXT parser, which accepts
+                   ;; only the exact tokens '1' and '0' -- so `20::bool`
+                   ;; raised "invalid input syntax for type boolean: 20".
+                   (integer? v) (not (zero? v))
+                   :else
                    (let [b (coerce/parse-bool-token (str v))]
                      (when (nil? b)
                        (throw (errors/pg-error :invalid-text-representation

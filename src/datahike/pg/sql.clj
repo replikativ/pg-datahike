@@ -45,8 +45,11 @@
             ParenthesedSelect SetOperationList
             UnionOp IntersectOp ExceptOp]
            [net.sf.jsqlparser.schema Column Table]
+           [net.sf.jsqlparser.expression.operators.relational
+            ParenthesedExpressionList]
            [net.sf.jsqlparser.expression
             BooleanValue Function LongValue DoubleValue StringValue NullValue
+            SignedExpression
             CaseExpression CastExpression ArrayConstructor JdbcParameter]
            [net.sf.jsqlparser.statement.create.table CreateTable ColumnDefinition]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
@@ -1057,7 +1060,20 @@
                            ;; translate-select.
                             (let [e (.getExpression item)
                                   simple-cast? (fn [^CastExpression c]
-                                                 (let [inner (.getLeftExpression c)]
+                                                 (let [inner (.getLeftExpression c)
+                                                      ;; `(expr)::T` wraps the operand in a
+                                                      ;; single-element ParenthesedExpressionList,
+                                                      ;; and a negative literal is a
+                                                      ;; SignedExpression -- so `(-1)::bool` looked
+                                                      ;; non-trivial, took the full translator, and
+                                                      ;; reached the cast as the TEXT "-1".
+                                                       inner (if (and (instance? ParenthesedExpressionList inner)
+                                                                      (= 1 (count ^ParenthesedExpressionList inner)))
+                                                               (first ^ParenthesedExpressionList inner)
+                                                               inner)
+                                                       inner (if (instance? SignedExpression inner)
+                                                               (.getExpression ^SignedExpression inner)
+                                                               inner)]
                                                    (or (instance? LongValue inner)
                                                        (instance? DoubleValue inner)
                                                        (instance? StringValue inner)
@@ -1299,6 +1315,15 @@
                                                              (instance? CastExpression expr)
                                                              (let [cdt (.getColDataType ^CastExpression expr)
                                                                    inner (.getLeftExpression ^CastExpression expr)
+                                                                  ;; `(expr)::T` parses the operand as a
+                                                                  ;; single-element ParenthesedExpressionList, which
+                                                                  ;; none of the shape tests below match -- so
+                                                                  ;; `(-1)::bool` fell through to `(str inner)` and
+                                                                  ;; was cast as TEXT.
+                                                                   inner (if (and (instance? ParenthesedExpressionList inner)
+                                                                                  (= 1 (count ^ParenthesedExpressionList inner)))
+                                                                           (first ^ParenthesedExpressionList inner)
+                                                                           inner)
                                                                  ;; .getDataType is the BASE name ("int"); the `[]` is in
                                                                  ;; .getArrayData. (str cdt) carries the full "int[]".
                                                                    type-str (str/lower-case (str (.getDataType cdt)))
@@ -1326,6 +1351,23 @@
                                                                         ;; was affected -- `SELECT NULL::bool FROM t`
                                                                         ;; goes through translate-cast-expr, which has
                                                                         ;; the same guard already.
+                                                                        ;; A negative literal is a SignedExpression, not a
+                                                                        ;; LongValue, so the fallback stringified it and the
+                                                                        ;; cast saw TEXT. Numeric targets happen to reparse
+                                                                        ;; that string, but bool must not: PostgreSQL accepts
+                                                                        ;; the NUMBER `(-1)::bool` (nonzero -> true) while
+                                                                        ;; rejecting the STRING `'-1'::bool`. Keep it numeric.
+                                                                         (and (instance? SignedExpression inner)
+                                                                              (let [ie (.getExpression ^SignedExpression inner)]
+                                                                                (or (instance? LongValue ie)
+                                                                                    (instance? DoubleValue ie))))
+                                                                         (let [^SignedExpression se inner
+                                                                               ie (.getExpression se)
+                                                                               base (if (instance? LongValue ie)
+                                                                                      (.getValue ^LongValue ie)
+                                                                                      (types/decimal-literal
+                                                                                       ie (.getValue ^DoubleValue ie)))]
+                                                                           (if (= \- (.getSign se)) (- base) base))
                                                                          (instance? NullValue inner) :__null__
                                                                         ;; TRUE/FALSE reach the parser as a bare Column
                                                                         ;; (see the boolean-Column branch above), so the

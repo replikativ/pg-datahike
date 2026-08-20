@@ -52,10 +52,12 @@
 (deftest test-top-k-matches-full-sort-randomized
   (let [rng (java.util.Random. 42)
         rows (gen-rows rng 300)]
-    (doseq [order-by [[0 :asc]
-                      [0 :desc]
-                      [0 :asc 1 :desc]
-                      [2 :desc 0 :asc 1 :asc]]
+    (doseq [order-by [[0 :asc nil]
+                      [0 :desc nil]
+                      [0 :asc :first]
+                      [0 :desc :last]
+                      [0 :asc nil 1 :desc nil]
+                      [2 :desc nil 0 :asc :first 1 :asc nil]]
             lim [0 1 5 50 299 500]
             off [nil 0 3 100 400]]
       (testing (str "order-by " order-by " limit " lim " offset " off)
@@ -67,12 +69,12 @@
   ;; All keys equal → survivors must be the FIRST k rows in input
   ;; order, exactly as the stable full sort would keep them.
   (let [rows (mapv (fn [i] [1 (str "row-" i)]) (range 100))
-        cmp (null-safe-order-cmp [0 :asc])]
+        cmp (null-safe-order-cmp [0 :asc nil])]
     (is (= (vec (take 10 rows)) (vec (top-k-sort 10 cmp rows))))
     (is (= (naive-sorted cmp rows 7 20) (top-k-path cmp rows 7 20)))))
 
 (deftest test-top-k-edges
-  (let [cmp (null-safe-order-cmp [0 :asc])
+  (let [cmp (null-safe-order-cmp [0 :asc nil])
         rows [[3] [1] [2]]]
     (testing "k = 0 → empty"
       (is (= [] (vec (top-k-sort 0 cmp rows)))))
@@ -85,7 +87,13 @@
         (is (= [[1] [2] [nil] [:__null__]]
                (vec (top-k-sort 4 cmp nrows))))
         (is (= [[nil] [:__null__] [2] [1]]
-               (vec (top-k-sort 4 (null-safe-order-cmp [0 :desc]) nrows))))))))
+               (vec (top-k-sort 4 (null-safe-order-cmp [0 :desc nil]) nrows))))))
+    (testing "an EXPLICIT NULLS FIRST/LAST overrides the per-direction default"
+      (let [nrows [[nil] [2] [:__null__] [1]]]
+        (is (= [[nil] [:__null__] [1] [2]]
+               (vec (top-k-sort 4 (null-safe-order-cmp [0 :asc :first]) nrows))))
+        (is (= [[2] [1] [nil] [:__null__]]
+               (vec (top-k-sort 4 (null-safe-order-cmp [0 :desc :last]) nrows))))))))
 
 ;; ============================================================================
 ;; End to end: nullable ORDER BY column → server-side sort path.

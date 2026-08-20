@@ -3030,6 +3030,17 @@
                               v (expr/translate-expr ctx inner-expr)
                               ;; Materialize expression args (e.g. SUM(a * b) → SUM(?v))
                               v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                              ;; A CONSTANT argument -- `count(1)`, `avg(2.5)`,
+                              ;; `min(-1)` -- still has to reach the aggregate
+                              ;; as a VARIABLE. Datahike's find-spec parser has
+                              ;; no IFindVars implementation for a Constant, so
+                              ;; `(count 1)` raised a raw protocol error. Bind
+                              ;; it per row: the entity var is already in :with,
+                              ;; so `[(identity 1) ?c]` gives one ?c per row and
+                              ;; `count` then counts rows, as PostgreSQL does.
+                              v (if (symbol? v)
+                                  v
+                                  (ctx/materialize-arg! ctx (list 'identity v)))
                               ;; Per-input-type variant for SUM/AVG. Compute
                               ;; OID against the original AST expression
                               ;; (post-ref-deref `v` is a logic var with no
@@ -3052,7 +3063,11 @@
                               is-dh-distinct? (= agg-sym 'count-distinct)]
                           ;; Prevent set deduplication for non-distinct aggregates:
                           ;; adding the entity var to :with preserves duplicate rows.
-                          (when-not is-dh-distinct?
+                          ;; Only when there IS a table -- a table-free
+                          ;; `SELECT count(1)` has no entity to vary over, and
+                          ;; minting one produced an unbound `?_eid` ("Query for
+                          ;; unknown vars").
+                          (when (and default-table (not is-dh-distinct?))
                             (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
                           ;; array_agg(expr ORDER BY …): collect [sort-key value]
                           ;; pairs and sort in the agg fn so element order honors
@@ -3375,6 +3390,16 @@
                           (mapv (fn [^OrderByElement obe]
                                   (let [expr (.getExpression obe)
                                         asc? (.isAsc obe)
+                                        ;; Explicit NULLS FIRST / NULLS LAST. PostgreSQL's
+                                        ;; DEFAULT is NULLS LAST for ASC and NULLS FIRST for
+                                        ;; DESC (NULL sorts as the largest value), which the
+                                        ;; comparator already did -- but an explicit clause
+                                        ;; was DISCARDED, so `ORDER BY x ASC NULLS FIRST`
+                                        ;; silently returned the default order instead.
+                                        nulls (condp = (str (.getNullOrdering obe))
+                                                "NULLS_FIRST" :first
+                                                "NULLS_LAST"  :last
+                                                nil)
                                         ;; Check if ORDER BY references a SELECT alias
                                         v (cond
                                             ;; A bare integer constant is a 1-based
@@ -3486,7 +3511,7 @@
                                                             {:error :feature-not-supported
                                                              :feature "ORDER BY on aggregate not in SELECT list"
                                                              :detail (str "ORDER BY on aggregate not in SELECT list is not supported: " (str expr))})))]
-                                    [v (if asc? :asc :desc)]))
+                                    [v (if asc? :asc :desc) nulls]))
                                 order-by)))
 
 ;; LIMIT / OFFSET / FETCH FIRST
@@ -4112,11 +4137,20 @@
         ;; Vars produced by ctx/col-var! are tracked in ctx's :nullable-vars (always
         ;; get-else-bound); earlier passes also add to nullable-order-vars.
         nullable-vars (into @nullable-order-vars @(:nullable-vars ctx))
+        ;; An explicit NULLS ordering that differs from PostgreSQL's default
+        ;; for that direction can only be honoured by the server-side
+        ;; comparator -- Datahike's :order-by has no way to express it.
+        explicit-nulls? (and order-by-spec
+                             (some (fn [[_v dir nulls]]
+                                     (and nulls
+                                          (not= nulls (if (= dir :asc) :last :first))))
+                                   order-by-spec))
         has-nullable-order? (and order-by-spec
-                                 (some (fn [[v _dir]]
-                                         (and (symbol? v)
-                                              (contains? nullable-vars v)))
-                                       order-by-spec))
+                                 (or explicit-nulls?
+                                     (some (fn [[v _dir]]
+                                             (and (symbol? v)
+                                                  (contains? nullable-vars v)))
+                                           order-by-spec)))
         [find-elems-vec hidden-count order-by-flat sql-order-by]
         (if order-by-spec
           (let [;; seq? covers an aggregate form contributed by ORDER BY that
@@ -4127,15 +4161,23 @@
                                         (neg? (.indexOf ^java.util.List find-elems-vec v))))
                                  order-by-spec)
                 extended-find (into find-elems-vec (map first missing))
+                ;; Datahike's :order-by takes [idx dir] pairs; the server-side
+                ;; comparator takes [idx dir nulls] triples so it can honour an
+                ;; explicit NULLS FIRST / NULLS LAST.
                 ob (vec (mapcat
                          (fn [[v dir]]
                            (let [idx (.indexOf ^java.util.List extended-find v)]
                              (when (>= idx 0) [idx dir])))
                          order-by-spec))
+                ob3 (vec (mapcat
+                          (fn [[v dir nulls]]
+                            (let [idx (.indexOf ^java.util.List extended-find v)]
+                              (when (>= idx 0) [idx dir nulls])))
+                          order-by-spec))
                 hidden (+ (count missing) having-hidden group-by-hidden)]
             (if has-nullable-order?
               ;; Nullable ORDER BY → server-side sort (don't emit :order-by to Datahike)
-              [extended-find hidden nil ob]
+              [extended-find hidden nil ob3]
               ;; Non-nullable → Datahike handles it
               [extended-find hidden ob nil]))
           ;; No explicit SQL ORDER BY: default to a deterministic order on
