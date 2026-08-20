@@ -450,15 +450,22 @@
     ;; `(> :__null__ 15)` throws on the Keyword-vs-Number compare.
     (:col-idx having-spec)
     (let [{:keys [op col-idx value]} having-spec
+          ;; `translate-having-expr` emits Clojure-style operator symbols
+          ;; (`not=`), not SQL spellings -- so the `'<>` / `'!=` cases never
+          ;; matched and `HAVING count(*) <> 1` fell through to `:else =`,
+          ;; returning exactly the COMPLEMENT of the right groups.
+          ;;
+          ;; The sql/* predicates rather than clojure.core's: `=` is
+          ;; type-sensitive for numbers, so `HAVING sum(i) = 17.0` missed a
+          ;; long 17, and the ordering ops need PostgreSQL's NaN order.
           op-fn (cond
-                  (= op '>) >
-                  (= op '>=) >=
-                  (= op '<) <
-                  (= op '<=) <=
-                  (= op '=) =
-                  (= op '<>) not=
-                  (= op '!=) not=
-                  :else =)]
+                  (= op '>) sql/sql-gt?
+                  (= op '>=) sql/sql-ge?
+                  (= op '<) sql/sql-lt?
+                  (= op '<=) sql/sql-le?
+                  (= op '=) sql/sql-eq?
+                  (contains? #{'not= '<> '!=} op) sql/sql-ne?
+                  :else sql/sql-eq?)]
       (fn [row]
         (let [row-vec (if (sequential? row) (vec row) [row])
               cell (nth row-vec col-idx nil)]
@@ -4959,24 +4966,28 @@
 
 (defn- null-safe-order-cmp
   "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
-   is a flat [col-idx dir col-idx dir …] spec; nil and the :__null__
-   sentinel both mean SQL NULL, which sorts last for ASC and first for
-   DESC (the PG default NULLS ordering)."
+   is a flat [col-idx dir nulls col-idx dir nulls …] spec; nil and the
+   :__null__ sentinel both mean SQL NULL.
+
+   `nulls` is :first, :last, or nil for PostgreSQL's default — which is
+   NULLS LAST for ASC and NULLS FIRST for DESC, i.e. NULL sorts as the
+   largest value."
   [sql-order-by]
   (fn [a b]
     (let [av (if (sequential? a) a [a])
           bv (if (sequential? b) b [b])]
-      (loop [specs (partition 2 sql-order-by)]
-        (if-let [[idx dir] (first specs)]
+      (loop [specs (partition 3 sql-order-by)]
+        (if-let [[idx dir nulls] (first specs)]
           (let [va (nth av idx nil)
                 vb (nth bv idx nil)
                 a-null? (or (nil? va) (= :__null__ va))
                 b-null? (or (nil? vb) (= :__null__ vb))
+                ;; Explicit NULLS FIRST/LAST wins; otherwise the PG default.
+                nulls-first? (if nulls (= nulls :first) (= dir :desc))
                 c (cond
                     (and a-null? b-null?) 0
-                    ;; NULLs last for ASC, first for DESC (PG default)
-                    a-null? (if (= dir :asc) 1 -1)
-                    b-null? (if (= dir :asc) -1 1)
+                    a-null? (if nulls-first? -1 1)
+                    b-null? (if nulls-first? 1 -1)
                     ;; sql/order-cmp, not `compare`: Clojure's compares
                     ;; NaN EQUAL to everything, so a NaN in the sort key
                     ;; left the result silently unsorted -- and a

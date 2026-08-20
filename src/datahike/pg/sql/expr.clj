@@ -1449,35 +1449,37 @@
         effective-else (if (nil? else-val) :__null__ else-val)
         case-fn (let [branch-data (mapv (fn [{:keys [test then]}] [test then]) branches)
                       pv param-vars
-                      else-v effective-else]
+                      else-v effective-else
+                      ;; A branch value that evaluates to nil is SQL NULL,
+                      ;; and NULL has to leave here as the `:__null__`
+                      ;; sentinel: a datalog function binding that yields
+                      ;; nil FILTERS THE ROW, so `CASE WHEN id=1 THEN NULL
+                      ;; ELSE 2 END` returned four rows where PostgreSQL
+                      ;; returns five. `effective-else` covers a MISSING
+                      ;; ELSE; this covers an explicit NULL in either arm.
+                      nulled  (fn [v] (if (nil? v) :__null__ v))]
                   (fn [& args]
                     (let [bindings (zipmap pv args)]
                       ;; A branch is taken only when its test is TRUE.
                       ;; UNKNOWN is not: `CASE WHEN NULL THEN 'y' ELSE 'n'`
-                      ;; is 'n'. The sentinel is truthy, so a bare
+                      ;; is 'n', and the sentinel is truthy, so a bare
                       ;; `(when (interpret-form …))` took the branch.
                       ;;
-                      ;; `reduced` rather than `some`, because a branch
-                      ;; that matches and yields FALSE or NULL must WIN.
-                      ;; `(or (some …) else)` could not tell "no branch
-                      ;; matched" from "a branch produced false", so
-                      ;; `CASE WHEN true THEN false ELSE true END`
-                      ;; answered true.
                       ;; The hit is wrapped in a vector so that "a branch
-                      ;; matched and produced FALSE or NULL" is
+                      ;; matched and produced FALSE or NULL" stays
                       ;; distinguishable from "no branch matched".
-                      ;; `(or (some …) else)` could not tell them apart, so
+                      ;; `(or (some …) else)` could not tell those apart, so
                       ;; `CASE WHEN true THEN false ELSE true END` answered
-                      ;; true. And the ELSE is computed only on a miss --
+                      ;; true. And the ELSE is evaluated only on a miss --
                       ;; CASE short-circuits, so `CASE WHEN 1=1 THEN 1 ELSE
-                      ;; 2/0 END` must never evaluate the division.
+                      ;; 2/0 END` must never run the division.
                       (if-let [hit (reduce (fn [_ [test-form then-form]]
                                              (when (true? (interpret-form test-form bindings))
-                                               (reduced [(interpret-form then-form bindings)])))
+                                               (reduced [(nulled (interpret-form then-form bindings))])))
                                            nil
                                            branch-data)]
                         (first hit)
-                        (interpret-form else-v bindings)))))]
+                        (nulled (interpret-form else-v bindings))))))]
     ;; Make column args optional so entities with NULLs aren't excluded
     (ctx/make-columns-optional! ctx param-vars)
     ;; Register the :in parameter and its runtime value
@@ -3823,7 +3825,13 @@
                            (reduced nil)))
                        [] (conjunct-spine expr))]
       (if mays
-        [(concat ['not] mays)]
+        ;; Ground conjunction (`NOT (0 = -1 AND 1 <= 2.5)`) -- no variables to
+        ;; NOT-JOIN on, same problem as the ground atom below. Decide it here.
+        (if (empty? (ctx/collect-vars mays))
+          (if (every? #(true? (interpret-form (first %) {})) mays)
+            [[(list 'not= 1 1)]]
+            [])
+          [(concat ['not] mays)])
         (do (ctx/restore! ctx snap)
             (let [^AndExpression e expr]
               (combine-disjuncts ctx [(translate-predicate-false ctx (.getLeftExpression e))
@@ -3844,6 +3852,18 @@
         (empty? inner) [[(list 'not= 1 1)]]
         ;; φ is constant-false → F(φ) is every row.
         (every? false-sentinel? inner) []
+
+        ;; No variables anywhere in φ -- `NOT (1 = 1)`, or the constant
+        ;; disjunct of `NOT (i = 10 OR 2.5 <> 0)`. A datalog `not` is a
+        ;; NOT-JOIN and needs something to join ON, so emitting one here
+        ;; raises "Join variables should not be empty". Since φ is ground
+        ;; we can just decide it now: evaluate it, and answer with a
+        ;; constant instead of a negation.
+        (empty? (ctx/collect-vars inner))
+        (if (every? #(true? (interpret-form (first %) {})) inner)
+          [[(list 'not= 1 1)]]   ; φ is TRUE  → never FALSE → no rows
+          [])                    ; φ is FALSE → F(φ) is every row
+
         :else
         (let [;; DERIVE the guards from the operand vars rather than
               ;; hoisting whichever ones happen to be present: the
