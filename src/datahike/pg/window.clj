@@ -16,7 +16,8 @@
       :frame {:type :rows/:range :start bound :end bound}
       :offset int           — LAG/LEAD offset (default 1)
       :default val          — LAG/LEAD default value
-      :ntile-n int}         — NTILE bucket count")
+      :ntile-n int}         — NTILE bucket count"
+  (:require [datahike.pg.sql.fns :as fns]))
 
 (set! *warn-on-reflection* true)
 
@@ -154,16 +155,38 @@
     (if full-partition?
       ;; Full partition aggregate: compute once per partition, broadcast
       (doseq [partition partitions]
-        (let [vals (keep (fn [[_i row]] (let [v (nth row col-idx nil)]
-                                          (when (and (some? v) (not= :__null__ v)
-                                                     (number? v))
-                                            v)))
-                         partition)
+        (let [;; MIN/MAX are defined over any ordered type -- a date or a
+              ;; text column is legal -- so they must not be restricted to
+              ;; numbers the way the arithmetic aggregates are.
+              ordered-op? (contains? #{:min :max} op)
+              vals (if (:count-star? spec)
+                     ;; COUNT(*) counts ROWS in the frame, including the ones
+                     ;; whose columns are all NULL -- there is no argument to
+                     ;; be null. The `keep` below would count zero of them.
+                     partition
+                     (keep (fn [[_i row]] (let [v (nth row col-idx nil)]
+                                            (when (and (some? v) (not= :__null__ v)
+                                                       (or ordered-op? (number? v)))
+                                              v)))
+                           partition))
               agg-val (case op
                         :sum (if (empty? vals) nil (reduce + 0.0 vals))
-                        :avg (if (empty? vals) nil (/ (reduce + 0.0 vals) (count vals)))
-                        :min (if (empty? vals) nil (apply min vals))
-                        :max (if (empty? vals) nil (apply max vals))
+                        ;; Through the same implementation the non-window
+                        ;; aggregate uses: AVG over int / numeric is NUMERIC in
+                        ;; PostgreSQL, with a scale from select_div_scale, not a
+                        ;; double. `avg(i) OVER ()` answered 4.25 where the
+                        ;; plain `avg(i)` already answered 4.2500000000000000.
+                        :avg (cond
+                               (empty? vals) nil
+                               (every? #(or (integer? %) (decimal? %)) vals)
+                               (fns/filter-avg-numeric vals)
+                               :else (/ (reduce + 0.0 vals) (count vals)))
+                        ;; PostgreSQL's total order (NaN sorts above every
+                        ;; non-NaN), and it works for dates and text.
+                        :min (if (empty? vals) nil
+                                 (reduce (fn [a b] (if (neg? (fns/order-cmp b a)) b a)) vals))
+                        :max (if (empty? vals) nil
+                                 (reduce (fn [a b] (if (pos? (fns/order-cmp b a)) b a)) vals))
                         :count (count vals)
                         nil)]
           (doseq [[orig-idx _row] partition]

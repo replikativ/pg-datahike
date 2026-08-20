@@ -5322,9 +5322,16 @@
                           (cond->> (top-k-sort k null-safe-cmp results)
                             sql-offset (drop sql-offset))
                           (let [sorted (sort null-safe-cmp results)]
-                            (cond->> sorted
-                              sql-offset (drop sql-offset)
-                              sql-limit  (take sql-limit)))))
+                            ;; With window functions the OFFSET/LIMIT must wait:
+                            ;; PostgreSQL evaluates a window over the whole
+                            ;; result and only then trims, so trimming here made
+                            ;; `sum(i) OVER ()` the sum of the LIMITed rows.
+                            ;; The trim happens after the window pass instead.
+                            (if (seq window-specs)
+                              sorted
+                              (cond->> sorted
+                                sql-offset (drop sql-offset)
+                                sql-limit  (take sql-limit))))))
                       results)
             ;; Apply HAVING filter BEFORE trimming hidden columns:
             ;; HAVING can reference an aggregate that wasn't in the SELECT
@@ -5371,6 +5378,12 @@
                     final-aliases (mapv #(nth new-aliases %) visible-indices)]
                 [final-results final-aliases])
               [results find-aliases])
+            ;; The OFFSET/LIMIT deferred past the window pass above.
+            results (if (and (seq window-specs) sql-order-by)
+                      (cond->> results
+                        sql-offset (drop sql-offset)
+                        sql-limit  (take sql-limit))
+                      results)
             ;; Apply compound aggregate expressions: MAX(a) - MIN(a)
             ;; Each compound-expr has {:alias :op :l-idx :r-idx}.
             ;; We compute the derived value and replace the hidden agg columns.
@@ -6316,8 +6329,14 @@
                    :except    (let [first-set (set (:results (first executed)))
                                     rest-sets (map #(set (:results %)) (rest executed))]
                                 (apply clojure.set/difference first-set rest-sets))
-                   (mapcat :results executed))]
-    (format-query-result combined find-aliases)))
+                   (mapcat :results executed))
+        ;; The trailing ORDER BY applies to the COMBINED result. Without
+        ;; this, `EXCEPT` returned set/difference's arbitrary order and an
+        ;; explicit `ORDER BY … DESC` was ignored entirely.
+        ordered (if-let [ob (:sql-order-by parsed)]
+                  (sort (null-safe-order-cmp ob) combined)
+                  combined)]
+    (format-query-result ordered find-aliases)))
 
 (defn- exec-full-join
   [ctx parsed]
@@ -6971,6 +6990,39 @@
                 ;;
                 ;; The computed column is typed OID_TEXT, the same fallback
                 ;; the aggregate columns it is built from already use here.
+                ;; Window functions: exec-select APPENDS one value per spec
+                ;; and then drops the `__win_*` helper columns it added to
+                ;; :find for partition / order / aggregate inputs. The parsed
+                ;; find-aliases describe neither, so Describe advertised the
+                ;; wrong COUNT and every extended-protocol client ran off the
+                ;; end of the row -- `SELECT id, row_number() OVER (…)` came
+                ;; back as one column over JDBC while psql's simple query
+                ;; showed two. Same reshape, and the same reasoning, as the
+                ;; compound-expr case below.
+                [aliases oids]
+                (if-let [wspecs (:window-specs parsed)]
+                  (let [all-aliases (into (vec aliases)
+                                          (map (fn [sp] (or (:alias sp) (name (:op sp)))))
+                                          wspecs)
+                        ;; int8 for the counting / ranking ops, numeric for
+                        ;; AVG; anything else falls back to text, which is the
+                        ;; same default the aggregate columns here already use.
+                        win-oid (fn [sp]
+                                  (case (:op sp)
+                                    (:count :row_number :row-number :rank :dense_rank
+                                            :dense-rank :ntile) PgWireServer/OID_INT8
+                                    :avg PgWireServer/OID_NUMERIC
+                                    PgWireServer/OID_TEXT))
+                        all-oids (into (vec oids) (map win-oid) wspecs)
+                        vis (into [] (keep-indexed
+                                      (fn [i a]
+                                        (when-not (and (string? a)
+                                                       (.startsWith ^String a "__win_"))
+                                          i))
+                                      all-aliases))]
+                    [(mapv #(nth all-aliases %) vis)
+                     (int-array (map #(int (nth all-oids %)) vis))])
+                  [aliases oids])
                 [aliases oids]
                 (if-let [ces (:compound-exprs parsed)]
                   (let [all-aliases (into (vec aliases) (map :alias) ces)

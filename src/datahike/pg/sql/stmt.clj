@@ -2765,8 +2765,18 @@
                                                    "mode"} fname)
                       ranking-fns #{"row_number" "rank" "dense_rank" "ntile"
                                     "percent_rank" "cume_dist" "lag" "lead"}
+                      ;; JSqlParser's AnalyticType says which of the three
+                      ;; shapes this is: OVER (a window function),
+                      ;; FILTER_ONLY (`agg(x) FILTER (WHERE …)`), or
+                      ;; WITHIN_GROUP (an ordered-set aggregate). Inferring it
+                      ;; from the PRESENCE of a partition / order / frame
+                      ;; instead missed the empty window: `sum(i) OVER ()` has
+                      ;; none of them, so it fell through to the plain
+                      ;; aggregate path and raised "column must appear in the
+                      ;; GROUP BY clause".
                       is-window? (and (not within-group?)
-                                      (or (seq partition-list) (seq order-by-list)
+                                      (or (= "OVER" analytic-type)
+                                          (seq partition-list) (seq order-by-list)
                                           window-elem (contains? ranking-fns fname)))]
                   (cond
                     ;; Ordered-set aggregate via WITHIN GROUP — translate
@@ -2831,7 +2841,15 @@
                                                [(.indexOf ^java.util.List @find-elements v)
                                                 (if asc? :asc :desc)]))
                                            order-by-list))
-                          ;; Translate aggregate column (for SUM/AVG/etc.)
+                          ;; Translate aggregate column (for SUM/AVG/etc.).
+                          ;; `count(*)` has AllColumns as its "argument", which
+                          ;; is not a value expression -- translating it put a
+                          ;; non-var into :find and Datahike rejected the whole
+                          ;; query ("Cannot parse :find"). COUNT(*) counts rows
+                          ;; in the frame, so there is no column to reference.
+                          count-star? (or (nil? inner-expr)
+                                          (instance? AllColumns inner-expr))
+                          inner-expr (when-not count-star? inner-expr)
                           col-idx (when inner-expr
                                     (let [v (expr/translate-expr ctx inner-expr)
                                           v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
@@ -2876,6 +2894,7 @@
                                             :partition-by (or part-idxs [])
                                             :order-by (or ob-specs [])
                                             :frame frame}
+                                     count-star? (assoc :count-star? true)
                                      col-idx (assoc :col-idx col-idx)
                                      (= fname "ntile")
                                      (assoc :ntile-n (when inner-expr

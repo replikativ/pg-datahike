@@ -4444,7 +4444,16 @@
                                   :feature (str "IN with right-hand of type "
                                                 (.getName ^Class (type right)))
                                   :expr (str right)})))
-          non-null-vals (filterv some? vals)
+          ;; A NULL in the list is nil from a LITERAL list but the
+          ;; `:__null__` sentinel from a SUBQUERY, and only nil was being
+          ;; filtered. So the sentinel stayed in the membership set and
+          ;; `WHERE i IN (SELECT k …)` matched the rows where i IS NULL
+          ;; against the subquery's NULL; and the `NOT IN` NULL rule below
+          ;; never fired for a subquery, so `i NOT IN (SELECT k …)`
+          ;; returned rows where PostgreSQL returns none.
+          null-val?     (fn [v] (or (nil? v) (= :__null__ v)))
+          non-null-vals (filterv (complement null-val?) vals)
+          has-null-val? (boolean (some null-val? vals))
           ;; Detect parameterised values — JdbcParameter substitution
           ;; emits `?pN` symbols. A `(contains? #{?p1} ?col)` clause
           ;; would compare ?col against the literal var, never matching.
@@ -4454,8 +4463,10 @@
           has-param? (some symbol? non-null-vals)
           guards (ctx/null-guard-clauses ctx [col])]
       (cond
-        ;; NOT IN with NULL in the list → always empty (SQL standard)
-        (and not-in? (some nil? vals))
+        ;; NOT IN with NULL in the list → always empty (SQL standard):
+        ;; `x NOT IN (…, NULL)` is UNKNOWN for every x that matches
+        ;; nothing else, and FALSE for one that does.
+        (and not-in? has-null-val?)
         [[(list 'not= col col)]]
 
         ;; NOT IN with empty list → all rows match (everything is NOT IN {})
