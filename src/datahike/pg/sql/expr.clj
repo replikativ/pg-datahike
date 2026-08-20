@@ -569,6 +569,25 @@
         (swap! (:where-clauses ctx) conj [(list fn-param (first args)) result-var])
         result-var)
 
+      ;; VOLATILE zero-argument functions. A datalog function binding with
+      ;; no inputs is evaluated ONCE for the whole query, so `SELECT
+      ;; random() FROM t` handed every row the same draw where PostgreSQL
+      ;; draws per row (provolatile = 'v'). Feeding the entity var in as
+      ;; an ignored argument is what makes the binding row-varying.
+      ;;
+      ;; With no FROM there is no entity var and nothing to vary over --
+      ;; and a single row is exactly one draw, so folding is right there.
+      (and (contains? #{"random" "random_normal"} fname)
+           (:default-table ctx))
+      (let [fn-param (symbol (str "?vol-" fname (swap! (:var-counter ctx) inc)))
+            impl (get fns/sql-fn->clj-fn fname)
+            evar (ctx/entity-var! ctx (:default-table ctx))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj (fn [_row & more] (apply impl (or more nil))))
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param evar args) result-var])
+        result-var)
+
       (= fname "pg_typeof")
       (let [arg-expr (first params)
             oid-env {:db            (:db ctx)

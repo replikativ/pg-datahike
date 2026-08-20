@@ -39,7 +39,8 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
-            [datahike.pg.types :as types]))
+            [datahike.pg.types :as types]
+            [datahike.pg.prng]))
 
 (set! *warn-on-reflection* true)
 
@@ -1702,6 +1703,54 @@
 ;; literals already arrive as BigDecimal, so `sqrt(2.0)` reaches here as
 ;; one and `sqrt(2)` does not.
 
+(def ^:private session-prng
+  "Per-process PRNG cell. PostgreSQL keeps one per SESSION; a single
+   server process here shares one, which is the same thing for the
+   single-connection case the differential exercises and is noted as a
+   limitation for concurrent sessions."
+  (delay (datahike.pg.prng/make-session-state)))
+
+(defn sql-random
+  "random() -- pg_prng_double over the session PRNG."
+  []
+  (datahike.pg.prng/draw-double! @session-prng))
+
+(defn sql-setseed
+  "setseed(x). PostgreSQL restricts the argument to [-1,1] and rejects
+   NaN, then seeds via pg_prng_fseed."
+  [x]
+  (let [d (double x)]
+    (when (or (Double/isNaN d) (< d -1.0) (> d 1.0))
+      (throw (errors/pg-error
+              :invalid-parameter-value
+              {:message (str "setseed parameter " (types/float->pg-text d false)
+                             " is out of allowed range [-1,1]")})))
+    (datahike.pg.prng/set-seed! @session-prng d)
+    ;; "" and not nil: a datalog function binding that yields nil FILTERS
+    ;; the row, so `SELECT setseed(0.5)` came back with no rows at all.
+    ;; PostgreSQL's void renders as one empty row.
+    ""))
+
+(defn sql-random-normal
+  "random_normal(mean, stddev) -- Box-Muller over the same stream, as
+   pg_prng_double_normal does."
+  ([] (sql-random-normal 0.0 1.0))
+  ([mean] (sql-random-normal mean 1.0))
+  ([mean stddev]
+   (let [u1 (max 1.0e-300 (sql-random))
+         u2 (sql-random)
+         z (* (Math/sqrt (* -2.0 (Math/log u1))) (Math/cos (* 2.0 Math/PI u2)))]
+     (+ (double mean) (* (double stddev) z)))))
+
+(defn sql-random-range
+  "random(lo, hi) -- uniform over the CLOSED integer range."
+  [lo hi]
+  (let [l (long lo) h (long hi)]
+    (when (> l h)
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "lower bound must be less than or equal to upper bound"})))
+    (+ l (long (Math/floor (* (sql-random) (double (inc (- h l)))))))))
+
 (defn- throw-logarithm-error [msg]
   (throw (errors/pg-error :invalid-argument-for-logarithm {:message msg})))
 
@@ -2116,6 +2165,11 @@
    "atan2d"   sql-atan2d
    "erf"      sql-erf
    "erfc"     sql-erfc
+   "random"   (fn [] (sql-random))
+   "setseed"  sql-setseed
+   "random_normal" (fn ([] (sql-random-normal))
+                     ([m] (sql-random-normal m))
+                     ([m sd] (sql-random-normal m sd)))
    "div"      sql-div-trunc
    "factorial" sql-factorial
    "scale"    sql-scale
@@ -2258,6 +2312,7 @@
    "sind" #{1} "cosd" #{1} "tand" #{1} "cotd" #{1}
    "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
    "erf" #{1} "erfc" #{1}
+   "random" #{0} "setseed" #{1} "random_normal" #{0 1 2}
    "div" #{2} "factorial" #{1}
    "scale" #{1} "min_scale" #{1} "trim_scale" #{1}
    "width_bucket" #{4}
