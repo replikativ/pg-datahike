@@ -326,7 +326,9 @@
         ;; Materialize complex sub-expressions into intermediate vars
         args (when raw-args
                (mapv #(ctx/materialize-arg! ctx %) raw-args))
-        result-var (ctx/fresh-var! ctx)]
+        ;; Strict-function nullability: `upper(s)` is NULL wherever s is,
+        ;; and the result var is the operand a null-guard has to name.
+        result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) args)]
     (cond
       ;; ROW(a, b, …) — anonymous composite constructor. JSqlParser parses
       ;; it as a Function named "row". Build a PgRecord at runtime from the
@@ -1855,7 +1857,7 @@
         (do (jb/validate-json! inner-raw)
             (if (= :jsonb json-cast) (jb/serialize-jsonb inner-raw) inner-raw))
         (let [param (symbol (str "?json-cast" (swap! (:var-counter ctx) inc)))
-              result (ctx/fresh-var! ctx)
+              result (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
               jsonb? (= :jsonb json-cast)]
           (swap! (:in-params ctx) conj param)
           (swap! (:in-args ctx) conj
@@ -1895,7 +1897,7 @@
         (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
           (cast1 inner-raw)
           (let [fn-param (symbol (str "?cast-bit" (swap! (:var-counter ctx) inc)))
-                result-var (ctx/fresh-var! ctx)
+                result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
                 inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
             (swap! (:in-params ctx) conj fn-param)
             (swap! (:in-args ctx) conj cast1)
@@ -1923,7 +1925,7 @@
                                                 (pg-arr/array (or target-elem (:elem-type a))
                                                               (:elements a))
                                                 :__null__)))
-            result-var (ctx/fresh-var! ctx)
+            result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
             inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj cast-fn)
@@ -2007,7 +2009,7 @@
           :else    inner-raw)
       ;; Variable/expression — add runtime cast binding
         (let [inner-val (ctx/materialize-arg! ctx inner-raw)
-              result-var (ctx/fresh-var! ctx)]
+              result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)]
           (cond
             is-date?
             (let [fn-param (symbol (str "?cast-date" (swap! (:var-counter ctx) inc)))
@@ -3523,35 +3525,219 @@
                         op)
                       l r)]))))))
 
-(defn- guard-clause?
-  "A null-guard emitted by `ctx/null-guard-clauses`."
-  [c]
-  (and (vector? c) (= 1 (count c)) (seq? (first c))
-       (= 'not= (ffirst c))
-       (contains? #{:__null__ nil} (nth (first c) 2 ::none))))
+(declare translate-predicate translate-predicate-false)
 
-(defn- empty-after-guard-strip?
-  "True when every clause is a null-guard, so stripping them would leave
-   an EMPTY negation. `IS NOT NULL` translates to exactly one
-   guard-shaped clause, and `NOT (v IS NOT NULL)` then produced a bare
-   `(not)` — which datalog rejects with \"Cannot parse 'not' clause\"."
-  [clauses]
-  (every? guard-clause? clauses))
+(defn- false-sentinel?
+  "The canonical \"always false\" clause produced by EXISTS / IN-subquery
+   handlers when the inner query evaluates to no rows, or by an OR whose
+   every branch is constant-false. `(and false …)` short-circuits, so any
+   `and` containing the sentinel is itself constant-false."
+  [form]
+  (cond
+    (and (vector? form) (= 1 (count form)) (= '(not= 1 1) (first form)))
+    true
+    (and (seq? form) (= 'and (first form)))
+    (some false-sentinel? (rest form))
+    :else false))
 
-(defn- and-free?
-  "True when the expression tree contains no AND. Decides whether a NOT
-   may hoist its operands' null-guards out of the negation — see the
-   NotExpression branch of translate-predicate."
+(defn- combine-disjuncts
+  "Combine per-branch clause vectors into a single OR clause form.
+
+   Shared by the `OrExpression` branch of `translate-predicate` and the
+   `AndExpression` branch of `translate-predicate-false` — De Morgan makes
+   `NOT (a AND b)` a disjunction, so both need the same construction."
+  [ctx branch-clauses]
+  (let [;; translate-predicate returns a *vector of clauses* implicitly
+        ;; ANDed; wrap it back into a single form for OR composition.
+        ;; Empty vector = "no constraint" = always-true.
+        mk-branch    (fn [cs]
+                       (cond
+                         (empty? cs)      ::always-true
+                         (= 1 (count cs)) (first cs)
+                         :else            (concat ['and] cs)))
+        all-branches (mapv mk-branch branch-clauses)]
+    (cond
+      ;; Any branch always-true → OR(true, x) = true → no constraint.
+      ;; Returning [] means the caller (the surrounding AND) skips it.
+      (some #(= ::always-true %) all-branches)
+      []
+
+      ;; Drop constant-false branches. OR(false, x) = x.
+      :else
+      (let [live-branches (vec (remove false-sentinel? all-branches))]
+        (cond
+          ;; All branches false → OR is false. Emit one canonical
+          ;; false-sentinel; the surrounding AND short-circuits and the
+          ;; query returns no rows.
+          (empty? live-branches)
+          [[(list 'not= 1 1)]]
+
+          ;; Single live branch → unwrap to flat clauses so the caller
+          ;; keeps its vec-of-clauses shape.
+          (= 1 (count live-branches))
+          (let [b (first live-branches)]
+            (cond
+              (and (seq? b) (= 'and (first b))) (vec (rest b))
+              (vector? b)                       [b]
+              :else                             [b]))
+
+          ;; Several live branches → emit OR. shared-vars =
+          ;; (branch-vars ∩ outer-bound-vars). Datomic / legacy-engine
+          ;; semantics: shared-vars are the bridge between branches and
+          ;; the outer query (limit-context projects each branch's result
+          ;; to these). Branch-locals (e.g. the ?c1 introduced inside a
+          ;; correlated EXISTS subquery) must stay out of shared-vars or
+          ;; the post-projection `limit-rel` mismatches across branches.
+          ;; Empty intersection → use plain `or`.
+          :else
+          (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
+                outer-vars  (ctx/collect-vars @(:where-clauses ctx))
+                shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
+            [(if (seq shared-vars)
+               (concat ['or-join shared-vars] live-branches)
+               (concat ['or] live-branches))]))))))
+
+(defn- two-valued-predicate?
+  "True when the expression can only be TRUE or FALSE, never UNKNOWN.
+
+   `NOT` over such an expression is a plain set complement, so no null
+   guards are owed — and emitting them would be actively wrong:
+   `NOT (a IS NOT NULL)` must keep exactly the rows a guard would remove."
   [e]
   (cond
     (nil? e) true
-    (instance? net.sf.jsqlparser.expression.operators.conditional.AndExpression e) false
-    (instance? net.sf.jsqlparser.expression.operators.conditional.OrExpression e)
-    (let [^net.sf.jsqlparser.expression.operators.conditional.OrExpression o e]
-      (and (and-free? (.getLeftExpression o)) (and-free? (.getRightExpression o))))
-    (instance? Parenthesis e) (and-free? (.getExpression ^Parenthesis e))
-    (instance? NotExpression e) (and-free? (.getExpression ^NotExpression e))
-    :else true))
+    (instance? Parenthesis e) (two-valued-predicate? (.getExpression ^Parenthesis e))
+    (and (instance? ParenthesedExpressionList e)
+         (= 1 (count ^ParenthesedExpressionList e)))
+    (two-valued-predicate? (first ^ParenthesedExpressionList e))
+    (instance? IsNullExpression e) true
+    (instance? IsBooleanExpression e) true
+    (instance? ExistsExpression e) true
+    (instance? NotExpression e) (two-valued-predicate? (.getExpression ^NotExpression e))
+    (instance? AndExpression e)
+    (let [^AndExpression a e]
+      (and (two-valued-predicate? (.getLeftExpression a))
+           (two-valued-predicate? (.getRightExpression a))))
+    (instance? OrExpression e)
+    (let [^OrExpression o e]
+      (and (two-valued-predicate? (.getLeftExpression o))
+           (two-valued-predicate? (.getRightExpression o))))
+    :else false))
+
+(def ^:private op->may-kw
+  "Binary comparison predicates that `sql-may?` can express."
+  {'datahike.pg.sql/sql-eq? :eq
+   'datahike.pg.sql/sql-ne? :ne
+   'datahike.pg.sql/sql-lt? :lt
+   'datahike.pg.sql/sql-gt? :gt
+   'datahike.pg.sql/sql-le? :le
+   'datahike.pg.sql/sql-ge? :ge})
+
+(defn- may-clause
+  "M(φ) -- \"φ is TRUE or UNKNOWN\" -- as a single clause, or nil when the
+   translated φ has no such form.
+
+   Recognises the shape `null-guards + one binary comparison`. The guards
+   are DROPPED on purpose: they assert the operands are non-NULL, which is
+   exactly the case M is meant to also admit."
+  [clauses]
+  (let [guard? (fn [c] (and (vector? c) (= 1 (count c)) (seq? (first c))
+                            (= 'not= (ffirst c))
+                            (contains? #{:__null__ nil} (nth (first c) 2 ::none))))
+        body   (remove guard? clauses)]
+    (when (= 1 (count body))
+      (let [c (first body)]
+        (when (and (vector? c) (= 1 (count c)) (seq? (first c)))
+          (let [[op l r] (first c)]
+            (when (and (= 3 (count (first c))) (op->may-kw op))
+              [(list 'datahike.pg.sql/sql-may? (op->may-kw op) l r)])))))))
+
+(defn- conjunct-spine
+  "Flatten an AND spine (through parentheses) into its conjuncts."
+  [e]
+  (cond
+    (instance? Parenthesis e) (conjunct-spine (.getExpression ^Parenthesis e))
+    (and (instance? ParenthesedExpressionList e)
+         (= 1 (count ^ParenthesedExpressionList e)))
+    (conjunct-spine (first ^ParenthesedExpressionList e))
+    (instance? AndExpression e)
+    (let [^AndExpression a e]
+      (into (conjunct-spine (.getLeftExpression a))
+            (conjunct-spine (.getRightExpression a))))
+    :else [e]))
+
+(defn translate-predicate-false
+  "F(φ): the clauses selecting the rows where φ evaluates to **FALSE**.
+
+   SQL's `NOT φ` is TRUE exactly where φ is FALSE — not merely where φ
+   \"is not TRUE\". A datalog `(not <goal>)` is set complement, so it keeps
+   the FALSE rows *and* the UNKNOWN rows; that UNKNOWN set is precisely
+   where we used to diverge from PostgreSQL. So NOT descends into φ and
+   builds its false-set directly:
+
+     F(a AND b) = F(a) OR F(b)
+     F(a OR b)  = F(a) AND F(b)
+     F(NOT a)   = T(a)
+     F(atom)    = every operand IS NOT NULL, AND (not atom)
+
+   The leaf rule is where UNKNOWN gets dropped: an atom with a NULL
+   operand is UNKNOWN, hence not FALSE, hence not in F. Note this is not
+   NNF/De Morgan rewriting — the tree is walked once and a single `not`
+   is emitted per leaf, which measured ~3x cheaper than pushing negation
+   down to the leaves and re-planning the resulting positive form."
+  [ctx expr]
+  (cond
+    (instance? Parenthesis expr)
+    (translate-predicate-false ctx (.getExpression ^Parenthesis expr))
+
+    (and (instance? ParenthesedExpressionList expr)
+         (= 1 (count ^ParenthesedExpressionList expr)))
+    (translate-predicate-false ctx (first ^ParenthesedExpressionList expr))
+
+    (instance? AndExpression expr)
+    ;; A conjunction is FALSE exactly when it is not (TRUE or UNKNOWN), so
+    ;; when every conjunct has an M-form the whole thing collapses to ONE
+    ;; negation -- same plan shape, and ~2x cheaper than the De Morgan
+    ;; disjunction of per-conjunct negations below. Attempt it against a
+    ;; ctx snapshot: translating is side-effecting, so a partial attempt
+    ;; has to be rolled back before the general path re-translates.
+    (let [snap (ctx/snapshot ctx)
+          mays (reduce (fn [acc c]
+                         (if-let [m (may-clause (translate-predicate ctx c))]
+                           (conj acc m)
+                           (reduced nil)))
+                       [] (conjunct-spine expr))]
+      (if mays
+        [(concat ['not] mays)]
+        (do (ctx/restore! ctx snap)
+            (let [^AndExpression e expr]
+              (combine-disjuncts ctx [(translate-predicate-false ctx (.getLeftExpression e))
+                                      (translate-predicate-false ctx (.getRightExpression e))])))))
+
+    (instance? OrExpression expr)
+    (let [^OrExpression e expr]
+      (into (translate-predicate-false ctx (.getLeftExpression e))
+            (translate-predicate-false ctx (.getRightExpression e))))
+
+    (instance? NotExpression expr)
+    (translate-predicate ctx (.getExpression ^NotExpression expr))
+
+    :else
+    (let [inner (translate-predicate ctx expr)]
+      (cond
+        ;; φ is unconstrained (always TRUE) → never FALSE.
+        (empty? inner) [[(list 'not= 1 1)]]
+        ;; φ is constant-false → F(φ) is every row.
+        (every? false-sentinel? inner) []
+        :else
+        (let [;; DERIVE the guards from the operand vars rather than
+              ;; hoisting whichever ones happen to be present: the
+              ;; equality path emits none, because a NULL equals nothing
+              ;; and the guard is redundant right up until you negate it.
+              guards (when-not (two-valued-predicate? expr)
+                       (ctx/null-guard-clauses
+                        ctx (into #{} (filter symbol?) (flatten (seq inner)))))]
+          (conj (vec guards) (concat ['not] inner)))))))
 
 (defn translate-predicate
   "Translate a JSqlParser WHERE expression to Datalog :where clauses.
@@ -3564,82 +3750,14 @@
             (translate-predicate ctx (.getRightExpression e))))
 
     (instance? OrExpression expr)
-    (let [^OrExpression e expr
-          ;; Inside a disjunct, data-pattern emission is unsound (it
-          ;; would constrain rows the other branch should keep) —
-          ;; force the predicate paths.
-          left-clauses (binding [*conjunctive-where* false]
-                         (translate-predicate ctx (.getLeftExpression e)))
-          right-clauses (binding [*conjunctive-where* false]
-                          (translate-predicate ctx (.getRightExpression e)))
-          ;; The canonical "always false" sentinel produced by EXISTS /
-          ;; IN-subquery handlers when the inner evaluates to no rows.
-          ;; A branch carrying this sentinel (alone or under an `and`)
-          ;; is constant-false — it cannot match any outer row.
-          ;; `(and false …)` short-circuits to false, so any AND containing
-          ;; the sentinel is also constant-false.
-          false-sentinel? (fn false-sentinel? [form]
-                            (cond
-                              (and (vector? form)
-                                   (= 1 (count form))
-                                   (= '(not= 1 1) (first form)))
-                              true
-                              (and (seq? form) (= 'and (first form)))
-                              (some false-sentinel? (rest form))
-                              :else false))
-          ;; Build the per-branch form. translate-predicate returns a
-          ;; *vector of clauses* implicitly ANDed; wrap it back into a
-          ;; single form for OR composition. Empty vector = "no
-          ;; constraint" = always-true; in OR that subsumes the other
-          ;; branch (true OR x = true), so handled in the outer cond.
-          mk-branch    (fn [cs]
-                         (cond
-                           (empty? cs)      ::always-true
-                           (= 1 (count cs)) (first cs)
-                           :else            (concat ['and] cs)))
-          all-branches (mapv mk-branch [left-clauses right-clauses])]
-      (cond
-        ;; Any branch is always-true → OR(true, x) = true → no constraint.
-        ;; Returning [] means translate-predicate's caller (the AND in
-        ;; the surrounding WHERE) just skips this clause.
-        (some #(= ::always-true %) all-branches)
-        []
-
-        ;; Drop constant-false branches. OR(false, x) = x; OR(false, false) = false.
-        :else
-        (let [live-branches (vec (remove false-sentinel? all-branches))]
-          (cond
-            ;; All branches false → OR is false. Emit one canonical
-            ;; false-sentinel as a top-level clause; the surrounding AND
-            ;; short-circuits to false, the query returns no rows.
-            (empty? live-branches)
-            [[(list 'not= 1 1)]]
-
-            ;; Single live branch → unwrap to flat clauses so the outer
-            ;; translate-predicate keeps its vec-of-clauses shape.
-            (= 1 (count live-branches))
-            (let [b (first live-branches)]
-              (cond
-                (and (seq? b) (= 'and (first b))) (vec (rest b))
-                (vector? b)                       [b]
-                :else                             [b]))
-
-            ;; Two live branches → emit OR. shared-vars =
-            ;; (branch-vars ∩ outer-bound-vars). Datomic / legacy-engine
-            ;; semantics: shared-vars are the bridge between branches and
-            ;; the outer query (limit-context projects each branch's
-            ;; result to these). Branch-locals (e.g. the ?c1 introduced
-            ;; inside a correlated EXISTS subquery) must stay out of
-            ;; shared-vars or the post-projection `limit-rel`
-            ;; mismatches across branches. Empty intersection → use
-            ;; plain `or`.
-            :else
-            (let [branch-vars (apply set/union (map ctx/collect-vars live-branches))
-                  outer-vars  (ctx/collect-vars @(:where-clauses ctx))
-                  shared-vars (vec (sort-by str (set/intersection branch-vars outer-vars)))]
-              [(if (seq shared-vars)
-                 (concat ['or-join shared-vars] live-branches)
-                 (concat ['or] live-branches))])))))
+    ;; Inside a disjunct, data-pattern emission is unsound (it would
+    ;; constrain rows the other branch should keep) — force the
+    ;; predicate paths.
+    (let [^OrExpression e expr]
+      (combine-disjuncts
+       ctx (binding [*conjunctive-where* false]
+             [(translate-predicate ctx (.getLeftExpression e))
+              (translate-predicate ctx (.getRightExpression e))])))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
@@ -4114,39 +4232,11 @@
           ;; Temporarily set isNot and delegate to EXISTS handler
           (translate-predicate ctx (doto (ExistsExpression.) (.setNot true)
                                          (.setRightExpression (.getRightExpression exists-expr)))))
-        ;; Under negation a data pattern is unsound (it would constrain
-        ;; the outer query, not the negated branch) — predicate paths only.
-        (let [inner (binding [*conjunctive-where* false]
-                      (translate-predicate ctx inner-expr))]
-          (if (and (and-free? inner-expr) (not (empty-after-guard-strip? inner)))
-            ;; SQL: `NOT x` is TRUE only when x is FALSE, and a
-            ;; comparison with a NULL operand is UNKNOWN, not FALSE. The
-            ;; null-guards were INSIDE the `not`, so for a NULL row the
-            ;; guarded conjunction was false and `not` made it true:
-            ;; `WHERE NOT (v = 10)` returned the v-IS-NULL row, which
-            ;; PostgreSQL excludes.
-            ;;
-            ;; Hoisting the guards out of the negation says "operand is
-            ;; not null AND not(comparison)", which is the SQL meaning.
-            ;;
-            ;; Only when the inner tree has no AND. For a disjunction the
-            ;; same rule holds — an OR is FALSE only if every disjunct is
-            ;; FALSE, so every operand must be non-null. For a
-            ;; CONJUNCTION it does not: `NOT (v = 10 AND s = 'zzz')` is
-            ;; TRUE when s <> 'zzz' whatever v is, and hoisting v's guard
-            ;; would wrongly drop that row. That case is already correct
-            ;; today, so leaving AND-trees alone keeps it correct.
-            (let [body (remove guard-clause? inner)
-                  ;; DERIVE the guards from the operand vars rather than
-                  ;; only hoisting the ones already present. The equality
-                  ;; path emits none — a NULL equals nothing, so the
-                  ;; guard is redundant until you negate it — so
-                  ;; `NOT (v = 10)` had nothing to hoist and kept
-                  ;; returning the NULL row.
-                  vars   (into #{} (filter symbol?) (flatten (seq body)))
-                  guards (ctx/null-guard-clauses ctx vars)]
-              (conj (vec guards) (concat ['not] body)))
-            [(concat ['not] inner)]))))
+        ;; `NOT φ` selects exactly the rows where φ is FALSE. Under
+        ;; negation a data pattern is unsound (it would constrain the
+        ;; outer query, not the negated branch) — predicate paths only.
+        (binding [*conjunctive-where* false]
+          (translate-predicate-false ctx inner-expr))))
 
     (instance? InExpression expr)
     (let [^InExpression e expr

@@ -126,6 +126,7 @@
 (def sql-power-op fns/sql-power-op)
 (def sql-eq? fns/sql-eq?)
 (def sql-ne? fns/sql-ne?)
+(def sql-may? fns/sql-may?)
 (def sql-in? fns/sql-in?)
 (def sql-+   fns/sql-+)
 (def sql--   fns/sql--)

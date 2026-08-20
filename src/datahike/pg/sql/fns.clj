@@ -794,9 +794,36 @@
 (def sql-ge? (nan-cmp-op >=))
 
 (defn sql-ne?
-  "SQL `<>`. The complement of `sql-eq?`; see there."
+  "SQL `<>`. The complement of `sql-eq?` on non-NULL operands.
+
+   NOT simply `(not (sql-eq? a b))`: `sql-eq?` answers false for a NULL
+   operand (correct in predicate position, where UNKNOWN collapses to
+   FALSE), and negating that turns UNKNOWN into TRUE. `a <> 109` then
+   kept the rows where a IS NULL, which PostgreSQL excludes. The other
+   ordering comparisons reject NULL explicitly for the same reason -- see
+   `nan-cmp-op`."
   [a b]
-  (not (sql-eq? a b)))
+  (if (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b))
+    false
+    (not (sql-eq? a b))))
+
+(def ^:private may-ops
+  {:eq sql-eq? :ne sql-ne? :lt sql-lt? :gt sql-gt? :le sql-le? :ge sql-ge?})
+
+(defn sql-may?
+  "\"`a op b` is TRUE **or UNKNOWN**\" -- the complement of \"is FALSE\".
+
+   Used to translate `NOT (x AND y)` with a SINGLE datalog negation:
+   a conjunction is FALSE exactly when it is not (true-or-unknown), so
+   `NOT (x AND y)` becomes `(not (and (sql-may? …x) (sql-may? …y)))`
+   instead of a disjunction of two separate negations. Measured ~2x
+   cheaper on a 20k-row scan, and it keeps the plan shape that the
+   pre-3VL translation had.
+
+   `op` is a keyword rather than the predicate itself because a datalog
+   clause can only name a var or a literal, not a function value."
+  [op a b]
+  (or (sql-null? a) (sql-null? b) (boolean ((may-ops op) a b))))
 
 (defn sql-in?
   "SQL `IN` over a literal list. `contains?` on a set is `=`-based and so
