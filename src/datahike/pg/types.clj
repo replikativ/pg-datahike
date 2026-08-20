@@ -801,6 +801,40 @@
             :uuid    :uuid
             :text))))))
 
+(defrecord PgNumericSpecial [kind])
+
+(defn numeric-special
+  "NaN / +-Infinity as a NUMERIC. BigDecimal cannot represent any of
+   them, and PostgreSQL has had all three since 14, so they need a
+   carrier of their own -- the same shape PgBit and PgArray already use
+   for values Clojure has no native equivalent of.
+
+   `kind` is :nan, :inf or :-inf."
+  [kind]
+  (->PgNumericSpecial kind))
+
+(defn numeric-special? [x] (instance? PgNumericSpecial x))
+
+(def nan-numeric (numeric-special :nan))
+(def inf-numeric (numeric-special :inf))
+(def -inf-numeric (numeric-special :-inf))
+
+(defn numeric-special->double ^double [x]
+  (case (:kind x)
+    :nan Double/NaN
+    :inf Double/POSITIVE_INFINITY
+    :-inf Double/NEGATIVE_INFINITY))
+
+(defn double->numeric-special
+  "The special a double denotes, or nil when it is finite."
+  [^double d]
+  (cond (Double/isNaN d) nan-numeric
+        (Double/isInfinite d) (if (pos? d) inf-numeric -inf-numeric)
+        :else nil))
+
+(defn numeric-special-text [x]
+  (case (:kind x) :nan "NaN" :inf "Infinity" :-inf "-Infinity"))
+
 (defn infer-oid-from-value
   "Infer a PostgreSQL type OID from a Clojure runtime value."
   [v]
@@ -838,6 +872,7 @@
     ;; doubles -- once they became numeric, every value-inferred decimal
     ;; reported as text (25).
     (decimal? v)          oid-numeric
+    (numeric-special? v)  oid-numeric
     (boolean? v)          oid-bool
     (inst? v)             oid-timestamp
     ;; ::date / ::time cast results are java.time locals (issue #13);
@@ -949,6 +984,7 @@
      ;; See the same branch in the wire renderer: `.toString` on a
      ;; negative-scale BigDecimal produces an exponent form PostgreSQL
      ;; never emits.
+     (numeric-special? v) (numeric-special-text v)
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      ;; Same PostgreSQL float form the wire renderer uses.
      (or (instance? Float v) (instance? Double v))

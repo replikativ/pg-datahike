@@ -27,7 +27,8 @@
    Both errors are encoded as `ex-info` with `:sqlstate`; the wire
    layer's `handler.clj` already lifts those into ErrorResponse
    messages."
-  (:require [clojure.string :as str])
+  (:require [datahike.pg.types :as types]
+            [clojure.string :as str])
   (:import [java.math BigInteger BigDecimal]))
 
 (set! *warn-on-reflection* true)
@@ -175,6 +176,11 @@
       :bigdec
       (cond
         (instance? BigDecimal v) v
+        ;; NaN / +-Infinity, which BigDecimal cannot hold -- carried by
+        ;; types/PgNumericSpecial instead. PostgreSQL's numeric_in
+        ;; accepts the same spellings float8in does and says so.
+        (types/numeric-special? v) v
+        (special-float v) (types/double->numeric-special (special-float v))
         (instance? BigInteger v) (BigDecimal. ^BigInteger v)
         (instance? clojure.lang.BigInt v)
         (BigDecimal. (.toBigInteger ^clojure.lang.BigInt v))

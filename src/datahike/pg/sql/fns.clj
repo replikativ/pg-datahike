@@ -250,6 +250,38 @@
     (instance? java.util.UUID v) "uuid"
     :else nil))
 
+(defn- numspecial? [x] (types/numeric-special? x))
+
+(defn- ->num-double
+  "A numeric operand as a double, for the special-value paths."
+  ^double [x]
+  (if (numspecial? x) (types/numeric-special->double x) (double x)))
+
+(defn- special-arith
+  "Arithmetic where at least one operand is a numeric NaN or +-Infinity.
+
+   Every such result is either another special or a value the double
+   computation gets exactly right -- `Inf - Inf` is NaN, `Inf * 0` is
+   NaN, `x / Inf` is 0 -- so routing through double loses nothing, and
+   PostgreSQL's numeric special rules are IEEE's."
+  [f a b]
+  (let [r (f (->num-double a) (->num-double b))]
+    (or (types/double->numeric-special r)
+        (java.math.BigDecimal/valueOf r))))
+
+(defn- numeric-special-cmp
+  "PostgreSQL's numeric ordering, which is total: NaN above everything
+   and equal to itself, then +Infinity, then the finite values, then
+   -Infinity (numeric.c cmp_numerics)."
+  ^long [a b]
+  (let [rank (fn [x] (case (:kind x) :nan 2 :inf 1 :-inf -1))]
+    (cond
+      (and (numspecial? a) (numspecial? b))
+      (let [ra (rank a) rb (rank b)] (long (compare ra rb)))
+      (numspecial? a) (long (if (= :-inf (:kind a)) -1 1))
+      (numspecial? b) (long (if (= :-inf (:kind b)) 1 -1))
+      :else 0)))
+
 (defn nan-num? [x]
   (and (number? x) (Double/isNaN (double x))))
 
@@ -278,6 +310,8 @@
   (cond
     (and (bytes? a) (bytes? b))
     (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
+    (or (types/numeric-special? a) (types/numeric-special? b))
+    (numeric-special-cmp a b)
     (nan-num? a) (if (nan-num? b) 0 1)
     (nan-num? b) -1
     :else (compare a b)))
@@ -720,6 +754,10 @@
    `<=` `>=` are already cross-type."
   [a b]
   (cond
+    ;; A numeric special compares by PostgreSQL's total order, and equals
+    ;; only its own kind.
+    (or (numspecial? a) (numspecial? b))
+    (and (numspecial? a) (numspecial? b) (= (:kind a) (:kind b)))
     ;; PostgreSQL's float and numeric comparisons treat NaN as EQUAL to
     ;; itself (float.c float8_cmp_internal, numeric.c cmp_numerics) --
     ;; unlike IEEE-754, and unlike Clojure's `==`, which answers false.
@@ -745,7 +783,9 @@
       ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
       ;; sql-eq? already answers false the same way, via `=`.
       (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
-      (or (nan-num? a) (nan-num? b)) (pred (order-cmp a b) 0)
+      (or (nan-num? a) (nan-num? b)
+          (types/numeric-special? a) (types/numeric-special? b))
+      (pred (order-cmp a b) 0)
       :else (pred (compare a b) 0))))
 
 (def sql-lt? (nan-cmp-op <))
@@ -822,9 +862,18 @@
   [f underflow?]
   (fn [a b] (checked-float (f a b) a b underflow?)))
 
-(def sql-+ (null-safe (long-overflow->pg (float-checked + false))))
-(def sql-- (null-safe (long-overflow->pg (float-checked - false))))
-(def sql-* (null-safe (long-overflow->pg (float-checked * true))))
+(defn- special-aware
+  "Route an operation through the special-value path when either operand
+   is a numeric NaN or +-Infinity, which no BigDecimal operator accepts."
+  [f g]
+  (fn [a b]
+    (if (or (types/numeric-special? a) (types/numeric-special? b))
+      (special-arith g a b)
+      (f a b))))
+
+(def sql-+ (null-safe (special-aware (long-overflow->pg (float-checked + false)) +)))
+(def sql-- (null-safe (special-aware (long-overflow->pg (float-checked - false)) -)))
+(def sql-* (null-safe (special-aware (long-overflow->pg (float-checked * true)) *)))
 
 ;; ---------------------------------------------------------------------------
 ;; date arithmetic
@@ -2094,6 +2143,37 @@
   (null-safe (fn [v] (let [b (.stripTrailingZeros (bigdec v))]
                        (if (neg? (.scale b)) (.setScale b 0) b)))))
 
+(defn- special-passthrough
+  "Wrap a one-argument numeric function so a NaN / +-Infinity operand
+   passes through unchanged, which is what PostgreSQL does for rounding
+   and absolute value: round(Infinity) is Infinity, abs(NaN) is NaN.
+   BigDecimal has no representation for any of them, so without this
+   they reached the JVM as a record and raised."
+  [f]
+  ;; variadic: round and trunc take an optional scale, and a 1-arity
+  ;; wrapper silently broke `round(1.005, 2)`.
+  (fn [x & more]
+    (if (types/numeric-special? x) x (apply f x more))))
+
+(defn- special-abs [f]
+  (fn [x & more]
+    (if (types/numeric-special? x)
+      (if (= :-inf (:kind x)) types/inf-numeric x)
+      (apply f x more))))
+
+(defn- special-sign [f]
+  (fn [x & more]
+    (if (types/numeric-special? x)
+      (case (:kind x) :nan x :inf 1 :-inf -1)
+      (apply f x more))))
+
+(defn- special-null
+  "scale() and min_scale() answer NULL for a special -- there is no
+   scale to report."
+  [f]
+  (fn [x & more]
+    (if (types/numeric-special? x) :__null__ (apply f x more))))
+
 (def sql-fn->clj-fn
   "Map of SQL function names (lowercased) to Clojure fn values.
 
@@ -2106,9 +2186,9 @@
    ;; number of MAP ENTRIES (2), not its bit width. PG's length() on a
    ;; bit string is the bit count; octet_length is ceil(bits/8).
    "length"   sql-length
-   "abs"      clojure.core/abs
-   "floor"    #(Math/floor (double %))
-   "ceil"     #(Math/ceil (double %))
+   "abs"      (special-abs clojure.core/abs)
+   "floor"    (special-passthrough #(Math/floor (double %)))
+   "ceil"     (special-passthrough #(Math/ceil (double %)))
    "ceiling"  #(Math/ceil (double %))
    "trim"     str/trim
    "ltrim"    str/triml
@@ -2149,9 +2229,9 @@
    "pow"      (fn [b e] (if (or (num-arg? b) (num-arg? e))
                           (numeric-power (bigdec b) (bigdec e))
                           (sql-power b e)))
-   "round"    sql-round
-   "trunc"    sql-trunc
-   "sign"     sql-sign
+   "round"    (special-passthrough sql-round)
+   "trunc"    (special-passthrough sql-trunc)
+   "sign"     (special-sign sql-sign)
    "gcd"      sql-gcd
    ;; Degree trigonometry, div/factorial and the scale inspectors --
    ;; ported rather than derived; see their definitions.
@@ -2172,9 +2252,9 @@
                      ([m sd] (sql-random-normal m sd)))
    "div"      sql-div-trunc
    "factorial" sql-factorial
-   "scale"    sql-scale
-   "min_scale" sql-min-scale
-   "trim_scale" sql-trim-scale
+   "scale"    (special-null sql-scale)
+   "min_scale" (special-null sql-min-scale)
+   "trim_scale" (special-passthrough sql-trim-scale)
    "lcm"      sql-lcm
    "width_bucket" sql-width-bucket
    "pi"       (fn [] Math/PI)

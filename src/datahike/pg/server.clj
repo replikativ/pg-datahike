@@ -396,6 +396,8 @@
      ;; exponent keeps a NEGATIVE scale (`1.0e3` is unscaled 10 at scale
      ;; -1), and `.toString` renders that as "1.0E+3". PostgreSQL has no
      ;; exponent form in its numeric output -- it answers 1000.
+     ;; numeric NaN / +-Infinity -- see types/numeric-special.
+     (types/numeric-special? v) (types/numeric-special-text v)
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      (uuid? v)    (str v)
      (symbol? v)  (str v)
