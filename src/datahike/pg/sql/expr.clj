@@ -65,6 +65,7 @@
            [net.sf.jsqlparser.expression.operators.relational
             DoubleAnd EqualsTo ExistsExpression ExpressionList
             GreaterThan GreaterThanEquals InExpression IsBooleanExpression
+            IsDistinctExpression IsUnknownExpression
             IsNullExpression JsonOperator LikeExpression MinorThan
             MinorThanEquals NotEqualsTo ParenthesedExpressionList
             RegExpMatchOperator Between]
@@ -1055,7 +1056,10 @@
             ;; surfacing as XX000.
             _ (fns/check-arity! fname (count args))
             clj-fn (get fns/sql-fn->clj-fn fname)
-            wrapped (fns/null-safe clj-fn)
+            ;; Strictness is the rule, not a law -- see fns/non-strict-fns.
+            wrapped (if (contains? fns/non-strict-fns fname)
+                      clj-fn
+                      (fns/null-safe clj-fn))
             fn-param (symbol (str "?fn-" fname "-"
                                   (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
@@ -1374,9 +1378,12 @@
                 (= a b))
         not=  (let [[a b] (mapv #(interpret-form % bindings) args)]
                 (not= a b))
-        and   (every? #(interpret-form % bindings) args)
-        or    (some #(interpret-form % bindings) args)
-        not   (not (interpret-form (first args) bindings))
+        ;; Kleene, not Clojure truthiness: the `:__null__` sentinel is
+        ;; TRUTHY, so `every?`/`some?`/`not` all read UNKNOWN as TRUE.
+        ;; Reduce pairwise through the same tables the datalog path uses.
+        and   (reduce fns/sql-and3 true (mapv #(interpret-form % bindings) args))
+        or    (reduce fns/sql-or3 false (mapv #(interpret-form % bindings) args))
+        not   (fns/sql-not3 (interpret-form (first args) bindings))
         nil?  (let [v (interpret-form (first args) bindings)]
                 (nil? v))
         some? (let [v (interpret-form (first args) bindings)]
@@ -1445,11 +1452,32 @@
                       else-v effective-else]
                   (fn [& args]
                     (let [bindings (zipmap pv args)]
-                      (or (some (fn [[test-form then-form]]
-                                  (when (interpret-form test-form bindings)
-                                    (interpret-form then-form bindings)))
-                                branch-data)
-                          (interpret-form else-v bindings)))))]
+                      ;; A branch is taken only when its test is TRUE.
+                      ;; UNKNOWN is not: `CASE WHEN NULL THEN 'y' ELSE 'n'`
+                      ;; is 'n'. The sentinel is truthy, so a bare
+                      ;; `(when (interpret-form …))` took the branch.
+                      ;;
+                      ;; `reduced` rather than `some`, because a branch
+                      ;; that matches and yields FALSE or NULL must WIN.
+                      ;; `(or (some …) else)` could not tell "no branch
+                      ;; matched" from "a branch produced false", so
+                      ;; `CASE WHEN true THEN false ELSE true END`
+                      ;; answered true.
+                      ;; The hit is wrapped in a vector so that "a branch
+                      ;; matched and produced FALSE or NULL" is
+                      ;; distinguishable from "no branch matched".
+                      ;; `(or (some …) else)` could not tell them apart, so
+                      ;; `CASE WHEN true THEN false ELSE true END` answered
+                      ;; true. And the ELSE is computed only on a miss --
+                      ;; CASE short-circuits, so `CASE WHEN 1=1 THEN 1 ELSE
+                      ;; 2/0 END` must never evaluate the division.
+                      (if-let [hit (reduce (fn [_ [test-form then-form]]
+                                             (when (true? (interpret-form test-form bindings))
+                                               (reduced [(interpret-form then-form bindings)])))
+                                           nil
+                                           branch-data)]
+                        (first hit)
+                        (interpret-form else-v bindings)))))]
     ;; Make column args optional so entities with NULLs aren't excluded
     (ctx/make-columns-optional! ctx param-vars)
     ;; Register the :in parameter and its runtime value
@@ -1460,21 +1488,53 @@
            [(apply list fn-param param-vars) result-var])
     result-var))
 
+(defn- materialize-nested!
+  "Bottom-up, bind every compound ARGUMENT of a form to its own variable.
+
+   Datahike resolves function/predicate arguments FLAT -- only top-level
+   ?var symbols are substituted -- and rejects a nested seq argument
+   outright (datahike.query.analyze/check-fn-args), because it would
+   otherwise reach the function as a literal, never-evaluated list. So a
+   projected boolean like
+
+     (sql-and3 (sql-eq3? ?a 10) (sql-eq3? ?b 20))
+
+   has to be flattened into its own clauses:
+
+     [(sql-eq3? ?a 10) ?m1] [(sql-eq3? ?b 20) ?m2] [(sql-and3 ?m1 ?m2) ?r]
+
+   `(quote x)` is the one seq shape datahike does accept as an argument,
+   so it is passed through untouched."
+  [ctx form]
+  (if (and (seq? form) (not= 'quote (first form)))
+    (let [[op & args] form]
+      (cons op (mapv (fn [a]
+                       (if (and (seq? a) (not= 'quote (first a)))
+                         (ctx/materialize-arg! ctx (materialize-nested! ctx a))
+                         a))
+                     args)))
+    form))
+
 (defn translate-predicate-expr
   "Translate a SQL predicate expression into a Clojure boolean form
    suitable for use inside a cond binding. Unlike translate-predicate which
    returns Datalog where clauses, this returns a single form."
   [ctx expr]
   (cond
+    ;; Kleene AND/OR, not Clojure's. `true AND NULL` is NULL, and NULL is
+    ;; carried as the `:__null__` sentinel -- which Clojure's `and` sees
+    ;; as truthy, so `(and X :__null__)` answered the sentinel where a
+    ;; FALSE operand should have made it false, and `(or false :__null__)`
+    ;; answered the sentinel where it should be NULL.
     (instance? AndExpression expr)
     (let [^AndExpression e expr]
-      (list 'and
+      (list 'datahike.pg.sql/sql-and3
             (translate-predicate-expr ctx (.getLeftExpression e))
             (translate-predicate-expr ctx (.getRightExpression e))))
 
     (instance? OrExpression expr)
     (let [^OrExpression e expr]
-      (list 'or
+      (list 'datahike.pg.sql/sql-or3
             (translate-predicate-expr ctx (.getLeftExpression e))
             (translate-predicate-expr ctx (.getRightExpression e))))
 
@@ -1483,22 +1543,22 @@
     ;; comparison involving one.
     (instance? GreaterThan expr)
     (let [^GreaterThan e expr]
-      (list 'datahike.pg.sql/sql-gt? (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-gt3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? GreaterThanEquals expr)
     (let [^GreaterThanEquals e expr]
-      (list 'datahike.pg.sql/sql-ge? (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-ge3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? MinorThan expr)
     (let [^MinorThan e expr]
-      (list 'datahike.pg.sql/sql-lt? (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-lt3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? MinorThanEquals expr)
     (let [^MinorThanEquals e expr]
-      (list 'datahike.pg.sql/sql-le? (translate-expr ctx (.getLeftExpression e))
+      (list 'datahike.pg.sql/sql-le3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? EqualsTo expr)
@@ -1541,17 +1601,19 @@
         (let [l (.getLeftExpression e)]
           (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
                   'datahike.pg.sql/jsonb-eq?
-                  'datahike.pg.sql/sql-eq?)
+                  'datahike.pg.sql/sql-eq3?)
                 (translate-expr ctx l)
                 (translate-expr ctx right)))))
 
     (instance? NotEqualsTo expr)
+    ;; `not=` compared the `:__null__` sentinel structurally, so
+    ;; `SELECT a <> 10` answered TRUE for a NULL a. It is UNKNOWN.
     (let [^NotEqualsTo e expr
           l (.getLeftExpression e)
           r (.getRightExpression e)]
       (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
               'datahike.pg.sql/jsonb-ne?
-              'not=)
+              'datahike.pg.sql/sql-ne3?)
             (translate-expr ctx l)
             (translate-expr ctx r)))
 
@@ -1570,13 +1632,16 @@
     (instance? NotExpression expr)
     (let [^NotExpression e expr
           inner (translate-predicate-expr ctx (.getExpression e))]
-      ;; Datahike parses `(not <seq>)` inside a function-binding clause
-      ;; as negation-as-failure, so `[(not (= ?a 1)) ?v]` doesn't bind
-      ;; ?v — it just filters. Materialise nested seq forms first so
-      ;; we emit `[(not ?inner) ?v]` which resolves via clojure.core/not.
-      (list 'not (if (seq? inner)
-                   (ctx/materialize-arg! ctx inner)
-                   inner)))
+      ;; Kleene NOT: `NOT NULL` is NULL, not TRUE. Clojure's `not` sees
+      ;; the `:__null__` sentinel as truthy and answered false.
+      ;;
+      ;; Datahike also parses `(not <seq>)` inside a function-binding
+      ;; clause as negation-as-failure, so `[(not (= ?a 1)) ?v]` doesn't
+      ;; bind ?v -- it just filters. `sql-not3` is an ordinary function
+      ;; call and so has neither problem, but nested seq args still have
+      ;; to be materialised.
+      (list 'datahike.pg.sql/sql-not3
+            (if (seq? inner) (ctx/materialize-arg! ctx inner) inner)))
 
     ;; col [NOT] IN (literal-list-or-subquery) used inside CASE WHEN /
     ;; nested AND-OR. Lower to a single contains?/or-join form rather
@@ -1637,9 +1702,15 @@
                          (swap! (:where-clauses ctx) conj
                                 [(apply list fn-param non-null-vals) out-var])
                          out-var))
-                     (set non-null-vals))
-          base (list 'contains? set-form col)]
-      (if not-in? (list 'not base) base))
+                     ;; Keep a NULL marker in the set. `x IN (1, NULL)`
+                     ;; is UNKNOWN rather than FALSE when x is not 1 --
+                     ;; x might have equalled the unknown element -- so
+                     ;; sql-in3? has to be able to see that one was there.
+                     (cond-> (set non-null-vals)
+                       (not= (count vals) (count non-null-vals))
+                       (conj :__null__)))
+          base (list 'datahike.pg.sql/sql-in3? set-form col)]
+      (if not-in? (list 'datahike.pg.sql/sql-not3 base) base))
 
     ;; col [NOT] LIKE 'pat' inside CASE WHEN. Reuse the LIKE→regex
     ;; compile from translate-predicate (precomputed Pattern literal).
@@ -1673,8 +1744,8 @@
           re-str (str re-sb)
           re-str (if case-insensitive? (str "(?i)" re-str) re-str)
           re-obj (re-pattern re-str)
-          base (list 'boolean (list 're-find re-obj col))]
-      (if not-like? (list 'not base) base))
+          base (list 'datahike.pg.sql/sql-like3? col re-obj)]
+      (if not-like? (list 'datahike.pg.sql/sql-not3 base) base))
 
     ;; col [NOT] BETWEEN lo AND hi inside CASE WHEN.
     (instance? Between expr)
@@ -1684,8 +1755,8 @@
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           lo  (translate-expr ctx (.getBetweenExpressionStart e))
           hi  (translate-expr ctx (.getBetweenExpressionEnd e))
-          base (list 'and (list '<= lo col) (list '<= col hi))]
-      (if not-between? (list 'not base) base))
+          base (list 'datahike.pg.sql/sql-between3? col lo hi)]
+      (if not-between? (list 'datahike.pg.sql/sql-not3 base) base))
 
     ;; col IS [NOT] {TRUE|FALSE|UNKNOWN} inside CASE WHEN.
     (instance? IsBooleanExpression expr)
@@ -1698,6 +1769,26 @@
           target true?  ;; whether comparing to TRUE
           base (list '= col target)]
       (if not? (list 'not base) base))
+
+    ;; col IS [NOT] UNKNOWN. For a boolean, UNKNOWN is exactly NULL --
+    ;; and the test itself is 2-valued, never UNKNOWN.
+    (instance? IsUnknownExpression expr)
+    (let [^IsUnknownExpression e expr
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)]
+      (if (.isNot e)
+        (list 'datahike.pg.sql/sql-not-null? col)
+        (list 'datahike.pg.sql/sql-null? col)))
+
+    ;; a IS [NOT] DISTINCT FROM b -- the NULL-aware `<>`, also 2-valued.
+    (instance? IsDistinctExpression expr)
+    (let [^IsDistinctExpression e expr
+          l (translate-expr ctx (.getLeftExpression e))
+          l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+          r (translate-expr ctx (.getRightExpression e))
+          r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+          base (list 'datahike.pg.sql/sql-distinct? l r)]
+      (if (.isNot e) (list 'not base) base))
 
     ;; col ~ 'pat' / col !~ 'pat' inside CASE WHEN. Same pre-compile
     ;; trick as the WHERE form.
@@ -1713,8 +1804,8 @@
           pattern (translate-expr ctx (.getRightExpression e))
           re-str (let [s (str pattern)] (if ci? (str "(?i)" s) s))
           re-obj (re-pattern re-str)
-          base (list 'boolean (list 're-find re-obj col))]
-      (if negate? (list 'not base) base))
+          base (list 'datahike.pg.sql/sql-like3? col re-obj)]
+      (if negate? (list 'datahike.pg.sql/sql-not3 base) base))
 
     ;; A bare value/column expression used as a boolean: must be a
     ;; non-predicate type (literal, Column, Function, etc.). Routing
@@ -1809,6 +1900,22 @@
             (catch Exception _ nil)))
      ;; All parsing failed — return raw string
      s)))
+
+(defn- null-preserving
+  "Lift a runtime cast to SQL strictness: NULL in, NULL out -- carried as
+   the `:__null__` sentinel, never as nil.
+
+   Both halves matter, and each was wrong somewhere in this cond:
+
+   - Returning nil is not \"NULL\": a datalog function binding that yields
+     nil FILTERS THE ROW. `SELECT n::int FROM t` silently dropped every
+     row whose n was NULL instead of projecting NULL for it.
+   - Letting the sentinel reach the cast body is worse. The temporal
+     branches only guarded with `(when v …)`, and `:__null__` is truthy,
+     so they fell through to their string parser and `d::timestamp`
+     emitted the literal text `:__null__` to the client."
+  [f]
+  (fn [v] (if (or (nil? v) (= :__null__ v)) :__null__ (f v))))
 
 (defn translate-cast-expr
   "Translate a CAST expression to a Datalog function binding.
@@ -2041,7 +2148,7 @@
                                               (.atZone java.time.ZoneOffset/UTC)
                                               .toLocalDate))))))))]
               (swap! (:in-params ctx) conj fn-param)
-              (swap! (:in-args ctx) conj date-fn)
+              (swap! (:in-args ctx) conj (null-preserving date-fn))
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
             is-time?
@@ -2064,7 +2171,7 @@
                                   (try (java.time.LocalTime/parse time-only)
                                        (catch Exception _ s))))))]
               (swap! (:in-params ctx) conj fn-param)
-              (swap! (:in-args ctx) conj time-fn)
+              (swap! (:in-args ctx) conj (null-preserving time-fn))
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
             is-ts?
@@ -2081,14 +2188,14 @@
                               (.atStartOfDay ^java.time.LocalDate v)
                               :else (parse-timestamp-string (str v)))))]
               (swap! (:in-params ctx) conj ts-fn-param)
-              (swap! (:in-args ctx) conj ts-fn)
+              (swap! (:in-args ctx) conj (null-preserving ts-fn))
               (swap! (:where-clauses ctx) conj [(list ts-fn-param inner-val) result-var]))
 
             is-uuid?
             (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))
-                  uuid-fn (fn [v] (when v (java.util.UUID/fromString (str v))))]
+                  uuid-fn (fn [v] (java.util.UUID/fromString (str v)))]
               (swap! (:in-params ctx) conj uuid-fn-param)
-              (swap! (:in-args ctx) conj uuid-fn)
+              (swap! (:in-args ctx) conj (null-preserving uuid-fn))
               (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
 
           ;; ::regnamespace — always resolve to OID 2200 (single namespace)
@@ -2133,13 +2240,12 @@
                   ;; was a no-op while the same cast on a literal (folded
                   ;; above) applied it.
                   cast-fn (fn [v]
-                            (when (and (some? v) (not= :__null__ v))
-                              (sql-cast/cast-scalar
-                               v type-str
-                               {:explicit? true
-                                :parse-timestamp parse-timestamp-string})))]
+                            (sql-cast/cast-scalar
+                             v type-str
+                             {:explicit? true
+                              :parse-timestamp parse-timestamp-string}))]
               (swap! (:in-params ctx) conj fn-param)
-              (swap! (:in-args ctx) conj cast-fn)
+              (swap! (:in-args ctx) conj (null-preserving cast-fn))
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
 
             (or is-int? is-float? is-bool?)
@@ -2149,11 +2255,11 @@
                   ;; bit string cast to int must reinterpret its bits
                   ;; (5, not the digits 101), and coerce-numeric alone
                   ;; cannot see a PgBit.
-                  cast-fn (fn [v] (when (and (some? v) (not= :__null__ v))
-                                    (sql-cast/cast-scalar
-                                     v type-str
-                                     {:explicit? true
-                                      :parse-timestamp parse-timestamp-string})))]
+                  cast-fn (null-preserving
+                           (fn [v] (sql-cast/cast-scalar
+                                    v type-str
+                                    {:explicit? true
+                                     :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj cast-fn)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -3114,8 +3220,15 @@
         (instance? OrExpression expr)
         (instance? LikeExpression expr)
         (instance? Between expr)
+        (instance? IsBooleanExpression expr)
+        (instance? IsUnknownExpression expr)
+        (instance? IsDistinctExpression expr)
         (instance? InExpression expr))
-    (translate-predicate-expr ctx expr)
+    ;; Flatten: this result becomes a datalog clause, and datahike rejects
+    ;; nested forms as function arguments. (CASE / FILTER reach
+    ;; translate-predicate-expr directly and interpret the form tree
+    ;; instead, so they neither need nor want this.)
+    (materialize-nested! ctx (translate-predicate-expr ctx expr))
 
     ;; Scalar subquery in projection / expression position — `(SELECT
     ;; col FROM t WHERE …)`. PG semantics: returns one value per outer
@@ -3612,6 +3725,8 @@
     (two-valued-predicate? (first ^ParenthesedExpressionList e))
     (instance? IsNullExpression e) true
     (instance? IsBooleanExpression e) true
+    (instance? IsUnknownExpression e) true
+    (instance? IsDistinctExpression e) true
     (instance? ExistsExpression e) true
     (instance? NotExpression e) (two-valued-predicate? (.getExpression ^NotExpression e))
     (instance? AndExpression e)
@@ -4062,6 +4177,27 @@
         [[(list 'not= col target)]]
         ;; IS TRUE → (= col true) or IS FALSE → (= col false)
         [[(list '= col target)]]))
+
+    ;; col IS [NOT] UNKNOWN — for a boolean, UNKNOWN is exactly NULL.
+    (instance? IsUnknownExpression expr)
+    (let [^IsUnknownExpression e expr
+          col (translate-expr ctx (.getLeftExpression e))
+          col (if (seq? col) (ctx/materialize-arg! ctx col) col)]
+      (if (.isNot e)
+        [[(list 'datahike.pg.sql/sql-not-null? col)]]
+        [[(list 'datahike.pg.sql/sql-null? col)]]))
+
+    ;; a IS [NOT] DISTINCT FROM b — the NULL-aware `<>`.
+    (instance? IsDistinctExpression expr)
+    (let [^IsDistinctExpression e expr
+          l (translate-expr ctx (.getLeftExpression e))
+          l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+          r (translate-expr ctx (.getRightExpression e))
+          r (if (seq? r) (ctx/materialize-arg! ctx r) r)]
+      [[(list (if (.isNot e)
+                'datahike.pg.sql/sql-not-distinct?
+                'datahike.pg.sql/sql-distinct?)
+              l r)]])
 
     ;; col ~ 'pattern' / col !~ 'pattern' / col ~* 'pattern' / col !~* 'pattern'
     (instance? RegExpMatchOperator expr)
