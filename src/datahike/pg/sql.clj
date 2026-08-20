@@ -123,6 +123,7 @@
 (def sql-gt? fns/sql-gt?)
 (def sql-le? fns/sql-le?)
 (def sql-ge? fns/sql-ge?)
+(def sql-power-op fns/sql-power-op)
 (def sql-eq? fns/sql-eq?)
 (def sql-ne? fns/sql-ne?)
 (def sql-in? fns/sql-in?)

@@ -2823,7 +2823,7 @@
     (instance? BitwiseRightShift expr)
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-right fns/sql-bit-shift-right)
     (instance? BitwiseXor expr)
-    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-power fns/sql-power)
+    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-power-op fns/sql-power-op)
 
     ;; PG operators that overload on arrays: @> (contains), <@ (contained
     ;; by), && (overlap). JSqlParser uses JsonOperator for @> and <@,

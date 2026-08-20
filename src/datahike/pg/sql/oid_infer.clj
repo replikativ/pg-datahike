@@ -120,7 +120,7 @@
    "lcm"           :arg-type
    "width_bucket"  types/oid-int4
    ;; Math — always float
-   "sqrt"          types/oid-float8
+   "sqrt"          :numeric-or-float8
    "cbrt"          types/oid-float8
    "degrees"       types/oid-float8
    "radians"       types/oid-float8
@@ -131,11 +131,11 @@
    "asinh"         types/oid-float8
    "acosh"         types/oid-float8
    "atanh"         types/oid-float8
-   "exp"           types/oid-float8
-   "ln"            types/oid-float8
-   "log"           types/oid-float8
-   "log10"         types/oid-float8
-   "power"         types/oid-float8
+   "exp"           :numeric-or-float8
+   "ln"            :numeric-or-float8
+   "log"           :numeric-or-float8
+   "log10"         :numeric-or-float8
+   "power"         :numeric-or-float8
    "pow"           types/oid-float8
    "sin"           types/oid-float8
    "cos"           types/oid-float8
@@ -448,6 +448,22 @@
         (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
+      ;; PostgreSQL declares BOTH a float8 and a numeric overload of
+      ;; sqrt / exp / ln / log / log10 / power, and function resolution
+      ;; prefers the candidate with an exact-type argument -- so ANY
+      ;; numeric argument selects the numeric one, while all-integer
+      ;; arguments fall to float8 (the preferred type in the NUMERIC
+      ;; category). `2^10` is float8; `2.0^10` and `2^10.0` are numeric.
+      (= rule :numeric-or-float8)
+      ;; Two-argument `log` is the exception: PostgreSQL has only
+      ;; log(numeric, numeric), so it is numeric whatever the arguments
+      ;; look like. Reporting float8 there while the runtime answered a
+      ;; numeric is precisely the Describe/Execute mismatch that
+      ;; corrupts a binary client.
+      (if (or (and (= fname "log") (= 2 (count args)))
+              (some #(= types/oid-numeric (expr-oid % env)) (remove nil? args)))
+        types/oid-numeric
+        types/oid-float8)
       :else nil)))
 
 (defn- composite-name->oid
@@ -652,7 +668,13 @@
       ;; `^` is exponentiation, not xor — float8 for integer operands,
       ;; matching PG's preference for float8 over numeric when neither
       ;; `^(float8,float8)` nor `^(numeric,numeric)` matches exactly.
-      (instance? BitwiseXor expr) types/oid-float8
+      ;; `^` is numeric_power when an operand is numeric, like power().
+      (instance? BitwiseXor expr)
+      (let [^BinaryExpression e expr]
+        (if (or (= types/oid-numeric (expr-oid (.getLeftExpression e) env))
+                (= types/oid-numeric (expr-oid (.getRightExpression e) env)))
+          types/oid-numeric
+          types/oid-float8))
 
       ;; --- Concat (||) ---------------------------------------------------
       ;; bit || bit is `bitcat`, whose result is always bit varying (the

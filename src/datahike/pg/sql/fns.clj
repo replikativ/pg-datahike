@@ -1593,6 +1593,220 @@
   (contains? sql-aggregate->datalog (str/lower-case fname)))
 
 ;; ---------------------------------------------------------------------------
+;; numeric transcendentals
+;;
+;; PostgreSQL has BOTH a float8 and a numeric overload of sqrt / exp / ln
+;; / log / log10 / power, and resolution picks the numeric one whenever
+;; an argument is numeric. We answered float8 for all six, wrong in two
+;; ways at once: the reported type, and the precision -- `2.0 ^ 10` is
+;; 1024.0000000000000 in PostgreSQL, a scale that says how many digits
+;; are meaningful, and we answered 1024.
+;;
+;; The scale is not the operands'. Each function has its own rule in
+;; numeric.c, all of the shape "enough digits for NUMERIC_MIN_SIG_DIGITS
+;; significant figures, but never fewer than the input already shows".
+;; Those rules are ported. The VALUES are computed with BigDecimal at a
+;; guard margin and rounded to the rule's scale, rather than porting
+;; PostgreSQL's own exp_var/ln_var: agreement is then exact wherever the
+;; fuzz reached, and any drift would be in the last digit.
+
+(def ^:private ^:const numeric-max-result-scale 2000)
+
+(defn- clamp-rscale ^long [^long rscale ^long dscale]
+  (long (min (max rscale dscale 0) numeric-max-display-scale)))
+
+(defn- sqrt-rscale
+  "numeric_sqrt: sqrt roughly halves the weight, so half the digits of
+   the integer part are already known."
+  ^long [^java.math.BigDecimal a]
+  (let [w (long (first (nbase-weight+first a)))
+        sweight (if (>= w 0)
+                  (+ (quot (* w dec-digits) 2) 1)
+                  (- 1 (quot (- 1 (* w dec-digits)) 2)))]
+    (clamp-rscale (- numeric-min-sig-digits sweight) (.scale a))))
+
+(defn- exp-rscale
+  "numeric_exp: exp(x) has about x*log10(e) integer digits."
+  ^long [^java.math.BigDecimal a]
+  (let [val (-> (* (.doubleValue a) 0.434294481903252)
+                (max (double (- numeric-max-result-scale)))
+                (min (double numeric-max-result-scale)))]
+    (clamp-rscale (- numeric-min-sig-digits (long val)) (.scale a))))
+
+(defn- estimate-ln-dweight
+  "numeric.c estimate_ln_dweight — the decimal weight of ln(x), which is
+   what decides how many digits ln has to produce. Near 1 it uses
+   ln(1+x) ~= x, because ln there is small and its weight very negative."
+  ^long [^java.math.BigDecimal v]
+  (cond
+    (not (pos? (.signum v))) 0
+    (and (>= (.compareTo v (java.math.BigDecimal. "0.9")) 0)
+         (<= (.compareTo v (java.math.BigDecimal. "1.1")) 0))
+    (let [x (.subtract v java.math.BigDecimal/ONE)]
+      (if (zero? (.signum x))
+        0
+        (let [[w f] (nbase-weight+first x)]
+          (+ (* (long w) dec-digits) (long (Math/log10 (double f)))))))
+    :else
+    (let [ln-var (Math/log (Math/abs (.doubleValue v)))]
+      (if (zero? ln-var) 0 (long (Math/log10 (Math/abs ln-var)))))))
+
+(defn- ln-rscale ^long [^java.math.BigDecimal a]
+  (clamp-rscale (- numeric-min-sig-digits (estimate-ln-dweight a)) (.scale a)))
+
+(def ^:private ln10-str
+  "2.30258509299404568401799145468436420760110148862877297603333")
+
+(defn- bd-ln
+  "ln to `prec` significant digits. Reduce x = m*10^k with 1 <= m < 10,
+   then ln(m) by the atanh series 2*atanh((m-1)/(m+1)) -- which converges
+   quickly because the argument is bounded well away from the series'
+   singularity."
+  ^java.math.BigDecimal [^java.math.BigDecimal x ^long prec]
+  (let [mc (java.math.MathContext. (int (+ prec 15)))
+        k (long (- (.precision x) (.scale x) 1))
+        m (.movePointLeft x (int k))
+        y (.divide (.subtract m java.math.BigDecimal/ONE)
+                   (.add m java.math.BigDecimal/ONE) mc)
+        y2 (.multiply y y mc)
+        eps (.movePointLeft java.math.BigDecimal/ONE (int (+ prec 12)))
+        series (loop [n 1 pow (.multiply y y2 mc) acc y]
+                 (if (or (> n 2000) (< (.compareTo (.abs pow) eps) 0))
+                   acc
+                   (recur (inc n)
+                          (.multiply pow y2 mc)
+                          (.add acc (.divide pow (java.math.BigDecimal/valueOf (inc (* 2 n))) mc) mc))))]
+    (.add (.multiply (java.math.BigDecimal/valueOf 2) series mc)
+          (.multiply (java.math.BigDecimal/valueOf k) (java.math.BigDecimal. ln10-str) mc)
+          mc)))
+
+(defn- bd-exp
+  "exp to `prec` significant digits. Halve the argument until the
+   Maclaurin series converges quickly, then square back."
+  ^java.math.BigDecimal [^java.math.BigDecimal x ^long prec]
+  (let [mc (java.math.MathContext. (int (+ prec 15)))
+        mag (Math/abs (.doubleValue x))
+        halvings (long (max 0 (+ 4 (if (< mag 1.0) 0 (Math/ceil (/ (Math/log mag) (Math/log 2.0)))))))
+        xr (.divide x (.pow (java.math.BigDecimal/valueOf 2) (int halvings)) mc)
+        eps (.movePointLeft java.math.BigDecimal/ONE (int (+ prec 12)))
+        s (loop [n 1 term java.math.BigDecimal/ONE acc java.math.BigDecimal/ONE]
+            (if (or (> n 2000) (< (.compareTo (.abs term) eps) 0))
+              acc
+              (let [t (.divide (.multiply term xr mc) (java.math.BigDecimal/valueOf n) mc)]
+                (recur (inc n) t (.add acc t mc)))))]
+    (loop [i 0 v s] (if (>= i halvings) v (recur (inc i) (.multiply v v mc))))))
+
+;; The numeric overloads. Dispatch is on the ARGUMENT's runtime class,
+;; which mirrors PostgreSQL's function resolution: a numeric argument
+;; selects the numeric candidate, anything else stays float8. Decimal
+;; literals already arrive as BigDecimal, so `sqrt(2.0)` reaches here as
+;; one and `sqrt(2)` does not.
+
+(defn- throw-logarithm-error [msg]
+  (throw (errors/pg-error :invalid-argument-for-logarithm {:message msg})))
+
+(defn- num-arg? [x] (decimal? x))
+
+(declare numeric-power numeric-log)
+
+(defn sql-power-op
+  "The `^` operator. PostgreSQL resolves it to numeric_power whenever an
+   operand is numeric, exactly as the power() function does -- so
+   `2.0 ^ 10` is 1024.0000000000000, not 1024."
+  [b e]
+  (if (or (decimal? b) (decimal? e))
+    (numeric-power (bigdec b) (bigdec e))
+    (sql-power b e)))
+
+(defn sql-log2
+  "log(base, x). PostgreSQL has only a NUMERIC two-argument log -- there
+   is no float8 overload -- so both arguments coerce and the result is
+   numeric even for `log(2,64)`."
+  [b x]
+  (numeric-log (bigdec b) (bigdec x)))
+
+(defn- numeric-sqrt ^java.math.BigDecimal [^java.math.BigDecimal a]
+  (when (neg? (.signum a))
+    (throw (errors/pg-error :invalid-argument-for-power-function
+                            {:message "cannot take square root of a negative number"})))
+  (let [rs (sqrt-rscale a)]
+    (.setScale (.sqrt a (java.math.MathContext. (int (+ rs 20))))
+               (int rs) java.math.RoundingMode/HALF_UP)))
+
+(defn- numeric-exp ^java.math.BigDecimal [^java.math.BigDecimal a]
+  (let [rs (exp-rscale a)]
+    (.setScale (bd-exp a (+ rs 20)) (int rs) java.math.RoundingMode/HALF_UP)))
+
+(defn- numeric-ln ^java.math.BigDecimal [^java.math.BigDecimal a]
+  (cond
+    (zero? (.signum a)) (throw-logarithm-error "cannot take logarithm of zero")
+    (neg? (.signum a)) (throw-logarithm-error "cannot take logarithm of a negative number"))
+  (let [rs (ln-rscale a)]
+    (.setScale (bd-ln a (+ rs 20)) (int rs) java.math.RoundingMode/HALF_UP)))
+
+(defn- numeric-log
+  "log(base, x) — numeric_log. Computed as ln(x)/ln(base) at a guard
+   margin; the result scale follows the same MIN_SIG_DIGITS rule."
+  ^java.math.BigDecimal [^java.math.BigDecimal base ^java.math.BigDecimal x]
+  ;; 2201E, not the generic 22003 -- and the message names whichever
+  ;; operand is at fault, which is the BASE for log(0, 10).
+  (let [bad (cond (not (pos? (.signum base))) base
+                  (not (pos? (.signum x)))    x
+                  :else nil)]
+    (when bad
+      (throw-logarithm-error (if (zero? (.signum bad))
+                               "cannot take logarithm of zero"
+                               "cannot take logarithm of a negative number"))))
+  (let [rs (ln-rscale x)
+        p (+ rs 25)
+        mc (java.math.MathContext. (int p))
+        lb (bd-ln base p)]
+    (when (zero? (.signum lb)) (throw-division-by-zero))
+    (.setScale (.divide (bd-ln x p) lb mc) (int rs) java.math.RoundingMode/HALF_UP)))
+
+(defn- power-rscale
+  "numeric.c power_var_int: the result's decimal weight is about
+   exp * log10(base), and MIN_SIG_DIGITS beyond that is what matters."
+  ^long [^java.math.BigDecimal base ^java.math.BigDecimal e]
+  (let [bd (Math/abs (.doubleValue base))
+        f (if (zero? bd) 0.0 (* (.doubleValue e) (Math/log10 bd)))
+        f (-> f (max (double (- numeric-max-result-scale)))
+              (min (double numeric-max-result-scale)))]
+    (clamp-rscale (- numeric-min-sig-digits (long f))
+                  (max (.scale base) (.scale e)))))
+
+(defn- numeric-power ^java.math.BigDecimal [^java.math.BigDecimal base ^java.math.BigDecimal e]
+  (cond
+    (and (zero? (.signum base)) (neg? (.signum e)))
+    (throw (errors/pg-error :invalid-argument-for-power-function
+                            {:message "zero raised to a negative power is undefined"}))
+    (and (neg? (.signum base))
+         (not (zero? (.compareTo (.stripTrailingZeros e)
+                                 (.setScale (.stripTrailingZeros e) 0 java.math.RoundingMode/DOWN)))))
+    (throw (errors/pg-error
+            :invalid-argument-for-power-function
+            {:message "a negative number raised to a non-integer power yields a complex result"})))
+  (let [rs (power-rscale base e)
+        p (+ rs 25)
+        mc (java.math.MathContext. (int p))]
+    (cond
+      (zero? (.signum base))
+      (.setScale (if (zero? (.signum e)) java.math.BigDecimal/ONE java.math.BigDecimal/ZERO)
+                 (int rs) java.math.RoundingMode/HALF_UP)
+      ;; integer exponent within int range: exact repeated multiplication,
+      ;; which also handles a negative base
+      (and (zero? (.scale (.stripTrailingZeros e)))
+           (< (Math/abs (.doubleValue e)) 1.0e9))
+      (let [n (.intValueExact (.toBigIntegerExact (.stripTrailingZeros e)))
+            v (if (neg? n)
+                (.divide java.math.BigDecimal/ONE (.pow base (- n) mc) mc)
+                (.pow base n mc))]
+        (.setScale v (int rs) java.math.RoundingMode/HALF_UP))
+      :else
+      (.setScale (bd-exp (.multiply e (bd-ln base p) mc) p)
+                 (int rs) java.math.RoundingMode/HALF_UP))))
+
+;; ---------------------------------------------------------------------------
 ;; Degree trigonometry — ported from PostgreSQL's float.c, NOT derived
 ;;
 ;; These are NOT `sin(x * pi/180)`. PostgreSQL divides through by the
@@ -1867,14 +2081,25 @@
    ;; section above. Do NOT swap these back for bare Math/* methods —
    ;; each one differs from its Java namesake in domain checking,
    ;; base, or tie-breaking.
-   "sqrt"     sql-sqrt
+   ;; Each of these has a numeric overload in PostgreSQL, selected
+   ;; whenever an argument is numeric -- see the numeric-* fns above.
+   "sqrt"     (fn [x] (if (num-arg? x) (numeric-sqrt x) (sql-sqrt x)))
    "cbrt"     sql-cbrt
-   "exp"      sql-exp
-   "ln"       sql-ln
-   "log"      sql-log            ; base 10 (1-arg) / log(base, x) (2-arg)
-   "log10"    sql-log10
-   "power"    sql-power
-   "pow"      sql-power
+   "exp"      (fn [x] (if (num-arg? x) (numeric-exp x) (sql-exp x)))
+   "ln"       (fn [x] (if (num-arg? x) (numeric-ln x) (sql-ln x)))
+   "log"      (fn ([x] (if (num-arg? x)
+                         (numeric-log (java.math.BigDecimal. "10") x)
+                         (sql-log x)))
+                ([b x] (sql-log2 b x)))
+   "log10"    (fn [x] (if (num-arg? x)
+                        (numeric-log (java.math.BigDecimal. "10") x)
+                        (sql-log10 x)))
+   "power"    (fn [b e] (if (or (num-arg? b) (num-arg? e))
+                          (numeric-power (bigdec b) (bigdec e))
+                          (sql-power b e)))
+   "pow"      (fn [b e] (if (or (num-arg? b) (num-arg? e))
+                          (numeric-power (bigdec b) (bigdec e))
+                          (sql-power b e)))
    "round"    sql-round
    "trunc"    sql-trunc
    "sign"     sql-sign
