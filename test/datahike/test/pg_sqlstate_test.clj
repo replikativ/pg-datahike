@@ -402,7 +402,10 @@
     ;; 4.605… for log(100): a wrong ANSWER, not an error.
     (is (= 2.0 (call-sql-fn "log" 100.0)))
     (is (= 2.0 (call-sql-fn "log10" 100.0)))
-    (is (= 3.0 (call-sql-fn "log" 2.0 8.0)))
+    ;; PostgreSQL has only a NUMERIC two-argument log -- there is no
+    ;; float8 overload -- so both arguments coerce and the result is
+    ;; numeric, carrying numeric_log's scale.
+    (is (= (bigdec "3.0000000000000000") (call-sql-fn "log" 2.0 8.0)))
     (is (< (Math/abs (- 0.6931471805599453 (double (call-sql-fn "ln" 2.0)))) 1e-15)))
 
   (testing "round breaks ties away from zero, like PG (Math/round rounds toward +inf)"
