@@ -38,8 +38,13 @@
   ;; Server launcher — pairs with test/integration/start_pgwire.clj.
   ;; Starts pgwire on :15432 + nREPL on :15433 for dual SQL + Datalog
   ;; access.
+  ;; Carries the TEST deps too, so the one long-lived JVM can serve SQL
+  ;; on :15432, hot-reload src via its nREPL, and run test namespaces
+  ;; in-process -- instead of paying a fresh JVM + server boot for each.
   :server {:extra-paths ["test"]
-           :extra-deps  {nrepl/nrepl {:mvn/version "1.0.0"}}
+           :extra-deps  {nrepl/nrepl               {:mvn/version "1.0.0"}
+                         lambdaisland/kaocha       {:mvn/version "1.91.1392"}
+                         org.postgresql/postgresql {:mvn/version "42.7.3"}}
            ;; clojure -M:server already goes through clojure.main; a
            ;; bare script path as the only main-opt = "load and run".
            ;; Adding `-m clojure.main` on top makes it try to resolve
