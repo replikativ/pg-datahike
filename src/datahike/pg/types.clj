@@ -688,6 +688,19 @@
       (+ (bit-or (bit-shift-left p 16) s)
          var-hdr-sz))))
 
+(defn base-type-name-of
+  "The SQL type name with its `(…)` modifier stripped, lower-cased."
+  [type-str]
+  (-> (str type-str) (str/replace #"\s*\([^)]*\)" "") str/trim str/lower-case))
+
+(defn parse-char-length
+  "The `n` of `varchar(n)` / `char(n)`, or nil for an unmodified text
+   type. Only the length-carrying names qualify -- `text` has no limit."
+  [type-str]
+  (when (contains? #{"varchar" "character varying" "char" "character" "bpchar"}
+                   (base-type-name-of type-str))
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str)) second Integer/parseInt)))
+
 (defn decode-numeric-typmod
   "Inverse of `encode-numeric-typmod`. Returns `[precision scale]` or
    `[nil nil]` for typmod -1 (unconstrained NUMERIC)."

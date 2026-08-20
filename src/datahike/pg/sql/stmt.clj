@@ -4744,6 +4744,27 @@
         ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
         ;; forms). Empty / blank strings stay as-is so datahike's
         ;; rejection still surfaces (an empty keyword `:` is invalid).
+          ;; NOT blank-padded. PostgreSQL stores 'ab' in a char(4) as
+          ;; 'ab  ', but the padding is only half of bpchar: comparison,
+          ;; length() and text conversion all IGNORE trailing blanks, so
+          ;; padding without those makes `WHERE c = 'ab'` miss its row
+          ;; and `length(c)` answer 4. Measured both ways -- padding
+          ;; alone is a net loss. bpchar's blank-insensitivity is its own
+          ;; change.
+          ;;
+          ;; varchar(n) / char(n) on the WRITE path. An assignment
+          ;; REFUSES an over-long value where an explicit cast truncates
+          ;; -- so the column cannot hold text its own declared type
+          ;; forbids. Nothing enforced this, and nothing recorded the
+          ;; length either until the DDL started keeping it.
+          (and (= vtype :db.type/string) (string? val)
+               (contains? #{"varchar" "bpchar"} pg-type) typmod
+               (> (count ^String val) (- (long typmod) 4)))
+          (throw (errors/pg-error
+                  :string-data-right-truncation
+                  {:message (str "value too long for type "
+                                 (if (= "bpchar" pg-type) "character(" "character varying(")
+                                 (- (long typmod) 4) ")")}))
           (and (= vtype :db.type/keyword) (string? val))
           (if (clojure.string/blank? val) val (keyword val))
         ;; Already-keyword passes through. Symbols coerce to keywords.
@@ -5260,9 +5281,21 @@
                              :where [[?e :db/ident ?ident]
                                      [?e :pg/type ?pgtype]]}
                            db))
-                    (catch Throwable _ {}))]
+                    (catch Throwable _ {}))
+        ;; :pg/typmod itself, not only the decoded numeric scale -- the
+        ;; varchar(n) length check reads it directly, and INSERT has no
+        ;; db to fall back on.
+        typmod-meta (try
+                      (into {}
+                            (map (fn [[ident tm]] [ident {:pg/typmod tm}]))
+                            (d/q
+                             '{:find  [?ident ?tm]
+                               :where [[?e :db/ident ?ident]
+                                       [?e :pg/typmod ?tm]]}
+                             db))
+                      (catch Throwable _ {}))]
     (reduce-kv (fn [s ident more] (update s ident merge more))
-               schema (merge-with merge pg-meta scale-meta type-meta))))
+               schema (merge-with merge pg-meta scale-meta type-meta typmod-meta))))
 
 (defn enrich-schema-with-pg-array-meta
   "Datahike's `:schema` map only carries `:db/*` keys; pgwire-side

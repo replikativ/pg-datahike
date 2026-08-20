@@ -447,7 +447,12 @@
                       ;; truthful answer. A client that reads this to
                       ;; decide whether to apply a JIT workaround gets
                       ;; the right answer from us, not a copied default.
-                      "jit"                        "off"}
+                      "jit"                        "off"
+                      ;; PostgreSQL's default. Above 0 it means "print
+                      ;; shortest round-trip", which is what our float
+                      ;; renderer does -- so reporting the real default
+                      ;; is truthful, and SHOW returning empty was not.
+                      "extra_float_digits"         "1"}
             impl-fn (fn [name & [missing-ok]]
                       (or (get settings (str name))
                           (when missing-ok :__null__)

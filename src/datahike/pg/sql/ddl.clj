@@ -581,6 +581,21 @@
                                  (let [[p s] (types/parse-numeric-args raw-type)]
                                    (when (or p s)
                                      (types/encode-numeric-typmod p s))))
+                               ;; varchar(n) / char(n): the declared
+                               ;; length was dropped entirely, so the
+                               ;; column reported as plain `text` with no
+                               ;; character_maximum_length and nothing
+                               ;; enforced it on write. PostgreSQL's
+                               ;; typmod for these is n + VARHDRSZ.
+                               char-typmod
+                               (when (and (= dh-type :db.type/string) (not array-spec))
+                                 (when-let [n (types/parse-char-length raw-type)]
+                                   (+ n 4)))
+                               char-pg-type
+                               (when char-typmod
+                                 (let [b (types/base-type-name-of raw-type)]
+                                   (if (contains? #{"char" "character" "bpchar"} b)
+                                     "bpchar" "varchar")))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; NOT NULL inline; PK is implicitly NOT NULL
@@ -617,6 +632,8 @@
                                          ;; (count returns int).
                                          :pg/array-ndim  (long (:ndim array-spec)))
                        numeric-typmod (assoc :pg/typmod numeric-typmod)
+                       char-typmod (assoc :pg/typmod char-typmod)
+                       char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec
                             (not= :unsupported (:kind default-spec)))
