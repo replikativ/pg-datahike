@@ -105,6 +105,18 @@
    "sign"          :arg-type
    "mod"           :arg-type
    "gcd"           :arg-type
+   ;; Degree trig is float8 -> float8; erf/erfc likewise. div, factorial
+   ;; and trim_scale are numeric; scale / min_scale answer an int4.
+   "sind" types/oid-float8 "cosd" types/oid-float8
+   "tand" types/oid-float8 "cotd" types/oid-float8
+   "asind" types/oid-float8 "acosd" types/oid-float8
+   "atand" types/oid-float8 "atan2d" types/oid-float8
+   "erf" types/oid-float8 "erfc" types/oid-float8
+   "div" types/oid-numeric
+   "factorial" types/oid-numeric
+   "trim_scale" types/oid-numeric
+   "scale" types/oid-int4
+   "min_scale" types/oid-int4
    "lcm"           :arg-type
    "width_bucket"  types/oid-int4
    ;; Math — always float

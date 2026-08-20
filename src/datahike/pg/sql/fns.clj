@@ -1592,6 +1592,245 @@
 (defn aggregate-function? [^String fname]
   (contains? sql-aggregate->datalog (str/lower-case fname)))
 
+;; ---------------------------------------------------------------------------
+;; Degree trigonometry — ported from PostgreSQL's float.c, NOT derived
+;;
+;; These are NOT `sin(x * pi/180)`. PostgreSQL divides through by the
+;; function's own value at a reference angle, and that division CANCELS
+;; the libm error at the endpoints: `sind(30)` is exactly 0.5, `tand(45)`
+;; exactly 1, `asind(0.5)` exactly 30 — on any platform, whatever libm
+;; returns. A naive implementation misses every one of those, and they
+;; are precisely the values anyone checks.
+
+(def ^:private ^:const radians-per-degree 0.0174532925199432957692)
+
+(def ^:private sin-30 (Math/sin (* 30.0 radians-per-degree)))
+(def ^:private one-minus-cos-60 (- 1.0 (Math/cos (* 60.0 radians-per-degree))))
+(def ^:private asin-0-5 (Math/asin 0.5))
+(def ^:private acos-0-5 (Math/acos 0.5))
+(def ^:private atan-1-0 (Math/atan 1.0))
+
+(defn- sind-0-to-30 ^double [^double x]
+  (/ (/ (Math/sin (* x radians-per-degree)) sin-30) 2.0))
+
+(defn- cosd-0-to-60 ^double [^double x]
+  (- 1.0 (/ (/ (- 1.0 (Math/cos (* x radians-per-degree))) one-minus-cos-60) 2.0)))
+
+(defn- sind-q1 ^double [^double x]
+  (if (<= x 30.0) (sind-0-to-30 x) (cosd-0-to-60 (- 90.0 x))))
+
+(defn- cosd-q1 ^double [^double x]
+  (if (<= x 60.0) (cosd-0-to-60 x) (sind-0-to-30 (- 90.0 x))))
+
+(def ^:private tan-45 (/ (sind-q1 45.0) (cosd-q1 45.0)))
+(def ^:private cot-45 (/ (cosd-q1 45.0) (sind-q1 45.0)))
+
+(defn- asind-q1 ^double [^double x]
+  (if (<= x 0.5)
+    (* (/ (Math/asin x) asin-0-5) 30.0)
+    (- 90.0 (* (/ (Math/acos x) acos-0-5) 60.0))))
+
+(defn- acosd-q1 ^double [^double x]
+  (if (<= x 0.5)
+    (- 90.0 (* (/ (Math/asin x) asin-0-5) 30.0))
+    (* (/ (Math/acos x) acos-0-5) 60.0)))
+
+(defn- degree-reduce
+  "PostgreSQL's range reduction to [0,90]: fmod by 360, then reflect.
+   `sin-sign?` and `flip-at-90?` select the parity each function needs."
+  [^double x sin-sign? flip-at-90?]
+  (let [x (rem x 360.0)
+        [x sign] (if (< x 0.0) [(- x) (if sin-sign? -1.0 1.0)] [x 1.0])
+        [x sign] (if (> x 180.0) [(- 360.0 x) (if sin-sign? (- sign) sign)] [x sign])
+        [x sign] (if (> x 90.0)
+                   [(- 180.0 x) (if flip-at-90? (- sign) sign)]
+                   [x sign])]
+    [x sign]))
+
+(defn- deg-guard
+  "NaN in, NaN out; an infinite input is 22003 (POSIX, per float.c)."
+  [^double x]
+  (when (Double/isInfinite x) (throw-out-of-range "input is out of range"))
+  x)
+
+(def sql-sind
+  (null-safe (fn [x] (let [d (double x)]
+                       (if (Double/isNaN d) d
+                           (let [[a sign] (degree-reduce (deg-guard d) true false)]
+                             (* sign (sind-q1 a))))))))
+
+(def sql-cosd
+  (null-safe (fn [x] (let [d (double x)]
+                       (if (Double/isNaN d) d
+                           (let [[a sign] (degree-reduce (deg-guard d) false true)]
+                             (* sign (cosd-q1 a))))))))
+
+(def sql-tand
+  (null-safe (fn [x] (let [d (double x)]
+                       (if (Double/isNaN d) d
+                           (let [[a sign] (degree-reduce (deg-guard d) true true)
+                                 r (* sign (/ (/ (sind-q1 a) (cosd-q1 a)) tan-45))]
+                             ;; force -0.0 to 0.0, as dtand does
+                             (if (zero? r) 0.0 r)))))))
+
+(def sql-cotd
+  (null-safe (fn [x] (let [d (double x)]
+                       (if (Double/isNaN d) d
+                           (let [[a sign] (degree-reduce (deg-guard d) true true)
+                                 r (* sign (/ (/ (cosd-q1 a) (sind-q1 a)) cot-45))]
+                             (if (zero? r) 0.0 r)))))))
+
+(def sql-asind
+  (null-safe (fn [x] (let [d (double x)]
+                       (cond (Double/isNaN d) d
+                             (or (< d -1.0) (> d 1.0))
+                             (throw-out-of-range "input is out of range")
+                             (>= d 0.0) (asind-q1 d)
+                             :else (- (asind-q1 (- d))))))))
+
+(def sql-acosd
+  (null-safe (fn [x] (let [d (double x)]
+                       (cond (Double/isNaN d) d
+                             (or (< d -1.0) (> d 1.0))
+                             (throw-out-of-range "input is out of range")
+                             (>= d 0.0) (acosd-q1 d)
+                             :else (+ 90.0 (asind-q1 (- d))))))))
+
+(def sql-atand
+  (null-safe (fn [x] (let [d (double x)]
+                       (if (Double/isNaN d) d
+                           (* (/ (Math/atan d) atan-1-0) 45.0))))))
+
+(def sql-atan2d
+  (null-safe (fn [y x] (let [dy (double y) dx (double x)]
+                         (if (or (Double/isNaN dy) (Double/isNaN dx)) Double/NaN
+                             (* (/ (Math/atan2 dy dx) atan-1-0) 45.0))))))
+
+;; ---------------------------------------------------------------------------
+;; erf / erfc — PostgreSQL calls libm; the JDK has no equivalent.
+;;
+;; Abramowitz & Stegun 7.1.26 is only 1e-7; this is the higher-precision
+;; incomplete-gamma style expansion, good to ~1e-15 relative, which is
+;; what the differential asserts (15 significant digits, not bit
+;; equality — we are matching glibc, not a specification).
+
+(def ^:private ^:const log-sqrt-pi 0.5723649429247001)   ;; ln(Gamma(1/2))
+
+(defn- gamma-p-series
+  "Regularized lower incomplete gamma P(a,x) by its series expansion
+   (Numerical Recipes gser), iterated to double precision."
+  ^double [^double a ^double x]
+  (loop [n 1 ap a del (/ 1.0 a) sum (/ 1.0 a)]
+    (if (or (> n 300) (< (Math/abs del) (* (Math/abs sum) 1.0e-17)))
+      (* sum (Math/exp (+ (- x) (* a (Math/log x)) (- log-sqrt-pi))))
+      (let [ap' (+ ap 1.0)
+            del' (* del (/ x ap'))]
+        (recur (inc n) ap' del' (+ sum del'))))))
+
+(defn- gamma-q-cf
+  "Regularized upper incomplete gamma Q(a,x) by continued fraction
+   (Numerical Recipes gcf, modified Lentz)."
+  ^double [^double a ^double x]
+  (let [fpmin 1.0e-300]
+    (loop [i 1
+           b (+ x 1.0 (- a))
+           c (/ 1.0 fpmin)
+           d (/ 1.0 (+ x 1.0 (- a)))
+           h (/ 1.0 (+ x 1.0 (- a)))]
+      (if (> i 300)
+        (* h (Math/exp (+ (- x) (* a (Math/log x)) (- log-sqrt-pi))))
+        (let [an (* (- i) (- i a))
+              b' (+ b 2.0)
+              d' (let [v (+ (* an d) b')] (if (< (Math/abs v) fpmin) fpmin v))
+              c' (let [v (+ b' (/ an c))] (if (< (Math/abs v) fpmin) fpmin v))
+              d'' (/ 1.0 d')
+              del (* d'' c')
+              h' (* h del)]
+          (if (< (Math/abs (- del 1.0)) 1.0e-17)
+            (* h' (Math/exp (+ (- x) (* a (Math/log x)) (- log-sqrt-pi))))
+            (recur (inc i) b' c' d'' h')))))))
+
+(defn- erf-series
+  "erf(x) via the regularized incomplete gamma: erf(x) = P(1/2, x^2) for
+   x >= 0. PostgreSQL just calls libm's erf, so this is matching glibc
+   rather than a specification -- the differential asserts 15 significant
+   digits, not bit equality."
+  ^double [^double x]
+  (cond
+    (zero? x) 0.0
+    :else
+    (let [ax (Math/abs x)
+          x2 (* ax ax)
+          e (if (< x2 1.5)
+              (gamma-p-series 0.5 x2)
+              (- 1.0 (gamma-q-cf 0.5 x2)))]
+      (if (neg? x) (- e) e))))
+
+(def sql-erf
+  (null-safe (fn [x] (let [d (double x)]
+                       (cond (Double/isNaN d) d
+                             (Double/isInfinite d) (if (pos? d) 1.0 -1.0)
+                             :else (erf-series d))))))
+
+(defn- erfc-series
+  "erfc(x) = Q(1/2, x^2) for x >= 0, taken from the upper incomplete
+   gamma directly rather than as `1 - erf(x)` -- the subtraction loses
+   most of the significant digits once erf(x) approaches 1."
+  ^double [^double x]
+  (let [ax (Math/abs x)
+        x2 (* ax ax)
+        q (if (< x2 1.5)
+            (- 1.0 (gamma-p-series 0.5 x2))
+            (gamma-q-cf 0.5 x2))]
+    (if (neg? x) (- 2.0 q) q)))
+
+(def sql-erfc
+  (null-safe (fn [x] (let [d (double x)]
+                       (cond (Double/isNaN d) d
+                             (Double/isInfinite d) (if (pos? d) 0.0 2.0)
+                             :else (erfc-series d))))))
+
+;; ---------------------------------------------------------------------------
+;; numeric helpers
+
+(def sql-div-trunc
+  "div(y, x) — numeric_div_trunc: the quotient truncated toward zero, at
+   scale 0. Distinct from `/` (sql-div), which carries
+   select_div_scale's scale -- and named apart from it deliberately: the
+   two differ by exactly the thing the name would hide."
+  (null-safe
+   (fn [a b]
+     (when (and (number? b) (zero? b)) (throw-division-by-zero))
+     (let [x (bigdec a) y (bigdec b)]
+       (.setScale (.divideToIntegralValue ^java.math.BigDecimal x ^java.math.BigDecimal y)
+                  0 java.math.RoundingMode/DOWN)))))
+
+(def sql-factorial
+  (null-safe
+   (fn [n]
+     (let [v (long n)]
+       (cond
+         (neg? v) (throw-out-of-range "factorial of a negative number is undefined")
+         (> v 100000) (throw-out-of-range "value overflows numeric format")
+         :else (loop [i 2 acc java.math.BigInteger/ONE]
+                 (if (> i v)
+                   (java.math.BigDecimal. acc)
+                   (recur (inc i) (.multiply acc (java.math.BigInteger/valueOf i))))))))))
+
+(def sql-scale
+  "scale(numeric) — the declared display scale."
+  (null-safe (fn [v] (long (.scale (bigdec v))))))
+
+(def sql-min-scale
+  "min_scale(numeric) — the scale still needed after dropping trailing
+   zeros, floored at 0."
+  (null-safe (fn [v] (max 0 (long (.scale (.stripTrailingZeros (bigdec v))))))))
+
+(def sql-trim-scale
+  "trim_scale(numeric) — the value with trailing zeros removed."
+  (null-safe (fn [v] (let [b (.stripTrailingZeros (bigdec v))]
+                       (if (neg? (.scale b)) (.setScale b 0) b)))))
+
 (def sql-fn->clj-fn
   "Map of SQL function names (lowercased) to Clojure fn values.
 
@@ -1640,6 +1879,23 @@
    "trunc"    sql-trunc
    "sign"     sql-sign
    "gcd"      sql-gcd
+   ;; Degree trigonometry, div/factorial and the scale inspectors --
+   ;; ported rather than derived; see their definitions.
+   "sind"     sql-sind
+   "cosd"     sql-cosd
+   "tand"     sql-tand
+   "cotd"     sql-cotd
+   "asind"    sql-asind
+   "acosd"    sql-acosd
+   "atand"    sql-atand
+   "atan2d"   sql-atan2d
+   "erf"      sql-erf
+   "erfc"     sql-erfc
+   "div"      sql-div-trunc
+   "factorial" sql-factorial
+   "scale"    sql-scale
+   "min_scale" sql-min-scale
+   "trim_scale" sql-trim-scale
    "lcm"      sql-lcm
    "width_bucket" sql-width-bucket
    "pi"       (fn [] Math/PI)
@@ -1774,6 +2030,11 @@
    "round"    #{1 2}     ; round(x); round(x, decimals)
    "trunc"    #{1 2}
    "power"    #{2} "pow" #{2} "atan2" #{2} "mod" #{2} "gcd" #{2} "lcm" #{2}
+   "sind" #{1} "cosd" #{1} "tand" #{1} "cotd" #{1}
+   "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
+   "erf" #{1} "erfc" #{1}
+   "div" #{2} "factorial" #{1}
+   "scale" #{1} "min_scale" #{1} "trim_scale" #{1}
    "width_bucket" #{4}
    "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
    "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}
