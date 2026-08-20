@@ -1357,7 +1357,9 @@
    "integer_datetimes"             "on"
    "IntervalStyle"                 "postgres"
    "max_connections"               "100"
-   "max_identifier_length"         "63"})
+   "max_identifier_length"         "63"   ;; PostgreSQL's default; above 0 it selects shortest-round-trip
+   ;; float output, which is what our renderer produces.
+   "extra_float_digits" "1"})
 
 (defn- show-setting
   "Return a single-column SHOW QueryResult for setting-name / value."

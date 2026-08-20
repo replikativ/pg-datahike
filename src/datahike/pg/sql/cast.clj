@@ -85,6 +85,38 @@
                             (- p s) ".")}))
       scaled)))
 
+(def ^:private char-type-limit
+  "The text types that carry a length modifier, and whether an over-long
+   value is truncated or refused. PostgreSQL truncates on an EXPLICIT
+   cast and raises 22001 on an assignment -- `text` has no limit at all."
+  #{"varchar" "character varying" "char" "character" "bpchar"})
+
+(defn- text-length-limit
+  "The `n` of `varchar(n)` / `char(n)`, or nil when the target carries no
+   length."
+  [type-str]
+  (when (contains? char-type-limit (base-type-name type-str))
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str)) second Integer/parseInt)))
+
+(defn- apply-text-length
+  "Truncate to the declared length. `cast-scalar`'s explicit? flag is the
+   same distinction PostgreSQL draws: an explicit cast truncates
+   silently, an assignment refuses."
+  [^String v type-str explicit?]
+  (if-let [n (text-length-limit type-str)]
+    (if (<= (count v) n)
+      v
+      (if explicit?
+        (subs v 0 n)
+        (throw (errors/pg-error
+                :string-data-right-truncation
+                {:message (str "value too long for type "
+                               (if (contains? #{"char" "character" "bpchar"}
+                                              (base-type-name type-str))
+                                 "character(" "character varying(")
+                               n ")")}))))
+    v))
+
 (defn cast-to-integer
   "Cast to one of PostgreSQL's three integer widths.
 
@@ -261,11 +293,17 @@
         ;; `str` on a temporal value is java.util.Date.toString, which is
         ;; both the wrong format and rendered in the JVM's default time
         ;; zone — see types/temporal->pg-text.
-        :text (cond
-                (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
-                (pg-arr/array? v)   (pg-arr/to-pg-text v)
-                (string? v)         v
-                :else               (types/->pg-text v src-oid))
+        ;; `str` on a temporal value is java.util.Date.toString, which is
+        ;; both the wrong format and rendered in the JVM's default time
+        ;; zone — see types/temporal->pg-text. The length modifier is
+        ;; applied after, since it applies to the RENDERED text.
+        :text (apply-text-length
+               (cond
+                 (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)
+                 (pg-arr/array? v)   (pg-arr/to-pg-text v)
+                 (string? v)         v
+                 :else               (types/->pg-text v src-oid))
+               type-str explicit?)
 
         :boolean (if (boolean? v)
                    v
