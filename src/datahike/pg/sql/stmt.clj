@@ -2908,7 +2908,11 @@
                                                 cnt? is-count?]
                                             (fn [& args]
                                               (let [bindings (zipmap pv args)]
-                                                (if (expr/interpret-form cf bindings)
+                                                ;; FILTER (WHERE p) counts a row only when p
+                                                ;; is TRUE. UNKNOWN does not qualify, and the
+                                                ;; `:__null__` sentinel is truthy, so a bare
+                                                ;; `if` counted the NULL rows in.
+                                                (if (true? (expr/interpret-form cf bindings))
                                                   (if cnt? 1 (expr/interpret-form iv bindings))
                                                   (if cnt? 0 :__null__)))))
                               fn-param (symbol (str "?filter-fn" (swap! (:var-counter ctx) inc)))

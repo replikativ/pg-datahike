@@ -152,6 +152,11 @@
                                 2)))
         rounded (cond
                   (integer? v)      v
+                  ;; `true::int` is 1 and `false::int` is 0. Not a number
+                  ;; to coerce-numeric, which raised "cannot coerce class
+                  ;; java.lang.Boolean to bigint" -- so a projected
+                  ;; comparison could not be cast, as in `(a = 10)::int`.
+                  (boolean? v)      (if v 1 0)
                   (decimal? v)      (.setScale ^java.math.BigDecimal v 0
                                                java.math.RoundingMode/HALF_UP)
                   (number? v)       (Math/rint (double v))

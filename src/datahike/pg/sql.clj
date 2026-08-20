@@ -127,6 +127,20 @@
 (def sql-eq? fns/sql-eq?)
 (def sql-ne? fns/sql-ne?)
 (def sql-may? fns/sql-may?)
+(def sql-eq3? fns/sql-eq3?)
+(def sql-ne3? fns/sql-ne3?)
+(def sql-lt3? fns/sql-lt3?)
+(def sql-gt3? fns/sql-gt3?)
+(def sql-le3? fns/sql-le3?)
+(def sql-ge3? fns/sql-ge3?)
+(def sql-and3 fns/sql-and3)
+(def sql-or3 fns/sql-or3)
+(def sql-not3 fns/sql-not3)
+(def sql-like3? fns/sql-like3?)
+(def sql-distinct? fns/sql-distinct?)
+(def sql-not-distinct? fns/sql-not-distinct?)
+(def sql-in3? fns/sql-in3?)
+(def sql-between3? fns/sql-between3?)
 (def sql-in? fns/sql-in?)
 (def sql-+   fns/sql-+)
 (def sql--   fns/sql--)
@@ -1303,6 +1317,30 @@
                                                                          (pg-bits/bit-string-literal? inner)
                                                                          (pg-bits/bit-string-literal-value inner)
                                                                          (instance? StringValue inner) (expr/string-value-text ^StringValue inner)
+                                                                        ;; NULL::t is NULL for every target type. Without
+                                                                        ;; this the fallback stringified it and the cast
+                                                                        ;; parsed the literal text: `NULL::bool` raised
+                                                                        ;; "invalid input syntax for type boolean:
+                                                                        ;; \"NULL\"" and `NULL::text` answered the STRING
+                                                                        ;; 'NULL'. Only this table-free constant folder
+                                                                        ;; was affected -- `SELECT NULL::bool FROM t`
+                                                                        ;; goes through translate-cast-expr, which has
+                                                                        ;; the same guard already.
+                                                                         (instance? NullValue inner) :__null__
+                                                                        ;; TRUE/FALSE reach the parser as a bare Column
+                                                                        ;; (see the boolean-Column branch above), so the
+                                                                        ;; fallback stringified them and `true::int`
+                                                                        ;; raised "invalid input syntax for numeric".
+                                                                         (instance? BooleanValue inner)
+                                                                         (.getValue ^BooleanValue inner)
+                                                                         (and (instance? net.sf.jsqlparser.schema.Column inner)
+                                                                              (nil? (.getTable ^net.sf.jsqlparser.schema.Column inner))
+                                                                              (#{"true" "false"}
+                                                                               (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column inner)
+                                                                                       str/lower-case)))
+                                                                         (Boolean/parseBoolean
+                                                                          (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column inner)
+                                                                                  str/lower-case))
                                                                          :else (str inner))]
                                                                (cond
                                                               ;; Array-target cast: parse the canonical array text
@@ -1314,6 +1352,8 @@
                                                                  (if (or (nil? raw) (= :__null__ raw))
                                                                    :__null__
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
+                                                                 (or (nil? raw) (= :__null__ raw))
+                                                                 :__null__
                                                                  :else
                                                                  (sql-cast/cast-scalar
                                                                   raw type-str

@@ -825,6 +825,120 @@
   [op a b]
   (or (sql-null? a) (sql-null? b) (boolean ((may-ops op) a b))))
 
+(defn- three-valued
+  "Lift a 2-valued comparison to SQL's three-valued VALUE semantics.
+
+   The predicate-position comparisons (`sql-eq?`, `sql-lt?`, …) answer
+   FALSE for a NULL operand, which is right in a WHERE clause -- that is
+   where PostgreSQL collapses UNKNOWN to \"reject\" (execExprInterp.c,
+   EEOP_QUAL). But in VALUE position the same comparison must yield NULL:
+
+     SELECT a = 10 FROM t   -- a IS NULL  ->  NULL, not false
+
+   These are deliberately SEPARATE symbols rather than a change to the
+   existing ones. The `:__null__` sentinel is TRUTHY in a datalog
+   predicate position, so making the WHERE comparisons return it would
+   let NULL rows through -- a bug this codebase has already shipped once."
+  [pred]
+  (fn [a b]
+    (if (or (sql-null? a) (sql-null? b)) :__null__ (boolean (pred a b)))))
+
+(def sql-eq3? (three-valued sql-eq?))
+(def sql-ne3? (three-valued sql-ne?))
+(def sql-lt3? (three-valued sql-lt?))
+(def sql-gt3? (three-valued sql-gt?))
+(def sql-le3? (three-valued sql-le?))
+(def sql-ge3? (three-valued sql-ge?))
+
+(defn sql-and3
+  "Kleene AND. FALSE dominates: `false AND NULL` is FALSE, because the
+   conjunction is false whatever the unknown operand turns out to be.
+   Only when nothing is FALSE and something is UNKNOWN is the result
+   UNKNOWN."
+  [a b]
+  (cond
+    (or (false? a) (false? b))     false
+    (or (sql-null? a) (sql-null? b)) :__null__
+    :else                          (and (boolean a) (boolean b))))
+
+(defn sql-or3
+  "Kleene OR. TRUE dominates: `true OR NULL` is TRUE."
+  [a b]
+  (cond
+    (or (true? a) (true? b))       true
+    (or (sql-null? a) (sql-null? b)) :__null__
+    :else                          (or (boolean a) (boolean b))))
+
+(defn sql-not3
+  "Kleene NOT. `NOT NULL` is NULL -- negation cannot resolve an unknown."
+  [a]
+  (if (sql-null? a) :__null__ (not a)))
+
+(defn sql-distinct?
+  "`a IS DISTINCT FROM b`. Never UNKNOWN -- that is the whole point of it:
+   it is the NULL-aware `<>`, where two NULLs are NOT distinct and a NULL
+   IS distinct from any value."
+  [a b]
+  (let [an (sql-null? a) bn (sql-null? b)]
+    (cond
+      (and an bn) false
+      (or an bn)  true
+      :else       (not (sql-eq? a b)))))
+
+(def non-strict-fns
+  "Functions in `sql-fn->clj-fn` that must NOT be wrapped in `null-safe`.
+
+   Almost every SQL function is strict -- NULL in, NULL out -- so the
+   caller wraps the whole table. GREATEST and LEAST are the exceptions:
+   PostgreSQL compiles them to a MinMaxExpr, which SKIPS null inputs and
+   is NULL only when every input is. Wrapping them short-circuited to
+   NULL before their own implementation ever ran, so `greatest(NULL, 5)`
+   answered NULL instead of 5."
+  #{"greatest" "least"})
+
+(defn- min-max-skipping-nulls
+  "GREATEST / LEAST. See the note at their entries in the function table:
+   PostgreSQL's MinMaxExpr ignores NULL inputs rather than propagating
+   them, and answers NULL only when every input is NULL."
+  [args better?]
+  (let [vals (remove sql-null? args)]
+    (if (empty? vals)
+      :__null__
+      (reduce (fn [a b] (if (better? b a) b a)) vals))))
+
+(defn sql-not-distinct?
+  "`a IS NOT DISTINCT FROM b`. A named function rather than
+   `(not (sql-distinct? …))`, because datahike rejects a nested form as a
+   clause argument -- it would be passed through as a literal list."
+  [a b]
+  (not (sql-distinct? a b)))
+
+(defn sql-like3?
+  "LIKE / regex match in VALUE position: NULL input yields NULL, not false.
+   `re-find` cannot be used directly there -- it throws on the `:__null__`
+   sentinel and returns nil (which drops the row) on no-match."
+  [v re]
+  (if (sql-null? v) :__null__ (boolean (re-find re v))))
+
+(defn sql-in3?
+  "`x IN (…)` in VALUE position, three-valued.
+
+   NULL if x is NULL. Otherwise TRUE on a hit; on a miss the answer is
+   UNKNOWN when the list contains a NULL (x might have equalled it) and
+   FALSE only when every element is known and none matched."
+  [vals v]
+  (cond
+    (sql-null? v)               :__null__
+    (some #(sql-eq? % v) vals)  true
+    (some sql-null? vals)       :__null__
+    :else                       false))
+
+(defn sql-between3?
+  "`x BETWEEN lo AND hi` in VALUE position: `lo <= x AND x <= hi` under
+   Kleene AND, so any NULL operand makes it UNKNOWN rather than false."
+  [v lo hi]
+  (sql-and3 (sql-le3? lo v) (sql-le3? v hi)))
+
 (defn sql-in?
   "SQL `IN` over a literal list. `contains?` on a set is `=`-based and so
    inherits the cross-type numeric blindness described in `sql-eq?`;
@@ -2225,8 +2339,12 @@
    ;; ClassCastException on `greatest('a','b')` or two dates. Unlike
    ;; MIN/MAX these are not aggregates and PostgreSQL defines them over
    ;; any type with an ordering, so there is nothing to reject here.
-   "greatest" (fn [& args] (reduce (fn [a b] (if (pos? (order-cmp b a)) b a)) args))
-   "least"    (fn [& args] (reduce (fn [a b] (if (neg? (order-cmp b a)) b a)) args))
+   ;; NOT strict, unlike almost every other SQL function: PostgreSQL's
+   ;; MinMaxExpr SKIPS null inputs, so `greatest(NULL, 5)` is 5, and the
+   ;; result is NULL only when EVERY input is. Folding the sentinel
+   ;; through order-cmp instead made one NULL argument poison the answer.
+   "greatest" (fn [& args] (min-max-skipping-nulls args #(pos? (order-cmp %1 %2))))
+   "least"    (fn [& args] (min-max-skipping-nulls args #(neg? (order-cmp %1 %2))))
    ;; sql-mod, not bare `rem`: `rem` neither raises PostgreSQL's
    ;; "division by zero" on a zero modulus (it threw a raw Java
    ;; "Divide by zero") nor promotes an integer operand against a
