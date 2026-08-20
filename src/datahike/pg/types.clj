@@ -34,6 +34,7 @@
 (def oid-varchar  1043)
 (def oid-bpchar   1042)
 (def oid-name       19)
+(def oid-void     2278)
 (def oid-date     1082)
 (def oid-time     1083)
 (def oid-timestamp 1114)

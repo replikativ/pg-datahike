@@ -112,6 +112,8 @@
    "asind" types/oid-float8 "acosd" types/oid-float8
    "atand" types/oid-float8 "atan2d" types/oid-float8
    "erf" types/oid-float8 "erfc" types/oid-float8
+   "setseed" types/oid-void
+   "random_normal" types/oid-float8
    "div" types/oid-numeric
    "factorial" types/oid-numeric
    "trim_scale" types/oid-numeric
