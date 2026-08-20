@@ -327,6 +327,28 @@
    ;; order at Bind-time.
    :param-placeholders (atom (sorted-map))})
 
+(def ^:private snapshot-keys
+  [:var-counter :col->var :entity-vars :where-clauses :find-elements
+   :with-vars :in-params :in-args :left-join-evars :nullable-vars
+   :required-join-patterns :param-placeholders])
+
+(defn snapshot
+  "Capture every mutable slot of the translation context.
+
+   Lets a translation strategy be ATTEMPTED and rolled back. Translating
+   an expression is side-effecting -- it appends binding clauses, mints
+   vars, registers `:in` args -- so \"try the fast shape, fall back to the
+   general one\" would otherwise leave the fast attempt's clauses behind
+   and translate the same subtree twice."
+  [ctx]
+  (mapv (fn [k] [k @(get ctx k)]) snapshot-keys))
+
+(defn restore!
+  "Undo everything since `snapshot`."
+  [ctx snap]
+  (doseq [[k v] snap] (reset! (get ctx k) v))
+  nil)
+
 (defn fresh-var!
   "Generate a fresh logic variable ?v1, ?v2, etc."
   [ctx]
@@ -837,12 +859,48 @@
 ;; ---------------------------------------------------------------------------
 ;; Expression helpers
 
+(defn propagate-nullability!
+  "Flag `result-var` as nullable if anything in `sources` is.
+
+   SQL functions and operators are strict, so a computed value is NULL
+   whenever an input is. Recording that is what lets `null-guard-clauses`
+   derive a guard for a COMPUTED operand -- without it, `NOT (a + b = 30)`
+   and `NOT (upper(s) = 'AA')` guarded nothing and kept the rows where the
+   operand is NULL, which PostgreSQL excludes.
+
+   Over-approximating is safe. A non-strict form such as `coalesce(a, 0)`
+   gets flagged too, but its guard then simply always passes; the only
+   other reader of `:nullable-vars` is ORDER BY, where the flag just
+   selects the null-aware comparator."
+  [ctx result-var sources]
+  (when (symbol? result-var)
+    (let [nullable @(:nullable-vars ctx)]
+      (when (some (fn [x] (or (and (symbol? x) (contains? nullable x))
+                              (nil? x)
+                              (= :__null__ x)))
+                  (tree-seq coll? seq sources))
+        (swap! (:nullable-vars ctx) conj result-var))))
+  result-var)
+
 (defn materialize-arg!
   "If arg is a compound form (seq), bind it to a fresh var via a
-   function-binding clause and return the var. Otherwise return arg."
+   function-binding clause and return the var. Otherwise return arg.
+
+   The fresh var inherits the nullability of the form: SQL functions and
+   operators are strict, so `a + b`, `upper(s)` and `abs(a)` are NULL
+   whenever an input is. Recording that in `:nullable-vars` is what lets
+   `null-guard-clauses` derive a guard for a COMPUTED operand -- without
+   it, `NOT (a + b = 30)` guarded nothing and kept the rows where the sum
+   is NULL, which PostgreSQL excludes.
+
+   Over-approximating is safe. A non-strict form such as `coalesce(a, 0)`
+   gets flagged too, but its guard then simply always passes; the only
+   other reader of `:nullable-vars` is ORDER BY, where the flag just
+   selects the null-aware comparator."
   [ctx arg]
   (if (seq? arg)
     (let [v (fresh-var! ctx)]
+      (propagate-nullability! ctx v arg)
       (add-clause! ctx [arg v])
       v)
     arg))
