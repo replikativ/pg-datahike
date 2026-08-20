@@ -41,7 +41,7 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
-            PlainSelect SelectItem Join
+            PlainSelect SelectItem Join OrderByElement
             ParenthesedSelect SetOperationList
             UnionOp IntersectOp ExceptOp]
            [net.sf.jsqlparser.schema Column Table]
@@ -1557,10 +1557,43 @@
                                         (if (.isAll ^UnionOp op) :union-all :union)
                                         (instance? IntersectOp op) :intersect
                                         (instance? ExceptOp op) :except
-                                        :else :union-all)))]
+                                        :else :union-all)))
+                          ;; The trailing ORDER BY belongs to the WHOLE set
+                          ;; operation, not to its last member, and it was
+                          ;; being dropped: `… EXCEPT … ORDER BY 1` came back
+                          ;; in whatever order set/difference produced, and
+                          ;; `ORDER BY 1 DESC` was ignored outright.
+                          ;;
+                          ;; Resolved here against the FIRST member's output
+                          ;; names, which is what PostgreSQL sorts by, into the
+                          ;; [idx dir nulls] triples null-safe-order-cmp takes.
+                          set-order-by
+                          (let [obes (.getOrderByElements sol)
+                                aliases (vec (:find-aliases (first sub-results)))]
+                            (when (seq obes)
+                              (vec (mapcat
+                                    (fn [^OrderByElement obe]
+                                      (let [e (.getExpression obe)
+                                            idx (cond
+                                                  (instance? LongValue e)
+                                                  (dec (.getValue ^LongValue e))
+                                                  (instance? Column e)
+                                                  (let [nm (.getColumnName ^Column e)]
+                                                    (first (keep-indexed
+                                                            (fn [i a] (when (= a nm) i))
+                                                            aliases)))
+                                                  :else nil)
+                                            nulls (condp = (str (.getNullOrdering obe))
+                                                    "NULLS_FIRST" :first
+                                                    "NULLS_LAST"  :last
+                                                    nil)]
+                                        (when (and idx (nat-int? idx))
+                                          [idx (if (.isAsc obe) :asc :desc) nulls])))
+                                    obes))))]
                       (cond-> {:type :set-operation
                                :op op-type
                                :sub-results sub-results}
+                        (seq set-order-by) (assoc :sql-order-by set-order-by)
                        ;; Top-level catalog materialisation propagates
                        ;; to the server's set-operation executor via
                        ;; :enriched-db — each sub-query runs against it.
