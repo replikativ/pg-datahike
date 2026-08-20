@@ -2314,6 +2314,12 @@
         (and (= op-sym '+) (date? r)) 'datahike.pg.sql/sql-date+
         :else nil))))
 
+(defn- agg-marker?
+  "An aggregate placeholder produced by translate-expr, as distinct from
+   any other map-like value."
+  [x]
+  (and (map? x) (or (:aggregate x) (:compound-agg x))))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -2341,7 +2347,12 @@
                                 (.getExpression ^SignedExpression left-expr)
                                 left-expr))
         r (translate-expr ctx (.getRightExpression expr))]
-    (if (or (map? l) (map? r))
+    ;; `map?`, not agg-marker? -- a defrecord IS a map, so any
+    ;; record-valued operand (a numeric NaN/Infinity carrier, a PgBit, a
+    ;; PgArray) was mistaken for an aggregate marker and turned the whole
+    ;; expression into a compound-aggregate descriptor. `'NaN'::numeric +
+    ;; 1` came back as the descriptor's printed form.
+    (if (or (agg-marker? l) (agg-marker? r))
       ;; Compound aggregate expression: return descriptor for SELECT handler
       {:compound-agg true :op op-sym :left l :right r :expr expr}
       (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
