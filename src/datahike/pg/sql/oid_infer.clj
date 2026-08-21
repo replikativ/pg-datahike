@@ -250,12 +250,53 @@
                      :default          types/oid-float8}
    "min"            :arg-type
    "max"            :arg-type
-   "stddev"         types/oid-float8
-   "stddev_samp"    types/oid-float8
-   "stddev_pop"     types/oid-float8
-   "variance"       types/oid-float8
-   "var_samp"       types/oid-float8
-   "var_pop"        types/oid-float8
+   ;; The variance family follows AVG, not COUNT: PostgreSQL declares a
+   ;; NUMERIC overload for int2/int4/int8/numeric and a float8 one only
+   ;; for float4/float8 (pg_aggregate.dat). Reporting float8 for all of
+   ;; them meant `stddev(int)` advertised — and computed — a double where
+   ;; PG gives numeric.
+   "stddev"         {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
+   "stddev_samp"    {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
+   "stddev_pop"     {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
+   "variance"       {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
+   "var_samp"       {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
+   "var_pop"        {types/oid-int2    types/oid-numeric
+                     types/oid-int4    types/oid-numeric
+                     types/oid-int8    types/oid-numeric
+                     types/oid-numeric types/oid-numeric
+                     types/oid-float4  types/oid-float8
+                     types/oid-float8  types/oid-float8
+                     :default          types/oid-float8}
    "median"         :arg-type
    "corr"           types/oid-float8
    ;; Ordered-set aggregates (WITHIN GROUP). PG: percentile_cont

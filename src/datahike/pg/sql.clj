@@ -99,6 +99,12 @@
 (def filter-count-distinct fns/filter-count-distinct)
 (def filter-variance-samp  fns/filter-variance-samp)
 (def filter-stddev-samp    fns/filter-stddev-samp)
+(def filter-variance-pop   fns/filter-variance-pop)
+(def filter-stddev-pop     fns/filter-stddev-pop)
+(def filter-variance-samp-numeric fns/filter-variance-samp-numeric)
+(def filter-variance-pop-numeric  fns/filter-variance-pop-numeric)
+(def filter-stddev-samp-numeric   fns/filter-stddev-samp-numeric)
+(def filter-stddev-pop-numeric    fns/filter-stddev-pop-numeric)
 (def filter-corr           fns/filter-corr)
 (def filter-array-agg      fns/filter-array-agg)
 (def filter-string-agg     fns/filter-string-agg)
@@ -626,7 +632,17 @@
                  [curr-db curr-schema deferred ns-map]))
 
              (some? inner)
-             (if-let [m (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name)]
+             ;; With the CTEs materialised SO FAR in scope. A WITH list is
+             ;; sequential -- `WITH a AS (…), b AS (SELECT … FROM a)` is
+             ;; ordinary SQL -- but the name->namespace map was only bound
+             ;; after the whole list had been folded, so a CTE body could
+             ;; not see the CTE before it and the query died with
+             ;; `relation "a" does not exist`.
+             (if-let [m (binding [ctx/*relation-namespaces*
+                                  (merge ctx/*relation-namespaces* ns-map)
+                                  stmt/*cte-namespaces*
+                                  (merge stmt/*cte-namespaces* ns-map)]
+                          (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name))]
                [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
                [curr-db curr-schema deferred ns-map])
 
