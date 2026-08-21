@@ -459,26 +459,38 @@
   [a b]
   (not (jsonb-eq? a b)))
 
+(defn- jsonb-null? [v] (or (nil? v) (= :__null__ v)))
+
+(defn- contains-parsed?
+  "Structural containment over already-parsed jsonb values."
+  [l r]
+  (cond
+    (and (map? l) (map? r))
+    (every? (fn [[k v]]
+              (let [lv (get l k ::missing)]
+                (if (and (map? lv) (map? v))
+                  (contains-parsed? lv v)
+                  (= lv v))))
+            r)
+
+    (and (sequential? l) (sequential? r))
+    ;; Array containment: every element of r must be in l
+    (let [l-set (set l)]
+      (every? l-set r))
+
+    :else (= l r)))
+
 (defn jsonb-contains?
-  "PostgreSQL @> operator: does left contain right?"
+  "PostgreSQL `@>`: does left contain right?
+
+   NULL in, NULL out -- `js @> '{\"a\":1}'` on a NULL js is UNKNOWN, and
+   answering false made it indistinguishable from a genuine non-match.
+   The recursion runs on parsed values, so a nested nil stays a plain
+   mismatch rather than turning the whole answer into NULL."
   [left right]
-  (let [l (parse-jsonb left)
-        r (parse-jsonb right)]
-    (cond
-      (and (map? l) (map? r))
-      (every? (fn [[k v]]
-                (let [lv (get l k ::missing)]
-                  (if (and (map? lv) (map? v))
-                    (jsonb-contains? lv v)
-                    (= lv v))))
-              r)
-
-      (and (sequential? l) (sequential? r))
-      ;; Array containment: every element of r must be in l
-      (let [l-set (set l)]
-        (every? l-set r))
-
-      :else (= l r))))
+  (if (or (jsonb-null? left) (jsonb-null? right))
+    :__null__
+    (contains-parsed? (parse-jsonb left) (parse-jsonb right))))
 
 (defn jsonb-contained?
   "PostgreSQL <@ operator: is left contained in right?"
@@ -486,13 +498,21 @@
   (jsonb-contains? right left))
 
 (defn jsonb-exists?
-  "PostgreSQL ? operator: does key exist in jsonb object?"
+  "PostgreSQL `?`: does the key exist as an object key, or as a string
+   element of an array?
+
+   NULL in, NULL out. And the array case must answer a BOOLEAN: `some`
+   returns the key itself on a hit and nil on a miss, and a datalog
+   binding that yields nil FILTERS THE ROW -- so a jsonb array without the
+   key vanished from the result instead of answering false."
   [v key]
-  (let [parsed (parse-jsonb v)]
-    (cond
-      (map? parsed) (contains? parsed key)
-      (sequential? parsed) (some #{key} parsed)
-      :else false)))
+  (if (or (nil? v) (= :__null__ v))
+    :__null__
+    (let [parsed (parse-jsonb v)]
+      (cond
+        (map? parsed)        (contains? parsed key)
+        (sequential? parsed) (boolean (some #{key} parsed))
+        :else                false))))
 
 (defn- ->key-seq
   "The key list for `?|` / `?&`.
@@ -510,16 +530,20 @@
     :else            [ks]))
 
 (defn jsonb-exists-any?
-  "PostgreSQL ?| operator: does any of the keys exist?"
+  "PostgreSQL ?| operator: does any of the keys exist? NULL in, NULL out."
   [v keys]
-  (let [parsed (parse-jsonb v)]
-    (boolean (some #(jsonb-exists? parsed %) (->key-seq keys)))))
+  (if (jsonb-null? v)
+    :__null__
+    (let [parsed (parse-jsonb v)]
+      (boolean (some #(true? (jsonb-exists? parsed %)) (->key-seq keys))))))
 
 (defn jsonb-exists-all?
-  "PostgreSQL ?& operator: do all keys exist?"
+  "PostgreSQL ?& operator: do all keys exist? NULL in, NULL out."
   [v keys]
-  (let [parsed (parse-jsonb v)]
-    (every? #(jsonb-exists? parsed %) (->key-seq keys))))
+  (if (jsonb-null? v)
+    :__null__
+    (let [parsed (parse-jsonb v)]
+      (every? #(true? (jsonb-exists? parsed %)) (->key-seq keys)))))
 
 ;; ============================================================================
 ;; Operators: modification
@@ -837,18 +861,24 @@
 ;; ============================================================================
 
 (defn jsonb-typeof
-  "PostgreSQL jsonb_typeof(jsonb): return type name as string."
+  "PostgreSQL jsonb_typeof(jsonb): the type name as a string.
+
+   A SQL NULL is NULL, distinct from the JSON null literal, which is the
+   string \"null\". Without the guard the sentinel was parsed as ordinary
+   text and every NULL row reported \"string\"."
   [v]
-  (let [parsed (parse-jsonb v)]
-    (cond
-      (nil? parsed)        "null"
-      (= json-null parsed) "null"
-      (map? parsed)        "object"
-      (sequential? parsed) "array"
-      (string? parsed)     "string"
-      (number? parsed)     "number"
-      (boolean? parsed)    "boolean"
-      :else                "string")))
+  (if (or (nil? v) (= :__null__ v))
+    :__null__
+    (let [parsed (parse-jsonb v)]
+      (cond
+        (nil? parsed)        "null"
+        (= json-null parsed) "null"
+        (map? parsed)        "object"
+        (sequential? parsed) "array"
+        (string? parsed)     "string"
+        (number? parsed)     "number"
+        (boolean? parsed)    "boolean"
+        :else                "string"))))
 
 (defn jsonb-array-length
   "PostgreSQL jsonb_array_length(jsonb): return array length."

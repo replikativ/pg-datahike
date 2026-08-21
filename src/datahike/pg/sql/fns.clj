@@ -754,6 +754,12 @@
    `<=` `>=` are already cross-type."
   [a b]
   (cond
+    ;; An ARRAY column comes back as canonical PG text ("{1,2,3}") while an
+    ;; ARRAY[...] literal is a PgArray record, so `arr = ARRAY[1,2,3]`
+    ;; compared a String to a record and answered false for every row.
+    ;; Parse the text side with the record's element type and compare.
+    (and (pg-arr/array? a) (string? b)) (sql-eq? a (pg-arr/from-pg-text b (:elem-type a)))
+    (and (pg-arr/array? b) (string? a)) (sql-eq? (pg-arr/from-pg-text a (:elem-type b)) b)
     ;; A numeric special compares by PostgreSQL's total order, and equals
     ;; only its own kind.
     (or (numspecial? a) (numspecial? b))
