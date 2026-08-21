@@ -1638,6 +1638,59 @@
                    nil)))
              find-elems)])))
 
+(defn correlated-subquery-refs
+  "Given a subquery `inner` (a JSqlParser Select) and the set of
+   `outer-aliases` (lowercased outer FROM aliases/table names), return the
+   set of [outer-alias col] correlation references the inner makes, or nil
+   when uncorrelated.
+
+   Detection is lexical -- it finds `alias.col` occurrences of an OUTER alias
+   in the inner SQL (negative-lookbehind so `xt.` doesn't match alias `t`).
+   Robust enough for catalog / introspection shapes; AST-precise detection
+   (which would also respect inner shadowing) is a later refinement."
+  [inner outer-aliases]
+  (when (seq outer-aliases)
+    (let [sql (str inner)
+          refs (for [a outer-aliases
+                     [_ col] (re-seq
+                              (re-pattern
+                               (str "(?i)(?<![\\w.])"
+                                    (java.util.regex.Pattern/quote a)
+                                    "\\.([A-Za-z_][A-Za-z0-9_]*)"))
+                              sql)]
+                 [a (str/lower-case col)])]
+      (not-empty (set refs)))))
+
+(defn eval-correlated-scalar
+  "Evaluate one SQL fragment for a correlated subquery against `query-db`
+   with `*from-bindings*` already bound by the caller. `subquery?` true ->
+   `sql` is a full SELECT (run as-is); false -> `sql` is a bare
+   scalar/predicate expression, wrapped as `SELECT (<sql>)`.
+
+   Returns the first cell, or `:__null__` -- NEVER nil. A Datalog function
+   binding that yields nil FILTERS THE ROW, so a per-row evaluator that
+   returned nil for an empty subquery would silently delete outer rows
+   instead of giving them SQL NULL.
+
+   One implementation for both callers: the deferred SELECT-list evaluator
+   and the per-row WHERE-position binding below."
+  [parse-fn sql subquery? inner-schema query-db]
+  (let [v (try
+            (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
+                  p   (parse-fn run-sql inner-schema query-db)
+                  q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
+              (if (nil? q)
+                (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
+                (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+                      ;; An aggregate over an empty relation is still ONE
+                      ;; row -- `(SELECT count(*) FROM t WHERE …)` with no
+                      ;; match is 0, not NULL.
+                      res (or (when (empty? (seq res)) (empty-aggregate-row q)) res)
+                      fr  (first res)]
+                  (if (sequential? fr) (first fr) fr))))
+            (catch Throwable _ nil))]
+    (if (some? v) v :__null__)))
+
 (defn translate-predicate-expr
   "Translate a SQL predicate expression into a Clojure boolean form
    suitable for use inside a cond binding. Unlike translate-predicate which
@@ -2664,8 +2717,18 @@
         (let [nm (unquote-ident (.getColumnName col))
               aliases (:table-aliases ctx)]
           (when (or (contains? aliases nm) (= nm (:default-table ctx)))
+            ;; The FULL resolution, same as the value path: the short
+            ;; arity cannot search the other relations in scope, so a
+            ;; column belonging to a JOINED relation looked unresolvable
+            ;; and a name that also named a relation -- `FROM t,
+            ;; generate_series(1,2) g`, where the SRF's single column is
+            ;; called `g` too -- was read as a whole-ROW reference and
+            ;; came back as a record.
             (let [attr (ctx/attr-of ctx (ctx/resolve-column
-                                         col aliases (:default-table ctx)))]
+                                         col aliases (:default-table ctx)
+                                         (:col-overrides ctx)
+                                         (:derived-aliases ctx)
+                                         (:ci-index ctx)))]
               (when-not (and attr (get (:schema ctx) attr))
                 nm))))))))
 
@@ -2707,6 +2770,69 @@
     (swap! (:in-args ctx) conj rec-fn)
     (ctx/add-clause! ctx [(cons fn-param vars) result-var])
     result-var))
+
+(defn- outer-alias-set
+  "The FROM aliases (and bare table names) a subquery could correlate
+   against, lowercased."
+  [ctx]
+  (into #{} (comp (map (fn [a] (some-> a name str/lower-case)))
+                  (remove nil?))
+        (concat (keys (or (:table-aliases ctx) {}))
+                [(:default-table ctx)])))
+
+(defn- correlated-scalar-var!
+  "Bind a variable to a CORRELATED scalar subquery's value, evaluated once
+   per outer row, and return the variable.
+
+   The subquery becomes an ordinary Datalog function binding --
+   `[(?corr-fn ?outer-col …) ?v]` -- so it is evaluated INSIDE the query,
+   with the outer row's values already bound. That is what makes it work
+   in WHERE: the filter runs before grouping and before LIMIT, exactly
+   where SQL puts it, with no post-pass to reorder.
+
+   Before this, a correlated scalar subquery in an expression was
+   evaluated ONCE at translate time. When the inner happened to translate
+   anyway -- which it does whenever the correlation predicate's outer
+   column resolves to a same-named inner one -- the result was a single
+   CONSTANT folded into the predicate: `WHERE 0 > (SELECT min(i) FROM ft
+   t2 WHERE t2.id <> ft.id)` became `0 > -3`, the GLOBAL minimum, and
+   every row passed."
+  [ctx inner corr-refs]
+  (let [parse-fn (:parse-sql ctx)
+        schema   (:schema ctx)
+        db       (:db ctx)
+        inner-sql (str inner)
+        corr-refs (vec corr-refs)
+        ;; Through translate-expr, so the outer column resolves exactly as
+        ;; it would anywhere else in the statement -- aliases, ref columns
+        ;; and the nullable-var bookkeeping included.
+        arg-vars (mapv (fn [[a c]]
+                         (translate-expr
+                          ctx
+                          (net.sf.jsqlparser.schema.Column.
+                           (net.sf.jsqlparser.schema.Table. ^String a)
+                           ^String c)))
+                       corr-refs)
+        out-var  (ctx/fresh-var! ctx)
+        fn-param (symbol (str "?corr-scalar" (swap! (:var-counter ctx) inc)))
+        f (fn [& outer-vals]
+            (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
+                             {} (map vector corr-refs outer-vals))]
+              (binding [params/*from-bindings* fb
+                        ;; Without it the inner translator reads `t2.id =
+                        ;; ft.id` as an implicit JOIN against the relation
+                        ;; `ft` and adds ft to the inner FROM -- the
+                        ;; correlation predicate dissolves and every outer
+                        ;; row gets the same uncorrelated answer.
+                        params/*lateral-outer-aliases* (set (map first corr-refs))]
+                (eval-correlated-scalar parse-fn inner-sql true schema db))))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj f)
+    (ctx/add-clause! ctx [(apply list fn-param arg-vars) out-var])
+    ;; It can be NULL, so comparisons against it need the three-valued
+    ;; guard every other nullable value gets.
+    (swap! (:nullable-vars ctx) conj out-var)
+    out-var))
 
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
@@ -3398,45 +3524,45 @@
     ;; catalog (we don't track column defaults or collations as rows),
     ;; so the inner produces no rows for any outer row → NULL.
     ;;
-    ;; Strategy: attempt to evaluate the inner SELECT once at
-    ;; translate time against the (catalog-enriched) db. Three cases:
-    ;;   1. Non-correlated, returns rows → use first row's first col.
-    ;;   2. Non-correlated, returns 0 rows → :__null__.
-    ;;   3. Correlated (references outer aliases the inner translator
-    ;;      can't resolve) → translate-select throws → :__null__.
-    ;; Case 3 is a planned conservative fallback: we don't yet have a
-    ;; per-row scalar-subquery executor, but the catalog tables that
-    ;; drive correlated psql probes (pg_attrdef, pg_collation) are
-    ;; empty in our impl, so the correct PG result IS NULL.
+    ;; Strategy: a CORRELATED inner becomes a per-row function binding
+    ;; (`correlated-scalar-var!`); an uncorrelated one is evaluated once
+    ;; at translate time against the (catalog-enriched) db, which is both
+    ;; correct and cheaper -- its value cannot vary by row.
+    ;;   1. Uncorrelated, returns rows → use first row's first col.
+    ;;   2. Uncorrelated, returns 0 rows → :__null__.
     (or (instance? ParenthesedSelect expr) (instance? PlainSelect expr))
     (let [inner (if (instance? ParenthesedSelect expr)
                   (.getSelect ^ParenthesedSelect expr)
                   expr)
-          db    (:db ctx)]
-      (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
-        (try
-          (let [parse-fn   (:parse-sql ctx)
-                inner-sql  (str inner)
-                parsed     (parse-fn inner-sql (:schema ctx) db)
-                q          (:query parsed)
-                in-args    (:in-args parsed)
-                query-db   (or (:enriched-db parsed) db)
-                q-fn       d/q
-                results    (if (seq in-args)
-                             (apply q-fn q query-db in-args)
-                             (q-fn q query-db))
+          db    (:db ctx)
+          corr-refs (when (and db (instance? PlainSelect inner) (:parse-sql ctx))
+                      (seq (correlated-subquery-refs inner (outer-alias-set ctx))))]
+      (if corr-refs
+        (correlated-scalar-var! ctx inner corr-refs)
+        (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
+          (try
+            (let [parse-fn   (:parse-sql ctx)
+                  inner-sql  (str inner)
+                  parsed     (parse-fn inner-sql (:schema ctx) db)
+                  q          (:query parsed)
+                  in-args    (:in-args parsed)
+                  query-db   (or (:enriched-db parsed) db)
+                  q-fn       d/q
+                  results    (if (seq in-args)
+                               (apply q-fn q query-db in-args)
+                               (q-fn q query-db))
                 ;; An aggregate over an empty relation is still ONE row --
                 ;; `(SELECT count(*) FROM t WHERE false)` is 0, not NULL.
                 ;; The rule lives with the other consumers; see
                 ;; stmt/empty-aggregate-row.
-                results    (or (when (empty? (seq results))
-                                 (empty-aggregate-row q))
-                               results)
-                first-row  (first results)
-                v          (if (sequential? first-row) (first first-row) first-row)]
-            (if (some? v) v :__null__))
-          (catch Throwable _ :__null__))
-        :__null__))
+                  results    (or (when (empty? (seq results))
+                                   (empty-aggregate-row q))
+                                 results)
+                  first-row  (first results)
+                  v          (if (sequential? first-row) (first first-row) first-row)]
+              (if (some? v) v :__null__))
+            (catch Throwable _ :__null__))
+          :__null__)))
 
     :else
     (throw (ex-info "unsupported SQL expression"

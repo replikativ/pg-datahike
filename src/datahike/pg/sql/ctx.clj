@@ -108,7 +108,17 @@
                        ;; Prefer the default table's own alias when it is
                        ;; one of them, so the emitted form stays the plain
                        ;; keyword rather than an `[:aliased …]` wrapper.
-                       (if (contains? aks default-table) default-table (first aks)))
+                       ;; Otherwise prefer a REAL alias over the storage
+                       ;; name: one FROM item registers both, and picking
+                       ;; between them with `first` on a SET is arbitrary
+                       ;; -- for a virtual relation whose storage name
+                       ;; differs from the user's alias that produced a
+                       ;; SECOND entity var for the same relation, and the
+                       ;; query cross-joined it with itself.
+                       (cond
+                         (contains? aks default-table) default-table
+                         :else (or (first (sort (filter #(not= % (get table-aliases %)) aks)))
+                                   (first (sort aks)))))
 
                      (> (count by-attr) 1)
                      (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
