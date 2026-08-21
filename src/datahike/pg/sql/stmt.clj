@@ -1630,7 +1630,7 @@
     (:subquery-sql then-spec) (eval-corr-scalar parse-fn (:subquery-sql then-spec) true inner-schema query-db)
     :else                     (eval-corr-scalar parse-fn (:expr-sql then-spec) false inner-schema query-db)))
 
-(defn- run-correlated-spec
+(defn run-correlated-spec
   "Value of a deferred correlated SELECT item for one outer row. `fb` is the
    per-row *from-bindings*. :scalar runs the subquery; :case walks branches."
   [parse-fn spec fb inner-schema query-db]
