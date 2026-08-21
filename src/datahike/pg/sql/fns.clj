@@ -76,6 +76,17 @@
       ;; each step -- which is exactly what float4pl does.
       (reduce (fn [acc v] (float (+ (float acc) (float v)))) (float 0) vs))))
 
+(defn ->bigdec
+  "Coerce one aggregate input to BigDecimal. The numeric SUM/AVG
+   runtimes share it so they widen identically."
+  ^java.math.BigDecimal [v]
+  (cond
+    (instance? java.math.BigDecimal v) v
+    (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
+    (integer? v) (java.math.BigDecimal/valueOf (long v))
+    (float? v)   (java.math.BigDecimal/valueOf (double v))
+    :else        (java.math.BigDecimal. (str v))))
+
 (defn filter-sum-numeric
   "SUM with explicit BigDecimal accumulation. PG returns NUMERIC for
    SUM(int8) and SUM(numeric) to avoid overflow; this variant matches
@@ -86,13 +97,7 @@
   (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
     (if (empty? vs)
       :__null__
-      (reduce (fn [^java.math.BigDecimal acc v]
-                (.add acc (cond
-                            (instance? java.math.BigDecimal v) v
-                            (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                            (integer? v) (java.math.BigDecimal/valueOf (long v))
-                            (float? v)   (java.math.BigDecimal/valueOf (double v))
-                            :else        (java.math.BigDecimal. (str v)))))
+      (reduce (fn [^java.math.BigDecimal acc v] (.add acc (->bigdec v)))
               java.math.BigDecimal/ZERO
               vs))))
 
@@ -161,6 +166,27 @@
         (min numeric-max-display-scale)
         long)))
 
+(defn avg-numeric-of
+  "AVG over a group already reduced to its SUM and its non-null COUNT.
+
+   The numeric AVG depends on nothing else, which is what lets the
+   window engine keep a RUNNING sum over an expanding frame and still
+   get the byte-identical answer `filter-avg-numeric` gives for the
+   whole frame -- rather than recomputing the aggregate from scratch at
+   every row, or (as it did) inventing a second, double-precision AVG
+   of its own."
+  [^java.math.BigDecimal sum ^long n]
+  (if (zero? n)
+    :__null__
+    (let [n-bd (java.math.BigDecimal/valueOf n)
+          ;; The same select_div_scale port the `/` operator uses.
+          ;; This site used to carry its own AVG-specialised copy,
+          ;; with its own weight/leading-digit helpers and its own
+          ;; duplicate of the two PG constants -- two ports of one
+          ;; rule, free to drift.
+          rscale (int (div-result-scale sum n-bd))]
+      (.divide sum n-bd rscale java.math.RoundingMode/HALF_UP))))
+
 (defn filter-avg-numeric
   "AVG with BigDecimal precision. Matches PG's AVG(int*)→numeric and
    AVG(numeric)→numeric. Scale tracks PG's `select_div_scale`: at
@@ -178,27 +204,11 @@
   (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
     (if (empty? vs)
       :__null__
-      (let [sum (reduce (fn [^java.math.BigDecimal acc v]
-                          (.add acc (cond
-                                      (instance? java.math.BigDecimal v) v
-                                      (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                                      (integer? v) (java.math.BigDecimal/valueOf (long v))
-                                      (float? v)   (java.math.BigDecimal/valueOf (double v))
-                                      :else        (java.math.BigDecimal. (str v)))))
-                        java.math.BigDecimal/ZERO
-                        vs)
-            n-count (count vs)
-            n-bd (java.math.BigDecimal/valueOf (long n-count))
-            ;; The same select_div_scale port the `/` operator uses.
-            ;; This site used to carry its own AVG-specialised copy,
-            ;; with its own weight/leading-digit helpers and its own
-            ;; duplicate of the two PG constants -- two ports of one
-            ;; rule, free to drift.
-            rscale (int (div-result-scale sum n-bd))]
-        (.divide ^java.math.BigDecimal sum
-                 ^java.math.BigDecimal n-bd
-                 rscale
-                 java.math.RoundingMode/HALF_UP)))))
+      (avg-numeric-of (reduce (fn [^java.math.BigDecimal acc v]
+                                (.add acc (->bigdec v)))
+                              java.math.BigDecimal/ZERO
+                              vs)
+                      (count vs)))))
 
 (defn sql-null?
   "SQL NULL, however it is carried. NULL travels as the `:__null__`
@@ -316,6 +326,28 @@
     (nan-num? b) -1
     :else (compare a b)))
 
+(defn order-key-cmp
+  "Compare two ORDER BY key values. `dir` is :asc or :desc; `nulls` is
+   :first, :last, or nil for PostgreSQL's default -- NULLS LAST for ASC
+   and NULLS FIRST for DESC, i.e. NULL sorts as the largest value.
+
+   The null half of an ORDER BY comparator, in one place. Both the
+   server's ORDER BY fallback and the window engine's within-partition
+   sort need it, and the window copy had drifted: it pinned nulls LAST
+   in both directions and compared with `compare` rather than
+   `order-cmp`, so a DESC window ordered its NULLs the wrong end and a
+   NaN sort key left the partition silently unsorted."
+  ^long [va vb dir nulls]
+  (let [a-null? (or (nil? va) (= :__null__ va))
+        b-null? (or (nil? vb) (= :__null__ vb))
+        nulls-first? (if nulls (= nulls :first) (= dir :desc))]
+    (cond
+      (and a-null? b-null?) 0
+      a-null? (if nulls-first? -1 1)
+      b-null? (if nulls-first? 1 -1)
+      (= dir :desc) (order-cmp vb va)
+      :else (order-cmp va vb))))
+
 (defn- order-agg
   "Reduce with `order-cmp` rather than `clojure.core/min`/`max`, which are
    NUMERIC-ONLY — they cast to Number, so MIN/MAX over any other type
@@ -355,11 +387,23 @@
   [coll]
   (count (remove #(or (nil? %) (= :__null__ %)) coll)))
 
+(def filtered-out
+  "Marker for a row an aggregate FILTER excluded.
+
+   Distinct from `:__null__` because the two mean different things to the
+   aggregates that PRESERVE nulls: `array_agg(x) FILTER (WHERE p)` keeps a
+   NULL x on a row that passes p, and drops the row entirely on one that
+   does not. Every other aggregate skips nulls anyway, so it only has to
+   be told apart here."
+  ::filtered-out)
+
 (defn- box-array-agg
   "Box an ordered seq of array_agg element values (`:__null__` → nil) into a
    PgArray, inferring the element type from the first non-nil value."
   [ordered-vals]
-  (let [vs (into [] (map #(if (= :__null__ %) nil %)) ordered-vals)
+  (let [vs (into [] (comp (remove #(= filtered-out %))
+                          (map #(if (= :__null__ %) nil %)))
+                 ordered-vals)
         arr-fn pg-arr/array
         pick-type (fn [v]
                     (cond
@@ -373,7 +417,12 @@
                       :else                 :text))
         first-v (some identity vs)
         elem-type (if (some? first-v) (pick-type first-v) :text)]
-    (arr-fn elem-type vs)))
+    ;; PostgreSQL's array_agg over NO rows is NULL, not an empty array --
+    ;; which the docstring already claimed and the code did not do. Only
+    ;; visible once an aggregate could see an empty group at all: a window
+    ;; frame that excludes every row (`ROWS BETWEEN 2 PRECEDING AND 1
+    ;; PRECEDING` on the first row) or a FILTER that admits none.
+    (if (empty? vs) :__null__ (arr-fn elem-type vs))))
 
 (defn filter-array-agg
   "SQL array_agg(col) — collect all non-NULL values into a PgArray.
@@ -395,7 +444,9 @@
    NULLs are kept — PostgreSQL's jsonb_agg emits JSON null for them,
    unlike array_agg — and an empty group is SQL NULL."
   [coll]
-  (let [vs (mapv (fn [v] (if (= :__null__ v) :datahike.pg.jsonb/json-null v)) coll)]
+  (let [vs (into [] (comp (remove #(= filtered-out %))
+                          (map (fn [v] (if (= :__null__ v) :datahike.pg.jsonb/json-null v))))
+                 coll)]
     (if (empty? vs) :__null__ vs)))
 
 (defn- akey-compare
