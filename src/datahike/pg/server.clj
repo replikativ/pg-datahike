@@ -4902,93 +4902,6 @@
       :dh-delete-branch  (handle-dh-delete-branch conn parsed)
       (empty-result "OK"))))
 
-(defn- splice-correlated
-  "Assemble `n-output` columns from `visible` (non-correlation columns in
-   order) and `out-pos->val` (subquery output-position → value). Shared by
-   exec-select (row values) and describeResult (aliases / OIDs) so the
-   correlated-subquery output layout is computed identically — see
-   doc/design-alignment.md."
-  [visible out-pos->val n-output]
-  (loop [p 0, v (seq visible), out []]
-    (if (= p n-output)
-      out
-      (if (contains? out-pos->val p)
-        (recur (inc p) v (conj out (get out-pos->val p)))
-        (recur (inc p) (next v) (conj out (first v)))))))
-
-(defn- eval-corr-scalar
-  "Evaluate one SQL fragment for a deferred correlated item against `query-db`
-   with `*from-bindings*` already bound (caller sets it). `subquery?` true →
-   `sql` is a full SELECT (run as-is); false → `sql` is a bare scalar/predicate
-   expression, wrapped as `SELECT (<sql>)`. Returns the first cell, or nil on
-   error / empty."
-  [sql subquery? inner-schema query-db]
-  (try
-    (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
-          p   (sql/parse-sql run-sql inner-schema query-db)
-          q   (:query p)
-          ia  (:in-args p)
-          qdb (or (:enriched-db p) query-db)]
-      (if (nil? q)
-        ;; table-free literal collapsed to a literal row
-        (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
-        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
-              ;; An aggregate over an empty relation is still ONE row --
-              ;; `(SELECT count(*) FROM t WHERE …)` with no match is 0, not
-              ;; NULL. exec-select applies this to the top-level result; a
-              ;; scalar subquery needs it too.
-              res (or (when (empty? (seq res)) (expr/empty-aggregate-row q)) res)
-              fr  (first res)]
-          (if (sequential? fr) (first fr) fr))))
-    (catch Throwable _ nil)))
-
-(defn- eval-corr-then
-  "Evaluate a CASE branch's THEN/ELSE spec ({:subquery-sql …} | {:expr-sql …}
-   | nil → SQL NULL) with *from-bindings* bound."
-  [then-spec inner-schema query-db]
-  (cond
-    (nil? then-spec)               :__null__
-    (:subquery-sql then-spec)      (eval-corr-scalar (:subquery-sql then-spec) true inner-schema query-db)
-    :else                          (eval-corr-scalar (:expr-sql then-spec) false inner-schema query-db)))
-
-(defn- run-correlated-spec
-  "Compute the value of a deferred correlated SELECT item for one outer row.
-   `fb` is the per-row *from-bindings* the caller has built. Dispatches on the
-   spec :kind — :scalar runs the subquery directly; :case walks the branches,
-   evaluating each WHEN against fb and the first matching THEN (or ELSE)."
-  [spec fb inner-schema query-db]
-  ;; `*lateral-outer-aliases*` as well as the bindings themselves: without it
-  ;; the inner translator sees `ch.pid = p.id` as an implicit JOIN against
-  ;; the relation `p` and adds p to the inner FROM, so the correlation
-  ;; predicate vanished and every outer row got the SAME uncorrelated
-  ;; answer -- `(SELECT count(*) FROM ch WHERE ch.pid = p.id)` counted the
-  ;; whole child table. It is a filter against a per-row CONSTANT.
-  ;; The LATERAL row producer already binds this; the scalar path did not.
-  (binding [params/*from-bindings* fb
-            stmt/*eval-update-db* query-db]
-    (case (:kind spec)
-      :case
-      (let [hit (some (fn [{:keys [when-sql then]}]
-                        (when (true? (eval-corr-scalar when-sql false inner-schema query-db))
-                          [(eval-corr-then then inner-schema query-db)]))
-                      (:branches spec))]
-        (if hit (first hit) (eval-corr-then (:else spec) inner-schema query-db)))
-      ;; :scalar (and default): run the inner subquery, take first cell.
-      ;; `*lateral-outer-aliases*` ONLY for the plain scalar subquery.
-      ;; It suppresses the implicit-join branch so `ch.pid = p.id` is read
-      ;; as a filter against a per-row constant rather than a join against
-      ;; the relation `p` -- without it the correlation predicate dissolves
-      ;; and every outer row gets the same uncorrelated answer.
-      ;;
-      ;; NOT for the :case kind. That one re-parses each WHEN/THEN fragment
-      ;; per branch per outer row, and asyncpg's composite introspection
-      ;; (`CASE WHEN typtype='c' THEN (SELECT array_agg(…) …) END`) hangs
-      ;; outright under it -- test_codecs::test_composites, reproduced by
-      ;; A/B against a fresh server. The CASE path is left exactly as it
-      ;; was; correlating it is a separate problem.
-      (binding [params/*lateral-outer-aliases* (set (keys fb))]
-        (eval-corr-scalar (:inner-sql spec) true inner-schema query-db)))))
-
 (defn- null-safe-order-cmp
   "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
    is a flat [col-idx dir nulls col-idx dir nulls …] spec; nil and the
@@ -5477,34 +5390,20 @@
             ;; correlation columns bound into *from-bindings*, splice the
             ;; resulting value at its out-pos, and drop the hidden __corr_
             ;; columns. No-op when the query has no correlated subqueries.
+            ;;
+            ;; `stmt/resolve-correlated-rows`, which the derived-table
+            ;; materialiser already uses. This site used to carry a copy of
+            ;; it, on top of a copy of the four functions underneath it --
+            ;; and the copies had already drifted: the OID splice the shared
+            ;; one does here was a separate pass fifty lines below.
+            ;; `find-aliases` rather than `(:find-aliases parsed)` because
+            ;; the window and compound passes above may have extended it.
             [results find-aliases]
-            (if-let [cs (:correlated-subqueries parsed)]
-              (let [{:keys [subqueries corr-col->idx n-output]} cs
-                    inner-schema (dbi/-schema query-db)
-                    corr-idx-set (set (vals corr-col->idx))
-                    visible-idxs (vec (remove corr-idx-set (range (count find-aliases))))
-                    out-pos->subq (into {} (map (juxt :out-pos identity)) subqueries)
-                    run-subq
-                    (fn [subq rv]
-                      (let [fb (reduce (fn [m [a c]]
-                                         (assoc-in m [a c] (nth rv (get corr-col->idx [a c]) nil)))
-                                       {} (:corr-refs subq))]
-                        (run-correlated-spec subq fb inner-schema query-db)))
-                    new-results
-                    (mapv (fn [row]
-                            (let [rv (if (sequential? row) (vec row) [row])
-                                  vis (mapv #(nth rv % nil) visible-idxs)
-                                  subq-vals (into {} (map (fn [[op sq]] [op (run-subq sq rv)]))
-                                                  out-pos->subq)]
-                              (splice-correlated vis subq-vals n-output)))
-                          results)
-                    visible-aliases (mapv #(nth find-aliases %) visible-idxs)
-                    new-aliases (splice-correlated
-                                 visible-aliases
-                                 (into {} (map (fn [[op sq]] [op (:alias sq)])) out-pos->subq)
-                                 n-output)]
-                [new-results new-aliases])
-              [results find-aliases])
+            (let [[rs as] (stmt/resolve-correlated-rows
+                           sql/parse-sql
+                           (assoc parsed :find-aliases find-aliases)
+                           results query-db (dbi/-schema query-db))]
+              [rs as])
             ;; Apply DISTINCT deduplication for aggregate queries
             results (if (and has-distinct? has-aggregates?)
                       (distinct results)
@@ -7082,14 +6981,14 @@
                         vis-idxs (vec (remove corr-idx-set (range (count aliases))))
                         vis-aliases (mapv #(nth aliases %) vis-idxs)
                         vis-oids (mapv #(aget ^ints oids %) vis-idxs)
-                        a (splice-correlated vis-aliases
-                                             (into {} (map (fn [s] [(:out-pos s) (:alias s)])) subqueries)
-                                             n-output)
-                        o (splice-correlated vis-oids
-                                             (into {} (map (fn [s] [(:out-pos s)
-                                                                    (int (or (:oid s) PgWireServer/OID_TEXT))]))
-                                                   subqueries)
-                                             n-output)]
+                        a (stmt/correlated-splice vis-aliases
+                                                  (into {} (map (fn [s] [(:out-pos s) (:alias s)])) subqueries)
+                                                  n-output)
+                        o (stmt/correlated-splice vis-oids
+                                                  (into {} (map (fn [s] [(:out-pos s)
+                                                                         (int (or (:oid s) PgWireServer/OID_TEXT))]))
+                                                        subqueries)
+                                                  n-output)]
                     [a (int-array (map int o))])
                   [aliases oids])
                 sources (compute-column-sources parsed db)

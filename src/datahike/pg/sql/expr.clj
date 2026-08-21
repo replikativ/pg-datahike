@@ -2425,15 +2425,6 @@
     / datahike.pg.sql/sql-div
     rem datahike.pg.sql/sql-mod})
 
-(defn- oid-env
-  "The environment `oid-infer/expr-oid` needs, pulled off a translation ctx."
-  [ctx]
-  {:db            (:db ctx)
-   :schema        (:schema ctx)
-   :table-aliases (:table-aliases ctx)
-   :default-table (:default-table ctx)
-   :hints         (:hints ctx)})
-
 (defn- int-arith-width
   "The declared integer width this arithmetic node must be checked at,
    or nil when no integer width governs it.
