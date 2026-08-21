@@ -4933,6 +4933,11 @@
         ;; table-free literal collapsed to a literal row
         (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
         (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+              ;; An aggregate over an empty relation is still ONE row --
+              ;; `(SELECT count(*) FROM t WHERE …)` with no match is 0, not
+              ;; NULL. exec-select applies this to the top-level result; a
+              ;; scalar subquery needs it too.
+              res (or (when (empty? (seq res)) (expr/empty-aggregate-row q)) res)
               fr  (first res)]
           (if (sequential? fr) (first fr) fr))))
     (catch Throwable _ nil)))
@@ -4952,6 +4957,13 @@
    spec :kind — :scalar runs the subquery directly; :case walks the branches,
    evaluating each WHEN against fb and the first matching THEN (or ELSE)."
   [spec fb inner-schema query-db]
+  ;; `*lateral-outer-aliases*` as well as the bindings themselves: without it
+  ;; the inner translator sees `ch.pid = p.id` as an implicit JOIN against
+  ;; the relation `p` and adds p to the inner FROM, so the correlation
+  ;; predicate vanished and every outer row got the SAME uncorrelated
+  ;; answer -- `(SELECT count(*) FROM ch WHERE ch.pid = p.id)` counted the
+  ;; whole child table. It is a filter against a per-row CONSTANT.
+  ;; The LATERAL row producer already binds this; the scalar path did not.
   (binding [params/*from-bindings* fb
             stmt/*eval-update-db* query-db]
     (case (:kind spec)
@@ -4962,7 +4974,20 @@
                       (:branches spec))]
         (if hit (first hit) (eval-corr-then (:else spec) inner-schema query-db)))
       ;; :scalar (and default): run the inner subquery, take first cell.
-      (eval-corr-scalar (:inner-sql spec) true inner-schema query-db))))
+      ;; `*lateral-outer-aliases*` ONLY for the plain scalar subquery.
+      ;; It suppresses the implicit-join branch so `ch.pid = p.id` is read
+      ;; as a filter against a per-row constant rather than a join against
+      ;; the relation `p` -- without it the correlation predicate dissolves
+      ;; and every outer row gets the same uncorrelated answer.
+      ;;
+      ;; NOT for the :case kind. That one re-parses each WHEN/THEN fragment
+      ;; per branch per outer row, and asyncpg's composite introspection
+      ;; (`CASE WHEN typtype='c' THEN (SELECT array_agg(…) …) END`) hangs
+      ;; outright under it -- test_codecs::test_composites, reproduced by
+      ;; A/B against a fresh server. The CASE path is left exactly as it
+      ;; was; correlating it is a separate problem.
+      (binding [params/*lateral-outer-aliases* (set (keys fb))]
+        (eval-corr-scalar (:inner-sql spec) true inner-schema query-db)))))
 
 (defn- null-safe-order-cmp
   "Row comparator for the server-side ORDER BY fallback. `sql-order-by`
@@ -5286,20 +5311,11 @@
                                            (and (seq? elem)
                                                 (symbol? (first elem))))
                                          find-elems))
-            results (if (and has-aggregates?
-                             all-aggregates?
-                             (empty? (seq results)))
-                      (let [default-row (mapv (fn [elem]
-                                                (let [agg-name (name (first elem))]
-                                                  (if (or (= agg-name "count")
-                                                          (= agg-name "count-distinct")
-                                                          (= agg-name "filter-count")
-                                                          (= agg-name "filter-count-distinct"))
-                                                    0
-                                                    nil)))
-                                              find-elems)]
-                        [default-row])
-                      results)
+            results (or (when (and has-aggregates?
+                                   all-aggregates?
+                                   (empty? (seq results)))
+                          (expr/empty-aggregate-row query))
+                        results)
             ;; Server-side null-safe sort (when ORDER BY has nullable columns).
             ;; With LIMIT n (+ OFFSET o) only the first n+o sorted rows are
             ;; ever emitted, so a bounded top-k selection replaces the full

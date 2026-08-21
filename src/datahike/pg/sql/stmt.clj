@@ -1609,7 +1609,11 @@
           q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
       (if (nil? q)
         (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
-        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb)) fr (first res)]
+        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+              ;; Same rule as the server-side twin: an aggregate over an
+              ;; empty relation is still ONE row.
+              res (or (when (empty? (seq res)) (expr/empty-aggregate-row q)) res)
+              fr (first res)]
           (if (sequential? fr) (first fr) fr))))
     (catch Throwable _ nil)))
 
@@ -1625,6 +1629,8 @@
   "Value of a deferred correlated SELECT item for one outer row. `fb` is the
    per-row *from-bindings*. :scalar runs the subquery; :case walks branches."
   [parse-fn spec fb inner-schema query-db]
+  ;; See the server-side twin: without *lateral-outer-aliases* the inner
+  ;; translator turns the correlation predicate into an implicit JOIN.
   (binding [params/*from-bindings* fb
             *eval-update-db* query-db]
     (case (:kind spec)
@@ -1634,7 +1640,10 @@
                           [(eval-corr-then parse-fn then inner-schema query-db)]))
                       (:branches spec))]
         (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
-      (eval-corr-scalar parse-fn (:inner-sql spec) true inner-schema query-db))))
+      ;; Scalar only -- see the server-side twin for why the :case path is
+      ;; deliberately left alone.
+      (binding [params/*lateral-outer-aliases* (set (keys fb))]
+        (eval-corr-scalar parse-fn (:inner-sql spec) true inner-schema query-db)))))
 
 (defn resolve-correlated-rows
   "Resolve a parsed SELECT's deferred correlated subqueries against raw result

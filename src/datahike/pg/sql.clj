@@ -1420,6 +1420,13 @@
                                                                      rows (if (seq inner-in-args)
                                                                             (apply q-fn inner-query cte-db inner-in-args)
                                                                             (q-fn inner-query cte-db))
+                                                                    ;; An aggregate over an empty relation is
+                                                                    ;; still ONE row -- see
+                                                                    ;; expr/empty-aggregate-row. The table-free
+                                                                    ;; folder is a THIRD consumer of that rule.
+                                                                     rows (or (when (empty? (seq rows))
+                                                                                (expr/empty-aggregate-row inner-query))
+                                                                              rows)
                                                                      first-row (first rows)
                                                                      v (if (sequential? first-row) (first first-row) first-row)]
                                                                  (if (or (nil? v) (= :__null__ v)) :__null__ v))
