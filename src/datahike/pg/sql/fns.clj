@@ -894,7 +894,10 @@
    is NULL only when every input is. Wrapping them short-circuited to
    NULL before their own implementation ever ran, so `greatest(NULL, 5)`
    answered NULL instead of 5."
-  #{"greatest" "least"})
+  #{"greatest" "least"
+    ;; quote_nullable's whole purpose is to render a NULL as the text
+    ;; "NULL"; wrapping it in null-safe short-circuited it to NULL.
+    "quote_nullable"})
 
 (defn- min-max-skipping-nulls
   "GREATEST / LEAST. See the note at their entries in the function table:
@@ -905,6 +908,34 @@
     (if (empty? vals)
       :__null__
       (reduce (fn [a b] (if (better? b a) b a)) vals))))
+
+(defn sql-between?
+  "`v BETWEEN lo AND hi` in PREDICATE position: `lo <= v AND v <= hi`,
+   Through the Kleene AND, so a NULL bound does NOT simply make it false:
+   `1 BETWEEN 3 AND NULL` is FALSE (the first conjunct settles it), while
+   `1 BETWEEN 0 AND NULL` is UNKNOWN. WHERE keeps only TRUE either way.
+
+   A single predicate rather than a pair of clauses so that NOT BETWEEN
+   can be its complement without a disjunction -- see `sql-not-between?`
+   -- and through sql-le? rather than clojure.core's `<=`, which is not
+   NaN-aware."
+  [v lo hi]
+  (true? (sql-and3 (sql-le3? lo v) (sql-le3? v hi))))
+
+(defn sql-not-between?
+  "`v NOT BETWEEN lo AND hi`, i.e. the Kleene NOT of `sql-between?`.
+
+   Rejecting any NULL operand outright would be wrong: `1 NOT BETWEEN 3
+   AND NULL` is TRUE, because `1 >= 3` is already FALSE and FALSE AND
+   UNKNOWN is FALSE, whose negation is TRUE.
+
+   Emitted as one predicate because the obvious `(or [(< v lo)]
+   [(> v hi)])` is invalid datalog whenever lo and hi are different
+   variables -- the two branches then bind different var sets, and
+   `id NOT BETWEEN 0 AND i` raised \"Join variable not declared inside
+   clauses\"."
+  [v lo hi]
+  (true? (sql-not3 (sql-and3 (sql-le3? lo v) (sql-le3? v hi)))))
 
 (defn sql-not-distinct?
   "`a IS NOT DISTINCT FROM b`. A named function rather than
@@ -1615,9 +1646,341 @@
   "Return last n characters of string."
   [s n] (let [s (str s) n (long n)] (subs s (max 0 (- (count s) n)))))
 
+(defn- ->s ^String [v] (str v))
+
+(defn- nullable-str
+  "Lift a 1-string-argument function to SQL strictness.
+
+   The table-dispatched functions get this from `null-safe` at the call
+   site, but the ones reached from a dedicated AST node -- TRIM, EXTRACT,
+   SUBSTRING -- are emitted as a direct datalog clause and bypass it, so
+   the `:__null__` sentinel reached `str` and `trim(s)` returned the
+   literal text \":__null__\"."
+  [f]
+  (fn [& args] (if (some sql-null? args) :__null__ (apply f args))))
+
+(defn sql-ascii
+  "First character's code point, 0 for the empty string (varlena.c ascii)."
+  [s]
+  (let [^String t (->s s)] (if (zero? (.length t)) 0 (long (.codePointAt t 0)))))
+
+(defn sql-chr
+  "Character with the given code point. PostgreSQL rejects 0 outright
+   (chr(0) is not a valid text character)."
+  [n]
+  (let [n (long n)]
+    (when (zero? n)
+      (throw (ex-info "null character not permitted"
+                      {:error :program-limit-exceeded
+                       :message "null character not permitted"})))
+    (String. (Character/toChars (int n)))))
+
+(defn- trim-set
+  "Trim any leading/trailing character that appears in `chars`. PostgreSQL's
+   btrim/ltrim/rtrim take a SET of characters, not a prefix to strip."
+  [^String t ^String chars left? right?]
+  (let [cs (set chars)
+        n (.length t)
+        lo (if left?
+             (loop [i 0] (if (and (< i n) (cs (.charAt t i))) (recur (inc i)) i))
+             0)
+        hi (if right?
+             (loop [i n] (if (and (> i lo) (cs (.charAt t (dec i)))) (recur (dec i)) i))
+             n)]
+    (subs t lo hi)))
+
+(def sql-btrim
+  (nullable-str (fn ([s] (str/trim (->s s)))
+                  ([s chars] (trim-set (->s s) (->s chars) true true)))))
+
+(def sql-ltrim
+  (nullable-str (fn ([s] (str/triml (->s s)))
+                  ([s chars] (trim-set (->s s) (->s chars) true false)))))
+
+(def sql-rtrim
+  (nullable-str (fn ([s] (str/trimr (->s s)))
+                  ([s chars] (trim-set (->s s) (->s chars) false true)))))
+
+(defn sql-md5
+  "MD5 as a lowercase hex string, as PostgreSQL's md5() returns."
+  [s]
+  (let [d (.digest (java.security.MessageDigest/getInstance "MD5")
+                   (.getBytes (->s s) java.nio.charset.StandardCharsets/UTF_8))]
+    (apply str (map #(format "%02x" %) d))))
+
+(defn sql-starts-with [s prefix] (.startsWith (->s s) (->s prefix)))
+
+(defn sql-split-part
+  "`split_part(string, delimiter, n)`. n is 1-based; a NEGATIVE n counts
+   from the END. Out of range yields the empty string, not NULL."
+  [s delim n]
+  (let [parts (str/split (->s s) (java.util.regex.Pattern/compile
+                                  (java.util.regex.Pattern/quote (->s delim)))
+                         -1)
+        cnt (count parts)
+        n (long n)]
+    (when (zero? n)
+      (throw (ex-info "field position must not be zero"
+                      {:error :invalid-parameter-value
+                       :message "field position must not be zero"})))
+    (let [idx (if (pos? n) (dec n) (+ cnt n))]
+      (if (or (neg? idx) (>= idx cnt)) "" (nth parts idx)))))
+
+(defn sql-translate
+  "Replace each character of `from` with the character at the same
+   position in `to`; characters of `from` with no counterpart are DELETED."
+  [s from to]
+  (let [^String t (->s s) ^String f (->s from) ^String r (->s to)
+        sb (StringBuilder.)]
+    (dotimes [i (.length t)]
+      (let [c (.charAt t i)
+            j (.indexOf f (int c))]
+        (cond
+          (neg? j)          (.append sb c)
+          (< j (.length r)) (.append sb (.charAt r j))
+          :else             nil)))          ; no counterpart -> dropped
+    (.toString sb)))
+
+(defn sql-overlay
+  "`overlay(string placing new from start [for count])`. `count` defaults
+   to the LENGTH OF THE REPLACEMENT, not to the rest of the string."
+  ([s new start] (sql-overlay s new start (count (->s new))))
+  ([s new start cnt]
+   (let [^String t (->s s)
+         n (.length t)
+         start (long start)
+         cnt (long cnt)
+         lo (max 0 (dec start))
+         hi (min n (max lo (+ lo (max 0 cnt))))]
+     (str (subs t 0 (min lo n)) (->s new) (subs t hi)))))
+
+(defn sql-quote-ident
+  "Double-quote an identifier only when it needs it -- PostgreSQL leaves a
+   plain lowercase identifier bare (quote_ident in ruleutils.c)."
+  [s]
+  (let [^String t (->s s)]
+    (if (and (seq t)
+             (re-matches #"[a-z_][a-z_0-9$]*" t)
+             (not (contains? #{"select" "from" "where" "table" "user" "order" "group"
+                               "and" "or" "not" "null" "true" "false"} t)))
+      t
+      (str \" (str/replace t "\"" "\"\"") \"))))
+
+(defn sql-quote-literal [v]
+  (if (sql-null? v)
+    :__null__
+    (str \' (str/replace (->s v) "'" "''") \')))
+
+(defn sql-quote-nullable
+  "Like quote_literal, but a NULL becomes the unquoted string NULL."
+  [v]
+  (if (sql-null? v) "NULL" (sql-quote-literal v)))
+
+(defn sql-to-hex [n] (Long/toHexString (long n)))
+
+(defn- re-flags->int
+  "PostgreSQL's single-letter regex flags -> java.util.regex bit flags.
+   `g` (global) is not a compile flag; the callers that honour it read it
+   from the string themselves."
+  [flags]
+  (let [f (str (when (sql-null? flags) "") (when-not (sql-null? flags) flags))]
+    (cond-> 0
+      (str/includes? f "i") (bit-or java.util.regex.Pattern/CASE_INSENSITIVE)
+      (str/includes? f "m") (bit-or java.util.regex.Pattern/MULTILINE)
+      (str/includes? f "n") (bit-or java.util.regex.Pattern/MULTILINE)
+      (str/includes? f "x") (bit-or java.util.regex.Pattern/COMMENTS))))
+
+(defn- re-compile ^java.util.regex.Pattern [pattern flags]
+  (java.util.regex.Pattern/compile (str pattern) (re-flags->int flags)))
+
+(defn- pg-replacement->java
+  "PostgreSQL writes capture references as `\\1`..`\\9` and the whole match
+   as `\\&`; java.util.regex wants `$1` and `$0`. A literal `\\\\` stays one
+   backslash, and `$` in the replacement must be escaped so Java does not
+   read it as a group reference."
+  [^String r]
+  (let [sb (StringBuilder.)
+        n (.length r)]
+    (loop [i 0]
+      (if (>= i n)
+        (.toString sb)
+        (let [c (.charAt r i)]
+          (cond
+            (and (= c \\) (< (inc i) n))
+            (let [d (.charAt r (inc i))]
+              (cond
+                (Character/isDigit d) (do (.append sb "$") (.append sb d) (recur (+ i 2)))
+                (= d \&)              (do (.append sb "$0") (recur (+ i 2)))
+                (= d \\)              (do (.append sb "\\\\") (recur (+ i 2)))
+                :else                 (do (.append sb d) (recur (+ i 2)))))
+            (= c \$) (do (.append sb "\\$") (recur (inc i)))
+            :else    (do (.append sb c) (recur (inc i)))))))))
+
+(defn sql-regexp-replace
+  "`regexp_replace(string, pattern, replacement [, flags])`. Replaces only
+   the FIRST match unless the `g` flag is given -- the opposite of most
+   languages' default, and the usual source of surprise."
+  ([s pattern repl] (sql-regexp-replace s pattern repl nil))
+  ([s pattern repl flags]
+   (if (or (sql-null? s) (sql-null? pattern) (sql-null? repl))
+     :__null__
+     (let [m (.matcher (re-compile pattern flags) (str s))
+           r (pg-replacement->java (str repl))]
+       (if (str/includes? (str (when-not (sql-null? flags) flags)) "g")
+         (.replaceAll m r)
+         (.replaceFirst m r))))))
+
+(defn sql-regexp-like
+  "`regexp_like(string, pattern [, flags])` -- a partial match, as `~` is."
+  ([s pattern] (sql-regexp-like s pattern nil))
+  ([s pattern flags]
+   (if (or (sql-null? s) (sql-null? pattern))
+     :__null__
+     (.find (.matcher (re-compile pattern flags) (str s))))))
+
+(defn sql-regexp-count
+  "`regexp_count(string, pattern [, start [, flags]])` -- non-overlapping
+   matches at or after the 1-based `start`."
+  ([s pattern] (sql-regexp-count s pattern 1 nil))
+  ([s pattern start] (sql-regexp-count s pattern start nil))
+  ([s pattern start flags]
+   (if (or (sql-null? s) (sql-null? pattern))
+     :__null__
+     (let [^String t (str s)
+           from (max 0 (dec (long (if (sql-null? start) 1 start))))]
+       (if (> from (.length t))
+         0
+         (let [m (.matcher (re-compile pattern flags) t)]
+           (.region m from (.length t))
+           (loop [c 0] (if (.find m) (recur (inc c)) c))))))))
+
+(defn- nth-match
+  "The java Matcher positioned on the Nth match at or after `start`, or nil."
+  [s pattern start n flags]
+  (let [^String t (str s)
+        from (max 0 (dec (long (if (sql-null? start) 1 start))))
+        n (long (if (sql-null? n) 1 n))]
+    (when (<= from (.length t))
+      (let [m (.matcher (re-compile pattern flags) t)]
+        (.region m from (.length t))
+        (loop [i 1]
+          (when (.find m)
+            (if (= i n) m (recur (inc i)))))))))
+
+(defn sql-regexp-substr
+  "`regexp_substr(string, pattern [, start [, N [, flags]]])` -- the Nth
+   match's text, NULL when there is no Nth match."
+  ([s pattern] (sql-regexp-substr s pattern 1 1 nil))
+  ([s pattern start] (sql-regexp-substr s pattern start 1 nil))
+  ([s pattern start n] (sql-regexp-substr s pattern start n nil))
+  ([s pattern start n flags]
+   (if (or (sql-null? s) (sql-null? pattern))
+     :__null__
+     (if-let [m (nth-match s pattern start n flags)] (.group m) :__null__))))
+
+(defn sql-regexp-instr
+  "`regexp_instr(string, pattern [, start [, N [, endoption [, flags]]]])`
+   -- the 1-based position of the Nth match, 0 when there is none.
+   `endoption` 1 asks for the position AFTER the match."
+  ([s pattern] (sql-regexp-instr s pattern 1 1 0 nil))
+  ([s pattern start] (sql-regexp-instr s pattern start 1 0 nil))
+  ([s pattern start n] (sql-regexp-instr s pattern start n 0 nil))
+  ([s pattern start n endoption] (sql-regexp-instr s pattern start n endoption nil))
+  ([s pattern start n endoption flags]
+   (if (or (sql-null? s) (sql-null? pattern))
+     :__null__
+     (if-let [m (nth-match s pattern start n flags)]
+       (if (and (not (sql-null? endoption)) (= 1 (long endoption)))
+         (inc (.end m))
+         (inc (.start m)))
+       0))))
+
+(defn- ->zdt ^java.time.ZonedDateTime [v]
+  (cond
+    (instance? java.util.Date v)          (.atZone (.toInstant ^java.util.Date v) java.time.ZoneOffset/UTC)
+    (instance? java.time.Instant v)       (.atZone ^java.time.Instant v java.time.ZoneOffset/UTC)
+    (instance? java.time.LocalDate v)     (.atStartOfDay ^java.time.LocalDate v java.time.ZoneOffset/UTC)
+    (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    :else nil))
+
+(defn sql-extract
+  "`EXTRACT(field FROM value)` / `date_part(field, value)`. PostgreSQL
+   returns NUMERIC, so the result is a BigDecimal -- `extract(epoch …)`
+   carries sub-second digits, and an integer-typed result would drop them."
+  [field v]
+  (if (or (sql-null? field) (sql-null? v))
+    :__null__
+    (let [f (str/lower-case (str/replace (str field) #"^'|'$" ""))
+          zdt (->zdt v)]
+      (if (nil? zdt)
+        :__null__
+        (let [n (case f
+                  ("year" "years" "y")      (.getYear zdt)
+                  ("month" "months" "mon")  (.getMonthValue zdt)
+                  ("day" "days" "d")        (.getDayOfMonth zdt)
+                  ("hour" "hours" "h")      (.getHour zdt)
+                  ("minute" "minutes" "min") (.getMinute zdt)
+                  "second"                  (+ (.getSecond zdt)
+                                               (/ (double (.getNano zdt)) 1e9))
+                  "milliseconds"            (+ (* 1000.0 (.getSecond zdt))
+                                               (/ (double (.getNano zdt)) 1e6))
+                  "microseconds"            (+ (* 1000000.0 (.getSecond zdt))
+                                               (/ (double (.getNano zdt)) 1e3))
+                  "quarter"                 (inc (quot (dec (.getMonthValue zdt)) 3))
+                  ;; PostgreSQL's dow is 0=Sunday; java.time is 1=Monday..7=Sunday.
+                  "dow"                     (mod (.getValue (.getDayOfWeek zdt)) 7)
+                  "isodow"                  (.getValue (.getDayOfWeek zdt))
+                  "doy"                     (.getDayOfYear zdt)
+                  "epoch"                   (+ (double (.toEpochSecond zdt))
+                                               (/ (double (.getNano zdt)) 1e9))
+                  "week"                    (.get zdt (.weekOfWeekBasedYear
+                                                       java.time.temporal.WeekFields/ISO))
+                  "isoyear"                 (.get zdt (.weekBasedYear
+                                                       java.time.temporal.WeekFields/ISO))
+                  "decade"                  (quot (.getYear zdt) 10)
+                  "century"                 (quot (+ (.getYear zdt) 99) 100)
+                  "millennium"              (quot (+ (.getYear zdt) 999) 1000)
+                  (throw (ex-info (str "unit \"" f "\" not recognized")
+                                  {:error :invalid-parameter-value
+                                   :message (str "unit \"" f "\" not recognized")})))]
+          (if (integer? n)
+            (java.math.BigDecimal/valueOf (long n))
+            (java.math.BigDecimal/valueOf (double n))))))))
+
+(defn sql-substring
+  "PostgreSQL's `substring(str, start [, len])` (text_substring in
+   varlena.c). Positions are 1-based, and a range reaching outside the
+   string is CLAMPED rather than an error: `substring('abc', 0, 2)` is
+   'a', because the window covers positions 0 and 1 and only position 1
+   exists. A negative length IS an error.
+
+   NULL in, NULL out -- the `:__null__` sentinel would otherwise reach
+   `subs` and raise a raw ClassCastException on the Keyword."
+  ([s start] (sql-substring s start nil))
+  ([s start len]
+   (if (or (sql-null? s) (sql-null? start) (and (some? len) (sql-null? len)))
+     :__null__
+     (let [^String st (str s)
+           n (.length st)
+           start (long start)
+           _ (when (and len (neg? (long len)))
+               (throw (ex-info "negative substring length not allowed"
+                               {:error :invalid-parameter-value
+                                :message "negative substring length not allowed"})))
+           ;; Half-open window [start, start+len) in 1-based positions.
+           to (if len (+ start (long len)) (inc n))
+           lo (max 1 start)
+           hi (min (inc n) to)]
+       (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))
+
 (defn sql-position
-  "Return 1-based position of substring in string, 0 if not found."
-  [substring string]
+  "1-based position of `substring` in `string`, 0 if not found.
+
+   Argument order is PostgreSQL's textpos(str, search_str) -- the STRING
+   first. The `position(sub IN str)` syntax reads the other way round, but
+   gram.y swaps the operands before they reach the function, so the SQL
+   form is handled at the call site (see translate-function-call)."
+  [string substring]
   (let [idx (.indexOf (str string) (str substring))]
     (if (neg? idx) 0 (inc idx))))
 
@@ -2331,9 +2694,12 @@
    "floor"    (special-passthrough #(Math/floor (double %)))
    "ceil"     (special-passthrough #(Math/ceil (double %)))
    "ceiling"  #(Math/ceil (double %))
-   "trim"     str/trim
-   "ltrim"    str/triml
-   "rtrim"    str/trimr
+   ;; The 2-argument forms take a SET OF CHARACTERS to strip, not a
+   ;; prefix -- and str/triml takes only one argument, so `ltrim(s, 'ab')`
+   ;; raised a raw ArityException.
+   "trim"     sql-btrim
+   "ltrim"    sql-ltrim
+   "rtrim"    sql-rtrim
    "replace"  str/replace
    ;; Not clojure.core/max|min: those are numeric-only and threw a raw
    ;; ClassCastException on `greatest('a','b')` or two dates. Unlike
@@ -2440,8 +2806,30 @@
    "char_length"  sql-length
    "octet_length" sql-octet-length
    "bit_length"   sql-bit-length
+   ;; `position(sub IN str)` swaps its operands at the PARSER (gram.y), so
+   ;; the FUNCTION takes (string, substring) -- same as strpos, which shares
+   ;; textpos with it in varlena.c. We had both pointing at a
+   ;; (substring, string) implementation, so `strpos('abc','b')` answered 0.
    "position"     sql-position
    "strpos"       sql-position
+   "ascii"        sql-ascii
+   "date_part"    sql-extract
+   "regexp_replace" sql-regexp-replace
+   "regexp_like"    sql-regexp-like
+   "regexp_count"   sql-regexp-count
+   "regexp_substr"  sql-regexp-substr
+   "regexp_instr"   sql-regexp-instr
+   "chr"          sql-chr
+   "btrim"        sql-btrim
+   "md5"          sql-md5
+   "starts_with"  sql-starts-with
+   "split_part"   sql-split-part
+   "translate"    sql-translate
+   "overlay"      sql-overlay
+   "quote_ident"  sql-quote-ident
+   "quote_literal" sql-quote-literal
+   "quote_nullable" sql-quote-nullable
+   "to_hex"       sql-to-hex
    "pg_is_in_recovery"        pg-is-in-recovery
    "acldefault"               acldefault
    "pg_table_is_visible"      pg-table-is-visible
@@ -2544,6 +2932,14 @@
    "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
    "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}
    "left"     #{2} "right" #{2} "position" #{2} "strpos" #{2}
+   "ascii"    #{1} "chr" #{1} "md5" #{1} "to_hex" #{1}
+   "btrim"    #{1 2} "starts_with" #{2} "split_part" #{3} "translate" #{3}
+   "ltrim"    #{1 2} "rtrim" #{1 2} "trim" #{1 2}
+   "date_part" #{2}
+   "regexp_replace" #{3 4} "regexp_like" #{2 3} "regexp_count" #{2 3 4}
+   "regexp_substr"  #{2 3 4 5} "regexp_instr" #{2 3 4 5 6}
+   "overlay"  #{3 4}
+   "quote_ident" #{1} "quote_literal" #{1} "quote_nullable" #{1}
    "repeat"   #{2}
    "lpad"     #{2 3} "rpad" #{2 3}})
 
