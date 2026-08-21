@@ -1554,6 +1554,37 @@
                      args)))
     form))
 
+(defn like-pattern->regex
+  "Compile a SQL LIKE pattern to a java.util.regex.Pattern.
+
+   `%` is `.*`, `_` is `.`, everything else is quoted, and `escape`
+   (default `\\`) escapes the next character. Anchored at both ends,
+   because LIKE matches the WHOLE string.
+
+   Public and shared: the UPDATE SET condition evaluator needs exactly this
+   compilation, and adding a third copy of it beside the two already in
+   this namespace is how the LIKE branches drift apart."
+  ([pattern case-insensitive?] (like-pattern->regex pattern case-insensitive? \\))
+  ([pattern case-insensitive? ^Character escape]
+   (let [^String pat-str (str pattern)
+         re-sb (StringBuilder. "^")]
+     (loop [i 0]
+       (when (< i (count pat-str))
+         (let [c (.charAt pat-str i)]
+           (if (= c (.charValue escape))
+             (if (< (inc i) (count pat-str))
+               (do (.append re-sb (java.util.regex.Pattern/quote
+                                   (str (.charAt pat-str (inc i)))))
+                   (recur (+ i 2)))
+               (recur (inc i)))
+             (case c
+               \% (do (.append re-sb ".*") (recur (inc i)))
+               \_ (do (.append re-sb ".") (recur (inc i)))
+               (do (.append re-sb (java.util.regex.Pattern/quote (str c)))
+                   (recur (inc i))))))))
+     (.append re-sb "$")
+     (re-pattern (cond->> (str re-sb) case-insensitive? (str "(?i)"))))))
+
 (defn- any-all-op-fn
   "Runtime `x <op> ANY(arr)` / `x <op> ALL(arr)`.
 
@@ -1830,29 +1861,10 @@
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           pattern (translate-expr ctx (.getRightExpression e))
-          pat-str (str pattern)
           ^Character esc (or (when-let [c (.getEscape e)]
                                (when-not (str/blank? (str c)) (Character/valueOf (char (first (str c))))))
                              (Character/valueOf \\))
-          re-sb (StringBuilder. "^")
-          _ (loop [i 0]
-              (when (< i (count pat-str))
-                (let [c (.charAt ^String pat-str i)]
-                  (if (= c (.charValue esc))
-                    (if (< (inc i) (count pat-str))
-                      (let [next-c (.charAt ^String pat-str (inc i))]
-                        (.append re-sb (java.util.regex.Pattern/quote (str next-c)))
-                        (recur (+ i 2)))
-                      (recur (inc i)))
-                    (case c
-                      \% (do (.append re-sb ".*") (recur (inc i)))
-                      \_ (do (.append re-sb ".") (recur (inc i)))
-                      (do (.append re-sb (java.util.regex.Pattern/quote (str c)))
-                          (recur (inc i))))))))
-          _ (.append re-sb "$")
-          re-str (str re-sb)
-          re-str (if case-insensitive? (str "(?i)" re-str) re-str)
-          re-obj (re-pattern re-str)
+          re-obj (like-pattern->regex pattern case-insensitive? esc)
           base (list 'datahike.pg.sql/sql-like3? col re-obj)]
       (if not-like? (list 'datahike.pg.sql/sql-not3 base) base))
 

@@ -63,10 +63,14 @@
             Alias Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis SignedExpression CastExpression
             JsonExpression TimezoneExpression TimeKeyExpression ArrayConstructor JdbcParameter
-            CaseExpression WhenClause RowConstructor]
+            CaseExpression WhenClause RowConstructor
+            NotExpression ExtractExpression TrimFunction ArrayExpression]
+           [net.sf.jsqlparser.expression.operators.arithmetic
+            Modulo BitwiseAnd BitwiseOr BitwiseXor]
            [net.sf.jsqlparser.expression.operators.relational
             GreaterThan GreaterThanEquals MinorThan MinorThanEquals
-            EqualsTo NotEqualsTo IsNullExpression
+            EqualsTo NotEqualsTo IsNullExpression Between LikeExpression
+            InExpression JsonOperator
             ParenthesedExpressionList]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
@@ -5126,6 +5130,26 @@
          (catch Exception _ x))
     x))
 
+(defn- temporal-value?
+  "A stored date/timestamp. Dates come back as java.util.Date from the
+   :db.type/instant attribute; the java.time types appear via casts."
+  [v]
+  (or (instance? java.util.Date v)
+      (instance? java.time.LocalDate v)
+      (instance? java.time.LocalDateTime v)
+      (instance? java.time.Instant v)))
+
+(defn- shift-days
+  "`date + n` / `date - n`: shift by n DAYS, preserving the value's type."
+  [v ^long n]
+  (cond
+    (instance? java.time.LocalDate v)     (.plusDays ^java.time.LocalDate v n)
+    (instance? java.time.LocalDateTime v) (.plusDays ^java.time.LocalDateTime v n)
+    (instance? java.time.Instant v)       (.plus ^java.time.Instant v n java.time.temporal.ChronoUnit/DAYS)
+    (instance? java.util.Date v)
+    (java.util.Date/from (.plus (.toInstant ^java.util.Date v) n java.time.temporal.ChronoUnit/DAYS))
+    :else nil))
+
 (defn eval-update-cond
   "Evaluate a boolean expression in UPDATE SET position -- the tests of a
    CASE. Three-valued: returns true / false / :__null__, so the caller can
@@ -5164,7 +5188,60 @@
       (instance? MinorThanEquals expr)
       (fns/sql-le3? (ev (.getLeftExpression ^MinorThanEquals expr)) (ev (.getRightExpression ^MinorThanEquals expr)))
       (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
-      :else (let [v (ev expr)] (if (nil? v) :__null__ (boolean v))))))
+
+      ;; The predicate surface eval-update-expr does not itself decide.
+      ;; These all have three-valued implementations already.
+      (instance? Between expr)
+      (let [^Between b expr
+            v (ev (.getLeftExpression b))]
+        (if (.isNot b)
+          (fns/sql-not-between? v (ev (.getBetweenExpressionStart b)) (ev (.getBetweenExpressionEnd b)))
+          (fns/sql-between? v (ev (.getBetweenExpressionStart b)) (ev (.getBetweenExpressionEnd b)))))
+
+      (instance? LikeExpression expr)
+      (let [^LikeExpression l expr
+            v (ev (.getLeftExpression l))
+            pat (ev (.getRightExpression l))
+            r (fns/sql-like3? v (expr/like-pattern->regex (str pat) (.isCaseInsensitive l)))]
+        (if (.isNot l) (fns/sql-not3 r) r))
+
+      (instance? InExpression expr)
+      (let [^InExpression i expr
+            v (ev (.getLeftExpression i))
+            right (.getRightExpression i)
+            vals (when (instance? ParenthesedExpressionList right)
+                   (mapv ev ^ParenthesedExpressionList right))
+            r (if vals (fns/sql-in3? (set vals) v) :__null__)]
+        (if (.isNot i) (fns/sql-not3 r) r))
+
+      (instance? JsonOperator expr)
+      (let [^JsonOperator jo expr
+            l (ev (.getLeftExpression jo))
+            r (ev (.getRightExpression jo))]
+        (case (.getStringExpression jo)
+          "@>" (jb/jsonb-contains? l r)
+          "<@" (jb/jsonb-contained? l r)
+          "?"  (jb/jsonb-exists? l r)
+          "?|" (jb/jsonb-exists-any? l r)
+          "?&" (jb/jsonb-exists-all? l r)
+          :__null__))
+
+      ;; A bare column or a value expression used as a boolean.
+      (or (instance? Column expr) (instance? JdbcParameter expr))
+      (let [v (ev expr)] (cond (nil? v) :__null__ (= :__null__ v) :__null__ :else (boolean v)))
+
+      ;; Anything else is REFUSED. The old `:else` evaluated the node with
+      ;; eval-update-expr and took its truthiness -- and eval-update-expr
+      ;; STRINGIFIED whatever it did not know, so a non-empty string made
+      ;; EVERY unrecognised predicate unconditionally TRUE. `UPDATE t SET x
+      ;; = CASE WHEN s LIKE 'zzz%' THEN 'a' ELSE 'b' END` took the THEN
+      ;; branch on every row.
+      :else
+      (throw (ex-info "UPDATE SET condition not supported"
+                      {:error :feature-not-supported
+                       :feature (str "UPDATE SET condition of type "
+                                     (.getName ^Class (type expr)))
+                       :expr (str expr)})))))
 
 (defn eval-update-expr
   "Evaluate an UPDATE SET expression for a specific entity.
@@ -5217,7 +5294,20 @@
         (get entity-map (keyword "excluded" col-name))
 
         :else
-        (get entity-map (keyword ns-str col-name))))
+        (let [v (get entity-map (keyword ns-str col-name))
+              ;; `a[1]` parses as a COLUMN with an array constructor
+              ;; attached, not as an ArrayExpression -- so the plain column
+              ;; lookup returned the WHOLE array and the subscript was
+              ;; silently dropped.
+              subs (some-> (.getArrayConstructor col-expr) .getExpressions)]
+          (if-let [idx (when (= 1 (count subs))
+                         (let [i (eval-update-expr (first subs) entity-map ns-str schema)]
+                           (when (integer? i) (long i))))]
+            (let [arr (cond (pg-arr/array? v) v
+                            (string? v) (try (pg-arr/from-pg-text v :unknown)
+                                             (catch Throwable _ nil)))]
+              (when arr (nth (pg-arr/flat-elements arr) (dec idx) nil)))
+            v))))
 
     ;; Arithmetic context: a wire parameter of unknown type decodes as a
     ;; String; PG resolves `int + $1` by casting the unknown operand to
@@ -5226,9 +5316,18 @@
     ;; 22P02 would.
     (instance? Addition value-expr)
     (let [^Addition e value-expr
-          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
-          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
-      (when (and (number? l) (number? r)) (+ l r)))
+          l0 (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
+          r0 (eval-update-expr (.getRightExpression e) entity-map ns-str schema)
+          l (num-operand l0)
+          r (num-operand r0)]
+      (cond
+        ;; `date + n` shifts by n DAYS. A date column is stored as a
+        ;; java.util.Date, which num-operand turns into nothing, so
+        ;; `UPDATE t SET d = d + 1` silently WIPED the column instead of
+        ;; advancing it.
+        (and (temporal-value? l0) (number? r)) (shift-days l0 (long r))
+        (and (number? l) (temporal-value? r0)) (shift-days r0 (long l))
+        (and (number? l) (number? r)) (+ l r)))
 
     ;; Negative literal operand: `SET x = x + -123` parses the RHS as a
     ;; SignedExpression; without this branch it fell to `(str value-expr)`
@@ -5247,6 +5346,11 @@
           r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
       (cond
         (and (nil? l)) nil
+        ;; `date - n` shifts back n DAYS, the mirror of the Addition branch.
+        ;; Checked BEFORE the jsonb-deletion case, which would otherwise
+        ;; try to parse a Date as JSON.
+        (and (temporal-value? l) (number? (num-operand r)))
+        (shift-days l (- (long (num-operand r))))
         ;; jsonb key/index deletion: left is jsonb (string containing JSON, map, or vector)
         (and (some? l) (some? r)
              (or (map? (jb/parse-jsonb l)) (sequential? (jb/parse-jsonb l))))
@@ -5303,7 +5407,14 @@
            ;; divergence predates the shared registry; it is preserved
            ;; deliberately so this refactor stays behaviour-preserving,
            ;; and is resolved when the operator semantics are fixed.
-           (if (= op-str "->>") r (jb/serialize-jsonb r))))
+           ;;
+           ;; A missing key is SQL NULL, which must leave as nil: the
+           ;; sentinel reached the column and `SET s = j->>'k'` wrote the
+           ;; literal text ":__null__" for every row without that key.
+           (cond
+             (= :__null__ r) nil
+             (= op-str "->>") r
+             :else (jb/serialize-jsonb r))))
        base-val
        chain))
 
@@ -5327,7 +5438,18 @@
     (instance? net.sf.jsqlparser.expression.Function value-expr)
     (let [^net.sf.jsqlparser.expression.Function f value-expr
           fname (str/lower-case (.getName f))
-          args (some-> (.getParameters f) .getExpressions)]
+          ;; The SQL keyword call forms -- `substring(s FROM 1 FOR 2)`,
+          ;; `position('a' IN s)` -- put their operands in a
+          ;; NamedExpressionList and leave .getParameters empty, so they
+          ;; arrived with NO arguments and fell through to the stringifying
+          ;; fallback below.
+          args (or (some-> (.getParameters f) .getExpressions)
+                   (some-> (.getNamedParameters f) .getExpressions))
+          args (if (and (= fname "position") (nil? (.getParameters f)) (= 2 (count args)))
+                 ;; gram.y swaps these before analysis -- see the same
+                 ;; adjustment in translate-function-call.
+                 [(second args) (first args)]
+                 args)]
       (case fname
         ("now" "current_timestamp" "localtimestamp") (java.util.Date.)
         ("current_date") (java.util.Date.)
@@ -5341,6 +5463,10 @@
         ;; coalesce / nullif are not in the shared table -- the SELECT path
         ;; special-cases them in the translator, which this evaluator cannot
         ;; reuse -- so they need spelling out here.
+        ("substring" "substr")
+        (let [[a b c] (mapv #(eval-update-expr % entity-map ns-str schema) args)
+              r (if (some? c) (fns/sql-substring a b c) (fns/sql-substring a b))]
+          (if (= :__null__ r) nil r))
         "coalesce"
         (first (remove nil? (map #(eval-update-expr % entity-map ns-str schema) args)))
         "nullif"
@@ -5357,7 +5483,12 @@
                           (fns/null-safe impl))
                 r (apply wrapped vs)]
             (if (= :__null__ r) nil r))
-          (str value-expr))))
+          ;; Refuse rather than stringify: this fallback wrote the SQL
+          ;; source text of the call into the column.
+          (throw (ex-info "UPDATE SET function not supported"
+                          {:error :feature-not-supported
+                           :feature (str "UPDATE SET function " fname)
+                           :expr (str value-expr)})))))
 
     ;; Scalar subquery: (SELECT col FROM tbl WHERE ...). Used inside
     ;; concat()/etc. arguments for correlated reads. Requires a live db
@@ -5412,8 +5543,95 @@
         (first taken)
         (when-let [else (.getElseExpression ce)] (ev else))))
 
-    ;; Fallback: try as string
-    :else (str value-expr)))
+    ;; Arithmetic and bitwise operators that already have an implementation
+    ;; in the shared function table. Without these the fallback stringified
+    ;; the expression, and `UPDATE t SET n = 7 % 3` was a SILENT NO-OP --
+    ;; the text failed the numeric coercion and the column kept its old
+    ;; value, with no error.
+    (instance? Modulo value-expr)
+    (let [^Modulo e value-expr]
+      (fns/sql-mod (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
+                   (eval-update-expr (.getRightExpression e) entity-map ns-str schema)))
+
+    (or (instance? BitwiseAnd value-expr) (instance? BitwiseOr value-expr)
+        (instance? BitwiseXor value-expr))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e value-expr
+          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
+          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
+      (when (and (some? l) (some? r))
+        (cond
+          (instance? BitwiseAnd value-expr) (bit-and (long l) (long r))
+          (instance? BitwiseOr value-expr)  (bit-or (long l) (long r))
+          :else                             (bit-xor (long l) (long r)))))
+
+    ;; EXTRACT(field FROM v) / TRIM(… FROM s) are their own AST nodes, not
+    ;; Functions, so they never reached the function table.
+    (instance? ExtractExpression value-expr)
+    (let [^ExtractExpression e value-expr
+          v (fns/sql-extract (str (.getName e))
+                             (eval-update-expr (.getExpression e) entity-map ns-str schema))]
+      (if (= :__null__ v) nil v))
+
+    (instance? TrimFunction value-expr)
+    (let [^TrimFunction e value-expr
+          spec (str/lower-case (str (.getTrimSpecification e)))
+          from-e (.getFromExpression e)
+          str-e (if from-e from-e (.getExpression e))
+          chars-e (when from-e (.getExpression e))
+          v (eval-update-expr str-e entity-map ns-str schema)
+          c (when chars-e (eval-update-expr chars-e entity-map ns-str schema))
+          f (case spec "leading" fns/sql-ltrim "trailing" fns/sql-rtrim fns/sql-btrim)
+          r (if c (f v c) (f v))]
+      (if (= :__null__ r) nil r))
+
+    ;; ARRAY[…] constructor, and `arr[i]` subscripting.
+    (instance? ArrayConstructor value-expr)
+    ;; Canonical PG text, not the PgArray record: an array COLUMN is stored
+    ;; as "{1,2}" text, so handing the record straight to the coercion wrote
+    ;; the Clojure vector's toString ("[7, 8]") into the column.
+    (pg-arr/to-pg-text
+     (pg-arr/array :unknown
+                   (mapv #(eval-update-expr % entity-map ns-str schema)
+                         (.getExpressions ^ArrayConstructor value-expr))))
+
+    (instance? ArrayExpression value-expr)
+    (let [^ArrayExpression e value-expr
+          base (eval-update-expr (.getObjExpression e) entity-map ns-str schema)
+          idx  (eval-update-expr (.getIndexExpression e) entity-map ns-str schema)]
+      ;; An array COLUMN arrives as canonical PG text; an ARRAY[…] literal
+      ;; as a PgArray record. Accept either.
+      (let [arr (cond (pg-arr/array? base) base
+                      (string? base) (try (pg-arr/from-pg-text base :unknown)
+                                          (catch Throwable _ nil)))]
+        (when (and arr (integer? idx))
+          (nth (pg-arr/flat-elements arr) (dec (long idx)) nil))))
+
+    ;; A PREDICATE in value position -- `SET b = (n > 5)`,
+    ;; `SET s = (n IN (10,20))::text`. eval-update-cond already knows the
+    ;; whole predicate surface three-valued; the fallback stringified them,
+    ;; so the column received the SQL source text "n IN (10, 20)".
+    (or (instance? EqualsTo value-expr) (instance? NotEqualsTo value-expr)
+        (instance? GreaterThan value-expr) (instance? GreaterThanEquals value-expr)
+        (instance? MinorThan value-expr) (instance? MinorThanEquals value-expr)
+        (instance? Between value-expr) (instance? LikeExpression value-expr)
+        (instance? InExpression value-expr) (instance? IsNullExpression value-expr)
+        (instance? NotExpression value-expr) (instance? JsonOperator value-expr)
+        (instance? AndExpression value-expr) (instance? OrExpression value-expr))
+    (let [v (eval-update-cond value-expr entity-map ns-str schema)]
+      (if (= :__null__ v) nil v))
+
+    ;; Anything else is REFUSED, not stringified. `:else (str value-expr)`
+    ;; wrote the SQL source text of the expression into the column --
+    ;; `UPDATE t SET a = ARRAY[7,8]` stored the string "ARRAY[7, 8]" in an
+    ;; int[] column, no error raised. Silent data corruption is worse than
+    ;; an honest refusal, which is the stance doc/design-alignment.md
+    ;; already takes for OUTER LATERAL.
+    :else
+    (throw (ex-info "UPDATE SET expression not supported"
+                    {:error :feature-not-supported
+                     :feature (str "UPDATE SET expression of type "
+                                   (.getName ^Class (type value-expr)))
+                     :expr (str value-expr)}))))
 
 (defn extract-returning
   "Extract RETURNING clause column names from a ReturningClause.
