@@ -2781,6 +2781,13 @@
               (case agg-name
                 "sum" 'datahike.pg.sql/filter-sum-numeric
                 "avg" 'datahike.pg.sql/filter-avg-numeric
+                ;; The variance family is NUMERIC over int2/int4/int8/
+                ;; numeric, and its numeric runtime is not merely more
+                ;; precise -- the float one OVERFLOWED on int8 input.
+                ("stddev" "stddev_samp") 'datahike.pg.sql/filter-stddev-samp-numeric
+                "stddev_pop"             'datahike.pg.sql/filter-stddev-pop-numeric
+                ("variance" "var_samp")  'datahike.pg.sql/filter-variance-samp-numeric
+                "var_pop"                'datahike.pg.sql/filter-variance-pop-numeric
                 nil)
               ;; sum(float4) accumulates at float4 precision (float4pl),
               ;; so it needs its own runtime too.

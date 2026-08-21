@@ -598,22 +598,134 @@
             winners (filter #(= max-cnt (val %)) freq)]
         (first (sort (map key winners)))))))
 
-(defn filter-variance-samp
-  "SQL VAR_SAMP(x) — sample variance, ignores :__null__/nil. Returns
-   :__null__ when fewer than 2 non-null values remain (matches PG)."
-  [coll]
+(defn- bd-sqrt
+  "Square root of a non-negative BigDecimal, rounded HALF_UP to `rscale`
+   decimals -- PostgreSQL's `sqrt_var`, which computes to at least one
+   guard digit and then `round_var`s to the requested scale."
+  ^java.math.BigDecimal [^java.math.BigDecimal x ^long rscale]
+  (if (zero? (.signum x))
+    (.setScale java.math.BigDecimal/ZERO (int rscale))
+    (let [mc (java.math.MathContext. (int (+ (.precision x) rscale 4))
+                                     java.math.RoundingMode/HALF_UP)]
+      (.setScale (.sqrt x mc) (int rscale) java.math.RoundingMode/HALF_UP))))
+
+(defn- numeric-stddev-internal
+  "PostgreSQL's `numeric_stddev_internal` (numeric.c), exactly.
+
+   VAR_SAMP / VAR_POP / STDDEV_SAMP / STDDEV_POP over int2, int4, int8 or
+   numeric return NUMERIC in PostgreSQL -- only the float4 / float8
+   overloads return float8. Computing them in double instead was wrong
+   twice over: the last digits differed (PG 26754.55172957, ours
+   26754.55172956557, because the numeric result carries
+   select_div_scale's digit count rather than a double's), and
+   `stddev(bigint)` OVERFLOWED -- `(reduce + 0 …)` over int8 values near
+   Long/MAX_VALUE threw where PostgreSQL simply widens.
+
+   The formula avoids a mean entirely, which is what keeps it exact:
+
+     numerator = N * sum(x^2) - sum(x)^2
+     denom     = N * (N-1)   (sample)   or   N * N   (population)
+     variance  = numerator / denom       at select_div_scale
+     stddev    = sqrt(variance)          at the same scale
+
+   A negative numerator can only be roundoff, and PostgreSQL answers 0."
+  [coll sample? variance?]
   (let [vs (drop-nulls coll)
         n  (count vs)]
-    (if (< n 2)
-      :__null__
-      (let [mean (/ (double (reduce + 0 vs)) n)
-            ss   (reduce + 0.0 (map #(let [d (- (double %) mean)] (* d d)) vs))]
-        (/ ss (dec n))))))
+    (cond
+      (zero? n) :__null__
+      (and sample? (<= n 1)) :__null__
+      ;; "By analogy to the behavior of the float8 functions, any infinity
+      ;; input produces NaN output" -- numeric.c.
+      (some types/numeric-special? vs) Double/NaN
+      :else
+      (let [bds   (mapv ->bigdec vs)
+            sum-x (reduce (fn [^java.math.BigDecimal a ^java.math.BigDecimal b] (.add a b))
+                          java.math.BigDecimal/ZERO bds)
+            sum-x2 (reduce (fn [^java.math.BigDecimal a ^java.math.BigDecimal b]
+                             (.add a (.multiply b b)))
+                           java.math.BigDecimal/ZERO bds)
+            n-bd  (java.math.BigDecimal/valueOf (long n))
+            ;; rscale for the two products, from sumX's scale BEFORE
+            ;; squaring -- both products are exact at it.
+            rs0   (int (* 2 (.scale sum-x)))
+            vx    (.setScale (.multiply sum-x sum-x) rs0 java.math.RoundingMode/HALF_UP)
+            vx2   (.setScale (.multiply n-bd sum-x2) rs0 java.math.RoundingMode/HALF_UP)
+            numer (.subtract vx2 vx)]
+        (if (<= (.signum numer) 0)
+          java.math.BigDecimal/ZERO
+          (let [denom (if sample?
+                        (.multiply n-bd (java.math.BigDecimal/valueOf (long (dec n))))
+                        (.multiply n-bd n-bd))
+                rscale (int (div-result-scale numer denom))
+                var-v (.divide numer denom rscale java.math.RoundingMode/HALF_UP)]
+            (if variance? var-v (bd-sqrt var-v rscale))))))))
+
+(defn filter-variance-samp-numeric
+  "VAR_SAMP over int2/int4/int8/numeric -- NUMERIC, per PostgreSQL."
+  [coll] (numeric-stddev-internal coll true true))
+
+(defn filter-variance-pop-numeric
+  "VAR_POP over int2/int4/int8/numeric -- NUMERIC, per PostgreSQL."
+  [coll] (numeric-stddev-internal coll false true))
+
+(defn filter-stddev-samp-numeric
+  "STDDEV_SAMP over int2/int4/int8/numeric -- NUMERIC, per PostgreSQL."
+  [coll] (numeric-stddev-internal coll true false))
+
+(defn filter-stddev-pop-numeric
+  "STDDEV_POP over int2/int4/int8/numeric -- NUMERIC, per PostgreSQL."
+  [coll] (numeric-stddev-internal coll false false))
+
+(defn- youngs-cramer
+  "PostgreSQL's float8 variance accumulator (`float8_accum`, float.c):
+   the Youngs-Cramer one-pass update, returning [N Sx Sxx].
+
+     N += 1;  Sx += x
+     Sxx += (x*N - Sx)^2 / (N * N_prev)      -- after the first value
+
+   Not the textbook two-pass mean formula, which is what this file used
+   and which rounds differently in the last place: PostgreSQL's answer is
+   this sequence of double operations, so reproducing the answer means
+   reproducing the sequence."
+  [vs]
+  (reduce (fn [[^long n ^double sx ^double sxx] v]
+            (let [x  (double v)
+                  n' (inc n)
+                  sx' (+ sx x)]
+              (if (pos? n)
+                (let [tmp (- (* x n') sx')]
+                  [n' sx' (+ sxx (/ (* tmp tmp) (* (double n') (double n))))])
+                [n' sx' (if (or (Double/isNaN x) (Double/isInfinite x))
+                          Double/NaN
+                          sxx)])))
+          [0 0.0 0.0] vs))
+
+(defn filter-variance-samp
+  "SQL VAR_SAMP(x) over float4/float8 — float8, ignores :__null__/nil.
+   :__null__ when fewer than 2 non-null values remain (matches PG).
+   int2/int4/int8/numeric take `filter-variance-samp-numeric`."
+  [coll]
+  (let [[n _ sxx] (youngs-cramer (drop-nulls coll))]
+    (if (< (long n) 2) :__null__ (/ (double sxx) (dec (long n))))))
+
+(defn filter-variance-pop
+  "SQL VAR_POP(x) over float4/float8 — float8. :__null__ for an empty
+   group; 0 for a single value, as PostgreSQL gives."
+  [coll]
+  (let [[n _ sxx] (youngs-cramer (drop-nulls coll))]
+    (if (< (long n) 1) :__null__ (/ (double sxx) (double (long n))))))
 
 (defn filter-stddev-samp
-  "SQL STDDEV_SAMP(x) — sample standard deviation. See filter-variance-samp."
+  "SQL STDDEV_SAMP(x) over float4/float8. See filter-variance-samp."
   [coll]
   (let [v (filter-variance-samp coll)]
+    (if (= :__null__ v) :__null__ (Math/sqrt (double v)))))
+
+(defn filter-stddev-pop
+  "SQL STDDEV_POP(x) over float4/float8. See filter-variance-pop."
+  [coll]
+  (let [v (filter-variance-pop coll)]
     (if (= :__null__ v) :__null__ (Math/sqrt (double v)))))
 
 (defn filter-jsonb-object-agg
@@ -2178,10 +2290,14 @@
    "count_distinct" 'datahike.pg.sql/filter-count-distinct
    "stddev"         'datahike.pg.sql/filter-stddev-samp
    "stddev_samp"    'datahike.pg.sql/filter-stddev-samp
-   "stddev_pop"     'stddev
+   ;; NOT Datalog's raw `stddev`/`variance`: those cast every element to
+   ;; Number, so a group containing a NULL -- which arrives as the
+   ;; `:__null__` sentinel -- died with "class clojure.lang.Keyword cannot
+   ;; be cast to class java.lang.Number".
+   "stddev_pop"     'datahike.pg.sql/filter-stddev-pop
    "variance"       'datahike.pg.sql/filter-variance-samp
    "var_samp"       'datahike.pg.sql/filter-variance-samp
-   "var_pop"        'variance
+   "var_pop"        'datahike.pg.sql/filter-variance-pop
    "median"         'median
    "corr"           'datahike.pg.sql/filter-corr
    "string_agg"     'datahike.pg.sql/filter-string-agg
