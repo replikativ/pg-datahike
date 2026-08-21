@@ -187,19 +187,49 @@
          (rows "SELECT DISTINCT t.id FROM t, LATERAL
                   (SELECT v FROM c WHERE c.tid = t.id) s ORDER BY t.id"))))
 
-(deftest outer-lateral-subquery-is-refused
-  ;; An OUTER lateral must keep the outer row with NULLs when the inner
-  ;; is empty, but an empty collection binding DROPS it — which is the
-  ;; inner-join semantics the rest of this relies on. Refuse explicitly
-  ;; rather than let the or-join pass reach the fn-binding clause and
-  ;; raise the datalog-internal `Cannot parse rule-vars`.
-  ;; Only LEFT is meaningful: PostgreSQL rejects RIGHT and FULL LATERAL
-  ;; outright ("invalid reference to FROM-clause entry"), because the
-  ;; inner cannot reference a table it is outer-joined from the left of.
+(deftest outer-lateral-subquery
+  ;; An OUTER lateral keeps the outer row with NULLs when the inner
+  ;; produces nothing. An empty collection binding DROPS it -- that is
+  ;; the inner-join semantics the rest of this relies on -- so the ROW
+  ;; PRODUCER supplies the missing row instead: one tuple of NULLs,
+  ;; which is exactly what LEFT JOIN LATERAL … ON TRUE means.
+  ;;
+  ;; (The or-join construction the other OUTER joins use cannot be
+  ;; applied here: it reached the fn-binding clause and raised the
+  ;; datalog-internal `Cannot parse rule-vars`, which is why this was
+  ;; refused outright before.)
+  (seed!) (seed2!)
+  (run "INSERT INTO t VALUES (3,1)")
+  (testing "an outer row with no inner rows survives, NULL-extended"
+    (is (= [["1" "10"] ["1" "11"] ["2" "20"] ["3" nil]]
+           (rows "SELECT t.id, s.v FROM t LEFT JOIN LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s ON true
+                  ORDER BY t.id, s.v"))))
+  (testing "an aggregate inner is still ONE row -- count is 0, not NULL"
+    (is (= [["1" "2"] ["2" "1"] ["3" "0"]]
+           (rows "SELECT t.id, s.c FROM t LEFT JOIN LATERAL
+                    (SELECT count(*) AS c FROM c WHERE c.tid = t.id) s ON true
+                  ORDER BY t.id"))))
+  (testing "INNER LATERAL still eliminates the childless row"
+    (is (= [["1" "10"] ["1" "11"] ["2" "20"]]
+           (rows "SELECT t.id, s.v FROM t JOIN LATERAL
+                    (SELECT v FROM c WHERE c.tid = t.id) s ON true
+                  ORDER BY t.id, s.v")))))
+
+(deftest outer-lateral-with-a-join-condition-is-refused
+  ;; ON TRUE only. With a real condition a row the condition rejects
+  ;; still has to survive as NULLs, and a producer that has already
+  ;; emitted its rows cannot tell that from a match. Refuse rather than
+  ;; answer wrongly.
+  ;;
+  ;; Only LEFT is meaningful at all: PostgreSQL rejects RIGHT and FULL
+  ;; LATERAL outright ("invalid reference to FROM-clause entry"),
+  ;; because the inner cannot reference a table it is outer-joined from
+  ;; the left of.
   (seed!) (seed2!)
   (let [e (.-error ^PgWireServer$QueryResult
            (run "SELECT t.id FROM t LEFT JOIN LATERAL
-                           (SELECT v FROM c WHERE c.tid = t.id) s ON true"))]
+                           (SELECT v FROM c WHERE c.tid = t.id) s ON s.v > 10"))]
     (is (re-find #"OUTER JOIN LATERAL" (or e "")))))
 
 (deftest an-uncorrelated-derived-table-is-untouched

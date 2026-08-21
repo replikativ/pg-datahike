@@ -632,7 +632,17 @@
                  [curr-db curr-schema deferred ns-map]))
 
              (some? inner)
-             (if-let [m (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name)]
+             ;; With the CTEs materialised SO FAR in scope. A WITH list is
+             ;; sequential -- `WITH a AS (…), b AS (SELECT … FROM a)` is
+             ;; ordinary SQL -- but the name->namespace map was only bound
+             ;; after the whole list had been folded, so a CTE body could
+             ;; not see the CTE before it and the query died with
+             ;; `relation "a" does not exist`.
+             (if-let [m (binding [ctx/*relation-namespaces*
+                                  (merge ctx/*relation-namespaces* ns-map)
+                                  stmt/*cte-namespaces*
+                                  (merge stmt/*cte-namespaces* ns-map)]
+                          (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name))]
                [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
                [curr-db curr-schema deferred ns-map])
 

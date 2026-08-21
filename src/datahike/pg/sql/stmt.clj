@@ -163,8 +163,16 @@
    or-join wrapping in translate-select.
    Returns {:name str :alias str :join-type keyword :ref-attr kw :left-entity-var sym}."
   [ctx ^Join join _default-table]
-  (let [jtype (join-type join)
-        right-table (.getRightItem join)
+  (let [right-table (.getRightItem join)
+        ;; A LEFT JOIN LATERAL is INNER as far as the or-join pass is
+        ;; concerned: its NULL-extended row is produced by the row
+        ;; producer itself (see the `:outer?` spec), and letting the
+        ;; or-join construction wrap the function-binding clause instead
+        ;; raised the datalog-internal "Cannot parse rule-vars".
+        jtype (if (or (instance? net.sf.jsqlparser.statement.select.LateralSubSelect right-table)
+                      (instance? net.sf.jsqlparser.statement.select.TableFunction right-table))
+                :inner
+                (join-type join))
         {:keys [name alias]}
         (cond
           (instance? Table right-table)
@@ -174,6 +182,19 @@
           ;; that column refs on the right side resolve correctly.
           (instance? ParenthesedSelect right-table)
           (let [a (when-let [al (.getAlias ^ParenthesedSelect right-table)]
+                    (unquote-ident (str/trim (.getName ^Alias al))))]
+            {:name a :alias a})
+
+          ;; A set-returning function in join / comma position. Its alias
+          ;; was not pulled here, so no entity var was created for it and
+          ;; the row-marker anchor pass never saw it: `SELECT count(*)
+          ;; FROM t, generate_series(1,3)` answered t's row count instead
+          ;; of the cross product. (A CORRELATED SRF declares no row
+          ;; marker -- its rows come from a function binding -- so the
+          ;; anchor pass skips it and this only registers the alias.)
+          (instance? net.sf.jsqlparser.statement.select.TableFunction right-table)
+          (let [a (when-let [al (.getAlias ^net.sf.jsqlparser.statement.select.TableFunction
+                                 right-table)]
                     (unquote-ident (str/trim (.getName ^Alias al))))]
             {:name a :alias a}))
         right-alias (or alias name)
@@ -1382,7 +1403,15 @@
                       ia (:in-args p)
                       qdb (or (:enriched-db p) query-db)]
                   (when q
-                    (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))]
+                    (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+                          ;; An aggregate over an empty relation is still
+                          ;; ONE row -- `LATERAL (SELECT count(*) … WHERE
+                          ;; ch.pid = t.id)` is 0 for an outer row with no
+                          ;; children, not "no row". The same rule every
+                          ;; other subquery evaluator applies.
+                          res (or (when (empty? (seq res))
+                                    (expr/empty-aggregate-row q))
+                                  res)]
                       ;; TAKE the visible columns. The inner's `:find`
                       ;; carries trailing bookkeeping vars — the entity
                       ;; var for ordering/bag semantics, and any hidden
@@ -1390,13 +1419,25 @@
                       ;; layer, not here. Passing them through made the
                       ;; produced tuple wider than the binding form, so
                       ;; the relation binding matched nothing.
-                      (vec (map-indexed
-                            (fn [i r]
-                              (conj (vec (take n-cols (if (sequential? r) r [r])))
-                                    (long (inc i))))
-                            res)))))
+                      ;; NO ordinality here: the emitter appends it for
+                      ;; every producer, so adding it a second time made
+                      ;; each tuple one element wider than the binding
+                      ;; form it feeds.
+                      (mapv (fn [r] (vec (take n-cols (if (sequential? r) r [r]))))
+                            res))))
                 (catch Throwable _ nil))
               []))))))
+
+(defn- trivially-true-on?
+  "True when a JOIN's ON condition is the constant TRUE -- `ON true`, or
+   absent. The only condition an OUTER LATERAL can be given without
+   changing what its NULL-extended row means."
+  [^Join j]
+  (let [es (seq (.getOnExpressions j))]
+    (or (nil? es)
+        (and (= 1 (count es))
+             (let [t (str/lower-case (str/trim (str (first es))))]
+               (or (= t "true") (= t "1 = 1")))))))
 
 (defn- lateral-subselect->spec
   "`JOIN LATERAL (SELECT …) s ON true` whose inner references an outer
@@ -2445,6 +2486,28 @@
                   derived
                   (conj lsrfs spec)])
 
+               ;; An UNCORRELATED set-returning function in join or comma
+               ;; position -- `FROM t, generate_series(1, 3) g`. Its rows
+               ;; do not depend on the outer row, so it materialises once
+               ;; into a virtual table exactly as it does in FROM-item
+               ;; position; only the FROM-item position had a branch for
+               ;; it, so the join form left the alias unregistered and
+               ;; every reference to it raised `column "g" does not
+               ;; exist`.
+               (and db (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+                    (table-fn->virtual-table
+                     ^net.sf.jsqlparser.statement.select.TableFunction rt db))
+               (let [{vdb :db vschema :schema vname :name valias :alias}
+                     (table-fn->virtual-table
+                      ^net.sf.jsqlparser.statement.select.TableFunction rt db)]
+                 [vdb vschema
+                  (cond-> (assoc aliases vname vname)
+                    (and valias (not= valias vname)) (assoc valias vname))
+                  ;; Its rows live in the speculative db's own entity-id
+                  ;; space, so it joins BY VALUE like a derived table.
+                  (conj derived {:join j :alias (or valias vname)})
+                  lsrfs])
+
                (instance? Table rt)
                (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
                  [db schema
@@ -2462,21 +2525,34 @@
                (let [spec (lateral-subselect->spec rt db schema outer-alias-set
                                                    lsrf-var-counter)]
                  ;; An OUTER lateral has to preserve the outer row with
-                 ;; NULLs when the inner is empty, but an empty
-                 ;; collection binding DROPS it — that is exactly the
-                 ;; inner-join semantics this relies on. Reproducing the
-                 ;; outer form needs the or-join construction the other
-                 ;; OUTER joins use. Refuse explicitly: without this the
-                 ;; or-join pass reached the fn-binding clause and raised
-                 ;; the datalog-internal `Cannot parse rule-vars`.
-                 (when (or (.isLeft j) (.isRight j) (.isFull j) (.isOuter j))
-                   (throw (errors/pg-error
-                           :feature-not-supported
-                           {:feature "OUTER JOIN LATERAL (subquery)"})))
-                 [(:db spec) (:schema spec)
-                  (assoc aliases (:alias spec) (:name spec))
-                  derived
-                  (conj lsrfs spec)])
+                 ;; NULLs when the inner is empty, and an empty collection
+                 ;; binding DROPS it -- that is the inner-join semantics
+                 ;; this relies on. The producer supplies the missing row
+                 ;; instead: one tuple of NULLs, which is precisely what
+                 ;; LEFT JOIN LATERAL … ON TRUE means. (The or-join
+                 ;; construction the other OUTER joins use cannot be
+                 ;; applied here -- it reached the fn-binding clause and
+                 ;; raised the datalog-internal `Cannot parse rule-vars`.)
+                 ;;
+                 ;; ON TRUE only. With a real condition, a row the
+                 ;; condition rejects still has to survive as NULLs, and a
+                 ;; producer that has already emitted its rows cannot
+                 ;; distinguish that from a match. Refuse rather than
+                 ;; answer wrongly.
+                 (let [outer? (boolean (or (.isLeft j) (.isRight j)
+                                           (.isFull j) (.isOuter j)))]
+                   (when (and outer? (not (trivially-true-on? j)))
+                     (throw (errors/pg-error
+                             :feature-not-supported
+                             {:feature "OUTER JOIN LATERAL (subquery) with a join condition"})))
+                   (when (or (.isRight j) (.isFull j))
+                     (throw (errors/pg-error
+                             :feature-not-supported
+                             {:feature "RIGHT/FULL JOIN LATERAL (subquery)"})))
+                   [(:db spec) (:schema spec)
+                    (assoc aliases (:alias spec) (:name spec))
+                    derived
+                    (conj lsrfs (cond-> spec outer? (assoc :outer? true)))]))
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
@@ -2596,12 +2672,17 @@
                 (swap! (:col->var ctx) assoc (keyword name c) v))
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj
-                     (fn [& as]
-                       (let [rs (apply rows-fn as)]
-                         ;; NEVER nil: bind-by-fn drops the outer tuple on
-                         ;; nil, which would swallow rows silently.
-                         (vec (map-indexed (fn [i r] (conj (vec r) (long (inc i))))
-                                           (or rs []))))))
+                     (let [outer? (:outer? lsrf-spec)
+                           null-row [(vec (repeat (count vars) :__null__))]]
+                       (fn [& as]
+                         (let [rs (apply rows-fn as)
+                               ;; LEFT JOIN LATERAL: no inner row means one
+                               ;; row of NULLs, not the outer row's removal.
+                               rs (if (and outer? (empty? rs)) null-row rs)]
+                           ;; NEVER nil: bind-by-fn drops the outer tuple on
+                           ;; nil, which would swallow rows silently.
+                           (vec (map-indexed (fn [i r] (conj (vec r) (long (inc i))))
+                                             (or rs [])))))))
               (ctx/add-clause! ctx [(apply list fn-param arg-vals) binding-form])
               ;; `:with` preserves bag multiplicity, which is the whole
               ;; point here — but that is exactly what DISTINCT must not
