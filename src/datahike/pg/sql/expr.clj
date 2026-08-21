@@ -1554,6 +1554,59 @@
                      args)))
     form))
 
+(defn- any-all-op-fn
+  "Runtime `x <op> ANY(arr)` / `x <op> ALL(arr)`.
+
+   Kleene over the elements: ALL is the AND, ANY the OR, so a NULL element
+   makes the answer UNKNOWN only when no other element has already settled
+   it -- `2 <> ALL(ARRAY[2,NULL])` is FALSE because an element that EQUALS
+   settles it, while `2 <> ALL(ARRAY[3,NULL])` is UNKNOWN.
+
+   One definition for both operators. The `=` and `<>` branches each had
+   their own copy forty lines apart, and only the `<>` one had been made
+   three-valued -- so `3 = ANY(ARRAY[1,NULL])` answered FALSE where
+   PostgreSQL says NULL."
+  [kind cmp]
+  (fn [c a]
+    (let [arr (coerce-pg-array a)]
+      (if (or (fns/sql-null? c) (nil? arr))
+        :__null__
+        (let [cmps (map (fn [el]
+                          (if (or (nil? el) (= :__null__ el))
+                            :__null__
+                            (cmp c el)))
+                        (pg-arr/flat-elements arr))]
+          (if (= kind "all")
+            (reduce fns/sql-and3 true cmps)
+            (reduce fns/sql-or3 false cmps)))))))
+
+(defn empty-aggregate-row
+  "SQL requires an aggregate over an EMPTY relation to still produce ONE
+   row -- COUNT is 0, everything else NULL -- but only when there is no
+   GROUP BY, i.e. every `:find` element is an aggregate form. With a
+   grouping column in `:find`, an empty result means zero matching groups
+   and PostgreSQL returns zero rows.
+
+   Datalog returns no rows at all either way, so the row has to be
+   synthesised. Returns `[row]` when the rule applies, else nil.
+
+   Shared deliberately: exec-select applies this to the top-level result,
+   and every SCALAR SUBQUERY evaluator needs the identical rule --
+   `SELECT (SELECT count(*) FROM t WHERE false)` is 0, not NULL -- but each
+   of them ran `d/q` directly and answered NULL."
+  [query]
+  (let [find-elems (:find query)]
+    (when (and (seq find-elems)
+               (every? (fn [elem] (and (seq? elem) (symbol? (first elem)))) find-elems))
+      [(mapv (fn [elem]
+               (let [agg-name (name (first elem))]
+                 (if (contains? #{"count" "count-distinct"
+                                  "filter-count" "filter-count-distinct"}
+                                agg-name)
+                   0
+                   nil)))
+             find-elems)])))
+
 (defn translate-predicate-expr
   "Translate a SQL predicate expression into a Clojure boolean form
    suitable for use inside a cond binding. Unlike translate-predicate which
@@ -1621,13 +1674,7 @@
               col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
               arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
               fn-param (symbol (str "?pg-" kind (swap! (:var-counter ctx) inc)))
-              op-fn (case kind
-                      "any" (fn [c a]
-                              (if-let [arr (coerce-pg-array a)]
-                                (boolean (pg-arr/member? arr c)) false))
-                      "all" (fn [c a]
-                              (if-let [arr (coerce-pg-array a)]
-                                (pg-arr/all-match? arr #(= % c)) true)))
+              op-fn (any-all-op-fn kind fns/sql-eq?)
               result-var (ctx/fresh-var! ctx)]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj op-fn)
@@ -1666,22 +1713,7 @@
               col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
               arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
               fn-param (symbol (str "?pg-ne-" kind (swap! (:var-counter ctx) inc)))
-              ;; Kleene over the elements: `<> ALL` is the AND, `<> ANY` the
-              ;; OR. A NULL element makes the answer UNKNOWN unless another
-              ;; element has already settled it -- `2 <> ALL(ARRAY[2,NULL])`
-              ;; is FALSE, `2 <> ALL(ARRAY[3,NULL])` is NULL.
-              op-fn (fn [c a]
-                      (if (or (fns/sql-null? c) (nil? (coerce-pg-array a)))
-                        :__null__
-                        (let [els (pg-arr/flat-elements (coerce-pg-array a))
-                              cmps (map (fn [el]
-                                          (if (or (nil? el) (= :__null__ el))
-                                            :__null__
-                                            (fns/sql-ne? c el)))
-                                        els)]
-                          (if (= kind "all")
-                            (reduce fns/sql-and3 true cmps)
-                            (reduce fns/sql-or3 false cmps)))))
+              op-fn (any-all-op-fn kind fns/sql-ne?)
               result-var (ctx/fresh-var! ctx)]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj op-fn)
@@ -3390,6 +3422,13 @@
                 results    (if (seq in-args)
                              (apply q-fn q query-db in-args)
                              (q-fn q query-db))
+                ;; An aggregate over an empty relation is still ONE row --
+                ;; `(SELECT count(*) FROM t WHERE false)` is 0, not NULL.
+                ;; The rule lives with the other consumers; see
+                ;; stmt/empty-aggregate-row.
+                results    (or (when (empty? (seq results))
+                                 (empty-aggregate-row q))
+                               results)
                 first-row  (first results)
                 v          (if (sequential? first-row) (first first-row) first-row)]
             (if (some? v) v :__null__))
@@ -3684,9 +3723,22 @@
                 ;; *from-bindings* itself: keying it off the latter
                 ;; changed behaviour for every other user of it and cost
                 ;; 37 asyncpg tests.
+                ;;
+                ;; And gated on the COLUMN, not just the alias. The set of
+                ;; outer references is collected LEXICALLY by regex
+                ;; (correlated-subquery-refs) while the values arrive in a
+                ;; runtime map, and the two can disagree. Suppressing on the
+                ;; alias alone meant that when the regex missed a reference,
+                ;; the join was suppressed AND the outer table still entered
+                ;; the inner FROM -- a CROSS PRODUCT. asyncpg's recursive
+                ;; {typeinfo} introspection query hung outright on that.
+                ;; Requiring the binding to actually supply the column makes
+                ;; a miss fall back to the ordinary join: slower, but right.
                 (not (some (fn [^Column c]
                              (when-let [t (some-> (.getTable c) .getName unquote-ident)]
-                               (contains? (or params/*lateral-outer-aliases* #{}) t)))
+                               (and (contains? (or params/*lateral-outer-aliases* #{}) t)
+                                    (contains? (get params/*from-bindings* t)
+                                               (unquote-ident (.getColumnName c))))))
                            [left right])))
        (let [resolve-col #(try (ctx/resolve-column ^Column %
                                                    (:table-aliases ctx)
