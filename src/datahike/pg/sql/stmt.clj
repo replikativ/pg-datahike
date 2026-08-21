@@ -44,6 +44,7 @@
             [datahike.query :as dq]
             [datahike.pg.cache :as pg-cache]
             [datahike.pg.errors :as errors]
+            [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.keywords :as pg-kw]
@@ -1773,6 +1774,36 @@
                                             (set a) bs))
                       ;; nil → not a UNION, single branch
                        (first branch-rows))
+        ;; Window functions inside a derived table or CTE. The window pass
+        ;; only ever ran at the top level, so `SELECT * FROM (SELECT …,
+        ;; row_number() OVER (…) rn FROM t) s` -- the standard way to use a
+        ;; window at all -- did not merely lose the window column: the
+        ;; hidden `__win_*` helper columns reached the materialiser as real
+        ;; attributes and the query failed outright with `column
+        ;; "__win_ord_1" of relation "__sub__…" does not exist`.
+        ;;
+        ;; Before LIMIT, which SQL applies after the window functions.
+        ;; (Single-branch only, like the correlated resolution above.)
+         win-specs (when (nil? (:op branch-parsed)) (:window-specs sub-parsed))
+         win-resolved
+         (when (seq win-specs)
+           (let [rows (window/execute-window-functions
+                       (mapv (fn [r] (if (sequential? r) (vec r) [r])) sub-results)
+                       win-specs)
+                 aliases (into (vec sub-aliases) (map :alias) win-specs)
+                 keep-idx (vec (keep-indexed
+                                (fn [i a] (when-not (and (string? a)
+                                                         (.startsWith ^String a "__win_"))
+                                            i))
+                                aliases))]
+             [(mapv (fn [r] (mapv #(nth r % nil) keep-idx)) rows)
+              (mapv #(nth aliases %) keep-idx)
+              (when sub-oids
+                (let [padded (into (vec sub-oids) (repeat (count win-specs) nil))]
+                  (mapv #(nth padded % nil) keep-idx)))]))
+         sub-results (if win-resolved (first win-resolved) sub-results)
+         sub-aliases (if win-resolved (second win-resolved) sub-aliases)
+         sub-oids    (if win-resolved (nth win-resolved 2) sub-oids)
          sub-results (cond->> sub-results
                        (:sql-offset sub-parsed) (drop (:sql-offset sub-parsed))
                        (:sql-limit sub-parsed)  (take (:sql-limit sub-parsed)))
@@ -2201,6 +2232,72 @@
                   :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))]
         (when sql (first (:select-item-oids (parse-fn sql schema db))))))
     (catch Throwable _ nil)))
+
+(def ^:private two-arg-aggs
+  "Aggregates whose implementation takes [v1 v2] pairs."
+  #{"string_agg" "corr" "jsonb_object_agg" "json_object_agg"})
+
+(def ^:private null-preserving-aggs
+  "Aggregates that KEEP a NULL input value, so an excluded row has to be
+   marked as something other than NULL -- see `fns/filtered-out`."
+  #{"array_agg" "jsonb_agg" "json_agg"})
+
+(defn- filter-arg-var!
+  "Bind a fresh variable to `inner-expr`'s value on the rows where
+   `filter-expr` is TRUE, and to `excluded` on every other row -- the NULL
+   sentinel for the aggregates that skip nulls, `fns/filtered-out` for the
+   ones that preserve them.
+
+   That single shape is all an aggregate FILTER needs: every `filter-*`
+   aggregate already skips the sentinel, so a filtered aggregate is just the
+   ordinary aggregate over this column -- in a GROUP BY and over a window
+   frame alike, with no second code path for either.
+
+   FILTER (WHERE p) admits a row only when p is TRUE. UNKNOWN does not
+   qualify, and the `:__null__` sentinel is truthy, so a bare `if` would
+   admit the NULL rows.
+
+   For COUNT(*) the value is 1 -- there is no argument. For COUNT(x) it is
+   x, so a row that passes the filter with a NULL x is still not counted,
+   which is what `count(x)` means; the previous COUNT-FILTER shape emitted
+   1 for every passing row and counted those in."
+  [ctx filter-expr inner-expr default-table count-star? arg2-expr excluded]
+  (let [cond-form (expr/translate-predicate-expr ctx filter-expr)
+        inner-val (cond
+                    count-star? 1
+                    inner-expr (expr/translate-expr ctx inner-expr)
+                    :else (ctx/entity-var! ctx default-table))
+        ;; A two-argument aggregate (string_agg's delimiter, corr's second
+        ;; series) reaches its implementation as a [v1 v2] PAIR -- the same
+        ;; shape the unfiltered path builds. Without it `string_agg(s, ',')
+        ;; FILTER (WHERE …)` handed the aggregate a bare value and died on
+        ;; "Don't know how to create ISeq from: Keyword".
+        arg2-val (when arg2-expr (expr/translate-expr ctx arg2-expr))
+        case-var (ctx/fresh-var! ctx)
+        cond-vars (vec (ctx/collect-vars cond-form))
+        param-vars (vec (distinct (concat cond-vars
+                                          (when (symbol? inner-val) [inner-val])
+                                          (when (symbol? arg2-val) [arg2-val]))))
+        compiled-fn (let [pv param-vars, cf cond-form, iv inner-val
+                          i2 arg2-val, pair? (some? arg2-expr), out excluded]
+                      (fn [& args]
+                        (let [bindings (zipmap pv args)]
+                          (if (true? (expr/interpret-form cf bindings))
+                            (if pair?
+                              [(expr/interpret-form iv bindings)
+                               (expr/interpret-form i2 bindings)]
+                              (expr/interpret-form iv bindings))
+                            ;; An excluded row of a PAIR aggregate has to stay
+                            ;; a pair: `filter-string-agg` reads `(first p)` of
+                            ;; every element, and a bare marker there died with
+                            ;; "Don't know how to create ISeq from: Keyword".
+                            (if pair? [out out] out)))))
+        fn-param (symbol (str "?filter-fn" (swap! (:var-counter ctx) inc)))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj compiled-fn)
+    (ctx/add-clause! ctx [(apply list fn-param param-vars) case-var])
+    (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+    case-var))
 
 (defn translate-select
   "Translate a PlainSelect into a Datalog query map + metadata.
@@ -2862,7 +2959,26 @@
                     ;; Window function: collect spec for server-side post-processing.
                     ;; All base columns must be in :find so the post-processor can
                     ;; partition, sort, and compute values from the result tuples.
-                    (let [;; Translate PARTITION BY columns to find-element indices
+                    (let [;; `OVER w` names a window defined once in the
+                          ;; statement's WINDOW clause. The name was never
+                          ;; resolved, so such a window had no PARTITION BY, no
+                          ;; ORDER BY and no frame at all -- every row of the
+                          ;; table in a single frame, silently.
+                          ^net.sf.jsqlparser.expression.WindowDefinition
+                          named-win (when-let [wn (.getWindowName ae)]
+                                      (or (some (fn [^net.sf.jsqlparser.expression.WindowDefinition wd]
+                                                  (when (= wn (.getWindowName wd)) wd))
+                                                (.getWindowDefinitions select))
+                                          (throw (errors/pg-error
+                                                  :undefined-object
+                                                  {:message (str "window \"" wn "\" does not exist")}))))
+                          partition-list (or (when named-win (.getPartitionExpressionList named-win))
+                                             partition-list)
+                          order-by-list (or (when named-win (.getOrderByElements named-win))
+                                            order-by-list)
+                          window-elem (or (when named-win (.getWindowElement named-win))
+                                          window-elem)
+                          ;; Translate PARTITION BY columns to find-element indices
                           part-idxs (when (seq partition-list)
                                       (mapv (fn [pexpr]
                                               (let [v (expr/translate-expr ctx pexpr)
@@ -2878,72 +2994,168 @@
                                      (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement obe]
                                              (let [v (expr/translate-expr ctx (.getExpression obe))
                                                    v (if (seq? v) (ctx/materialize-arg! ctx v) v)
-                                                   asc? (.isAsc obe)]
+                                                   asc? (.isAsc obe)
+                                                   ;; Explicit NULLS FIRST / NULLS LAST was
+                                                   ;; parsed and dropped here (the statement's
+                                                   ;; own ORDER BY next door keeps it), so
+                                                   ;; `rank() OVER (ORDER BY v NULLS FIRST)`
+                                                   ;; ranked the NULLs last.
+                                                   nulls (condp = (str (.getNullOrdering obe))
+                                                           "NULLS_FIRST" :first
+                                                           "NULLS_LAST"  :last
+                                                           nil)]
                                                (when-not (some #{v} @find-elements)
                                                  (swap! find-elements conj v)
                                                  (swap! find-aliases conj (str "__win_ord_" (count @find-elements))))
                                                [(.indexOf ^java.util.List @find-elements v)
-                                                (if asc? :asc :desc)]))
+                                                (if asc? :asc :desc)
+                                                nulls]))
                                            order-by-list))
-                          ;; Translate aggregate column (for SUM/AVG/etc.).
-                          ;; `count(*)` has AllColumns as its "argument", which
-                          ;; is not a value expression -- translating it put a
-                          ;; non-var into :find and Datahike rejected the whole
-                          ;; query ("Cannot parse :find"). COUNT(*) counts rows
-                          ;; in the frame, so there is no column to reference.
-                          count-star? (or (nil? inner-expr)
-                                          (instance? AllColumns inner-expr))
-                          inner-expr (when-not count-star? inner-expr)
-                          col-idx (when inner-expr
-                                    (let [v (expr/translate-expr ctx inner-expr)
-                                          v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
-                                      (when-not (some #{v} @find-elements)
-                                        (swap! find-elements conj v)
-                                        (swap! find-aliases conj (str "__win_col_" (count @find-elements))))
-                                      (.indexOf ^java.util.List @find-elements v)))
-                          ;; Parse frame specification
+                          ;; The function's own arguments. `.getExpression`
+                          ;; is the first, `.getOffset` the second and
+                          ;; `.getDefaultValue` the third -- which is how
+                          ;; `lag(v, 2, -1)`, `nth_value(v, 2)` and
+                          ;; `string_agg(v, ',')` carry theirs. The offset
+                          ;; and default were parsed and then DROPPED, so
+                          ;; `lead(v, 2, -1)` ran as `lead(v)`.
+                          ;;
+                          ;; `count(*)` has AllColumns as its "argument",
+                          ;; which is not a value expression -- translating it
+                          ;; put a non-var into :find and Datahike rejected
+                          ;; the whole query ("Cannot parse :find"). COUNT(*)
+                          ;; counts rows in the frame, so there is no column
+                          ;; to reference. NTILE's argument is its bucket
+                          ;; COUNT, not a column, and it hit exactly that
+                          ;; failure: `ntile(2) OVER (ORDER BY i)` put the
+                          ;; literal 2 into :find and could not run at all.
+                          count-star? (and (or (nil? inner-expr)
+                                               (instance? AllColumns inner-expr))
+                                           (nil? filter-expr))
+                          ntile? (= fname "ntile")
+                          arg-expr (when-not (or count-star? ntile? filter-expr) inner-expr)
+                          ;; A window argument has to travel in :find so the
+                          ;; post-processor can read it off the result tuple.
+                          find-idx! (fn [e tag]
+                                      (let [v (expr/translate-expr ctx e)
+                                            v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+                                        (when-not (some #{v} @find-elements)
+                                          (swap! find-elements conj v)
+                                          (swap! find-aliases conj (str tag (count @find-elements))))
+                                        (.indexOf ^java.util.List @find-elements v)))
+                          ;; `agg(x) FILTER (WHERE p) OVER (…)`. The filter was
+                          ;; parsed and DROPPED, so the window aggregate ran over
+                          ;; every row of the frame. It is applied the way the
+                          ;; non-window FILTER path applies it: the argument
+                          ;; column becomes `x when p else NULL`, and every
+                          ;; aggregate already skips the NULL sentinel -- so the
+                          ;; filter costs the window engine nothing and works for
+                          ;; whichever aggregate is on top.
+                          filter-var (when filter-expr
+                                       (filter-arg-var! ctx filter-expr inner-expr
+                                                        default-table count-star?
+                                                        (when (contains? two-arg-aggs fname)
+                                                          (.getOffset ae))
+                                                        (if (contains? null-preserving-aggs fname)
+                                                          fns/filtered-out
+                                                          :__null__)))
+                          col-idx (cond
+                                    filter-var (do (when-not (some #{filter-var} @find-elements)
+                                                     (swap! find-elements conj filter-var)
+                                                     (swap! find-aliases conj (str "__win_col_" (count @find-elements))))
+                                                   (.indexOf ^java.util.List @find-elements filter-var))
+                                    arg-expr (find-idx! arg-expr "__win_col_"))
+                          off-expr (.getOffset ae)
+                          def-expr (.getDefaultValue ae)
+                          ;; string_agg's delimiter (and any other
+                          ;; two-argument aggregate's second operand) is a
+                          ;; per-row value like the first, so it rides in
+                          ;; :find too and reaches the aggregate as the
+                          ;; [value delimiter] pair it already expects.
+                          two-arg-agg? (and off-expr (contains? #{"string_agg" "corr"} fname))
+                          ;; A CONSTANT second operand -- which the delimiter
+                          ;; almost always is -- must not go into :find:
+                          ;; Datahike rejects a non-variable there ("Cannot
+                          ;; parse :find"), which is what `string_agg(x, ',')
+                          ;; OVER ()` died of.
+                          arg2-const (when two-arg-agg?
+                                       (let [v (expr/translate-expr ctx off-expr)]
+                                         (when-not (or (symbol? v) (seq? v)) v)))
+                          arg2-idx (when (and two-arg-agg? (nil? arg2-const))
+                                     (find-idx! off-expr "__win_arg2_"))
+                          const-of (fn [e] (when e
+                                             (let [v (expr/translate-expr ctx e)]
+                                               (when (number? v) (long v)))))
+                          offset-n (when (and off-expr (not two-arg-agg?)) (const-of off-expr))
+                          default-val (when def-expr (expr/translate-expr ctx def-expr))
+                          ;; Parse frame specification. JSqlParser exposes the
+                          ;; bounds structurally -- WindowRange.getStart/getEnd
+                          ;; for `BETWEEN a AND b`, WindowElement.getOffset for
+                          ;; a lone start bound -- and each WindowOffset says
+                          ;; PRECEDING / FOLLOWING / CURRENT with a nil
+                          ;; expression for UNBOUNDED. Reading them off the
+                          ;; toString() instead is what made `ROWS UNBOUNDED
+                          ;; PRECEDING` come out as the whole partition and
+                          ;; `RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+                          ;; FOLLOWING` come out as a running total.
+                          parse-bound
+                          (fn [^net.sf.jsqlparser.expression.WindowOffset o default-bound]
+                            (if (nil? o)
+                              default-bound
+                              (let [t (str (.getType o))
+                                    e (.getExpression o)
+                                    n (when e (let [v (expr/translate-expr ctx e)]
+                                                (when (number? v) (long v))))]
+                                (case t
+                                  "CURRENT" :current-row
+                                  "PRECEDING" (if n [n :preceding] :unbounded-preceding)
+                                  "FOLLOWING" (if n [n :following] :unbounded-following)
+                                  default-bound))))
                           frame (if window-elem
-                                  (let [wt (str/upper-case (str (.getType window-elem)))
-                                        range? (str/starts-with? wt "RANGE")
-                                        ;; JSqlParser 5.1 does not expose structured frame-bound types
-                                        ;; (no WindowRange.getStart() / WindowOffset.getType() etc.), so
-                                        ;; we fall back to parsing the toString() representation with
-                                        ;; str/upper-case + str/starts-with? / regex.
-                                        parse-bound (fn [s default-bound]
-                                                      (let [upper (str/upper-case (str s))]
-                                                        (cond
-                                                          (str/starts-with? upper "UNBOUNDED PRECEDING") :unbounded-preceding
-                                                          (str/starts-with? upper "UNBOUNDED FOLLOWING") :unbounded-following
-                                                          (str/starts-with? upper "CURRENT ROW") :current-row
-                                                          ;; Numeric bound: "5 PRECEDING" or "3 FOLLOWING"
-                                                          (re-find #"(\d+)\s+PRECEDING" upper)
-                                                          [(Long/parseLong (second (re-find #"(\d+)\s+PRECEDING" upper))) :preceding]
-                                                          (re-find #"(\d+)\s+FOLLOWING" upper)
-                                                          [(Long/parseLong (second (re-find #"(\d+)\s+FOLLOWING" upper))) :following]
-                                                          :else default-bound)))
-                                        start-bound (parse-bound (.getRange window-elem) :unbounded-preceding)
-                                        off (.getOffset window-elem)
-                                        end-bound (if (nil? off)
-                                                    (if (seq order-by-list) :current-row :unbounded-following)
-                                                    (parse-bound off :unbounded-following))]
-                                    {:type (if range? :range :rows)
-                                     :start start-bound :end end-bound})
-                                  ;; Default frame per SQL standard
+                                  (let [range? (= "RANGE" (str (.getType window-elem)))
+                                        r (.getRange window-elem)]
+                                    (if r
+                                      {:type (if range? :range :rows)
+                                       :start (parse-bound (.getStart r) :unbounded-preceding)
+                                       :end   (parse-bound (.getEnd r) :current-row)}
+                                      ;; Only a start bound was given; SQL
+                                      ;; defines the end as CURRENT ROW.
+                                      {:type (if range? :range :rows)
+                                       :start (parse-bound (.getOffset window-elem) :unbounded-preceding)
+                                       :end :current-row}))
+                                  ;; The SQL default frame: the whole partition
+                                  ;; without an ORDER BY, and RANGE (peers, not
+                                  ;; rows) up to the current row with one.
                                   (if (seq order-by-list)
-                                    {:type :rows :start :unbounded-preceding :end :current-row}
+                                    {:type :range :start :unbounded-preceding :end :current-row}
                                     {:type :rows :start :unbounded-preceding :end :unbounded-following}))
                           ;; Build window spec
                           op-kw (keyword fname)
+                          ;; The aggregate is the SAME function the plain
+                          ;; (non-window) path uses, chosen by the same
+                          ;; precision rule -- so `sum(numeric) OVER ()` keeps
+                          ;; its scale and `avg(int) OVER ()` is NUMERIC, and
+                          ;; every aggregate the window engine's private `case`
+                          ;; never named (array_agg, string_agg, stddev, …)
+                          ;; works by construction rather than answering NULL.
+                          arg-oid (when-let [e (or arg-expr (when filter-expr
+                                                              (when-not (instance? AllColumns inner-expr)
+                                                                inner-expr)))]
+                                    (try (oid/expr-oid e agg-oid-env)
+                                         (catch Throwable _ nil)))
+                          agg-sym (when agg-sym
+                                    (or (pick-precision-variant fname arg-oid) agg-sym))
                           win-spec (cond-> {:op op-kw
                                             :partition-by (or part-idxs [])
                                             :order-by (or ob-specs [])
                                             :frame frame}
                                      count-star? (assoc :count-star? true)
                                      col-idx (assoc :col-idx col-idx)
-                                     (= fname "ntile")
-                                     (assoc :ntile-n (when inner-expr
-                                                       (let [v (expr/translate-expr ctx inner-expr)]
-                                                         (when (number? v) (long v))))))]
+                                     arg2-idx (assoc :arg2-idx arg2-idx)
+                                     (some? arg2-const) (assoc :arg2-const arg2-const)
+                                     offset-n (assoc :offset-n offset-n)
+                                     (some? default-val) (assoc :default-val default-val)
+                                     agg-sym (assoc :agg-sym agg-sym)
+                                     ntile? (assoc :ntile-n (const-of inner-expr)))]
                       ;; Don't add alias to find-aliases — the server adds it
                       ;; after computing the window values. find-aliases must match
                       ;; the Datalog :find elements count.
@@ -2954,53 +3166,33 @@
                     (do
                       (reset! has-aggregates? true)
                       (if (and filter-expr agg-sym)
-                        (let [cond-form (expr/translate-predicate-expr ctx filter-expr)
-                              inner-val (if inner-expr (expr/translate-expr ctx inner-expr)
-                                            (ctx/entity-var! ctx default-table))
-                              case-var (ctx/fresh-var! ctx)
-                          ;; Collect all referenced variables
-                              cond-vars (vec (ctx/collect-vars cond-form))
-                              all-param-vars (vec (distinct (concat cond-vars
-                                                                    (when (symbol? inner-val) [inner-val]))))
-                              is-count? (= fname "count")
-                          ;; COUNT FILTER: 1 if matched, 0 if not → SUM
-                          ;; All others: value if matched, :__null__ if not → filter-* aggregate
-                              compiled-fn (let [pv all-param-vars
-                                                cf cond-form
-                                                iv inner-val
-                                                cnt? is-count?]
-                                            (fn [& args]
-                                              (let [bindings (zipmap pv args)]
-                                                ;; FILTER (WHERE p) counts a row only when p
-                                                ;; is TRUE. UNKNOWN does not qualify, and the
-                                                ;; `:__null__` sentinel is truthy, so a bare
-                                                ;; `if` counted the NULL rows in.
-                                                (if (true? (expr/interpret-form cf bindings))
-                                                  (if cnt? 1 (expr/interpret-form iv bindings))
-                                                  (if cnt? 0 :__null__)))))
-                              fn-param (symbol (str "?filter-fn" (swap! (:var-counter ctx) inc)))
-                          ;; Per-input-type variant — same numeric-promotion
-                          ;; rule as the non-FILTER aggregate path.
+                        (let [is-count? (= fname "count")
+                              count-star? (and is-count?
+                                               (or (nil? inner-expr)
+                                                   (instance? AllColumns inner-expr)))
+                              case-var (filter-arg-var! ctx filter-expr inner-expr
+                                                        default-table count-star?
+                                                        (when (contains? two-arg-aggs fname)
+                                                          (.getOffset ae))
+                                                        (if (contains? null-preserving-aggs fname)
+                                                          fns/filtered-out
+                                                          :__null__))
+                              ;; Per-input-type variant — same numeric-promotion
+                              ;; rule as the non-FILTER aggregate path.
                               filter-precision-variant
-                              (when inner-expr
+                              (when (and inner-expr (not count-star?))
                                 (pick-precision-variant
                                  fname
                                  (oid/expr-oid inner-expr agg-oid-env)))
-                          ;; Choose aggregate: COUNT→sum, others→filter-aware variant
+                              ;; The same aggregate the unfiltered form uses.
+                              ;; This was a four-name `case` whose default was
+                              ;; `filter-sum`, so `array_agg(x) FILTER (…)`,
+                              ;; `string_agg`, `stddev` and every other
+                              ;; aggregate silently computed a SUM instead.
                               filter-agg (cond
-                                           is-count? 'sum
+                                           is-count? 'datahike.pg.sql/filter-count
                                            filter-precision-variant filter-precision-variant
-                                           :else
-                                           (case fname
-                                             "sum" 'datahike.pg.sql/filter-sum
-                                             "avg" 'datahike.pg.sql/filter-avg
-                                             "min" 'datahike.pg.sql/filter-min
-                                             "max" 'datahike.pg.sql/filter-max
-                                             'datahike.pg.sql/filter-sum))]
-                          (swap! (:in-params ctx) conj fn-param)
-                          (swap! (:in-args ctx) conj compiled-fn)
-                          (ctx/add-clause! ctx [(apply list fn-param all-param-vars) case-var])
-                          (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+                                           :else (or agg-sym 'datahike.pg.sql/filter-sum))]
                           (swap! find-elements conj (list filter-agg case-var))
                           (swap! find-aliases conj (or alias-str fname)))
                     ;; No filter — treat as regular aggregate
