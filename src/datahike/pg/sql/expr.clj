@@ -61,6 +61,7 @@
             Alias ArrayExpression Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis NotExpression CaseExpression WhenClause
             SignedExpression CastExpression TimeKeyExpression JsonExpression
+            ExtractExpression TrimFunction
             TimezoneExpression ArrayConstructor JdbcParameter JdbcNamedParameter]
            [net.sf.jsqlparser.expression.operators.relational
             DoubleAnd EqualsTo ExistsExpression ExpressionList
@@ -321,9 +322,22 @@
         fname (if (str/starts-with? raw-name "pg_catalog.")
                 (subs raw-name (count "pg_catalog."))
                 raw-name)
-        params (.getParameters f)
+        ;; The SQL keyword call forms -- `substring(s FROM 1 FOR 2)`,
+        ;; `position('a' IN s)`, `trim(BOTH ' ' FROM s)` -- put their
+        ;; operands in a NamedExpressionList and leave .getParameters
+        ;; empty, so they arrived with no arguments at all.
+        params (or (.getParameters f)
+                   (some-> (.getNamedParameters f) .getExpressions))
         raw-args (when params
                    (mapv #(translate-expr ctx %) params))
+        ;; `position(sub IN str)` names its operands the other way round
+        ;; from the function it resolves to -- PostgreSQL's gram.y swaps
+        ;; them before analysis, so do the same for the keyword form only.
+        raw-args (if (and (= fname "position")
+                          (nil? (.getParameters f))
+                          (= 2 (count raw-args)))
+                   [(second raw-args) (first raw-args)]
+                   raw-args)
         ;; Materialize complex sub-expressions into intermediate vars
         args (when raw-args
                (mapv #(ctx/materialize-arg! ctx %) raw-args))
@@ -935,26 +949,19 @@
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
-      ;; SUBSTR/SUBSTRING(s, start, len) → [(subs ?s (dec start) (+ (dec start) len)) ?result]
+      ;; SUBSTR/SUBSTRING(s, start [, len])
+      ;; Through sql-substring rather than a raw `subs`: `subs` throws on
+      ;; the `:__null__` sentinel ("class Keyword cannot be cast to
+      ;; String") and on any offset outside the string, where PostgreSQL
+      ;; clamps and returns as much as overlaps.
       (or (= fname "substr") (= fname "substring"))
       (let [[s start len] args]
-        (if (and (number? start) len (number? len))
-          ;; Constant offsets: precompute
-          (let [from (dec (long start))
-                to (+ from (long len))]
-            (swap! (:where-clauses ctx) conj
-                   [(list 'subs s from to) result-var])
-            result-var)
-          ;; Dynamic offsets
-          (do (swap! (:where-clauses ctx) conj
-                     [(list 'subs s
-                            (if (number? start) (dec (long start)) (list 'dec start))
-                            (if (and (number? start) (number? len))
-                              (+ (dec (long start)) (long len))
-                              (list '+ (if (number? start) (dec (long start)) (list 'dec start))
-                                    (or len (list 'count s)))))
-                      result-var])
-              result-var)))
+        (swap! (:where-clauses ctx) conj
+               [(if len
+                  (list 'datahike.pg.sql/sql-substring s start len)
+                  (list 'datahike.pg.sql/sql-substring s start))
+                result-var])
+        result-var)
 
       ;; DATE_TRUNC(precision, ts) → floor to precision boundary.
       ;; Accepts ts as either:
@@ -988,7 +995,11 @@
                                                   java.time.temporal.ChronoUnit/DAYS)
                           zdt))
             trunc-fn (fn [prec ts]
-                       (when (and prec ts (not= :__null__ ts))
+                       ;; NULL out, not nil: a datalog binding that yields nil
+                       ;; FILTERS THE ROW, so `date_trunc('month', d)` dropped
+                       ;; every row whose d was NULL.
+                       (if (or (fns/sql-null? prec) (fns/sql-null? ts))
+                         :__null__
                          (let [unit (let [u (if (keyword? prec) (name prec) (str prec))]
                                       (str/replace u #"s$" ""))]
                            (cond
@@ -997,6 +1008,23 @@
                                                 java.time.ZoneOffset/UTC)
                                    trunc (trunc-zdt unit zdt)]
                                (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+
+                             ;; A `date` column arrives as a LocalDate, which
+                             ;; the fall-through returned UNTRUNCATED --
+                             ;; `date_trunc('month', d)` answered d. PostgreSQL
+                             ;; resolves a date argument to the timestamptz
+                             ;; overload, so the result is an instant.
+                             (instance? java.time.LocalDate ts)
+                             (let [zdt (.atStartOfDay ^java.time.LocalDate ts
+                                                      java.time.ZoneOffset/UTC)
+                                   trunc (trunc-zdt unit zdt)]
+                               (java.util.Date/from (.toInstant ^java.time.ZonedDateTime trunc)))
+
+                             ;; A `timestamp` (no zone) stays zone-less.
+                             (instance? java.time.LocalDateTime ts)
+                             (let [zdt (.atZone ^java.time.LocalDateTime ts
+                                                java.time.ZoneOffset/UTC)]
+                               (.toLocalDateTime ^java.time.ZonedDateTime (trunc-zdt unit zdt)))
 
                              (number? ts)
                              (let [zdt (.atZone (java.time.Instant/ofEpochSecond (long ts))
@@ -3204,6 +3232,35 @@
           result-var)
         (translate-expr ctx left)))
 
+    ;; EXTRACT(field FROM value) is its own AST node, not a Function, so it
+    ;; never reached the function table at all.
+    (instance? ExtractExpression expr)
+    (let [^ExtractExpression e expr
+          v (translate-expr ctx (.getExpression e))
+          v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+      (list 'datahike.pg.sql/sql-extract (str (.getName e)) v))
+
+    ;; TRIM([LEADING|TRAILING|BOTH] [chars] FROM s) is also its own node.
+    ;; With a FROM, `.getExpression` is the CHARACTER SET and
+    ;; `.getFromExpression` is the string -- the other way round from the
+    ;; bare `trim(s)` form.
+    (instance? TrimFunction expr)
+    (let [^TrimFunction e expr
+          spec (str/lower-case (str (.getTrimSpecification e)))
+          from-e (.getFromExpression e)
+          str-e (if from-e from-e (.getExpression e))
+          chars-e (when from-e (.getExpression e))
+          v (translate-expr ctx str-e)
+          v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+          c (when chars-e
+              (let [cv (translate-expr ctx chars-e)]
+                (if (seq? cv) (ctx/materialize-arg! ctx cv) cv)))
+          f (case spec
+              "leading"  'datahike.pg.sql/sql-ltrim
+              "trailing" 'datahike.pg.sql/sql-rtrim
+              'datahike.pg.sql/sql-btrim)]
+      (if c (list f v c) (list f v)))
+
     ;; Boolean-producing operators as SELECT-list projections.
     ;; PG treats `SELECT col > 5 FROM t` as projecting a BOOL column;
     ;; WHERE and HAVING are the dominant use of these, but they're
@@ -3712,6 +3769,31 @@
                (concat ['or-join shared-vars] live-branches)
                (concat ['or] live-branches))]))))))
 
+(defn- ground-true?
+  "Evaluate a variable-free clause form and say whether it is TRUE.
+
+   Truthiness, except that the `:__null__` sentinel is NOT true -- it is
+   UNKNOWN, which a qual rejects. `re-find` and friends answer with a
+   match rather than `true`, so a bare `true?` would misread them."
+  [form]
+  (let [v (interpret-form form {})]
+    (and (some? v) (not= :__null__ v) (not (false? v)))))
+
+(defn- negated-clauses
+  "Emit `(not <clauses>)` -- or, when the clauses mention no variables,
+   decide the negation NOW and answer with a constant.
+
+   A datalog `not` is a NOT-JOIN and needs variables to join on, so a
+   ground body raises \"Join variables should not be empty\". That is
+   reachable from any predicate whose operands are all literals:
+   `NOT (1 = 1)`, `'aa' NOT LIKE 'a%'`."
+  [clauses]
+  (if (empty? (ctx/collect-vars clauses))
+    (if (every? (comp ground-true? first) clauses)
+      [[(list 'not= 1 1)]]   ; body is TRUE  -> its negation matches nothing
+      [])                    ; body is FALSE -> its negation matches every row
+    [(concat ['not] clauses)]))
+
 (defn- two-valued-predicate?
   "True when the expression can only be TRUE or FALSE, never UNKNOWN.
 
@@ -3826,12 +3908,8 @@
                        [] (conjunct-spine expr))]
       (if mays
         ;; Ground conjunction (`NOT (0 = -1 AND 1 <= 2.5)`) -- no variables to
-        ;; NOT-JOIN on, same problem as the ground atom below. Decide it here.
-        (if (empty? (ctx/collect-vars mays))
-          (if (every? #(true? (interpret-form (first %) {})) mays)
-            [[(list 'not= 1 1)]]
-            [])
-          [(concat ['not] mays)])
+        ;; NOT-JOIN on, same problem as the ground atom below.
+        (negated-clauses mays)
         (do (ctx/restore! ctx snap)
             (let [^AndExpression e expr]
               (combine-disjuncts ctx [(translate-predicate-false ctx (.getLeftExpression e))
@@ -3854,15 +3932,9 @@
         (every? false-sentinel? inner) []
 
         ;; No variables anywhere in φ -- `NOT (1 = 1)`, or the constant
-        ;; disjunct of `NOT (i = 10 OR 2.5 <> 0)`. A datalog `not` is a
-        ;; NOT-JOIN and needs something to join ON, so emitting one here
-        ;; raises "Join variables should not be empty". Since φ is ground
-        ;; we can just decide it now: evaluate it, and answer with a
-        ;; constant instead of a negation.
+        ;; disjunct of `NOT (i = 10 OR 2.5 <> 0)`. See `negated-clauses`.
         (empty? (ctx/collect-vars inner))
-        (if (every? #(true? (interpret-form (first %) {})) inner)
-          [[(list 'not= 1 1)]]   ; φ is TRUE  → never FALSE → no rows
-          [])                    ; φ is FALSE → F(φ) is every row
+        (negated-clauses inner)
 
         :else
         (let [;; DERIVE the guards from the operand vars rather than
@@ -4102,17 +4174,20 @@
                                (coerce-unknown-literal ctx left-ast bound-ast))
                              (translate-expr ctx bound-ast)))
           lo (coerce-bound (.getBetweenExpressionStart e))
-          hi (coerce-bound (.getBetweenExpressionEnd e))
-          guards (ctx/null-guard-clauses ctx [col lo hi])]
-      (if not-between?
-        ;; NOT BETWEEN → val < lo OR val > hi. Guard against NULL col
-        ;; (SQL: `col NOT BETWEEN a AND b` when col IS NULL → UNKNOWN → false).
-        (into guards
-              [(list 'or [(list '< col lo)] [(list '> col hi)])])
-        ;; BETWEEN → val >= lo AND val <= hi. Same guard.
-        (into guards
-              [[(list '>= col lo)]
-               [(list '<= col hi)]])))
+          hi (coerce-bound (.getBetweenExpressionEnd e))]
+      ;; One predicate per form, not a disjunction and not a pair of
+      ;; comparisons. `(or [(< col lo)] [(> col hi)])` binds different var
+      ;; sets in its two branches, which datalog rejects the moment lo and
+      ;; hi are different variables (`id NOT BETWEEN 0 AND i`). And the
+      ;; comparisons go through sql-le?, which orders NaN as PostgreSQL
+      ;; does; clojure.core's `<=` does not.
+      ;; NO null-guards: the predicates decide NULL themselves, under the
+      ;; Kleene AND. Guarding all three operands non-NULL first would drop
+      ;; the rows where `1 NOT BETWEEN 3 AND NULL` is TRUE.
+      [[(list (if not-between?
+                'datahike.pg.sql/sql-not-between?
+                'datahike.pg.sql/sql-between?)
+              col lo hi)]])
 
     (instance? IsNullExpression expr)
     (let [^IsNullExpression e expr
@@ -4338,7 +4413,7 @@
               re-obj (re-pattern regex-str)
               pred [(list 're-find re-obj col)]]
           (if not-like?
-            (conj guards (list 'not pred))
+            (into guards (negated-clauses [pred]))
             (conj guards pred)))
         ;; Parameter pattern → register an in-param matcher fn.
         ;; Cache the last (str pat) so re-Bind/re-Execute on the same
