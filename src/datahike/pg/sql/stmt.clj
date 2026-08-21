@@ -63,7 +63,7 @@
             Alias Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis SignedExpression CastExpression
             JsonExpression TimezoneExpression TimeKeyExpression ArrayConstructor JdbcParameter
-            CaseExpression RowConstructor]
+            CaseExpression WhenClause RowConstructor]
            [net.sf.jsqlparser.expression.operators.relational
             GreaterThan GreaterThanEquals MinorThan MinorThanEquals
             EqualsTo NotEqualsTo IsNullExpression
@@ -4940,7 +4940,7 @@
           (java.util.Date/from (.toInstant ^java.time.ZonedDateTime val))
           :else val)))))
 
-(declare eval-update-expr)
+(declare eval-update-expr eval-update-cond)
 
 (def ^:dynamic *eval-update-db*
   "Bound by build-update-tx-for-bindings to the live db when evaluating
@@ -5117,6 +5117,46 @@
          (catch Exception _ x))
     x))
 
+(defn eval-update-cond
+  "Evaluate a boolean expression in UPDATE SET position -- the tests of a
+   CASE. Three-valued: returns true / false / :__null__, so the caller can
+   apply PostgreSQL's rule that a branch is taken only on TRUE.
+
+   A small evaluator rather than a reuse of the WHERE translator: this runs
+   per ENTITY against an already-materialised entity-map, not as a datalog
+   clause over the whole relation."
+  [expr entity-map ns-str schema]
+  (let [ev (fn [e] (eval-update-expr e entity-map ns-str schema))]
+    (cond
+      (instance? AndExpression expr)
+      (fns/sql-and3 (eval-update-cond (.getLeftExpression ^AndExpression expr) entity-map ns-str schema)
+                    (eval-update-cond (.getRightExpression ^AndExpression expr) entity-map ns-str schema))
+      (instance? OrExpression expr)
+      (fns/sql-or3 (eval-update-cond (.getLeftExpression ^OrExpression expr) entity-map ns-str schema)
+                   (eval-update-cond (.getRightExpression ^OrExpression expr) entity-map ns-str schema))
+      (instance? net.sf.jsqlparser.expression.NotExpression expr)
+      (fns/sql-not3 (eval-update-cond (.getExpression ^net.sf.jsqlparser.expression.NotExpression expr)
+                                      entity-map ns-str schema))
+      (instance? Parenthesis expr)
+      (eval-update-cond (.getExpression ^Parenthesis expr) entity-map ns-str schema)
+      (instance? IsNullExpression expr)
+      (let [v (ev (.getLeftExpression ^IsNullExpression expr))]
+        (if (.isNot ^IsNullExpression expr) (some? v) (nil? v)))
+      (instance? EqualsTo expr)
+      (fns/sql-eq3? (ev (.getLeftExpression ^EqualsTo expr)) (ev (.getRightExpression ^EqualsTo expr)))
+      (instance? NotEqualsTo expr)
+      (fns/sql-ne3? (ev (.getLeftExpression ^NotEqualsTo expr)) (ev (.getRightExpression ^NotEqualsTo expr)))
+      (instance? GreaterThan expr)
+      (fns/sql-gt3? (ev (.getLeftExpression ^GreaterThan expr)) (ev (.getRightExpression ^GreaterThan expr)))
+      (instance? GreaterThanEquals expr)
+      (fns/sql-ge3? (ev (.getLeftExpression ^GreaterThanEquals expr)) (ev (.getRightExpression ^GreaterThanEquals expr)))
+      (instance? MinorThan expr)
+      (fns/sql-lt3? (ev (.getLeftExpression ^MinorThan expr)) (ev (.getRightExpression ^MinorThan expr)))
+      (instance? MinorThanEquals expr)
+      (fns/sql-le3? (ev (.getLeftExpression ^MinorThanEquals expr)) (ev (.getRightExpression ^MinorThanEquals expr)))
+      (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
+      :else (let [v (ev expr)] (if (nil? v) :__null__ (boolean v))))))
+
 (defn eval-update-expr
   "Evaluate an UPDATE SET expression for a specific entity.
    For simple literals, returns the literal value.
@@ -5289,7 +5329,26 @@
         (apply str (map #(let [v (eval-update-expr % entity-map ns-str schema)]
                            (if (some? v) (str v) ""))
                         args))
-        (str value-expr)))
+        ;; coalesce / nullif are not in the shared table -- the SELECT path
+        ;; special-cases them in the translator, which this evaluator cannot
+        ;; reuse -- so they need spelling out here.
+        "coalesce"
+        (first (remove nil? (map #(eval-update-expr % entity-map ns-str schema) args)))
+        "nullif"
+        (let [[a b] (mapv #(eval-update-expr % entity-map ns-str schema) args)]
+          (when-not (true? (fns/sql-eq3? a b)) a))
+        ;; Anything else in the shared function table. Without this the
+        ;; fallback STRINGIFIED the call, so `UPDATE t SET i = coalesce(i,0)`
+        ;; handed the numeric coercion the text "coalesce(i, 0)" and raised
+        ;; "invalid input syntax for numeric".
+        (if-let [impl (get fns/sql-fn->clj-fn fname)]
+          (let [vs (mapv #(eval-update-expr % entity-map ns-str schema) args)
+                wrapped (if (contains? fns/non-strict-fns fname)
+                          impl
+                          (fns/null-safe impl))
+                r (apply wrapped vs)]
+            (if (= :__null__ r) nil r))
+          (str value-expr))))
 
     ;; Scalar subquery: (SELECT col FROM tbl WHERE ...). Used inside
     ;; concat()/etc. arguments for correlated reads. Requires a live db
@@ -5323,6 +5382,26 @@
       (if (= (count pel) 1)
         (eval-update-expr (first pel) entity-map ns-str schema)
         (str value-expr)))
+
+    ;; CASE WHEN … THEN … ELSE … END. Without this the fallback stringified
+    ;; the whole expression, so `UPDATE t SET i = CASE …` wrote the SQL text
+    ;; into the column (or, for a numeric column, raised on the coercion).
+    ;; A branch is taken only when its test is TRUE -- UNKNOWN is not.
+    (instance? CaseExpression value-expr)
+    (let [^CaseExpression ce value-expr
+          switch (.getSwitchExpression ce)
+          switch-v (when switch (eval-update-expr switch entity-map ns-str schema))
+          ev (fn [e] (eval-update-expr e entity-map ns-str schema))
+          taken (reduce (fn [_ ^WhenClause wc]
+                          (let [when-e (.getWhenExpression wc)
+                                hit? (if switch
+                                       (true? (fns/sql-eq3? switch-v (ev when-e)))
+                                       (true? (eval-update-cond when-e entity-map ns-str schema)))]
+                            (when hit? (reduced [(ev (.getThenExpression wc))]))))
+                        nil (.getWhenClauses ce))]
+      (if taken
+        (first taken)
+        (when-let [else (.getElseExpression ce)] (ev else))))
 
     ;; Fallback: try as string
     :else (str value-expr)))
@@ -5639,7 +5718,16 @@
                                         attr (if db
                                                (ctx/resolve-inherited-attr raw-attr schema db)
                                                raw-attr)
-                                        coerced (coerce-insert-value val attr schema)]
+                                        ;; A row coming FROM A SELECT carries SQL
+                                        ;; NULL as the `:__null__` sentinel, not
+                                        ;; nil, and the sentinel reached the
+                                        ;; coercion as a value: `INSERT INTO t
+                                        ;; SELECT …` raised "invalid input syntax
+                                        ;; for column" the moment any selected
+                                        ;; value was NULL. A NULL column is simply
+                                        ;; an absent datom.
+                                        coerced (when-not (= :__null__ val)
+                                                  (coerce-insert-value val attr schema))]
                                     (when (some? coerced)
                                       [attr coerced])))
                                 (map vector col-names row))))
