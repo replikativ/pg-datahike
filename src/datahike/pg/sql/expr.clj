@@ -735,10 +735,11 @@
       ;; empty). 0 for empty array; sum across all dims for multi-dim.
       (= fname "cardinality")
       (let [fn-param (symbol (str "?card" (swap! (:var-counter ctx) inc)))
+            ;; NULL in, NULL out -- cardinality of an unknown array is not 0.
             impl-fn (fn [arr]
                       (if-let [a (coerce-pg-array arr)]
                         (count (pg-arr/flat-elements a))
-                        0))]
+                        :__null__))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj
@@ -774,8 +775,13 @@
       ;; index at 1 (we keep lbound=1 for the result).
       (= fname "array_append")
       (let [fn-param (symbol (str "?arr-app" (swap! (:var-counter ctx) inc)))
+            ;; array_append is NOT strict in its array argument: PostgreSQL
+            ;; treats a NULL array as empty, so `array_append(NULL, 9)` is
+            ;; `{9}` rather than NULL (array_userfuncs.c).
             impl-fn (fn [arr v]
-                      (if-let [a (coerce-pg-array arr)]
+                      (if-let [a (or (coerce-pg-array arr)
+                                     (when (or (nil? arr) (= :__null__ arr))
+                                       (pg-arr/array :unknown [])))]
                         (do
                           (when (pg-arr/multidim? a)
                             (throw (ex-info "array_append rejects multi-dim"
@@ -799,8 +805,11 @@
       ;; lbound is unchanged from the input.
       (= fname "array_prepend")
       (let [fn-param (symbol (str "?arr-prep" (swap! (:var-counter ctx) inc)))
+            ;; Not strict in the array argument either -- see array_append.
             impl-fn (fn [v arr]
-                      (if-let [a (coerce-pg-array arr)]
+                      (if-let [a (or (coerce-pg-array arr)
+                                     (when (or (nil? arr) (= :__null__ arr))
+                                       (pg-arr/array :unknown [])))]
                         (do
                           (when (pg-arr/multidim? a)
                             (throw (ex-info "array_prepend rejects multi-dim"
@@ -1640,12 +1649,50 @@
     ;; `SELECT a <> 10` answered TRUE for a NULL a. It is UNKNOWN.
     (let [^NotEqualsTo e expr
           l (.getLeftExpression e)
-          r (.getRightExpression e)]
-      (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
-              'datahike.pg.sql/jsonb-ne?
-              'datahike.pg.sql/sql-ne3?)
-            (translate-expr ctx l)
-            (translate-expr ctx r)))
+          r (.getRightExpression e)
+          ;; `x <> ANY(arr)` / `x <> ALL(arr)` were not recognised at all --
+          ;; only the `=` forms were -- so they reached the function table as
+          ;; a call to a function named "all" and raised "function all does
+          ;; not exist". `<> ALL` in particular is the array spelling of
+          ;; NOT IN, so this is a common idiom.
+          any-arr? (and (instance? Function r)
+                        (#{"any" "all"} (str/lower-case (.getName ^Function r))))]
+      (if any-arr?
+        (let [^Function fn-expr r
+              kind (str/lower-case (.getName fn-expr))
+              arr-expr (some-> (.getParameters fn-expr) (.get 0))
+              col-val (translate-expr ctx l)
+              arr-val (translate-expr ctx arr-expr)
+              col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
+              arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
+              fn-param (symbol (str "?pg-ne-" kind (swap! (:var-counter ctx) inc)))
+              ;; Kleene over the elements: `<> ALL` is the AND, `<> ANY` the
+              ;; OR. A NULL element makes the answer UNKNOWN unless another
+              ;; element has already settled it -- `2 <> ALL(ARRAY[2,NULL])`
+              ;; is FALSE, `2 <> ALL(ARRAY[3,NULL])` is NULL.
+              op-fn (fn [c a]
+                      (if (or (fns/sql-null? c) (nil? (coerce-pg-array a)))
+                        :__null__
+                        (let [els (pg-arr/flat-elements (coerce-pg-array a))
+                              cmps (map (fn [el]
+                                          (if (or (nil? el) (= :__null__ el))
+                                            :__null__
+                                            (fns/sql-ne? c el)))
+                                        els)]
+                          (if (= kind "all")
+                            (reduce fns/sql-and3 true cmps)
+                            (reduce fns/sql-or3 false cmps)))))
+              result-var (ctx/fresh-var! ctx)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj op-fn)
+          (swap! (:where-clauses ctx) conj
+                 [(list fn-param col-val arr-val) result-var])
+          result-var)
+        (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
+                'datahike.pg.sql/jsonb-ne?
+                'datahike.pg.sql/sql-ne3?)
+              (translate-expr ctx l)
+              (translate-expr ctx r))))
 
     (instance? IsNullExpression expr)
     ;; SQL NULL is carried as the `:__null__` sentinel, not nil — a
@@ -3017,21 +3064,36 @@
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
           fn-param (symbol (str "?pg-arr-op" (swap! (:var-counter ctx) inc)))
+          ;; An array COLUMN arrives as canonical PG text ("{1,2,3}"), not as
+          ;; a PgArray, so every `(and (array? a) (array? b))` test below
+          ;; failed against a stored column and `arr @> ARRAY[1]` silently
+          ;; matched nothing. Coerce the text side using the other's element
+          ;; type before deciding which family of operator this is.
+          as-arrays (fn [a b]
+                      (cond
+                        (and (pg-arr/array? a) (string? b))
+                        [a (coerce-pg-array b (:elem-type a))]
+                        (and (pg-arr/array? b) (string? a))
+                        [(coerce-pg-array a (:elem-type b)) b]
+                        :else [a b]))
           op-fn (case op-str
                   "@>" (fn [a b]
-                         (cond
-                           (and (pg-arr/array? a) (pg-arr/array? b))
-                           (pg-arr/contains-arr? a b)
-                           :else (jb/jsonb-contains? a b)))
+                         (let [[a b] (as-arrays a b)]
+                           (cond
+                             (and (pg-arr/array? a) (pg-arr/array? b))
+                             (pg-arr/contains-arr? a b)
+                             :else (jb/jsonb-contains? a b))))
                   "<@" (fn [a b]
-                         (cond
-                           (and (pg-arr/array? a) (pg-arr/array? b))
-                           (pg-arr/contains-arr? b a)
-                           :else (jb/jsonb-contained? a b)))
+                         (let [[a b] (as-arrays a b)]
+                           (cond
+                             (and (pg-arr/array? a) (pg-arr/array? b))
+                             (pg-arr/contains-arr? b a)
+                             :else (jb/jsonb-contained? a b))))
                   "&&" (fn [a b]
-                         (if (and (pg-arr/array? a) (pg-arr/array? b))
-                           (pg-arr/overlap? a b)
-                           false))
+                         (let [[a b] (as-arrays a b)]
+                           (if (and (pg-arr/array? a) (pg-arr/array? b))
+                             (pg-arr/overlap? a b)
+                             false)))
                   "?"  jb/jsonb-exists?
                   "?|" jb/jsonb-exists-any?
                   "?&" jb/jsonb-exists-all?
@@ -4112,7 +4174,12 @@
     (let [^NotEqualsTo e expr
           left (.getLeftExpression e)
           right (.getRightExpression e)]
-      ;; Special case: col <> ALL(ARRAY[...]) → translate as NOT IN (same semantics)
+      ;; Special case: col <> ALL(ARRAY[...]) → translate as NOT IN (same
+      ;; semantics), which keeps the O(1) set predicate for a literal list.
+      ;; A RUNTIME array (a column, a function result) and the `<> ANY` form
+      ;; have no literal list to build, and both fell through to a plain
+      ;; comparison against the Function node -- `2 <> ALL(arr)` compared the
+      ;; number to the call itself and matched the wrong rows.
       (if (and (instance? Function right)
                (= "all" (str/lower-case (.getName ^Function right))))
         (let [^Function fn-expr right
@@ -4142,9 +4209,17 @@
                   []
                   :else
                   (conj guards (list 'not [(list 'contains? (set non-null-vals) col)]))))
-            ;; Fallback to normal comparison if not an array
-              (translate-comparison ctx 'not= left right))))
-        (translate-comparison ctx 'not= left right)))
+            ;; Runtime array expression: no literal list to build, so use the
+            ;; value-position translation and collapse it at the qual.
+              (let [v (translate-predicate-expr ctx expr)
+                    v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+                [[(list 'true? v)]]))))
+        (if (and (instance? Function right)
+                 (= "any" (str/lower-case (.getName ^Function right))))
+          (let [v (translate-predicate-expr ctx expr)
+                v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+            [[(list 'true? v)]])
+          (translate-comparison ctx 'not= left right))))
 
     (instance? GreaterThan expr)
     (let [^GreaterThan e expr]
@@ -4957,30 +5032,21 @@
     (let [v (translate-expr ctx expr)]
       [[(list 'identity v)]])
 
-    ;; jsonb operators: @>, <@, ?, ?|, ?&
-    (instance? JsonOperator expr)
-    (let [^JsonOperator jo expr
-          op-str (.getStringExpression jo)
-          _ (reject-json-operator! ctx op-str
-                                   (.getLeftExpression jo) (.getRightExpression jo))
-          left   (translate-expr ctx (.getLeftExpression jo))
-          right  (translate-expr ctx (.getRightExpression jo))
-          left   (if (seq? left)  (ctx/materialize-arg! ctx left)  left)
-          right  (if (seq? right) (ctx/materialize-arg! ctx right) right)
-          op-fn  (case op-str
-                   "@>"  jb/jsonb-contains?
-                   "<@"  jb/jsonb-contained?
-                   "?"   jb/jsonb-exists?
-                   "?|"  jb/jsonb-exists-any?
-                   "?&"  jb/jsonb-exists-all?
-                   nil)]
-      (when op-fn
-        (let [param      (symbol (str "?json-pred" (swap! (:var-counter ctx) inc)))
-              result-var (ctx/fresh-var! ctx)]
-          (swap! (:in-params ctx) conj param)
-          (swap! (:in-args ctx) conj op-fn)
-          (swap! (:where-clauses ctx) conj [(list param left right) result-var])
-          [[(list 'identity result-var)]])))
+    ;; Containment / overlap / existence: @>, <@, &&, ?, ?|, ?&
+    ;;
+    ;; Delegated to the value-position translation rather than re-deciding
+    ;; here. That copy knew only the JSONB implementations, so `arr @>
+    ;; ARRAY[1]` matched nothing against an array column, and `&&`
+    ;; (DoubleAnd, a different AST class) was not handled at all -- it
+    ;; reached the catch-all and raised "WHERE expression of type ... is not
+    ;; supported".
+    (or (instance? JsonOperator expr) (instance? DoubleAnd expr))
+    (let [v (translate-expr ctx expr)
+          v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+      ;; `true?`, not `identity`: these are three-valued (NULL operand ->
+      ;; NULL), and the `:__null__` sentinel is truthy in a datalog
+      ;; predicate, so `identity` would let the NULL rows through.
+      [[(list 'true? v)]])
 
     ;; Bare column as boolean predicate: WHERE col_name means WHERE col_name = TRUE
     (instance? Column expr)

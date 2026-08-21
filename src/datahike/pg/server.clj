@@ -5333,6 +5333,28 @@
                                 sql-offset (drop sql-offset)
                                 sql-limit  (take sql-limit))))))
                       results)
+            ;; DISTINCT ON (exprs): keep the FIRST row of each run sharing
+            ;; those expressions. They are the leading ORDER BY keys, so the
+            ;; rows are already grouped by them here -- dedupe on the first N
+            ;; sort columns. Plain DISTINCT dedupes the WHOLE row and so
+            ;; returned every projection that happened to differ.
+            ;;
+            ;; Before the hidden-column trim below: an ON expression that is
+            ;; not in the SELECT list rides as a hidden column, and keying on
+            ;; it after the trim read past the end of every row.
+            results (if-let [n (:distinct-on-n parsed)]
+                      (let [idxs (mapv first (take n (partition 3 sql-order-by)))]
+                        (if (empty? idxs)
+                          results
+                          (second
+                           (reduce (fn [[seen acc] row]
+                                     (let [rv (if (sequential? row) (vec row) [row])
+                                           k (mapv #(nth rv % nil) idxs)]
+                                       (if (contains? seen k)
+                                         [seen acc]
+                                         [(conj seen k) (conj acc row)])))
+                                   [#{} []] results))))
+                      results)
             ;; Apply HAVING filter BEFORE trimming hidden columns:
             ;; HAVING can reference an aggregate that wasn't in the SELECT
             ;; projection — translate-select appends such aggregates as

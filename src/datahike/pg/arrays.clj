@@ -351,11 +351,16 @@
   (every? pred (flat-elements a)))
 
 (defn contains-arr?
-  "PG `a @> b`: every non-null leaf of b is present somewhere in a.
-   Operates on flattened leaves — PG ignores shape for `@>`."
+  "PG `a @> b`: every leaf of b is present somewhere in a.
+
+   A NULL leaf of b makes the answer FALSE -- it is not \"trivially
+   contained\", and it does not even match a NULL in a:
+   `ARRAY[4,NULL] <@ ARRAY[1,2,3,4,NULL]` is false. Treating nil as
+   satisfied made `arr <@ ARRAY[…]` match rows PostgreSQL excludes.
+   Operates on flattened leaves -- PG ignores shape for `@>`."
   [^PgArray a ^PgArray b]
   (let [as (set (flat-elements a))]
-    (every? #(or (nil? %) (contains? as %)) (flat-elements b))))
+    (every? #(and (some? %) (contains? as %)) (flat-elements b))))
 
 (defn overlap?
   "PG `a && b`: any leaf of a is a leaf of b (NULLs ignored).

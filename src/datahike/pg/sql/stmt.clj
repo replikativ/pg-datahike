@@ -686,6 +686,8 @@
   [expr]
   (or (first (figure-colname* expr)) "?column?"))
 
+(declare match-aggregate-index*)
+
 (defn match-aggregate-index
   "Try to find the index of an aggregate function in the find-elements.
    For COUNT(*) → look for (count ?x), for SUM(col) → (sum ?x) or
@@ -695,6 +697,19 @@
    null-filtering variant (filter-sum/avg/min/max/count[-distinct]) so
    HAVING clauses resolve regardless of which variant the SELECT
    projection emitted."
+  ([^Function f find-elems find-aliases] (match-aggregate-index f find-elems find-aliases nil))
+  ([^Function f find-elems find-aliases resolved]
+   ;; `resolved` is this Function's translated :find element, when the
+   ;; caller could compute it. Prefer an EXACT match on it: the fallbacks
+   ;; below match only the aggregate OPERATOR, so with `min(1)` in the
+   ;; SELECT list and `min(i)` in HAVING they resolved to the same column
+   ;; and the HAVING filtered on the wrong aggregate entirely.
+   (or (when resolved
+         (some (fn [[i elem]] (when (= elem resolved) i))
+               (map-indexed vector find-elems)))
+       (match-aggregate-index* f find-elems find-aliases))))
+
+(defn- match-aggregate-index*
   [^Function f find-elems find-aliases]
   (let [fname (str/lower-case (.getName f))
         agg-sym (get fns/sql-aggregate->datalog fname)
@@ -723,79 +738,92 @@
    The result is a map {:op symbol :col-idx int :value val} for simple cases,
    or a nested structure for AND/OR.
    The server applies this as a post-filter on result tuples."
-  [expr find-elems find-aliases]
-  (cond
-    (instance? AndExpression expr)
-    (let [^AndExpression e expr]
-      {:op :and
-       :clauses [(translate-having-expr (.getLeftExpression e) find-elems find-aliases)
-                 (translate-having-expr (.getRightExpression e) find-elems find-aliases)]})
+  ([expr find-elems find-aliases] (translate-having-expr expr find-elems find-aliases {}))
+  ([expr find-elems find-aliases agg-elems]
+   (cond
+     (instance? AndExpression expr)
+     (let [^AndExpression e expr]
+       {:op :and
+        :clauses [(translate-having-expr (.getLeftExpression e) find-elems find-aliases agg-elems)
+                  (translate-having-expr (.getRightExpression e) find-elems find-aliases agg-elems)]})
 
-    (instance? OrExpression expr)
-    (let [^OrExpression e expr]
-      {:op :or
-       :clauses [(translate-having-expr (.getLeftExpression e) find-elems find-aliases)
-                 (translate-having-expr (.getRightExpression e) find-elems find-aliases)]})
+     (instance? OrExpression expr)
+     (let [^OrExpression e expr]
+       {:op :or
+        :clauses [(translate-having-expr (.getLeftExpression e) find-elems find-aliases agg-elems)
+                  (translate-having-expr (.getRightExpression e) find-elems find-aliases agg-elems)]})
 
     ;; Comparison: aggregate op value
-    (or (instance? GreaterThan expr)
-        (instance? GreaterThanEquals expr)
-        (instance? MinorThan expr)
-        (instance? MinorThanEquals expr)
-        (instance? EqualsTo expr)
-        (instance? NotEqualsTo expr))
-    (let [left (cond
-                 (instance? GreaterThan expr) (.getLeftExpression ^GreaterThan expr)
-                 (instance? GreaterThanEquals expr) (.getLeftExpression ^GreaterThanEquals expr)
-                 (instance? MinorThan expr) (.getLeftExpression ^MinorThan expr)
-                 (instance? MinorThanEquals expr) (.getLeftExpression ^MinorThanEquals expr)
-                 (instance? EqualsTo expr) (.getLeftExpression ^EqualsTo expr)
-                 (instance? NotEqualsTo expr) (.getLeftExpression ^NotEqualsTo expr))
-          right (cond
-                  (instance? GreaterThan expr) (.getRightExpression ^GreaterThan expr)
-                  (instance? GreaterThanEquals expr) (.getRightExpression ^GreaterThanEquals expr)
-                  (instance? MinorThan expr) (.getRightExpression ^MinorThan expr)
-                  (instance? MinorThanEquals expr) (.getRightExpression ^MinorThanEquals expr)
-                  (instance? EqualsTo expr) (.getRightExpression ^EqualsTo expr)
-                  (instance? NotEqualsTo expr) (.getRightExpression ^NotEqualsTo expr))
-          op (cond
-               (instance? GreaterThan expr) '>
-               (instance? GreaterThanEquals expr) '>=
-               (instance? MinorThan expr) '<
-               (instance? MinorThanEquals expr) '<=
-               (instance? EqualsTo expr) '=
-               (instance? NotEqualsTo expr) 'not=)
+     (or (instance? GreaterThan expr)
+         (instance? GreaterThanEquals expr)
+         (instance? MinorThan expr)
+         (instance? MinorThanEquals expr)
+         (instance? EqualsTo expr)
+         (instance? NotEqualsTo expr))
+     (let [left (cond
+                  (instance? GreaterThan expr) (.getLeftExpression ^GreaterThan expr)
+                  (instance? GreaterThanEquals expr) (.getLeftExpression ^GreaterThanEquals expr)
+                  (instance? MinorThan expr) (.getLeftExpression ^MinorThan expr)
+                  (instance? MinorThanEquals expr) (.getLeftExpression ^MinorThanEquals expr)
+                  (instance? EqualsTo expr) (.getLeftExpression ^EqualsTo expr)
+                  (instance? NotEqualsTo expr) (.getLeftExpression ^NotEqualsTo expr))
+           right (cond
+                   (instance? GreaterThan expr) (.getRightExpression ^GreaterThan expr)
+                   (instance? GreaterThanEquals expr) (.getRightExpression ^GreaterThanEquals expr)
+                   (instance? MinorThan expr) (.getRightExpression ^MinorThan expr)
+                   (instance? MinorThanEquals expr) (.getRightExpression ^MinorThanEquals expr)
+                   (instance? EqualsTo expr) (.getRightExpression ^EqualsTo expr)
+                   (instance? NotEqualsTo expr) (.getRightExpression ^NotEqualsTo expr))
+           op (cond
+                (instance? GreaterThan expr) '>
+                (instance? GreaterThanEquals expr) '>=
+                (instance? MinorThan expr) '<
+                (instance? MinorThanEquals expr) '<=
+                (instance? EqualsTo expr) '=
+                (instance? NotEqualsTo expr) 'not=)
           ;; Left: aggregate function or alias reference
-          col-idx (cond
-                    (instance? Function left)
-                    (match-aggregate-index ^Function left find-elems find-aliases)
+           col-idx (cond
+                     (instance? Function left)
+                     (match-aggregate-index ^Function left find-elems find-aliases
+                                            (get agg-elems left))
                     ;; Column reference — resolve as alias
-                    (instance? Column left)
-                    (let [col-name (.getColumnName ^Column left)]
-                      (some (fn [[i a]] (when (= a col-name) i))
-                            (map-indexed vector find-aliases)))
-                    :else nil)
-          value (cond
-                  (instance? LongValue right) (.getValue ^LongValue right)
-                  (instance? DoubleValue right) (types/decimal-literal
-                                                 right (.getValue ^DoubleValue right))
-                  (instance? StringValue right) (expr/string-value-text ^StringValue right)
-                  :else (str right))]
-      {:op op :col-idx col-idx :value value})
+                     (instance? Column left)
+                     (let [col-name (.getColumnName ^Column left)]
+                       (some (fn [[i a]] (when (= a col-name) i))
+                             (map-indexed vector find-aliases)))
+                     :else nil)
+           value (cond
+                   (instance? LongValue right) (.getValue ^LongValue right)
+                   (instance? DoubleValue right) (types/decimal-literal
+                                                  right (.getValue ^DoubleValue right))
+                   (instance? StringValue right) (expr/string-value-text ^StringValue right)
+                   :else (str right))]
+       {:op op :col-idx col-idx :value value})
 
     ;; IS NULL / IS NOT NULL
-    (instance? IsNullExpression expr)
-    (let [^IsNullExpression e expr
-          not-null? (.isNot e)
-          inner (.getLeftExpression e)
-          col-idx (when (instance? Column inner)
-                    (let [col-name (.getColumnName ^Column inner)]
-                      (some (fn [[i a]] (when (= a col-name) i))
-                            (map-indexed vector find-aliases))))]
-      {:op (if not-null? :is-not-null :is-null) :col-idx col-idx})
+     (instance? IsNullExpression expr)
+     (let [^IsNullExpression e expr
+           not-null? (.isNot e)
+           inner (.getLeftExpression e)
+          ;; An AGGREGATE operand (`HAVING min(n) IS NOT NULL`) resolves the
+          ;; same way the comparison branch resolves its left-hand side.
+          ;; Only a bare Column was handled, so an aggregate left col-idx
+          ;; nil -- and a nil col-idx makes having-pred-fn return nil, which
+          ;; apply-having reads as "no predicate" and passes EVERY group
+          ;; through. Both directions were silently unfiltered.
+           col-idx (cond
+                     (instance? Function inner)
+                     (match-aggregate-index ^Function inner find-elems find-aliases
+                                            (get agg-elems inner))
+                     (instance? Column inner)
+                     (let [col-name (.getColumnName ^Column inner)]
+                       (some (fn [[i a]] (when (= a col-name) i))
+                             (map-indexed vector find-aliases)))
+                     :else nil)]
+       {:op (if not-null? :is-not-null :is-null) :col-idx col-idx})
 
-    :else
-    {:op :unsupported :expr (str expr)}))
+     :else
+     {:op :unsupported :expr (str expr)})))
 
 ;; ============================================================================
 ;; Derived-table materialization — shared by FROM (...) AS t and
@@ -2530,6 +2558,13 @@
                 (swap! (:where-clauses ctx) into preds))))
 
         has-distinct? (some? (.getDistinct select))
+        ;; `DISTINCT ON (exprs)` keeps the FIRST row of each group of rows
+        ;; sharing those expressions -- it is not plain DISTINCT, which
+        ;; dedupes the whole row. Treating it as the latter returned every
+        ;; row whose projection happened to differ, silently too many.
+        ;; PostgreSQL requires the ON expressions to be the leading ORDER BY
+        ;; ones, so "first" is well defined once the sort has run.
+        distinct-on-items (some-> (.getDistinct select) .getOnSelectItems)
 
         ;; GROUP BY
         group-by-element (.getGroupBy select)
@@ -3393,6 +3428,12 @@
               (let [agg-sym (get fns/sql-aggregate->datalog fname)
                     v (expr/translate-expr ctx (first params))
                     v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                    ;; A CONSTANT argument still has to reach the aggregate as
+                    ;; a VARIABLE -- Datahike's find-spec parser has no
+                    ;; IFindVars for a Constant. Same binding the projection
+                    ;; path does; this path (HAVING / ORDER BY) missed it, so
+                    ;; `HAVING sum(1) IS NOT NULL` raised a raw protocol error.
+                    v (if (symbol? v) v (ctx/materialize-arg! ctx (list 'identity v)))
                     precision-variant (pick-precision-variant
                                        fname
                                        (oid/expr-oid (first params) agg-oid-env))]
@@ -3994,6 +4035,7 @@
         ;; server's HAVING post-filter work without further changes.
         ;; The wire layer strips trailing :hidden-count columns from
         ;; results, so HAVING-only aggregates never reach the client.
+        having-agg-elems (atom {})
         having-agg-fns (when having-expr
                          (let [found (atom [])
                                walk (fn walk [^net.sf.jsqlparser.expression.Expression e]
@@ -4105,6 +4147,11 @@
           (->> having-agg-fns
                (keep (fn [f]
                        (when-let [elem (translate-agg f)]
+                         ;; Remember which :find element this Function
+                         ;; resolved to, so the HAVING translation can match
+                         ;; it EXACTLY rather than by aggregate name -- see
+                         ;; match-aggregate-index.
+                         (swap! having-agg-elems assoc f elem)
                          (when-not (contains? existing-agg-shapes elem)
                            (reset! has-aggregates? true)
                            (swap! find-elements conj elem)
@@ -4166,6 +4213,11 @@
                                    order-by-spec))
         has-nullable-order? (and order-by-spec
                                  (or explicit-nulls?
+                                     ;; DISTINCT ON keeps the FIRST row per
+                                     ;; ON-key, so it needs the rows in a
+                                     ;; known order HERE, in the same pass
+                                     ;; that dedupes them.
+                                     (seq distinct-on-items)
                                      (some (fn [[v _dir]]
                                              (and (symbol? v)
                                                   (contains? nullable-vars v)))
@@ -4315,6 +4367,10 @@
              :select-item-param-idx select-item-param-idx
              :has-aggregates? @has-aggregates?
              :has-distinct?   has-distinct?
+             ;; PostgreSQL requires the DISTINCT ON expressions to be the
+             ;; LEADING ORDER BY expressions, so they are exactly the first
+             ;; N sort keys -- no second resolution path needed.
+             :distinct-on-n   (when (seq distinct-on-items) (count distinct-on-items))
              :in-args         in-args
              :hidden-count    hidden-count
              ;; Pass enriched db when derived tables or derived-table-joins
@@ -4360,7 +4416,8 @@
              :right-tables (mapv #(get table-aliases (:alias %) (:name %)) join-infos))
       ;; Include HAVING as post-filter metadata
       having-expr
-      (assoc :having (translate-having-expr having-expr find-elems-vec @find-aliases)))))
+      (assoc :having (translate-having-expr having-expr find-elems-vec @find-aliases
+                                            @having-agg-elems)))))
 
 ;; ============================================================================
 ;; DML translation: INSERT, UPDATE, DELETE
