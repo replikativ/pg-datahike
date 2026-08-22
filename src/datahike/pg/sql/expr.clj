@@ -1440,6 +1440,46 @@
 
     :else form))
 
+(defn split-aggregate-projection
+  "Split the Datalog clauses a select item emitted into the ones that
+   belong to the QUERY and the projection FORM that has to run after it.
+
+   An aggregate's value does not exist until the grouping step, so
+   nothing computed FROM one can be a clause in the same query --
+   `round(avg(x), 2)` emits `[(?pg-round ?agg ?scale) ?out]`, and `?agg`
+   is a find element, not a binding. PostgreSQL draws the same line: the
+   scan and the aggregate below, the projection above.
+
+   A clause is above the line when any of its inputs is (transitively) an
+   aggregate slot. Those are inlined -- their SSA-style out-variables
+   substituted back into one nested form -- and the rest are handed back
+   to the query untouched, which is what keeps an ordinary column
+   reference in the same expression (`sum(x) + id`) working.
+
+   Returns [query-clauses projection-form]."
+  [v clauses agg-vars]
+  (let [out-of (fn [c] (when (and (vector? c) (= 2 (count c)) (seq? (first c)))
+                         (second c)))
+        deferred (volatile! (set agg-vars))
+        above? (fn [c]
+                 (boolean (some @deferred
+                                (filter symbol? (tree-seq coll? seq (first c))))))
+        keep-cs (vec (remove (fn [c]
+                               (if-let [o (out-of c)]
+                                 (when (above? c) (vswap! deferred conj o) true)
+                                 false))
+                             clauses))
+        by-out (into {} (keep (fn [c]
+                                (when-let [o (out-of c)]
+                                  (when (contains? @deferred o) [o (first c)])))
+                              clauses))
+        inline (fn inline [x]
+                 (cond
+                   (and (symbol? x) (contains? by-out x)) (inline (get by-out x))
+                   (seq? x) (apply list (map inline x))
+                   :else x))]
+    [keep-cs (inline v)]))
+
 (defn translate-case-expr
   "Translate a CASE WHEN expression by compiling a Clojure function
    and passing it as an :in parameter. Returns the result variable.
@@ -3329,6 +3369,22 @@
     (instance? CastExpression expr)
     (translate-cast-expr ctx ^CastExpression expr)
 
+    ;; `agg(x) FILTER (WHERE p)` nested in a larger expression. JSqlParser
+    ;; surfaces the FILTER form as an AnalyticExpression, so it did not
+    ;; reach the aggregate branch below and the whole expression was
+    ;; rejected -- "expression of type AnalyticExpression is not
+    ;; supported" -- where PostgreSQL just adds 1 to a filtered sum.
+    ;; A windowed aggregate (`OVER …`) is NOT hoisted: the window pass
+    ;; computes it after the query from the whole result set.
+    (and (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
+         (:hoisted-aggs ctx)
+         (let [^net.sf.jsqlparser.expression.AnalyticExpression ae expr]
+           (and (= "FILTER_ONLY" (str (.getType ae)))
+                (fns/aggregate-function? (str/lower-case (.getName ae))))))
+    (let [v (ctx/fresh-var! ctx)]
+      (swap! (:hoisted-aggs ctx) conj {:var v :fn-node expr})
+      v)
+
     ;; Functions — aggregate or scalar
     (instance? Function expr)
     (let [^Function f expr
@@ -3379,8 +3435,21 @@
             (pg-arr/array :text [])))
 
         (fns/aggregate-function? fname)
-        ;; handled at select-item level — return marker
-        {:aggregate true :fn fname :params (.getParameters f)}
+        ;; An aggregate NESTED inside a larger expression -- `round(avg(x),
+        ;; 2)`, `coalesce(sum(x), 0)`, `upper(max(s))`. PostgreSQL hoists
+        ;; these: the aggregate is computed by the grouping step and the
+        ;; expression around it is a projection over the result. We do the
+        ;; same -- allocate a variable, register the aggregate under it,
+        ;; and hand the variable back so the enclosing translation
+        ;; produces an ordinary form over it.
+        ;;
+        ;; Without a sink (HAVING, and any caller that has no grouping
+        ;; step to hoist INTO) the old marker is returned instead.
+        (if-let [sink (:hoisted-aggs ctx)]
+          (let [v (ctx/fresh-var! ctx)]
+            (swap! sink conj {:var v :fn-node f})
+            v)
+          {:aggregate true :fn fname :params (.getParameters f)})
 
         ;; Non-aggregate function → Datalog function binding
         :else (translate-function-call ctx f)))

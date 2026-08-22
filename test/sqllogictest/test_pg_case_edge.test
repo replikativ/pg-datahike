@@ -111,6 +111,15 @@ CREATE TABLE freq_tbl (f1 INTEGER, f2 INTEGER)
 statement ok
 INSERT INTO freq_tbl VALUES (1, 2), (2, 3), (3, 4), (1, 1), (2, 2), (3, 3), (6, 7), (8, 9)
 
-# CASE with aggregate in condition is not supported
-statement error
+# An aggregate in a CASE condition is ordinary SQL -- the aggregate is
+# computed by the grouping step and the CASE is a projection over its
+# result. This asserted our own refusal ("aggregate in CASE not
+# supported"); PostgreSQL answers the rows below.
+query IT rowsort
 SELECT f1, CASE WHEN COUNT(*) > 1 THEN 'multiple' ELSE 'single' END FROM freq_tbl GROUP BY f1
+----
+1	multiple
+2	multiple
+3	multiple
+6	single
+8	single
