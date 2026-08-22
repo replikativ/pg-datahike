@@ -267,6 +267,44 @@
   [ctx expr]
   (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
 
+(def common-type-fns
+  "The functions whose result type PostgreSQL resolves with
+   `select_common_type` over their arguments rather than taking the
+   first one's."
+  #{"coalesce" "nullif" "greatest" "least"})
+
+(defn coerce-to-common!
+  "Coerce `v` to the common type of `arg-exprs`, per PostgreSQL's
+   `select_common_type`, and return the coerced variable -- or `v`
+   unchanged when every argument already has that type.
+
+   CASE, COALESCE, NULLIF, GREATEST and LEAST all resolve one type for
+   the whole construct and coerce each branch to it. Returning a branch
+   value as-is is visibly wrong when the branches differ:
+   `coalesce(n, f)` over a numeric and a float8 is float8 in PostgreSQL,
+   so it prints 1.5 where the untouched numeric prints 1.50."
+  [ctx v arg-exprs construct]
+  (let [oids (mapv #(when-not (oid-infer/untyped-literal? %) (source-oid ctx %)) arg-exprs)
+        common (types/select-common-type oids construct false)]
+    (if-not (and common (some #(and % (not= % common)) oids))
+      v
+      (let [tname (get types/oid->pg-name common)
+            cast1 (fn [x]
+                    (if (or (nil? x) (= :__null__ x))
+                      x
+                      (try (sql-cast/cast-scalar x tname {:explicit? true})
+                           (catch Throwable _ x))))]
+        (if (or (symbol? v) (seq? v))
+          (let [p (symbol (str "?common-cast" (swap! (:var-counter ctx) inc)))
+                out (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) v)
+                vv (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+            (swap! (:in-params ctx) conj p)
+            (swap! (:in-args ctx) conj cast1)
+            (ctx/add-clause! ctx [(list p vv) out])
+            out)
+          ;; already a value: fold now
+          (cast1 v))))))
+
 (defn- int-width-of
   "The declared integer width of a single expression, or nil."
   [ctx e]
@@ -1565,7 +1603,12 @@
     ;; Add the function-call binding: [(?case-fn ?a ?b ...) ?result]
     (swap! (:where-clauses ctx) conj
            [(apply list fn-param param-vars) result-var])
-    result-var))
+    ;; CASE resolves ONE type across its branches and coerces each to it.
+    (coerce-to-common! ctx result-var
+                       (concat (mapv (fn [^WhenClause wc] (.getThenExpression wc))
+                                     when-clauses)
+                               (when else-expr [else-expr]))
+                       "CASE")))
 
 (defn- materialize-nested!
   "Bottom-up, bind every compound ARGUMENT of a form to its own variable.
@@ -1718,6 +1761,19 @@
   (let [v (try
             (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
                   p   (parse-fn run-sql inner-schema query-db)
+                  ;; `parse-sql` REPORTS a translation failure as an error
+                  ;; map rather than throwing, so the type errors below
+                  ;; would be swallowed here just as silently as a throw:
+                  ;; the inner would produce no query and the item would
+                  ;; read as NULL.
+                  _   (when (and (= :error (:type p))
+                                 (contains? #{"42883" "42804"} (:sqlstate p)))
+                        (throw (ex-info (:message p)
+                                        {:error (if (= "42804" (:sqlstate p))
+                                                  :datatype-mismatch
+                                                  :undefined-function)
+                                         :sqlstate (:sqlstate p)
+                                         :detail (:message p)})))
                   q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
               (if (nil? q)
                 (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
@@ -1728,7 +1784,18 @@
                       res (or (when (empty? (seq res)) (empty-aggregate-row q)) res)
                       fr  (first res)]
                   (if (sequential? fr) (first fr) fr))))
-            (catch Throwable _ nil))]
+            ;; A TYPE-RESOLUTION error is PostgreSQL's own answer to this
+            ;; query and has to reach the client: `(SELECT count(*) …
+            ;; WHERE t2.flag = t.n)` is `operator does not exist: boolean
+            ;; = integer` there, not a column of NULLs here. Everything
+            ;; else stays tolerant -- the catalog probes this path was
+            ;; written for fail to translate for reasons PostgreSQL does
+            ;; not share, and NULL is the right answer for those.
+            (catch Throwable t
+              (let [{:keys [error]} (ex-data t)]
+                (if (contains? #{:undefined-function :datatype-mismatch} error)
+                  (throw t)
+                  nil))))]
     (if (some? v) v :__null__)))
 
 (defn translate-predicate-expr
@@ -3452,7 +3519,14 @@
           {:aggregate true :fn fname :params (.getParameters f)})
 
         ;; Non-aggregate function → Datalog function binding
-        :else (translate-function-call ctx f)))
+        :else
+        (let [v (translate-function-call ctx f)]
+          (if (contains? common-type-fns fname)
+            (coerce-to-common! ctx v
+                               (or (some-> (.getParameters f) .getExpressions)
+                                   (some-> (.getNamedParameters f) .getExpressions))
+                               (str/upper-case fname))
+            v))))
 
     ;; CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME
     (instance? TimeKeyExpression expr)
@@ -3858,6 +3932,80 @@
   [(or (coerce-unknown-literal ctx right left) left)
    (or (coerce-unknown-literal ctx left right) right)])
 
+(def ^:private op-sym->sql
+  "The SQL spelling of a comparison operator, for PostgreSQL's
+   `operator does not exist` message."
+  {'= "=" 'not= "<>" '< "<" '> ">" '<= "<=" '>= ">="})
+
+(def ^:private estimated-relation-prefixes
+  "Namespaces of relations whose column types WE inferred rather than the
+   user declaring them."
+  ["__cte" "__sub__" "__lsub__" "__srf"])
+
+(defn- estimated-column-type?
+  "True when `e` is a column of a CTE, a derived table or a LATERAL
+   relation.
+
+   PostgreSQL knows those columns' types exactly -- it propagates them
+   from the subquery's target list. We ESTIMATE them: the materialiser
+   samples the rows, and a column that is NULL in every sampled row
+   falls back to text. Checking an operator against an estimate raises
+   on our own guess, which is what happened to asyncpg's `typeinfo`
+   introspection: `ti.oid = tt.range_subtype` compared a catalog oid
+   against a recursive-CTE column whose values are all NULL here, so we
+   called it text and rejected a query PostgreSQL accepts."
+  [ctx e]
+  (boolean
+   (when (instance? Column e)
+     (when-let [attr (try (ctx/attr-of ctx (ctx/resolve-column
+                                            ^Column e
+                                            (:table-aliases ctx)
+                                            (:default-table ctx)
+                                            (:col-overrides ctx)
+                                            (:derived-aliases ctx)
+                                            (:ci-index ctx)))
+                          (catch Throwable _ nil))]
+       (when-let [ns- (namespace attr)]
+         (some #(str/starts-with? ns- %) estimated-relation-prefixes))))))
+
+(defn- operand-type-oid
+  "An operand's type for OPERATOR resolution, or nil when PostgreSQL
+   would call it UNKNOWN.
+
+   A quoted literal and NULL are untyped constants there -- they take
+   the other operand's type, so they can never make a comparison
+   ill-typed. `expr-oid` reports text for both because that is the right
+   answer for a PROJECTION (`SELECT 'a'` is text); it is the wrong one
+   here, and using it would make `flag = 'true'` an error."
+  [ctx e]
+  (when-not (or (oid-infer/untyped-literal? e) (estimated-column-type? ctx e))
+    (source-oid ctx e)))
+
+(defn- check-comparison-types!
+  "Raise 42883 when PostgreSQL has no operator for these operand types.
+
+   PostgreSQL resolves an operator by finding a candidate both arguments
+   coerce to implicitly; with none, `true = 1` is an ERROR, not FALSE.
+   We compared anything against anything and answered, which is a wrong
+   answer wearing the right shape -- a driver probing types with
+   `WHERE oid = 'x'` got a row count instead of the error it tests for.
+
+   Only fires when BOTH operand types are known: an operand we could not
+   type stays lenient, which is the safe direction for a check whose
+   whole risk is a false positive."
+  [ctx op left right]
+  (let [a (operand-type-oid ctx left)
+        b (operand-type-oid ctx right)]
+    (when-not (types/comparison-compatible? a b)
+      (throw (errors/pg-error
+              :undefined-function
+              {:detail (str "operator does not exist: "
+                            (get types/oid->pg-name a "?") " "
+                            (get op-sym->sql op (str op)) " "
+                            (get types/oid->pg-name b "?"))
+               :hint (str "No operator matches the given name and argument "
+                          "types. You might need to add explicit type casts.")})))))
+
 (defn translate-comparison
   "Translate a binary comparison to Datalog predicate clauses.
 
@@ -3882,6 +4030,7 @@
    reverse) coerces the digit literal to a long. Matches PG's implicit
    `oidin('16384')` resolution that powers psql's `\\d <table>` queries."
   [ctx op left right]
+  (check-comparison-types! ctx op left right)
   (if (and (instance? Function right)
            (#{"any" "all"}
             (str/lower-case (.getName ^Function right))))
@@ -4281,7 +4430,11 @@
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
           left (.getLeftExpression e)
-          right (.getRightExpression e)]
+          right (.getRightExpression e)
+          ;; Here as well as in translate-comparison: the index fast
+          ;; paths below (bind-col-param! / bind-col-value!) never reach
+          ;; it, and they are exactly the shape `col = <literal>` takes.
+          _ (check-comparison-types! ctx '= left right)]
       ;; Special case: col = ANY(...) / col = ALL(...)
       ;;  - Literal ARRAY[…] or '{…}' → expand to or-join over literals
       ;;    (no allocation, best-planner hints)
@@ -4423,7 +4576,8 @@
     (instance? NotEqualsTo expr)
     (let [^NotEqualsTo e expr
           left (.getLeftExpression e)
-          right (.getRightExpression e)]
+          right (.getRightExpression e)
+          _ (check-comparison-types! ctx 'not= left right)]
       ;; Special case: col <> ALL(ARRAY[...]) → translate as NOT IN (same
       ;; semantics), which keeps the O(1) set predicate for a literal list.
       ;; A RUNTIME array (a column, a function result) and the `<> ANY` form

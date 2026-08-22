@@ -61,10 +61,16 @@
     (let [oids (run-param-oids "SELECT * FROM t WHERE age = CAST(? AS BIGINT)")]
       ;; oid-int8 = 20
       (is (= 20 (get oids 1)))))
-  (testing "WHERE col = CAST(? AS TEXT) — cast target overrides col type"
-    (let [oids (run-param-oids "SELECT * FROM t WHERE age = CAST(? AS TEXT)")]
-      ;; oid-text = 25 — the cast target wins, NOT age's int8
-      (is (= 25 (get oids 1))))))
+  (testing "WHERE col = CAST(? AS TEXT) is an ERROR, as in PostgreSQL"
+    ;; This asserted that the cast target (text) won over age's int8 and
+    ;; became the parameter's OID. PostgreSQL never gets that far: there
+    ;; is no `bigint = text` operator and it raises 42883 at PREPARE
+    ;; time -- verified against the oracle. Our own operator resolution
+    ;; now says the same thing, so there is no parameter to type.
+    ;; The best-effort parameter pass swallows the translation error, so
+    ;; what is observable here is that there is nothing to type. The
+    ;; 42883 itself is asserted in pg-type-resolution-test.
+    (is (nil? (run-param-oids "SELECT * FROM t WHERE age = CAST(? AS TEXT)")))))
 
 (deftest cast-on-col-side-still-resolves
   (testing "WHERE CAST(col AS TEXT) = ? — param maps to col-side comparand"
