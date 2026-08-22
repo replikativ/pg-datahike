@@ -1291,7 +1291,9 @@
                                                              -1)]
                                       :literal-rows (mapv vec rows)})
 
-                                   (and table-free? (identical? db pre-cte-db))
+                                   (and table-free?
+                                        (zero? param-count)
+                                        (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression
                                    (let [select-items (.getSelectItems ^PlainSelect stmt)
                                          fake-ctx (ctx/make-ctx cte-schema {} nil {:db cte-db :parse-sql parse-sql})

@@ -13,7 +13,8 @@
    2. Datahike type → PG OID (for wire protocol RowDescription)
    3. PG OID → SQL name (for format_type() and information_schema)
    4. SQL name → category (for CAST type classification)"
-  (:require [clojure.string :as str])
+  (:require [clojure.set :as set]
+            [clojure.string :as str])
   (:import [datahike.pg PgWireServer]))
 
 ;; ============================================================================
@@ -310,6 +311,7 @@
     "int8"        oid-int8
     "text"        oid-text
     "varchar"     oid-varchar
+    "bpchar"      oid-bpchar
     "float4"      oid-float4
     "float8"      oid-float8
     "numeric"     oid-numeric
@@ -625,6 +627,171 @@
    oid-uuid-array        -1
    oid-json-array        -1
    oid-jsonb-array       -1})
+
+;; ============================================================================
+;; Type resolution — PostgreSQL's category / preferred / implicit-cast
+;; tables, and the algorithm that reads them
+;; ============================================================================
+
+(def oid->category
+  "`typcategory` from pg_type.dat, for the types we carry.
+
+   PostgreSQL resolves the type of CASE / COALESCE / GREATEST / LEAST /
+   UNION, and of an operator's arguments, from three catalog facts and
+   nothing else: a type's CATEGORY, whether it is its category's
+   PREFERRED type, and which coercions are IMPLICIT. Guessing at the
+   answer instead -- `coalesce(a, b)` takes a's type -- is wrong the
+   moment the arguments differ: PostgreSQL answers float8 for
+   `coalesce(numeric, float8)`, which prints 1.5 where numeric prints
+   1.50."
+  {oid-bool        :B
+   oid-int2        :N  oid-int4    :N  oid-int8   :N
+   oid-float4      :N  oid-float8  :N  oid-numeric :N  oid-oid :N
+   oid-text        :S  oid-varchar :S  oid-bpchar :S  oid-name :S  oid-char :S
+   oid-date        :D  oid-time    :D  oid-timestamp :D  oid-timestamptz :D
+   oid-interval    :T
+   oid-bit         :V  oid-varbit  :V
+   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U})
+
+(def preferred-oids
+  "`typispreferred`. One per category among the types we carry: a
+   preferred type is never given up during resolution."
+  #{oid-bool oid-float8 oid-oid oid-text oid-timestamptz oid-interval oid-varbit})
+
+(def implicit-casts
+  "castsource -> #{casttarget} for the pg_cast.dat entries whose
+   castcontext is 'i' (implicit). Only implicit casts count for type
+   resolution -- `float8 -> numeric` exists but is ASSIGNMENT, which is
+   exactly why numeric loses to float8 and not the other way round."
+  {oid-int2      #{oid-int4 oid-int8 oid-float4 oid-float8 oid-numeric oid-oid}
+   oid-int4      #{oid-int8 oid-float4 oid-float8 oid-numeric oid-oid}
+   oid-int8      #{oid-float4 oid-float8 oid-numeric oid-oid}
+   oid-float4    #{oid-float8}
+   oid-numeric   #{oid-float4 oid-float8}
+   oid-text      #{oid-bpchar oid-varchar oid-name}
+   oid-varchar   #{oid-text oid-bpchar oid-name}
+   oid-bpchar    #{oid-text oid-varchar oid-name}
+   oid-name      #{oid-text}
+   oid-char      #{oid-text}
+   oid-date      #{oid-timestamp oid-timestamptz}
+   oid-time      #{oid-interval}
+   oid-timestamp #{oid-timestamptz}
+   oid-bit       #{oid-varbit}
+   oid-varbit    #{oid-bit}})
+
+(defn implicit-coercible?
+  "Can `from` be coerced to `to` implicitly? `can_coerce_type` with
+   COERCION_IMPLICIT, for a single scalar argument."
+  [from to]
+  (or (= from to)
+      (contains? (get implicit-casts from #{}) to)))
+
+(defn select-common-type
+  "PostgreSQL's `select_common_type` (parse_coerce.c), verbatim in
+   structure:
+
+     - all inputs the same type -> that type
+     - otherwise walk the rest, holding a candidate:
+         * a nil (unknown) input is skipped
+         * a different CATEGORY is an error -- the constructs cannot be
+           matched
+         * the candidate gives way only if it is NOT its category's
+           preferred type, the candidate coerces implicitly to the new
+           type, and the new type does NOT coerce back
+     - all-unknown resolves to text
+
+   `oids` may contain nils for operands whose type we could not infer;
+   they are the UNKNOWN of the algorithm. Returns nil when every input
+   is unknown AND `unknown->text?` is false, so a caller that would
+   rather keep its own answer can.
+
+   `context` is the SQL construct's name for the error message; when it
+   is nil a category mismatch returns nil instead of raising, which is
+   what PostgreSQL's own callers do when they want to test rather than
+   resolve."
+  ([oids] (select-common-type oids nil true))
+  ([oids context] (select-common-type oids context true))
+  ([oids context unknown->text?]
+   (let [known (remove nil? oids)]
+     (cond
+       (empty? known) (when unknown->text? oid-text)
+       (apply = known) (first known)
+       :else
+       (loop [[n & more] (rest known)
+              ptype (first known)]
+         (if (nil? n)
+           ptype
+           (let [pcat (get oid->category ptype)
+                 ncat (get oid->category n)
+                 ppref (contains? preferred-oids ptype)]
+             (cond
+               (= n ptype) (recur more ptype)
+               ;; A type we have no category for cannot be reasoned
+               ;; about; keep the candidate rather than guess.
+               (or (nil? pcat) (nil? ncat)) (recur more ptype)
+               (not= ncat pcat)
+               (if context
+                 (throw (ex-info (str context " types "
+                                      (get oid->pg-name ptype "?") " and "
+                                      (get oid->pg-name n "?")
+                                      " cannot be matched")
+                                 {:error :datatype-mismatch
+                                  :sqlstate "42804"}))
+                 nil)
+               (and (not ppref)
+                    (implicit-coercible? ptype n)
+                    (not (implicit-coercible? n ptype)))
+               (recur more n)
+               :else (recur more ptype)))))))))
+
+(defn- coercion-targets
+  "The types a value of `oid` can reach implicitly, itself included."
+  [oid]
+  (conj (get implicit-casts oid #{}) oid))
+
+(def ^:private no-comparison-operator-oids
+  "Types among the OIDs we expose that have no ordinary comparison
+   operators in PostgreSQL.
+
+   This is deliberately a small bridge to the generated operator catalog:
+   implicit coercibility can tell us whether an operator candidate could
+   accept two different input types, but it cannot tell us that a candidate
+   exists in the first place. `json = json` is the load-bearing example --
+   identical input types, but PostgreSQL defines equality only for jsonb.
+   Arrays inherit their element type's comparison support, so json[] is
+   excluded as well."
+  #{oid-json oid-json-array})
+
+(defn comparison-compatible?
+  "Would PostgreSQL find an operator for a comparison between these two
+   types?
+
+   `oper_select_candidate` comes down to this for the cross-type
+   comparison families: with no exact match, a candidate survives only
+   if BOTH arguments coerce to its argument type implicitly. So the test
+   is whether the two types have any implicit target in common.
+
+   `boolean = integer` is the case this exists to catch -- PostgreSQL
+   raises 42883 rather than answering false. `date = time` is the one
+   that shows why a category test is not enough: both are category D and
+   neither coerces to the other, so PostgreSQL has no candidate there
+   either, while `date = timestamp` resolves through timestamp.
+
+   Either side unknown means an untyped literal, which takes the other
+   side's type; a type absent from the tables stays lenient.
+
+   `op` is accepted now so this API has the shape of PostgreSQL's real
+   operator lookup. The bridge table above currently excludes types with no
+   comparison family at all; a generated pg_operator slice can make this
+   lookup fully operator-specific."
+  ([a b] (comparison-compatible? '= a b))
+  ([_op a b]
+   (and (not (contains? no-comparison-operator-oids a))
+        (not (contains? no-comparison-operator-oids b))
+        (or (nil? a) (nil? b) (= a b)
+            (nil? (get oid->category a)) (nil? (get oid->category b))
+            (boolean (seq (set/intersection (coercion-targets a)
+                                            (coercion-targets b))))))))
 
 ;; ============================================================================
 ;; Convenience functions

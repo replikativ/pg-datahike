@@ -148,11 +148,14 @@
    "atan2"         types/oid-float8
    "pi"            types/oid-float8
    "random"        types/oid-float8
-   ;; Null handling — first arg type wins
-   "coalesce"      :arg-type
-   "nullif"        :arg-type
-   "greatest"      :arg-type
-   "least"         :arg-type
+   ;; Null handling — PostgreSQL resolves a COMMON type across all the
+   ;; arguments (select_common_type), it does not take the first one's.
+   ;; `coalesce(numeric, float8)` is float8: numeric coerces to float8
+   ;; implicitly and float8 does not coerce back.
+   "coalesce"      :common-type
+   "nullif"        :common-type
+   "greatest"      :common-type
+   "least"         :common-type
    ;; Date/time — constants + truncation
    "now"           types/oid-timestamptz
    "current_timestamp" types/oid-timestamptz
@@ -457,6 +460,33 @@
                              :else nil))
       :else              nil)))
 
+(defn untyped-literal?
+  "PostgreSQL's UNKNOWN: a quoted literal, NULL, or an unresolved
+   parameter. Such an operand takes its type FROM the others, so it must
+   not take part in resolving a common type or an operator -- `CASE WHEN
+   … THEN NULL ELSE 2 END` is integer, and `flag = 'true'` is a boolean
+   comparison.
+
+   `expr-oid` reports text for a quoted literal because that is the
+   right answer for a PROJECTION (`SELECT 'a'` is text); it is the wrong
+   one for RESOLUTION, which is what this distinguishes."
+  [e]
+  (or (instance? StringValue e)
+      (instance? NullValue e)
+      (instance? JdbcNamedParameter e)
+      ;; A `$N` is unknown only while its type is undeclared. The
+      ;; plan-cache rewrite turns every bare number into one, so treating
+      ;; the node itself as untyped would blind resolution to exactly the
+      ;; literals it is meant to catch -- `flag = 10` reaches the
+      ;; translator as `flag = $1` with int4 declared for $1.
+      (and (instance? JdbcParameter e)
+           (nil? (get params/*declared-param-oids* (.getIndex ^JdbcParameter e))))))
+
+(defn resolution-oid
+  "`expr-oid`, except that an untyped literal reports nil (UNKNOWN)."
+  [e env]
+  (when-not (untyped-literal? e) (expr-oid e env)))
+
 (defn- function-oid
   "Resolve a scalar or aggregate function reference. `:arg-type`
    sentinel in the registry means 'propagate the first argument's type'.
@@ -491,6 +521,11 @@
         (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
+      ;; COALESCE / NULLIF / GREATEST / LEAST resolve a COMMON type over
+      ;; every argument, the same way CASE and UNION do.
+      (= rule :common-type)
+      (types/select-common-type (mapv #(resolution-oid % env) args)
+                                (str/upper-case fname) false)
       ;; PostgreSQL declares BOTH a float8 and a numeric overload of
       ;; sqrt / exp / ln / log / log10 / power, and function resolution
       ;; prefers the candidate with an exact-type argument -- so ANY
@@ -578,9 +613,15 @@
    the user intended)."
   [^CaseExpression e env]
   (let [branches (concat
-                  (mapv #(.getThenExpression ^WhenClause %) (.getWhenClauses e))
-                  (when-let [el (.getElseExpression e)] [el]))]
-    (some #(expr-oid % env) branches)))
+                  ;; parse_expr.c prepends CASE/ELSE before choosing the
+                  ;; common type. Order matters when casts work both ways and
+                  ;; neither type is preferred (varchar versus bpchar).
+                  (when-let [el (.getElseExpression e)] [el])
+                  (mapv #(.getThenExpression ^WhenClause %) (.getWhenClauses e)))]
+    ;; The COMMON type of every branch, not the first branch that happens
+    ;; to have one: `CASE WHEN … THEN 1.50::numeric ELSE 1.5::float8 END`
+    ;; is float8 in PostgreSQL, and prints 1.5 rather than 1.50.
+    (types/select-common-type (mapv #(resolution-oid % env) branches) "CASE" false)))
 
 (defn- boolean-literal-column?
   "JSqlParser versions older than 5.x sometimes parse bare `TRUE`/`FALSE`

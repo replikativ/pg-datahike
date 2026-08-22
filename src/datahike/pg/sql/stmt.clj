@@ -1379,12 +1379,24 @@
             cols (vec (map-indexed (fn [i si] (select-item-col-name si i)) items))
             ;; Best-effort storage type: a bare column reference keeps
             ;; the type it has in the schema.
+            ;;
+            ;; An UNQUALIFIED column belongs to the inner's own FROM item
+            ;; -- `(SELECT v FROM c WHERE …)` projects c.v. Requiring the
+            ;; qualifier meant every unqualified projection fell back to
+            ;; :db.type/string, so the relation declared TEXT for an
+            ;; integer column: Describe reported the wrong type, and
+            ;; `WHERE s.v > 10` looked like text > integer.
+            inner-from-name (when-let [fi (.getFromItem ^PlainSelect inner)]
+                              (when (instance? net.sf.jsqlparser.schema.Table fi)
+                                (some-> (.getName ^net.sf.jsqlparser.schema.Table fi)
+                                        unquote-ident str/lower-case)))
             vtype-of (fn [^net.sf.jsqlparser.statement.select.SelectItem si]
                        (let [e (.getExpression si)]
                          (or (when (instance? Column e)
                                (let [^Column c e
-                                     t (some-> (.getTable c) .getName unquote-ident
-                                               str/lower-case)
+                                     t (or (some-> (.getTable c) .getName unquote-ident
+                                                   str/lower-case)
+                                           inner-from-name)
                                      n (str/lower-case (unquote-ident (.getColumnName c)))]
                                  (when t (get-in schema [(keyword t n) :db/valueType]))))
                              :db.type/string)))
@@ -1552,23 +1564,17 @@
         (recur (inc p) (next v) (conj out (first v)))))))
 
 (defn- eval-corr-scalar
-  "Evaluate one SQL fragment for a deferred correlated item against `query-db`
-   with *from-bindings* already bound. `subquery?` true → run `sql` as-is;
-   false → wrap as `SELECT (<sql>)`. First cell, or nil on error/empty."
+  "Evaluate one SQL fragment for a deferred correlated item -- see
+   `expr/eval-correlated-scalar`, which this and the WHERE-position
+   binding both call. Kept as a local name so the CASE-branch evaluator
+   below reads the same as it did.
+
+   It returned nil on error where the shared one returns the NULL
+   sentinel; the difference is invisible here, because every caller
+   treats nil as SQL NULL, and the shared one has to be strict about it
+   (a Datalog binding that yields nil FILTERS THE ROW)."
   [parse-fn sql subquery? inner-schema query-db]
-  (try
-    (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
-          p   (parse-fn run-sql inner-schema query-db)
-          q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
-      (if (nil? q)
-        (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
-        (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
-              ;; Same rule as the server-side twin: an aggregate over an
-              ;; empty relation is still ONE row.
-              res (or (when (empty? (seq res)) (expr/empty-aggregate-row q)) res)
-              fr (first res)]
-          (if (sequential? fr) (first fr) fr))))
-    (catch Throwable _ nil)))
+  (expr/eval-correlated-scalar parse-fn sql subquery? inner-schema query-db))
 
 (defn- eval-corr-then
   "Evaluate a CASE branch THEN/ELSE spec with *from-bindings* bound."
