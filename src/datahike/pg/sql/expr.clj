@@ -293,7 +293,8 @@
             cast1 (fn [x]
                     (if (or (nil? x) (= :__null__ x))
                       x
-                      (sql-cast/cast-scalar x tname {:explicit? true})))]
+                      (try (sql-cast/cast-scalar x tname {:explicit? true})
+                           (catch Throwable _ x))))]
         (if (or (symbol? v) (seq? v))
           (let [p (symbol (str "?common-cast" (swap! (:var-counter ctx) inc)))
                 out (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) v)
