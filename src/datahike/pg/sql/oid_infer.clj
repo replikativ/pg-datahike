@@ -165,7 +165,12 @@
    "current_date"  types/oid-date
    "current_time"  types/oid-time
    "localtime"     types/oid-time
-   "date_trunc"    types/oid-timestamptz
+   ;; date_trunc has three overloads and each RETURNS its second
+   ;; argument's type (pg_proc.dat): timestamptz, timestamp, interval.
+   ;; Reporting timestamptz for all of them made `date_trunc('day', ts)`
+   ;; on a plain timestamp render with a `+00` offset, which is a
+   ;; different instant for a client that reads it as local time.
+   "date_trunc"    :arg2-type
    "date_part"     types/oid-float8
    "extract"       types/oid-float8
    "age"           types/oid-interval
@@ -521,6 +526,17 @@
         (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
+      ;; The SECOND argument's type -- `date_trunc(unit, ts)` returns
+      ;; whatever ts is.
+      (= rule :arg2-type)
+      (when-let [a2 (second args)]
+        ;; A `date` has no date_trunc overload of its own and coerces
+        ;; implicitly to BOTH timestamp and timestamptz, so function
+        ;; resolution falls to the category's PREFERRED type -- verified
+        ;; against the oracle: `date_trunc('month', date_col)` comes back
+        ;; with a `+00`.
+        (let [o (expr-oid a2 env)]
+          (if (= o types/oid-date) types/oid-timestamptz o)))
       ;; COALESCE / NULLIF / GREATEST / LEAST resolve a COMMON type over
       ;; every argument, the same way CASE and UNION do.
       (= rule :common-type)

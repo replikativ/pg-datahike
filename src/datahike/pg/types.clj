@@ -1080,7 +1080,10 @@
     (cond
       (Double/isNaN d)      "NaN"
       (Double/isInfinite d) (if (pos? d) "Infinity" "-Infinity")
-      (zero? d)             "0"
+      ;; -0.0 is a distinct float value and PostgreSQL prints its sign:
+      ;; `0.0 / -1` is `-0` there. `zero?` is true for both zeros, so the
+      ;; sign has to come from the bit pattern.
+      (zero? d)             (if (neg? (Double/doubleToRawLongBits d)) "-0" "0")
       :else
       (let [s (if float4? (Float/toString (float v)) (Double/toString d))
             minus? (str/starts-with? s "-")
