@@ -895,7 +895,9 @@
       (sequential? parsed) (count parsed)
       ;; NULL in, NULL out: the function is strict, so it is never
       ;; called on SQL NULL -- but our sentinel reaches it.
-      (or (nil? parsed) (= :__null__ v) (= json-null parsed)) :__null__
+      ;; JSON null is a scalar value and therefore reaches the scalar
+      ;; error below. Only SQL NULL is absorbed by strictness.
+      (or (nil? v) (= :__null__ v)) :__null__
       (map? parsed)
       (throw (errors/pg-error :invalid-parameter-value
                               {:message "cannot get array length of a non-array"}))
@@ -998,4 +1000,3 @@
 ;; ============================================================================
 ;; Wire protocol: formatting jsonb for transport
 ;; ============================================================================
-

@@ -48,7 +48,16 @@
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
     (loop [acc []] (if (.next rs) (recur (conj acc (.getString rs (int n)))) acc))))
 
+(defn- sqlstate [^Connection c sql]
+  (try
+    (col c 1 sql)
+    nil
+    (catch org.postgresql.util.PSQLException e (.getSQLState e))))
+
 (defn- seed! [^Connection c]
+  ;; Text rendering of timestamptz is session-sensitive. Pin the same
+  ;; deterministic zone used by the PostgreSQL oracle for these fixtures.
+  (exec! c "SET TIME ZONE 'UTC'")
   (exec! c (str "CREATE TABLE zz (id int, f float8, r real, ts timestamp, "
                 "tz timestamptz, d date, js jsonb)"))
   (exec! c (str "INSERT INTO zz VALUES "
@@ -94,6 +103,11 @@
     (is (= [nil] (col c 1 "SELECT jsonb_array_length(NULL::jsonb)"))
         "strict: NULL in, NULL out")
     (testing "a non-array is an error, with PostgreSQL's two messages"
+      (is (thrown-with-msg?
+           org.postgresql.util.PSQLException #"cannot get array length of a scalar"
+           (col c 1 "SELECT jsonb_array_length('null'::jsonb)"))
+          "JSON null is a scalar, not SQL NULL")
+      (is (= "22023" (sqlstate c "SELECT jsonb_array_length('null'::jsonb)")))
       (is (thrown-with-msg?
            org.postgresql.util.PSQLException #"cannot get array length of a scalar"
            (col c 1 "SELECT jsonb_array_length('5'::jsonb)")))
