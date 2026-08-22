@@ -113,6 +113,27 @@ Not wired into CI — needs a running Postgres. Use locally during
 feature development; copy surprising diffs into `sqllogictest/` as
 new test cases once fixed.
 
+## PostgreSQL's upstream regression suite
+
+`bb pg-regress` runs PostgreSQL's own `pg_regress` driver, SQL, and expected
+output against an existing pg-datahike server. It uses `../postgres` and the
+installed PostgreSQL 17 tools by default:
+
+```
+bb pg-regress jsonb
+bb pg-regress jsonb expressions
+```
+
+This is initially a baseline rather than a CI gate. A completed upstream test
+that produces differences exits successfully and retains its full output under
+`.internal/pg-regress/`; a harness failure still fails. The summary highlights
+frequent target errors and internal-looking failures so unsupported surface
+does not hide class casts, unknown Datalog variables, or lost connections.
+
+Use `PG_REGRESS_STRICT=1` only for an admitted test that is expected to match
+completely. Endpoint, PostgreSQL checkout, and binary overrides are documented
+in `test/integration/postgres-regress/README.md`.
+
 ## Golden-file catalog tests (planned)
 
 pgjdbc / Hibernate / Rails / Django all call a small fixed set of

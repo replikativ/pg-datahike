@@ -28,6 +28,10 @@
                 :task (apply shell "clojure -M:dev -m datahike.test.cross-engine"
                              *command-line-args*)}
 
+  pg-regress {:doc "Run named PostgreSQL regression tests against an existing pg-datahike server (non-gating by default)."
+              :task (apply shell "bash test/integration/postgres-regress/run.sh"
+                           *command-line-args*)}
+
   format {:doc "Check Clojure source formatting with cljfmt."
           :task (shell "clojure -M:format")}
 
