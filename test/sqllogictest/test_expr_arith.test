@@ -60,11 +60,14 @@ SELECT -a FROM t1
 0
 3
 
+# -1 * 0.0 is -0, not 0: negative zero is a distinct float value and
+# PostgreSQL prints its sign (verified against the oracle). This block
+# asserted 0.000000, which was our own output before the sign survived.
 query R rowsort
 SELECT -1 * c FROM t1
 ----
 -2.500000
-0.000000
+-0.000000
 -1.500000
 -3.000000
 1.000000

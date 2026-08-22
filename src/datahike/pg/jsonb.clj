@@ -9,6 +9,7 @@
   (:require [jsonista.core :as json]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.errors :as errors]
             [datahike.pg.records :as records]))
 
 (set! *warn-on-reflection* true)
@@ -881,10 +882,26 @@
         :else                "string"))))
 
 (defn jsonb-array-length
-  "PostgreSQL jsonb_array_length(jsonb): return array length."
+  "PostgreSQL `jsonb_array_length(jsonb)`.
+
+   A non-array is an ERROR, not NULL (jsonfuncs.c): a scalar root and a
+   non-array root raise 22023 with different messages. Answering NULL
+   dropped the row instead -- `SELECT jsonb_array_length(js) FROM t`
+   returned only the rows whose js happened to be an array, where
+   PostgreSQL fails the statement."
   [v]
   (let [parsed (parse-jsonb v)]
-    (if (sequential? parsed) (count parsed) nil)))
+    (cond
+      (sequential? parsed) (count parsed)
+      ;; NULL in, NULL out: the function is strict, so it is never
+      ;; called on SQL NULL -- but our sentinel reaches it.
+      (or (nil? parsed) (= :__null__ v) (= json-null parsed)) :__null__
+      (map? parsed)
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "cannot get array length of a non-array"}))
+      :else
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "cannot get array length of a scalar"})))))
 
 (defn jsonb-object-keys
   "PostgreSQL jsonb_object_keys(jsonb): return keys of object.
