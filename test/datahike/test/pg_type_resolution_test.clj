@@ -82,7 +82,13 @@
     (is (true? (types/comparison-compatible? types/oid-date types/oid-timestamp)))
     (is (true? (types/comparison-compatible? types/oid-int2 types/oid-numeric))))
   (testing "an untyped literal takes the other side's type"
-    (is (true? (types/comparison-compatible? nil types/oid-bool)))))
+    (is (true? (types/comparison-compatible? nil types/oid-bool))))
+  (testing "declared character types round-trip through schema metadata"
+    (is (= types/oid-bpchar (get types/pg-name->oid "bpchar"))))
+  (testing "coercibility is not a substitute for an operator catalog"
+    (is (false? (types/comparison-compatible? '= types/oid-json types/oid-json)))
+    (is (false? (types/comparison-compatible? '= types/oid-json-array types/oid-json-array)))
+    (is (true? (types/comparison-compatible? '= types/oid-jsonb types/oid-jsonb)))))
 
 (deftest common-type-of-a-construct
   (with-open [c (jdbc)]
@@ -98,6 +104,16 @@
     (testing "and the reported type follows the same rule"
       (is (= ["double precision"] (col c 1 "SELECT pg_typeof(coalesce(n,f)) FROM tr LIMIT 1")))
       (is (= ["numeric"] (col c 1 "SELECT pg_typeof(coalesce(i,n)) FROM tr LIMIT 1"))))
+    (testing "CASE gives ELSE the most significant type position"
+      ;; varchar and bpchar coerce implicitly in both directions and neither
+      ;; is preferred. PostgreSQL therefore keeps whichever one it sees
+      ;; first -- and parse_expr.c deliberately prepends ELSE.
+      (exec! c "CREATE TABLE tr_chars (v varchar(4), c char(4))")
+      (exec! c "INSERT INTO tr_chars VALUES ('v', 'c')")
+      (is (= ["character"]
+             (col c 1 "SELECT pg_typeof(CASE WHEN true THEN v ELSE c END) FROM tr_chars")))
+      (is (= ["character varying"]
+             (col c 1 "SELECT pg_typeof(CASE WHEN true THEN c ELSE v END) FROM tr_chars"))))
     (testing "an untyped literal is UNKNOWN, not text"
       ;; `expr-oid` answers text for a quoted literal because that is
       ;; right for a projection; using it here would make every mixed
@@ -114,6 +130,27 @@
   (with-open [c (jdbc)]
     (seed! c)
     (testing "no candidate operator is an error, not an answer"
+      (is (thrown-with-msg?
+           org.postgresql.util.PSQLException
+           #"operator does not exist: json = json"
+           (col c 1 "SELECT '{}'::json = '{}'::json")))
+      (doseq [sql ["SELECT true IN (1,2)"
+                   "SELECT 1 WHERE true IN (1,2)"
+                   "SELECT CASE true WHEN 1 THEN 'x' ELSE 'y' END"
+                   "SELECT true IS DISTINCT FROM 1"
+                   "SELECT 1 WHERE true IS DISTINCT FROM 1"]]
+        (is (thrown-with-msg?
+             org.postgresql.util.PSQLException
+             #"operator does not exist: boolean = integer"
+             (col c 1 sql))
+            sql))
+      (doseq [sql ["SELECT true BETWEEN 0 AND 2"
+                   "SELECT 1 WHERE true BETWEEN 0 AND 2"]]
+        (is (thrown-with-msg?
+             org.postgresql.util.PSQLException
+             #"operator does not exist: boolean >= integer"
+             (col c 1 sql))
+            sql))
       (is (thrown-with-msg?
            org.postgresql.util.PSQLException
            #"operator does not exist: boolean = integer"

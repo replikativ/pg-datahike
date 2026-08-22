@@ -95,6 +95,7 @@
          translate-cast-expr
          translate-predicate-expr
          translate-comparison
+         check-comparison-types!
          translate-function-call
          translate-binary-arith
          flatten-json-chain
@@ -292,8 +293,7 @@
             cast1 (fn [x]
                     (if (or (nil? x) (= :__null__ x))
                       x
-                      (try (sql-cast/cast-scalar x tname {:explicit? true})
-                           (catch Throwable _ x))))]
+                      (sql-cast/cast-scalar x tname {:explicit? true})))]
         (if (or (symbol? v) (seq? v))
           (let [p (symbol (str "?common-cast" (swap! (:var-counter ctx) inc)))
                 out (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) v)
@@ -1538,6 +1538,8 @@
         branches (mapv (fn [^WhenClause wc]
                          (let [when-val (.getWhenExpression wc)
                                then-val (.getThenExpression wc)
+                               _ (when switch-expr
+                                   (check-comparison-types! ctx '= switch-expr when-val))
                                test (if switch-val
                                       (list 'datahike.pg.sql/sql-eq? switch-val (translate-expr ctx when-val))
                                       (translate-predicate-expr ctx when-val))
@@ -1605,9 +1607,13 @@
            [(apply list fn-param param-vars) result-var])
     ;; CASE resolves ONE type across its branches and coerces each to it.
     (coerce-to-common! ctx result-var
-                       (concat (mapv (fn [^WhenClause wc] (.getThenExpression wc))
-                                     when-clauses)
-                               (when else-expr [else-expr]))
+                       ;; PostgreSQL gives ELSE the first (most significant)
+                       ;; position in select_common_type. This is observable
+                       ;; for bidirectionally coercible, non-preferred types
+                       ;; such as varchar and bpchar.
+                       (concat (when else-expr [else-expr])
+                               (mapv (fn [^WhenClause wc] (.getThenExpression wc))
+                                     when-clauses))
                        "CASE")))
 
 (defn- materialize-nested!
@@ -1825,28 +1831,33 @@
     ;; sorts NaN above everything, and IEEE-754 answers false for every
     ;; comparison involving one.
     (instance? GreaterThan expr)
-    (let [^GreaterThan e expr]
+    (let [^GreaterThan e expr
+          _ (check-comparison-types! ctx '> (.getLeftExpression e) (.getRightExpression e))]
       (list 'datahike.pg.sql/sql-gt3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? GreaterThanEquals expr)
-    (let [^GreaterThanEquals e expr]
+    (let [^GreaterThanEquals e expr
+          _ (check-comparison-types! ctx '>= (.getLeftExpression e) (.getRightExpression e))]
       (list 'datahike.pg.sql/sql-ge3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? MinorThan expr)
-    (let [^MinorThan e expr]
+    (let [^MinorThan e expr
+          _ (check-comparison-types! ctx '< (.getLeftExpression e) (.getRightExpression e))]
       (list 'datahike.pg.sql/sql-lt3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? MinorThanEquals expr)
-    (let [^MinorThanEquals e expr]
+    (let [^MinorThanEquals e expr
+          _ (check-comparison-types! ctx '<= (.getLeftExpression e) (.getRightExpression e))]
       (list 'datahike.pg.sql/sql-le3? (translate-expr ctx (.getLeftExpression e))
             (translate-expr ctx (.getRightExpression e))))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
           right (.getRightExpression e)
+          _ (check-comparison-types! ctx '= (.getLeftExpression e) right)
           any-arr? (and (instance? Function right)
                         (#{"any" "all"}
                          (str/lower-case (.getName ^Function right))))]
@@ -1888,6 +1899,7 @@
     (let [^NotEqualsTo e expr
           l (.getLeftExpression e)
           r (.getRightExpression e)
+          _ (check-comparison-types! ctx 'not= l r)
           ;; `x <> ANY(arr)` / `x <> ALL(arr)` were not recognised at all --
           ;; only the `=` forms were -- so they reached the function table as
           ;; a call to a function named "all" and raised "function all does
@@ -1949,14 +1961,21 @@
     (instance? InExpression expr)
     (let [^InExpression e expr
           not-in? (.isNot e)
+          left-ast (.getLeftExpression e)
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           right (.getRightExpression e)
           vals (cond
                  (instance? ParenthesedExpressionList right)
-                 (mapv #(translate-expr ctx %) ^ParenthesedExpressionList right)
+                 (mapv (fn [v]
+                         (check-comparison-types! ctx '= left-ast v)
+                         (translate-expr ctx v))
+                       ^ParenthesedExpressionList right)
                  (instance? ExpressionList right)
-                 (mapv #(translate-expr ctx %) ^ExpressionList right)
+                 (mapv (fn [v]
+                         (check-comparison-types! ctx '= left-ast v)
+                         (translate-expr ctx v))
+                       ^ExpressionList right)
                  ;; IN (SELECT …) — evaluate the subquery once at
                  ;; translate-time and lift its result column to a
                  ;; value list. Same conservative pattern as the
@@ -2032,10 +2051,15 @@
     (instance? Between expr)
     (let [^Between e expr
           not-between? (.isNot e)
+          left-ast (.getLeftExpression e)
+          lo-ast (.getBetweenExpressionStart e)
+          hi-ast (.getBetweenExpressionEnd e)
+          _ (check-comparison-types! ctx '>= left-ast lo-ast)
+          _ (check-comparison-types! ctx '<= left-ast hi-ast)
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
-          lo  (translate-expr ctx (.getBetweenExpressionStart e))
-          hi  (translate-expr ctx (.getBetweenExpressionEnd e))
+          lo  (translate-expr ctx lo-ast)
+          hi  (translate-expr ctx hi-ast)
           base (list 'datahike.pg.sql/sql-between3? col lo hi)]
       (if not-between? (list 'datahike.pg.sql/sql-not3 base) base))
 
@@ -2064,6 +2088,7 @@
     ;; a IS [NOT] DISTINCT FROM b -- the NULL-aware `<>`, also 2-valued.
     (instance? IsDistinctExpression expr)
     (let [^IsDistinctExpression e expr
+          _ (check-comparison-types! ctx '= (.getLeftExpression e) (.getRightExpression e))
           l (translate-expr ctx (.getLeftExpression e))
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (translate-expr ctx (.getRightExpression e))
@@ -3996,7 +4021,7 @@
   [ctx op left right]
   (let [a (operand-type-oid ctx left)
         b (operand-type-oid ctx right)]
-    (when-not (types/comparison-compatible? a b)
+    (when-not (types/comparison-compatible? op a b)
       (throw (errors/pg-error
               :undefined-function
               {:detail (str "operator does not exist: "
@@ -4645,6 +4670,10 @@
     (let [^Between e expr
           not-between? (.isNot e)
           left-ast (.getLeftExpression e)
+          lo-ast (.getBetweenExpressionStart e)
+          hi-ast (.getBetweenExpressionEnd e)
+          _ (check-comparison-types! ctx '>= left-ast lo-ast)
+          _ (check-comparison-types! ctx '<= left-ast hi-ast)
           col (translate-expr ctx left-ast)
           ;; PG-style typinput on each bound when LHS is a typed Column
           ;; — `oid BETWEEN '16000' AND '17000'` and similar.
@@ -4652,8 +4681,8 @@
                          (or (when (instance? Column left-ast)
                                (coerce-unknown-literal ctx left-ast bound-ast))
                              (translate-expr ctx bound-ast)))
-          lo (coerce-bound (.getBetweenExpressionStart e))
-          hi (coerce-bound (.getBetweenExpressionEnd e))]
+          lo (coerce-bound lo-ast)
+          hi (coerce-bound hi-ast)]
       ;; One predicate per form, not a disjunction and not a pair of
       ;; comparisons. `(or [(< col lo)] [(> col hi)])` binds different var
       ;; sets in its two branches, which datalog rejects the moment lo and
@@ -4764,6 +4793,7 @@
     ;; a IS [NOT] DISTINCT FROM b — the NULL-aware `<>`.
     (instance? IsDistinctExpression expr)
     (let [^IsDistinctExpression e expr
+          _ (check-comparison-types! ctx '= (.getLeftExpression e) (.getRightExpression e))
           l (translate-expr ctx (.getLeftExpression e))
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (translate-expr ctx (.getRightExpression e))
@@ -4959,6 +4989,7 @@
           ;; column's typinput. Mirrors `c.oid IN ('16384','16385')`
           ;; from pgjdbc's getColumns probe.
           translate-in-elem (fn [el]
+                              (check-comparison-types! ctx '= left-ast el)
                               (or (when (instance? Column left-ast)
                                     (coerce-unknown-literal ctx left-ast el))
                                   (translate-expr ctx el)))

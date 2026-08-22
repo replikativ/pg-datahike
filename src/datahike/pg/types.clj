@@ -311,6 +311,7 @@
     "int8"        oid-int8
     "text"        oid-text
     "varchar"     oid-varchar
+    "bpchar"      oid-bpchar
     "float4"      oid-float4
     "float8"      oid-float8
     "numeric"     oid-numeric
@@ -748,6 +749,19 @@
   [oid]
   (conj (get implicit-casts oid #{}) oid))
 
+(def ^:private no-comparison-operator-oids
+  "Types among the OIDs we expose that have no ordinary comparison
+   operators in PostgreSQL.
+
+   This is deliberately a small bridge to the generated operator catalog:
+   implicit coercibility can tell us whether an operator candidate could
+   accept two different input types, but it cannot tell us that a candidate
+   exists in the first place. `json = json` is the load-bearing example --
+   identical input types, but PostgreSQL defines equality only for jsonb.
+   Arrays inherit their element type's comparison support, so json[] is
+   excluded as well."
+  #{oid-json oid-json-array})
+
 (defn comparison-compatible?
   "Would PostgreSQL find an operator for a comparison between these two
    types?
@@ -764,12 +778,20 @@
    either, while `date = timestamp` resolves through timestamp.
 
    Either side unknown means an untyped literal, which takes the other
-   side's type; a type absent from the tables stays lenient."
-  [a b]
-  (or (nil? a) (nil? b) (= a b)
-      (nil? (get oid->category a)) (nil? (get oid->category b))
-      (boolean (seq (set/intersection (coercion-targets a)
-                                      (coercion-targets b))))))
+   side's type; a type absent from the tables stays lenient.
+
+   `op` is accepted now so this API has the shape of PostgreSQL's real
+   operator lookup. The bridge table above currently excludes types with no
+   comparison family at all; a generated pg_operator slice can make this
+   lookup fully operator-specific."
+  ([a b] (comparison-compatible? '= a b))
+  ([_op a b]
+   (and (not (contains? no-comparison-operator-oids a))
+        (not (contains? no-comparison-operator-oids b))
+        (or (nil? a) (nil? b) (= a b)
+            (nil? (get oid->category a)) (nil? (get oid->category b))
+            (boolean (seq (set/intersection (coercion-targets a)
+                                            (coercion-targets b))))))))
 
 ;; ============================================================================
 ;; Convenience functions

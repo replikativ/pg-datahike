@@ -613,8 +613,11 @@
    the user intended)."
   [^CaseExpression e env]
   (let [branches (concat
-                  (mapv #(.getThenExpression ^WhenClause %) (.getWhenClauses e))
-                  (when-let [el (.getElseExpression e)] [el]))]
+                  ;; parse_expr.c prepends CASE/ELSE before choosing the
+                  ;; common type. Order matters when casts work both ways and
+                  ;; neither type is preferred (varchar versus bpchar).
+                  (when-let [el (.getElseExpression e)] [el])
+                  (mapv #(.getThenExpression ^WhenClause %) (.getWhenClauses e)))]
     ;; The COMMON type of every branch, not the first branch that happens
     ;; to have one: `CASE WHEN … THEN 1.50::numeric ELSE 1.5::float8 END`
     ;; is float8 in PostgreSQL, and prints 1.5 rather than 1.50.
