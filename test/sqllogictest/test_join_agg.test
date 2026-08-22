@@ -53,8 +53,16 @@ Bob	400.000000
 Carol	300.000000
 
 # JOIN with HAVING >= (inclusive)
+# HAVING may not reference a SELECT-list ALIAS: PostgreSQL resolves names
+# there against the FROM relations only (GROUP BY and ORDER BY are the two
+# clauses that also see output names), and answers
+#   ERROR: column "total" does not exist
+# Written out longhand, which is what PostgreSQL accepts.
 query TR nosort
-SELECT c.name, SUM(o.amount) AS total FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name HAVING total >= 350 ORDER BY total DESC
+SELECT c.name, SUM(o.amount) AS total FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) >= 350 ORDER BY total DESC
 ----
 Bob	400.000000
 Alice	350.000000
+
+statement error
+SELECT c.name, SUM(o.amount) AS total FROM orders o INNER JOIN customers c ON o.customer_id = c.id GROUP BY c.name HAVING total >= 350

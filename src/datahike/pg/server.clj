@@ -416,78 +416,37 @@
 ;; HAVING post-filter
 ;; ============================================================================
 
-(defn- having-pred-fn
-  "Return a predicate function for a single HAVING clause spec.
-   Spec is a map {:op <symbol> :col-idx <int> :value <number>}
-   or nested {:op :and/:or :clauses [...]}.
-   Returns a predicate (fn [row] -> bool) or nil if unresolvable."
-  [having-spec]
-  (cond
-    ;; Nested AND/OR
-    (= (:op having-spec) :and)
-    (let [preds (keep having-pred-fn (:clauses having-spec))]
-      (when (seq preds)
-        (fn [row] (every? #(% row) preds))))
+(defn- row-bindings
+  "Variable bindings for a projection or predicate FORM evaluated against
+   one result row: every `:find` element that is a plain variable, read
+   off the row by position, plus the query's `:in` parameters.
 
-    (= (:op having-spec) :or)
-    (let [preds (keep having-pred-fn (:clauses having-spec))]
-      (when (seq preds)
-        (fn [row] (some #(% row) preds))))
-
-    ;; IS NULL / IS NOT NULL
-    (#{:is-null :is-not-null} (:op having-spec))
-    (when-let [col-idx (:col-idx having-spec)]
-      (let [check-null? (= :is-null (:op having-spec))]
-        (fn [row]
-          (let [row-vec (if (sequential? row) (vec row) [row])
-                cell (nth row-vec col-idx nil)
-                is-null? (or (nil? cell) (= :__null__ cell))]
-            (if check-null? is-null? (not is-null?))))))
-
-    ;; Leaf comparison. SQL three-valued logic: a NULL cell makes
-    ;; `cell op value` evaluate to UNKNOWN, and HAVING treats UNKNOWN
-    ;; as FALSE (the group is filtered out). Without this guard,
-    ;; `(> :__null__ 15)` throws on the Keyword-vs-Number compare.
-    (:col-idx having-spec)
-    (let [{:keys [op col-idx value]} having-spec
-          ;; `translate-having-expr` emits Clojure-style operator symbols
-          ;; (`not=`), not SQL spellings -- so the `'<>` / `'!=` cases never
-          ;; matched and `HAVING count(*) <> 1` fell through to `:else =`,
-          ;; returning exactly the COMPLEMENT of the right groups.
-          ;;
-          ;; The sql/* predicates rather than clojure.core's: `=` is
-          ;; type-sensitive for numbers, so `HAVING sum(i) = 17.0` missed a
-          ;; long 17, and the ordering ops need PostgreSQL's NaN order.
-          op-fn (cond
-                  (= op '>) sql/sql-gt?
-                  (= op '>=) sql/sql-ge?
-                  (= op '<) sql/sql-lt?
-                  (= op '<=) sql/sql-le?
-                  (= op '=) sql/sql-eq?
-                  (contains? #{'not= '<> '!=} op) sql/sql-ne?
-                  :else sql/sql-eq?)]
-      (fn [row]
-        (let [row-vec (if (sequential? row) (vec row) [row])
-              cell (nth row-vec col-idx nil)]
-          (if (or (nil? cell) (= :__null__ cell))
-            false
-            (let [cell-num (cond
-                             (number? cell) cell
-                             (instance? clojure.lang.Ratio cell) (double cell)
-                             :else cell)]
-              (op-fn cell-num value))))))
-
-    :else nil))
+   That is what lets such a form reference a GROUPING column (`sum(x) +
+   id`, or a plain column in HAVING) and a `$N` placeholder as well as the
+   aggregate slots the caller adds."
+  [query in-args row]
+  (let [rv (if (sequential? row) (vec row) [row])]
+    (into (into {} (keep-indexed (fn [i e] (when (symbol? e) [e (nth rv i nil)])))
+                (:find query))
+          (zipmap (rest (:in query)) in-args))))
 
 (defn- apply-having
-  "Filter result rows by HAVING predicates.
-   having-spec is a map {:op ... :col-idx ... :value ...} from the SQL parser."
-  [results _find-aliases having-spec]
-  (if (nil? having-spec)
-    results
-    (if-let [pred (having-pred-fn having-spec)]
-      (filter pred results)
-      results)))
+  "Filter result rows by HAVING.
+
+   `having` is {:form <predicate form> :slots [[var idx] …]} -- the
+   aggregates hoisted into hidden columns, and a form over them.
+   PostgreSQL keeps a group only when the predicate is TRUE, so UNKNOWN
+   (a NULL operand) drops it, which is what `true?` says here."
+  [results having query in-args]
+  (if-let [{:keys [form slots]} having]
+    (filterv (fn [row]
+               (let [rv (if (sequential? row) (vec row) [row])
+                     binds (reduce (fn [m [sym idx]] (assoc m sym (nth rv idx nil)))
+                                   (row-bindings query in-args row)
+                                   slots)]
+                 (true? (expr/interpret-form form binds))))
+             results)
+    results))
 
 ;; ============================================================================
 ;; Result formatting
@@ -3346,8 +3305,6 @@
       ;; A compound aggregate over a constant — `sum(x) / 2` — carries the
       ;; constant in the spec rather than in a column, and a rewritten
       ;; literal arrives here as a ParamRef like any other.
-      (contains? parsed :compound-exprs)
-      (update :compound-exprs sql/substitute-params fetch)
       (contains? parsed :sub-results)
       (update :sub-results
               (fn [subs]
@@ -5290,7 +5247,7 @@
             ;; hidden find-elements, and the HAVING :col-idx points at
             ;; them. Trimming first would strip the column the filter
             ;; needs and silently drop every row.
-            results (apply-having results find-aliases having)
+            results (apply-having results having query in-args)
             ;; Strip hidden ORDER BY / HAVING-aggregate columns from
             ;; results and aliases.
             [results find-aliases]
@@ -5335,44 +5292,37 @@
                         sql-offset (drop sql-offset)
                         sql-limit  (take sql-limit))
                       results)
-            ;; Apply compound aggregate expressions: MAX(a) - MIN(a)
-            ;; Each compound-expr has {:alias :op :l-idx :r-idx}.
-            ;; We compute the derived value and replace the hidden agg columns.
+            ;; Expressions OVER aggregates: `max(a) - min(a)`,
+            ;; `round(avg(x), 2)`, `coalesce(sum(x), 0)`. The translator
+            ;; hoisted each aggregate into a hidden `__compound_` column and
+            ;; left a FORM over the variables bound to them; evaluate it per
+            ;; group and splice the value in.
+            ;;
+            ;; `expr/interpret-form` -- the same evaluator FILTER and the
+            ;; correlated-CASE path use, over the same `datahike.pg.sql/*`
+            ;; functions the Datalog path calls. This was a bespoke tree
+            ;; walker that knew four arithmetic operators and nothing else,
+            ;; so it was both a second implementation of SQL arithmetic
+            ;; (`sum(id) / 2` had to special-case `sql-div` to avoid
+            ;; answering a Ratio) and a ceiling on what could appear around
+            ;; an aggregate at all.
             [results find-aliases]
             (if (seq compound-exprs)
-              ;; `/` here must be the same division the datalog path uses,
-              ;; or `sum(id) / 2` answers a Ratio where `id / 2` answers an
-              ;; integer. This is the second site that evaluates SQL
-              ;; arithmetic; sql/sql-div is the one implementation.
-              (let [ops {'+ + '- - '* * '/ sql/sql-div}
-                    ;; Compute the compound values for each row
-                    ;; The spec is a tree: a node is an aggregate column
-                    ;; (:idx), a constant (:const), or an operation over two
-                    ;; more nodes. `sum(v) * 2 + 1` is the nested case. A
-                    ;; node with neither :idx nor :op is a constant, which
-                    ;; also covers `{}` — substitute-params drops nil map
-                    ;; values, so a NULL constant arrives as an empty node.
-                    eval-node
-                    (fn eval-node [row node]
-                      (cond
-                        (contains? node :idx) (nth row (:idx node) nil)
-                        (:op node)
-                        (let [l (eval-node row (:left node))
-                              r (eval-node row (:right node))
-                              op-fn (get ops (:op node))]
-                          (when (and l r op-fn (number? l) (number? r))
-                            (op-fn l r)))
-                        :else (:const node)))
-                    new-results
+              (let [new-results
                     (mapv (fn [row]
-                            (let [rv (if (sequential? row) (vec row) [row])]
-                              (reduce (fn [r spec] (conj r (eval-node r spec)))
+                            (let [rv (if (sequential? row) (vec row) [row])
+                                  binds (row-bindings query in-args row)]
+                              (reduce (fn [r {:keys [form slots]}]
+                                        (let [b (reduce (fn [m [sym idx]]
+                                                          (assoc m sym (nth r idx nil)))
+                                                        binds slots)
+                                              val (expr/interpret-form form b)]
+                                          (conj r (if (= :__null__ val) nil val))))
                                       rv compound-exprs)))
                           results)
-                    ;; Build new aliases: keep originals + add compound aliases
                     compound-aliases (mapv :alias compound-exprs)
                     new-aliases (into (vec find-aliases) compound-aliases)
-                    ;; Hide the internal aggregate columns (prefixed with __compound_)
+                    ;; Hide the internal aggregate columns.
                     visible-indices (into []
                                           (keep-indexed (fn [i a]
                                                           (when-not (and (string? a)

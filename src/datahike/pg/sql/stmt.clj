@@ -125,7 +125,6 @@
          translate-update
          translate-delete
          translate-join
-         translate-having-expr
          translate-cte-branch
          translate-recursive-cte
          extract-value
@@ -758,98 +757,6 @@
                                  (= op base-name))))
                   i))
               (map-indexed vector find-elems)))))
-
-(defn translate-having-expr
-  "Translate a HAVING expression into a Clojure predicate fn form.
-   The result is a map {:op symbol :col-idx int :value val} for simple cases,
-   or a nested structure for AND/OR.
-   The server applies this as a post-filter on result tuples."
-  ([expr find-elems find-aliases] (translate-having-expr expr find-elems find-aliases {}))
-  ([expr find-elems find-aliases agg-elems]
-   (cond
-     (instance? AndExpression expr)
-     (let [^AndExpression e expr]
-       {:op :and
-        :clauses [(translate-having-expr (.getLeftExpression e) find-elems find-aliases agg-elems)
-                  (translate-having-expr (.getRightExpression e) find-elems find-aliases agg-elems)]})
-
-     (instance? OrExpression expr)
-     (let [^OrExpression e expr]
-       {:op :or
-        :clauses [(translate-having-expr (.getLeftExpression e) find-elems find-aliases agg-elems)
-                  (translate-having-expr (.getRightExpression e) find-elems find-aliases agg-elems)]})
-
-    ;; Comparison: aggregate op value
-     (or (instance? GreaterThan expr)
-         (instance? GreaterThanEquals expr)
-         (instance? MinorThan expr)
-         (instance? MinorThanEquals expr)
-         (instance? EqualsTo expr)
-         (instance? NotEqualsTo expr))
-     (let [left (cond
-                  (instance? GreaterThan expr) (.getLeftExpression ^GreaterThan expr)
-                  (instance? GreaterThanEquals expr) (.getLeftExpression ^GreaterThanEquals expr)
-                  (instance? MinorThan expr) (.getLeftExpression ^MinorThan expr)
-                  (instance? MinorThanEquals expr) (.getLeftExpression ^MinorThanEquals expr)
-                  (instance? EqualsTo expr) (.getLeftExpression ^EqualsTo expr)
-                  (instance? NotEqualsTo expr) (.getLeftExpression ^NotEqualsTo expr))
-           right (cond
-                   (instance? GreaterThan expr) (.getRightExpression ^GreaterThan expr)
-                   (instance? GreaterThanEquals expr) (.getRightExpression ^GreaterThanEquals expr)
-                   (instance? MinorThan expr) (.getRightExpression ^MinorThan expr)
-                   (instance? MinorThanEquals expr) (.getRightExpression ^MinorThanEquals expr)
-                   (instance? EqualsTo expr) (.getRightExpression ^EqualsTo expr)
-                   (instance? NotEqualsTo expr) (.getRightExpression ^NotEqualsTo expr))
-           op (cond
-                (instance? GreaterThan expr) '>
-                (instance? GreaterThanEquals expr) '>=
-                (instance? MinorThan expr) '<
-                (instance? MinorThanEquals expr) '<=
-                (instance? EqualsTo expr) '=
-                (instance? NotEqualsTo expr) 'not=)
-          ;; Left: aggregate function or alias reference
-           col-idx (cond
-                     (instance? Function left)
-                     (match-aggregate-index ^Function left find-elems find-aliases
-                                            (get agg-elems left))
-                    ;; Column reference — resolve as alias
-                     (instance? Column left)
-                     (let [col-name (.getColumnName ^Column left)]
-                       (some (fn [[i a]] (when (= a col-name) i))
-                             (map-indexed vector find-aliases)))
-                     :else nil)
-           value (cond
-                   (instance? LongValue right) (.getValue ^LongValue right)
-                   (instance? DoubleValue right) (types/decimal-literal
-                                                  right (.getValue ^DoubleValue right))
-                   (instance? StringValue right) (expr/string-value-text ^StringValue right)
-                   :else (str right))]
-       {:op op :col-idx col-idx :value value})
-
-    ;; IS NULL / IS NOT NULL
-     (instance? IsNullExpression expr)
-     (let [^IsNullExpression e expr
-           not-null? (.isNot e)
-           inner (.getLeftExpression e)
-          ;; An AGGREGATE operand (`HAVING min(n) IS NOT NULL`) resolves the
-          ;; same way the comparison branch resolves its left-hand side.
-          ;; Only a bare Column was handled, so an aggregate left col-idx
-          ;; nil -- and a nil col-idx makes having-pred-fn return nil, which
-          ;; apply-having reads as "no predicate" and passes EVERY group
-          ;; through. Both directions were silently unfiltered.
-           col-idx (cond
-                     (instance? Function inner)
-                     (match-aggregate-index ^Function inner find-elems find-aliases
-                                            (get agg-elems inner))
-                     (instance? Column inner)
-                     (let [col-name (.getColumnName ^Column inner)]
-                       (some (fn [[i a]] (when (= a col-name) i))
-                             (map-indexed vector find-aliases)))
-                     :else nil)]
-       {:op (if not-null? :is-not-null :is-null) :col-idx col-idx})
-
-     :else
-     {:op :unsupported :expr (str expr)})))
 
 ;; ============================================================================
 ;; Derived-table materialization — shared by FROM (...) AS t and
@@ -2068,34 +1975,6 @@
       :alias   (or alias target-name)
       :aliases sub-aliases})))
 
-(defn- agg-cast-inner
-  "If `expr` is a CAST (or parenthesised CAST) wrapping an aggregate —
-   `count(*)::int4`, `sum(x)::numeric`, an aggregate AnalyticExpression —
-   return that inner aggregate so the select-item dispatch registers it as
-   an aggregate instead of routing the whole CAST through the scalar-
-   expression path (which feeds the aggregate's spec map into the cast
-   coercer → \"cannot coerce PersistentArrayMap to bigint\").
-
-   The wrapping cast's result OID is computed independently by
-   `select-item-oids` (which walks the original CAST via oid-infer), and an
-   integer-width cast over count/sum/min/max doesn't change the value, so
-   dropping the runtime cast here is correct for those. A value-changing
-   cast over an aggregate (e.g. `avg(x)::int` truncation) loses the
-   truncation — acceptable for now, and strictly better than the previous
-   hard error. Returns nil when `expr` is not a cast-over-aggregate."
-  [expr]
-  (letfn [(peel [e]
-            (cond
-              (instance? CastExpression e) (peel (.getLeftExpression ^CastExpression e))
-              (instance? Parenthesis e)    (peel (.getExpression ^Parenthesis e))
-              :else e))]
-    (when (instance? CastExpression expr)
-      (let [i (peel expr)]
-        (when (or (and (instance? Function i)
-                       (fns/aggregate-function? (str/lower-case (.getName ^Function i))))
-                  (instance? net.sf.jsqlparser.expression.AnalyticExpression i))
-          i)))))
-
 (def ^:dynamic *cte-namespaces*
   "`{cte-name -> synthetic-namespace}` for the WITH items in scope.
 
@@ -2878,6 +2757,222 @@
                 nil)
               :else nil)))
 
+        ;; `agg(x) FILTER (WHERE p)` and the bare `agg(x)` that JSqlParser
+        ;; also surfaces as an AnalyticExpression. Same two rules as
+        ;; emit-agg!: the aggregate is the one `sql-aggregate->datalog`
+        ;; names, at the precision `pick-precision-variant` picks.
+        emit-analytic-agg!
+        (fn [^net.sf.jsqlparser.expression.AnalyticExpression ae alias0]
+          (let [fname (str/lower-case (.getName ae))
+                agg-sym (get fns/sql-aggregate->datalog fname)
+                inner-expr (.getExpression ae)
+                filter-expr (.getFilterExpression ae)
+                idx (count @find-elements)]
+            (reset! has-aggregates? true)
+            (if (and filter-expr agg-sym)
+              (let [is-count? (= fname "count")
+                    count-star? (and is-count?
+                                     (or (nil? inner-expr)
+                                         (instance? AllColumns inner-expr)))
+                    case-var (filter-arg-var! ctx filter-expr inner-expr
+                                              default-table count-star?
+                                              (when (contains? two-arg-aggs fname)
+                                                (.getOffset ae))
+                                              (if (contains? null-preserving-aggs fname)
+                                                fns/filtered-out
+                                                :__null__))
+                    ;; Per-input-type variant — same numeric-promotion
+                    ;; rule as the non-FILTER aggregate path.
+                    filter-precision-variant
+                    (when (and inner-expr (not count-star?))
+                      (pick-precision-variant
+                       fname
+                       (oid/expr-oid inner-expr agg-oid-env)))
+                    ;; The same aggregate the unfiltered form uses.
+                    ;; This was a four-name `case` whose default was
+                    ;; `filter-sum`, so `array_agg(x) FILTER (…)`,
+                    ;; `string_agg`, `stddev` and every other aggregate
+                    ;; silently computed a SUM instead.
+                    filter-agg (cond
+                                 is-count? 'datahike.pg.sql/filter-count
+                                 filter-precision-variant filter-precision-variant
+                                 :else (or agg-sym 'datahike.pg.sql/filter-sum))]
+                (swap! find-elements conj (list filter-agg case-var))
+                (swap! find-aliases conj (or alias0 fname)))
+              ;; No filter — treat as regular aggregate
+              (let [v (if inner-expr (expr/translate-expr ctx inner-expr)
+                          (ctx/entity-var! ctx default-table))]
+                (swap! find-elements conj (list (or agg-sym 'count) v))
+                (swap! find-aliases conj (or alias0 fname))))
+            idx))
+
+        ;; ONE aggregate emitter. The select-item branch below and the
+        ;; HOISTED aggregates (an aggregate nested inside a larger
+        ;; expression -- `round(avg(x), 2)`) both go through it, so a
+        ;; nested aggregate gets the same COUNT(*) / DISTINCT / FILTER /
+        ;; two-argument / in-aggregate-ORDER-BY handling and the same
+        ;; precision variant as a top-level one. Appends the aggregate's
+        ;; form to `find-elements` under `alias0` and returns its index.
+        emit-agg-fn!
+        (fn [^Function f-node alias0]
+          (let [idx (count @find-elements)]
+            (let [^Function f f-node
+                  fname (str/lower-case (.getName f))
+                  agg-sym (get fns/sql-aggregate->datalog fname)
+                  params (.getParameters f)
+                  is-distinct? (.isDistinct f)]
+              (reset! has-aggregates? true)
+              (let [is-count-star? (or (nil? params)
+                                       (= 0 (count params))
+                                       (and (= 1 (count params))
+                                            (instance? AllColumns (first params))))
+                    is-count-col? (and (= fname "count")
+                                       (not is-count-star?)
+                                       params (pos? (count params)))]
+                (if (and (= fname "count") is-count-star?)
+                        ;; COUNT(*) — count entities using row-marker if available
+                  (let [evar (ctx/entity-var! ctx default-table)
+                        table-name (get (:table-aliases ctx) default-table default-table)
+                        marker-attr (pgs/row-marker-attr table-name)]
+                    (when (empty? @(:where-clauses ctx))
+                      (if (get schema marker-attr)
+                        (ctx/add-clause! ctx [evar marker-attr true])
+                        (let [cols (pgs/column-info schema table-name db)]
+                          (when-let [first-col (second cols)]
+                            (ctx/col-var! ctx (:attr first-col))))))
+                    (if is-distinct?
+                      (swap! find-elements conj (list 'count-distinct evar))
+                      (swap! find-elements conj (list 'count evar)))
+                    (swap! find-aliases conj (or alias0 "count")))
+                        ;; Multi-argument aggregates (CORR)
+                        ;; Two-argument aggregates: CORR(y,x) and the
+                        ;; object-aggs, which all fold over [a b] pairs.
+                        ;; string_agg folds over [value delimiter] pairs, the
+                        ;; same two-argument shape CORR and the object
+                        ;; aggregates already use — it was a per-row fn that
+                        ;; stringified one value and dropped the delimiter, so
+                        ;; it returned one row per input row.
+                  (if (and (contains? #{'datahike.pg.sql/filter-corr
+                                        'datahike.pg.sql/filter-jsonb-object-agg
+                                        'datahike.pg.sql/filter-json-object-agg
+                                        'datahike.pg.sql/filter-string-agg}
+                                      agg-sym)
+                           params (= 2 (count params)))
+                    (let [v1 (expr/translate-expr ctx (first params))
+                          v2 (expr/translate-expr ctx (second params))
+                          v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
+                          v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
+                          pair-var (ctx/fresh-var! ctx)
+                                ;; string_agg(expr, delim ORDER BY …) — element
+                                ;; order is observable in the joined string, so
+                                ;; it needs the same treatment array_agg gets.
+                                ;; The triple carries the delimiter along with
+                                ;; the sort key and the value.
+                          order-els (when (= agg-sym 'datahike.pg.sql/filter-string-agg)
+                                      (seq (.getOrderByElements f)))]
+                      (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+                      (if order-els
+                        (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                               (let [kv (expr/translate-expr ctx (.getExpression o))]
+                                                 (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                             order-els)
+                              sort-key (if (= 1 (count key-vars))
+                                         (first key-vars)
+                                         (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
+                              all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                  (not (.isAsc o)))
+                                                order-els)]
+                          (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
+                          (swap! find-elements conj
+                                 (list (if all-desc?
+                                         'datahike.pg.sql/filter-string-agg-ordered-desc
+                                         'datahike.pg.sql/filter-string-agg-ordered)
+                                       pair-var)))
+                        (do
+                          (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
+                          (swap! find-elements conj (list agg-sym pair-var))))
+                      (swap! find-aliases conj (or alias0 fname)))
+                          ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
+                    (let [inner-expr (first params)
+                          v (expr/translate-expr ctx inner-expr)
+                                ;; Materialize expression args (e.g. SUM(a * b) → SUM(?v))
+                          v (if (seq? v) (ctx/materialize-arg! ctx v) v)
+                                ;; A CONSTANT argument -- `count(1)`, `avg(2.5)`,
+                                ;; `min(-1)` -- still has to reach the aggregate
+                                ;; as a VARIABLE. Datahike's find-spec parser has
+                                ;; no IFindVars implementation for a Constant, so
+                                ;; `(count 1)` raised a raw protocol error. Bind
+                                ;; it per row: the entity var is already in :with,
+                                ;; so `[(identity 1) ?c]` gives one ?c per row and
+                                ;; `count` then counts rows, as PostgreSQL does.
+                          v (if (symbol? v)
+                              v
+                              (ctx/materialize-arg! ctx (list 'identity v)))
+                                ;; Per-input-type variant for SUM/AVG. Compute
+                                ;; OID against the original AST expression
+                                ;; (post-ref-deref `v` is a logic var with no
+                                ;; OID rule). Falls back silently to default
+                                ;; agg-sym when input type doesn't match the
+                                ;; precision-sensitive set.
+                          precision-variant (when inner-expr
+                                              (pick-precision-variant
+                                               fname
+                                               (oid/expr-oid inner-expr agg-oid-env)))
+                          agg-sym (cond
+                                    (and is-count-col? is-distinct?)
+                                    'datahike.pg.sql/filter-count-distinct
+                                    is-count-col?
+                                    'datahike.pg.sql/filter-count
+                                    precision-variant precision-variant
+                                    :else agg-sym)
+                                ;; Distinct aggregates (e.g. SUM(DISTINCT x)) deduplicate
+                                ;; their input collection rather than doing a set scan.
+                          is-dh-distinct? (= agg-sym 'count-distinct)]
+                            ;; Prevent set deduplication for non-distinct aggregates:
+                            ;; adding the entity var to :with preserves duplicate rows.
+                            ;; Only when there IS a table -- a table-free
+                            ;; `SELECT count(1)` has no entity to vary over, and
+                            ;; minting one produced an unbound `?_eid` ("Query for
+                            ;; unknown vars").
+                      (when (and default-table (not is-dh-distinct?))
+                        (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
+                            ;; array_agg(expr ORDER BY …): collect [sort-key value]
+                            ;; pairs and sort in the agg fn so element order honors
+                            ;; the in-aggregate ORDER BY (composite field order in
+                            ;; asyncpg's introspection depends on this). Direction
+                            ;; is taken uniformly from the keys (all-DESC → desc).
+                      (let [order-els (when (= fname "array_agg")
+                                        (seq (.getOrderByElements f)))]
+                        (if order-els
+                          (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                 (let [kv (expr/translate-expr ctx (.getExpression o))]
+                                                   (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
+                                               order-els)
+                                sort-key (if (= 1 (count key-vars))
+                                           (first key-vars)
+                                           (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
+                                pair-var (ctx/fresh-var! ctx)
+                                all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
+                                                    (not (.isAsc o)))
+                                                  order-els)
+                                ord-sym (if all-desc?
+                                          'datahike.pg.sql/filter-array-agg-ordered-desc
+                                          'datahike.pg.sql/filter-array-agg-ordered)]
+                            (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
+                            (swap! find-elements conj (list ord-sym pair-var)))
+                          (swap! find-elements conj (list agg-sym v))))
+                      (swap! find-aliases conj (or alias0 fname)))))))
+            idx))
+
+        ;; One entry point for both node shapes: JSqlParser surfaces a bare
+        ;; `sum(x)` as a Function and `sum(x) FILTER (…)` as an
+        ;; AnalyticExpression, and a HOISTED aggregate can be either.
+        emit-agg!
+        (fn [f-node alias0]
+          (if (instance? net.sf.jsqlparser.expression.AnalyticExpression f-node)
+            (emit-analytic-agg! f-node alias0)
+            (emit-agg-fn! f-node alias0)))
+
         ;; --- Correlated scalar subqueries in the SELECT list (slice A of the
         ;; per-row / LATERAL executor — doc/design-alignment.md). A
         ;; scalar subquery that references an OUTER FROM alias is DEFERRED:
@@ -2909,10 +3004,14 @@
 
         _ (doseq [^SelectItem item loop-items]
             (let [raw-expr (.getExpression item)
-                  ;; A CAST over an aggregate (count(*)::int4) dispatches as
-                  ;; the inner aggregate; the cast only re-types the result
-                  ;; (handled by select-item-oids). See agg-cast-inner.
-                  expr (or (agg-cast-inner raw-expr) raw-expr)
+                  ;; A CAST over an aggregate used to be PEELED here and
+                  ;; dispatched as the inner aggregate, on the grounds that
+                  ;; the cast only re-types the result. It does not:
+                  ;; `avg(n)::int` ROUNDS, and dropping the conversion
+                  ;; answered 15.0000000000000000 where PostgreSQL answers
+                  ;; 15. It is an expression over an aggregate like any
+                  ;; other, and the hoisting path below handles it.
+                  expr raw-expr
                   alias-str (select-item-alias item)]
               (cond
                 ;; SELECT t.* — table-qualified wildcard. JSqlParser
@@ -3255,274 +3354,56 @@
 
                     ;; Not a window — handle as FILTER aggregate or plain aggregate
                     :else
-                    (do
-                      (reset! has-aggregates? true)
-                      (if (and filter-expr agg-sym)
-                        (let [is-count? (= fname "count")
-                              count-star? (and is-count?
-                                               (or (nil? inner-expr)
-                                                   (instance? AllColumns inner-expr)))
-                              case-var (filter-arg-var! ctx filter-expr inner-expr
-                                                        default-table count-star?
-                                                        (when (contains? two-arg-aggs fname)
-                                                          (.getOffset ae))
-                                                        (if (contains? null-preserving-aggs fname)
-                                                          fns/filtered-out
-                                                          :__null__))
-                              ;; Per-input-type variant — same numeric-promotion
-                              ;; rule as the non-FILTER aggregate path.
-                              filter-precision-variant
-                              (when (and inner-expr (not count-star?))
-                                (pick-precision-variant
-                                 fname
-                                 (oid/expr-oid inner-expr agg-oid-env)))
-                              ;; The same aggregate the unfiltered form uses.
-                              ;; This was a four-name `case` whose default was
-                              ;; `filter-sum`, so `array_agg(x) FILTER (…)`,
-                              ;; `string_agg`, `stddev` and every other
-                              ;; aggregate silently computed a SUM instead.
-                              filter-agg (cond
-                                           is-count? 'datahike.pg.sql/filter-count
-                                           filter-precision-variant filter-precision-variant
-                                           :else (or agg-sym 'datahike.pg.sql/filter-sum))]
-                          (swap! find-elements conj (list filter-agg case-var))
-                          (swap! find-aliases conj (or alias-str fname)))
-                    ;; No filter — treat as regular aggregate
-                        (let [v (if inner-expr (expr/translate-expr ctx inner-expr)
-                                    (ctx/entity-var! ctx default-table))]
-                          (swap! find-elements conj (list (or agg-sym 'count) v))
-                          (swap! find-aliases conj (or alias-str fname)))))))
+                    (emit-analytic-agg! ae alias-str)))
 
                 ;; Aggregate: COUNT(*), SUM(col), etc.
                 (and (instance? Function expr)
                      (fns/aggregate-function? (str/lower-case (.getName ^Function expr))))
-                (let [^Function f expr
-                      fname (str/lower-case (.getName f))
-                      agg-sym (get fns/sql-aggregate->datalog fname)
-                      params (.getParameters f)
-                      is-distinct? (.isDistinct f)]
-                  (reset! has-aggregates? true)
-                  (let [is-count-star? (or (nil? params)
-                                           (= 0 (count params))
-                                           (and (= 1 (count params))
-                                                (instance? AllColumns (first params))))
-                        is-count-col? (and (= fname "count")
-                                           (not is-count-star?)
-                                           params (pos? (count params)))]
-                    (if (and (= fname "count") is-count-star?)
-                      ;; COUNT(*) — count entities using row-marker if available
-                      (let [evar (ctx/entity-var! ctx default-table)
-                            table-name (get (:table-aliases ctx) default-table default-table)
-                            marker-attr (pgs/row-marker-attr table-name)]
-                        (when (empty? @(:where-clauses ctx))
-                          (if (get schema marker-attr)
-                            (ctx/add-clause! ctx [evar marker-attr true])
-                            (let [cols (pgs/column-info schema table-name db)]
-                              (when-let [first-col (second cols)]
-                                (ctx/col-var! ctx (:attr first-col))))))
-                        (if is-distinct?
-                          (swap! find-elements conj (list 'count-distinct evar))
-                          (swap! find-elements conj (list 'count evar)))
-                        (swap! find-aliases conj (or alias-str "count")))
-                      ;; Multi-argument aggregates (CORR)
-                      ;; Two-argument aggregates: CORR(y,x) and the
-                      ;; object-aggs, which all fold over [a b] pairs.
-                      ;; string_agg folds over [value delimiter] pairs, the
-                      ;; same two-argument shape CORR and the object
-                      ;; aggregates already use — it was a per-row fn that
-                      ;; stringified one value and dropped the delimiter, so
-                      ;; it returned one row per input row.
-                      (if (and (contains? #{'datahike.pg.sql/filter-corr
-                                            'datahike.pg.sql/filter-jsonb-object-agg
-                                            'datahike.pg.sql/filter-json-object-agg
-                                            'datahike.pg.sql/filter-string-agg}
-                                          agg-sym)
-                               params (= 2 (count params)))
-                        (let [v1 (expr/translate-expr ctx (first params))
-                              v2 (expr/translate-expr ctx (second params))
-                              v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
-                              v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
-                              pair-var (ctx/fresh-var! ctx)
-                              ;; string_agg(expr, delim ORDER BY …) — element
-                              ;; order is observable in the joined string, so
-                              ;; it needs the same treatment array_agg gets.
-                              ;; The triple carries the delimiter along with
-                              ;; the sort key and the value.
-                              order-els (when (= agg-sym 'datahike.pg.sql/filter-string-agg)
-                                          (seq (.getOrderByElements f)))]
-                          (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
-                          (if order-els
-                            (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                   (let [kv (expr/translate-expr ctx (.getExpression o))]
-                                                     (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
-                                                 order-els)
-                                  sort-key (if (= 1 (count key-vars))
-                                             (first key-vars)
-                                             (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
-                                  all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                      (not (.isAsc o)))
-                                                    order-els)]
-                              (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
-                              (swap! find-elements conj
-                                     (list (if all-desc?
-                                             'datahike.pg.sql/filter-string-agg-ordered-desc
-                                             'datahike.pg.sql/filter-string-agg-ordered)
-                                           pair-var)))
-                            (do
-                              (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
-                              (swap! find-elements conj (list agg-sym pair-var))))
-                          (swap! find-aliases conj (or alias-str fname)))
-                        ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
-                        (let [inner-expr (first params)
-                              v (expr/translate-expr ctx inner-expr)
-                              ;; Materialize expression args (e.g. SUM(a * b) → SUM(?v))
-                              v (if (seq? v) (ctx/materialize-arg! ctx v) v)
-                              ;; A CONSTANT argument -- `count(1)`, `avg(2.5)`,
-                              ;; `min(-1)` -- still has to reach the aggregate
-                              ;; as a VARIABLE. Datahike's find-spec parser has
-                              ;; no IFindVars implementation for a Constant, so
-                              ;; `(count 1)` raised a raw protocol error. Bind
-                              ;; it per row: the entity var is already in :with,
-                              ;; so `[(identity 1) ?c]` gives one ?c per row and
-                              ;; `count` then counts rows, as PostgreSQL does.
-                              v (if (symbol? v)
-                                  v
-                                  (ctx/materialize-arg! ctx (list 'identity v)))
-                              ;; Per-input-type variant for SUM/AVG. Compute
-                              ;; OID against the original AST expression
-                              ;; (post-ref-deref `v` is a logic var with no
-                              ;; OID rule). Falls back silently to default
-                              ;; agg-sym when input type doesn't match the
-                              ;; precision-sensitive set.
-                              precision-variant (when inner-expr
-                                                  (pick-precision-variant
-                                                   fname
-                                                   (oid/expr-oid inner-expr agg-oid-env)))
-                              agg-sym (cond
-                                        (and is-count-col? is-distinct?)
-                                        'datahike.pg.sql/filter-count-distinct
-                                        is-count-col?
-                                        'datahike.pg.sql/filter-count
-                                        precision-variant precision-variant
-                                        :else agg-sym)
-                              ;; Distinct aggregates (e.g. SUM(DISTINCT x)) deduplicate
-                              ;; their input collection rather than doing a set scan.
-                              is-dh-distinct? (= agg-sym 'count-distinct)]
-                          ;; Prevent set deduplication for non-distinct aggregates:
-                          ;; adding the entity var to :with preserves duplicate rows.
-                          ;; Only when there IS a table -- a table-free
-                          ;; `SELECT count(1)` has no entity to vary over, and
-                          ;; minting one produced an unbound `?_eid` ("Query for
-                          ;; unknown vars").
-                          (when (and default-table (not is-dh-distinct?))
-                            (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
-                          ;; array_agg(expr ORDER BY …): collect [sort-key value]
-                          ;; pairs and sort in the agg fn so element order honors
-                          ;; the in-aggregate ORDER BY (composite field order in
-                          ;; asyncpg's introspection depends on this). Direction
-                          ;; is taken uniformly from the keys (all-DESC → desc).
-                          (let [order-els (when (= fname "array_agg")
-                                            (seq (.getOrderByElements f)))]
-                            (if order-els
-                              (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                     (let [kv (expr/translate-expr ctx (.getExpression o))]
-                                                       (if (seq? kv) (ctx/materialize-arg! ctx kv) kv)))
-                                                   order-els)
-                                    sort-key (if (= 1 (count key-vars))
-                                               (first key-vars)
-                                               (ctx/materialize-arg! ctx (apply list 'vector key-vars)))
-                                    pair-var (ctx/fresh-var! ctx)
-                                    all-desc? (every? (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
-                                                        (not (.isAsc o)))
-                                                      order-els)
-                                    ord-sym (if all-desc?
-                                              'datahike.pg.sql/filter-array-agg-ordered-desc
-                                              'datahike.pg.sql/filter-array-agg-ordered)]
-                                (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
-                                (swap! find-elements conj (list ord-sym pair-var)))
-                              (swap! find-elements conj (list agg-sym v))))
-                          (swap! find-aliases conj (or alias-str fname)))))))
+                (emit-agg! ^Function expr alias-str)
 
                 ;; Regular column or expression
                 :else
-                (let [v (expr/translate-expr ctx expr)]
-                  (if (:compound-agg v)
-                    ;; Compound aggregate expression: MAX(a) - MIN(a)
-                    ;; Add each aggregate as find-elements. Record the
-                    ;; arithmetic expression for server-side post-processing.
-                    (let [add-agg!
-                          (fn [agg-marker]
-                            (when (:aggregate agg-marker)
-                              (let [{:keys [fn params]} agg-marker
-                                    inner (when params (first params))
-                                    ;; Same per-input-type selection the plain
-                                    ;; and FILTER aggregate paths make: an
-                                    ;; aggregate whose result is numeric needs
-                                    ;; the exact BigDecimal runtime. Without
-                                    ;; it this path always took the float8
-                                    ;; variant, so `avg(n)` was exact but
-                                    ;; `avg(n) * 1` came back as a double.
-                                    agg-sym (or (when inner
-                                                  (pick-precision-variant
-                                                   fn (try (oid/expr-oid inner agg-oid-env)
-                                                           (catch Throwable _ nil))))
-                                                (get fns/sql-aggregate->datalog fn))
-                                    iv (when inner (expr/translate-expr ctx inner))
-                                    ;; `count(*)` translates its argument to
-                                    ;; the keyword :*, which is not a datalog
-                                    ;; variable -- it reached :find as
-                                    ;; `(count :*)` and the parser rejected the
-                                    ;; whole query. Counting rows is counting
-                                    ;; entities, same as the no-argument case.
-                                    inner-var (cond
-                                                (or (nil? inner) (= :* iv))
-                                                (ctx/entity-var! ctx default-table)
-                                                (seq? iv) (ctx/materialize-arg! ctx iv)
-                                                :else iv)]
-                                (reset! has-aggregates? true)
-                                (when (not= agg-sym 'count-distinct)
-                                  (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
-                                (let [idx (count @find-elements)]
-                                  (swap! find-elements conj (list agg-sym inner-var))
-                                  (swap! find-aliases conj (str "__compound_" idx))
-                                  idx))))
-                          ;; A constant operand may already have been
-                          ;; rewritten to a `$N` placeholder for the plan
-                          ;; cache, in which case what we hold is the datalog
-                          ;; symbol and not the value. Hand back the ParamRef
-                          ;; so the existing Execute-time substitution
-                          ;; resolves it, exactly as it does for :in-args.
-                          const-operand
-                          (fn [x]
-                            (if-let [idx (and (symbol? x)
-                                              (some (fn [[i sym]] (when (= sym x) i))
-                                                    @(:param-placeholders ctx)))]
-                              (params/->ParamRef idx)
-                              x))
-                          ;; The spec is a TREE, not a pair of column
-                          ;; indices. `sum(v) * 2 + 1` nests one compound
-                          ;; expression inside another and a flat
-                          ;; {:l-idx :r-idx} cannot say that, so it indexed
-                          ;; the row with nil and threw. An operand is one of
-                          ;; three things: an aggregate (a column index), a
-                          ;; constant, or another expression.
-                          operand
-                          (fn operand [x]
-                            (cond
-                              (:compound-agg x) {:op    (:op x)
-                                                 :left  (operand (:left x))
-                                                 :right (operand (:right x))}
-                              (:aggregate x)    {:idx (add-agg! x)}
-                              :else             {:const (const-operand x)}))
-                          tree (operand v)]
+                ;; An aggregate may be nested ANYWHERE in this expression --
+                ;; `round(avg(x), 2)`, `coalesce(sum(x), 0)`, `max(a) - min(a)`.
+                ;; translate-expr hoists each one into a variable and
+                ;; registers it here; what comes back is an ordinary form
+                ;; over those variables, evaluated per GROUP after the query.
+                ;;
+                ;; This used to handle binary ARITHMETIC over aggregates only,
+                ;; with its own tree shape and its own four-operator
+                ;; evaluator. Anything else -- a function call, a cast, a
+                ;; CASE -- either raised (`round(avg(x),2)`: "No matching ctor
+                ;; found for class java.math.BigDecimal") or returned the
+                ;; internal aggregate MARKER MAP to the client as data
+                ;; (`coalesce(sum(n),0)` answered `{":fn": "sum", …}`).
+                (let [sink (atom [])
+                      before (count @(:where-clauses ctx))
+                      v (expr/translate-expr (assoc ctx :hoisted-aggs sink) expr)
+                      hoisted @sink]
+                  (if (seq hoisted)
+                    (let [all (vec @(:where-clauses ctx))
+                          [keep-cs form] (expr/split-aggregate-projection
+                                          v (subvec all before) (map :var hoisted))
+                          ;; The clauses ABOVE the aggregate line never
+                          ;; belonged to the query -- they reference a find
+                          ;; element rather than a binding, so datahike left
+                          ;; the projection variable unbound and the column
+                          ;; came back as the literal symbol `?v2`.
+                          _ (reset! (:where-clauses ctx)
+                                    (into (subvec all 0 before) keep-cs))
+                          slots (mapv (fn [{:keys [var fn-node]}]
+                                        [var (emit-agg! fn-node
+                                                        (str "__compound_" (count @find-elements)))])
+                                      hoisted)]
                       (swap! compound-exprs conj
                              ;; figure-colname, not the expression's text:
                              ;; PostgreSQL names a computed column
                              ;; `?column?`, and the raw text also leaked the
                              ;; `$1` the plan-cache rewrite left behind
-                             ;; (`sum(v)/$1`). The non-compound path below
-                             ;; already names columns this way.
-                             (assoc tree :alias (or alias-str (figure-colname expr)))))
+                             ;; (`sum(v)/$1`).
+                             {:alias (or alias-str (figure-colname expr))
+                              :form  form
+                              :slots slots}))
                     ;; Regular non-aggregate expression
                     (let [v (cond
                               (seq? v)            (ctx/materialize-arg! ctx v)
@@ -4314,46 +4195,6 @@
             (when (and (seq data-patterns) (seq other-clauses))
               (reset! (:where-clauses ctx) (into data-patterns other-clauses))))
 
-        ;; HAVING-only aggregates: if the HAVING expression references an
-        ;; aggregate that isn't already in the SELECT projection, the
-        ;; aggregate needs to be computed all the same — otherwise
-        ;; `match-aggregate-index` can't resolve it and the server's
-        ;; `apply-having` drops the predicate silently.
-        ;;
-        ;; Walk HAVING's JSqlParser tree, collect every Function whose
-        ;; name is an aggregate, and append each one to find-elements as
-        ;; a hidden column. Reuses the same translation shape as the
-        ;; SELECT-item aggregate branch (`(agg-sym ?inner-var)`), so
-        ;; downstream `match-aggregate-index` resolution and the
-        ;; server's HAVING post-filter work without further changes.
-        ;; The wire layer strips trailing :hidden-count columns from
-        ;; results, so HAVING-only aggregates never reach the client.
-        having-agg-elems (atom {})
-        having-agg-fns (when having-expr
-                         (let [found (atom [])
-                               walk (fn walk [^net.sf.jsqlparser.expression.Expression e]
-                                      (when e
-                                        (cond
-                                          (instance? Function e)
-                                          (let [^Function f e
-                                                fname (str/lower-case (.getName f))]
-                                            (when (fns/aggregate-function? fname)
-                                              (swap! found conj f)))
-                                          (instance? AndExpression e)
-                                          (do (walk (.getLeftExpression ^AndExpression e))
-                                              (walk (.getRightExpression ^AndExpression e)))
-                                          (instance? OrExpression e)
-                                          (do (walk (.getLeftExpression ^OrExpression e))
-                                              (walk (.getRightExpression ^OrExpression e)))
-                                          (instance? GreaterThan e)         (do (walk (.getLeftExpression ^GreaterThan e))         (walk (.getRightExpression ^GreaterThan e)))
-                                          (instance? GreaterThanEquals e)   (do (walk (.getLeftExpression ^GreaterThanEquals e))   (walk (.getRightExpression ^GreaterThanEquals e)))
-                                          (instance? MinorThan e)           (do (walk (.getLeftExpression ^MinorThan e))           (walk (.getRightExpression ^MinorThan e)))
-                                          (instance? MinorThanEquals e)     (do (walk (.getLeftExpression ^MinorThanEquals e))     (walk (.getRightExpression ^MinorThanEquals e)))
-                                          (instance? EqualsTo e)            (do (walk (.getLeftExpression ^EqualsTo e))            (walk (.getRightExpression ^EqualsTo e)))
-                                          (instance? NotEqualsTo e)         (do (walk (.getLeftExpression ^NotEqualsTo e))         (walk (.getRightExpression ^NotEqualsTo e)))
-                                          (instance? IsNullExpression e)    (walk (.getLeftExpression ^IsNullExpression e)))))]
-                           (walk having-expr)
-                           @found))
         ;; PostgreSQL rejects a select item that is neither aggregated
         ;; nor grouped (42803). Datalog has no such rule — it groups by
         ;; whatever non-aggregate :find elements it is given — so
@@ -4428,36 +4269,54 @@
                                        :sqlstate "42803"
                                        :column (clojure.core/name attr)}))))))))
 
-        ;; Append each HAVING-only aggregate as a hidden find element.
-        ;; `find-aliases` gets a sentinel "__having_agg_<i>" so its
-        ;; length keeps matching find-elements; the hidden-count below
-        ;; trims them from the visible projection.
-        having-hidden
-        (let [existing-agg-shapes
-              (into #{}
-                    (filter (fn [el] (and (seq? el) (symbol? (first el)))))
-                    @find-elements)]
-          (->> having-agg-fns
-               (keep (fn [f]
-                       (when-let [elem (translate-agg f)]
-                         ;; Remember which :find element this Function
-                         ;; resolved to, so the HAVING translation can match
-                         ;; it EXACTLY rather than by aggregate name -- see
-                         ;; match-aggregate-index.
-                         (swap! having-agg-elems assoc f elem)
-                         (when-not (contains? existing-agg-shapes elem)
-                           (reset! has-aggregates? true)
-                           (swap! find-elements conj elem)
-                           ;; Intentionally NOT extending find-aliases:
-                           ;; aliases track the visible projection. The
-                           ;; resulting (count find-elements) >
-                           ;; (count find-aliases) — the gap rides on
-                           ;; :hidden-count so the wire layer strips
-                           ;; these columns before emitting rows, and
-                           ;; describeResult / RowDescription stay
-                           ;; aligned with find-aliases.
-                           elem))))
-               count))
+        ;; HAVING is a predicate OVER aggregates, so it is translated
+        ;; exactly the way an expression over aggregates in the select
+        ;; list is: hoist each aggregate into a hidden `:find` element and
+        ;; keep a FORM over the variables bound to them, evaluated per
+        ;; group after the query.
+        ;;
+        ;; It used to be a SHAPE MATCHER -- `{:op :col-idx :value}`, built
+        ;; by an AST walker that knew AND/OR, the six comparisons and IS
+        ;; NULL, and required an aggregate on the left with a literal on
+        ;; the right. Everything else was silently DROPPED rather than
+        ;; refused, so `HAVING sum(n) + 1 > 11` returned EVERY group. The
+        ;; form carries whatever the predicate translator produces --
+        ;; arithmetic on either side, NOT, BETWEEN, IN, a CASE -- with the
+        ;; same three-valued logic WHERE uses.
+        ;;
+        ;; find-aliases tracks the VISIBLE projection, so the alias
+        ;; `emit-agg!` appends is dropped again and the column rides on
+        ;; `:hidden-count`, which is what strips it at the wire layer.
+        [having-spec having-hidden]
+        (if having-expr
+          (let [sink (atom [])
+                before (count @(:where-clauses ctx))
+                form (expr/translate-predicate-expr
+                      (assoc ctx :hoisted-aggs sink) having-expr)
+                all (vec @(:where-clauses ctx))
+                [keep-cs pform] (expr/split-aggregate-projection
+                                 form (subvec all before) (map :var @sink))
+                _ (reset! (:where-clauses ctx) (into (subvec all 0 before) keep-cs))
+                n-hidden (atom 0)
+                slots (mapv
+                       (fn [{:keys [var fn-node]}]
+                         (let [idx (emit-agg! fn-node nil)
+                               elem (nth @find-elements idx)
+                               ;; The same aggregate may already be
+                               ;; projected -- `SELECT sum(n) … HAVING
+                               ;; sum(n) > 1` -- in which case read that
+                               ;; column instead of computing it twice.
+                               prior (first (keep-indexed
+                                             (fn [i e] (when (and (< i idx) (= e elem)) i))
+                                             @find-elements))]
+                           (swap! find-aliases pop)
+                           (if prior
+                             (do (swap! find-elements pop) [var prior])
+                             (do (swap! n-hidden inc) [var idx]))))
+                       @sink)]
+            [{:form pform :slots slots} @n-hidden])
+          [nil 0])
+
         ;; GROUP BY keys that are not projected must still reach :find,
         ;; because Datalog derives grouping from the non-aggregate :find
         ;; elements — there is no separate grouping clause. Without this
@@ -4709,8 +4568,7 @@
              :right-tables (mapv #(get table-aliases (:alias %) (:name %)) join-infos))
       ;; Include HAVING as post-filter metadata
       having-expr
-      (assoc :having (translate-having-expr having-expr find-elems-vec @find-aliases
-                                            @having-agg-elems)))))
+      (assoc :having having-spec))))
 
 ;; ============================================================================
 ;; DML translation: INSERT, UPDATE, DELETE
