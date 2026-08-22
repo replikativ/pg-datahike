@@ -1606,12 +1606,9 @@
     ;; Add the function-call binding: [(?case-fn ?a ?b ...) ?result]
     (swap! (:where-clauses ctx) conj
            [(apply list fn-param param-vars) result-var])
-    ;; CASE resolves ONE type across its branches and coerces each to it.
+    ;; PostgreSQL gives ELSE the first (most significant) position when
+    ;; selecting CASE's common type.
     (coerce-to-common! ctx result-var
-                       ;; PostgreSQL gives ELSE the first (most significant)
-                       ;; position in select_common_type. This is observable
-                       ;; for bidirectionally coercible, non-preferred types
-                       ;; such as varchar and bpchar.
                        (concat (when else-expr [else-expr])
                                (mapv (fn [^WhenClause wc] (.getThenExpression wc))
                                      when-clauses))

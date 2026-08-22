@@ -114,6 +114,15 @@
              (col c 1 "SELECT pg_typeof(CASE WHEN true THEN v ELSE c END) FROM tr_chars")))
       (is (= ["character varying"]
              (col c 1 "SELECT pg_typeof(CASE WHEN true THEN c ELSE v END) FROM tr_chars"))))
+    (testing "a parameterized table-free CASE is not constant-folded at Parse"
+      (with-open [st (.prepareStatement
+                      c
+                      "SELECT CASE WHEN CAST(? AS numeric) IS NULL THEN 0 ELSE CAST(? AS numeric) END")]
+        (.setBigDecimal st 1 (bigdec 123))
+        (.setBigDecimal st 2 (bigdec 123))
+        (with-open [rs (.executeQuery st)]
+          (is (.next rs))
+          (is (= "123" (.getString rs 1))))))
     (testing "an untyped literal is UNKNOWN, not text"
       ;; `expr-oid` answers text for a quoted literal because that is
       ;; right for a projection; using it here would make every mixed
