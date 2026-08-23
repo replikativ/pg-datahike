@@ -464,22 +464,47 @@
 
 (defn- jsonb-null? [v] (or (nil? v) (= :__null__ v)))
 
+(declare contains-parsed?)
+
+(defn- contained-element?
+  "Whether one RHS array element/object value is represented by `candidate`.
+
+   Containers recurse only when their kinds match. A scalar lookup in an
+   array is deliberately top-level: PostgreSQL does not search nested arrays
+   for it."
+  [candidate required]
+  (cond
+    (and (map? candidate) (map? required))
+    (contains-parsed? candidate required)
+
+    (and (sequential? candidate) (sequential? required))
+    (contains-parsed? candidate required)
+
+    :else (= candidate required)))
+
 (defn- contains-parsed?
-  "Structural containment over already-parsed jsonb values."
+  "Structural containment over already-parsed jsonb values.
+
+   This follows PostgreSQL's `JsonbDeepContains`: object edges must line up,
+   each RHS array element may match any LHS element (duplicates therefore do
+   not matter), nested containers recurse, and an array may contain a raw
+   scalar while a raw scalar cannot contain an array."
   [l r]
   (cond
     (and (map? l) (map? r))
     (every? (fn [[k v]]
-              (let [lv (get l k ::missing)]
-                (if (and (map? lv) (map? v))
-                  (contains-parsed? lv v)
-                  (= lv v))))
+              (and (contains? l k)
+                   (contained-element? (get l k) v)))
             r)
 
-    (and (sequential? l) (sequential? r))
-    ;; Array containment: every element of r must be in l
-    (let [l-set (set l)]
-      (every? l-set r))
+    (sequential? l)
+    (if (sequential? r)
+      (every? (fn [required]
+                (boolean (some #(contained-element? % required) l)))
+              r)
+      ;; PostgreSQL represents a top-level scalar as a raw-scalar pseudo
+      ;; array. A real array may contain it, but matching stays at this level.
+      (boolean (some #(= % r) l)))
 
     :else (= l r)))
 
@@ -526,7 +551,7 @@
    string and `doc ?| array['a','b']` answered false for everything."
   [ks]
   (cond
-    (record? ks)     (or (:elements ks) [])
+    (pg-arr/array? ks) (pg-arr/flat-elements ks)
     (string? ks)     [ks]
     (sequential? ks) ks
     (nil? ks)        []
@@ -535,18 +560,20 @@
 (defn jsonb-exists-any?
   "PostgreSQL ?| operator: does any of the keys exist? NULL in, NULL out."
   [v keys]
-  (if (jsonb-null? v)
+  (if (or (jsonb-null? v) (jsonb-null? keys))
     :__null__
     (let [parsed (parse-jsonb v)]
-      (boolean (some #(true? (jsonb-exists? parsed %)) (->key-seq keys))))))
+      (boolean (some #(true? (jsonb-exists? parsed %))
+                     (remove nil? (->key-seq keys)))))))
 
 (defn jsonb-exists-all?
   "PostgreSQL ?& operator: do all keys exist? NULL in, NULL out."
   [v keys]
-  (if (jsonb-null? v)
+  (if (or (jsonb-null? v) (jsonb-null? keys))
     :__null__
     (let [parsed (parse-jsonb v)]
-      (every? #(true? (jsonb-exists? parsed %)) (->key-seq keys)))))
+      (every? #(true? (jsonb-exists? parsed %))
+              (remove nil? (->key-seq keys))))))
 
 ;; ============================================================================
 ;; Operators: modification
