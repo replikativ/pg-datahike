@@ -24,10 +24,17 @@
 
 (use-fixtures :each fixture)
 
+(defn- result [sql] (.execute *handler* sql))
+
 (defn- rows [sql]
-  (mapv vec (.-rows ^PgWireServer$QueryResult (.execute *handler* sql))))
+  (mapv vec (.-rows ^PgWireServer$QueryResult (result sql))))
 
 (defn- value [sql] (ffirst (rows sql)))
+
+(defn- state [sql]
+  (try
+    (.-sqlstate ^PgWireServer$QueryResult (result sql))
+    (catch Exception e (:sqlstate (ex-data e)))))
 
 (defn- contains-value [left right]
   (value (str "SELECT '" left "'::jsonb @> '" right "'::jsonb")))
@@ -69,3 +76,24 @@
            (rows "SELECT '{\"a\":1}'::jsonb ?| NULL::text[]")))
     (is (= [[nil]]
            (rows "SELECT '{\"a\":1}'::jsonb ?& NULL::text[]")))))
+
+(deftest named-predicate-functions
+  (testing "the pg_proc spellings share their implementations with operators"
+    (is (= "t" (value "SELECT jsonb_contains('{\"a\":1,\"b\":2}', '{\"a\":1}')")))
+    (is (= "t" (value "SELECT jsonb_contained('{\"a\":1}', '{\"a\":1,\"b\":2}')")))
+    (is (= "t" (value "SELECT jsonb_exists('{\"a\":null}', 'a')")))
+    (is (= "t" (value "SELECT jsonb_exists_any('{\"a\":null}', ARRAY['x','a'])")))
+    (is (= "f" (value "SELECT jsonb_exists_any('{\"a\":null}', ARRAY[]::text[])")))
+    (is (= "t" (value "SELECT jsonb_exists_all('{\"a\":null}', ARRAY[]::text[])"))))
+  (testing "the shared spec makes them strict, typed boolean, and arity checked"
+    (is (= [[nil]] (rows "SELECT jsonb_contains(NULL, '{\"a\":1}')")))
+    (is (= [16]
+           (vec (.-columnOids ^PgWireServer$QueryResult
+                              (result "SELECT jsonb_exists('{}', 'a')")))))
+    (is (= "42883" (state "SELECT jsonb_exists('{}')")))))
+
+(deftest named-predicate-in-update-expression
+  (result "CREATE TABLE predicate_update (id int PRIMARY KEY, doc jsonb, matched bool)")
+  (result "INSERT INTO predicate_update VALUES (1, '{\"a\":1}', false)")
+  (result "UPDATE predicate_update SET matched = jsonb_contains(doc, '{\"a\":1}') WHERE id = 1")
+  (is (= "t" (value "SELECT matched FROM predicate_update WHERE id = 1"))))

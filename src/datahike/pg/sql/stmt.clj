@@ -5623,7 +5623,9 @@
         ;; "invalid input syntax for numeric".
         (if-let [impl (get fns/sql-fn->clj-fn fname)]
           (let [vs (mapv #(eval-update-expr % entity-map ns-str schema) args)
-                wrapped (if (contains? fns/non-strict-fns fname)
+                spec (get fns/sql-function-specs fname)
+                wrapped (if (or (contains? fns/non-strict-fns fname)
+                                (= false (:strict? spec)))
                           impl
                           (fns/null-safe impl))
                 r (apply wrapped vs)]

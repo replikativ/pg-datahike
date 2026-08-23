@@ -1133,7 +1133,9 @@
             _ (fns/check-arity! fname (count args))
             clj-fn (get fns/sql-fn->clj-fn fname)
             ;; Strictness is the rule, not a law -- see fns/non-strict-fns.
-            wrapped (if (contains? fns/non-strict-fns fname)
+            spec (get fns/sql-function-specs fname)
+            wrapped (if (or (contains? fns/non-strict-fns fname)
+                            (= false (:strict? spec)))
                       clj-fn
                       (fns/null-safe clj-fn))
             fn-param (symbol (str "?fn-" fname "-"
