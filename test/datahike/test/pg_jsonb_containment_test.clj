@@ -89,7 +89,7 @@
     (is (= [[nil]] (rows "SELECT jsonb_contains(NULL, '{\"a\":1}')")))
     (is (= [16]
            (vec (.-columnOids ^PgWireServer$QueryResult
-                              (result "SELECT jsonb_exists('{}', 'a')")))))
+                 (result "SELECT jsonb_exists('{}', 'a')")))))
     (is (= "42883" (state "SELECT jsonb_exists('{}')")))))
 
 (deftest named-predicate-in-update-expression
