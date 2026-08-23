@@ -273,6 +273,10 @@
   (testing "the text[] operand remains an expression and is evaluated"
     (is (= "20" (v "SELECT d #> ARRAY['a','b','1'] FROM pj")))
     (is (= "20" (v "SELECT d #>> ARRAY['a',chr(98),'1'] FROM pj")))
+    (is (= "20" (v "SELECT d#>ARRAY['a','b','1'] FROM pj"))
+        "PostgreSQL permits no whitespace around #>")
+    (is (= "20" (v "SELECT d#>>ARRAY['a','b','1'] FROM pj"))
+        "and the same lexical boundary is required for #>>")
     (is (= "{\"a\": {\"b\": [10, 20]}, \"z\": 1}"
            (v "SELECT d #> ARRAY[]::text[] FROM pj"))))
   (testing "a missing path is SQL NULL, not a dropped row"
@@ -331,6 +335,12 @@
   (testing "json_object_agg keeps insertion order and pads its braces,
             which is PostgreSQL's own punctuation for that function"
     (is (= "{ \"b\" : 1, \"a\" : 2, \"c\" : 3 }" (v "SELECT json_object_agg(k,v) FROM oa")))))
+
+(deftest table-free-object-aggregate
+  (testing "a constant two-argument aggregate has one synthetic input row,
+            not an unbound table entity"
+    (is (= "{\"1\": null}"
+           (v "SELECT jsonb_object_agg(1, NULL::jsonb)")))))
 
 (deftest arrow-returns-a-json-value
   (run "CREATE TABLE ar (id int PRIMARY KEY, d jsonb)")

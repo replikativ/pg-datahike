@@ -510,7 +510,8 @@
                (catch Exception _ nil))
         first-arg (first args)
         rule (or (get sql-aggregate->return-oid fname)
-                 (get sql-fn->return-oid fname))]
+                 (get sql-fn->return-oid fname)
+                 (get-in fns/sql-function-specs [fname :return-oid]))]
     (cond
       ;; ROW(...) — anonymous composite constructor → record OID (2249).
       ;; A ::type cast wrapping it overrides via cast-oid.

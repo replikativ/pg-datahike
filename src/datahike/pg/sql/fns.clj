@@ -39,6 +39,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.jsonb :as jb]
             [datahike.pg.types :as types]
             [datahike.pg.prng]))
 
@@ -740,7 +741,14 @@
   (let [ps (remove (fn [p] (let [k (first p)] (or (nil? k) (= :__null__ k)))) pairs)]
     (if (empty? ps)
       :__null__
-      (into {} (map (fn [p] [(str (first p)) (second p)])) ps))))
+      (into {}
+            (map (fn [p]
+                   [(str (first p))
+                    (let [v (second p)]
+                      (if (or (nil? v) (= :__null__ v))
+                        :datahike.pg.jsonb/json-null
+                        v))]))
+            ps))))
 
 (defn filter-string-agg
   "SQL `string_agg(expr, delimiter)` — ONE string over the whole group.
@@ -2851,12 +2859,25 @@
   (fn [x & more]
     (if (types/numeric-special? x) :__null__ (apply f x more))))
 
-(def sql-fn->clj-fn
-  "Map of SQL function names (lowercased) to Clojure fn values.
+(def sql-function-specs
+  "Function metadata shared by lowering, UPDATE evaluation, arity checking,
+   and result-OID inference.
 
-   Values are actual `IFn` objects (not symbols) so we can wrap them in
-   `null-safe` at emit time. Java static methods are wrapped in thin fns
-   so they're callable through the same path."
+   New functions should start here. The older execution/arity/OID tables are
+   incrementally derived from this registry as their entries migrate, avoiding
+   another bespoke lowering branch for each PostgreSQL function family."
+  {"jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "jsonb_exists"     {:impl jb/jsonb-exists?     :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "jsonb_exists_any" {:impl jb/jsonb-exists-any? :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "jsonb_exists_all" {:impl jb/jsonb-exists-all? :arities #{2}
+                       :strict? true :return-oid types/oid-bool}})
+
+(def ^:private legacy-sql-fn->clj-fn
   {"upper"    str/upper-case
    "lower"    str/lower-case
    ;; NOT bare `count`: a PgBit is a defrecord, so `count` returns its
@@ -3064,6 +3085,15 @@
    ;; MEETS is the standard alias for IMMEDIATELY_PRECEDES (A.end == B.start)
    "meets"                  (fn [_af at bf _bt] (= at bf))})
 
+(def sql-fn->clj-fn
+  "Map of SQL function names (lowercased) to Clojure fn values.
+
+   Values are actual `IFn` objects (not symbols) so we can wrap them in
+   `null-safe` at emit time. Java static methods are wrapped in thin fns
+   so they're callable through the same path."
+  (merge legacy-sql-fn->clj-fn
+         (update-vals sql-function-specs :impl)))
+
 ;; ---------------------------------------------------------------------------
 ;; Declared arities
 ;;
@@ -3080,8 +3110,7 @@
 ;; catalog stubs and the variadic string helpers), so this can be filled
 ;; in incrementally without breaking anything.
 
-(def sql-fn-arities
-  "SQL function name → set of accepted argument counts. Absent = unchecked."
+(def ^:private legacy-sql-fn-arities
   {"pi"       #{0}
    "abs"      #{1} "sign"    #{1} "sqrt"  #{1} "cbrt"  #{1}
    "exp"      #{1} "ln"      #{1} "log10" #{1}
@@ -3115,6 +3144,11 @@
    "quote_ident" #{1} "quote_literal" #{1} "quote_nullable" #{1}
    "repeat"   #{2}
    "lpad"     #{2 3} "rpad" #{2 3}})
+
+(def sql-fn-arities
+  "SQL function name → set of accepted argument counts. Absent = unchecked."
+  (merge legacy-sql-fn-arities
+         (update-vals sql-function-specs :arities)))
 
 (defn check-arity!
   "Raise 42883 when `argc` is not an accepted arity for `fname`. No-op

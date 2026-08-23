@@ -2876,7 +2876,15 @@
                                 ;; the sort key and the value.
                           order-els (when (= agg-sym 'datahike.pg.sql/filter-string-agg)
                                       (seq (.getOrderByElements f)))]
-                      (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+                      ;; Preserve duplicate input rows when a relation drives
+                      ;; the aggregate. A table-free aggregate has exactly one
+                      ;; synthetic input row and no entity variable to bind;
+                      ;; minting `?_eid` here made the final Datalog query fail
+                      ;; with "Query for unknown vars" instead of aggregating
+                      ;; its constant arguments.
+                      (when default-table
+                        (swap! (:with-vars ctx) conj
+                               (ctx/entity-var! ctx default-table)))
                       (if order-els
                         (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
                                                (let [kv (expr/translate-expr ctx (.getExpression o))]
@@ -5623,7 +5631,9 @@
         ;; "invalid input syntax for numeric".
         (if-let [impl (get fns/sql-fn->clj-fn fname)]
           (let [vs (mapv #(eval-update-expr % entity-map ns-str schema) args)
-                wrapped (if (contains? fns/non-strict-fns fname)
+                spec (get fns/sql-function-specs fname)
+                wrapped (if (or (contains? fns/non-strict-fns fname)
+                                (= false (:strict? spec)))
                           impl
                           (fns/null-safe impl))
                 r (apply wrapped vs)]
