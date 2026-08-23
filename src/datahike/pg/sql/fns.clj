@@ -741,7 +741,14 @@
   (let [ps (remove (fn [p] (let [k (first p)] (or (nil? k) (= :__null__ k)))) pairs)]
     (if (empty? ps)
       :__null__
-      (into {} (map (fn [p] [(str (first p)) (second p)])) ps))))
+      (into {}
+            (map (fn [p]
+                   [(str (first p))
+                    (let [v (second p)]
+                      (if (or (nil? v) (= :__null__ v))
+                        :datahike.pg.jsonb/json-null
+                        v))]))
+            ps))))
 
 (defn filter-string-agg
   "SQL `string_agg(expr, delimiter)` — ONE string over the whole group.

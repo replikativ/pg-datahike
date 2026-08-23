@@ -822,6 +822,21 @@
 
                 :else (recur (inc i) acc)))))))))
 
+(defn json-path-operator-spacing-rule
+  "Put a lexical boundary around PostgreSQL's `#>` and `#>>` operators.
+
+   JSqlParser parses the spaced forms as JsonExpression, but reads a tight
+   `value::jsonb#>array[...]` as the ordinary `>` comparison between a cast
+   whose type name absorbed `#` and the array. PostgreSQL's regression SQL
+   uses that whitespace-free spelling. The tokenizer already recognizes the
+   complete operator and excludes strings/comments, so this rewrite is both
+   narrow and representation-independent."
+  [toks]
+  (keep (fn [{:keys [type text pos end]}]
+          (when (and (= :op type) (#{"#>" "#>>"} text))
+            [pos end (str " " text " ")]))
+        toks))
+
 ;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
@@ -846,4 +861,5 @@
    reserved-column-name-rule
    boolean-is-rule
    default-fn-call-paren-rule
+   json-path-operator-spacing-rule
    partition-by-rule])
