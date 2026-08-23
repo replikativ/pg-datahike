@@ -1269,9 +1269,16 @@
       (let [target (first args)
             path (rest args)
             fn-param (symbol (str "?jsonb-path" (swap! (:var-counter ctx) inc)))
-            result-var (ctx/fresh-var! ctx)]
+            result-var (ctx/fresh-var! ctx)
+            json-family? (= fname "json_extract_path")]
         (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj jb/jsonb-get-path)
+        (swap! (:in-args ctx) conj
+               (fn [value steps]
+                 (let [result (jb/jsonb-get-path value steps)]
+                   (if (= :__null__ result)
+                     :__null__
+                     ((if json-family? jb/serialize-json jb/serialize-jsonb)
+                      result)))))
         (swap! (:where-clauses ctx) conj [(list fn-param target (vec path)) result-var])
         result-var)
 
@@ -2798,7 +2805,7 @@
             (if (seq? r) (ctx/materialize-arg! ctx r) r)))))
 
 (defn flatten-json-chain
-  "Flatten a JsonExpression into {:base Expression :chain [[key op-str] ...]} pairs.
+  "Flatten a JsonExpression into {:base Expression :chain [[key-expr op-str] ...]} pairs.
    JSqlParser encodes chained access recursively: data->'a'->>'b' is
    JsonExpression(base=data, idents=[JsonExpression(base='a', idents=['b'], ops=[->>])], ops=[->])
    We flatten to {:base data-Column, :chain [['a' '->'] ['b' '->>']]}.
@@ -2816,21 +2823,15 @@
       ;; → step (-> base 'a') then flatten inner with base replaced by result
       (let [inner ^JsonExpression (first idents)
             inner-base (.getExpression inner)
-            outer-key (cond
-                        (instance? StringValue inner-base) (string-value-text ^StringValue inner-base)
-                        (instance? LongValue inner-base)   (.getValue ^LongValue inner-base)
-                        :else (str inner-base))
             outer-op (first ops)
             ;; Recurse: treat the inner JsonExpression as if its base were already resolved
             inner-chain (:chain (flatten-json-chain inner))]
-        {:base base :chain (into [[outer-key outer-op]] inner-chain)})
-      ;; Simple: single step — ident is a literal key or index
-      (let [ident (first idents)
-            key-val (cond
-                      (instance? StringValue ident) (string-value-text ^StringValue ident)
-                      (instance? LongValue ident)   (.getValue ^LongValue ident)
-                      :else (str ident))]
-        {:base base :chain [[key-val (first ops)]]}))))
+        {:base base :chain (into [[inner-base outer-op]] inner-chain)})
+      ;; Keep the AST node. The RHS of #>/#>> is an arbitrary text[]
+      ;; expression (ARRAY constructors, casts, parameters, function calls),
+      ;; not merely a string literal. Stringifying it here destroyed the
+      ;; expression before either SELECT or UPDATE could evaluate it.
+      {:base base :chain [[(first idents) (first ops)]]})))
 
 (defn- whole-row-ref-alias
   "The table alias a bare identifier denotes as a PostgreSQL WHOLE-ROW
@@ -3586,8 +3587,12 @@
           ;; `d->'a'->>'b'` is unaffected.
           value-op? (contains? #{"->" "#>"} (second (last chain)))]
       (cond-> (reduce
-               (fn [current [key-val op-str]]
-                 (let [op-fn  (jb/op op-str)
+               (fn [current [key-expr op-str]]
+                 (let [translated-key (translate-expr ctx key-expr)
+                       key-val (if (seq? translated-key)
+                                 (ctx/materialize-arg! ctx translated-key)
+                                 translated-key)
+                       op-fn  (jb/op op-str)
                        param  (symbol (str "?json-op" (swap! (:var-counter ctx) inc)))
                        result (ctx/fresh-var! ctx)]
                    (swap! (:in-params ctx) conj param)

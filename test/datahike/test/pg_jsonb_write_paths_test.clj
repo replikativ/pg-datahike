@@ -270,10 +270,38 @@
     (is (= "20" (v "SELECT d #> '{a,b,1}' FROM pj")))
     (is (= "20" (v "SELECT d #>> '{a,b,1}' FROM pj")))
     (is (= "{\"b\": [10, 20]}" (v "SELECT d #> '{a}' FROM pj"))))
+  (testing "the text[] operand remains an expression and is evaluated"
+    (is (= "20" (v "SELECT d #> ARRAY['a','b','1'] FROM pj")))
+    (is (= "20" (v "SELECT d #>> ARRAY['a',chr(98),'1'] FROM pj")))
+    (is (= "{\"a\": {\"b\": [10, 20]}, \"z\": 1}"
+           (v "SELECT d #> ARRAY[]::text[] FROM pj"))))
   (testing "a missing path is SQL NULL, not a dropped row"
     (is (= [[nil]] (rows "SELECT d #> '{nope}' FROM pj"))))
+  (testing "a NULL text[] element makes the result SQL NULL; it is not the
+            empty-string object key"
+    (is (= [[nil]]
+           (rows "SELECT '{\"\":1}'::jsonb #> ARRAY[NULL]"))))
+  (testing "array-text quoting is parsed rather than split on commas"
+    (is (= "1"
+           (v "SELECT '{\"a,b\":1}'::jsonb #> '{\"a,b\"}'")))
+    (is (= [[nil]]
+           (rows "SELECT '{\"NULL\":2}'::jsonb #> '{NULL}'")))
+    (is (= "2"
+           (v "SELECT '{\"NULL\":2}'::jsonb #> '{\"NULL\"}'"))))
+  (testing "the named JSON-valued extractor quotes a string result while its
+            text sibling does not"
+    (is (= "\"stringy\""
+           (v "SELECT jsonb_extract_path('{\"f4\":{\"f6\":\"stringy\"}}'::jsonb, 'f4', 'f6')")))
+    (is (= "stringy"
+           (v "SELECT jsonb_extract_path_text('{\"f4\":{\"f6\":\"stringy\"}}'::jsonb, 'f4', 'f6')"))))
   (testing "bare # is still PostgreSQL's XOR and still unsupported"
     (is (= "42601" (state "SELECT 42#")))))
+
+(deftest path-expression-in-update
+  (run "CREATE TABLE pju (id int PRIMARY KEY, src jsonb, dst jsonb)")
+  (run "INSERT INTO pju VALUES (1, '{\"a\":{\"b\":[10,20]}}', '{}')")
+  (run "UPDATE pju SET dst = src #> ARRAY['a','b','1'] WHERE id = 1")
+  (is (= "20" (v "SELECT dst FROM pju WHERE id = 1"))))
 
 (deftest json-has-no-comparison-or-containment-operators
   (testing "PostgreSQL gives `json` exactly six operators — ->, ->>, #>,
