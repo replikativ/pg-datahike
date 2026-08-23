@@ -5545,8 +5545,9 @@
     (let [{:keys [base chain]} (expr/flatten-json-chain ^JsonExpression value-expr)
           base-val (eval-update-expr base entity-map ns-str schema)]
       (reduce
-       (fn [current [key-val op-str]]
-         (let [r ((jb/op op-str) current key-val)]
+       (fn [current [key-expr op-str]]
+         (let [key-val (eval-update-expr key-expr entity-map ns-str schema)
+               r ((jb/op op-str) current key-val)]
            ;; `->` is serialised here and NOT in the SELECT emitter. That
            ;; divergence predates the shared registry; it is preserved
            ;; deliberately so this refactor stays behaviour-preserving,
@@ -7527,4 +7528,3 @@
               cur
               (recur (d/db-with cur (mk-data-tx novel)) (into seen novel) (inc i)))))))
     (catch Throwable _ db)))
-

@@ -393,31 +393,33 @@
    an array by position through the same path."
   [path]
   (cond
-    (record? path)     (mapv str (or (:elements path) []))
-    (sequential? path) (mapv str path)
+    (pg-arr/array? path) (mapv #(when (some? %) (str %))
+                               (pg-arr/flat-elements path))
+    (sequential? path)  (mapv #(when (some? %) (str %)) path)
     (string? path)     (let [t (str/trim path)]
                          (if (and (str/starts-with? t "{") (str/ends-with? t "}"))
-                           (let [inner (subs t 1 (dec (count t)))]
-                             (if (str/blank? inner)
-                               []
-                               (mapv str/trim (str/split inner #","))))
+                           (mapv #(when (some? %) (str %))
+                                 (pg-arr/flat-elements
+                                  (pg-arr/from-pg-text t :text)))
                            [t]))
-    (nil? path)        []
+    (nil? path)        nil
     :else              [path]))
 
 (defn jsonb-get-path
   "PostgreSQL #> operator: extract jsonb at path."
   [v path]
   (let [steps (->path-seq path)]
-    (reduce (fn [acc k]
-              (if (= acc :__null__)
-                :__null__
-                ;; A numeric step indexes an array; jsonb-get dispatches
-                ;; on the step's type, so hand it a long when it is one.
-                (jsonb-get acc (if (re-matches #"-?\d+" (str k))
-                                 (parse-long (str k))
-                                 k))))
-            (parse-jsonb v) steps)))
+    (if (or (nil? steps) (some nil? steps))
+      :__null__
+      (reduce (fn [acc k]
+                (if (= acc :__null__)
+                  :__null__
+                  ;; A numeric step indexes an array; jsonb-get dispatches
+                  ;; on the step's type, so hand it a long when it is one.
+                  (jsonb-get acc (if (re-matches #"-?\d+" (str k))
+                                   (parse-long (str k))
+                                   k))))
+              (parse-jsonb v) steps))))
 
 (defn jsonb-get-path-text
   "PostgreSQL #>> operator: extract text at path.
