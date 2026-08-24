@@ -1225,6 +1225,75 @@
 (def sql-- (null-safe (special-aware (long-overflow->pg (float-checked - false)) -)))
 (def sql-* (null-safe (special-aware (long-overflow->pg (float-checked * true)) *)))
 
+(declare throw-division-by-zero)
+
+;; PostgreSQL money is an int64 count of cents. Datahike carries the SQL
+;; value as a scale-2 BigDecimal, so arithmetic must explicitly return to
+;; cents or the carrier silently becomes unbounded numeric.
+(defn- money-out-of-range []
+  (throw (errors/pg-error :numeric-value-out-of-range
+                          {:message "money out of range"})))
+
+(defn- money->cents ^long [v]
+  (try
+    (.longValueExact (.movePointRight ^java.math.BigDecimal (bigdec v) 2))
+    (catch ArithmeticException _ (money-out-of-range))))
+
+(defn- cents->money ^java.math.BigDecimal [^long cents]
+  (java.math.BigDecimal/valueOf cents 2))
+
+(def sql-money+
+  (null-safe
+   (fn [a b]
+     (try (cents->money (Math/addExact (money->cents a) (money->cents b)))
+          (catch ArithmeticException _ (money-out-of-range))))))
+
+(def sql-money-
+  (null-safe
+   (fn [a b]
+     (try (cents->money (Math/subtractExact (money->cents a) (money->cents b)))
+          (catch ArithmeticException _ (money-out-of-range))))))
+
+(defn- checked-money-float-cents ^long [^double result]
+  ;; FLOAT8_FITS_IN_INT64 uses an exclusive 2^63 upper bound. Long/MAX_VALUE
+  ;; itself rounds to 2^63 as a double, so comparing against (double MAX)
+  ;; would incorrectly accept it and Java's narrowing conversion would clamp.
+  (let [two63 (Math/scalb (double 1.0) (int 63))]
+    (if (or (Double/isNaN result) (Double/isInfinite result)
+            (>= result two63) (< result (- two63)))
+      (money-out-of-range)
+      (long result))))
+
+(def sql-money*
+  (null-safe
+   (fn [a b]
+     (let [[money factor] (if (decimal? a) [a b] [b a])
+           cents (money->cents money)]
+       (if (integer? factor)
+         (try (cents->money (Math/multiplyExact cents (long factor)))
+              (catch ArithmeticException _ (money-out-of-range)))
+         (cents->money
+          (checked-money-float-cents
+           (Math/rint (* (double cents) (double factor))))))))))
+
+(def sql-money-div
+  (null-safe
+   (fn [money divisor]
+     (let [cents (money->cents money)]
+       (cond
+         (and (number? divisor) (zero? divisor)) (throw-division-by-zero)
+         (integer? divisor) (cents->money (quot cents (long divisor)))
+         :else (cents->money
+                (checked-money-float-cents
+                 (Math/rint (/ (double cents) (double divisor))))))))))
+
+(def sql-money-div-money
+  (null-safe
+   (fn [a b]
+     (let [divisor (money->cents b)]
+       (when (zero? divisor) (throw-division-by-zero))
+       (/ (double (money->cents a)) (double divisor))))))
+
 ;; ---------------------------------------------------------------------------
 ;; date arithmetic
 ;;

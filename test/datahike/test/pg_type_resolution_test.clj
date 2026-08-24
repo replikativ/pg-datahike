@@ -196,6 +196,40 @@
         (.executeUpdate ps))
       (is (= [expected] (col c 1 "SELECT m FROM money_input")) input))))
 
+(deftest postgres-money-arithmetic-slice
+  ;; PostgreSQL 17 src/test/regress/sql/money.sql lines 108-118 and 139-148.
+  (with-open [c (jdbc)]
+    (with-open [st (.createStatement c)
+                rs (.executeQuery st (str "SELECT '1'::money + '2'::money, "
+                                          "'1'::money / '2'::money"))]
+      (is (.next rs))
+      (is (= "money" (.getColumnTypeName (.getMetaData rs) 1)))
+      (is (= "float8" (.getColumnTypeName (.getMetaData rs) 2)))
+      (is (= "3.00" (.getString rs 1)))
+      (is (= "0.5" (.getString rs 2))))
+    (doseq [[sql expected] [["SELECT '878.08'::money / 11::float8" "79.83"]
+                            ["SELECT '878.08'::money / 11::float4" "79.83"]
+                            ["SELECT '878.08'::money / 11::bigint" "79.82"]
+                            ["SELECT '878.08'::money / 11::int" "79.82"]
+                            ["SELECT '878.08'::money / 11::smallint" "79.82"]
+                            ["SELECT '90000000000000099.00'::money / 10::bigint"
+                             "9000000000000009.90"]]]
+      (is (= [expected] (col c 1 sql)) sql))
+    (doseq [sql ["SELECT '92233720368547758.07'::money + '0.01'::money"
+                 "SELECT '-92233720368547758.08'::money - '0.01'::money"
+                 "SELECT '92233720368547758.07'::money * 2::float8"
+                 "SELECT '-1'::money / 1.175494e-38::float4"
+                 "SELECT '92233720368547758.07'::money * 2::int4"
+                 "SELECT '42'::money * 'inf'::float8"
+                 "SELECT '42'::money * '-inf'::float8"
+                 "SELECT '42'::money * 'nan'::float4"]]
+      (let [e (try (col c 1 sql) nil (catch java.sql.SQLException e e))]
+        (is (= "22003" (.getSQLState e)) sql)
+        (is (= "ERROR: money out of range" (.getMessage e)) sql)))
+    (let [sql "SELECT '1'::money / 0::int2"
+          e (try (col c 1 sql) nil (catch java.sql.SQLException e e))]
+      (is (= "22012" (.getSQLState e)) sql))))
+
 (deftest operator-resolution
   (with-open [c (jdbc)]
     (seed! c)

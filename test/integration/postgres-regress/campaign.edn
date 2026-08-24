@@ -27,7 +27,15 @@
       {:id :assignment-input
        :source-lines [53 73]
        :gate "test/datahike/test/pg_type_resolution_test.clj"
-       :test-var "postgres-money-assignment-slice"}]}
+       :test-var "postgres-money-assignment-slice"}
+      {:id :division-rounding
+       :source-lines [108 118]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-arithmetic-slice"}
+      {:id :arithmetic-overflow
+       :source-lines [139 148]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-arithmetic-slice"}]}
     {:name "arrays" :mode :discovery
      :boundaries #{:array-codec :array-expressions :polymorphism}
      :blockers #{:postgres-vector-types :create-function}}

@@ -2892,6 +2892,30 @@
         (when-let [target (numeric-target-for-oid (source-oid ctx typed-expr))]
           (coerce/coerce-numeric (string-value-text unknown-expr) target)))))
 
+(defn- money-arith-op
+  "Select PostgreSQL's fixed-width money operator from operand OIDs.
+   BigDecimal alone cannot make this decision because numeric uses the
+   same Datahike carrier."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
+  (let [left (.getLeftExpression expr)
+        right (.getRightExpression expr)
+        l0 (source-oid ctx left)
+        r0 (source-oid ctx right)
+        l (if (instance? StringValue left) r0 l0)
+        r (if (instance? StringValue right) l0 r0)
+        money? #(= types/oid-money %)
+        factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
+                              types/oid-float4 types/oid-float8} %)]
+    (cond
+      (and (= op-sym '+) (money? l) (money? r)) 'datahike.pg.sql/sql-money+
+      (and (= op-sym '-) (money? l) (money? r)) 'datahike.pg.sql/sql-money-
+      (and (= op-sym '*)
+           (or (and (money? l) (factor? r))
+               (and (factor? l) (money? r)))) 'datahike.pg.sql/sql-money*
+      (and (= op-sym '/) (money? l) (money? r)) 'datahike.pg.sql/sql-money-div-money
+      (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.sql/sql-money-div
+      :else nil)))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -2949,7 +2973,8 @@
       (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
             rv (if (seq? r) (ctx/materialize-arg! ctx r) r)
             int-op (int-arith-op ctx expr op-sym)
-            emit-op (or (date-arith-op ctx expr op-sym)
+            emit-op (or (money-arith-op ctx expr op-sym)
+                        (date-arith-op ctx expr op-sym)
                         (first int-op)
                         (float4-arith-op ctx expr op-sym)
                         (get arith-op->null-safe op-sym op-sym))

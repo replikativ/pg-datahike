@@ -275,6 +275,11 @@
 (def sql-date- fns/sql-date-)
 (def sql-*   fns/sql-*)
 (def sql-div fns/sql-div)
+(def sql-money+ fns/sql-money+)
+(def sql-money- fns/sql-money-)
+(def sql-money* fns/sql-money*)
+(def sql-money-div fns/sql-money-div)
+(def sql-money-div-money fns/sql-money-div-money)
 (def sql-mod fns/sql-mod)
 
 ;; Bitwise operators. Re-exported here because the translator emits

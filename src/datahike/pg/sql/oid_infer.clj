@@ -441,8 +441,13 @@
         l (if (instance? StringValue left) r0 l0)
         r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
+        money?   #(= % types/oid-money)
+        money-factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
+                                    types/oid-float4 types/oid-float8} %)
         plus?    (instance? Addition e)
-        minus?   (instance? Subtraction e)]
+        minus?   (instance? Subtraction e)
+        multiply? (instance? Multiplication e)
+        divide?  (instance? Division e)]
     (cond
       ;; PostgreSQL's date operators do not follow numeric promotion:
       ;; `date - date` is an integer count of days and `date +/- integer`
@@ -454,6 +459,15 @@
       ;; for why the other one is not inspected.
       (and (or plus? minus?) (date? l))    types/oid-date
       (and plus? (date? r))                types/oid-date
+      ;; money is a closed operator family, not ordinary numeric
+      ;; promotion. Its Datahike carrier is BigDecimal, but +, -, *, and
+      ;; scalar / retain money while money / money returns float8.
+      (and divide? (money? l) (money? r)) types/oid-float8
+      (and (or plus? minus?) (money? l) (money? r)) types/oid-money
+      (and multiply?
+           (or (and (money? l) (money-factor? r))
+               (and (money-factor? l) (money? r)))) types/oid-money
+      (and divide? (money? l) (money-factor? r)) types/oid-money
       :else (promoted-numeric l r))))
 
 (defn resolve-aggregate-result-oid
