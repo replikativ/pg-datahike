@@ -70,6 +70,10 @@
        :source-lines [1284 1287]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
        :test-var "finite-power-range-boundaries"}
+      {:id :sqrt-rounding-thresholds
+       :source-lines [1271 1278]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "square-root-rounding-thresholds"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"

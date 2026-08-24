@@ -2750,9 +2750,11 @@
   (when (neg? (.signum a))
     (throw (errors/pg-error :invalid-argument-for-power-function
                             {:message "cannot take square root of a negative number"})))
-  (let [rs (sqrt-rscale a)]
-    (.setScale (.sqrt a (java.math.MathContext. (int (+ rs 20))))
-               (int rs) java.math.RoundingMode/HALF_UP)))
+  ;; Result scale is independent of working precision. Using rs+20 as a
+  ;; MathContext precision loses guard digits when the result has a large
+  ;; integer part; bd-sqrt accounts for the input precision before applying
+  ;; PostgreSQL's final HALF_UP rounding at rs.
+  (bd-sqrt a (sqrt-rscale a)))
 
 (defn- numeric-exp ^java.math.BigDecimal [^java.math.BigDecimal a]
   (let [rs (exp-rscale a)]
