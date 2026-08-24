@@ -2125,11 +2125,11 @@
    syntax error PostgreSQL raises (issue #29). Catching it lexically
    also keeps a future `#` operator honest: the check is over `:op`
    tokens, so it disappears the moment one is implemented."
-  #{\# \$})
+  #{\$})
 
 (defn- unsupported-operator-error
-  "An `{:type :error}` map when `sql` uses an operator character we do
-   not implement, else nil.
+  "An `{:type :error}` map when `sql` uses unsupported or malformed
+   operator syntax, else nil.
 
    The tokeniser already excludes string literals, dollar-quoted
    strings, quoted identifiers and comments, and classifies `$N` as
@@ -2137,22 +2137,62 @@
    a substring test first: tokenising every statement would put a scan
    on the hot path for a case that essentially never fires."
   [^String sql]
-  (when (or (<= 0 (.indexOf sql "#")) (<= 0 (.indexOf sql "$")))
-    (when-let [bad (first (filter (fn [{:keys [type text]}]
-                                    (and (= :op type)
-                                         (some unsupported-op-chars text)
-                                         ;; `#>` and `#>>` ARE implemented —
-                                         ;; they parse as JsonExpression, the
-                                         ;; same node `->`/`->>` produce, and
-                                         ;; are in jb/op. Only bare `#` (PG's
-                                         ;; XOR) and `#-` remain unsupported,
-                                         ;; so the check narrows to the exact
-                                         ;; tokens rather than the character.
-                                         (not (contains? #{"#>" "#>>"} text))))
-                                  (cls/tokenize-all sql)))]
-      {:type :error
-       :sqlstate "42601"
-       :message (str "syntax error at or near \"" (:text bad) "\"")})))
+  (when (or (<= 0 (.indexOf sql "#"))
+            (<= 0 (.indexOf sql "$"))
+            (re-find #"(?i)\bxor\b" sql))
+    (let [tokens (vec (remove #(= :comment (:type %)) (cls/tokenize-all sql)))
+          clause-keywords #{"select" "from" "where" "group" "order" "having"
+                            "limit" "offset" "join" "on" "as" "when" "then"
+                            "else" "end" "and" "or" "not" "in" "is" "by"}
+          raw-xor-infix? (fn [idx]
+                           (let [prev (nth tokens (dec idx) nil)
+                                 next (nth tokens (inc idx) nil)
+                                 keyword? #(and (= :ident (:type %))
+                                                (contains? clause-keywords
+                                                           (str/lower-case (:text %))))]
+                             (and prev next
+                                  (not (keyword? prev))
+                                  (not (keyword? next))
+                                  (not (and (= :punct (:type prev))
+                                            (contains? #{"(" "[" "{" "," ";"}
+                                                       (:text prev))))
+                                  (not (and (= :punct (:type next))
+                                            (contains? #{")" "]" "}" "," ";"}
+                                                       (:text next)))))))
+          xor-infix? (fn [idx]
+                       (let [prev (nth tokens (dec idx) nil)
+                             next (nth tokens (inc idx) nil)]
+                         (and prev next
+                              (not (and (= :punct (:type prev))
+                                        (contains? #{"(" "[" "{" "," ";"}
+                                                   (:text prev))))
+                              (not (= :op (:type prev)))
+                              (not (and (= :punct (:type next))
+                                        (contains? #{")" "]" "}" "," ";"}
+                                                   (:text next))))
+                              ;; Unary signs are valid starts; another # or
+                              ;; a binary operator is not.
+                              (not (and (= :op (:type next))
+                                        (not (contains? #{"+" "-" "~"}
+                                                        (:text next))))))))
+          bad (first
+               (keep-indexed
+                (fn [idx {:keys [type text] :as token}]
+                  (when (or (and (= :ident type)
+                                 (= "xor" (str/lower-case text))
+                                 (raw-xor-infix? idx))
+                            (and (= :op type)
+                                 (or (some unsupported-op-chars text)
+                                     (and (= "#" text) (not (xor-infix? idx)))
+                                     (and (str/includes? text "#")
+                                          (not (contains? #{"#" "#>" "#>>"} text))))
+                                 (not (contains? #{"#>" "#>>"} text))))
+                    token))
+                tokens))]
+      (when bad
+        {:type :error
+         :sqlstate "42601"
+         :message (str "syntax error at or near \"" (:text bad) "\"")}))))
 
 (defn simple-query-param-error
   "An `{:type :error}` map when `sql` uses a `$N` placeholder in the

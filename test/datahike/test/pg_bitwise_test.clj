@@ -87,7 +87,8 @@
                  "SELECT 42 << NULL"
                  "SELECT NULL >> 2"]]
       (is (nil? (v sql)) sql)))
-  (testing "the xor implementation is strict even while SQL # remains unsupported"
+  (testing "xor is strict too"
+    (is (nil? (v "SELECT 42 # NULL")))
     (is (= :__null__ (fns/sql-bit-xor 42 :__null__)))))
 
 (deftest bitwise-not-is-not-the-identity
@@ -305,12 +306,18 @@
                                 "SELECT id FROM f WHERE flags & 8 = 8")))))))
 
 ;; ---------------------------------------------------------------------------
-;; `#` stays a syntax error
+;; `#` is XOR
 ;; ---------------------------------------------------------------------------
 
-(deftest hash-xor-remains-unimplemented
-  (testing "JSqlParser cannot lex `#` as an operator, and emulating it
-            textually could not reproduce its precedence — so it stays a
-            clean 42601 rather than a wrong answer"
-    (is (re-find #"syntax error at or near"
-                 (or (err "SELECT 5 # 3") "")))))
+(deftest hash-xor
+  (is (= "6" (v "SELECT 5 # 3")))
+  (is (= "0110" (v "SELECT B'1100' # B'1010'")))
+  (is (= [oid-bit] (oids "SELECT B'1100' # B'1010'")))
+  (is (re-find #"cannot XOR bit strings of different sizes"
+               (or (err "SELECT B'0010' # B'011101'") "")))
+  (testing "# shares PostgreSQL's left-associative generic-op level"
+    (is (= "7" (v "SELECT 4 # 3 | 1")) "(4#3)|1")
+    (is (= "6" (v "SELECT 4 | 3 # 1")) "(4|3)#1")
+    (is (= "1" (v "SELECT 4 # 3 & 1")) "(4#3)&1")
+    (is (= "1" (v "SELECT 4 & 3 # 1")) "(4&3)#1")
+    (is (= "4" (v "SELECT 1 # 2 + 3")) "1#(2+3)")))

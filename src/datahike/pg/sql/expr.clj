@@ -71,7 +71,7 @@
             MinorThanEquals NotEqualsTo ParenthesedExpressionList
             RegExpMatchOperator Between]
            [net.sf.jsqlparser.expression.operators.conditional
-            AndExpression OrExpression]
+            AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.arithmetic
             Addition Subtraction Multiplication Division Modulo Concat
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
@@ -3018,6 +3018,50 @@
             (if (seq? l) (ctx/materialize-arg! ctx l) l)
             (if (seq? r) (ctx/materialize-arg! ctx r) r)))))
 
+(defn- generic-bitwise-node?
+  [expr]
+  (or (instance? BitwiseAnd expr)
+      (instance? BitwiseOr expr)
+      (instance? BitwiseLeftShift expr)
+      (instance? BitwiseRightShift expr)))
+
+(defn- rebuild-generic-bitwise
+  "Copy a JSqlParser generic bitwise node with new children. Avoid mutating
+   the cached AST: the same parsed tree may be translated concurrently."
+  [node left right]
+  (cond
+    (instance? BitwiseAnd node)        (BitwiseAnd. left right)
+    (instance? BitwiseOr node)         (BitwiseOr. left right)
+    (instance? BitwiseLeftShift node)  (BitwiseLeftShift. left right)
+    (instance? BitwiseRightShift node) (BitwiseRightShift. left right)))
+
+(defn- normalize-xor-tree
+  "Give rewritten PostgreSQL `#` the generic-operator precedence.
+
+   JSqlParser parses `a XOR b | c` as `a XOR (b | c)`. PostgreSQL parses
+   `a # b | c` as `(a # b) | c`, because both operators occupy one
+   left-associative level. Rotate every generic bitwise node on XOR's right
+   edge, producing fresh nodes so AST-cache entries remain immutable."
+  [left right]
+  (if (generic-bitwise-node? right)
+    (rebuild-generic-bitwise
+     right
+     (normalize-xor-tree left
+                         (.getLeftExpression
+                          ^net.sf.jsqlparser.expression.BinaryExpression right))
+     (.getRightExpression
+      ^net.sf.jsqlparser.expression.BinaryExpression right))
+    (XorExpression. left right)))
+
+(defn- translate-hash-xor
+  [ctx ^XorExpression expr]
+  (let [normalized (normalize-xor-tree (.getLeftExpression expr)
+                                       (.getRightExpression expr))]
+    (if (instance? XorExpression normalized)
+      (translate-binary-fn ctx normalized
+                           'datahike.pg.sql/sql-bit-xor fns/sql-bit-xor)
+      (translate-expr ctx normalized))))
+
 (defn flatten-json-chain
   "Flatten a JsonExpression into {:base Expression :chain [[key-expr op-str] ...]} pairs.
    JSqlParser encodes chained access recursively: data->'a'->>'b' is
@@ -3660,9 +3704,9 @@
     ;; above `*` and left-associative, which JSqlParser also matches, so
     ;; `2 ^ 3 ^ 3` = 512 and `2 ^ 3 * 2` = 16.
     ;;
-    ;; `#` itself stays a syntax error: JSqlParser cannot lex it as an
-    ;; operator at all, and emulating it textually could not reproduce
-    ;; its precedence. See unsupported-operator-error in sql.clj.
+    ;; Bare `#` is token-rewritten to JSqlParser's XorExpression. Its AST is
+    ;; normalized below because the parser gives XOR lower precedence than
+    ;; these operators while PostgreSQL puts them all at one level.
     (instance? BitwiseAnd expr)
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-and fns/sql-bit-and)
     (instance? BitwiseOr expr)
@@ -3673,6 +3717,8 @@
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-right fns/sql-bit-shift-right)
     (instance? BitwiseXor expr)
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-power-op fns/sql-power-op)
+    (instance? XorExpression expr)
+    (translate-hash-xor ctx expr)
 
     ;; PG operators that overload on arrays: @> (contains), <@ (contained
     ;; by), && (overlap). JSqlParser uses JsonOperator for @> and <@,

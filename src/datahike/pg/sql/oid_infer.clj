@@ -34,7 +34,7 @@
             Addition BitwiseAnd BitwiseLeftShift BitwiseOr BitwiseRightShift
             BitwiseXor Concat Division Modulo Multiplication Subtraction]
            [net.sf.jsqlparser.expression.operators.conditional
-            AndExpression OrExpression]
+            AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression LikeExpression
@@ -798,7 +798,8 @@
       ;; declares them only on bit, so even varbit operands yield bit),
       ;; otherwise the promoted integer type.
       (or (instance? BitwiseAnd expr) (instance? BitwiseOr expr)
-          (instance? BitwiseLeftShift expr) (instance? BitwiseRightShift expr))
+          (instance? BitwiseLeftShift expr) (instance? BitwiseRightShift expr)
+          (instance? XorExpression expr))
       (let [^BinaryExpression e expr
             l (expr-oid (.getLeftExpression e) env)]
         (if (or (= l types/oid-bit) (= l types/oid-varbit))

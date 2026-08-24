@@ -7,7 +7,8 @@
    to nothing and answered zero rows — a malformed statement reported
    as an empty result.
 
-   The check is over `:op` tokens from our own tokeniser rather than
+   Valid infix `#` is PostgreSQL XOR and is token-rewritten for
+   JSqlParser. The check is over `:op` tokens from our own tokeniser rather than
    over the raw text, so a `#` inside a string literal, a dollar-quoted
    string, a quoted identifier or a comment stays untouched.
 
@@ -67,11 +68,15 @@
 (deftest trailing-dollar-is-a-syntax-error
   (is (= "42601" (first (parse-err "SELECT 42$")))))
 
-(deftest hash-in-an-operator-position-is-rejected-not-mis-parsed
-  (testing "we implement no `#` operator, so it is a syntax error rather
-            than a column named `a#b`"
-    (is (= "42601" (first (parse-err "SELECT a#b"))))
-    (is (= "42601" (first (parse-err "SELECT 5 # 3"))))))
+(deftest hash-in-an-operator-position-is-xor-not-an-identifier
+  (testing "adjacent operands are still tokenized as PostgreSQL XOR"
+    (is (nil? (parse-err "SELECT a#b")))
+    (is (nil? (parse-err "SELECT 5 # 3")))
+    (is (= [["6"]] (rows "SELECT 5 # 3")))))
+
+(deftest xor-keyword-is-not-postgresql-syntax
+  (testing "XOR is only parser scaffolding for PostgreSQL's # operator"
+    (is (= "42601" (first (parse-err "SELECT 5 XOR 3"))))))
 
 (deftest error-message-names-the-offending-token
   (let [[_ msg] (parse-err "SELECT 42#")]

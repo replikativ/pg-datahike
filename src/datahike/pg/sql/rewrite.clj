@@ -849,6 +849,19 @@
             [pos end (str " " text " ")]))
         toks))
 
+(defn hash-xor-rule
+  "Rewrite PostgreSQL's bare `#` XOR operator to JSqlParser's `XOR`
+   keyword. The tokenizer keeps strings, quoted identifiers and comments
+   opaque, and the exact-token check leaves JSON `#>` / `#>>` untouched.
+
+   JSqlParser assigns XOR a lower precedence than `&` / `|` / shifts;
+   expr/normalize-xor-tree corrects that AST grouping after parsing."
+  [toks]
+  (keep (fn [{:keys [type text pos end]}]
+          (when (and (= :op type) (= "#" text))
+            [pos end " XOR "]))
+        toks))
+
 ;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
@@ -873,5 +886,6 @@
    reserved-column-name-rule
    boolean-is-rule
    default-fn-call-paren-rule
+   hash-xor-rule
    json-path-operator-spacing-rule
    partition-by-rule])

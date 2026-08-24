@@ -39,6 +39,10 @@
        :source-lines [162 169]
        :gate "test/datahike/test/pg_bitwise_test.clj"
        :test-var "postgres-bit-position-slice"}
+      {:id :bitwise-width-errors
+       :source-lines [118 121]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "hash-xor"}
       {:id :overlay
        :source-lines [218 221]
        :gate "test/datahike/test/pg_bitwise_test.clj"
