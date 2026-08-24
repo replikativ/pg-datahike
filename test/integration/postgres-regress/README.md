@@ -25,6 +25,22 @@ The script uses PostgreSQL 17's installed `pg_regress` and `psql` by default.
 Override them with `PG_REGRESS_BIN`, `PG_REGRESS_BINDIR`, or
 `PG_REGRESS_MAJOR`.
 
+The compatibility campaign is machine-readable in `campaign.edn`. List its
+waves and current admission modes, or run a whole wave (optionally restricted
+to one mode), with:
+
+```bash
+bb pg-regress-wave
+bb pg-regress-wave 1
+bb pg-regress-wave 1 discovery
+```
+
+`:unmeasured` means the upstream file has not yet been triaged on a clean
+fixture, `:discovery` means it is continuously useful but has classified
+prerequisites or differences, and `:strict` means its complete normalized API
+output is a gate. Promote coherent application-facing statement groups into
+focused differential tests before marking a dependency-heavy file strict.
+
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
 result output, unified diff, and summary. A normal mismatch (`pg_regress`
 status 1) is reported but does not fail the task. Harness failures remain

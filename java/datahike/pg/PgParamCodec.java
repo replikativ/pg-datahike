@@ -570,6 +570,8 @@ public final class PgParamCodec {
             case PgWireServer.OID_FLOAT4,
                  PgWireServer.OID_FLOAT8 ->
                 Double.parseDouble(s);
+            case PgWireServer.OID_NUMERIC ->
+                new BigDecimal(s);
             case PgWireServer.OID_UUID ->
                 UUID.fromString(s);
             // Date/time come in as ISO-8601 or PG's text forms; the downstream
