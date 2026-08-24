@@ -257,11 +257,13 @@
 ;; time, and it cannot depend on the translator (the translator already
 ;; depends on it).
 
-(def ^:private hex-bit-literal-re
+(def ^:private quoted-hex-bit-literal-re
   ;; The quoted form only. JSqlParser also produces HexValue for the
   ;; `0x4A` spelling, which PostgreSQL does not accept at all, so
-  ;; matching it here would invent syntax rather than mirror PG.
-  #"(?i)^x'[0-9a-f]*'$")
+  ;; matching it here would invent syntax rather than mirror PG. Match
+  ;; malformed quoted bodies too so they reach bit_in-style validation
+  ;; and report the offending digit instead of "HexValue unsupported".
+  #"(?is)^x'.*'$")
 
 (defn bit-string-literal?
   "True for a SQL bit-string literal — `B'1001000'` or `X'4A'`.
@@ -274,7 +276,7 @@
              (and p (.equalsIgnoreCase ^String p "B"))))
       (and (instance? net.sf.jsqlparser.expression.HexValue expr)
            (some? (re-matches
-                   hex-bit-literal-re
+                   quoted-hex-bit-literal-re
                    (str (.getValue ^net.sf.jsqlparser.expression.HexValue expr)))))))
 
 (defn bit-string-literal-value

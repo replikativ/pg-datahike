@@ -117,6 +117,14 @@
       (is (= "22P02" state))
       (is (re-find #"not a valid binary digit" msg)))))
 
+(deftest invalid-hexadecimal-digit-raises
+  ;; These are the two malformed HexValue nodes in PostgreSQL's bit.sql.
+  ;; Other non-hex letters are rejected earlier by JSqlParser's grammar.
+  (doseq [sql ["SELECT X' 0'" "SELECT X'0 '"]]
+    (let [[state msg] (parse-err sql)]
+      (is (= "22P02" state) sql)
+      (is (re-find #"not a valid hexadecimal digit" msg) sql))))
+
 ;; ---------------------------------------------------------------------------
 ;; Operations on bit values — these all worked by string coincidence
 ;; before the literal had a type, so they are the regression surface.
