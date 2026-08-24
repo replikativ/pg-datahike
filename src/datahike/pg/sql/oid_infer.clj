@@ -63,8 +63,12 @@
    "trim"          types/oid-text
    "ltrim"         types/oid-text
    "rtrim"         types/oid-text
-   "substring"     types/oid-text
-   "substr"        types/oid-text
+   ;; These have text and bit overloads; both preserve the first
+   ;; argument's type. OVERLAY's keyword syntax stores its operands in
+   ;; JSqlParser's named-parameter list, handled in `function-oid` below.
+   "substring"     :arg-type
+   "substr"        :arg-type
+   "overlay"       :arg-type
    "replace"       types/oid-text
    "lpad"          types/oid-text
    "rpad"          types/oid-text
@@ -534,7 +538,7 @@
         ;; Extract arg exprs from JSqlParser's parameter list. May be null
         ;; for zero-arg fns like NOW() / PI() / RANDOM().
         args (try
-               (when-let [pl (.getParameters f)]
+               (when-let [pl (or (.getParameters f) (.getNamedParameters f))]
                  (vec (.getExpressions pl)))
                (catch Exception _ nil))
         first-arg (first args)

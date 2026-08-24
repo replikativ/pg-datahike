@@ -214,6 +214,37 @@
   (is (= [oid-int4 oid-bit oid-int8]
          (oids "SELECT get_bit(B'0', 0), set_bit(B'0', 0, 1), bit_count(B'1')"))))
 
+(deftest postgres-bit-position-slice
+  ;; PostgreSQL 17 bit.sql lines 162-169 exercise matches that cross byte
+  ;; boundaries.  PgBit used to be stringified as a Clojure record here,
+  ;; silently returning zero for every query.
+  (is (= ["14" "15" "17" "19"]
+         (mapv v ["SELECT POSITION(B'111010110' IN B'0000011101011111010110')"
+                  "SELECT POSITION(B'111010110' IN B'00000011101011111010110')"
+                  "SELECT POSITION(B'111010110' IN B'0000000011101011111010110')"
+                  "SELECT POSITION(B'111010110' IN B'000000000011101011111010110')"])))
+  (is (= ["1" "2" "0"]
+         (mapv v ["SELECT POSITION(B'000000000011101011111010110' IN B'000000000011101011111010110')"
+                  "SELECT POSITION(B'00000000011101011111010110' IN B'000000000011101011111010110')"
+                  "SELECT POSITION(B'0000000000011101011111010110' IN B'000000000011101011111010110')"]))))
+
+(deftest postgres-bit-overlay-slice
+  ;; PostgreSQL 17 bit.sql lines 218-221.  The replacement is an unknown
+  ;; string literal that PostgreSQL resolves to bit. Starting past the end
+  ;; appends once; it does not fill the intervening positions with zeroes.
+  (is (= ["0001011100" "0101010100" "0101011100001" "0101011100001"]
+         (mapv v ["SELECT overlay(B'0101011100' placing '001' from 2 for 3)"
+                  "SELECT overlay(B'0101011100' placing '101' from 6)"
+                  "SELECT overlay(B'0101011100' placing '001' from 11)"
+                  "SELECT overlay(B'0101011100' placing '001' from 20)"])))
+  (is (= [oid-bit]
+         (oids "SELECT overlay(B'0101011100' placing '001' from 2 for 3)"))))
+
+(deftest bit-substring-preserves-bit-type
+  (is (= "1011" (v "SELECT substring(B'010110' from 2 for 4)")))
+  (is (= "010110" (v "SELECT substring(B'010110' from -2)")))
+  (is (= [oid-bit] (oids "SELECT substring(B'010110' from 2 for 4)"))))
+
 (deftest bit-string-operands-must-be-the-same-width
   (testing "PG refuses rather than padding — the width is part of the value"
     (is (re-find #"cannot AND bit strings of different sizes"

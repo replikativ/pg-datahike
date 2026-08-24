@@ -2013,15 +2013,26 @@
 (defn sql-overlay
   "`overlay(string placing new from start [for count])`. `count` defaults
    to the LENGTH OF THE REPLACEMENT, not to the rest of the string."
-  ([s new start] (sql-overlay s new start (count (->s new))))
+  ([s new start]
+   (if (pg-bits/pg-bit? s)
+     (let [replacement (if (pg-bits/pg-bit? new)
+                         new
+                         (pg-bits/parse-bit-literal (str new)))]
+       (pg-bits/overlay-bits s replacement start))
+     (sql-overlay s new start (count (->s new)))))
   ([s new start cnt]
-   (let [^String t (->s s)
-         n (.length t)
-         start (long start)
-         cnt (long cnt)
-         lo (max 0 (dec start))
-         hi (min n (max lo (+ lo (max 0 cnt))))]
-     (str (subs t 0 (min lo n)) (->s new) (subs t hi)))))
+   (if (pg-bits/pg-bit? s)
+     (let [replacement (if (pg-bits/pg-bit? new)
+                         new
+                         (pg-bits/parse-bit-literal (str new)))]
+       (pg-bits/overlay-bits s replacement start cnt))
+     (let [^String t (->s s)
+           n (.length t)
+           start (long start)
+           cnt (long cnt)
+           lo (max 0 (dec start))
+           hi (min n (max lo (+ lo (max 0 cnt))))]
+       (str (subs t 0 (min lo n)) (->s new) (subs t hi))))))
 
 (defn sql-quote-ident
   "Double-quote an identifier only when it needs it -- PostgreSQL leaves a
@@ -2229,18 +2240,22 @@
   ([s start len]
    (if (or (sql-null? s) (sql-null? start) (and (some? len) (sql-null? len)))
      :__null__
-     (let [^String st (str s)
-           n (.length st)
-           start (long start)
-           _ (when (and len (neg? (long len)))
-               (throw (ex-info "negative substring length not allowed"
-                               {:error :invalid-parameter-value
-                                :message "negative substring length not allowed"})))
-           ;; Half-open window [start, start+len) in 1-based positions.
-           to (if len (+ start (long len)) (inc n))
-           lo (max 1 start)
-           hi (min (inc n) to)]
-       (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))
+     (if (pg-bits/pg-bit? s)
+       (if (some? len)
+         (pg-bits/substring-bits s start len)
+         (pg-bits/substring-bits s start))
+       (let [^String st (str s)
+             n (.length st)
+             start (long start)
+             _ (when (and len (neg? (long len)))
+                 (throw (ex-info "negative substring length not allowed"
+                                 {:error :invalid-parameter-value
+                                  :message "negative substring length not allowed"})))
+             ;; Half-open window [start, start+len) in 1-based positions.
+             to (if len (+ start (long len)) (inc n))
+             lo (max 1 start)
+             hi (min (inc n) to)]
+         (if (<= hi lo) "" (subs st (dec lo) (dec hi))))))))
 
 (defn sql-position
   "1-based position of `substring` in `string`, 0 if not found.
@@ -2250,8 +2265,10 @@
    gram.y swaps the operands before they reach the function, so the SQL
    form is handled at the call site (see translate-function-call)."
   [string substring]
-  (let [idx (.indexOf (str string) (str substring))]
-    (if (neg? idx) 0 (inc idx))))
+  (if (and (pg-bits/pg-bit? string) (pg-bits/pg-bit? substring))
+    (pg-bits/position-bits string substring)
+    (let [idx (.indexOf (str string) (str substring))]
+      (if (neg? idx) 0 (inc idx)))))
 
 ;; ---------------------------------------------------------------------------
 ;; PostgreSQL catalog function stubs

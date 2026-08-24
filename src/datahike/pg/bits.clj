@@ -187,6 +187,62 @@
   [^PgBit a ^PgBit b]
   (make-bit (str (:bits a) (:bits b)) true))
 
+(defn substring-bits
+  "PostgreSQL `substring(bit, start [, length])`.
+
+   The requested window is 1-based and may begin before or end after the
+   value; only its overlap is returned.  A negative length is rejected.
+   PostgreSQL declares the result as `bit`, even when the input reached the
+   function through the implicit varbit-to-bit cast."
+  ([b start] (substring-bits b start nil))
+  ([^PgBit b start length]
+   (let [digits (:bits b)
+         n (count digits)
+         start (long start)
+         _ (when (and (some? length) (neg? (long length)))
+             (throw (ex-info "negative substring length not allowed"
+                             {:error :invalid-parameter-value
+                              :message "negative substring length not allowed"})))
+         to (if (some? length) (+ start (long length)) (inc n))
+         lo (max 1 start)
+         hi (min (inc n) to)]
+     (make-bit (if (<= hi lo) "" (subs digits (dec lo) (dec hi))) false))))
+
+(defn position-bits
+  "One-based position of `needle` in `haystack`, or zero when absent.
+
+   PostgreSQL's bitposition has one deliberate difference from Java/text
+   search: an empty bit string contains no match, even for an empty needle."
+  [^PgBit haystack ^PgBit needle]
+  (if (zero? (width haystack))
+    0
+    (let [idx (.indexOf ^String (:bits haystack) ^String (:bits needle))]
+      (if (neg? idx) 0 (inc idx)))))
+
+(defn overlay-bits
+  "PostgreSQL `overlay(bit placing bit from start [for length])`.
+
+   This is the SQL-standard definition: prefix before `start`, replacement,
+   then the suffix after the replaced window.  Starting beyond the end
+   appends immediately (there is no zero fill)."
+  ([target replacement start]
+   (overlay-bits target replacement start (width replacement)))
+  ([^PgBit target ^PgBit replacement start length]
+   (let [start (long start)
+         length (long length)
+         _ (when (or (not (pos? start)) (neg? length))
+             (throw (ex-info "negative substring length not allowed"
+                             {:error :invalid-parameter-value
+                              :message "negative substring length not allowed"})))
+         digits (:bits target)
+         n (count digits)
+         prefix-end (min n (dec start))
+         suffix-start (min n (+ (dec start) length))]
+     (make-bit (str (subs digits 0 prefix-end)
+                    (:bits replacement)
+                    (subs digits suffix-start))
+               false))))
+
 ;; ---------------------------------------------------------------------------
 ;; SQL literals
 ;;

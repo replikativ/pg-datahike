@@ -34,7 +34,15 @@
      [{:id :shift-storage
        :source-lines [174 179]
        :gate "test/datahike/test/pg_bitwise_test.clj"
-       :test-var "postgres-bit-shift-storage-slice"}]}
+       :test-var "postgres-bit-shift-storage-slice"}
+      {:id :position
+       :source-lines [162 169]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "postgres-bit-position-slice"}
+      {:id :overlay
+       :source-lines [218 221]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "postgres-bit-overlay-slice"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
      :blockers #{:numeric-formatting :numeric-typemods :create-function}}
