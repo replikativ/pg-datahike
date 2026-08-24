@@ -363,6 +363,9 @@
     (is (= [["bigint"]]              (rows (.execute *handler* "SELECT format_type(20, -1)"))))
     (is (= [["text"]]                (rows (.execute *handler* "SELECT format_type(25, -1)"))))
     (is (= [["character varying"]]   (rows (.execute *handler* "SELECT format_type(1043, -1)"))))
+    (is (= [["bpchar"]]              (rows (.execute *handler* "SELECT format_type(1042, -1)"))))
+    (is (= [["character(14)"]]       (rows (.execute *handler* "SELECT format_type(1042, 18)"))))
+    (is (= [["numeric(8,2)"]]        (rows (.execute *handler* "SELECT format_type(1700, 524294)"))))
     (is (= [["boolean"]]             (rows (.execute *handler* "SELECT format_type(16, -1)")))))
 
   (testing "format_type composes inside SELECT against pg_type"
@@ -1856,7 +1859,7 @@
   (is (nil? (err (.execute *handler* "INSERT INTO view_base VALUES (1, 1.25)"))))
   (is (nil? (err (.execute *handler*
                             (str "CREATE VIEW live_view AS "
-                                 "SELECT id, n::numeric AS amount FROM view_base")))))
+                                 "SELECT id, n::numeric(8,2) AS amount FROM view_base")))))
   (is (= [["1" "1.25"]]
          (rows (.execute *handler* "SELECT * FROM live_view ORDER BY id"))))
   (is (= [["live_view"]]
@@ -1865,6 +1868,21 @@
   (is (= [["v"]]
          (rows (.execute *handler*
                          "SELECT relkind FROM pg_class WHERE relname = 'live_view'"))))
+  (is (= [["id" "23" "p"] ["amount" "1700" "m"]]
+         (rows (.execute *handler*
+                         (str "SELECT a.attname, a.atttypid, a.attstorage FROM pg_attribute a "
+                              "JOIN pg_class c ON a.attrelid = c.oid "
+                              "WHERE c.relname = 'live_view' ORDER BY a.attnum")))))
+  (is (= [["integer"] ["numeric(8,2)"]]
+         (rows (.execute *handler*
+                         (str "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                              "JOIN pg_class c ON a.attrelid = c.oid "
+                              "WHERE c.relname = 'live_view' ORDER BY a.attnum")))))
+  (is (.contains ^String
+                 (first-val (.execute *handler*
+                                      (str "SELECT pg_get_viewdef(oid::oid, true) FROM pg_class "
+                                           "WHERE relname = 'live_view'")))
+                 "view_base"))
   (is (= [["1" "1.25"]]
          (rows (.execute *handler*
                          (str "SELECT b.id, v.amount FROM view_base b "

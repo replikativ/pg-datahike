@@ -593,7 +593,8 @@
         ;; only via .getArrayData — so an array cast like `::int[]` must be
         ;; detected here and wrapped to the element's array OID, else it
         ;; reports the scalar (int4) and the binary array value mis-decodes.
-        type-str (some-> cdt .getDataType str str/lower-case)
+        type-str (some-> cdt .getDataType str str/lower-case
+                         types/base-type-name-of)
         ad       (when cdt (.getArrayData cdt))
         array?   (and ad (pos? (.size ^java.util.List ad)))
         scalar-oid
@@ -615,7 +616,11 @@
            ;; and `pg_typeof` says real.
            :float     (if (#{"real" "float4"} type-str) types/oid-float4 types/oid-float8)
            :numeric   types/oid-numeric
-           :text      types/oid-text
+           :text      (cond
+                        (contains? #{"varchar" "character varying"} type-str) types/oid-varchar
+                        (contains? #{"char" "character" "bpchar"} type-str) types/oid-bpchar
+                        (= "name" type-str) types/oid-name
+                        :else types/oid-text)
            :boolean   types/oid-bool
            :date      types/oid-date
            :time      types/oid-time

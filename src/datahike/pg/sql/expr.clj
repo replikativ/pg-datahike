@@ -533,6 +533,31 @@
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
         result-var)
 
+      (= fname "pg_get_viewdef")
+      (let [fn-param (symbol (str "?viewdef" (swap! (:var-counter ctx) inc)))
+            definitions (if-let [db (:db ctx)]
+                          (into {}
+                                (map (fn [[name definition]]
+                                       [(long (Math/abs (.hashCode ^String name)))
+                                        definition]))
+                                (d/q '{:find [?name ?definition]
+                                       :where [[?e :datahike.pg/view-name ?name]
+                                               [?e :datahike.pg/view-definition ?definition]]}
+                                     db))
+                          {})
+            impl-fn (fn [oid & _]
+                      (let [oid (cond
+                                  (number? oid) (long oid)
+                                  (string? oid) (try (Long/parseLong oid)
+                                                     (catch Exception _ nil))
+                                  :else nil)]
+                        (or (get definitions oid) :__null__)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; NOW() → current timestamp as java.util.Date
       (= fname "now")
       (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))

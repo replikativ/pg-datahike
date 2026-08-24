@@ -82,6 +82,54 @@
 
 (def ^:private view-name-attr :datahike.pg/view-name)
 (def ^:private view-definition-attr :datahike.pg/view-definition)
+(def ^:private view-columns-attr :datahike.pg/view-columns)
+
+(defn- cast-expression-typmod [^CastExpression cast]
+  (let [type-str (str (.getColDataType cast))
+        base (-> type-str
+                 (str/replace #"\s*\([^)]*\)" "")
+                 str/trim str/lower-case)]
+    (cond
+      (= "numeric" base)
+      (when-let [[precision scale] (sql-cast/numeric-typmod type-str)]
+        (types/encode-numeric-typmod precision scale))
+
+      (contains? #{"char" "character" "bpchar"
+                   "varchar" "character varying"} base)
+      (when-let [[_ n] (re-find #"\(\s*(\d+)\s*\)" type-str)]
+        (+ 4 (Long/parseLong n)))
+
+      :else nil)))
+
+(defn- view-select-typmods [^PlainSelect select db output-count]
+  (let [from (.getFromItem select)
+        ^Table from-table (when (instance? Table from) from)
+        table-name (some-> from-table .getName unquote-ident)
+        table-alias (some-> from-table .getAlias .getName unquote-ident)
+        item-typmods
+        (mapv (fn [^SelectItem item]
+                (let [expression (.getExpression item)]
+                  (cond
+                    (instance? CastExpression expression)
+                    (or (cast-expression-typmod ^CastExpression expression) -1)
+
+                    (and table-name (instance? Column expression))
+                    (let [^Column column expression
+                          qualifier (some-> (.getTable column) .getName unquote-ident)
+                          source-table (if (or (nil? qualifier)
+                                               (= qualifier table-alias)
+                                               (= qualifier table-name))
+                                         table-name qualifier)]
+                      (long (or (params/pg-typmod-of-attr
+                                 db (keyword source-table
+                                             (unquote-ident (.getColumnName column))))
+                                -1)))
+
+                    :else -1)))
+              (.getSelectItems select))]
+    (if (= output-count (count item-typmods))
+      item-typmods
+      (vec (repeat output-count -1)))))
 
 (defn- translate-create-view [^CreateView cv schema db]
   (let [view-name (unquote-ident (str (.getView cv)))
@@ -111,24 +159,36 @@
                               {:feature "CREATE VIEW with a non-plain SELECT"})))
     ;; Validate now; execute the stored definition against the then-current
     ;; snapshot whenever the view is read.
-    (stmt/translate-select ^PlainSelect select schema db)
-    (if (and existing-eid if-not-exists? (not replace?))
-      {:type :ddl-create-view :noop? true :view-name view-name :tx-data []}
-      {:type :ddl-create-view
-       :view-name view-name
-       :tx-data (cond-> []
-                  (not (contains? schema view-name-attr))
-                  (into [{:db/ident view-name-attr
-                          :db/valueType :db.type/string
-                          :db/cardinality :db.cardinality/one
-                          :db/unique :db.unique/identity}
-                         {:db/ident view-definition-attr
-                          :db/valueType :db.type/string
-                          :db/cardinality :db.cardinality/one}])
-                  true
-                  (conj {:db/id (or existing-eid (str (gensym "view-")))
-                         view-name-attr view-name
-                         view-definition-attr (str select)}))})))
+    (let [validated (stmt/translate-select ^PlainSelect select schema db)
+          aliases (:find-aliases validated)
+          typmods (view-select-typmods ^PlainSelect select db (count aliases))
+          columns (mapv (fn [name oid typmod]
+                          {:name name :oid (long (or oid types/oid-text))
+                           :typmod typmod})
+                        aliases (:select-item-oids validated) typmods)]
+      (if (and existing-eid if-not-exists? (not replace?))
+        {:type :ddl-create-view :noop? true :view-name view-name :tx-data []}
+        {:type :ddl-create-view
+         :view-name view-name
+         :tx-data (cond-> []
+                    (not (contains? schema view-name-attr))
+                    (conj {:db/ident view-name-attr
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity})
+                    (not (contains? schema view-definition-attr))
+                    (conj {:db/ident view-definition-attr
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one})
+                    (not (contains? schema view-columns-attr))
+                    (conj {:db/ident view-columns-attr
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one})
+                    true
+                    (conj {:db/id (or existing-eid (str (gensym "view-")))
+                           view-name-attr view-name
+                           view-definition-attr (str select)
+                           view-columns-attr (pr-str columns)}))}))))
 
 ;; Aggregate + scalar fns moved to datahike.pg.sql.fns. Re-export at the old
 ;; `datahike.pg.sql/...` names so the qualified symbols emitted by the

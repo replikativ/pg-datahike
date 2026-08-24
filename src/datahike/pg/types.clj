@@ -913,8 +913,36 @@
 
 (defn format-type
   "PostgreSQL format_type(oid, typmod) — return type name for an OID."
-  [type-oid _typmod]
-  (get oid->pg-name (if (number? type-oid) (long type-oid) 0) "text"))
+  [type-oid typmod]
+  (let [oid (cond
+              (number? type-oid) (long type-oid)
+              (string? type-oid) (try (Long/parseLong type-oid)
+                                      (catch Exception _ 0))
+              :else 0)
+        tm (cond
+             (number? typmod) (long typmod)
+             (string? typmod) (try (Long/parseLong typmod)
+                                   (catch Exception _ -1))
+             :else -1)
+        base (if (= oid oid-bpchar)
+               "bpchar"
+               (get oid->pg-name oid "text"))]
+    (if (neg? tm)
+      base
+      (cond
+        (= oid oid-numeric)
+        (let [[precision scale] (decode-numeric-typmod tm)]
+          (if precision (format "numeric(%d,%d)" precision scale) base))
+
+        (= oid oid-varchar) (format "character varying(%d)" (max 0 (- tm 4)))
+        (= oid oid-bpchar)  (format "character(%d)" (max 0 (- tm 4)))
+        (= oid oid-bit)     (format "bit(%d)" tm)
+        (= oid oid-varbit)  (format "bit varying(%d)" tm)
+        (= oid oid-time)    (format "time(%d) without time zone" tm)
+        (= oid 1266)        (format "time(%d) with time zone" tm)
+        (= oid oid-timestamp)   (format "timestamp(%d) without time zone" tm)
+        (= oid oid-timestamptz) (format "timestamp(%d) with time zone" tm)
+        :else base))))
 
 (defn wire-size
   "Return the wire protocol type size for an OID."

@@ -20,7 +20,8 @@
      — called by the wire handler to short-circuit common boot probes
        (pgjdbc's field-metadata, Hibernate's feature detection) into
        fast paths before JSqlParser even runs."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -250,6 +251,9 @@
      ;; PG identity-column kind: '' = not identity, 'a' = always,
      ;; 'd' = by default. We never emit identity columns.
      {:db/ident :pg_attribute/attidentity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; PostgreSQL type storage strategy: p=plain, m=main, x=extended.
+     ;; psql's \d+ renders this as Plain/Main/Extended.
+     {:db/ident :pg_attribute/attstorage :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      ;; atttypmod: encodes NUMERIC(p, s) precision/scale (and varchar(n)
      ;; length when we add it). -1 = unconstrained — what real PG
      ;; reports for plain `NUMERIC` or `TEXT` columns. Drives
@@ -597,12 +601,28 @@
 
 (defn- view-entities [db]
   (if db
-    (mapv (fn [[name definition]] {:name name :definition definition})
-          (d/q '{:find [?name ?definition]
+    (mapv (fn [[eid name definition]]
+            (let [columns-str (:datahike.pg/view-columns
+                               (d/pull db '[:datahike.pg/view-columns] eid))]
+              {:name name
+               :definition definition
+               :columns (when columns-str
+                          (try (edn/read-string columns-str)
+                               (catch Exception _ nil)))}))
+          (d/q '{:find [?e ?name ?definition]
                  :where [[?e :datahike.pg/view-name ?name]
                          [?e :datahike.pg/view-definition ?definition]]}
                db))
     []))
+
+(defn- attribute-storage [oid]
+  (cond
+    (= oid types/oid-numeric) "m"
+    (or (contains? types/array-oid->element-oid oid)
+        (contains? #{types/oid-bytea types/oid-text types/oid-varchar
+                     types/oid-bpchar types/oid-json types/oid-jsonb}
+                   oid)) "x"
+    :else "p"))
 
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
@@ -660,12 +680,14 @@
                :pg_attribute/attrelid (long oid)
                :pg_attribute/attnotnull false
                :pg_attribute/attidentity ""
+               :pg_attribute/attstorage (attribute-storage (:oid f))
                :pg_attribute/atttypmod -1
                :pg_attribute/attisdropped false
                (pgs/row-marker-attr "pg_attribute") true}))
-       (for [[tname {:keys [columns]}] (sort-by key tables)
-             [idx col] (map-indexed vector columns)
-             :let [tbl-oid (or (pgs/table-oid cte-db tname)
+       (concat
+        (for [[tname {:keys [columns]}] (sort-by key tables)
+              [idx col] (map-indexed vector columns)
+              :let [tbl-oid (or (pgs/table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
                                    ;; started tracking :pg/table-oid — fall
                                    ;; back to the attnum-derived composite
@@ -705,9 +727,22 @@
           :pg_attribute/attrelid (long tbl-oid)
           :pg_attribute/attnotnull pk?
           :pg_attribute/attidentity ""
+          :pg_attribute/attstorage (attribute-storage (:oid col))
           :pg_attribute/atttypmod typmod
           :pg_attribute/attisdropped false
-          (pgs/row-marker-attr "pg_attribute") true})))
+          (pgs/row-marker-attr "pg_attribute") true})
+        (for [{:keys [name columns]} (view-entities cte-db)
+              [idx col] (map-indexed vector columns)]
+          {:pg_attribute/attname (:name col)
+           :pg_attribute/atttypid (long (:oid col))
+           :pg_attribute/attnum (long (inc idx))
+           :pg_attribute/attrelid (long (Math/abs (.hashCode ^String name)))
+           :pg_attribute/attnotnull false
+           :pg_attribute/attidentity ""
+           :pg_attribute/attstorage (attribute-storage (:oid col))
+           :pg_attribute/atttypmod (long (or (:typmod col) -1))
+           :pg_attribute/attisdropped false
+           (pgs/row-marker-attr "pg_attribute") true}))))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
       :pg_namespace/nspowner pg-role-oid
