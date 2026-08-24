@@ -869,10 +869,10 @@
 ;; NUMERIC typmod — encodes precision and scale per PG's atttypmod scheme
 
 ;; PG encodes NUMERIC's typmod as:
-;;   typmod = ((precision << 16) | scale) + VARHDRSZ
+;;   typmod = ((precision << 16) | (scale & 0x7ff)) + VARHDRSZ
 ;;   VARHDRSZ = 4
 ;; A typmod of -1 means "no precision specified" (PG default for plain
-;; NUMERIC). Decoding: subtract 4, scale = low 16 bits, precision =
+;; NUMERIC). Decoding: subtract 4, scale = signed low 11 bits, precision =
 ;; upper 16 bits. We mirror PG exactly so clients (pgjdbc, psycopg2,
 ;; Metabase) see the same value they'd see on a real PG.
 (def ^:const var-hdr-sz 4)
@@ -885,8 +885,18 @@
     -1
     (let [p (or precision 0)
           s (or scale 0)]
-      (+ (bit-or (bit-shift-left p 16) s)
+      (+ (bit-or (bit-shift-left p 16) (bit-and s 0x7ff))
          var-hdr-sz))))
+
+(defn decode-numeric-scale
+  "Sign-extend PostgreSQL's packed 11-bit NUMERIC scale.
+
+   This also decodes the parser-only 1048..2047 representation emitted by
+   `negative-numeric-scale-rule`; ordinary positive scales 0..1000 are
+   unchanged."
+  [packed]
+  (let [x (bit-and (long packed) 0x7ff)]
+    (- (bit-xor x 1024) 1024)))
 
 (defn base-type-name-of
   "The SQL type name with its `(…)` modifier stripped, lower-cased."
@@ -918,7 +928,7 @@
     [nil nil]
     (let [adjusted (- typmod var-hdr-sz)]
       [(bit-shift-right adjusted 16)
-       (bit-and adjusted 0xFFFF)])))
+       (decode-numeric-scale adjusted)])))
 
 (defn parse-numeric-args
   "Parse the JSqlParser ColDataType string `\"NUMERIC (10, 2)\"` (or
@@ -930,7 +940,7 @@
       (let [parts (mapv str/trim (str/split args-str #","))
             p (try (Long/parseLong (nth parts 0 "")) (catch Exception _ nil))
             s (try (Long/parseLong (nth parts 1 "0")) (catch Exception _ nil))]
-        [p (or s 0)])
+        [p (if s (decode-numeric-scale s) 0)])
       [nil nil])))
 
 (defn pg-name-for-dh-type

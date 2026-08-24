@@ -98,6 +98,49 @@
     (is (thrown-with-msg? SQLException #"numeric field overflow"
                           (one c "SELECT 1000::numeric(3,0)")))))
 
+(deftest negative-scale-numeric-typmods
+  (with-open [c (jdbc)]
+    (testing "casts round to positions left of the decimal point"
+      (is (= "12000" (one c "SELECT 12345::numeric(3,-3)")))
+      (is (= "-12000" (one c "SELECT (-12345)::numeric(3,-3)"))))
+    (exec! c "CREATE TABLE neg_scale (n numeric(3,-3))")
+    (exec! c "INSERT INTO neg_scale VALUES (12345), (654321)")
+    (is (= "12000" (one c "SELECT min(n) FROM neg_scale")))
+    (is (= "numeric(3,-3)"
+           (one c (str "SELECT format_type(a.atttypid, a.atttypmod) "
+                       "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                       "WHERE c.relname = 'neg_scale' AND a.attname = 'n'"))))
+    (is (thrown-with-msg? SQLException #"numeric field overflow"
+                          (exec! c "INSERT INTO neg_scale VALUES (999500000)")))))
+
+(deftest numeric-typmods-support-scale-greater-than-precision
+  (with-open [c (jdbc)]
+    (is (= "0.000123"
+           (one c "SELECT 0.0001234::numeric(3,6)")))
+    (is (thrown-with-msg? SQLException #"numeric field overflow"
+                          (one c "SELECT 0.0009995::numeric(3,6)")))
+    (exec! c (str "CREATE TABLE mixed_scales ("
+                  "millions numeric(3,-6), thousands numeric(3,-3), "
+                  "units numeric(3,0), thousandths numeric(3,3), "
+                  "millionths numeric(3,6))"))
+    (exec! c (str "INSERT INTO mixed_scales VALUES "
+                  "(123456, 123, 0.123, 0.000123, 0.000000123)"))
+    (is (= "0.000000"
+           (one c "SELECT millionths FROM mixed_scales")))))
+
+(deftest integer-literals-wider-than-int8-become-exact-numeric
+  (with-open [c (jdbc)]
+    (is (= "9223372036854775808"
+           (one c "SELECT 9223372036854775808")))
+    (is (= "999999999999999999999"
+           (one c (str "SELECT mod(999999999999999999999::numeric,"
+                       "1000000000000000000000)"))))
+    (is (= "-9999999999999999999999"
+           (one c (str "SELECT div(-9999999999999999999999::numeric,"
+                       "1000000000000000000000)*1000000000000000000000 + "
+                       "mod(-9999999999999999999999::numeric,"
+                       "1000000000000000000000)"))))))
+
 (deftest writes-enforce-the-declared-width
   (with-open [c (jdbc)]
     (seed! c)

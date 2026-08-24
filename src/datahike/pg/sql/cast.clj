@@ -60,7 +60,9 @@
   [type-str]
   (when-let [m (re-find #"\(\s*(\d+)\s*(?:,\s*(-?\d+)\s*)?\)" (str type-str))]
     [(Integer/parseInt (nth m 1))
-     (if (nth m 2) (Integer/parseInt (nth m 2)) 0)]))
+     (if (nth m 2)
+       (types/decode-numeric-scale (Integer/parseInt (nth m 2)))
+       0)]))
 
 (defn apply-numeric-typmod
   "PostgreSQL's apply_typmod (numeric.c): round to the declared scale,
@@ -70,11 +72,13 @@
    Both halves were missing. The scale is why `123.456::numeric(10,1)`
    answered 123.456 instead of 123.5, and the precision is why
    `123456::numeric(5,2)` was accepted at all -- 22003 numeric field
-   overflow was never raised on any path."
+  overflow was never raised on any path."
   [^java.math.BigDecimal v p s]
   (let [scaled (.setScale v (int s) java.math.RoundingMode/HALF_UP)
         ;; PG's own test: |value| must be < 10^(p-s).
-        limit (.pow (java.math.BigDecimal. "10") (int (- p s)))]
+        ;; scaleByPowerOfTen also covers s > p, where the exponent is
+        ;; negative (for example numeric(3,6) has a limit of 10^-3).
+        limit (.scaleByPowerOfTen java.math.BigDecimal/ONE (int (- p s)))]
     (if (>= (.compareTo (.abs scaled) limit) 0)
       (throw (errors/pg-error
               :numeric-value-out-of-range

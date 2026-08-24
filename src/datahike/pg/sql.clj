@@ -602,6 +602,8 @@
      - (PRIMARY KEY(col)) → (id serial) for INHERITS bodies
      - ALTER TABLE … TYPE … USING half stripping
      - reserved column name (INDEX/KEY varchar) quoting
+     - negative NUMERIC/DECIMAL scale packing for JSqlParser
+     - integer literals wider than int8 routed through exact NUMERIC parsing
 
    ::regnamespace / ::regclass casts are handled in
    expr/translate-cast-expr, no preprocessing needed."

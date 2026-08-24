@@ -862,6 +862,59 @@
             [pos end " XOR "]))
         toks))
 
+(defn negative-numeric-scale-rule
+  "Encode a negative NUMERIC/DECIMAL scale for JSqlParser.
+
+   PostgreSQL stores scales as signed 11-bit values in atttypmod, while
+   JSqlParser 5.2 rejects the minus token in `numeric(p,-s)`. Valid positive
+   scales stop at 1000, so the packed range 1048..2047 is unambiguous and
+   can be decoded immediately by the shared typmod readers. Strings and
+  comments remain opaque because this matches classified tokens only."
+  [toks]
+  (let [significant (vec (remove #(= :comment (:type %)) toks))]
+    (into []
+          (keep (fn [i]
+                  (let [type-tok (nth significant i nil)
+                        open     (nth significant (inc i) nil)
+                        precision (nth significant (+ i 2) nil)
+                        comma    (nth significant (+ i 3) nil)
+                        minus    (nth significant (+ i 4) nil)
+                        scale    (nth significant (+ i 5) nil)
+                        close    (nth significant (+ i 6) nil)]
+                    (when (and (contains? #{"numeric" "decimal"} (kw-text type-tok))
+                               (punct? open "(")
+                               (= :number (:type precision))
+                               (punct? comma ",")
+                               (= :op (:type minus)) (= "-" (:text minus))
+                               (= :number (:type scale))
+                               (punct? close ")"))
+                      (let [n (try (Long/parseLong (:text scale))
+                                   (catch Exception _ nil))]
+                        (when (and n (<= 0 n 1000))
+                          [(:pos minus) (:end scale)
+                           (str (bit-and (- n) 0x7ff))]))))))
+          (range (count significant)))))
+
+(defn wide-integer-literal-rule
+  "Make integer literals wider than Java long parseable by JSqlParser.
+
+   PostgreSQL assigns an integer constant to numeric when it does not fit
+   int4 or int8. JSqlParser instead constructs LongValue and fails before
+   we can apply PostgreSQL's type inference. Appending `e0` selects its
+   DoubleValue AST without changing the number; our expression lowering
+   rebuilds DoubleValue from its original token as BigDecimal, so no
+   floating-point conversion or scale change occurs."
+  [toks]
+  (keep (fn [{:keys [type text end]}]
+          (when (and (= :number type)
+                     (not (re-find #"[.eE]" text))
+                     (try
+                       (Long/parseLong text)
+                       false
+                       (catch NumberFormatException _ true)))
+            [end end "e0"]))
+        toks))
+
 ;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
@@ -886,6 +939,8 @@
    reserved-column-name-rule
    boolean-is-rule
    default-fn-call-paren-rule
+   negative-numeric-scale-rule
+   wide-integer-literal-rule
    hash-xor-rule
    json-path-operator-spacing-rule
    partition-by-rule])
