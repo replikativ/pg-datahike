@@ -40,6 +40,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types]
             [datahike.pg.prng]))
 
@@ -1373,8 +1374,14 @@
    resolution does: two integers divide as integers, anything else
    divides as it did."
   ([a b]
-   (when (and (number? b) (zero? b)) (throw-division-by-zero))
    (cond
+     ;; numeric NaN absorbs even a zero divisor; PostgreSQL returns NaN
+     ;; for NaN/0 while every non-NaN numeric divided by zero errors.
+     (or (and (numspecial? a) (= :nan (:kind a)))
+         (and (numspecial? b) (= :nan (:kind b))))
+     types/nan-numeric
+     (and (number? b) (zero? b)) (throw-division-by-zero)
+     (or (numspecial? a) (numspecial? b)) (special-arith / a b)
      (and (integer? a) (integer? b)) (int-div a b)
      ;; numeric / numeric -- and numeric / integer, which PostgreSQL
      ;; also resolves as numeric. A float on either side outranks
@@ -1399,13 +1406,18 @@
    operand, so `mod(1, 3.0)` answered `1` where PostgreSQL answers
    `1.0`."
   [a b]
-  (when (and (number? b) (zero? b)) (throw-division-by-zero))
-  (if (and (or (decimal? a) (decimal? b)) (number? a) (number? b))
+  (cond
+    (or (and (numspecial? a) (= :nan (:kind a)))
+        (and (numspecial? b) (= :nan (:kind b))))
+    types/nan-numeric
+    (and (number? b) (zero? b)) (throw-division-by-zero)
+    (or (numspecial? a) (numspecial? b)) (special-arith rem a b)
+    (and (or (decimal? a) (decimal? b)) (number? a) (number? b))
     (let [^java.math.BigDecimal x (bigdec a)
           ^java.math.BigDecimal y (bigdec b)]
       (.setScale (.remainder x y) (max (.scale x) (.scale y))
                  java.math.RoundingMode/UNNECESSARY))
-    (rem a b)))
+    :else (rem a b)))
 
 (def sql-div (null-safe checked-div))
 
@@ -1498,17 +1510,18 @@
   "PG's float.c overflow/underflow guard idiom, applied verbatim:
 
      if (isinf(result) && !isinf(arg1)) float_overflow_error();
-     if (result == 0.0 && arg1 != 0.0) float_underflow_error();
+     if (result == 0.0 && isfinite(arg1) && arg1 != 0.0)
+       float_underflow_error();
 
-   An infinite *input* may legitimately produce an infinite result, and
-   a zero input a zero result — only the finite→infinite and
-   nonzero→zero transitions are errors. The UNDERFLOW half is the one
+   An infinite *input* may legitimately produce either an infinite or a
+   zero result, and a zero input a zero result — only the finite→infinite
+   and finite-nonzero→zero transitions are errors. The UNDERFLOW half is the one
    that gets forgotten: `exp(-1000.0::float8)` is an error in PG."
   ^double [^double result ^double input]
   (cond
     (and (Double/isInfinite result) (not (Double/isInfinite input)))
     (throw-out-of-range "value out of range: overflow")
-    (and (zero? result) (not (zero? input)))
+    (and (zero? result) (not (Double/isInfinite input)) (not (zero? input)))
     (throw-out-of-range "value out of range: underflow")
     :else result))
 
@@ -1700,9 +1713,12 @@
    `low == high` is an error. A NaN operand is allowed (PG treats NaN
    as larger than everything); NaN or infinite BOUNDS are not. All four
    argument failures are 2201G, not the 22003 used elsewhere in
-   float.c — see float.c:4190-4203."
+  float.c — see float.c:4190-4203."
   [operand low high cnt]
-  (let [o (double operand) l (double low) h (double high) n (long cnt)]
+  (let [o (->num-double operand)
+        l (->num-double low)
+        h (->num-double high)
+        n (long cnt)]
     (when (<= n 0) (throw-width-bucket "count must be greater than zero"))
     (when (or (Double/isNaN l) (Double/isNaN h))
       (throw-width-bucket "lower and upper bounds cannot be NaN"))
@@ -1713,6 +1729,7 @@
           below? (if asc? (< o l) (> o l))
           above? (if asc? (>= o h) (<= o h))]
       (cond
+        (Double/isNaN o) (inc n)
         below? 0
         above? (inc n)
         :else (inc (long (Math/floor (* n (/ (- o l) (- h l))))))))))
@@ -2488,7 +2505,17 @@
 (defn- throw-logarithm-error [msg]
   (throw (errors/pg-error :invalid-argument-for-logarithm {:message msg})))
 
-(defn- num-arg? [x] (decimal? x))
+(defn- num-arg? [x]
+  (or (decimal? x) (numspecial? x)))
+
+(defn- numeric-double-result
+  "Carry a double computation back through NUMERIC's runtime type."
+  [^double d]
+  (or (types/double->numeric-special d)
+      (.stripTrailingZeros (java.math.BigDecimal/valueOf d))))
+
+(defn- numeric-special-unary [f x]
+  (numeric-double-result (double (f (->num-double x)))))
 
 (declare numeric-power numeric-log)
 
@@ -2497,16 +2524,20 @@
    operand is numeric, exactly as the power() function does -- so
    `2.0 ^ 10` is 1024.0000000000000, not 1024."
   [b e]
-  (if (or (decimal? b) (decimal? e))
-    (numeric-power (bigdec b) (bigdec e))
-    (sql-power b e)))
+  (cond
+    (or (numspecial? b) (numspecial? e))
+    (numeric-double-result (sql-power (->num-double b) (->num-double e)))
+    (or (decimal? b) (decimal? e)) (numeric-power (bigdec b) (bigdec e))
+    :else (sql-power b e)))
 
 (defn sql-log2
   "log(base, x). PostgreSQL has only a NUMERIC two-argument log -- there
    is no float8 overload -- so both arguments coerce and the result is
    numeric even for `log(2,64)`."
   [b x]
-  (numeric-log (bigdec b) (bigdec x)))
+  (if (or (numspecial? b) (numspecial? x))
+    (numeric-double-result (sql-log (->num-double b) (->num-double x)))
+    (numeric-log (bigdec b) (bigdec x))))
 
 (defn- numeric-sqrt ^java.math.BigDecimal [^java.math.BigDecimal a]
   (when (neg? (.signum a))
@@ -2797,10 +2828,14 @@
    two differ by exactly the thing the name would hide."
   (null-safe
    (fn [a b]
-     (when (and (number? b) (zero? b)) (throw-division-by-zero))
-     (let [x (bigdec a) y (bigdec b)]
-       (.setScale (.divideToIntegralValue ^java.math.BigDecimal x ^java.math.BigDecimal y)
-                  0 java.math.RoundingMode/DOWN)))))
+     (if (or (numspecial? a) (numspecial? b))
+       (let [q (checked-div a b)]
+         (if (numspecial? q) q (.setScale ^java.math.BigDecimal q 0)))
+       (do
+         (when (and (number? b) (zero? b)) (throw-division-by-zero))
+         (let [x (bigdec a) y (bigdec b)]
+           (.setScale (.divideToIntegralValue ^java.math.BigDecimal x ^java.math.BigDecimal y)
+                      0 java.math.RoundingMode/DOWN)))))))
 
 (def sql-factorial
   (null-safe
@@ -2859,6 +2894,82 @@
   (fn [x & more]
     (if (types/numeric-special? x) :__null__ (apply f x more))))
 
+(defn pg-input-valid?
+  "Pure subset of pg_input_is_valid(text, regtype) for application-facing
+   scalar types. The function deliberately invokes the same input helpers as
+   casts; validation must not become a second, more permissive parser."
+  [value type-name]
+  (try
+    (let [s (str value)
+          [_ base modifier] (re-matches #"(?is)^\s*(.+?)(?:\(([^)]*)\))?\s*$"
+                                        (str type-name))
+          base (some-> base str/lower-case str/trim)
+          modifier (some-> modifier str/trim)
+          int-value (fn [lo hi]
+                      (let [n (Long/parseLong (str/trim s))]
+                        (<= lo n hi)))
+          float-value (fn []
+                        (or (some? (coerce/special-float s))
+                            (do (Double/parseDouble (str/trim s)) true)))
+          char-value (fn []
+                       (if modifier
+                         (let [limit (Long/parseLong modifier)
+                               unpadded (str/replace s #"\s+$" "")]
+                           (<= (count unpadded) limit))
+                         true))]
+      (boolean
+       (case base
+         ("bool" "boolean") (some? (coerce/parse-bool-token s))
+         ("int2" "smallint") (int-value -32768 32767)
+         ("int4" "int" "integer") (int-value -2147483648 2147483647)
+         ("int8" "bigint") (do (Long/parseLong (str/trim s)) true)
+         ("oid") (let [n (Long/parseLong (str/trim s))]
+                   (<= 0 n 4294967295))
+         ("float4" "real" "float8" "double precision") (float-value)
+         ("numeric" "decimal") (do (coerce/coerce-numeric s :bigdec) true)
+         ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
+         ("bit" "bit varying" "varbit")
+         (do (pg-bits/parse-bit-literal (str/trim s)
+                                        (contains? #{"bit varying" "varbit"} base))
+             (if modifier
+               (let [width (Long/parseLong modifier)]
+                 (if (= base "bit") (= (count (str/trim s)) width)
+                     (<= (count (str/trim s)) width)))
+               true))
+         ("char" "character" "varchar" "character varying" "text" "name")
+         (char-value)
+         false)))
+    (catch Throwable _ false)))
+
+(defn pg-input-error-info
+  "The four-column record returned by pg_input_error_info. This is kept
+   beside pg-input-valid? so both APIs share the same accepted scalar input
+   surface. SQL NULL is represented by the query engine's sentinel."
+  [value type-name]
+  (let [[_ raw-base modifier] (re-matches #"(?is)^\s*(.+?)(?:\(([^)]*)\))?\s*$"
+                                          (str type-name))
+        base (some-> raw-base str/lower-case str/trim)
+        display-type (case base
+                       ("bool" "boolean") "boolean"
+                       ("int2" "smallint") "smallint"
+                       ("int4" "int" "integer") "integer"
+                       ("int8" "bigint") "bigint"
+                       ("varchar" "character varying") "character varying"
+                       ("char" "character") "character"
+                       base)
+        display-type (if modifier
+                       (str display-type "(" (str/trim modifier) ")")
+                       display-type)
+        too-long? (and modifier
+                       (contains? #{"char" "character" "varchar" "character varying"} base))
+        message (if too-long?
+                  (str "value too long for type " display-type)
+                  (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
+        sqlstate (if too-long? "22001" "22P02")]
+    (if (pg-input-valid? value type-name)
+      [nil nil nil nil]
+      [message nil nil sqlstate])))
+
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,
    and result-OID inference.
@@ -2866,7 +2977,25 @@
    New functions should start here. The older execution/arity/OID tables are
    incrementally derived from this registry as their entries migrate, avoiding
    another bespoke lowering branch for each PostgreSQL function family."
-  {"jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
+  {;; PostgreSQL resolves an unknown literal in these homogeneous numeric
+   ;; calls from another, already-typed argument.  Lowering consumes this
+   ;; metadata before translating the argument expressions.
+   "div"              {:unknown-args :homogeneous}
+   "log"              {:unknown-args :homogeneous}
+   "mod"              {:unknown-args :homogeneous}
+   "power"            {:unknown-args :homogeneous}
+   "pow"              {:unknown-args :homogeneous}
+   "gcd"              {:unknown-args :homogeneous}
+   "lcm"              {:unknown-args :homogeneous}
+   ;; The first three arguments share a numeric overload; count is int4.
+   "width_bucket"     {:unknown-args {:homogeneous-prefix 3}}
+   "booleq"           {:impl = :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "boolne"           {:impl not= :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "pg_input_is_valid" {:impl pg-input-valid? :arities #{2}
+                        :strict? true :return-oid types/oid-bool}
+   "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}
                        :strict? true :return-oid types/oid-bool}
@@ -2917,23 +3046,25 @@
    ;; base, or tie-breaking.
    ;; Each of these has a numeric overload in PostgreSQL, selected
    ;; whenever an argument is numeric -- see the numeric-* fns above.
-   "sqrt"     (fn [x] (if (num-arg? x) (numeric-sqrt x) (sql-sqrt x)))
+   "sqrt"     (fn [x] (cond (numspecial? x) (numeric-special-unary sql-sqrt x)
+                            (num-arg? x) (numeric-sqrt x)
+                            :else (sql-sqrt x)))
    "cbrt"     sql-cbrt
-   "exp"      (fn [x] (if (num-arg? x) (numeric-exp x) (sql-exp x)))
-   "ln"       (fn [x] (if (num-arg? x) (numeric-ln x) (sql-ln x)))
-   "log"      (fn ([x] (if (num-arg? x)
-                         (numeric-log (java.math.BigDecimal. "10") x)
-                         (sql-log x)))
+   "exp"      (fn [x] (cond (numspecial? x) (numeric-special-unary sql-exp x)
+                            (num-arg? x) (numeric-exp x)
+                            :else (sql-exp x)))
+   "ln"       (fn [x] (cond (numspecial? x) (numeric-special-unary sql-ln x)
+                            (num-arg? x) (numeric-ln x)
+                            :else (sql-ln x)))
+   "log"      (fn ([x] (cond (numspecial? x) (numeric-special-unary sql-log x)
+                             (num-arg? x) (numeric-log (java.math.BigDecimal. "10") x)
+                             :else (sql-log x)))
                 ([b x] (sql-log2 b x)))
-   "log10"    (fn [x] (if (num-arg? x)
-                        (numeric-log (java.math.BigDecimal. "10") x)
-                        (sql-log10 x)))
-   "power"    (fn [b e] (if (or (num-arg? b) (num-arg? e))
-                          (numeric-power (bigdec b) (bigdec e))
-                          (sql-power b e)))
-   "pow"      (fn [b e] (if (or (num-arg? b) (num-arg? e))
-                          (numeric-power (bigdec b) (bigdec e))
-                          (sql-power b e)))
+   "log10"    (fn [x] (cond (numspecial? x) (numeric-special-unary sql-log10 x)
+                            (num-arg? x) (numeric-log (java.math.BigDecimal. "10") x)
+                            :else (sql-log10 x)))
+   "power"    sql-power-op
+   "pow"      sql-power-op
    "round"    (special-passthrough sql-round)
    "trunc"    (special-passthrough sql-trunc)
    "sign"     (special-sign sql-sign)
@@ -3092,7 +3223,10 @@
    `null-safe` at emit time. Java static methods are wrapped in thin fns
    so they're callable through the same path."
   (merge legacy-sql-fn->clj-fn
-         (update-vals sql-function-specs :impl)))
+         (into {} (keep (fn [[fname spec]]
+                          (when (contains? spec :impl)
+                            [fname (:impl spec)])))
+               sql-function-specs)))
 
 ;; ---------------------------------------------------------------------------
 ;; Declared arities
@@ -3148,7 +3282,10 @@
 (def sql-fn-arities
   "SQL function name → set of accepted argument counts. Absent = unchecked."
   (merge legacy-sql-fn-arities
-         (update-vals sql-function-specs :arities)))
+         (into {} (keep (fn [[fname spec]]
+                          (when (contains? spec :arities)
+                            [fname (:arities spec)])))
+               sql-function-specs)))
 
 (defn check-arity!
   "Raise 42883 when `argc` is not an accepted arity for `fname`. No-op

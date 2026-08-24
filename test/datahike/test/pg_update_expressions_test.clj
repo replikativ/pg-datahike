@@ -41,6 +41,9 @@
 (defn- exec! [^Connection c sql]
   (with-open [st (.createStatement c)] (.execute st sql)))
 
+(defn- update-count [^Connection c sql]
+  (with-open [st (.createStatement c)] (.executeUpdate st sql)))
+
 (defn- rows [^Connection c sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
     (let [n (.. rs getMetaData getColumnCount)]
@@ -136,3 +139,27 @@
     (is (= ["aax" nil] (col-after c 3 "UPDATE w SET s = s || 'x'")))
     (is (= ["t" nil] (col-after c 4 "UPDATE w SET b = (n > 5)")))
     (is (= ["5" "5"] (col-after c 2 "UPDATE w SET n = 5")))))
+
+(deftest update-from-an-ordinary-table
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE upd_target (id int, v int)")
+    (exec! c "CREATE TABLE upd_source (id int, flag int, delta int)")
+    (exec! c "INSERT INTO upd_target VALUES (1,4),(2,8),(3,-9),(4,-12)")
+    (exec! c (str "INSERT INTO upd_source VALUES "
+                  "(1,1,-1),(2,2,-2),(3,3,-3),(4,2,-4),(5,1,NULL),(6,NULL,-6)"))
+    (is (= 1
+           (update-count
+            c
+            (str "UPDATE upd_target SET v = CASE WHEN s.flag >= 2 "
+                 "THEN 2 * delta ELSE 3 * delta END "
+                 "FROM upd_source s WHERE delta = -upd_target.v"))))
+    (is (= [["1" "-8"] ["2" "8"] ["3" "-9"] ["4" "-12"]]
+           (rows c "SELECT id,v FROM upd_target ORDER BY id")))
+    (testing "an unqualified name owned by target and source is ambiguous"
+      (let [e (try
+                (exec! c (str "UPDATE upd_target SET v = 0 FROM upd_source s "
+                              "WHERE id = s.id"))
+                nil
+                (catch java.sql.SQLException e e))]
+        (is (some? e))
+        (is (= "42702" (.getSQLState ^java.sql.SQLException e)))))))

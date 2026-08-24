@@ -72,7 +72,9 @@
     (with-open [cp (connect-to "prod")
                 cs (connect-to "staging")]
       (is (= "prod"    (scalar cp "SELECT current_database()")))
-      (is (= "staging" (scalar cs "SELECT current_database()"))))))
+      (is (= "staging" (scalar cs "SELECT current_database()")))
+      (is (= "t" (scalar cp "SELECT current_catalog = current_database()")))
+      (is (= "t" (scalar cs "SELECT current_catalog = current_database()"))))))
 
 (deftest routing-isolates-tables
   (testing "prod only sees its table, staging only sees its own"

@@ -20,7 +20,8 @@
      — called by the wire handler to short-circuit common boot probes
        (pgjdbc's field-metadata, Hibernate's feature detection) into
        fast paths before JSqlParser even runs."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
@@ -250,6 +251,9 @@
      ;; PG identity-column kind: '' = not identity, 'a' = always,
      ;; 'd' = by default. We never emit identity columns.
      {:db/ident :pg_attribute/attidentity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; PostgreSQL type storage strategy: p=plain, m=main, x=extended.
+     ;; psql's \d+ renders this as Plain/Main/Extended.
+     {:db/ident :pg_attribute/attstorage :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      ;; atttypmod: encodes NUMERIC(p, s) precision/scale (and varchar(n)
      ;; length when we add it). -1 = unconstrained — what real PG
      ;; reports for plain `NUMERIC` or `TEXT` columns. Drives
@@ -445,9 +449,7 @@
      {:db/ident :pg_sequences/cache_size :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_sequences/last_value :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_sequences") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
-    ;; pg_views — list of all user-defined views. We don't store views
-    ;; so this is always empty, but ORMs (Metabase, pgAdmin) union it
-    ;; with pg_tables during table discovery; not having it raises.
+    ;; pg_views — populated from transactional :datahike.pg/view-* metadata.
     "pg_views"
     [{:db/ident :pg_views/schemaname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_views/viewname   :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -597,6 +599,31 @@
   (when-not (= value (- start increment))
     value))
 
+(defn- view-entities [db]
+  (if db
+    (mapv (fn [[eid name definition]]
+            (let [columns-str (:datahike.pg/view-columns
+                               (d/pull db '[:datahike.pg/view-columns] eid))]
+              {:name name
+               :definition definition
+               :columns (when columns-str
+                          (try (edn/read-string columns-str)
+                               (catch Exception _ nil)))}))
+          (d/q '{:find [?e ?name ?definition]
+                 :where [[?e :datahike.pg/view-name ?name]
+                         [?e :datahike.pg/view-definition ?definition]]}
+               db))
+    []))
+
+(defn- attribute-storage [oid]
+  (cond
+    (= oid types/oid-numeric) "m"
+    (or (contains? types/array-oid->element-oid oid)
+        (contains? #{types/oid-bytea types/oid-text types/oid-varchar
+                     types/oid-bpchar types/oid-json types/oid-jsonb}
+                   oid)) "x"
+    :else "p"))
+
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
    per-table body; library consumers add more via the registry."
@@ -653,30 +680,32 @@
                :pg_attribute/attrelid (long oid)
                :pg_attribute/attnotnull false
                :pg_attribute/attidentity ""
+               :pg_attribute/attstorage (attribute-storage (:oid f))
                :pg_attribute/atttypmod -1
                :pg_attribute/attisdropped false
                (pgs/row-marker-attr "pg_attribute") true}))
-       (for [[tname {:keys [columns]}] (sort-by key tables)
-             [idx col] (map-indexed vector columns)
-             :let [tbl-oid (or (pgs/table-oid cte-db tname)
+       (concat
+        (for [[tname {:keys [columns]}] (sort-by key tables)
+              [idx col] (map-indexed vector columns)
+              :let [tbl-oid (or (pgs/table-oid cte-db tname)
                                    ;; Pre-existing tables from before we
                                    ;; started tracking :pg/table-oid — fall
                                    ;; back to the attnum-derived composite
                                    ;; key convention (name → hash) so stale
                                    ;; data still has a stable attrelid.
-                               (Math/abs (.hashCode ^String tname)))
-                   pk? (= :db.unique/identity (:unique col))
+                                (Math/abs (.hashCode ^String tname)))
+                    pk? (= :db.unique/identity (:unique col))
                        ;; -1 = unconstrained (real PG's default for
                        ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
                        ;; columns get a positive value via DDL.
-                   typmod (long (or (get typmods (:attr col)) -1))]]
-         {:pg_attribute/attname (:name col)
+                    typmod (long (or (get typmods (:attr col)) -1))]]
+          {:pg_attribute/attname (:name col)
               ;; Cardinality-many columns project as PG arrays, so
               ;; their atttypid must be the array OID — pgjdbc reads
               ;; this for ResultSetMetaData and the field-metadata
               ;; cache key. Mirrors the OID inference in
               ;; oid-infer/column-oid.
-          :pg_attribute/atttypid
+           :pg_attribute/atttypid
           ;; `(:oid col)`, NOT a fresh derivation from :valuetype. The
           ;; column map already carries the authoritative OID from
           ;; `declared-col-oid`, which honours the `:pg/type` recorded at
@@ -687,20 +716,33 @@
           ;; pick a codec, so it is not cosmetic — and a date column's
           ;; binary encode then failed and silently shipped text bytes
           ;; labelled as binary.
-          (long (let [base (:oid col)]
-                  (if (and (= :db.cardinality/many (:cardinality col))
+           (long (let [base (:oid col)]
+                   (if (and (= :db.cardinality/many (:cardinality col))
                            ;; `_int4` already resolved to 1007 via
                            ;; :pg/type; promoting again would give int[][].
-                           (not (contains? types/array-oid->element-oid base)))
-                    (get types/element-oid->array-oid base types/oid-text-array)
-                    base)))
-          :pg_attribute/attnum (long (inc idx))
-          :pg_attribute/attrelid (long tbl-oid)
-          :pg_attribute/attnotnull pk?
-          :pg_attribute/attidentity ""
-          :pg_attribute/atttypmod typmod
-          :pg_attribute/attisdropped false
-          (pgs/row-marker-attr "pg_attribute") true})))
+                            (not (contains? types/array-oid->element-oid base)))
+                     (get types/element-oid->array-oid base types/oid-text-array)
+                     base)))
+           :pg_attribute/attnum (long (inc idx))
+           :pg_attribute/attrelid (long tbl-oid)
+           :pg_attribute/attnotnull pk?
+           :pg_attribute/attidentity ""
+           :pg_attribute/attstorage (attribute-storage (:oid col))
+           :pg_attribute/atttypmod typmod
+           :pg_attribute/attisdropped false
+           (pgs/row-marker-attr "pg_attribute") true})
+        (for [{:keys [name columns]} (view-entities cte-db)
+              [idx col] (map-indexed vector columns)]
+          {:pg_attribute/attname (:name col)
+           :pg_attribute/atttypid (long (:oid col))
+           :pg_attribute/attnum (long (inc idx))
+           :pg_attribute/attrelid (long (Math/abs (.hashCode ^String name)))
+           :pg_attribute/attnotnull false
+           :pg_attribute/attidentity ""
+           :pg_attribute/attstorage (attribute-storage (:oid col))
+           :pg_attribute/atttypmod (long (or (:typmod col) -1))
+           :pg_attribute/attisdropped false
+           (pgs/row-marker-attr "pg_attribute") true}))))
     "pg_namespace"
     [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
       :pg_namespace/nspowner pg-role-oid
@@ -845,14 +887,22 @@
       ;; pg_dump, psql's \ds and ORM introspection find them at all —
       ;; without a row here a sequence is invisible to anything that
       ;; walks pg_class (issue #26).
-      (mapv (fn [s]
-              (let [nm (:__seq__/name s)]
-                {:pg_class/oid (long (Math/abs (.hashCode ^String nm)))
-                 :pg_class/relname nm
-                 :pg_class/relnamespace 2200
-                 :pg_class/relkind "S"
-                 (pgs/row-marker-attr "pg_class") true}))
-            (sequence-entities cte-db))))
+      (into
+       (mapv (fn [s]
+               (let [nm (:__seq__/name s)]
+                 {:pg_class/oid (long (Math/abs (.hashCode ^String nm)))
+                  :pg_class/relname nm
+                  :pg_class/relnamespace 2200
+                  :pg_class/relkind "S"
+                  (pgs/row-marker-attr "pg_class") true}))
+             (sequence-entities cte-db))
+       (mapv (fn [{:keys [name]}]
+               {:pg_class/oid (long (Math/abs (.hashCode ^String name)))
+                :pg_class/relname name
+                :pg_class/relnamespace 2200
+                :pg_class/relkind "v"
+                (pgs/row-marker-attr "pg_class") true})
+             (view-entities cte-db)))))
     "pg_tables"
     (mapv (fn [t]
             {:pg_tables/schemaname "public"
@@ -865,6 +915,14 @@
              :pg_tables/rowsecurity false
              (pgs/row-marker-attr "pg_tables") true})
           (pgs/table-names user-schema))
+    "pg_views"
+    (mapv (fn [{view-name :name definition :definition}]
+            {:pg_views/schemaname "public"
+             :pg_views/viewname view-name
+             :pg_views/viewowner "datahike"
+             :pg_views/definition definition
+             (pgs/row-marker-attr "pg_views") true})
+          (view-entities cte-db))
     "information_schema_columns"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; udt_name in PG follows the underlying base-type convention from
@@ -1476,7 +1534,7 @@
     :try-advisory-xact-lock :try-advisory-lock
     :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
     :pg-backend-pid :txid-current :pg-sleep :pg-notify
-    :comment-on :lock-table :create-view :create-index
+    :comment-on :lock-table :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
@@ -1534,4 +1592,3 @@
 ;; ============================================================================
 ;; Main entry point
 ;; ============================================================================
-

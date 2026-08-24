@@ -81,6 +81,24 @@
   (with-open [st (.createStatement c)]
     (.executeUpdate st sql)))
 
+(deftest create-table-as-select-materializes-schema-and-rows
+  (with-open [c (jdbc)]
+    (is (zero? (update-count
+                c "CREATE TABLE eng_copy AS
+                     SELECT id, name FROM emp WHERE dept = 'Eng'")))
+    (is (= [["1" "Alice"] ["2" "Bob"] ["5" "Eve"]]
+           (rows c "SELECT id, name FROM eng_copy ORDER BY id")))
+    (is (= [["integer" "text"]]
+           (rows c "SELECT pg_typeof(id), pg_typeof(name) FROM eng_copy LIMIT 1")))))
+
+(deftest create-table-as-aggregate-result
+  (with-open [c (jdbc)]
+    (is (zero? (update-count
+                c "CREATE TABLE dept_counts AS
+                     SELECT dept, count(*) AS n FROM emp GROUP BY dept")))
+    (is (= [["Eng" "3"] ["Sales" "2"]]
+           (rows c "SELECT dept, n FROM dept_counts ORDER BY dept")))))
+
 ;; ---------------------------------------------------------------------------
 ;; Plain (non-recursive) CTE lifted to every DML path
 ;; ---------------------------------------------------------------------------
@@ -94,6 +112,37 @@
             ["Bob"   "85000"]]
            (rows c "WITH eng AS (SELECT name, salary FROM emp WHERE dept = 'Eng')
                     SELECT name, salary FROM eng ORDER BY salary DESC")))))
+
+(deftest explain-is-a-non-executing-api-boundary
+  (with-open [c (jdbc)
+              st (.createStatement c)]
+    (.execute st "BEGIN")
+    (with-open [rs (.executeQuery st "EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM emp")]
+      (is (= "QUERY PLAN" (.. rs getMetaData (getColumnLabel 1))))
+      (is (.next rs))
+      (is (re-find #"^Datahike Query " (.getString rs 1))))
+    ;; A supported EXPLAIN must not poison the surrounding transaction.
+    (is (= [["5"]] (rows c "SELECT count(*) FROM emp")))
+    (.execute st "COMMIT")
+    (let [e (is (thrown? SQLException
+                         (rows c "EXPLAIN (ANALYZE TRUE) SELECT * FROM emp")))]
+      (is (= "0A000" (.getSQLState ^SQLException e))))))
+
+(deftest values-cte-materializes-declared-columns
+  ;; PostgreSQL's scalar regression tests use this shape heavily for
+  ;; tables of bit patterns. Values is a Select body in JSqlParser, but it
+  ;; is not a PlainSelect; force-casting it in materialize-set-op! leaked a
+  ;; ClassCastException instead of producing the CTE rows.
+  (with-open [c (jdbc)]
+    (is (= [["1" "a"] ["2" "b"]]
+           (rows c "WITH testdata(bits, label) AS
+                      (VALUES (2, 'b'), (1, 'a'))
+                    SELECT bits, label FROM testdata ORDER BY bits")))
+    (is (= [["bit" "1"] ["bit" "2"]]
+           (rows c "WITH testdata(bits) AS
+                      (VALUES (x'00000001'), (x'00000002'))
+                    SELECT pg_typeof(bits), bits::integer
+                    FROM testdata ORDER BY bits")))))
 
 (deftest with-on-delete-resolves-cte-in-where
   ;; Before the materialize-withs! lift, parse-sql only ran the WITH-list

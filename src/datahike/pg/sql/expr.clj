@@ -88,8 +88,11 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
+(declare coerce-unknown-literal)
+(declare source-oid string-value-text)
 
 (declare translate-expr
+         column-value!
          translate-predicate
          translate-case-expr
          translate-cast-expr
@@ -101,6 +104,40 @@
          flatten-json-chain
          interpret-form
          parse-timestamp-string)
+
+(defn- numeric-target-for-oid [oid]
+  (case oid
+    21 :long
+    23 :long
+    20 :long
+    700 :float
+    701 :double
+    1700 :bigdec
+    nil))
+
+(defn- coerce-function-unknowns
+  "Apply a function spec's argument-resolution rule to raw AST operands.
+   PostgreSQL uses a known argument type to resolve unknown literals in
+   homogeneous calls (for example div(numeric, unknown))."
+  [ctx fname arg-exprs]
+  (let [rule (get-in fns/sql-function-specs [fname :unknown-args])
+        homogeneous-count (cond
+                            (= :homogeneous rule) (count arg-exprs)
+                            (map? rule) (:homogeneous-prefix rule))]
+    (if homogeneous-count
+      (let [homogeneous-args (take homogeneous-count arg-exprs)]
+        (if-let [target (some #(numeric-target-for-oid
+                                (try (source-oid ctx %)
+                                     (catch Throwable _ nil)))
+                              homogeneous-args)]
+          (mapv (fn [idx arg]
+                  (if (and (< idx homogeneous-count)
+                           (instance? StringValue arg))
+                    (coerce/coerce-numeric (string-value-text arg) target)
+                    arg))
+                (range) arg-exprs)
+          arg-exprs))
+      arg-exprs)))
 
 (def ^:dynamic *conjunctive-where*
   "True while translating top-level AND-ed conjuncts of a WHERE (or an
@@ -367,8 +404,13 @@
         ;; empty, so they arrived with no arguments at all.
         params (or (.getParameters f)
                    (some-> (.getNamedParameters f) .getExpressions))
-        raw-args (when params
-                   (mapv #(translate-expr ctx %) params))
+        arg-exprs (when params (vec params))
+        arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
+        raw-args (when arg-exprs
+                   (mapv #(if (instance? net.sf.jsqlparser.expression.Expression %)
+                            (translate-expr ctx %)
+                            %)
+                         arg-exprs))
         ;; `position(sub IN str)` names its operands the other way round
         ;; from the function it resolves to -- PostgreSQL's gram.y swaps
         ;; them before analysis, so do the same for the keyword form only.
@@ -384,6 +426,48 @@
         ;; and the result var is the operand a null-guard has to name.
         result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) args)]
     (cond
+      ;; SQL value functions with a precision modifier parse as ordinary
+      ;; Function nodes (`current_timestamp(0)`, `localtime(3)`). They are
+      ;; stable within one statement and are not catalog function lookups.
+      (contains? #{"current_timestamp" "current_time"
+                   "localtimestamp" "localtime"} fname)
+      (let [fn-param (symbol (str "?sql-time" (swap! (:var-counter ctx) inc)))
+            temporal-fn
+            (fn [& [precision]]
+              (let [^java.util.Date statement-time
+                    (or params/*statement-time* (java.util.Date.))
+                    instant (.toInstant statement-time)
+                    p (long (min 6 (max 0 (or precision 6))))
+                    factor (long (Math/pow 10 (- 9 p)))
+                    nanos (.getNano instant)
+                    truncated (.with instant java.time.temporal.ChronoField/NANO_OF_SECOND
+                                     (* (quot nanos factor) factor))
+                    zdt (.atZone truncated java.time.ZoneOffset/UTC)]
+                (case fname
+                  "current_timestamp" (java.util.Date/from truncated)
+                  "current_time" (.toLocalTime zdt)
+                  "localtimestamp" (.toLocalDateTime zdt)
+                  "localtime" (.toLocalTime zdt))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj temporal-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; PostgreSQL exposes date(timestamp) as the function-style spelling
+      ;; of an explicit cast. It is used by the upstream expressions suite
+      ;; and by application SQL generated independently of `::date`.
+      (= fname "date")
+      (let [fn-param (symbol (str "?date-cast" (swap! (:var-counter ctx) inc)))
+            date-fn (fn [v]
+                      (sql-cast/cast-scalar
+                       v "date" {:parse-timestamp parse-timestamp-string}))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj date-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; ROW(a, b, …) — anonymous composite constructor. JSqlParser parses
       ;; it as a Function named "row". Build a PgRecord at runtime from the
       ;; field values, inferring each field's OID from its value (nested
@@ -429,9 +513,8 @@
       ;; datahike.pg.sql.classify, but column-position use lands here.
       (= fname "current_database")
       (let [fn-param (symbol (str "?cur-db" (swap! (:var-counter ctx) inc)))
-            ;; Resolve the bound db-name from session-state if available;
-            ;; otherwise fall back to "datahike" (our default handler name).
-            impl-fn (fn [] "datahike")]
+            state params/*session-state*
+            impl-fn (fn [] (or (some-> state deref :db-name) "datahike"))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -439,16 +522,46 @@
 
       (= fname "current_schema")
       (let [fn-param (symbol (str "?cur-sch" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [] "public")]
+            state params/*session-state*
+            impl-fn (fn []
+                      (let [path (or (some-> state deref :search-path)
+                                     ["$user" "public"])]
+                        (or (first (filter #{"public" "pg_catalog"} path))
+                            :__null__)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
         result-var)
 
+      (= fname "pg_get_viewdef")
+      (let [fn-param (symbol (str "?viewdef" (swap! (:var-counter ctx) inc)))
+            definitions (if-let [db (:db ctx)]
+                          (into {}
+                                (map (fn [[name definition]]
+                                       [(long (Math/abs (.hashCode ^String name)))
+                                        definition]))
+                                (d/q '{:find [?name ?definition]
+                                       :where [[?e :datahike.pg/view-name ?name]
+                                               [?e :datahike.pg/view-definition ?definition]]}
+                                     db))
+                          {})
+            impl-fn (fn [oid & _]
+                      (let [oid (cond
+                                  (number? oid) (long oid)
+                                  (string? oid) (try (Long/parseLong oid)
+                                                     (catch Exception _ nil))
+                                  :else nil)]
+                        (or (get definitions oid) :__null__)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; NOW() → current timestamp as java.util.Date
       (= fname "now")
       (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-            now-fn (fn [] (java.util.Date.))]
+            now-fn (fn [] (or params/*statement-time* (java.util.Date.)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj now-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -2268,8 +2381,11 @@
         ;; PostgreSQL raises 22P02, and `'{"b":1,"a":2}'::jsonb` was not
         ;; canonicalised.
         json-cast (get {"json" :json "jsonb" :jsonb} type-str)
-        ;; Only the text targets consult this; see source-oid.
-        src-oid (when is-text? (source-oid ctx inner))]
+        ;; Text rendering and bit-to-number reinterpretation consult the
+        ;; declared source type. Bit columns are stored as digit strings in
+        ;; Datahike, so runtime class alone cannot distinguish bit B'10'
+        ;; (integer 2) from text '10' (integer 10).
+        src-oid (source-oid ctx inner)]
     (cond
       ;; Both types VALIDATE on input; only jsonb normalises after.
       json-cast
@@ -2570,7 +2686,12 @@
                   ;; cannot see a PgBit.
                   cast-fn (null-preserving
                            (fn [v] (sql-cast/cast-scalar
-                                    v type-str
+                                    (if (and (string? v)
+                                             (contains? #{types/oid-bit types/oid-varbit} src-oid))
+                                      (pg-bits/parse-bit-literal
+                                       v (= src-oid types/oid-varbit))
+                                      v)
+                                    type-str
                                     {:explicit? true
                                      :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj fn-param)
@@ -2672,8 +2793,16 @@
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
   (let [env (oid-env ctx)
         oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
-        l (oid (.getLeftExpression expr))
-        r (oid (.getRightExpression expr))]
+        left (.getLeftExpression expr)
+        right (.getRightExpression expr)
+        l0 (oid left)
+        r0 (oid right)
+        ;; A quoted literal is `unknown`, not text, during PostgreSQL
+        ;; operator lookup. Against float4 it therefore selects the
+        ;; float4/float4 operator; an actually typed integer literal still
+        ;; widens the expression to float8 as documented above.
+        l (if (instance? StringValue left) r0 l0)
+        r (if (instance? StringValue right) l0 r0)]
     (when (and (= l types/oid-float4) (= r types/oid-float4))
       (get '{+ datahike.pg.sql/sql-f4+
              - datahike.pg.sql/sql-f4-
@@ -2732,6 +2861,19 @@
   [x]
   (and (map? x) (or (:aggregate x) (:compound-agg x))))
 
+(defn- coerce-arithmetic-unknown
+  "Resolve a quoted unknown operand from the other arithmetic operand's
+   numeric OID. The column-specific path keeps index/type metadata behavior;
+   the OID fallback covers casts and function expressions such as
+   `'Infinity'::numeric / '0'`."
+  [ctx typed-expr unknown-expr]
+  (or (when (instance? Column typed-expr)
+        (coerce-unknown-literal ctx typed-expr unknown-expr))
+      (when (and (instance? StringValue unknown-expr)
+                 (not (pg-bits/bit-string-literal? unknown-expr)))
+        (when-let [target (numeric-target-for-oid (source-oid ctx typed-expr))]
+          (coerce/coerce-numeric (string-value-text unknown-expr) target)))))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -2743,6 +2885,7 @@
    server-side after the query."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
   (let [left-expr (.getLeftExpression expr)
+        right-expr (.getRightExpression expr)
         ;; PG puts prefix `~` at the generic-operator precedence level,
         ;; BELOW `+ - * / %` and `^`, so `~1 + 1` means `~(1 + 1)` = -3
         ;; and `~2 * 3` means `~(2 * 3)` = -7. JSqlParser binds the `~`
@@ -2755,10 +2898,28 @@
         ;; PG too — so they deliberately do NOT come through here.
         not-prefix? (and (instance? SignedExpression left-expr)
                          (= \~ (.getSign ^SignedExpression left-expr)))
-        l (translate-expr ctx (if not-prefix?
-                                (.getExpression ^SignedExpression left-expr)
-                                left-expr))
-        r (translate-expr ctx (.getRightExpression expr))]
+        effective-left (if not-prefix?
+                         (.getExpression ^SignedExpression left-expr)
+                         left-expr)
+        ;; A quoted literal starts as PostgreSQL's pseudo-type `unknown`.
+        ;; Once the other arithmetic operand establishes a column type,
+        ;; PostgreSQL runs that type's input function before invoking the
+        ;; operator. Comparisons already did this through
+        ;; coerce-unknown-literal, but arithmetic sent the raw String to
+        ;; Clojure's +/*/... and leaked a String->Number ClassCastException.
+        ;; Reuse the same typinput dispatch here for both operand orders.
+        coerced-left (coerce-arithmetic-unknown ctx right-expr effective-left)
+        coerced-right (coerce-arithmetic-unknown ctx effective-left right-expr)
+        ;; A successful typinput result is already a Datalog-compatible
+        ;; runtime value, not a JSqlParser node; do not feed it back through
+        ;; translate-expr (which quite correctly rejects raw Float/Double
+        ;; objects as AST expressions).
+        l (if (some? coerced-left)
+            coerced-left
+            (translate-expr ctx effective-left))
+        r (if (some? coerced-right)
+            coerced-right
+            (translate-expr ctx right-expr))]
     ;; `map?`, not agg-marker? -- a defrecord IS a map, so any
     ;; record-valued operand (a numeric NaN/Infinity carrier, a PgBit, a
     ;; PgArray) was mistaken for an aggregate marker and turned the whole
@@ -2792,8 +2953,16 @@
    than here, because the operand types generally aren't known until
    execution."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr fn-sym f]
-  (let [l (translate-expr ctx (.getLeftExpression expr))
-        r (translate-expr ctx (.getRightExpression expr))
+  (let [left-expr (.getLeftExpression expr)
+        right-expr (.getRightExpression expr)
+        coerced-left (coerce-arithmetic-unknown ctx right-expr left-expr)
+        coerced-right (coerce-arithmetic-unknown ctx left-expr right-expr)
+        l (if (some? coerced-left)
+            coerced-left
+            (translate-expr ctx left-expr))
+        r (if (some? coerced-right)
+            coerced-right
+            (translate-expr ctx right-expr))
         ;; Fold only when BOTH operands are already values. A column
         ;; reference translates to a Datalog VAR (a symbol), which is
         ;; neither a seq nor a map — folding on "not a seq" applied the
@@ -2887,7 +3056,7 @@
         attr-ref (fn [c] (if (= alias-name table-name)
                            (:attr c)
                            [:aliased alias-name (:attr c)]))
-        vars (mapv #(ctx/col-var! ctx (attr-ref %)) cols)
+        vars (mapv #(column-value! ctx (attr-ref %)) cols)
         meta-cols (mapv #(select-keys % [:name :oid]) cols)
         rec-fn (fn [& vals]
                  (pg-rec/->PgRecord
@@ -2967,6 +3136,71 @@
     (swap! (:nullable-vars ctx) conj out-var)
     out-var))
 
+(defn column-value!
+  "Return a column's SQL value variable. Most Datahike scalar values are
+   already their SQL representation. NUMERIC specials use reserved
+   BigDecimals at rest, while bit/varbit use canonical digit strings; both
+   are decoded at this boundary. Join planning and literal equality can still
+   bind the raw datom directly through col-var!."
+  [ctx resolved]
+  (let [raw (ctx/col-var! ctx resolved)
+        attr (ctx/attr-of ctx resolved)
+        attr-schema (get (:schema ctx) attr)
+        pg-type (or (:pg/type attr-schema)
+                    (params/pg-type-of-attr (:db ctx) attr))
+        decode-fn (cond
+                    (= :db.type/bigdec (:db/valueType attr-schema))
+                    types/numeric-storage->value
+
+                    (contains? #{"bit" "varbit"} pg-type)
+                    (fn [v]
+                      (if (string? v)
+                        (pg-bits/parse-bit-literal v (= "varbit" pg-type))
+                        v))
+
+                    :else nil)]
+    (if decode-fn
+      (let [decode-param (symbol (str "?column-decode" (swap! (:var-counter ctx) inc)))
+            decoded (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) raw)]
+        (swap! (:in-params ctx) conj decode-param)
+        (swap! (:in-args ctx) conj decode-fn)
+        (ctx/add-clause! ctx [(list decode-param raw) decoded])
+        decoded)
+      raw)))
+
+(defn- column-storage-value
+  "Encode a typed SQL value for direct binding against a stored datom."
+  [ctx resolved v]
+  (let [attr (ctx/attr-of ctx resolved)]
+    (if (= :db.type/bigdec (get-in (:schema ctx) [attr :db/valueType]))
+      (types/numeric-value->storage v)
+      v)))
+
+(defn- session-value-expr!
+  "Lower a bare SQL session value to a zero-argument Datalog input fn.
+   Capture the session atom now so prepared statements observe later changes."
+  [ctx prefix value-fn]
+  (let [result-var (ctx/fresh-var! ctx)
+        fn-param (symbol (str "?" prefix (swap! (:var-counter ctx) inc)))
+        state params/*session-state*
+        impl-fn (fn [] (or (value-fn state) :__null__))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj impl-fn)
+    (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+    result-var))
+
+(defn- session-current-schema [state]
+  (let [path (or (some-> state deref :search-path) ["$user" "public"])]
+    (first (filter #{"public" "pg_catalog"} path))))
+
+(defn- bare-session-value-column? [expr]
+  (and (instance? Column expr)
+       (nil? (.getTable ^Column expr))
+       (contains? #{"current_schema" "current_catalog"
+                    "current_user" "session_user" "user" "system_user"
+                    "localtime" "localtimestamp"}
+                  (str/lower-case (.getColumnName ^Column expr)))))
+
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
    Returns a Datalog-compatible value or variable symbol."
@@ -2976,7 +3210,17 @@
     (and (instance? Column expr)
          (= "current_schema" (.getColumnName ^Column expr))
          (nil? (.getTable ^Column expr)))
-    "public"
+    (session-value-expr! ctx "cur-sch" session-current-schema)
+
+    ;; CURRENT_CATALOG is the bare SQL-value spelling paired with
+    ;; current_database(). Generic expressions need both operands; the
+    ;; sole-projection classifier still supplies the real connection name.
+    (and (instance? Column expr)
+         (= "current_catalog" (str/lower-case (.getColumnName ^Column expr)))
+         (nil? (.getTable ^Column expr)))
+    (session-value-expr! ctx "cur-cat"
+                         (fn [state]
+                           (or (some-> state deref :db-name) "datahike")))
 
     ;; current_user / session_user / user / system_user as bare
     ;; identifiers (PG keywords; JSqlParser surfaces them as Column).
@@ -2986,6 +3230,29 @@
          (contains? #{"current_user" "session_user" "user" "system_user"}
                     (str/lower-case (.getColumnName ^Column expr))))
     "datahike"
+
+    ;; JSqlParser surfaces bare LOCALTIME / LOCALTIMESTAMP as unqualified
+    ;; Columns even though SQL defines them as value functions. This must
+    ;; precede the general Column branch below.
+    (and (instance? Column expr)
+         (nil? (.getTable ^Column expr))
+         (contains? #{"localtime" "localtimestamp"}
+                    (str/lower-case (.getColumnName ^Column expr))))
+    (let [key-str (str/lower-case (.getColumnName ^Column expr))
+          result-var (ctx/fresh-var! ctx)
+          fn-param (symbol (str "?sql-local-time" (swap! (:var-counter ctx) inc)))
+          value-fn (fn []
+                     (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))
+                           ^java.time.Instant instant (.toInstant st)
+                           ^java.time.ZonedDateTime zdt
+                           (.atZone instant java.time.ZoneOffset/UTC)]
+                       (if (= key-str "localtime")
+                         (.toLocalTime zdt)
+                         (.toLocalDateTime zdt))))]
+      (swap! (:in-params ctx) conj fn-param)
+      (swap! (:in-args ctx) conj value-fn)
+      (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+      result-var)
 
     ;; A bare identifier naming a table in scope is a PostgreSQL
     ;; WHOLE-ROW REFERENCE: `SELECT t FROM t` yields the composite
@@ -3000,6 +3267,22 @@
     (let [^Column col-expr expr
           tbl (.getTable col-expr)
           tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
+          col-name (unquote-ident (.getColumnName col-expr))
+          binding-owners (when (and (nil? tbl-name) (seq params/*from-source-aliases*))
+                           (params/binding-column-owners params/*from-bindings* col-name))
+          ;; UPDATE's target relation is represented in ctx, while each
+          ;; FROM row is a constant binding. Account for both scopes before
+          ;; choosing an unqualified FROM column.
+          target-column? (when (seq binding-owners)
+                           (try
+                             (let [resolved (ctx/resolve-column
+                                             col-expr (:table-aliases ctx)
+                                             (:default-table ctx)
+                                             (:col-overrides ctx)
+                                             (:derived-aliases ctx) (:ci-index ctx))
+                                   attr (ctx/attr-of ctx resolved)]
+                               (boolean (and attr (contains? (:schema ctx) attr))))
+                             (catch Exception _ false)))
           ;; JSqlParser parses `xs[2]` as a Column with a side-channel
           ;; `ArrayConstructor` carrying the indices: `(.getColumnName)`
           ;; returns the bare name `xs`; `(.getArrayConstructor)` is the
@@ -3011,8 +3294,17 @@
           ac (.getArrayConstructor col-expr)]
       (cond
         (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
-        ;; Bound by UPDATE ... FROM (VALUES ...) AS alias(cols)
-        (get-in params/*from-bindings* [tbl-name (unquote-ident (.getColumnName col-expr))])
+        ;; Bound by the current UPDATE ... FROM row.
+        (get-in params/*from-bindings* [tbl-name col-name])
+
+        (and (nil? tbl-name) (> (count binding-owners) 1))
+        (params/ambiguous-column! col-name)
+
+        (and (nil? tbl-name) (= 1 (count binding-owners)) target-column?)
+        (params/ambiguous-column! col-name)
+
+        (and (nil? tbl-name) (= 1 (count binding-owners)))
+        (get-in params/*from-bindings* [(first binding-owners) col-name])
 
         (some? ac)
         ;; Walk the bracket-expressions left-to-right, applying
@@ -3050,7 +3342,7 @@
                                            (:default-table ctx)
                                            (:col-overrides ctx)
                                            (:derived-aliases ctx) (:ci-index ctx))]
-          (ctx/col-var! ctx resolved))))
+          (column-value! ctx resolved))))
 
     (instance? AllColumns expr)
     :*
@@ -3561,15 +3853,17 @@
           now-fn (cond
                    (or (= key-str "current_timestamp")
                        (= key-str "now()"))
-                   (fn [] (java.util.Date.))
+                   (fn [] (or params/*statement-time* (java.util.Date.)))
                    ;; LocalDate (not a midnight java.util.Date) so the
                    ;; result renders as "yyyy-MM-dd" with OID 1082, like
                    ;; PG's date type.
                    (= key-str "current_date")
-                   (fn [] (java.time.LocalDate/now java.time.ZoneOffset/UTC))
+                   (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
+                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalDate)))
                    (= key-str "current_time")
-                   (fn [] (java.util.Date.))
-                   :else (fn [] (java.util.Date.)))
+                   (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
+                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalTime)))
+                   :else (fn [] (or params/*statement-time* (java.util.Date.))))
           fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj now-fn)
@@ -3620,7 +3914,7 @@
       (if (and (instance? Function left)
                (= "now" (str/lower-case (.getName ^Function left))))
         (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-              now-fn (fn [] (java.util.Date.))
+              now-fn (fn [] (or params/*statement-time* (java.util.Date.)))
               result-var (ctx/fresh-var! ctx)]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj now-fn)
@@ -4083,6 +4377,20 @@
                 (nil? (.getArrayConstructor ^Column right))
                 (not (jsonb-column? ctx left))
                 (not (jsonb-column? ctx right))
+                ;; UPDATE FROM values are constants for this invocation,
+                ;; not a second Datalog relation. This gate is deliberately
+                ;; UPDATE-specific; using *from-bindings* alone also catches
+                ;; correlated/LATERAL machinery and changes its join plans.
+                (not (and (seq params/*from-source-aliases*)
+                          (some (fn [^Column c]
+                                  (let [t (some-> (.getTable c) .getName unquote-ident)
+                                        cn (unquote-ident (.getColumnName c))]
+                                    (if t
+                                      (and (contains? params/*from-source-aliases* t)
+                                           (contains? (get params/*from-bindings* t) cn))
+                                      (seq (params/binding-column-owners
+                                            params/*from-bindings* cn)))))
+                                [left right])))
                 ;; NOT when either side names a table bound in
                 ;; *from-bindings*. Those columns are CONSTANTS supplied
                 ;; per outer row (UPDATE ... FROM (VALUES …), and a
@@ -4547,7 +4855,9 @@
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx) (:ci-index ctx))
-                pv (jsonb-canonical-operand ctx resolved (translate-expr ctx right))]
+                pv (->> (translate-expr ctx right)
+                        (jsonb-canonical-operand ctx resolved)
+                        (column-storage-value ctx resolved))]
             (cond
               (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
               (and (not (symbol? pv)) (ctx/bind-col-value! ctx resolved pv)) []
@@ -4573,8 +4883,9 @@
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
                   coerced (coerce-unknown-literal ctx left right)
-                  val (jsonb-canonical-operand
-                       ctx resolved (or coerced (translate-expr ctx right)))]
+                  val (->> (or coerced (translate-expr ctx right))
+                           (jsonb-canonical-operand ctx resolved)
+                           (column-storage-value ctx resolved))]
               (cond
                 (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var
@@ -4706,7 +5017,8 @@
     (let [^IsNullExpression e expr
           not-null? (.isNot e)
           inner (.getLeftExpression e)]
-      (if (instance? Column inner)
+      (if (and (instance? Column inner)
+               (not (bare-session-value-column? inner)))
         (let [^Column col inner
               resolved (ctx/resolve-column col
                                            (:table-aliases ctx)

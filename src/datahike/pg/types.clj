@@ -132,7 +132,7 @@
    :pg/type = this name so oid-infer round-trips the original OID rather than the
    storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
    binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
-  {18 "char", 26 "oid"})
+  {18 "char", 26 "oid", oid-bit "bit", oid-varbit "varbit"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -187,6 +187,7 @@
    ;; Consistent with `timetz`, which already falls through to string.
    ;; The :pg/type "time" hint still drives the wire OID (1083/1266).
    "time"              :db.type/string
+   "timetz"            :db.type/string
    "time without time zone"      :db.type/string
    "time with time zone"         :db.type/string
    ;; Binary
@@ -339,6 +340,13 @@
                  (when-let [arr-oid (element-oid->array-oid oid)]
                    [(str "_" (name kw)) arr-oid])))
          elem-kw->oid)))
+
+(def oid->pg-type-marker
+  "Inverse of `pg-name->oid`: wire OID to the canonical string persisted in
+   `:pg/type`.  This is deliberately distinct from `oid->pg-name`, whose
+   values are PostgreSQL display names such as `integer` and `double
+   precision`; persisted hints must be resolvable by `pg-name->oid` again."
+  (into {} (map (fn [[pg-name oid]] [oid pg-name])) pg-name->oid))
 
 (def dh-type->oid
   "Map Datahike :db/valueType to PostgreSQL type OID for wire protocol."
@@ -501,7 +509,7 @@
 
 (def cast-time-types
   "SQL type names that cast to a TIME (no date component)."
-  #{"time" "time without time zone" "time with time zone"})
+  #{"time" "timetz" "time without time zone" "time with time zone"})
 
 (def cast-uuid-types
   "SQL type names that cast to UUID."
@@ -819,6 +827,8 @@
    oid-varchar     :db.type/string
    oid-bpchar      :db.type/string
    oid-name        :db.type/string
+   oid-bit         :db.type/string
+   oid-varbit      :db.type/string
    oid-date        :db.type/instant
    oid-time        :db.type/instant
    oid-timestamp   :db.type/instant
@@ -903,8 +913,36 @@
 
 (defn format-type
   "PostgreSQL format_type(oid, typmod) — return type name for an OID."
-  [type-oid _typmod]
-  (get oid->pg-name (if (number? type-oid) (long type-oid) 0) "text"))
+  [type-oid typmod]
+  (let [oid (cond
+              (number? type-oid) (long type-oid)
+              (string? type-oid) (try (Long/parseLong type-oid)
+                                      (catch Exception _ 0))
+              :else 0)
+        tm (cond
+             (number? typmod) (long typmod)
+             (string? typmod) (try (Long/parseLong typmod)
+                                   (catch Exception _ -1))
+             :else -1)
+        base (if (= oid oid-bpchar)
+               "bpchar"
+               (get oid->pg-name oid "text"))]
+    (if (neg? tm)
+      base
+      (cond
+        (= oid oid-numeric)
+        (let [[precision scale] (decode-numeric-typmod tm)]
+          (if precision (format "numeric(%d,%d)" precision scale) base))
+
+        (= oid oid-varchar) (format "character varying(%d)" (max 0 (- tm 4)))
+        (= oid oid-bpchar)  (format "character(%d)" (max 0 (- tm 4)))
+        (= oid oid-bit)     (format "bit(%d)" tm)
+        (= oid oid-varbit)  (format "bit varying(%d)" tm)
+        (= oid oid-time)    (format "time(%d) without time zone" tm)
+        (= oid 1266)        (format "time(%d) with time zone" tm)
+        (= oid oid-timestamp)   (format "timestamp(%d) without time zone" tm)
+        (= oid oid-timestamptz) (format "timestamp(%d) with time zone" tm)
+        :else base))))
 
 (defn wire-size
   "Return the wire protocol type size for an OID."
@@ -985,6 +1023,54 @@
 (def nan-numeric (numeric-special :nan))
 (def inf-numeric (numeric-special :inf))
 (def -inf-numeric (numeric-special :-inf))
+
+;; Datahike's :db.type/bigdec quite deliberately accepts BigDecimal only,
+;; while PostgreSQL NUMERIC also has NaN and +/-Infinity. Keep those values
+;; in the ordinary AVET/EAVT numeric index by assigning them three BigDecimal
+;; representatives outside PostgreSQL's finite NUMERIC domain. PostgreSQL's
+;; on-disk numeric weight is bounded (a finite value cannot reach 10^200000),
+;; so this mapping is injective over values the SQL API is allowed to accept.
+;; The representatives preserve PostgreSQL's total order:
+;;
+;;     NaN > Infinity > every finite value > -Infinity
+;;
+;; They are an SQL storage detail, not a new Datahike value type. Decode them
+;; whenever a numeric datom crosses back into expression evaluation.
+(def ^:private numeric-special-storage-scale -200000)
+
+(def ^:private numeric-special->storage-map
+  {:nan  (java.math.BigDecimal. (java.math.BigInteger/valueOf 3)
+                                numeric-special-storage-scale)
+   :inf  (java.math.BigDecimal. (java.math.BigInteger/valueOf 2)
+                                numeric-special-storage-scale)
+   :-inf (java.math.BigDecimal. (java.math.BigInteger/valueOf -2)
+                                numeric-special-storage-scale)})
+
+(def ^:private numeric-storage->special-map
+  (into {} (map (fn [[kind value]] [value (numeric-special kind)]))
+        numeric-special->storage-map))
+
+(defn numeric-value->storage
+  "Encode a PgNumericSpecial for a :db.type/bigdec attribute. Finite
+   numeric values pass through unchanged."
+  [v]
+  (if (numeric-special? v)
+    (get numeric-special->storage-map (:kind v))
+    v))
+
+(defn numeric-special-storage?
+  "True when v is one of the three reserved at-rest NUMERIC values."
+  [v]
+  (and (instance? java.math.BigDecimal v)
+       (contains? numeric-storage->special-map v)))
+
+(defn numeric-storage->value
+  "Decode a reserved numeric BigDecimal to its SQL value. Ordinary values
+   (and the SQL NULL sentinel used inside translated queries) pass through."
+  [v]
+  (if (instance? java.math.BigDecimal v)
+    (get numeric-storage->special-map v v)
+    v))
 
 (defn numeric-special->double ^double [x]
   (case (:kind x)

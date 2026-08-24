@@ -467,7 +467,8 @@
   [toks]
   (let [clause #{"from" "where" "group" "having" "order"
                  "limit" "offset" "union" "except" "intersect"
-                 "join" "window" "fetch" "for"}]
+                 "join" "window" "fetch" "for"}
+        predicate #{"is" "in" "not" "between" "like" "ilike"}]
     (loop [ts toks, depth 0]
       (if (empty? ts)
         true
@@ -477,11 +478,16 @@
             (= ")" tx) (recur (rest ts) (max 0 (dec depth)))
             (pos? depth) (recur (rest ts) depth)
             (= "," tx) false
+            ;; Any top-level operator means the leading system value is
+            ;; merely an operand (`current_catalog = current_database()`,
+            ;; `now() + interval ...`), not the complete projection.
+            (= :op (:type t)) false
             ;; A trailing cast (`now()::date`) changes the result type
             ;; and column name — the hijack handlers hardcode both, so
             ;; route through the translator (issue #13).
             (= "::" tx) false
             (kw-in? t clause) false
+            (kw-in? t predicate) false
             :else (recur (rest ts) depth)))))))
 
 (defn- classify-select
@@ -640,7 +646,9 @@
                              :tag "CREATE EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
       (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
-      (kw=? t1 "view")      {:kind :create-view}
+      ;; Views are real database objects now; route through JSqlParser and
+      ;; the transactional DDL path instead of acknowledging a no-op.
+      (kw=? t1 "view")      {:kind :generic-sql}
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
       (kw=? t1 "sequence")  (classify-create-sequence (rest toks))
@@ -1273,8 +1281,17 @@
                     (= :string (:type first-val)) (:value first-val)
                     (= :number (:type first-val)) (:text first-val)
                     (ident-tok? first-val) (ident-text first-val)
-                    :else nil)]
-    {:kind :set :var var-name :value value-str}))
+                    :else nil)
+        result {:kind :set :var var-name :value value-str}]
+    (cond-> result
+      (= "search_path" var-name)
+      (assoc :values
+             (vec (keep (fn [t]
+                          (cond
+                            (= :string (:type t)) (:value t)
+                            (ident-tok? t) (ident-text t)
+                            :else nil))
+                        after-eq))))))
 
 (defn- classify-set
   "SET name = value / SET TIME ZONE '…' / SET SESSION AUTHORIZATION …

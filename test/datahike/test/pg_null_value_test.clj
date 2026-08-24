@@ -167,7 +167,10 @@
            (col2 c "SELECT id, CASE WHEN f THEN 'y' ELSE 'n' END FROM bt ORDER BY id")))
     (testing "no ELSE means NULL"
       (is (= ["y" "y" "y" nil nil nil nil nil nil]
-             (col2 c "SELECT id, CASE WHEN f THEN 'y' END FROM bt ORDER BY id"))))))
+             (col2 c "SELECT id, CASE WHEN f THEN 'y' END FROM bt ORDER BY id"))))
+    (testing "a table-free CASE with a runtime function uses general lowering"
+      (is (= [nil]
+             (col2 c "SELECT '7', CASE WHEN random() < 0 THEN 1 END"))))))
 
 (deftest case-returns-a-matched-branch-even-when-its-value-is-falsy
   (with-open [c (jdbc)]

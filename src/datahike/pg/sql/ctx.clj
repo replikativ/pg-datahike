@@ -65,6 +65,21 @@
    (let [table-ref (.getTable col)
          table-alias (when table-ref (params/unquote-ident (.getName ^Table table-ref)))
          col-name0 (params/unquote-ident (.getColumnName col))
+         ;; A relation alias may rename its output columns (`v AS v1(x1)`).
+         ;; Those names do not exist in the schema's case-folded index, so
+         ;; unqualified resolution must search alias-scoped overrides first.
+         override-owners (when (nil? table-alias)
+                           (into #{} (keep (fn [[alias cols]]
+                                             (when (contains? cols col-name0) alias)))
+                                 col-overrides))
+         override-owner (cond
+                          (= 1 (count override-owners)) (first override-owners)
+                          (> (count override-owners) 1)
+                          (throw (ex-info (str "column reference \"" col-name0
+                                               "\" is ambiguous")
+                                          {:error :ambiguous-column
+                                           :column col-name0}))
+                          :else nil)
          ;; An UNQUALIFIED name is resolved against every relation in
          ;; scope, not just the default table. PostgreSQL searches all
          ;; FROM items and raises 42702 when more than one claims the
@@ -79,8 +94,11 @@
          ;; exactly as before. Relations absent from `ci` (catalog and
          ;; speculative tables) simply do not become candidates, so this
          ;; can only ever turn a failure into a resolution.
-         owner (when (and (nil? table-alias) ci (not= "db_id" col-name0)
-                          (> (count (set (vals table-aliases))) 1))
+         relation-aliases (:relation-aliases (meta table-aliases))
+         owner (or override-owner
+                   (when (and (nil? table-alias) ci (not= "db_id" col-name0)
+                              (or (> (count relation-aliases) 1)
+                                  (> (count (set (vals table-aliases))) 1)))
                  ;; Group by the resolved ATTRIBUTE, not by alias.
                  ;; `table-aliases` registers BOTH `{alias -> name}` and
                  ;; `{name -> name}` for ONE from item, so `FROM pg_type t`
@@ -95,16 +113,38 @@
                  ;; registered twice from two of them. PostgreSQL does
                  ;; raise there. Narrow, and the alternative is a false
                  ;; positive on every aliased single-table query.
-                 (let [by-attr (reduce (fn [m [ak tn]]
-                                         (if-let [a (pgs/canonical-attr ci tn col-name0)]
-                                           (if (pgs/ambiguous? a)
-                                             m
-                                             (update m a (fnil conj #{}) ak))
-                                           m))
-                                       {} table-aliases)]
-                   (cond
-                     (= 1 (count by-attr))
-                     (let [aks (val (first by-attr))]
+                     (let [by-attr (reduce (fn [m [ak tn]]
+                                             (if-let [a (pgs/canonical-attr ci tn col-name0)]
+                                               (if (pgs/ambiguous? a)
+                                                 m
+                                                 (update m a (fnil conj #{}) ak))
+                                               m))
+                                           {} table-aliases)
+                           ;; A map cannot represent relation OCCURRENCES:
+                           ;; `FROM t x, t y` has one distinct value (`t`),
+                           ;; although an unqualified `col` is ambiguous.
+                           ;; translate-select attaches the ordered aliases
+                           ;; from the FROM list as metadata so self-joins are
+                           ;; checked without mistaking `{t t, x t}` from one
+                           ;; aliased occurrence for two relations.
+                           occurrence-candidates
+                           (when (seq relation-aliases)
+                             (into []
+                                   (keep (fn [ak]
+                                           (let [tn (get table-aliases ak ak)]
+                                             (when-let [a (pgs/canonical-attr ci tn col-name0)]
+                                               (when-not (pgs/ambiguous? a) [ak a])))))
+                                   relation-aliases))]
+                       (cond
+                         (= 1 (count occurrence-candidates))
+                         (ffirst occurrence-candidates)
+
+                         (> (count occurrence-candidates) 1)
+                         (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
+                                         {:error :ambiguous-column :column col-name0}))
+
+                         (= 1 (count by-attr))
+                         (let [aks (val (first by-attr))]
                        ;; Prefer the default table's own alias when it is
                        ;; one of them, so the emitted form stays the plain
                        ;; keyword rather than an `[:aliased …]` wrapper.
@@ -115,16 +155,16 @@
                        ;; differs from the user's alias that produced a
                        ;; SECOND entity var for the same relation, and the
                        ;; query cross-joined it with itself.
-                       (cond
-                         (contains? aks default-table) default-table
-                         :else (or (first (sort (filter #(not= % (get table-aliases %)) aks)))
-                                   (first (sort aks)))))
+                           (cond
+                             (contains? aks default-table) default-table
+                             :else (or (first (sort (filter #(not= % (get table-aliases %)) aks)))
+                                       (first (sort aks)))))
 
-                     (> (count by-attr) 1)
-                     (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
-                                     {:error :ambiguous-column :column col-name0}))
+                         (> (count by-attr) 1)
+                         (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
+                                         {:error :ambiguous-column :column col-name0}))
 
-                     :else nil)))
+                         :else nil))))
          alias-key (or table-alias owner default-table)
          table-name (get table-aliases alias-key alias-key)
          col-name (params/unquote-ident (.getColumnName col))
@@ -144,7 +184,8 @@
        ;; a quoted identifier still select precisely: `"firstName"`
        ;; hits `:person/firstName` directly, and `"firstname"` hits
        ;; `:person/firstname` if that is what exists.
-       (let [kw (or (get-in col-overrides [table-name col-name])
+       (let [kw (or (get-in col-overrides [alias-key col-name])
+                    (get-in col-overrides [table-name col-name])
                     (when-let [a (pgs/canonical-attr ci table-name col-name)]
                       (when-not (pgs/ambiguous? a) a))
                     (keyword table-name col-name))]
@@ -257,7 +298,8 @@
                   Drives the `:col-overrides` lookup used by `resolve-column`
                   so `WHERE <renamed-col>` and `JOIN … ON …` resolve hint-
                   mapped columns to their real attribute keywords."
-  [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases ref-targets computed-aliases]}]]
+  [schema table-aliases default-table & [{:keys [db parse-sql hints derived-aliases ref-targets
+                                                 computed-aliases column-overrides]}]]
   {:schema        schema
    :table-aliases table-aliases
    :default-table default-table
@@ -302,13 +344,15 @@
    ;; level attribute in O(1). Only entries for columns with a
    ;; :datahike.pg/column rename — `resolve-column` falls back to the
    ;; default name-from-ident path for unhinted columns.
-   :col-overrides (reduce-kv (fn [acc ident h]
-                               (if-let [col (:column h)]
-                                 (let [ns (namespace ident)]
-                                   (assoc-in acc [ns col] ident))
-                                 acc))
-                             {}
-                             (or hints {}))
+   :col-overrides (merge-with merge
+                              (reduce-kv (fn [acc ident h]
+                                           (if-let [col (:column h)]
+                                             (let [ns (namespace ident)]
+                                               (assoc-in acc [ns col] ident))
+                                             acc))
+                                         {}
+                                         (or hints {}))
+                              (or column-overrides {}))
    :var-counter   (atom 0)
    :col->var      (atom {})       ;; [alias-key attr-keyword] or attr-keyword → ?var-symbol
    :entity-vars   (atom {})       ;; alias-key → ?entity-var

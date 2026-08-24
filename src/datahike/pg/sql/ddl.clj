@@ -592,10 +592,12 @@
                                  (when-let [n (types/parse-char-length raw-type)]
                                    (+ n 4)))
                                char-pg-type
-                               (when char-typmod
-                                 (let [b (types/base-type-name-of raw-type)]
-                                   (if (contains? #{"char" "character" "bpchar"} b)
-                                     "bpchar" "varchar")))
+                               (let [b (types/base-type-name-of raw-type)]
+                                 (cond
+                                   (contains? #{"char" "character" "bpchar"} b) "bpchar"
+                                   (contains? #{"varchar" "character varying"} b) "varchar"
+                                   (= "name" b) "name"
+                                   :else nil))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; NOT NULL inline; PK is implicitly NOT NULL

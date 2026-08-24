@@ -302,7 +302,10 @@
   {:db.type/long    (safe #(Long/parseLong (.trim ^String %)))
    :db.type/double  (safe #(Double/parseDouble (.trim ^String %)))
    :db.type/float   (safe #(.floatValue ^Number (Double/parseDouble (.trim ^String %))))
-   :db.type/bigdec  (safe #(BigDecimal. (.trim ^String %)))
+   ;; NUMERIC's typinput accepts NaN and +/-Infinity as well as finite
+   ;; decimals. coerce-numeric returns the PgNumericSpecial carrier for
+   ;; those spellings and BigDecimal otherwise.
+   :db.type/bigdec  (safe #(coerce-numeric % :bigdec))
    :db.type/boolean parse-bool-token
    :db.type/uuid    (safe #(java.util.UUID/fromString (.trim ^String %)))
    :db.type/string  identity

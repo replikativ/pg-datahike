@@ -134,6 +134,20 @@
    a JSqlParser AST and re-translate on each Execute)."
   nil)
 
+(def ^:dynamic *statement-time*
+  "The wall-clock instant captured once at statement execution. SQL stable
+   value functions (now/current_timestamp/current_date/current_time and
+   their local variants) derive from this value so sibling calls agree.
+   Nil during parsing and non-server use."
+  nil)
+
+(def ^:dynamic *session-state*
+  "The current pgwire connection's session-state atom while SQL is being
+   translated. Session-valued expressions capture the atom (rather than a
+   snapshot) so a prepared statement observes later SET/RESET changes. Nil
+   for callers that use the SQL translator without a server session."
+  nil)
+
 (def ^:dynamic *parse-db*
   "Bound by parse-sql to the live db snapshot so downstream helpers
    (e.g. pg-type-of-attr) can consult Datahike for attribute metadata
@@ -150,11 +164,35 @@
   nil)
 
 (def ^:dynamic *from-bindings*
-  "When bound (by build-update-tx handling UPDATE ... FROM (VALUES ...)),
+  "When bound (by build-update-tx handling UPDATE ... FROM),
    a map {alias-name → {col-name → literal}} used by the Column branches
    of translate-expr and eval-update-expr to substitute row-level values
-   for references like `__tmp.col` to the VALUES alias."
+   for references like `src.col` to the current FROM row."
   nil)
+
+(def ^:dynamic *from-source-aliases*
+  "Aliases in *from-bindings* that belong to an UPDATE's FROM clause.
+   The binding map can additionally contain the materialised target row
+   for correlated expressions; unqualified SQL lookup must not mistake
+   that implementation detail for another FROM item."
+  nil)
+
+(defn binding-column-owners
+  "Return the aliases in `bindings` that expose `col-name`.
+
+   Presence is tested with contains? so a SQL NULL remains a found value."
+  [bindings col-name]
+  (into [] (keep (fn [[alias row]]
+                   (when (and (or (nil? *from-source-aliases*)
+                                  (contains? *from-source-aliases* alias))
+                              (contains? row col-name))
+                     alias)))
+        bindings))
+
+(defn ambiguous-column!
+  [col-name]
+  (throw (ex-info (str "column reference \"" col-name "\" is ambiguous")
+                  {:error :ambiguous-column :column col-name :sqlstate "42702"})))
 
 (def ^:dynamic *lateral-outer-aliases*
   "When bound (by the correlated-LATERAL row producer), the set of OUTER

@@ -363,6 +363,9 @@
     (is (= [["bigint"]]              (rows (.execute *handler* "SELECT format_type(20, -1)"))))
     (is (= [["text"]]                (rows (.execute *handler* "SELECT format_type(25, -1)"))))
     (is (= [["character varying"]]   (rows (.execute *handler* "SELECT format_type(1043, -1)"))))
+    (is (= [["bpchar"]]              (rows (.execute *handler* "SELECT format_type(1042, -1)"))))
+    (is (= [["character(14)"]]       (rows (.execute *handler* "SELECT format_type(1042, 18)"))))
+    (is (= [["numeric(8,2)"]]        (rows (.execute *handler* "SELECT format_type(1700, 524294)"))))
     (is (= [["boolean"]]             (rows (.execute *handler* "SELECT format_type(16, -1)")))))
 
   (testing "format_type composes inside SELECT against pg_type"
@@ -1761,6 +1764,33 @@
       (is (some? (err r)))
       (is (= "22P02" (sqlstate r))))))
 
+(deftest test-postgres-boolean-comparison-functions
+  (is (= [["t" "t"]]
+         (rows (.execute *handler* "SELECT booleq(true, true), boolne(true, false)"))))
+  (is (= [["Charlie"]]
+         (rows (.execute *handler*
+                         "SELECT name FROM person WHERE boolne(age > 30, false)")))))
+
+(deftest test-pg-input-is-valid
+  (is (= [["t" "f" "t" "f"]]
+         (rows (.execute *handler*
+                         (str "SELECT pg_input_is_valid('yes', 'bool'), "
+                              "pg_input_is_valid('junk', 'bool'), "
+                              "pg_input_is_valid('32767', 'int2'), "
+                              "pg_input_is_valid('32768', 'int2')")))))
+  (is (= [["t" "f" "t" "f"]]
+         (rows (.execute *handler*
+                         (str "SELECT pg_input_is_valid('abcd  ', 'char(4)'), "
+                              "pg_input_is_valid('abcde', 'varchar(4)'), "
+                              "pg_input_is_valid('Infinity', 'numeric'), "
+                              "pg_input_is_valid('nope', 'uuid')"))))))
+
+(deftest test-pg-input-error-info
+  (is (= [["invalid input syntax for type boolean: \"junk\""
+           nil nil "22P02"]]
+         (rows (.execute *handler*
+                         "SELECT * FROM pg_input_error_info('junk', 'bool')")))))
+
 (deftest test-current-timestamp-cast-and-render
   (testing "current_timestamp::date returns one row rendered as a date (issue #13)"
     (let [r (.execute *handler* "SELECT current_timestamp::date")]
@@ -1775,6 +1805,109 @@
     (let [r (.execute *handler* "SELECT current_date")]
       (is (nil? (err r)))
       (is (re-matches #"\d{4}-\d{2}-\d{2}" (ffirst (rows r)))))))
+
+(deftest test-sql-temporal-value-functions
+  (testing "stable value functions share one statement clock"
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT date(now())::text = current_date::text"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT current_timestamp = now()"))))
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT now()::timetz::text = current_time::text"))))
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT now()::time::text = localtime::text"))))
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT now()::timestamp::text = localtimestamp::text")))))
+  (testing "precision-bearing keyword forms lower as value functions"
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT length(current_timestamp::text) >= length(current_timestamp(0)::text)"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT current_timestamp = current_timestamp(7)"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT localtime = localtime(7)"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT localtimestamp = localtimestamp(7)"))))))
+
+(deftest test-current-catalog-inside-expression
+  (is (= [["t"]]
+         (rows (.execute *handler*
+                         "SELECT current_catalog = current_database()")))))
+
+(deftest test-current-schema-follows-search-path
+  (let [prepared (.parse *handler*
+                         "SELECT coalesce(current_schema, 'missing')"
+                         (int-array 0))]
+    (is (= [["public"]] (rows (.execute *handler* "SELECT current_schema"))))
+    (is (nil? (err (.execute *handler* "SET search_path = notme"))))
+    (is (= [[nil]] (rows (.execute *handler* "SELECT current_schema"))))
+    (is (= [["t"]] (rows (.execute *handler* "SELECT current_schema IS NULL"))))
+    (is (= [["missing"]]
+           (rows (.executePrepared *handler* prepared (object-array [nil])))))
+    (is (nil? (err (.execute *handler* "SET search_path = notme, pg_catalog"))))
+    (is (= [["pg_catalog"]] (rows (.execute *handler* "SELECT current_schema"))))
+    (is (= [["notme, pg_catalog"]]
+           (rows (.execute *handler* "SHOW search_path"))))
+    (is (nil? (err (.execute *handler* "RESET search_path"))))
+    (is (= [["public"]] (rows (.execute *handler* "SELECT current_schema"))))))
+
+(deftest test-create-view-is-live-and-transactional
+  (is (nil? (err (.execute *handler* "CREATE TABLE view_base (id int, n numeric)"))))
+  (is (nil? (err (.execute *handler* "INSERT INTO view_base VALUES (1, 1.25)"))))
+  (is (nil? (err (.execute *handler*
+                           (str "CREATE VIEW live_view AS "
+                                "SELECT id, n::numeric(8,2) AS amount FROM view_base")))))
+  (is (= [["1" "1.25"]]
+         (rows (.execute *handler* "SELECT * FROM live_view ORDER BY id"))))
+  (is (= [["live_view"]]
+         (rows (.execute *handler*
+                         "SELECT viewname FROM pg_views WHERE viewname = 'live_view'"))))
+  (is (= [["v"]]
+         (rows (.execute *handler*
+                         "SELECT relkind FROM pg_class WHERE relname = 'live_view'"))))
+  (is (= [["id" "23" "p"] ["amount" "1700" "m"]]
+         (rows (.execute *handler*
+                         (str "SELECT a.attname, a.atttypid, a.attstorage FROM pg_attribute a "
+                              "JOIN pg_class c ON a.attrelid = c.oid "
+                              "WHERE c.relname = 'live_view' ORDER BY a.attnum")))))
+  (is (= [["integer"] ["numeric(8,2)"]]
+         (rows (.execute *handler*
+                         (str "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                              "JOIN pg_class c ON a.attrelid = c.oid "
+                              "WHERE c.relname = 'live_view' ORDER BY a.attnum")))))
+  (is (.contains ^String
+       (first-val (.execute *handler*
+                            (str "SELECT pg_get_viewdef(oid::oid, true) FROM pg_class "
+                                 "WHERE relname = 'live_view'")))
+                 "view_base"))
+  (is (= [["1" "1.25"]]
+         (rows (.execute *handler*
+                         (str "SELECT b.id, v.amount FROM view_base b "
+                              "JOIN live_view v ON b.id = v.id WHERE b.id = 1")))))
+  (testing "unsupported column-name lists fail explicitly"
+    (is (= "0A000"
+           (sqlstate (.execute *handler*
+                               "CREATE VIEW named_view (view_id) AS SELECT id FROM view_base")))))
+  (is (nil? (err (.execute *handler* "INSERT INTO view_base VALUES (2, 2.50)"))))
+  (is (= [["2" "2.50"]]
+         (rows (.execute *handler* "SELECT id, amount FROM live_view WHERE id = 2"))))
+  (is (nil? (err (.execute *handler*
+                           "CREATE OR REPLACE VIEW live_view AS SELECT id FROM view_base"))))
+  (is (= [["1"] ["2"]]
+         (rows (.execute *handler* "SELECT * FROM live_view ORDER BY id"))))
+  (testing "view metadata follows transaction rollback"
+    (is (nil? (err (.execute *handler* "BEGIN"))))
+    (is (nil? (err (.execute *handler*
+                             "CREATE VIEW rolled_back_view AS SELECT id FROM view_base"))))
+    (is (nil? (err (.execute *handler* "ROLLBACK"))))
+    (is (= "42P01"
+           (sqlstate (.execute *handler* "SELECT * FROM rolled_back_view")))))
+  (is (nil? (err (.execute *handler* "DROP VIEW live_view"))))
+  (is (= "42P01" (sqlstate (.execute *handler* "SELECT * FROM live_view"))))
+  (is (nil? (err (.execute *handler* "DROP VIEW IF EXISTS live_view")))))
 
 (deftest test-insert-update-current-timestamp-keyword
   (testing "bare current_timestamp (TimeKeyExpression) in VALUES / SET (issue #14)"

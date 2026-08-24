@@ -112,6 +112,17 @@
   (is (= [["150"]] (rows "SELECT sum(sal) FROM g")))
   (is (= [["50"]] (rows "SELECT max(sal) FROM g"))))
 
+(deftest having-without-group-by-is-one-implicit-group
+  (testing "a constant HAVING emits zero or one row, never one per source row"
+    (is (= [] (rows "SELECT 1 AS one FROM g HAVING 1 > 2")))
+    (is (= [["1"]] (rows "SELECT 1 AS one FROM g HAVING 1 < 2"))))
+  (testing "a dead source predicate is not evaluated for the constant group"
+    (is (= [["1"]]
+           (rows "SELECT 1 AS one FROM g WHERE 1/(id-1) = 1 HAVING 1 < 2"))))
+  (testing "plain source columns are ungrouped, including HAVING-only refs"
+    (is (= "42803" (state "SELECT sal FROM g HAVING min(sal) < max(sal)")))
+    (is (= "42803" (state "SELECT 1 FROM g HAVING sal > 1")))))
+
 (deftest group-by-an-output-column-alias
   (testing "PostgreSQL resolves a bare GROUP BY name as a local FROM
             column first, then an output-column alias
@@ -137,8 +148,20 @@
             ungrouped column is an error even with no GROUP BY at all"
     (is (= "42803" (state "SELECT dept, count(*) FROM g"))))
 
+  (testing "a hidden ORDER BY column obeys the same grouping rule"
+    (is (= "42803" (state "SELECT count(*) FROM g GROUP BY dept ORDER BY sal")))
+    (is (= {["2"] 1 ["3"] 1}
+           (bag "SELECT count(*) FROM g GROUP BY dept ORDER BY dept"))))
+
   (testing "the message names the column the way PostgreSQL does"
     (is (re-find #"column \"g\.sal\"" (or (err "SELECT dept, sal FROM g GROUP BY dept") "")))))
+
+(deftest unqualified-self-join-columns-are-ambiguous
+  (testing "relation occurrences, not distinct storage namespaces, determine ambiguity"
+    (is (= "42702" (state "SELECT count(*) FROM g x, g y WHERE x.id = y.id GROUP BY dept")))
+    (is (= "42702" (state "SELECT count(sal) FROM g x, g y WHERE x.id = y.id GROUP BY x.dept")))
+    (is (= {["2"] 1 ["3"] 1}
+           (bag "SELECT count(*) FROM g x, g y WHERE x.id = y.id GROUP BY x.dept")))))
 
 (deftest grouping-by-the-primary-key-licenses-every-column
   (testing "PostgreSQL allows an ungrouped column when the table's PRIMARY

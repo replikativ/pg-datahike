@@ -52,13 +52,14 @@
             SignedExpression
             CaseExpression CastExpression ArrayConstructor JdbcParameter]
            [net.sf.jsqlparser.statement.create.table CreateTable ColumnDefinition]
+           [net.sf.jsqlparser.statement.create.view CreateView]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
            [net.sf.jsqlparser.statement.insert Insert]
            [net.sf.jsqlparser.statement.update Update UpdateSet]
            [net.sf.jsqlparser.statement.delete Delete]
            [net.sf.jsqlparser.statement.drop Drop]
            [net.sf.jsqlparser.statement.alter Alter AlterExpression]
-           [net.sf.jsqlparser.statement SavepointStatement RollbackStatement Commit]
+           [net.sf.jsqlparser.statement ExplainStatement SavepointStatement RollbackStatement Commit]
            [net.sf.jsqlparser.statement.create.index CreateIndex]))
 
 (set! *warn-on-reflection* true)
@@ -78,6 +79,116 @@
 (def nextval-marker? params/nextval-marker?)
 (def resolve-nextvals! params/resolve-nextvals!)
 (def ^:private unquote-ident params/unquote-ident)
+
+(def ^:private view-name-attr :datahike.pg/view-name)
+(def ^:private view-definition-attr :datahike.pg/view-definition)
+(def ^:private view-columns-attr :datahike.pg/view-columns)
+
+(defn- cast-expression-typmod [^CastExpression cast]
+  (let [type-str (str (.getColDataType cast))
+        base (-> type-str
+                 (str/replace #"\s*\([^)]*\)" "")
+                 str/trim str/lower-case)]
+    (cond
+      (= "numeric" base)
+      (when-let [[precision scale] (sql-cast/numeric-typmod type-str)]
+        (types/encode-numeric-typmod precision scale))
+
+      (contains? #{"char" "character" "bpchar"
+                   "varchar" "character varying"} base)
+      (when-let [[_ n] (re-find #"\(\s*(\d+)\s*\)" type-str)]
+        (+ 4 (Long/parseLong n)))
+
+      :else nil)))
+
+(defn- view-select-typmods [^PlainSelect select db output-count]
+  (let [from (.getFromItem select)
+        ^Table from-table (when (instance? Table from) from)
+        table-name (some-> from-table .getName unquote-ident)
+        table-alias (some-> from-table .getAlias .getName unquote-ident)
+        item-typmods
+        (mapv (fn [^SelectItem item]
+                (let [expression (.getExpression item)]
+                  (cond
+                    (instance? CastExpression expression)
+                    (or (cast-expression-typmod ^CastExpression expression) -1)
+
+                    (and table-name (instance? Column expression))
+                    (let [^Column column expression
+                          qualifier (some-> (.getTable column) .getName unquote-ident)
+                          source-table (if (or (nil? qualifier)
+                                               (= qualifier table-alias)
+                                               (= qualifier table-name))
+                                         table-name qualifier)]
+                      (long (or (params/pg-typmod-of-attr
+                                 db (keyword source-table
+                                             (unquote-ident (.getColumnName column))))
+                                -1)))
+
+                    :else -1)))
+              (.getSelectItems select))]
+    (if (= output-count (count item-typmods))
+      item-typmods
+      (vec (repeat output-count -1)))))
+
+(defn- translate-create-view [^CreateView cv schema db]
+  (let [view-name (unquote-ident (str (.getView cv)))
+        existing-eid (ffirst
+                      (d/q '{:find [?e]
+                             :in [$ ?name-attr ?view-name]
+                             :where [[?e ?name-attr ?view-name]]}
+                           db view-name-attr view-name))
+        table-exists? (or (contains? schema (pgs/row-marker-attr view-name))
+                          (some #(and (keyword? %)
+                                      (= view-name (namespace %)))
+                                (keys schema)))
+        replace? (.isOrReplace cv)
+        if-not-exists? (.isIfNotExists cv)
+        select (.getSelect cv)]
+    (when (seq (.getColumnNames cv))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "CREATE VIEW column name lists"})))
+    (when (and table-exists? (not existing-eid))
+      (throw (ex-info (str "relation \"" view-name "\" already exists")
+                      {:error :duplicate-table :table view-name :sqlstate "42P07"})))
+    (when (and existing-eid (not replace?) (not if-not-exists?))
+      (throw (ex-info (str "relation \"" view-name "\" already exists")
+                      {:error :duplicate-table :table view-name :sqlstate "42P07"})))
+    (when-not (instance? PlainSelect select)
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "CREATE VIEW with a non-plain SELECT"})))
+    ;; Validate now; execute the stored definition against the then-current
+    ;; snapshot whenever the view is read.
+    (let [validated (stmt/translate-select ^PlainSelect select schema db)
+          aliases (:find-aliases validated)
+          typmods (view-select-typmods ^PlainSelect select db (count aliases))
+          columns (mapv (fn [name oid typmod]
+                          {:name name :oid (long (or oid types/oid-text))
+                           :typmod typmod})
+                        aliases (:select-item-oids validated) typmods)]
+      (if (and existing-eid if-not-exists? (not replace?))
+        {:type :ddl-create-view :noop? true :view-name view-name :tx-data []}
+        {:type :ddl-create-view
+         :view-name view-name
+         :tx-data (cond-> []
+                    (not (contains? schema view-name-attr))
+                    (conj {:db/ident view-name-attr
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity})
+                    (not (contains? schema view-definition-attr))
+                    (conj {:db/ident view-definition-attr
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one})
+                    (not (contains? schema view-columns-attr))
+                    (conj {:db/ident view-columns-attr
+                           :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one})
+                    true
+                    (conj {:db/id (or existing-eid (str (gensym "view-")))
+                           view-name-attr view-name
+                           view-definition-attr (str select)
+                           view-columns-attr (pr-str columns)}))}))))
 
 ;; Aggregate + scalar fns moved to datahike.pg.sql.fns. Re-export at the old
 ;; `datahike.pg.sql/...` names so the qualified symbols emitted by the
@@ -492,6 +603,24 @@
   [^String sql]
   (rw/rewrite sql rw/default-rules))
 
+(defn- explain-prefix
+  "Extract PostgreSQL EXPLAIN options that JSqlParser 5.2 cannot parse.
+   Returns the inner statement plus a parser-compatible EXPLAIN spelling."
+  [^String sql]
+  (or
+   (when-let [[_ opts inner]
+              (re-matches #"(?is)^\s*EXPLAIN\s*\(([^)]*)\)\s*(.+?)\s*;?\s*$" sql)]
+     (let [analyze-token (second (re-find #"(?i)(?:^|,)\s*ANALY[ZS]E(?:\s+(\w+))?"
+                                          opts))]
+       {:inner inner
+        :parser-sql (str "EXPLAIN " inner)
+        :analyze? (and (some? (re-find #"(?i)(?:^|,)\s*ANALY[ZS]E\b" opts))
+                       (not (contains? #{"false" "off" "0"}
+                                       (some-> analyze-token str/lower-case))))}))
+   (when-let [[_ analyze inner]
+              (re-matches #"(?is)^\s*EXPLAIN\s+(?:(ANALY[ZS]E)\s+)?(.+?)\s*;?\s*$" sql)]
+     {:inner inner :parser-sql sql :analyze? (some? analyze)})))
+
 (defn- stmt-with-items
   "Statement-agnostic WITH-list accessor. JSqlParser exposes
    `.getWithItemsList` separately on PlainSelect / SetOperationList /
@@ -506,6 +635,71 @@
     (instance? Update stmt)            (.getWithItemsList ^Update stmt)
     (instance? Delete stmt)            (.getWithItemsList ^Delete stmt)
     :else                              nil))
+
+(defn- translate-create-table-as
+  "Lower CREATE TABLE name AS SELECT into one atomic schema+data transaction.
+   CTAS is an application-facing DDL/DML boundary, not merely parser sugar:
+   column names and SQL types come from the SELECT result and the rows are
+   captured from the same database snapshot used during translation."
+  [^CreateTable ct schema db]
+  (let [select (.getSelect ct)]
+    (when-not (instance? PlainSelect select)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:feature "CREATE TABLE AS with a non-plain SELECT"})))
+    (let [base (ddl/translate-create-table ct db)
+          selected (stmt/translate-select ^PlainSelect select schema db)
+          query-db (or (:enriched-db selected) db)
+          rows (if (seq (:in-args selected))
+                 (apply d/q (:query selected) query-db (:in-args selected))
+                 (d/q (:query selected) query-db))
+          hidden (long (or (:hidden-count selected) 0))
+          visible-rows (mapv (fn [row]
+                               (let [row (if (sequential? row) (vec row) [row])]
+                                 (if (pos? hidden)
+                                   (subvec row 0 (- (count row) hidden))
+                                   row)))
+                             rows)
+          aliases (mapv (fn [idx alias]
+                          (params/unquote-ident
+                           (or alias (str "column" (inc idx)))))
+                        (range) (:find-aliases selected))
+          oids (vec (:select-item-oids selected))
+          table-name (:table-name base)
+          marker (pgs/row-marker-attr table-name)
+          col-specs (mapv (fn [idx alias]
+                            (let [oid (or (nth oids idx nil)
+                                          (some->> visible-rows
+                                                   (map #(nth % idx nil))
+                                                   (remove #(or (nil? %) (= :__null__ %)))
+                                                   first
+                                                   types/infer-oid-from-value)
+                                          types/oid-text)
+                                  vtype (or (types/dh-type-for-oid oid)
+                                            :db.type/string)
+                                  attr (keyword table-name alias)
+                                  pg-type (get types/oid->pg-type-marker oid)]
+                              {:alias alias :attr attr :oid oid :vtype vtype
+                               :schema (cond-> {:db/ident attr
+                                                :db/valueType vtype
+                                                :db/cardinality :db.cardinality/one}
+                                         pg-type (assoc :pg/type pg-type))}))
+                          (range) aliases)
+          ctas-schema (into {} (map (fn [{:keys [attr schema]}] [attr schema])) col-specs)
+          data-tx (mapv (fn [row]
+                          (reduce (fn [entity [idx {:keys [attr]}]]
+                                    (let [v (nth row idx nil)]
+                                      (if (or (nil? v) (= :__null__ v))
+                                        entity
+                                        (assoc entity attr
+                                               (stmt/coerce-insert-value
+                                                v attr ctas-schema db)))))
+                                  {:db/id (str (gensym "ctas-")) marker true}
+                                  (map-indexed vector col-specs)))
+                        visible-rows)]
+      (-> base
+          (assoc :column-order aliases)
+          (update :tx-data into (concat (mapv :schema col-specs) data-tx))))))
 
 (defn- plain-selects-in
   "All PlainSelects reachable from a SELECT body, descending
@@ -638,13 +832,19 @@
              ;; after the whole list had been folded, so a CTE body could
              ;; not see the CTE before it and the query died with
              ;; `relation "a" does not exist`.
-             (if-let [m (binding [ctx/*relation-namespaces*
-                                  (merge ctx/*relation-namespaces* ns-map)
-                                  stmt/*cte-namespaces*
-                                  (merge stmt/*cte-namespaces* ns-map)]
-                          (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name))]
-               [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
-               [curr-db curr-schema deferred ns-map])
+             (let [;; JSqlParser stores `WITH t(a,b) AS ...`'s column
+                   ;; names on WithItem.getWithItemList, not on the Alias
+                   ;; object (whose alias-column list is empty here).
+                   alias-cols (some->> (.getWithItemList wi)
+                                       (mapv #(params/unquote-ident (str %))))]
+               (if-let [m (binding [ctx/*relation-namespaces*
+                                    (merge ctx/*relation-namespaces* ns-map)
+                                    stmt/*cte-namespaces*
+                                    (merge stmt/*cte-namespaces* ns-map)]
+                            (stmt/materialize-set-op! inner cte-ns curr-db curr-schema
+                                                      cte-name alias-cols))]
+                 [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
+                 [curr-db curr-schema deferred ns-map]))
 
              ;; A data-modifying WITH body (INSERT/UPDATE/DELETE/MERGE,
              ;; with or without RETURNING). PostgreSQL runs these and
@@ -718,6 +918,7 @@
     ;; Classify once; pass the result into the system-query check so we
     ;; don't re-tokenize the same SQL twice per statement.
       (let [cls-info (cls/classify sql)
+            explain (explain-prefix sql)
             sys-type (catalog/system-query?* sql cls-info)]
         (cond
           sys-type
@@ -852,6 +1053,11 @@
 
               base))
 
+          (and explain (:analyze? explain))
+          {:type :error
+           :message "EXPLAIN ANALYZE is not supported by datahike pgwire"
+           :sqlstate "0A000"}
+
         ;; Reject authorization/RLS/extension/COPY DDL with a clean PG
         ;; error code (0A000 feature_not_supported). The classifier tags
         ;; these with :reject-kind + :tag; handler optionally swallows
@@ -867,7 +1073,7 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [stmt (ast-parse (preprocess-sql sql))
+          (let [stmt (ast-parse (preprocess-sql (or (:parser-sql explain) sql)))
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a
@@ -1107,7 +1313,6 @@
                                   (instance? DoubleValue e)
                                   (instance? StringValue e)
                                   (instance? NullValue e)
-                                  (instance? CaseExpression e)
                                   (and (instance? CastExpression e) (simple-cast? e))
                                   (instance? net.sf.jsqlparser.statement.select.ParenthesedSelect e)
                                   (and (instance? net.sf.jsqlparser.schema.Column e)
@@ -1632,6 +1837,31 @@
                         (not (identical? db orig-db))
                         (assoc :enriched-db db)))
 
+          ;; EXPLAIN (non-ANALYZE): expose the actual lowered Datahike query.
+                    (instance? ExplainStatement stmt)
+                    (let [inner-sql (:inner explain)
+                          inner (when inner-sql (parse-sql inner-sql schema db))]
+                      (cond
+                        (nil? inner-sql)
+                        {:type :error :message "invalid EXPLAIN statement" :sqlstate "42601"}
+                        (= :error (:type inner)) inner
+                        (not= :select (:type inner))
+                        {:type :error
+                         :message "EXPLAIN currently supports SELECT statements only"
+                         :sqlstate "0A000"}
+                        :else
+                        {:type :select
+                         :query {:find [] :where []}
+                         :find-aliases ["QUERY PLAN"]
+                         :select-item-oids [types/oid-text]
+                         :has-aggregates? false
+                         :has-distinct? false
+                         :in-args []
+                         :hidden-count 0
+                         ;; This is deliberately a truthful engine plan,
+                         ;; not a fabricated PostgreSQL Seq Scan tree.
+                         :literal-row [(str "Datahike Query " (pr-str (:query inner)))]}))
+
           ;; INSERT
                     (instance? Insert stmt)
                     (cond-> (translate-insert ^Insert stmt schema db)
@@ -1656,17 +1886,26 @@
                       (not (identical? db orig-db)) (assoc :enriched-db db)
                       (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map))
 
+          ;; CREATE VIEW
+                    (instance? CreateView stmt)
+                    (translate-create-view ^CreateView stmt schema db)
+
           ;; CREATE TABLE
                     (instance? CreateTable stmt)
-                    (ddl/translate-create-table ^CreateTable stmt db)
+                    (if (.getSelect ^CreateTable stmt)
+                      (translate-create-table-as ^CreateTable stmt schema db)
+                      (ddl/translate-create-table ^CreateTable stmt db))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)
                     (let [^Drop d stmt
                           drop-type (when-let [t (.getType d)] (str/lower-case t))
                           obj-name (-> d .getName .getName)]
-                      (if (= drop-type "sequence")
-                        {:type :ddl-drop-sequence :seq-name obj-name}
+                      (case drop-type
+                        "sequence" {:type :ddl-drop-sequence :seq-name obj-name}
+                        "view" {:type :ddl-drop-view
+                                :view-name (unquote-ident obj-name)
+                                :if-exists? (.isIfExists d)}
                         {:type :ddl-drop :table obj-name}))
 
           ;; COMMIT (JSqlParser AST)

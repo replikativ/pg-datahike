@@ -639,9 +639,12 @@
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
    Handles empty result sets by returning proper column metadata with 0 rows.
-   Optional schema-oids: int array of OIDs to use when results are empty."
-  ([results find-aliases] (format-query-result results find-aliases nil))
+   Optional schema-oids: int array of OIDs to use when results are empty.
+   Optional typmods supply declared widths for bpchar text rendering."
+  ([results find-aliases] (format-query-result results find-aliases nil nil))
   ([results find-aliases schema-oids]
+   (format-query-result results find-aliases schema-oids nil))
+  ([results find-aliases schema-oids typmods]
    (let [col-names (into-array String find-aliases)
          result-seq (seq results)
         ;; Determine OIDs: prefer schema-oids, refine unknowns with value inference
@@ -682,9 +685,18 @@
                                           (if (sequential? row)
                                             (map-indexed
                                              (fn [i v]
-                                               (value->string
-                                                v (when (< i (alength ^ints oids))
-                                                    (aget ^ints oids i))))
+                                               (let [oid (when (< i (alength ^ints oids))
+                                                           (aget ^ints oids i))
+                                                     s (value->string v oid)
+                                                     tm (when (and typmods
+                                                                   (< i (alength ^ints typmods)))
+                                                          (aget ^ints typmods i))]
+                                                 (if (and s (= oid types/oid-bpchar)
+                                                          tm (>= tm 4)
+                                                          (< (count s) (- tm 4)))
+                                                   (str s (apply str (repeat (- (- tm 4) (count s))
+                                                                             \space)))
+                                                   s)))
                                              row)
                                             [(value->string row (when (pos? (alength ^ints oids))
                                                                   (aget ^ints oids 0)))]))))
@@ -1389,6 +1401,12 @@
       (show-setting "statement_timeout"
                     (str (or (:statement-timeout @session-state) 0)))
 
+      (= setting-name "search_path")
+      (show-setting "search_path"
+                    (if-let [path (:search-path @session-state)]
+                      (str/join ", " path)
+                      (get show-settings "search_path")))
+
       (contains? show-settings setting-name)
       (show-setting setting-name (get show-settings setting-name))
 
@@ -1408,12 +1426,37 @@
                [(into-array String ["PostgreSQL 15.0 (Datahike PgWire compatibility layer)"])])
    "SELECT 1"))
 
-(defn- handle-current-schema []
+(defn- effective-search-path [session-state]
+  (or (:search-path @session-state) ["$user" "public"]))
+
+(defn- normalize-search-path [values]
+  (->> values
+       (mapcat #(str/split (str %) #","))
+       (map str/trim)
+       (map #(if (and (>= (count %) 2)
+                      (str/starts-with? % "\"")
+                      (str/ends-with? % "\""))
+               (subs % 1 (dec (count %)))
+               %))
+       (remove str/blank?)
+       vec))
+
+(defn- set-search-path! [session-state values]
+  (if (and (= 1 (count values))
+           (= "default" (str/lower-case (str (first values)))))
+    (swap! session-state dissoc :search-path)
+    (swap! session-state assoc :search-path (normalize-search-path values))))
+
+(defn- current-schema-name [session-state]
+  (first (filter #{"public" "pg_catalog"}
+                 (effective-search-path session-state))))
+
+(defn- handle-current-schema [session-state]
   (PgWireServer$QueryResult.
    (into-array String ["current_schema"])
    (int-array [PgWireServer/OID_TEXT])
    (into-array (Class/forName "[Ljava.lang.String;")
-               [(into-array String ["public"])])
+               [(into-array String [(current-schema-name session-state)])])
    "SELECT 1"))
 
 (defn- handle-current-database
@@ -1874,13 +1917,13 @@
 
             ;; Domain CHECK with a parsed AST. PG's `VALUE` keyword
             ;; refers to the column's value; bind it under the
-            ;; conventional (keyword "" "VALUE") so the existing
+            ;; conventional lower-case unqualified keyword so the existing
             ;; eval-check-predicate / eval-update-expr machinery
             ;; resolves it without a special case.
             (and (= :domain (:kind spec)) (some? v) (:check-ast spec))
             (let [r (try
                       (sql/eval-check-predicate (:check-ast spec)
-                                                {(keyword "" "VALUE") v}
+                                                {(keyword "" "value") v}
                                                 "" schema)
                       (catch Throwable _ ::error))]
               (when (false? r)
@@ -2567,6 +2610,8 @@
                       ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
                       ;; plan per statement shape, values supplied at d/q time.
                       (binding [params/*from-bindings* from-bindings
+                                params/*from-source-aliases* (when from-bindings
+                                                               (set (keys from-bindings)))
                                 expr/*conjunctive-where* true]
                         (let [preds (#'sql/translate-predicate ctx where-expr)]
                           (swap! (:where-clauses ctx) into preds))))
@@ -2642,6 +2687,9 @@
                                             ;; ClassCastException on the ParamRef
                                             ;; (pgbench -M prepared).
                                             raw-val (binding [params/*from-bindings* eff-from-bindings
+                                                              params/*from-source-aliases*
+                                                              (when from-bindings
+                                                                (set (keys from-bindings)))
                                                               params/*bound-params*
                                                               (or params/*bound-params*
                                                                   (when-let [cb *cached-bound*]
@@ -2673,8 +2721,10 @@
    that need speculative tempid remapping should pass an `eid->tempid` map
    and remap the tx-data afterward.
 
-   For UPDATE ... FROM (VALUES ...) AS alias(cols), runs one update per
-   VALUES row with the alias's columns bound to that row's literals."
+   For UPDATE ... FROM, runs the target matcher once per source row with
+   that row's columns bound as constants. PostgreSQL updates a target row
+   at most once even when several source rows match; retain the first match
+   in the source's stable entity order."
   [db schema parsed]
   (if-let [{:keys [alias cols rows]} (:from-values parsed)]
     (reduce
@@ -2687,7 +2737,50 @@
              (update :tx-data into tx-data))))
      {:eids [] :tx-data []}
      rows)
-    (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil))))
+    (if-let [{source-table :table source-alias :alias} (:from-table parsed)]
+      (let [column-info (->> (pgs/column-info schema source-table db)
+                             (remove #(= "db-row-exists" (:name %)))
+                             vec)
+            marker (pgs/row-marker-attr source-table)
+            source-eids (if (contains? schema marker)
+                          ;; Row markers are deliberately not :db/indexed;
+                          ;; AVET therefore has no entries for them. AEVT is
+                          ;; still an attribute-prefix scan and remains cheap.
+                          (into [] (keep (fn [^datahike.datom.Datom datom]
+                                           (when (true? (.-v datom)) (.-e datom))))
+                                (d/datoms db :aevt marker))
+                          (->> column-info
+                               (mapcat (fn [{:keys [attr]}]
+                                         (when (and attr (not= :db/id attr))
+                                           (map (fn [^datahike.datom.Datom datom] (.-e datom))
+                                                (d/datoms db :aevt attr)))))
+                               distinct
+                               sort
+                               vec))]
+        (with-cte-namespaces parsed
+          (dissoc
+           (reduce
+            (fn [{:keys [seen] :as acc} eid]
+              (let [entity-map (into {} (map (fn [^datahike.datom.Datom datom]
+                                               [(.-a datom) (.-v datom)]))
+                                     (d/datoms db :eavt eid))
+                    row (into {}
+                              (map (fn [{:keys [name attr]}]
+                                     [name (if (= :db/id attr) eid (get entity-map attr))]))
+                              column-info)
+                    result (build-update-tx-for-bindings
+                            db schema parsed {source-alias row})
+                    fresh-eids (remove seen (:eids result))
+                    fresh-set (set fresh-eids)
+                    fresh-tx (filterv #(contains? fresh-set (second %)) (:tx-data result))]
+                (-> acc
+                    (update :seen into fresh-eids)
+                    (update :eids into fresh-eids)
+                    (update :tx-data into fresh-tx))))
+            {:seen #{} :eids [] :tx-data []}
+            source-eids)
+           :seen)))
+      (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil)))))
 
 (defn- check-update-identity-collisions!
   "Pre-flight check: before running tx-data from build-update-tx, scan
@@ -3084,6 +3177,40 @@
         (empty-result "CREATE TABLE")
         (catch Exception e
           (classified-error "CREATE TABLE error: " e))))))
+
+(defn- execute-ddl-create-view [conn parsed tx-state]
+  (cond
+    (:noop? parsed) (empty-result "CREATE VIEW")
+    (:in-tx? @tx-state)
+    (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE VIEW")
+    :else
+    (try
+      (transact-recorded! conn (:tx-data parsed))
+      (empty-result "CREATE VIEW")
+      (catch Exception e
+        (classified-error "CREATE VIEW error: " e)))))
+
+(defn- execute-ddl-drop-view [conn parsed tx-state]
+  (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        view-name (:view-name parsed)
+        eid (ffirst (d/q '{:find [?e]
+                           :in [$ ?view-name]
+                           :where [[?e :datahike.pg/view-name ?view-name]]}
+                         db view-name))]
+    (cond
+      (and (nil? eid) (:if-exists? parsed)) (empty-result "DROP VIEW")
+      (nil? eid) (classified-error
+                  ""
+                  (ex-info (str "view \"" view-name "\" does not exist")
+                           {:error :undefined-table :table view-name :sqlstate "42P01"}))
+      (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP VIEW")
+      :else
+      (try
+        (transact-recorded! conn [[:db/retractEntity eid]])
+        (empty-result "DROP VIEW")
+        (catch Exception e
+          (classified-error "DROP VIEW error: " e))))))
 
 ;; ============================================================================
 ;; Query handler — the main dispatch
@@ -3944,9 +4071,9 @@
    whole group is atomic. COPY is excluded — it runs its own sub-protocol
    and commits separately."
   #{:insert :update :update-with-recursive :delete :truncate
-    :ddl-create :ddl-create-sequence :ddl-alter-sequence
+    :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-create-domain
-    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-sequence})
+    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
   [{:keys [conn session-id tx-state]} _parsed]
@@ -4030,7 +4157,7 @@
 (def ^:private session-guc-keys
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
-  [:as-of :since :history :branch :commit-id
+  [:as-of :since :history :branch :commit-id :search-path
    :valid-at :valid-from :valid-to :statement-timeout :isolation])
 
 (defn- handle-reset
@@ -4042,8 +4169,13 @@
    silently accepts RESET of any settable GUC, so the single-var case is
    a no-op. asyncpg's pool reset sends `RESET ALL` on every release."
   [{:keys [session-state]} parsed]
-  (when (= "all" (some-> (:var parsed) str/lower-case))
-    (swap! session-state #(apply dissoc % session-guc-keys)))
+  (let [setting (some-> (:var parsed) str/lower-case)]
+    (cond
+      (= "all" setting)
+      (swap! session-state #(apply dissoc % session-guc-keys))
+
+      (= "search_path" setting)
+      (swap! session-state dissoc :search-path)))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -4636,7 +4768,11 @@
   (let [{:keys [conn session-state schema tx-state
                 on-create-database on-delete-database registry-atom]} ctx]
     (case (:system-type parsed)
-      :set      (empty-result "SET")
+      :set
+      (do
+        (when (= "search_path" (some-> (:var parsed) str/lower-case))
+          (set-search-path! session-state (:values parsed)))
+        (empty-result "SET"))
       :prepare          (handle-prepare ctx parsed)
       :execute-prepared (handle-execute-prepared ctx parsed)
       :deallocate       (handle-deallocate ctx parsed)
@@ -4694,8 +4830,10 @@
       ;; Datahike), but PostgreSQL returns the NEW VALUE as text and
       ;; asyncpg reads it back, so returning empty-string was not
       ;; harmless: echo the value argument.
-      (single-row-result "set_config" PgWireServer/OID_TEXT
-                         (or (second (:args parsed)) ""))
+      (let [[setting value] (:args parsed)]
+        (when (= "search_path" (some-> setting str/lower-case))
+          (set-search-path! session-state [value]))
+        (single-row-result "set_config" PgWireServer/OID_TEXT (or value "")))
 
       :copy-from-stdin
       ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
@@ -4816,7 +4954,6 @@
       :pg-notify               (handle-pg-notify ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
       :empty-catalog      (handle-empty-catalog ctx parsed)
-      :create-view        (empty-result "CREATE VIEW")
       :create-index       (empty-result "CREATE INDEX")
       :get-fk-conname     (handle-get-fk-conname ctx parsed)
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
@@ -4840,7 +4977,7 @@
       :show              (handle-show (:var parsed) schema session-state tx-state)
       :version           (handle-version)
       :pg-keywords       (handle-pg-keywords ctx parsed)
-      :current-schema    (handle-current-schema)
+      :current-schema    (handle-current-schema session-state)
       :current-database  (handle-current-database (:db-name @session-state))
       :now               (handle-now ctx parsed)
 
@@ -4990,7 +5127,8 @@
                  rows (if (pos? hidden)
                         (mapv #(subvec (vec %) 0 keep-n) res)
                         res)
-                 result (format-query-result rows aliases schema-oids)]
+                 result (format-query-result rows aliases schema-oids
+                                             (when sources (nth sources 2)))]
              (if sources
                (-> ^PgWireServer$QueryResult result
                    (.withColumnSources (first sources) (second sources))
@@ -5375,7 +5513,8 @@
                              (.get ^java.util.Map select-shape-cache shape-key))]
           (if cached-shape
             (let [[schema-oids sources] cached-shape
-                  result (format-query-result results find-aliases schema-oids)]
+                  result (format-query-result results find-aliases schema-oids
+                                              (when sources (nth sources 2)))]
               (if sources
                 (-> ^PgWireServer$QueryResult result
                     (.withColumnSources (first sources) (second sources))
@@ -5421,7 +5560,8 @@
                   _ (when shape-key
                       (.put ^java.util.Map select-shape-cache shape-key
                             [schema-oids sources]))
-                  result (format-query-result results find-aliases schema-oids)]
+                  result (format-query-result results find-aliases schema-oids
+                                              (when sources (nth sources 2)))]
               (if sources
                 (-> ^PgWireServer$QueryResult result
                     (.withColumnSources (first sources) (second sources))
@@ -6680,7 +6820,8 @@
         ;; `*registered-databases*` bound here so any catalog probe on
         ;; `pg_database` that lands during parse materialization sees
         ;; this server's actual registry instead of the legacy fallback.
-        (binding [catalog/*registered-databases* registered-databases]
+        (binding [catalog/*registered-databases* registered-databases
+                  params/*session-state* session-state]
           (let [base-db (apply-temporal (d/db conn) session-state)
                 ;; In an open transaction, parse/validate against the
                 ;; speculative-db so a statement referencing a table
@@ -7007,14 +7148,15 @@
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
         (let [bound (vec bound-params)]
-          (or
-           ;; Tier-1 compiled lane: plain autocommit SELECT with no
-           ;; session modifiers runs its compiled executor directly.
-           (fast-select-prepared conn parsed bound session-state tx-state on-query)
-           (binding [*cached-parsed* parsed
-                     *cached-bound* bound
-                     *implicit-tx-allowed* true]
-             (.execute this (or (:sql parsed) ""))))))
+          (binding [params/*statement-time* (java.util.Date.)]
+            (or
+             ;; Tier-1 compiled lane: plain autocommit SELECT with no
+             ;; session modifiers runs its compiled executor directly.
+             (fast-select-prepared conn parsed bound session-state tx-state on-query)
+             (binding [*cached-parsed* parsed
+                       *cached-bound* bound
+                       *implicit-tx-allowed* true]
+               (.execute this (or (:sql parsed) "")))))))
 
       (executeInGroup [this sql]
         ;; Simple-query group member: a write opens/joins the 'Q''s
@@ -7029,6 +7171,8 @@
         ;; doesn't go through `parse` first) sees the registry when it
         ;; hits pg_database.
         (binding [catalog/*registered-databases* registered-databases
+                  params/*statement-time* (java.util.Date.)
+                  params/*session-state* session-state
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
         ;; If aborted, reject everything except ROLLBACK / ROLLBACK TO /
@@ -7320,6 +7464,9 @@
                             ;; add via ALTER TABLE without an explicit bust.
                             :ddl-create            (do (invalidate-schema-cache!)
                                                        (exec-ddl-create ctx parsed))
+                            :ddl-create-view       (do (invalidate-schema-cache!)
+                                                       (execute-ddl-create-view
+                                                        (:conn ctx) parsed (:tx-state ctx)))
                             :ddl-create-sequence   (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-sequence ctx parsed))
                             :ddl-alter-sequence    (do (invalidate-schema-cache!)
@@ -7339,6 +7486,9 @@
                                                        (exec-ddl-alter ctx parsed))
                             :ddl-drop              (do (invalidate-schema-cache!)
                                                        (exec-ddl-drop ctx parsed))
+                            :ddl-drop-view         (do (invalidate-schema-cache!)
+                                                       (execute-ddl-drop-view
+                                                        (:conn ctx) parsed (:tx-state ctx)))
                             :ddl-drop-sequence     (do (invalidate-schema-cache!)
                                                        (exec-ddl-drop-sequence ctx parsed))
                             :set-operation         (exec-set-operation ctx parsed)

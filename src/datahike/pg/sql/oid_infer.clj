@@ -345,6 +345,14 @@
                        (or (params/unquote-ident (.getName t))
                            (params/unquote-ident (.getAlias t))))
           table-real (or (get table-aliases col-table col-table)
+                         ;; An unqualified column uses default-table, which
+                         ;; may itself be a SQL alias (including a CTE name
+                         ;; redirected to its synthetic namespace). Resolve
+                         ;; that through the same map as an explicit
+                         ;; `alias.column`; otherwise execution finds the
+                         ;; right attr while OID inference silently returns
+                         ;; nil/text.
+                         (get table-aliases default-table default-table)
                          default-table)
           hint-attr (when (and hints col-table)
                       (some (fn [[attr h]]
@@ -423,8 +431,16 @@
       :else nil)))
 
 (defn- binary-arith-oid [^BinaryExpression e env]
-  (let [l (expr-oid (.getLeftExpression e) env)
-        r (expr-oid (.getRightExpression e) env)
+  (let [left (.getLeftExpression e)
+        right (.getRightExpression e)
+        l0 (expr-oid left env)
+        r0 (expr-oid right env)
+        ;; StringValue is PostgreSQL's `unknown` pseudo-type until
+        ;; operator resolution. When the opposite arithmetic operand is
+        ;; typed, its typinput determines both the selected operator and
+        ;; result OID (`real * '-10'` remains real, for example).
+        l (if (instance? StringValue left) r0 l0)
+        r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
         plus?    (instance? Addition e)
         minus?   (instance? Subtraction e)]
@@ -577,7 +593,8 @@
         ;; only via .getArrayData — so an array cast like `::int[]` must be
         ;; detected here and wrapped to the element's array OID, else it
         ;; reports the scalar (int4) and the binary array value mis-decodes.
-        type-str (some-> cdt .getDataType str str/lower-case)
+        type-str (some-> cdt .getDataType str str/lower-case
+                         types/base-type-name-of)
         ad       (when cdt (.getArrayData cdt))
         array?   (and ad (pos? (.size ^java.util.List ad)))
         scalar-oid
@@ -599,7 +616,11 @@
            ;; and `pg_typeof` says real.
            :float     (if (#{"real" "float4"} type-str) types/oid-float4 types/oid-float8)
            :numeric   types/oid-numeric
-           :text      types/oid-text
+           :text      (cond
+                        (contains? #{"varchar" "character varying"} type-str) types/oid-varchar
+                        (contains? #{"char" "character" "bpchar"} type-str) types/oid-bpchar
+                        (= "name" type-str) types/oid-name
+                        :else types/oid-text)
            :boolean   types/oid-bool
            :date      types/oid-date
            :time      types/oid-time
@@ -851,8 +872,9 @@
       (instance? TimeKeyExpression expr)
       (let [k (some-> (.getStringValue ^TimeKeyExpression expr) str/lower-case)]
         (cond
-          (str/includes? (or k "") "date") types/oid-date
-          (str/includes? (or k "") "time") types/oid-timestamptz
+          (= k "current_date") types/oid-date
+          (= k "current_time") types/oid-time
+          (= k "current_timestamp") types/oid-timestamptz
           :else types/oid-timestamptz))
 
       ;; --- Placeholders -------------------------------------------------
