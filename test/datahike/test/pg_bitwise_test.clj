@@ -245,6 +245,23 @@
   (is (= "010110" (v "SELECT substring(B'010110' from -2)")))
   (is (= [oid-bit] (oids "SELECT substring(B'010110' from 2 for 4)"))))
 
+(deftest bit-defaults-and-table-shorthand
+  ;; PostgreSQL 17 bit.sql lines 232-240. TABLE is a general SQL query
+  ;; boundary; exercising it here also proves bit literals survive the
+  ;; delayed DEFAULT materialization path as canonical stored digits.
+  (.execute *handler*
+            (str "CREATE TABLE bit_defaults ("
+                 "b1 bit(4) DEFAULT '1001', "
+                 "b2 bit(4) DEFAULT B'0101', "
+                 "b3 bit varying(5) DEFAULT '1001', "
+                 "b4 bit varying(5) DEFAULT B'0101')"))
+  (.execute *handler* "INSERT INTO bit_defaults DEFAULT VALUES")
+  (let [^PgWireServer$QueryResult result (.execute *handler* "TABLE bit_defaults")]
+    (is (= [["1001" "0101" "1001" "0101"]]
+           (mapv vec (.-rows result))))
+    (is (= [oid-bit oid-bit 1562 1562]
+           (vec (.-columnOids result))))))
+
 (deftest bit-string-operands-must-be-the-same-width
   (testing "PG refuses rather than padding — the width is part of the value"
     (is (re-find #"cannot AND bit strings of different sizes"

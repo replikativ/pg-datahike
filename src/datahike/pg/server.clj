@@ -1734,6 +1734,10 @@
                     (re-matches #"-?\d+\.\d+" value) (Double/parseDouble value)
                     :else value)
                   (catch Exception _ value))
+    ;; Bit defaults must remain strings even when the digit run happens to
+    ;; look numeric. :literal retains its legacy numeric inference for
+    ;; existing database metadata.
+    :bit      value
     :fn      (case value
                "now"           (java.util.Date.)
                "current_date"  (java.time.LocalDate/now java.time.ZoneOffset/UTC)
@@ -3005,7 +3009,7 @@
      :pg/table-oid     — only on row-marker attrs; stable per-table OID
                          populating pg_class / pg_attribute / pg_index.
      :pg/not-null      — enforced at INSERT/UPDATE. PG error 23502.
-     :pg/default-kind  — :literal | :fn | :nextval. Consumed by
+     :pg/default-kind  — :literal | :bit | :fn | :nextval. Consumed by
                          INSERT-time default materialization.
      :pg/default-value — string form of the literal or function name.
      :pg/default-arg   — argument for :nextval (sequence name).

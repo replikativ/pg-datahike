@@ -42,7 +42,7 @@
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem Join OrderByElement
-            ParenthesedSelect SetOperationList
+            ParenthesedSelect SetOperationList TableStatement
             UnionOp IntersectOp ExceptOp]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression.operators.relational
@@ -1799,6 +1799,16 @@
                            :find-aliases (:find-aliases result)})
               ;; Regular SELECT (possibly with LEFT JOIN from RIGHT rewrite)
                         (assoc result :type :select)))
+
+                    ;; PostgreSQL's `TABLE relation` is exactly the
+                    ;; shorthand `SELECT * FROM relation`. JSqlParser gives
+                    ;; it a dedicated Select subtype, so lower it into the
+                    ;; existing SELECT path rather than maintaining a second
+                    ;; relation scanner/executor.
+                    (instance? TableStatement stmt)
+                    (parse-sql (str "SELECT * FROM "
+                                    (.getTable ^TableStatement stmt))
+                               schema db)
 
                     (instance? ParenthesedSelect stmt)
                     (let [inner (.getSelect ^ParenthesedSelect stmt)]

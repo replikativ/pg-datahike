@@ -254,6 +254,7 @@
                                  (string? v) (str "'" (str/replace v #"'" "''") "'")
                                  (nil? v) "NULL"
                                  :else (str v)))
+                    :bit (str "B'" (:pg/default-value ent) "'")
                     :now "now()"
                     :nextval (str "nextval('" (:pg/default-arg ent) "')")
                     nil))]

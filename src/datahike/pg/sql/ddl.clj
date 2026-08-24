@@ -143,12 +143,15 @@
    the schema entity. Shape:
 
      {:kind :literal  :value <long|double|string|boolean|nil>}
+     {:kind :bit      :value <canonical bit input string>}
      {:kind :fn       :value <canonical fn name string>}
      {:kind :nextval  :value <sequence name string>}
      {:kind :unsupported :raw <original SQL text>}
 
    The literal branch handles numbers, single-quoted strings, boolean
-   keywords, and NULL. The :fn branch covers the stateless current-*
+   keywords, and NULL. The :bit branch prevents a digit-only bit default
+   from being reinterpreted as a number by delayed materialization. The
+   :fn branch covers the stateless current-*
    functions PG users rely on. :nextval is the only stateful default
    we support and it ties into our existing sequence infrastructure.
    Unknown expressions land in :unsupported so CREATE TABLE can
@@ -212,6 +215,15 @@
             {:kind :literal
              :value (-> base (subs 1 (dec (count base)))
                         (str/replace "''" "'"))}
+            ;; SQL-standard bit literal.  Defaults are materialized after
+            ;; INSERT expression coercion, so persist the canonical digit
+            ;; run used by bit/varbit columns. Hex keeps its input prefix so
+            ;; the column's bit coercion can expand each digit to four bits.
+            (re-matches #"(?i)b'[01]*'" base)
+            {:kind :bit :value (subs base 2 (dec (count base)))}
+            (re-matches #"(?i)x'[0-9a-f]*'" base)
+            {:kind :bit
+             :value (str "x" (subs base 2 (dec (count base))))}
             ;; Known zero-arg functions. Match either form: `now`,
             ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`. Also
             ;; accept the AT TIME ZONE wrapper Odoo uses
@@ -613,7 +625,22 @@
                                ;; enforcement path doesn't double-error.
                                not-null-here? (and (not pk-here?)
                                                    (column-is-not-null? col))
-                               default-spec (column-default-spec col)
+                               default-spec (let [spec (column-default-spec col)
+                                                  bit-type? (contains?
+                                                             #{"bit" "varbit" "bit varying"}
+                                                             (types/base-type-name-of raw-type))]
+                                              ;; A quoted unknown literal is
+                                              ;; coerced to the declared bit
+                                              ;; type at CREATE time in PG.
+                                              ;; Preserve that intent: the
+                                              ;; delayed default evaluator's
+                                              ;; legacy :literal path parses
+                                              ;; digit-only strings as longs.
+                                              (if (and bit-type?
+                                                       (= :literal (:kind spec))
+                                                       (string? (:value spec)))
+                                                (assoc spec :kind :bit)
+                                                spec))
                                _ (when (= :unsupported (:kind default-spec))
                                    (throw (ex-info "DEFAULT expression not supported"
                                                    {:error :feature-not-supported
