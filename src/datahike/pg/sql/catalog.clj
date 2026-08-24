@@ -693,19 +693,19 @@
                                    ;; back to the attnum-derived composite
                                    ;; key convention (name → hash) so stale
                                    ;; data still has a stable attrelid.
-                               (Math/abs (.hashCode ^String tname)))
-                   pk? (= :db.unique/identity (:unique col))
+                                (Math/abs (.hashCode ^String tname)))
+                    pk? (= :db.unique/identity (:unique col))
                        ;; -1 = unconstrained (real PG's default for
                        ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
                        ;; columns get a positive value via DDL.
-                   typmod (long (or (get typmods (:attr col)) -1))]]
-         {:pg_attribute/attname (:name col)
+                    typmod (long (or (get typmods (:attr col)) -1))]]
+          {:pg_attribute/attname (:name col)
               ;; Cardinality-many columns project as PG arrays, so
               ;; their atttypid must be the array OID — pgjdbc reads
               ;; this for ResultSetMetaData and the field-metadata
               ;; cache key. Mirrors the OID inference in
               ;; oid-infer/column-oid.
-          :pg_attribute/atttypid
+           :pg_attribute/atttypid
           ;; `(:oid col)`, NOT a fresh derivation from :valuetype. The
           ;; column map already carries the authoritative OID from
           ;; `declared-col-oid`, which honours the `:pg/type` recorded at
@@ -716,21 +716,21 @@
           ;; pick a codec, so it is not cosmetic — and a date column's
           ;; binary encode then failed and silently shipped text bytes
           ;; labelled as binary.
-          (long (let [base (:oid col)]
-                  (if (and (= :db.cardinality/many (:cardinality col))
+           (long (let [base (:oid col)]
+                   (if (and (= :db.cardinality/many (:cardinality col))
                            ;; `_int4` already resolved to 1007 via
                            ;; :pg/type; promoting again would give int[][].
-                           (not (contains? types/array-oid->element-oid base)))
-                    (get types/element-oid->array-oid base types/oid-text-array)
-                    base)))
-          :pg_attribute/attnum (long (inc idx))
-          :pg_attribute/attrelid (long tbl-oid)
-          :pg_attribute/attnotnull pk?
-          :pg_attribute/attidentity ""
-          :pg_attribute/attstorage (attribute-storage (:oid col))
-          :pg_attribute/atttypmod typmod
-          :pg_attribute/attisdropped false
-          (pgs/row-marker-attr "pg_attribute") true})
+                            (not (contains? types/array-oid->element-oid base)))
+                     (get types/element-oid->array-oid base types/oid-text-array)
+                     base)))
+           :pg_attribute/attnum (long (inc idx))
+           :pg_attribute/attrelid (long tbl-oid)
+           :pg_attribute/attnotnull pk?
+           :pg_attribute/attidentity ""
+           :pg_attribute/attstorage (attribute-storage (:oid col))
+           :pg_attribute/atttypmod typmod
+           :pg_attribute/attisdropped false
+           (pgs/row-marker-attr "pg_attribute") true})
         (for [{:keys [name columns]} (view-entities cte-db)
               [idx col] (map-indexed vector columns)]
           {:pg_attribute/attname (:name col)

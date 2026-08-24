@@ -2747,7 +2747,7 @@
                           ;; AVET therefore has no entries for them. AEVT is
                           ;; still an attribute-prefix scan and remains cheap.
                           (into [] (keep (fn [^datahike.datom.Datom datom]
-                                          (when (true? (.-v datom)) (.-e datom))))
+                                           (when (true? (.-v datom)) (.-e datom))))
                                 (d/datoms db :aevt marker))
                           (->> column-info
                                (mapcat (fn [{:keys [attr]}]

@@ -1858,8 +1858,8 @@
   (is (nil? (err (.execute *handler* "CREATE TABLE view_base (id int, n numeric)"))))
   (is (nil? (err (.execute *handler* "INSERT INTO view_base VALUES (1, 1.25)"))))
   (is (nil? (err (.execute *handler*
-                            (str "CREATE VIEW live_view AS "
-                                 "SELECT id, n::numeric(8,2) AS amount FROM view_base")))))
+                           (str "CREATE VIEW live_view AS "
+                                "SELECT id, n::numeric(8,2) AS amount FROM view_base")))))
   (is (= [["1" "1.25"]]
          (rows (.execute *handler* "SELECT * FROM live_view ORDER BY id"))))
   (is (= [["live_view"]]
@@ -1879,9 +1879,9 @@
                               "JOIN pg_class c ON a.attrelid = c.oid "
                               "WHERE c.relname = 'live_view' ORDER BY a.attnum")))))
   (is (.contains ^String
-                 (first-val (.execute *handler*
-                                      (str "SELECT pg_get_viewdef(oid::oid, true) FROM pg_class "
-                                           "WHERE relname = 'live_view'")))
+       (first-val (.execute *handler*
+                            (str "SELECT pg_get_viewdef(oid::oid, true) FROM pg_class "
+                                 "WHERE relname = 'live_view'")))
                  "view_base"))
   (is (= [["1" "1.25"]]
          (rows (.execute *handler*
@@ -1895,13 +1895,13 @@
   (is (= [["2" "2.50"]]
          (rows (.execute *handler* "SELECT id, amount FROM live_view WHERE id = 2"))))
   (is (nil? (err (.execute *handler*
-                            "CREATE OR REPLACE VIEW live_view AS SELECT id FROM view_base"))))
+                           "CREATE OR REPLACE VIEW live_view AS SELECT id FROM view_base"))))
   (is (= [["1"] ["2"]]
          (rows (.execute *handler* "SELECT * FROM live_view ORDER BY id"))))
   (testing "view metadata follows transaction rollback"
     (is (nil? (err (.execute *handler* "BEGIN"))))
     (is (nil? (err (.execute *handler*
-                              "CREATE VIEW rolled_back_view AS SELECT id FROM view_base"))))
+                             "CREATE VIEW rolled_back_view AS SELECT id FROM view_base"))))
     (is (nil? (err (.execute *handler* "ROLLBACK"))))
     (is (= "42P01"
            (sqlstate (.execute *handler* "SELECT * FROM rolled_back_view")))))
