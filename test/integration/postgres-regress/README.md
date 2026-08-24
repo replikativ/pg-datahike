@@ -108,3 +108,22 @@ have admitted.
 Do not reduce the diff count by merely matching diagnostic wording. Promote
 high-value behavior into focused unit or SQLLogic tests, and treat silent wrong
 answers and internal failures ahead of explicitly unsupported surface.
+
+## PostgreSQL source map
+
+Use PostgreSQL's implementation and catalogs to establish semantics before
+adding compatibility behavior. This map gives the usual starting points; keep
+specific issue investigations and changing regression results in their GitHub
+issues or pull requests rather than turning this document into a historical
+ledger.
+
+| Boundary | PostgreSQL authority | Upstream regression corpus | pg-datahike coverage |
+|---|---|---|---|
+| Expression parsing, parameter typing, and lowering | `src/backend/parser/parse_expr.c`, `parse_oper.c`, `parse_coerce.c`; `src/include/catalog/pg_proc.dat`, `pg_operator.dat` | `expressions.sql`, focused statements in type suites | expression/OID tests and extended-query pgjdbc tests |
+| Set-returning functions | overloads in `pg_proc.dat`; integer implementations in `src/backend/utils/adt/int.c` | `rangefuncs.sql` | SRF, lateral-SRF, and extended-query tests |
+| Type lookup and casts | `src/backend/parser/parse_type.c`, `parse_coerce.c`; `src/include/catalog/pg_type.dat` | per-type suites and `type_sanity.sql` | type-resolution, cast, enum/domain, and DDL-fidelity tests |
+| Arrays and array input | `src/backend/utils/adt/arrayfuncs.c` (`array_in`, `ReadArrayStr`) | `arrays.sql` plus each element type's suite | array codec, SQL array, and array-column tests |
+| Catalog row descriptions | catalog headers such as `pg_type.h`, `pg_attribute.h`, `pg_class.h` | `type_sanity.sql` and driver metadata queries | catalog tests plus pgjdbc/ORM probes |
+| Relation resolution and errors | `src/backend/parser/parse_relation.c` | broadly exercised across the suite | unknown-table/column and catalog tests |
+| `EXPLAIN` grammar/API | `src/backend/parser/gram.y`, `src/backend/commands/explain.c` | `explain.sql` | accepted-option and unsupported-feature tests |
+| `money` | `src/backend/utils/adt/cash.c`; money entries in `pg_type.dat`, `pg_cast.dat`, and `pg_operator.dat` | `money.sql` | core OID/cast/DDL tests; full suite not admitted |
