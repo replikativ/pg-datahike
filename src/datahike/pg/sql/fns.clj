@@ -2501,6 +2501,7 @@
 ;; fuzz reached, and any drift would be in the last digit.
 
 (def ^:private ^:const numeric-max-result-scale 2000)
+(def ^:private ^:const numeric-max-integer-digits 131072)
 
 (defn- clamp-rscale ^long [^long rscale ^long dscale]
   (long (min (max rscale dscale 0) numeric-max-display-scale)))
@@ -2795,6 +2796,22 @@
     (clamp-rscale (- numeric-min-sig-digits (long f))
                   (max (.scale base) (.scale e)))))
 
+(defn- power-result-weight
+  "Approximate log10(abs(base)^exponent) without narrowing BASE to double.
+   The near-one case is why this uses the BigDecimal ln implementation:
+   PostgreSQL's regression suite raises (1 - 1.5e-1000) to a huge power,
+  which becomes exactly 1.0 as a double even though its logarithm matters."
+  ^double [^java.math.BigDecimal base ^java.math.BigDecimal exponent]
+  (let [abs-base (.abs base)
+        base-double (.doubleValue abs-base)
+        exponent-double (.doubleValue exponent)]
+    (if (and (= 1.0 base-double)
+             (not (zero? (.compareTo abs-base java.math.BigDecimal/ONE))))
+      (let [mc (java.math.MathContext. 32)
+            ln-product (.multiply exponent (bd-ln abs-base 32) mc)]
+        (* (.doubleValue ln-product) 0.434294481903252))
+      (* exponent-double (Math/log10 base-double)))))
+
 (defn- numeric-power ^java.math.BigDecimal [^java.math.BigDecimal base ^java.math.BigDecimal e]
   (cond
     (and (zero? (.signum base)) (neg? (.signum e)))
@@ -2806,13 +2823,29 @@
     (throw (errors/pg-error
             :invalid-argument-for-power-function
             {:message "a negative number raised to a non-integer power yields a complex result"})))
-  (let [rs (power-rscale base e)
+  (let [abs-base (.abs base)
+        base-is-one? (zero? (.compareTo abs-base java.math.BigDecimal/ONE))
+        result-weight (when-not (or (zero? (.signum base)) base-is-one?)
+                        (power-result-weight base e))
+        rs (if base-is-one?
+             (clamp-rscale numeric-min-sig-digits (max (.scale base) (.scale e)))
+             (power-rscale base e))
         p (+ rs 25)
         mc (java.math.MathContext. (int p))]
     (cond
       (zero? (.signum base))
       (.setScale (if (zero? (.signum e)) java.math.BigDecimal/ONE java.math.BigDecimal/ZERO)
                  (int rs) java.math.RoundingMode/HALF_UP)
+      base-is-one?
+      (.setScale (if (and (neg? (.signum base))
+                          (.testBit (.toBigIntegerExact e) 0))
+                   (.negate java.math.BigDecimal/ONE)
+                   java.math.BigDecimal/ONE)
+                 (int rs) java.math.RoundingMode/UNNECESSARY)
+      (> result-weight numeric-max-integer-digits)
+      (throw-out-of-range "value overflows numeric format")
+      (< (inc result-weight) (- numeric-max-display-scale))
+      (.setScale java.math.BigDecimal/ZERO (int numeric-max-display-scale))
       ;; integer exponent within int range: exact repeated multiplication,
       ;; which also handles a negative base
       (and (zero? (.scale (.stripTrailingZeros e)))

@@ -66,6 +66,10 @@
        :source-lines [791 802]
        :gate "test/datahike/test/pg_numeric_special_test.clj"
        :test-var "float-specials-cast-to-numeric"}
+      {:id :finite-power-range
+       :source-lines [1284 1287]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "finite-power-range-boundaries"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"

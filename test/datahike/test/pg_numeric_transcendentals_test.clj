@@ -99,3 +99,22 @@
                           (one c "SELECT power(0.0,-1.0)")))
     (is (thrown-with-msg? SQLException #"negative number raised to a non-integer"
                           (one c "SELECT power(-1.0,0.5)")))))
+
+(deftest finite-power-range-boundaries
+  (with-open [c (jdbc)]
+    (testing "PostgreSQL numeric.sql lines 1284-1285 round far underflow to zero"
+      (doseq [exponent [-2147483648 -2147483647]]
+        (is (= "t" (one c (str "SELECT 10.0 ^ " exponent " = 0"))))
+        (is (= "1000" (one c (str "SELECT scale(10.0 ^ " exponent ")"))))))
+    (testing "lines 1286-1287 detect overflow before BigInteger allocation"
+      (doseq [sql ["SELECT 10.0 ^ 2147483647"
+                   "SELECT 117743296169.0 ^ 1000000000"]]
+        (try
+          (one c sql)
+          (is false sql)
+          (catch SQLException e
+            (is (= "22003" (.getSQLState e)))
+            (is (re-find #"value overflows numeric format" (.getMessage e)))))))
+    (testing "arbitrary-size exponents of -1 need only parity"
+      (is (= "-1.0000000000000000" (one c "SELECT (-1.0) ^ 2147483647")))
+      (is (= "1.0000000000000000" (one c "SELECT (-1.0) ^ 2147483648"))))))
