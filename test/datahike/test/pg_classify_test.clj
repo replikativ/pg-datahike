@@ -146,6 +146,8 @@
   ;; (issue #13: `SELECT now()::date` rendered as timestamp).
   (is (= :generic-sql      (kind "SELECT now()::date")))
   (is (= :generic-sql      (kind "SELECT version()::text")))
+  (is (= :generic-sql      (kind "SELECT current_catalog = current_database()")))
+  (is (= :generic-sql      (kind "SELECT now() = current_timestamp")))
   (is (= :current-schema   (kind "SELECT current_schema()")))
   (is (= :current-database (kind "SELECT current_database()")))
   (is (= :pg-backend-pid   (kind "SELECT pg_backend_pid()")))

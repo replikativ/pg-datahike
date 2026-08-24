@@ -1829,6 +1829,11 @@
     (is (= [["t"]]
            (rows (.execute *handler* "SELECT localtimestamp = localtimestamp(7)"))))))
 
+(deftest test-current-catalog-inside-expression
+  (is (= [["t"]]
+         (rows (.execute *handler*
+                         "SELECT current_catalog = current_database()")))))
+
 (deftest test-insert-update-current-timestamp-keyword
   (testing "bare current_timestamp (TimeKeyExpression) in VALUES / SET (issue #14)"
     (is (nil? (err (.execute *handler* "CREATE TABLE tkey(id INTEGER, ts TIMESTAMP)"))))

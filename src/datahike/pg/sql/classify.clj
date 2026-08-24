@@ -477,6 +477,10 @@
             (= ")" tx) (recur (rest ts) (max 0 (dec depth)))
             (pos? depth) (recur (rest ts) depth)
             (= "," tx) false
+            ;; Any top-level operator means the leading system value is
+            ;; merely an operand (`current_catalog = current_database()`,
+            ;; `now() + interval ...`), not the complete projection.
+            (= :op (:type t)) false
             ;; A trailing cast (`now()::date`) changes the result type
             ;; and column name — the hijack handlers hardcode both, so
             ;; route through the translator (issue #13).

@@ -3158,6 +3158,14 @@
          (nil? (.getTable ^Column expr)))
     "public"
 
+    ;; CURRENT_CATALOG is the bare SQL-value spelling paired with
+    ;; current_database(). Generic expressions need both operands; the
+    ;; sole-projection classifier still supplies the real connection name.
+    (and (instance? Column expr)
+         (= "current_catalog" (str/lower-case (.getColumnName ^Column expr)))
+         (nil? (.getTable ^Column expr)))
+    "datahike"
+
     ;; current_user / session_user / user / system_user as bare
     ;; identifiers (PG keywords; JSqlParser surfaces them as Column).
     ;; All collapse to the static handler role.
