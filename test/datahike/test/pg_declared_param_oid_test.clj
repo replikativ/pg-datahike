@@ -41,6 +41,7 @@
 (def oid-varchar 1043)
 (def oid-date 1082)
 (def oid-numeric 1700)
+(def oid-int4-array 1007)
 
 (def ^:dynamic *port* nil)
 
@@ -195,31 +196,50 @@
             (recur))))
       (f in out))))
 
+(defn- bind-body [statement-name params]
+  (apply ba (cstr "") (cstr statement-name)
+         [:i16 0]                    ; all params text
+         [:i16 (count params)]
+         (concat
+          (mapcat (fn [^String p]
+                    (if (nil? p)
+                      [[:i32 -1]]
+                      (let [b (.getBytes p StandardCharsets/UTF_8)]
+                        [[:i32 (alength b)] b])))
+                  params)
+          [[:i16 0]])))              ; all results text
+
+(defn- send-bind-execute-sync! [^DataOutputStream out statement-name params]
+  (send-msg! out \B (bind-body statement-name params))
+  (send-msg! out \E (ba (cstr "") [:i32 0]))
+  (send-msg! out \S (byte-array 0)))
+
+(defn- parse-describe-execute-many
+  "Parse and Describe one named statement, then Bind and Execute it for
+   every parameter vector. Returns one decoded protocol cycle per Bind.
+
+   Reusing the parsed statement is important: it verifies that lowering
+   did not capture values from the first Bind and that NULL in a later
+   Bind does not change its already-resolved parameter or result types."
+  [sql param-oids param-sets]
+  (with-conn
+    (fn [in out]
+      (let [statement-name "matrix"]
+        (send-msg! out \P (apply ba (cstr statement-name) (cstr sql)
+                                 [:i16 (count param-oids)]
+                                 (map (fn [o] [:i32 o]) param-oids)))
+        (send-msg! out \D (ba (.getBytes "S" StandardCharsets/UTF_8)
+                              (cstr statement-name)))
+        (mapv (fn [params]
+                (send-bind-execute-sync! out statement-name params)
+                (decode (read-until-ready in)))
+              param-sets)))))
+
 (defn- parse-describe-execute
   "Parse `sql` declaring `param-oids`, Describe the statement, Bind
    `params` (text format) and Execute. Returns the decoded messages."
-  ([sql param-oids params] (parse-describe-execute sql param-oids params nil))
-  ([sql param-oids params _opts]
-   (with-conn
-     (fn [in out]
-       (send-msg! out \P (apply ba (cstr "") (cstr sql)
-                                [:i16 (count param-oids)]
-                                (map (fn [o] [:i32 o]) param-oids)))
-       (send-msg! out \D (ba (.getBytes "S" StandardCharsets/UTF_8) (cstr "")))
-       (send-msg! out \B (apply ba (cstr "") (cstr "")
-                                [:i16 0]                    ; all params text
-                                [:i16 (count params)]
-                                (concat
-                                 (mapcat (fn [^String p]
-                                           (if (nil? p)
-                                             [[:i32 -1]]
-                                             (let [b (.getBytes p StandardCharsets/UTF_8)]
-                                               [[:i32 (alength b)] b])))
-                                         params)
-                                 [[:i16 0]])))              ; all results text
-       (send-msg! out \E (ba (cstr "") [:i32 0]))
-       (send-msg! out \S (byte-array 0))
-       (decode (read-until-ready in))))))
+  [sql param-oids params]
+  (first (parse-describe-execute-many sql param-oids [params])))
 
 (defn- simple [sql]
   (with-conn
@@ -330,3 +350,174 @@
       (is (= [oid-int4 oid-text] (:param-oids r))
           "the int column's own OID, the text column's own OID")
       (is (= "INSERT 0 1" (:command-complete r))))))
+
+;; ---------------------------------------------------------------------------
+;; Parse/Bind lifecycle matrix
+;; ---------------------------------------------------------------------------
+
+(def declared-int4-expression-cases
+  [{:label "bare parameter"
+    :sql "SELECT $1"
+    :column-oid oid-int4
+    :rows [["7"]]}
+   {:label "parentheses"
+    :sql "SELECT ($1)"
+    :column-oid oid-int4
+    :rows [["7"]]}
+   {:label "unary operator"
+    :sql "SELECT -($1)"
+    :column-oid oid-int4
+    :rows [["-7"]]}
+   {:label "left binary operand"
+    :sql "SELECT $1 + 1"
+    :column-oid oid-int4
+    :rows [["8"]]}
+   {:label "right binary operand"
+    :sql "SELECT 1 + $1"
+    :column-oid oid-int4
+    :rows [["8"]]}
+   {:label "strict scalar function"
+    :sql "SELECT abs($1)"
+    :column-oid oid-int4
+    :rows [["7"]]}
+   {:label "common-type function"
+    :sql "SELECT coalesce($1, 9)"
+    :column-oid oid-int4
+    :rows [["7"]]}
+   {:label "CASE result"
+    :sql "SELECT CASE WHEN true THEN $1 ELSE 9 END"
+    :column-oid oid-int4
+    :rows [["7"]]}
+   {:label "array element"
+    :sql "SELECT ARRAY[$1, 9]"
+    :column-oid oid-int4-array
+    :rows [["{7,9}"]]}
+   {:label "polymorphic introspection"
+    :sql "SELECT pg_typeof($1)::text"
+    :column-oid oid-text
+    :rows [["integer"]]}
+   {:label "NULL predicate"
+    :sql "SELECT $1 IS NULL"
+    :column-oid oid-bool
+    :rows [["f"]]}])
+
+(deftest declared-parameter-types-drive-expression-lifecycle
+  (doseq [{:keys [label sql column-oid rows]} declared-int4-expression-cases]
+    (testing label
+      (let [r (parse-describe-execute sql [oid-int4] ["7"])]
+        (is (nil? (:error r)) (str sql " returned " (:error r)))
+        (is (= [oid-int4] (:param-oids r)) sql)
+        (is (= column-oid (:oid (first (:columns r)))) sql)
+        (is (= rows (:rows r)) sql)))))
+
+(def declared-type-lifecycle-cases
+  [{:label "bool under NOT"
+    :sql "SELECT NOT $1"
+    :param-oid oid-bool
+    :value "true"
+    :column-oid oid-bool
+    :rows [["f"]]}
+   {:label "int2 arithmetic"
+    :sql "SELECT $1 + 1::int2"
+    :param-oid oid-int2
+    :value "7"
+    :column-oid oid-int2
+    :rows [["8"]]}
+   {:label "int8 arithmetic"
+    :sql "SELECT $1 + 1"
+    :param-oid oid-int8
+    :value "2147483648"
+    :column-oid oid-int8
+    :rows [["2147483649"]]}
+   {:label "numeric arithmetic"
+    :sql "SELECT $1 + 1.25"
+    :param-oid oid-numeric
+    :value "7.50"
+    :column-oid oid-numeric
+    :rows [["8.75"]]}
+   {:label "float4 arithmetic"
+    :sql "SELECT $1 + 1::float4"
+    :param-oid oid-float4
+    :value "7.5"
+    :column-oid oid-float4
+    :rows [["8.5"]]}
+   {:label "float8 arithmetic"
+    :sql "SELECT $1 + 1"
+    :param-oid oid-float8
+    :value "7.5"
+    :column-oid oid-float8
+    :rows [["8.5"]]}
+   {:label "text function"
+    :sql "SELECT upper($1)"
+    :param-oid oid-text
+    :value "hello"
+    :column-oid oid-text
+    :rows [["HELLO"]]}
+   {:label "varchar argument with text result"
+    :sql "SELECT upper($1)"
+    :param-oid oid-varchar
+    :value "hello"
+    :column-oid oid-text
+    :rows [["HELLO"]]}
+   {:label "date arithmetic"
+    :sql "SELECT $1 + 1"
+    :param-oid oid-date
+    :value "2024-01-01"
+    :column-oid oid-date
+    :rows [["2024-01-02"]]}])
+
+(deftest declared-types-drive-bind-decoding-and-result-metadata
+  (doseq [{:keys [label sql param-oid value column-oid rows]}
+          declared-type-lifecycle-cases]
+    (testing label
+      (let [r (parse-describe-execute sql [param-oid] [value])]
+        (is (nil? (:error r)) (str sql " returned " (:error r)))
+        (is (= [param-oid] (:param-oids r)) sql)
+        (is (= column-oid (:oid (first (:columns r)))) sql)
+        (is (= rows (:rows r)) sql)))))
+
+(deftest contextual-inference-resolves-unknown-parameter-slots
+  (doseq [{:keys [label sql param-oid column-oid rows]}
+          [{:label "explicit cast"
+            :sql "SELECT $1::int4"
+            :column-oid oid-int4
+            :rows [["7"]]}
+           {:label "binary operator"
+            :sql "SELECT $1 + 1"
+            :column-oid oid-int4
+            :rows [["8"]]}
+           {:label "common-type function"
+            :sql "SELECT coalesce($1, 9)"
+            :column-oid oid-int4
+            :rows [["7"]]}
+           {:label "comparison operator"
+            :sql "SELECT $1 = 7"
+            :column-oid oid-bool
+            :rows [["t"]]}
+           {:label "text concatenation"
+            :sql "SELECT $1 || 'x'"
+            :param-oid oid-text
+            :column-oid oid-text
+            :rows [["7x"]]}
+           {:label "common-type greatest"
+            :sql "SELECT greatest($1, 9)"
+            :column-oid oid-int4
+            :rows [["9"]]}]]
+    (testing label
+      (let [param-oid (or param-oid oid-int4)
+            r (parse-describe-execute sql [0] ["7"])]
+        (is (nil? (:error r)) (str sql " returned " (:error r)))
+        (is (= [param-oid] (:param-oids r)) sql)
+        (is (= column-oid (:oid (first (:columns r)))) sql)
+        (is (= rows (:rows r)) sql)))))
+
+(deftest parsed-statement-can-be-rebound-with-values-and-null
+  (let [[first-bind second-bind null-bind]
+        (parse-describe-execute-many "SELECT $1 + 1" [oid-int4]
+                                     [["2"] ["8"] [nil]])]
+    (is (= [oid-int4] (:param-oids first-bind)))
+    (is (= oid-int4 (:oid (first (:columns first-bind)))))
+    (is (= [["3"]] (:rows first-bind)))
+    (is (= [["9"]] (:rows second-bind)))
+    (is (= [[nil]] (:rows null-bind)))
+    (is (every? #(nil? (:error %)) [first-bind second-bind null-bind]))))

@@ -1,0 +1,88 @@
+{:postgres-major 17
+ :modes #{:unmeasured :discovery :strict}
+ :waves
+ [{:id 1
+   :name "expression, type, and error foundations"
+   :tests
+   [{:name "expressions" :mode :discovery
+     :boundaries #{:expressions :type-inference :nulls}
+     :blockers #{:point :create-function :planner-explain}}
+    {:name "prepare" :mode :unmeasured
+     :boundaries #{:parameter-inference :type-lookup :prepared-sql}}
+    {:name "errors" :mode :unmeasured
+     :boundaries #{:sqlstate :name-resolution :transaction-errors}}
+    {:name "int2" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "int4" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "int8" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "bit" :mode :unmeasured :boundaries #{:scalar-type :operators :nulls}}
+    {:name "numeric" :mode :unmeasured :boundaries #{:scalar-type :operators :casts}}
+    {:name "money" :mode :discovery
+     :boundaries #{:scalar-type :operators :casts :text-codec}
+     :blockers #{:locale :operator-coverage}}
+    {:name "arrays" :mode :discovery
+     :boundaries #{:array-codec :array-expressions :polymorphism}
+     :blockers #{:postgres-vector-types :create-function}}
+    {:name "uuid" :mode :unmeasured :boundaries #{:scalar-type :array-codec}}
+    {:name "enum" :mode :unmeasured :boundaries #{:user-type :casts :ordering}}
+    {:name "domain" :mode :unmeasured
+     :boundaries #{:user-type :casts :constraints}
+     :blockers #{:domain-constraint-coverage}}
+    {:name "create_type" :mode :unmeasured :boundaries #{:type-ddl :type-lookup}}
+    {:name "type_sanity" :mode :unmeasured
+     :boundaries #{:catalogs :type-registry}
+     :blockers #{:postgres-internal-catalog-completeness}}
+    {:name "opr_sanity" :mode :unmeasured
+     :boundaries #{:catalogs :operator-registry}
+     :blockers #{:postgres-internal-catalog-completeness}}
+    {:name "misc_sanity" :mode :unmeasured
+     :boundaries #{:catalogs}
+     :blockers #{:postgres-internal-catalog-completeness}}
+    {:name "namespace" :mode :unmeasured :boundaries #{:name-resolution :schemas}}
+    {:name "rangefuncs" :mode :discovery
+     :boundaries #{:set-returning-functions :lateral :parameter-inference}
+     :blockers #{:create-function :fixture-dependencies}}
+    {:name "explain" :mode :discovery
+     :boundaries #{:utility-grammar :errors}
+     :blockers #{:postgres-planner-output :helper-functions}}]}
+
+  {:id 2
+   :name "application DDL, DML, and relational SQL"
+   :tests
+   [{:name "boolean" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "char" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "name" :mode :unmeasured :boundaries #{:scalar-type :catalogs}}
+    {:name "varchar" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "text" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "float4" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "float8" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "date" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "time" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "timestamp" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "timestamptz" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "interval" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "create_table" :mode :unmeasured :boundaries #{:ddl}}
+    {:name "constraints" :mode :unmeasured :boundaries #{:ddl :constraints}}
+    {:name "insert" :mode :unmeasured :boundaries #{:dml}}
+    {:name "insert_conflict" :mode :unmeasured :boundaries #{:dml :constraints}}
+    {:name "update" :mode :unmeasured :boundaries #{:dml}}
+    {:name "delete" :mode :unmeasured :boundaries #{:dml}}
+    {:name "returning" :mode :unmeasured :boundaries #{:dml :result-metadata}}
+    {:name "transactions" :mode :unmeasured :boundaries #{:transactions}}
+    {:name "case" :mode :unmeasured :boundaries #{:expressions}}
+    {:name "subselect" :mode :unmeasured :boundaries #{:relational}}
+    {:name "union" :mode :unmeasured :boundaries #{:relational :common-types}}
+    {:name "join" :mode :unmeasured :boundaries #{:relational}}
+    {:name "aggregates" :mode :unmeasured :boundaries #{:aggregates}}
+    {:name "window" :mode :unmeasured :boundaries #{:windows}}
+    {:name "with" :mode :unmeasured :boundaries #{:ctes}}
+    {:name "limit" :mode :unmeasured :boundaries #{:relational}}]}
+
+  {:id 3
+   :name "specialized application types"
+   :tests
+   [{:name "json" :mode :unmeasured :boundaries #{:json}}
+    {:name "jsonb" :mode :discovery :boundaries #{:jsonb}}
+    {:name "jsonpath" :mode :unmeasured :boundaries #{:jsonpath}}
+    {:name "sqljson" :mode :unmeasured :boundaries #{:sql-json}}
+    {:name "tsearch" :mode :unmeasured :boundaries #{:full-text}}
+    {:name "tsdicts" :mode :unmeasured :boundaries #{:full-text}}]}]}

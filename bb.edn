@@ -32,6 +32,10 @@
               :task (apply shell "bash test/integration/postgres-regress/run.sh"
                            *command-line-args*)}
 
+  pg-regress-wave {:doc "List or run a classified PostgreSQL compatibility wave. Usage: bb pg-regress-wave [WAVE [MODE]]."
+                   :task (apply shell "bb test/integration/postgres-regress/campaign.clj"
+                                *command-line-args*)}
+
   pg-regress-bootstrap {:doc "Load PostgreSQL onek/tenk API fixtures after running test_setup on a fresh database."
                         :task (shell "bash test/integration/postgres-regress/bootstrap-api.sh")}
 

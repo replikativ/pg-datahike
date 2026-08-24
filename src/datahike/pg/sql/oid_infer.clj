@@ -412,21 +412,20 @@
       ;; here is a rewritten literal, which is never float8.
       (or (= l-oid types/oid-numeric) (= r-oid types/oid-numeric))
       types/oid-numeric
-      ;; Integers only when BOTH sides are typed. An untyped side is a
-      ;; literal the plan-cache rewrite turned into `$N`, and it may be
-      ;; a DECIMAL literal -- which is numeric and outranks int. Firing
-      ;; on one typed side reported int8 for `i4 + 1.0`, whose value is
-      ;; a numeric: psycopg2 read the int8 OID, tried int("11.0") and
-      ;; raised ValueError. Returning nil instead lets the caller fall
-      ;; back to value-based inference, which sees the real type.
       ;; Integer arithmetic keeps the WIDER operand's width -- int2+int2
       ;; is int2pl and stays int2, int4+int8 is int48pl and becomes int8.
       ;; Collapsing all three to int8 made every integer expression
       ;; report bigint, so a binary client sized for int4 was handed an
-      ;; 8-byte payload.
+      ;; 8-byte payload. One integer side also settles an UNKNOWN protocol
+      ;; parameter or quoted literal: PostgreSQL resolves `$1 + 1` and
+      ;; `'1' + int4_col` through the int4 operator. Decimal literals
+      ;; rewritten by the plan cache carry a declared NUMERIC OID and
+      ;; therefore take the numeric branch above rather than this one.
       (and (int-oid? l-oid) (int-oid? r-oid))
       (let [rank {types/oid-int2 0 types/oid-int4 1 types/oid-int8 2}]
         (if (>= (rank l-oid) (rank r-oid)) l-oid r-oid))
+      (and (int-oid? l-oid) (nil? r-oid)) l-oid
+      (and (nil? l-oid) (int-oid? r-oid)) r-oid
       (and l-oid r-oid) types/oid-int8
       :else nil)))
 
