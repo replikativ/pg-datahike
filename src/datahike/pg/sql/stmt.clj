@@ -5102,7 +5102,7 @@
    discarded, so 22003 numeric field overflow was never raised on any
    write path."
   [v p scale]
-  (if (instance? java.math.BigDecimal v)
+  (if (or (instance? java.math.BigDecimal v) (types/numeric-special? v))
     (cond
       (and p scale) (sql-cast/apply-numeric-typmod v p scale)
       scale         (.setScale ^java.math.BigDecimal v (int scale)

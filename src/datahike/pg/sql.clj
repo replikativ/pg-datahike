@@ -2026,7 +2026,8 @@
          ;; (structured category). The errors namespace knows how to
          ;; map both to a (sqlstate, message, fields) tuple.
         (let [data (ex-data e)
-              [classified-code classified-msg] (errors/classify-exception e)
+              [classified-code classified-msg classified-fields]
+              (errors/classify-exception e)
                ;; Only prepend "SQL parse error:" when neither :sqlstate
                ;; nor a registered :error category was set — those came
                ;; from a real SQL-shape failure where the prefix is
@@ -2041,7 +2042,8 @@
                     (str "SQL parse error: " classified-msg))]
           {:type :error
            :message msg
-           :sqlstate classified-code})))))
+           :sqlstate classified-code
+           :error-fields classified-fields})))))
 
 (defn- templated-parse
   "Lexical INSERT-VALUES fast path. Returns a parsed result on

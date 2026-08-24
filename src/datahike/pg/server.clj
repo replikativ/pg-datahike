@@ -6378,7 +6378,7 @@
     (format-query-result combined (or find-aliases (:find-aliases left-query)))))
 
 (defn- exec-error
-  "Parse-time failure handler. Returns a plain `:message` string,
+  "Parse-time failure handler. Returns a PostgreSQL ErrorResponse,
    optionally with an explicit :sqlstate (for known-unsupported DDL
    like GRANT/REVOKE/RLS — see CT6). Without one, run the message
    through the regex classifier so pgJDBC sees e.g. 42601 for syntax
@@ -6405,7 +6405,10 @@
         ;; in_failed_sql_transaction state.
         (when (:in-tx? @tx-state)
           (swap! tx-state assoc :aborted? true))
-        (error-result msg code)))))
+        (let [^PgWireServer$QueryResult result (error-result msg code)]
+          (if-let [fields (:error-fields parsed)]
+            (.withErrorFields result fields)
+            result))))))
 
 (defn- columns-from-schema
   "When `COPY t FROM stdin` is invoked WITHOUT an explicit column
@@ -6843,7 +6846,8 @@
               (when (= :error (:type parsed))
                 (throw (PgWireServer$PgProtocolException.
                         (or (:sqlstate parsed) "42601")
-                        (or (:message parsed) "statement could not be parsed"))))
+                        (or (:message parsed) "statement could not be parsed")
+                        (:error-fields parsed))))
               (let [;; Attach the original SQL so downstream code that reads
                   ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                   ;; working even though parse-sql may not have set it for

@@ -1802,7 +1802,30 @@
         (Double/isNaN o) (inc n)
         below? 0
         above? (inc n)
-        :else (inc (long (Math/floor (* n (/ (- o l) (- h l))))))))))
+        :else
+        ;; Computing `(o-l)/(h-l)` as a double rounds to exactly 1 for
+        ;; ranges such as [-1e100, 1] with operand 0, incorrectly placing
+        ;; an interior value in the overflow bucket. Work from the nearer
+        ;; endpoint using decimal arithmetic: the complementary form keeps
+        ;; even a 1e-100 distance visible.
+        (let [bd-o (java.math.BigDecimal/valueOf o)
+              bd-l (java.math.BigDecimal/valueOf l)
+              bd-h (java.math.BigDecimal/valueOf h)
+              from-low (.abs (.subtract bd-o bd-l))
+              from-high (.abs (.subtract bd-h bd-o))
+              span (.add from-low from-high)
+              buckets (java.math.BigDecimal/valueOf n)
+              near-low? (<= (.compareTo from-low from-high) 0)
+              distance (if near-low? from-low from-high)
+              scaled (.divide (.multiply buckets distance)
+                              span java.math.MathContext/DECIMAL128)
+              offset (.longValue (.setScale scaled 0
+                                            (if near-low?
+                                              java.math.RoundingMode/FLOOR
+                                              java.math.RoundingMode/CEILING)))]
+          (if near-low?
+            (inc offset)
+            (inc (- n offset))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; SQL string function implementations

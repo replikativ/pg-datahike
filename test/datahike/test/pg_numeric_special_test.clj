@@ -16,7 +16,8 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager SQLException]))
+  (:import [java.sql Connection DriverManager SQLException]
+           [org.postgresql.util PSQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -33,10 +34,13 @@
 
 (use-fixtures :each ns-fixture)
 
-(defn- ^Connection jdbc []
-  (DriverManager/getConnection
-   (str "jdbc:postgresql://127.0.0.1:" *port*
-        "/n?user=x&password=x&sslmode=disable&binaryTransfer=false")))
+(defn- ^Connection jdbc
+  ([] (jdbc nil))
+  ([query-mode]
+   (DriverManager/getConnection
+    (str "jdbc:postgresql://127.0.0.1:" *port*
+         "/n?user=x&password=x&sslmode=disable&binaryTransfer=false"
+         (when query-mode (str "&preferQueryMode=" query-mode))))))
 
 (defn- one [^Connection c sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
@@ -108,6 +112,10 @@
       (is (= "11" (one c "SELECT width_bucket('Infinity'::numeric, 1, 10, 10)")))
       (is (= "0" (one c "SELECT width_bucket('-Infinity'::numeric, 1, 10, 10)")))
       (is (= "889" (one c "SELECT width_bucket('NaN', 3.0, 4.0, 888)")))
+      (is (= "10" (one c "SELECT width_bucket(0, -1e100::numeric, 1, 10)")))
+      (is (= "10" (one c "SELECT width_bucket(0, -1e100::float8, 1, 10)")))
+      (is (= "10" (one c "SELECT width_bucket(1, 1e100::numeric, 0, 10)")))
+      (is (= "10" (one c "SELECT width_bucket(1, 1e100::float8, 0, 10)")))
       (is (thrown-with-msg? SQLException #"bounds must be finite"
                             (one c "SELECT width_bucket(0::numeric, 'Infinity'::numeric, 5, 10)"))))
     (testing "scale has nothing to report for a special"
@@ -125,10 +133,48 @@
     (is (thrown-with-msg? SQLException #"cannot convert infinity to integer"
                           (one c "SELECT 'Infinity'::numeric::int")))))
 
+(deftest float-specials-cast-to-numeric
+  (with-open [c (jdbc)]
+    (doseq [[source expected] [["'NaN'::float8" "NaN"]
+                               ["'Infinity'::float8" "Infinity"]
+                               ["'-Infinity'::float8" "-Infinity"]
+                               ["'NaN'::float4" "NaN"]
+                               ["'Infinity'::float4" "Infinity"]
+                               ["'-Infinity'::float4" "-Infinity"]]]
+      (is (= expected (one c (str "SELECT " source "::numeric")))))
+    (doseq [target ["float8" "float4"]
+            [source expected] [["'NaN'::numeric" "NaN"]
+                               ["'Infinity'::numeric" "Infinity"]
+                               ["'-Infinity'::numeric" "-Infinity"]]]
+      (is (= expected (one c (str "SELECT " source "::" target)))))))
+
+(deftest constrained-numeric-rejects-infinity-but-allows-nan
+  (with-open [c (jdbc)]
+    (is (= "NaN" (one c "SELECT 'NaN'::numeric(4,4)")))
+    (is (thrown-with-msg? SQLException #"numeric field overflow"
+                          (one c "SELECT 'Infinity'::numeric(4,4)")))
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE constrained_special (n numeric(3,-3))")
+      (.executeUpdate st "INSERT INTO constrained_special VALUES ('NaN')")
+      (is (thrown-with-msg? SQLException #"numeric field overflow"
+                            (.executeUpdate st "INSERT INTO constrained_special VALUES ('Inf')"))))))
+
+(deftest parse-time-numeric-errors-preserve-detail-fields
+  (doseq [query-mode [nil "simple"]]
+    (with-open [c (jdbc query-mode)]
+      (try
+        (one c "SELECT 'Infinity'::numeric(4,4)")
+        (is false (or query-mode "extended"))
+        (catch PSQLException e
+          (is (= "22003" (.getSQLState e)))
+          (is (= (str "A field with precision 4, scale 4 "
+                      "cannot hold an infinite value.")
+                 (some-> e .getServerErrorMessage .getDetail))))))))
+
 (deftest numeric-specials-persist-in-tables
   (with-open [c (jdbc)]
     (with-open [st (.createStatement c)]
-      (.execute st "CREATE TABLE measurements (id int PRIMARY KEY, n numeric(20,2))")
+      (.execute st "CREATE TABLE measurements (id int PRIMARY KEY, n numeric)")
       ;; This is the first transaction-breaking statement in PostgreSQL's
       ;; numeric regression test. Keep it in an explicit transaction so a
       ;; rejected special cannot hide behind an auto-commit boundary.

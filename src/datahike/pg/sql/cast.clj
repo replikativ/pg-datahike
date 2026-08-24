@@ -73,21 +73,30 @@
    answered 123.456 instead of 123.5, and the precision is why
    `123456::numeric(5,2)` was accepted at all -- 22003 numeric field
   overflow was never raised on any path."
-  [^java.math.BigDecimal v p s]
-  (let [scaled (.setScale v (int s) java.math.RoundingMode/HALF_UP)
-        ;; PG's own test: |value| must be < 10^(p-s).
-        ;; scaleByPowerOfTen also covers s > p, where the exponent is
-        ;; negative (for example numeric(3,6) has a limit of 10^-3).
-        limit (.scaleByPowerOfTen java.math.BigDecimal/ONE (int (- p s)))]
-    (if (>= (.compareTo (.abs scaled) limit) 0)
+  [v p s]
+  (if (types/numeric-special? v)
+    (if (= :nan (:kind v))
+      v
       (throw (errors/pg-error
               :numeric-value-out-of-range
-              ;; PostgreSQL puts the arithmetic in DETAIL, not the message.
               {:message "numeric field overflow"
                :detail (str "A field with precision " p ", scale " s
-                            " must round to an absolute value less than 10^"
-                            (- p s) ".")}))
-      scaled)))
+                            " cannot hold an infinite value.")})))
+    (let [^java.math.BigDecimal decimal v
+          scaled (.setScale decimal (int s) java.math.RoundingMode/HALF_UP)
+          ;; PG's own test: |value| must be < 10^(p-s).
+          ;; scaleByPowerOfTen also covers s > p, where the exponent is
+          ;; negative (for example numeric(3,6) has a limit of 10^-3).
+          limit (.scaleByPowerOfTen java.math.BigDecimal/ONE (int (- p s)))]
+      (if (>= (.compareTo (.abs scaled) limit) 0)
+        (throw (errors/pg-error
+                :numeric-value-out-of-range
+                ;; PostgreSQL puts the arithmetic in DETAIL, not the message.
+                {:message "numeric field overflow"
+                 :detail (str "A field with precision " p ", scale " s
+                              " must round to an absolute value less than 10^"
+                              (- p s) ".")}))
+        scaled))))
 
 (def ^:private money-min-cents (biginteger Long/MIN_VALUE))
 (def ^:private money-max-cents (biginteger Long/MAX_VALUE))
@@ -179,7 +188,7 @@
                     :numeric-value-out-of-range
                     {:message (str "cannot convert "
                                    (if (= :nan (:kind v)) "NaN" "infinity")
-                                   " to integer")})))
+                                   " to " tname)})))
         _ (when (and (number? v)
                      (or (Double/isNaN (double v)) (Double/isInfinite (double v))))
             ;; PostgreSQL reports these as a plain range failure for the
@@ -334,7 +343,8 @@
             ;; conversion, not through its shortest-round-trip text --
             ;; see coerce/float->numeric.
             :numeric (let [bd (if (or (instance? Float v) (instance? Double v))
-                                (coerce/float->numeric v)
+                                (or (types/double->numeric-special (double v))
+                                    (coerce/float->numeric v))
                                 (coerce/coerce-numeric v :bigdec))]
                        (if-let [[p sc] (numeric-typmod type-str)]
                          (apply-numeric-typmod bd p sc)
