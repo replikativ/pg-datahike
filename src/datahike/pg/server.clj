@@ -1917,13 +1917,13 @@
 
             ;; Domain CHECK with a parsed AST. PG's `VALUE` keyword
             ;; refers to the column's value; bind it under the
-            ;; conventional (keyword "" "VALUE") so the existing
+            ;; conventional lower-case unqualified keyword so the existing
             ;; eval-check-predicate / eval-update-expr machinery
             ;; resolves it without a special case.
             (and (= :domain (:kind spec)) (some? v) (:check-ast spec))
             (let [r (try
                       (sql/eval-check-predicate (:check-ast spec)
-                                                {(keyword "" "VALUE") v}
+                                                {(keyword "" "value") v}
                                                 "" schema)
                       (catch Throwable _ ::error))]
               (when (false? r)
