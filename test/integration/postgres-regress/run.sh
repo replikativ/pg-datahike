@@ -81,8 +81,8 @@ result_files=("${output_dir}"/results/*.out)
 if (( ${#result_files[@]} > 0 )); then
   echo
   echo "Per-test target error summary:"
-  printf '%-24s %8s %8s %8s %8s %8s\n' \
-    "test" "expected" "target" "delta" "aborted" "internal"
+  printf '%-24s %8s %8s %8s %8s %8s %10s\n' \
+    "test" "expected" "target" "delta" "aborted" "internal" "api-match"
   for result_file in "${result_files[@]}"; do
     test_name="$(basename "${result_file}" .out)"
     expected_file="${input_dir}/expected/${test_name}.out"
@@ -95,12 +95,26 @@ if (( ${#result_files[@]} > 0 )); then
     internal_count="$(rg -c \
       'class .* cannot be cast|ClassCastException|NullPointerException|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
       "${result_file}" || true)"
+    api_match="n/a"
+    if [[ -f "${expected_file}" ]]; then
+      # PostgreSQL prints source excerpts and carets for parser/input errors.
+      # They are presentation rather than SQL result semantics; keep every
+      # error message, DETAIL/HINT, row, type and table-formatting line.
+      if diff -q \
+        <(sed -e '/^LINE [0-9][0-9]*: /d' -e '/^[[:space:]]*\^$/d' "${expected_file}") \
+        <(sed -e '/^LINE [0-9][0-9]*: /d' -e '/^[[:space:]]*\^$/d' "${result_file}") \
+        >/dev/null; then
+        api_match="yes"
+      else
+        api_match="no"
+      fi
+    fi
     expected_error_count="${expected_error_count:-0}"
     error_count="${error_count:-0}"
-    printf '%-24s %8s %8s %+8d %8s %8s\n' \
+    printf '%-24s %8s %8s %+8d %8s %8s %10s\n' \
       "${test_name}" "${expected_error_count}" "${error_count}" \
       "$((error_count - expected_error_count))" \
-      "${aborted_count:-0}" "${internal_count:-0}"
+      "${aborted_count:-0}" "${internal_count:-0}" "${api_match}"
   done
 
   echo

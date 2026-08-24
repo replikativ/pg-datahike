@@ -40,6 +40,8 @@ also prints:
 - total diff lines as a coarse trend;
 - per-test expected/target error counts and their coarse delta, plus
   transaction-cascade and internal-failure counts;
+- `api-match`, which compares complete output after removing only PostgreSQL's
+  `LINE n:` source excerpt and caret presentation from errors;
 - the most frequent target-side errors;
 - internal-looking signatures such as class casts, unknown Datalog variables,
   and lost connections.
@@ -53,6 +55,11 @@ The error delta is also only a triage signal: matching counts do not prove that
 the same statements failed, and one missing expected error can cancel one extra
 target error. Use the unified diff to establish behavior before promoting a
 slice to a gate.
+
+`api-match=yes` is stronger: all commands, errors, rows, column labels and
+psql-rendered values agree after the narrow source-position normalization. It
+does not claim wire-level ErrorResponse position fields are implemented, but
+it is suitable for admitting an SQL API behavior slice.
 
 ## Compatibility campaign
 

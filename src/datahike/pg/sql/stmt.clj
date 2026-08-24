@@ -811,6 +811,7 @@
    known one whose arguments we could not evaluate (a correlated LATERAL
    argument): the first is 42883, the second is not."
   #{"unnest" "generate_series" "pg_get_keywords"
+    "pg_input_error_info"
     "jsonb_array_elements" "json_array_elements"
     "jsonb_array_elements_text" "json_array_elements_text"
     "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
@@ -882,6 +883,14 @@
                              {:aliases aliases :rows rows :vtypes vtypes
                               :pg-types (vec pg-types)}))]
      (cond
+       (= fname "pg_input_error_info")
+       (let [[value type-name] (mapv eval-fn params)]
+         (when (= 2 (count params))
+           (with-ordinality ["message" "detail" "hint" "sql_error_code"]
+             [(fns/pg-input-error-info value type-name)]
+             [:db.type/string :db.type/string :db.type/string :db.type/string]
+             ["text" "text" "text" "text"])))
+
        (= fname "unnest")
        ;; PG `unnest` flattens ALL dimensions into one row per leaf
        ;; (`arrayfuncs.c`, ArrayGetNItems over ndim) — `ARRAY[[1,2],[3,4]]`

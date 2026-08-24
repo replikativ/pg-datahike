@@ -2894,7 +2894,7 @@
   (fn [x & more]
     (if (types/numeric-special? x) :__null__ (apply f x more))))
 
-(defn- pg-input-valid?
+(defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
    casts; validation must not become a second, more permissive parser."
@@ -2940,6 +2940,35 @@
          (char-value)
          false)))
     (catch Throwable _ false)))
+
+(defn pg-input-error-info
+  "The four-column record returned by pg_input_error_info. This is kept
+   beside pg-input-valid? so both APIs share the same accepted scalar input
+   surface. SQL NULL is represented by the query engine's sentinel."
+  [value type-name]
+  (let [[_ raw-base modifier] (re-matches #"(?is)^\s*(.+?)(?:\(([^)]*)\))?\s*$"
+                                          (str type-name))
+        base (some-> raw-base str/lower-case str/trim)
+        display-type (case base
+                       ("bool" "boolean") "boolean"
+                       ("int2" "smallint") "smallint"
+                       ("int4" "int" "integer") "integer"
+                       ("int8" "bigint") "bigint"
+                       ("varchar" "character varying") "character varying"
+                       ("char" "character") "character"
+                       base)
+        display-type (if modifier
+                       (str display-type "(" (str/trim modifier) ")")
+                       display-type)
+        too-long? (and modifier
+                       (contains? #{"char" "character" "varchar" "character varying"} base))
+        message (if too-long?
+                  (str "value too long for type " display-type)
+                  (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
+        sqlstate (if too-long? "22001" "22P02")]
+    (if (pg-input-valid? value type-name)
+      [nil nil nil nil]
+      [message nil nil sqlstate])))
 
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,

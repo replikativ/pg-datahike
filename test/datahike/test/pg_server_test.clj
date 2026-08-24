@@ -1782,6 +1782,12 @@
                               "pg_input_is_valid('Infinity', 'numeric'), "
                               "pg_input_is_valid('nope', 'uuid')"))))))
 
+(deftest test-pg-input-error-info
+  (is (= [["invalid input syntax for type boolean: \"junk\""
+           nil nil "22P02"]]
+         (rows (.execute *handler*
+                         "SELECT * FROM pg_input_error_info('junk', 'bool')")))))
+
 (deftest test-current-timestamp-cast-and-render
   (testing "current_timestamp::date returns one row rendered as a date (issue #13)"
     (let [r (.execute *handler* "SELECT current_timestamp::date")]
