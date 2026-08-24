@@ -4294,88 +4294,6 @@
             (when (and (seq data-patterns) (seq other-clauses))
               (reset! (:where-clauses ctx) (into data-patterns other-clauses))))
 
-        ;; PostgreSQL rejects a select item that is neither aggregated
-        ;; nor grouped (42803). Datalog has no such rule — it groups by
-        ;; whatever non-aggregate :find elements it is given — so
-        ;; `SELECT sal, count(*) FROM g GROUP BY dept` quietly returned
-        ;; five ungrouped rows instead of erroring, which is a wrong
-        ;; answer wearing the right shape.
-        ;;
-        ;; PostgreSQL licenses an ungrouped column when the table's
-        ;; PRIMARY KEY is a subset of the grouping columns, because the
-        ;; grouping is then a no-op for that table
-        ;; (check_functional_grouping in pg_constraint.c) — that is what
-        ;; makes `SELECT * FROM g GROUP BY id` legal. A SQL PRIMARY KEY
-        ;; is stored as the namespace's `:db.unique/identity` attribute,
-        ;; so covering it is the same test here.
-        ;;
-        ;; Only plain column references are checked. A materialised
-        ;; expression has no entry in `:col->var`, so it is skipped
-        ;; rather than guessed at — PostgreSQL would reject more than we
-        ;; do, and under-reporting is the safe direction for a check
-        ;; whose whole risk is false positives.
-        _ (when (and (or (seq group-by) @has-aggregates?)
-                     (exact-schema-for-grouping? db))
-            (let [fe @find-elements
-                  fa @find-aliases
-                  ordinal-elems
-                  (mapv (fn [pos]
-                          (when (or (< pos 1) (> pos (count fa)))
-                            (throw (ex-info (str "GROUP BY position " pos
-                                                 " is not in select list")
-                                            {:error :invalid-column-reference
-                                             :sqlstate "42P10"})))
-                          (let [el (nth fe (dec pos))]
-                            (when (seq? el)
-                              (throw (ex-info "aggregate functions are not allowed in GROUP BY"
-                                              {:error :grouping-error
-                                               :sqlstate "42803"})))
-                            el))
-                        group-by-ordinals)
-                  gvars (into (into (set group-by-vars) ordinal-elems)
-                              ;; an output alias named in GROUP BY groups
-                              ;; by its select-list element
-                              (keep (fn [[a el]]
-                                      (when (contains? group-by-alias-names a) el))
-                                    (map vector fa fe)))
-                  var->col (persistent!
-                            (reduce (fn [m [k v]]
-                                      (if (and (vector? k) (keyword? (second k)))
-                                        (assoc! m v k)
-                                        m))
-                                    (transient {}) @(:col->var ctx)))
-                  ;; Namespaces whose identity attribute is a grouping
-                  ;; key: every column of those is licensed.
-                  pk-grouped (into #{}
-                                   (keep (fn [v]
-                                           (when-let [[_ attr] (var->col v)]
-                                             (when (= :db.unique/identity
-                                                      (:db/unique (get schema attr)))
-                                               (namespace attr)))))
-                                   group-by-vars)
-                  ;; ORDER BY expressions are allowed to be hidden from the
-                  ;; projection, but they are not exempt from grouping rules:
-                  ;; `SELECT count(*) FROM t GROUP BY a ORDER BY b` is 42803.
-                  ;; Include directly-resolved order columns in the same
-                  ;; validation pass as visible target columns.
-                  visible (concat (take (count @find-aliases) @find-elements)
-                                  (keep (fn [[v _dir _nulls]]
-                                          (when (symbol? v) v))
-                                        order-by-spec))]
-              (doseq [el visible]
-                (when (and (symbol? el) (not (contains? gvars el)))
-                  (when-let [[alias-key attr] (var->col el)]
-                    (when-not (contains? pk-grouped (namespace attr))
-                      ;; `name` is shadowed by a local holding the table
-                      ;; name throughout this let, hence the qualified calls.
-                      (throw (ex-info (str "column \"" (or alias-key (namespace attr))
-                                           "." (clojure.core/name attr)
-                                           "\" must appear in the GROUP BY clause "
-                                           "or be used in an aggregate function")
-                                      {:error :grouping-error
-                                       :sqlstate "42803"
-                                       :column (clojure.core/name attr)}))))))))
-
         ;; HAVING is a predicate OVER aggregates, so it is translated
         ;; exactly the way an expression over aggregates in the select
         ;; list is: hoist each aggregate into a hidden `:find` element and
@@ -4424,6 +4342,87 @@
             [{:form pform :slots slots} @n-hidden])
           [nil 0])
 
+        ;; HAVING creates one implicit group even when neither it nor the
+        ;; projection contains an aggregate. Without this, the ordinary
+        ;; no-ORDER-BY path appended the entity id to :find and
+        ;; `SELECT 1 FROM t HAVING true` returned one row per entity.
+        ;;
+        ;; If both the projection and HAVING are constant, the implicit
+        ;; group also exists for an empty input and no source value can
+        ;; affect it. PostgreSQL consequently does not evaluate a dead
+        ;; `WHERE 1/a` in this shape. Mark it so the where-clause snapshot
+        ;; below can retain only bindings needed by the constant projection.
+        source-var->col
+        (persistent!
+         (reduce (fn [m [k v]]
+                   (if (and (vector? k) (keyword? (second k)))
+                     (assoc! m v k)
+                     m))
+                 (transient {}) @(:col->var ctx)))
+        visible-find (take (count @find-aliases) @find-elements)
+        having-form-vars (if having-spec
+                           (ctx/collect-vars (:form having-spec))
+                           #{})
+        source-vars-in-result
+        (into #{}
+              (filter #(contains? source-var->col %))
+              (concat (filter symbol? visible-find)
+                      having-form-vars
+                      (keep (fn [[v _dir _nulls]]
+                              (when (symbol? v) v))
+                            order-by-spec)))
+        degenerate-having?
+        (and having-expr
+             (not @has-aggregates?)
+             (empty? source-vars-in-result))
+        _ (when having-expr (reset! has-aggregates? true))
+
+        ;; PostgreSQL rejects every source column that is neither aggregated
+        ;; nor grouped (42803), including hidden ORDER BY columns and columns
+        ;; referenced only by HAVING. This deliberately runs AFTER HAVING
+        ;; aggregate hoisting so there is one validation boundary for the
+        ;; entire query expression tree.
+        _ (when (and (or (seq group-by) @has-aggregates?)
+                     (exact-schema-for-grouping? db))
+            (let [fe @find-elements
+                  fa @find-aliases
+                  ordinal-elems
+                  (mapv (fn [pos]
+                          (when (or (< pos 1) (> pos (count fa)))
+                            (throw (ex-info (str "GROUP BY position " pos
+                                                 " is not in select list")
+                                            {:error :invalid-column-reference
+                                             :sqlstate "42P10"})))
+                          (let [el (nth fe (dec pos))]
+                            (when (seq? el)
+                              (throw (ex-info "aggregate functions are not allowed in GROUP BY"
+                                              {:error :grouping-error
+                                               :sqlstate "42803"})))
+                            el))
+                        group-by-ordinals)
+                  gvars (into (into (set group-by-vars) ordinal-elems)
+                              (keep (fn [[a el]]
+                                      (when (contains? group-by-alias-names a) el))
+                                    (map vector fa fe)))
+                  pk-grouped (into #{}
+                                   (keep (fn [v]
+                                           (when-let [[_ attr] (source-var->col v)]
+                                             (when (= :db.unique/identity
+                                                      (:db/unique (get schema attr)))
+                                               (namespace attr)))))
+                                   group-by-vars)]
+              (doseq [v source-vars-in-result]
+                (when-not (contains? gvars v)
+                  (when-let [[alias-key attr] (source-var->col v)]
+                    (when-not (contains? pk-grouped (namespace attr))
+                      (throw (ex-info (str "column \"" (or alias-key (namespace attr))
+                                           "." (clojure.core/name attr)
+                                           "\" must appear in the GROUP BY clause "
+                                           "or be used in an aggregate function")
+                                      {:error :grouping-error
+                                       :sqlstate "42803"
+                                       :column (clojure.core/name attr)}))))))))
+
         ;; GROUP BY keys that are not projected must still reach :find,
         ;; because Datalog derives grouping from the non-aggregate :find
         ;; elements — there is no separate grouping clause. Without this
@@ -4452,7 +4451,13 @@
         ;; snapshot before, the aggregate's input var (e.g. ?sales_amount)
         ;; references no `:where` clause and Datahike rejects it as
         ;; "Query for unknown vars".
-        where-clauses @(:where-clauses ctx)
+        where-clauses
+        (if degenerate-having?
+          (let [projection-vars (set (filter symbol? visible-find))]
+            (filterv (fn [clause]
+                       (some projection-vars (ctx/collect-vars clause)))
+                     @(:where-clauses ctx)))
+          @(:where-clauses ctx))
         find-elems @find-elements
 
         find-elems-vec (vec find-elems)
@@ -4540,7 +4545,10 @@
 
         in-params @(:in-params ctx)
         in-args @(:in-args ctx)
-        with-vars @(:with-vars ctx)
+        ;; A constant implicit HAVING group deliberately detached from its
+        ;; source relation above must not keep that relation's entity id in
+        ;; :with: it is now unbound and would suppress the singleton row.
+        with-vars (if degenerate-having? [] @(:with-vars ctx))
         ;; Remove :with vars that appear in :find (Datahike disallows overlap)
         find-syms (set (mapcat (fn [elem]
                                  (if (seq? elem) (filter symbol? (flatten elem)) [elem]))
