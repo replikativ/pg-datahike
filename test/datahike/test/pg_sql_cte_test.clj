@@ -81,6 +81,24 @@
   (with-open [st (.createStatement c)]
     (.executeUpdate st sql)))
 
+(deftest create-table-as-select-materializes-schema-and-rows
+  (with-open [c (jdbc)]
+    (is (zero? (update-count
+                c "CREATE TABLE eng_copy AS
+                     SELECT id, name FROM emp WHERE dept = 'Eng'")))
+    (is (= [["1" "Alice"] ["2" "Bob"] ["5" "Eve"]]
+           (rows c "SELECT id, name FROM eng_copy ORDER BY id")))
+    (is (= [["integer" "text"]]
+           (rows c "SELECT pg_typeof(id), pg_typeof(name) FROM eng_copy LIMIT 1")))))
+
+(deftest create-table-as-aggregate-result
+  (with-open [c (jdbc)]
+    (is (zero? (update-count
+                c "CREATE TABLE dept_counts AS
+                     SELECT dept, count(*) AS n FROM emp GROUP BY dept")))
+    (is (= [["Eng" "3"] ["Sales" "2"]]
+           (rows c "SELECT dept, n FROM dept_counts ORDER BY dept")))))
+
 ;; ---------------------------------------------------------------------------
 ;; Plain (non-recursive) CTE lifted to every DML path
 ;; ---------------------------------------------------------------------------

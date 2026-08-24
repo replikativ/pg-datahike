@@ -525,6 +525,71 @@
     (instance? Delete stmt)            (.getWithItemsList ^Delete stmt)
     :else                              nil))
 
+(defn- translate-create-table-as
+  "Lower CREATE TABLE name AS SELECT into one atomic schema+data transaction.
+   CTAS is an application-facing DDL/DML boundary, not merely parser sugar:
+   column names and SQL types come from the SELECT result and the rows are
+   captured from the same database snapshot used during translation."
+  [^CreateTable ct schema db]
+  (let [select (.getSelect ct)]
+    (when-not (instance? PlainSelect select)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:feature "CREATE TABLE AS with a non-plain SELECT"})))
+    (let [base (ddl/translate-create-table ct db)
+          selected (stmt/translate-select ^PlainSelect select schema db)
+          query-db (or (:enriched-db selected) db)
+          rows (if (seq (:in-args selected))
+                 (apply d/q (:query selected) query-db (:in-args selected))
+                 (d/q (:query selected) query-db))
+          hidden (long (or (:hidden-count selected) 0))
+          visible-rows (mapv (fn [row]
+                               (let [row (if (sequential? row) (vec row) [row])]
+                                 (if (pos? hidden)
+                                   (subvec row 0 (- (count row) hidden))
+                                   row)))
+                             rows)
+          aliases (mapv (fn [idx alias]
+                          (params/unquote-ident
+                           (or alias (str "column" (inc idx)))))
+                        (range) (:find-aliases selected))
+          oids (vec (:select-item-oids selected))
+          table-name (:table-name base)
+          marker (pgs/row-marker-attr table-name)
+          col-specs (mapv (fn [idx alias]
+                            (let [oid (or (nth oids idx nil)
+                                          (some->> visible-rows
+                                                   (map #(nth % idx nil))
+                                                   (remove #(or (nil? %) (= :__null__ %)))
+                                                   first
+                                                   types/infer-oid-from-value)
+                                          types/oid-text)
+                                  vtype (or (types/dh-type-for-oid oid)
+                                            :db.type/string)
+                                  attr (keyword table-name alias)
+                                  pg-type (get types/oid->pg-type-marker oid)]
+                              {:alias alias :attr attr :oid oid :vtype vtype
+                               :schema (cond-> {:db/ident attr
+                                                :db/valueType vtype
+                                                :db/cardinality :db.cardinality/one}
+                                         pg-type (assoc :pg/type pg-type))}))
+                          (range) aliases)
+          ctas-schema (into {} (map (fn [{:keys [attr schema]}] [attr schema])) col-specs)
+          data-tx (mapv (fn [row]
+                          (reduce (fn [entity [idx {:keys [attr]}]]
+                                    (let [v (nth row idx nil)]
+                                      (if (or (nil? v) (= :__null__ v))
+                                        entity
+                                        (assoc entity attr
+                                               (stmt/coerce-insert-value
+                                                v attr ctas-schema db)))))
+                                  {:db/id (str (gensym "ctas-")) marker true}
+                                  (map-indexed vector col-specs)))
+                        visible-rows)]
+      (-> base
+          (assoc :column-order aliases)
+          (update :tx-data into (concat (mapv :schema col-specs) data-tx))))))
+
 (defn- plain-selects-in
   "All PlainSelects reachable from a SELECT body, descending
    ParenthesedSelect wrappers and SetOperationList (UNION/…) parts.
@@ -1713,7 +1778,9 @@
 
           ;; CREATE TABLE
                     (instance? CreateTable stmt)
-                    (ddl/translate-create-table ^CreateTable stmt db)
+                    (if (.getSelect ^CreateTable stmt)
+                      (translate-create-table-as ^CreateTable stmt schema db)
+                      (ddl/translate-create-table ^CreateTable stmt db))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)

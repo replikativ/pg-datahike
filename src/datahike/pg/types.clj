@@ -340,6 +340,13 @@
                    [(str "_" (name kw)) arr-oid])))
          elem-kw->oid)))
 
+(def oid->pg-type-marker
+  "Inverse of `pg-name->oid`: wire OID to the canonical string persisted in
+   `:pg/type`.  This is deliberately distinct from `oid->pg-name`, whose
+   values are PostgreSQL display names such as `integer` and `double
+   precision`; persisted hints must be resolvable by `pg-name->oid` again."
+  (into {} (map (fn [[pg-name oid]] [oid pg-name])) pg-name->oid))
+
 (def dh-type->oid
   "Map Datahike :db/valueType to PostgreSQL type OID for wire protocol."
   {:db.type/string  oid-text

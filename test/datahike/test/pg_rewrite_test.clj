@@ -123,6 +123,14 @@
     (let [sql "-- REFERENCES p(id)\nSELECT 1"]
       (is (= sql (strip-refs sql))))))
 
+(deftest create-table-as-select-is-not-an-alias
+  (testing "the statement-level AS introduces a query, not an alias named select"
+    (let [sql "CREATE TABLE copied AS SELECT id FROM source"]
+      (is (= sql (rw/rewrite sql [rw/quote-reserved-alias-rule])))))
+  (testing "reserved projection aliases are still quoted"
+    (is (= "SELECT 1 AS \"select\""
+           (rw/rewrite "SELECT 1 AS select" [rw/quote-reserved-alias-rule])))))
+
 ;; ============================================================================
 ;; create-index-anonymous-rule
 ;; ============================================================================
