@@ -301,6 +301,17 @@
                          (apply-numeric-typmod bd p sc)
                          bd))))
 
+        ;; money is stored through Datahike's BigDecimal carrier. Real
+        ;; PostgreSQL stores an int64 count of the locale's fractional
+        ;; units; with the default two fractional digits this is the same
+        ;; value model at the SQL boundary. Locale-specific symbols remain
+        ;; a presentation concern, while scale and OID stay faithful.
+        :money
+        (let [bd (if (instance? java.math.BigDecimal v)
+                   v
+                   (coerce/coerce-numeric v :bigdec))]
+          (.setScale ^java.math.BigDecimal bd 2 java.math.RoundingMode/HALF_UP))
+
         ;; `str` on a temporal value is java.util.Date.toString, which is
         ;; both the wrong format and rendered in the JVM's default time
         ;; zone — see types/temporal->pg-text.

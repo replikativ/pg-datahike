@@ -30,6 +30,7 @@
 (def oid-text       25)
 (def oid-oid        26)
 (def oid-json      114)
+(def oid-money     790)
 (def oid-float4    700)
 (def oid-float8    701)
 (def oid-varchar  1043)
@@ -70,6 +71,7 @@
 (def oid-numeric-array     1231)
 (def oid-uuid-array        2951)
 (def oid-json-array        199)
+(def oid-money-array       791)
 (def oid-jsonb-array       3807)
 
 (def element-oid->array-oid
@@ -93,6 +95,7 @@
    oid-numeric     oid-numeric-array
    oid-uuid        oid-uuid-array
    oid-json        oid-json-array
+   oid-money       oid-money-array
    oid-jsonb       oid-jsonb-array})
 
 (def array-oid->element-oid
@@ -120,6 +123,7 @@
    :numeric     oid-numeric
    :uuid        oid-uuid
    :json        oid-json
+   :money       oid-money
    :jsonb       oid-jsonb})
 
 (def oid->elem-kw
@@ -132,7 +136,8 @@
    :pg/type = this name so oid-infer round-trips the original OID rather than the
    storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
    binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
-  {18 "char", 26 "oid", oid-bit "bit", oid-varbit "varbit"})
+  {18 "char", 26 "oid", oid-name "name", oid-money "money",
+   oid-bit "bit", oid-varbit "varbit"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -173,6 +178,7 @@
    "real"              :db.type/float
    "numeric"           :db.type/bigdec
    "decimal"           :db.type/bigdec
+   "money"             :db.type/bigdec
    ;; Boolean
    "boolean"           :db.type/boolean
    "bool"              :db.type/boolean
@@ -234,6 +240,7 @@
    "float4"            :float4
    "real"              :float4
    "numeric"           :numeric
+   "money"             :money
    "decimal"           :numeric
    "boolean"           :bool
    "bool"              :bool
@@ -311,6 +318,8 @@
     "int4"        oid-int4
     "int8"        oid-int8
     "text"        oid-text
+    "name"        oid-name
+    "money"       oid-money
     "varchar"     oid-varchar
     "bpchar"      oid-bpchar
     "float4"      oid-float4
@@ -408,6 +417,7 @@
    oid-varchar    "character varying"
    oid-bpchar     "character"
    oid-name       "name"
+   oid-money      "money"
    oid-bytea      "bytea"
    oid-date       "date"
    oid-time       "time without time zone"
@@ -484,6 +494,10 @@
    reports OID 1700 — asyncpg uses binary numeric, not float8."
   #{"numeric" "decimal" "dec"})
 
+(def cast-money-types
+  "SQL names for PostgreSQL's fixed-scale money type."
+  #{"money"})
+
 (def cast-text-types
   "SQL type names that cast to text (Clojure string)."
   #{"text" "varchar" "character varying" "character" "char" "bpchar" "name"})
@@ -546,6 +560,7 @@
    [oid-text      "text"      -1  "b"]
    [oid-oid       "oid"        4  "b"]
    [oid-json      "json"      -1  "b"]
+   [oid-money     "money"      8  "b"]
    [oid-float4    "float4"     4  "b"]
    [oid-float8    "float8"     8  "b"]
    [oid-varchar   "varchar"   -1  "b"]
@@ -583,6 +598,7 @@
    [oid-numeric-array     "_numeric"     -1 "b"]
    [oid-uuid-array        "_uuid"        -1 "b"]
    [oid-json-array        "_json"        -1 "b"]
+   [oid-money-array       "_money"       -1 "b"]
    [oid-jsonb-array       "_jsonb"       -1 "b"]])
 
 ;; ============================================================================
@@ -603,6 +619,7 @@
    oid-varchar   -1
    oid-bpchar    -1
    oid-name      64
+   oid-money      8
    oid-bytea     -1
    oid-date       4
    oid-time       8
@@ -634,6 +651,7 @@
    oid-numeric-array     -1
    oid-uuid-array        -1
    oid-json-array        -1
+   oid-money-array       -1
    oid-jsonb-array       -1})
 
 ;; ============================================================================
@@ -654,7 +672,7 @@
    1.50."
   {oid-bool        :B
    oid-int2        :N  oid-int4    :N  oid-int8   :N
-   oid-float4      :N  oid-float8  :N  oid-numeric :N  oid-oid :N
+   oid-float4      :N  oid-float8  :N  oid-numeric :N  oid-money :N  oid-oid :N
    oid-text        :S  oid-varchar :S  oid-bpchar :S  oid-name :S  oid-char :S
    oid-date        :D  oid-time    :D  oid-timestamp :D  oid-timestamptz :D
    oid-interval    :T
@@ -823,6 +841,7 @@
    oid-float4      :db.type/double
    oid-float8      :db.type/double
    oid-numeric     :db.type/bigdec
+   oid-money       :db.type/bigdec
    oid-text        :db.type/string
    oid-varchar     :db.type/string
    oid-bpchar      :db.type/string
@@ -972,6 +991,7 @@
         (= base "jsonb")                      :jsonb
         (contains? cast-integer-types base)   :integer
         (contains? cast-numeric-types base)   :numeric
+        (contains? cast-money-types base)     :money
         (contains? cast-float-types base)     :float
         (contains? cast-text-types base)      :text
         (contains? cast-boolean-types base)   :boolean

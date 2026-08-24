@@ -616,6 +616,7 @@
            ;; and `pg_typeof` says real.
            :float     (if (#{"real" "float4"} type-str) types/oid-float4 types/oid-float8)
            :numeric   types/oid-numeric
+           :money     types/oid-money
            :text      (cond
                         (contains? #{"varchar" "character varying"} type-str) types/oid-varchar
                         (contains? #{"char" "character" "bpchar"} type-str) types/oid-bpchar

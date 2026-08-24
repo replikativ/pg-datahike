@@ -29,7 +29,8 @@
    testing."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.fns :as fns])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
 (def oid-int8 20)
@@ -76,6 +77,17 @@
   (is (= "20" (v "SELECT 5 << 2")))
   (is (= "1" (v "SELECT 5 >> 2")))
   (is (= "255" (v "SELECT (-1) & 255"))))
+
+(deftest bitwise-operators-are-strict
+  (testing "every supported SQL bitwise operator returns NULL if any input is NULL"
+    (doseq [sql ["SELECT 42 & NULL"
+                 "SELECT NULL | 42"
+                 "SELECT ~NULL"
+                 "SELECT 42 << NULL"
+                 "SELECT NULL >> 2"]]
+      (is (nil? (v sql)) sql)))
+  (testing "the xor implementation is strict even while SQL # remains unsupported"
+    (is (= :__null__ (fns/sql-bit-xor 42 :__null__)))))
 
 (deftest bitwise-not-is-not-the-identity
   (testing "SELECT ~1 answered 1 — a silent wrong answer, not an error"

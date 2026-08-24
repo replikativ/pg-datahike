@@ -217,7 +217,7 @@
   (case table-name
     "pg_type"
     [{:db/ident :pg_type/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_type/typname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_type/typlen :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      ;; typtype is PG's "char" (OID 18): clients (asyncpg's is_scalar_type)
      ;; binary-decode it to a single byte, so advertise OID 18 not text.
@@ -235,7 +235,7 @@
      {:db/ident :pg_type/typnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
-    [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+    [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      ;; atttypid is PG's `oid` type — declare it so `array_agg(atttypid)`
      ;; (asyncpg's typeinfo attrtypoids) infers oid[] (1028), the array type
      ;; asyncpg core-registers. Reporting int8[] (1016) made asyncpg loop
@@ -268,14 +268,14 @@
     ;; looks the owner up in its role map. A NULL owner resolved to OID
     ;; 0 and it aborted with "role with OID 0 does not exist".
     [{:db/ident :pg_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_namespace/nspname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_namespace/nspname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_namespace/nspowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_namespace") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     ;; A single role, the one every connection authenticates as. We have
     ;; no privilege system; this exists so ownership resolves.
     "pg_roles"
     [{:db/ident :pg_roles/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_roles/rolname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_roles/rolname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_roles/rolsuper :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_roles/rolinherit :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_roles/rolcreaterole :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -286,11 +286,11 @@
      {:db/ident :pg_roles/rolconnlimit :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_roles") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_database"
-    [{:db/ident :pg_database/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+    [{:db/ident :pg_database/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_database/datdba :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_database") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_proc"
-    [{:db/ident :pg_proc/proname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+    [{:db/ident :pg_proc/proname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_proc/provolatile :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/pronamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_proc/pronargs :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -302,7 +302,7 @@
      ;; from the table's :pg/table-oid. Lets pgjdbc's metadata joins
      ;; (pg_class.oid = pg_attribute.attrelid, etc.) resolve rows.
      {:db/ident :pg_class/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     {:db/ident :pg_class/relname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_class/relname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_class/relnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_class/relkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      ;; reltype: the pg_type OID of this relation's composite row-type.

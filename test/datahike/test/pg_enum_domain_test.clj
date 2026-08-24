@@ -86,6 +86,11 @@
         (is (= "mood" (:datahike.pg/enum-of ent)))
         (is (= :db.type/string (:db/valueType ent)))))))
 
+(deftest registered-enum-remains-a-valid-cast-target
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (is (= [["happy"]] (mapv vec (query-rows c "SELECT 'happy'::mood"))))))
+
 ;; ============================================================================
 ;; DOMAIN
 ;; ============================================================================

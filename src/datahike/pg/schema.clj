@@ -24,6 +24,37 @@
   [vtype]
   (types/pg-name-for-dh-type vtype))
 
+(defn sql-type-exists?
+  "True when a cast target names a built-in or a registered user type.
+
+   PostgreSQL resolves a TypeName during parse analysis and raises 42704
+   before evaluating its operand. pg-datahike historically treated every
+   unknown name as text, which made `NULL::does_not_exist` appear valid.
+   ENUM, DOMAIN, and composite registries remain valid extension points."
+  [db type-name]
+  (let [raw (-> (str type-name) str/trim str/lower-case
+                (str/replace #"\s*\([^)]*\)" ""))
+        raw (if (str/ends-with? raw "[]")
+              (subs raw 0 (- (count raw) 2))
+              raw)
+        base (last (str/split raw #"\."))
+        built-in? (or (types/cast-category base)
+                      (contains? types/pg-name->oid base)
+                      (contains? #{"regclass" "regnamespace" "regtype"} base))
+        registered? (fn [attr]
+                      (when db
+                        (try
+                          (boolean
+                           (ffirst (d/q {:find '[?e]
+                                         :in '[$ ?name]
+                                         :where [['?e attr '?name]]}
+                                        db base)))
+                          (catch Throwable _ false))))]
+    (boolean (or built-in?
+                 (registered? :datahike.pg.enum/name)
+                 (registered? :datahike.pg.domain/name)
+                 (registered? :datahike.pg.composite/name)))))
+
 ;; ============================================================================
 ;; Internal namespace filter
 ;; ============================================================================

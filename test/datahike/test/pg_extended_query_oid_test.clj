@@ -356,3 +356,28 @@
   (testing "CAST(... AS BIGINT) reports BIGINT"
     (is (= [Types/BIGINT]
            (meta-types "SELECT CAST(salary AS BIGINT) FROM employee")))))
+
+(deftest pgjdbc-declared-parameter-types-drive-lowering
+  (testing "the Parse message's int4 OID types unary operators and pg_typeof"
+    (with-open [^Connection c (jdbc-conn)]
+      (with-open [^PreparedStatement ps (.prepareStatement c "SELECT -(?)")]
+        (.setInt ps 1 42)
+        (with-open [^ResultSet rs (.executeQuery ps)]
+          (is (.next rs))
+          (is (= Types/INTEGER (.getColumnType (.getMetaData rs) 1)))
+          (is (= -42 (.getInt rs 1)))))
+      (with-open [^PreparedStatement ps (.prepareStatement c "SELECT pg_typeof(?)::text")]
+        (.setInt ps 1 42)
+        (with-open [^ResultSet rs (.executeQuery ps)]
+          (is (.next rs))
+          (is (= "integer" (.getString rs 1)))))))
+  (testing "a parameterized target-list SRF materializes after Bind"
+    (with-open [^Connection c (jdbc-conn)
+                ^PreparedStatement ps (.prepareStatement c "SELECT generate_series(1, ?)")]
+      (.setInt ps 1 5)
+      (with-open [^ResultSet rs (.executeQuery ps)]
+        (is (= [1 2 3 4 5]
+               (loop [values []]
+                 (if (.next rs)
+                   (recur (conj values (.getInt rs 1)))
+                   values))))))))

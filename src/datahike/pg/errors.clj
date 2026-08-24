@@ -107,7 +107,9 @@
    {:sqlstate "42704"
     :format (fn [{:keys [name kind]}]
               (when name
-                (str "unrecognized " (or kind "object") " \"" name "\"")))}
+                (if (= kind "type")
+                  (str "type \"" name "\" does not exist")
+                  (str "unrecognized " (or kind "object") " \"" name "\""))))}
 
    ;; --- constraint violations -----------------------------------------
    :unique-violation

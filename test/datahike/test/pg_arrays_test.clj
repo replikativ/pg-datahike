@@ -204,6 +204,11 @@
 (deftest text-parse-text-quoted-with-comma
   (is (= ["a,b" "c"] (:elements (arr/from-pg-text "{\"a,b\",c}" :text)))))
 
+(deftest text-parse-item-whitespace
+  (testing "whitespace outside an item is ignored, including around quotes"
+    (is (= ["a" "b" " c "]
+           (:elements (arr/from-pg-text "{  a  ,   \"b\"  ,\" c \" }" :text))))))
+
 (deftest text-parse-null-token
   (is (= ["a" nil "c"] (:elements (arr/from-pg-text "{a,NULL,c}" :text))))
   (testing "NULL is case-insensitive per PG"
