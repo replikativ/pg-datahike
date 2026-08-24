@@ -1202,7 +1202,6 @@
                                   (instance? DoubleValue e)
                                   (instance? StringValue e)
                                   (instance? NullValue e)
-                                  (instance? CaseExpression e)
                                   (and (instance? CastExpression e) (simple-cast? e))
                                   (instance? net.sf.jsqlparser.statement.select.ParenthesedSelect e)
                                   (and (instance? net.sf.jsqlparser.schema.Column e)
