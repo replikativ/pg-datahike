@@ -40,6 +40,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types]
             [datahike.pg.prng]))
 
@@ -2893,6 +2894,53 @@
   (fn [x & more]
     (if (types/numeric-special? x) :__null__ (apply f x more))))
 
+(defn- pg-input-valid?
+  "Pure subset of pg_input_is_valid(text, regtype) for application-facing
+   scalar types. The function deliberately invokes the same input helpers as
+   casts; validation must not become a second, more permissive parser."
+  [value type-name]
+  (try
+    (let [s (str value)
+          [_ base modifier] (re-matches #"(?is)^\s*(.+?)(?:\(([^)]*)\))?\s*$"
+                                        (str type-name))
+          base (some-> base str/lower-case str/trim)
+          modifier (some-> modifier str/trim)
+          int-value (fn [lo hi]
+                      (let [n (Long/parseLong (str/trim s))]
+                        (<= lo n hi)))
+          float-value (fn []
+                        (or (some? (coerce/special-float s))
+                            (do (Double/parseDouble (str/trim s)) true)))
+          char-value (fn []
+                       (if modifier
+                         (let [limit (Long/parseLong modifier)
+                               unpadded (str/replace s #"\s+$" "")]
+                           (<= (count unpadded) limit))
+                         true))]
+      (boolean
+       (case base
+         ("bool" "boolean") (some? (coerce/parse-bool-token s))
+         ("int2" "smallint") (int-value -32768 32767)
+         ("int4" "int" "integer") (int-value -2147483648 2147483647)
+         ("int8" "bigint") (do (Long/parseLong (str/trim s)) true)
+         ("oid") (let [n (Long/parseLong (str/trim s))]
+                   (<= 0 n 4294967295))
+         ("float4" "real" "float8" "double precision") (float-value)
+         ("numeric" "decimal") (do (coerce/coerce-numeric s :bigdec) true)
+         ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
+         ("bit" "bit varying" "varbit")
+         (do (pg-bits/parse-bit-literal (str/trim s)
+                                        (contains? #{"bit varying" "varbit"} base))
+             (if modifier
+               (let [width (Long/parseLong modifier)]
+                 (if (= base "bit") (= (count (str/trim s)) width)
+                     (<= (count (str/trim s)) width)))
+               true))
+         ("char" "character" "varchar" "character varying" "text" "name")
+         (char-value)
+         false)))
+    (catch Throwable _ false)))
+
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,
    and result-OID inference.
@@ -2912,6 +2960,12 @@
    "lcm"              {:unknown-args :homogeneous}
    ;; The first three arguments share a numeric overload; count is int4.
    "width_bucket"     {:unknown-args {:homogeneous-prefix 3}}
+   "booleq"           {:impl = :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "boolne"           {:impl not= :arities #{2}
+                       :strict? true :return-oid types/oid-bool}
+   "pg_input_is_valid" {:impl pg-input-valid? :arities #{2}
+                        :strict? true :return-oid types/oid-bool}
    "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}

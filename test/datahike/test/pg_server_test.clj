@@ -1761,6 +1761,27 @@
       (is (some? (err r)))
       (is (= "22P02" (sqlstate r))))))
 
+(deftest test-postgres-boolean-comparison-functions
+  (is (= [["t" "t"]]
+         (rows (.execute *handler* "SELECT booleq(true, true), boolne(true, false)"))))
+  (is (= [["Charlie"]]
+         (rows (.execute *handler*
+                         "SELECT name FROM person WHERE boolne(age > 30, false)")))))
+
+(deftest test-pg-input-is-valid
+  (is (= [["t" "f" "t" "f"]]
+         (rows (.execute *handler*
+                         (str "SELECT pg_input_is_valid('yes', 'bool'), "
+                              "pg_input_is_valid('junk', 'bool'), "
+                              "pg_input_is_valid('32767', 'int2'), "
+                              "pg_input_is_valid('32768', 'int2')")))))
+  (is (= [["t" "f" "t" "f"]]
+         (rows (.execute *handler*
+                         (str "SELECT pg_input_is_valid('abcd  ', 'char(4)'), "
+                              "pg_input_is_valid('abcde', 'varchar(4)'), "
+                              "pg_input_is_valid('Infinity', 'numeric'), "
+                              "pg_input_is_valid('nope', 'uuid')"))))))
+
 (deftest test-current-timestamp-cast-and-render
   (testing "current_timestamp::date returns one row rendered as a date (issue #13)"
     (let [r (.execute *handler* "SELECT current_timestamp::date")]
