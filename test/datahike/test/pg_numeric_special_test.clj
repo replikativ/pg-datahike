@@ -108,6 +108,52 @@
     (is (= "t" (one c "SELECT 'Infinity'::numeric > 1e308")))
     (is (= "f" (one c "SELECT '-Infinity'::numeric > 0")))))
 
+(deftest special-power-follows-postgres-posix-table
+  (with-open [c (jdbc)]
+    (testing "the identities Java Math/pow does not implement"
+      (is (= "1" (one c "SELECT power('NaN'::numeric, 0)")))
+      (is (= "1" (one c "SELECT power(1::numeric, 'NaN')")))
+      (is (= "1" (one c "SELECT power(-1::numeric, 'Infinity')")))
+      (is (= "1" (one c "SELECT power(-1::numeric, '-Infinity')"))))
+    (testing "infinite bases retain the sign for positive odd exponents"
+      (is (= "-Infinity" (one c "SELECT power('-Infinity'::numeric, 3)")))
+      (is (= "Infinity" (one c "SELECT power('-Infinity'::numeric, 4)")))
+      (is (= "0" (one c "SELECT power('-Infinity'::numeric, -3)")))
+      (is (= "-Infinity"
+             (one c (str "SELECT power('-Infinity'::numeric, "
+                         "99999999999999999999999999999999999999999)")))
+          "parity must not narrow an arbitrary-precision exponent to int64"))
+    (testing "PostgreSQL numeric.sql lines 730-748"
+      (doseq [[base exponent expected]
+              [["-1" "inf" "1"]
+               ["-2" "3" "-8.0000000000000000"]
+               ["-2" "-1" "-0.5000000000000000"]
+               ["-2" "inf" "Infinity"]
+               ["-2" "-inf" "0"]
+               ["inf" "-2" "0"]
+               ["inf" "-inf" "0"]
+               ["-inf" "2" "Infinity"]
+               ["-inf" "3" "-Infinity"]
+               ["-inf" "-2" "0"]
+               ["-inf" "-3" "0"]
+               ["-inf" "0" "1"]
+               ["-inf" "inf" "Infinity"]
+               ["-inf" "-inf" "0"]]]
+        (is (= expected
+               (one c (str "SELECT power('" base "'::numeric, '"
+                           exponent "'::numeric)")))))
+      (doseq [[base exponent]
+              [["0" "-1"] ["0" "-inf"] ["-2" "3.3"]
+               ["-2" "-1.5"] ["-inf" "4.5"]]]
+        (is (thrown? SQLException
+                     (one c (str "SELECT power('" base "'::numeric, '"
+                                 exponent "'::numeric)"))))))
+    (testing "domain errors still precede the special result table"
+      (is (thrown-with-msg? SQLException #"zero raised to a negative power"
+                            (one c "SELECT power(0::numeric, '-Infinity')")))
+      (is (thrown-with-msg? SQLException #"negative number raised to a non-integer"
+                            (one c "SELECT power('-Infinity'::numeric, 4.5)"))))))
+
 (deftest scalar-functions-pass-specials-through
   (with-open [c (jdbc)]
     (is (= "Infinity" (one c "SELECT round('Infinity'::numeric)")))
@@ -128,6 +174,10 @@
                             (one c "SELECT div('Infinity'::numeric, '0')")))
       (is (thrown-with-msg? SQLException #"negative"
                             (one c "SELECT log('-Infinity'::numeric, '10')"))))
+    (testing "numeric ceil and floor do not manufacture a floating negative zero"
+      (is (= "0" (one c "SELECT ceil(-0.000001::numeric)")))
+      (is (= "0" (one c "SELECT ceiling(-0.000001::numeric)")))
+      (is (= "-1" (one c "SELECT floor(-0.000001::numeric)"))))
     (testing "width_bucket accepts special operands but rejects special bounds"
       (is (= "11" (one c "SELECT width_bucket('Infinity'::numeric, 1, 10, 10)")))
       (is (= "0" (one c "SELECT width_bucket('-Infinity'::numeric, 1, 10, 10)")))

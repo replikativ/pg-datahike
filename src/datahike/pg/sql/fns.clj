@@ -1734,6 +1734,16 @@
           (neg? d) -1.0
           :else 0.0)))
 
+(defn- sql-floor [x]
+  (if (decimal? x)
+    (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/FLOOR)
+    (Math/floor (double x))))
+
+(defn- sql-ceil [x]
+  (if (decimal? x)
+    (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/CEILING)
+    (Math/ceil (double x))))
+
 (defn- sql-round
   "SQL ROUND — half away from zero, i.e. PG's NUMERIC rounding
    (numeric.c:11657 round_var). `Math/round` breaks ties toward
@@ -2647,6 +2657,74 @@
 
 (declare numeric-power numeric-log)
 
+(defn- numeric-integral?
+  "PostgreSQL's numeric_is_integral for the finite values represented here.
+   Infinity is treated as integral by numeric_power's special-value rules;
+   NaN is handled before this predicate is reached."
+  [x]
+  (or (and (numspecial? x) (not= :nan (:kind x)))
+      (and (number? x)
+           (<= (.scale (.stripTrailingZeros (bigdec x))) 0))))
+
+(defn- numeric-sign ^long [x]
+  (if (numspecial? x)
+    (case (:kind x) :inf 1 :-inf -1 :nan 0)
+    (long (.signum (bigdec x)))))
+
+(defn- numeric-special-power
+  "numeric_power's POSIX special-value table from PostgreSQL numeric.c.
+
+   Java's Math/pow is close, but differs at the identities PostgreSQL
+   deliberately handles before invoking its finite power algorithm:
+   NaN^0, 1^NaN, and (-1)^+/-Infinity are all 1."
+  [base exponent]
+  (cond
+    (and (numspecial? base) (= :nan (:kind base)))
+    (if (and (not (numspecial? exponent)) (zero? (numeric-sign exponent)))
+      java.math.BigDecimal/ONE
+      types/nan-numeric)
+
+    (and (numspecial? exponent) (= :nan (:kind exponent)))
+    (if (and (not (numspecial? base)) (zero? (.compareTo (bigdec base) java.math.BigDecimal/ONE)))
+      java.math.BigDecimal/ONE
+      types/nan-numeric)
+
+    :else
+    (let [sign-base (numeric-sign base)
+          sign-exp (numeric-sign exponent)]
+      (cond
+        (and (zero? sign-base) (neg? sign-exp))
+        (throw-power-domain "zero raised to a negative power is undefined")
+
+        (and (neg? sign-base) (not (numeric-integral? exponent)))
+        (throw-power-domain
+         "a negative number raised to a non-integer power yields a complex result")
+
+        (and (not (numspecial? base))
+             (zero? (.compareTo (bigdec base) java.math.BigDecimal/ONE)))
+        java.math.BigDecimal/ONE
+
+        (zero? sign-exp) java.math.BigDecimal/ONE
+        (and (zero? sign-base) (pos? sign-exp)) java.math.BigDecimal/ZERO
+
+        (numspecial? exponent)
+        (let [abs-base-compare
+              (if (numspecial? base)
+                1
+                (.compareTo (.abs (bigdec base)) java.math.BigDecimal/ONE))]
+          (cond
+            (zero? abs-base-compare) java.math.BigDecimal/ONE
+            (= (pos? abs-base-compare) (pos? sign-exp)) types/inf-numeric
+            :else java.math.BigDecimal/ZERO))
+
+        (= :inf (:kind base))
+        (if (pos? sign-exp) types/inf-numeric java.math.BigDecimal/ZERO)
+
+        ;; Only -Infinity with a finite, non-zero integral exponent remains.
+        (neg? sign-exp) java.math.BigDecimal/ZERO
+        (.testBit (.toBigIntegerExact (bigdec exponent)) 0) types/-inf-numeric
+        :else types/inf-numeric))))
+
 (defn sql-power-op
   "The `^` operator. PostgreSQL resolves it to numeric_power whenever an
    operand is numeric, exactly as the power() function does -- so
@@ -2654,7 +2732,7 @@
   [b e]
   (cond
     (or (numspecial? b) (numspecial? e))
-    (numeric-double-result (sql-power (->num-double b) (->num-double e)))
+    (numeric-special-power b e)
     (or (decimal? b) (decimal? e)) (numeric-power (bigdec b) (bigdec e))
     :else (sql-power b e)))
 
@@ -3153,9 +3231,9 @@
    ;; bit string is the bit count; octet_length is ceil(bits/8).
    "length"   sql-length
    "abs"      (special-abs clojure.core/abs)
-   "floor"    (special-passthrough #(Math/floor (double %)))
-   "ceil"     (special-passthrough #(Math/ceil (double %)))
-   "ceiling"  #(Math/ceil (double %))
+   "floor"    (special-passthrough sql-floor)
+   "ceil"     (special-passthrough sql-ceil)
+   "ceiling"  (special-passthrough sql-ceil)
    ;; The 2-argument forms take a SET OF CHARACTERS to strip, not a
    ;; prefix -- and str/triml takes only one argument, so `ltrim(s, 'ab')`
    ;; raised a raw ArityException.

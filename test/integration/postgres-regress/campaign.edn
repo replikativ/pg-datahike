@@ -58,7 +58,11 @@
      :boundaries #{:scalar-type :operators :casts}
      :blockers #{:numeric-formatting :numeric-typemods :create-function}
      :strict-slices
-     [{:id :special-float-conversions
+     [{:id :special-power-boundaries
+       :source-lines [730 748]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "special-power-follows-postgres-posix-table"}
+      {:id :special-float-conversions
        :source-lines [791 802]
        :gate "test/datahike/test/pg_numeric_special_test.clj"
        :test-var "float-specials-cast-to-numeric"}
