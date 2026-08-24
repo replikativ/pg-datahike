@@ -364,15 +364,16 @@
               (= "cast" (kw-text prev))))
           :else (recur (dec i) depth))))))
 
-(defn- create-table-as?
-  "True for the statement-level AS in CREATE [TEMP] TABLE name AS SELECT.
+(defn- create-relation-as?
+  "True for the statement-level AS in CREATE TABLE/VIEW name AS SELECT.
    SELECT/WITH/VALUES starts a query here, not a reserved-word alias."
   [toks ^long as-idx]
   (let [prior-kws (keep kw-text (take as-idx toks))
         next-kw (some-> (nth toks (inc as-idx) nil) kw-text)]
     (and (contains? #{"select" "with" "values"} next-kw)
          (= "create" (first prior-kws))
-         (some #{"table"} prior-kws))))
+         (not-any? #{"select" "with" "values"} prior-kws)
+         (some #{"table" "view"} prior-kws))))
 
 (defn quote-reserved-alias-rule
   "Find `AS <reserved-kw>` outside of `CAST(... AS ...)` contexts and
@@ -392,7 +393,7 @@
               (if (and nt-kw
                        (contains? alias-reserved-kws nt-kw)
                        (not (inside-cast-parens? toks (inc i)))
-                       (not (create-table-as? toks i)))
+                       (not (create-relation-as? toks i)))
                 (let [start (:pos next-t)
                       end (:end next-t)
                       ;; FOLD before quoting. The source token is

@@ -445,9 +445,7 @@
      {:db/ident :pg_sequences/cache_size :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_sequences/last_value :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_sequences") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
-    ;; pg_views — list of all user-defined views. We don't store views
-    ;; so this is always empty, but ORMs (Metabase, pgAdmin) union it
-    ;; with pg_tables during table discovery; not having it raises.
+    ;; pg_views — populated from transactional :datahike.pg/view-* metadata.
     "pg_views"
     [{:db/ident :pg_views/schemaname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident :pg_views/viewname   :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -596,6 +594,15 @@
   [{:__seq__/keys [value start increment]}]
   (when-not (= value (- start increment))
     value))
+
+(defn- view-entities [db]
+  (if db
+    (mapv (fn [[name definition]] {:name name :definition definition})
+          (d/q '{:find [?name ?definition]
+                 :where [[?e :datahike.pg/view-name ?name]
+                         [?e :datahike.pg/view-definition ?definition]]}
+               db))
+    []))
 
 (defn catalog-data-for*
   "Built-in catalog data — see catalog-schema-for*. Dispatches a
@@ -845,14 +852,22 @@
       ;; pg_dump, psql's \ds and ORM introspection find them at all —
       ;; without a row here a sequence is invisible to anything that
       ;; walks pg_class (issue #26).
-      (mapv (fn [s]
-              (let [nm (:__seq__/name s)]
-                {:pg_class/oid (long (Math/abs (.hashCode ^String nm)))
-                 :pg_class/relname nm
-                 :pg_class/relnamespace 2200
-                 :pg_class/relkind "S"
-                 (pgs/row-marker-attr "pg_class") true}))
-            (sequence-entities cte-db))))
+      (into
+       (mapv (fn [s]
+               (let [nm (:__seq__/name s)]
+                 {:pg_class/oid (long (Math/abs (.hashCode ^String nm)))
+                  :pg_class/relname nm
+                  :pg_class/relnamespace 2200
+                  :pg_class/relkind "S"
+                  (pgs/row-marker-attr "pg_class") true}))
+             (sequence-entities cte-db))
+       (mapv (fn [{:keys [name]}]
+               {:pg_class/oid (long (Math/abs (.hashCode ^String name)))
+                :pg_class/relname name
+                :pg_class/relnamespace 2200
+                :pg_class/relkind "v"
+                (pgs/row-marker-attr "pg_class") true})
+             (view-entities cte-db)))))
     "pg_tables"
     (mapv (fn [t]
             {:pg_tables/schemaname "public"
@@ -865,6 +880,14 @@
              :pg_tables/rowsecurity false
              (pgs/row-marker-attr "pg_tables") true})
           (pgs/table-names user-schema))
+    "pg_views"
+    (mapv (fn [{view-name :name definition :definition}]
+            {:pg_views/schemaname "public"
+             :pg_views/viewname view-name
+             :pg_views/viewowner "datahike"
+             :pg_views/definition definition
+             (pgs/row-marker-attr "pg_views") true})
+          (view-entities cte-db))
     "information_schema_columns"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; udt_name in PG follows the underlying base-type convention from
@@ -1476,7 +1499,7 @@
     :try-advisory-xact-lock :try-advisory-lock
     :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
     :pg-backend-pid :txid-current :pg-sleep :pg-notify
-    :comment-on :lock-table :create-view :create-index
+    :comment-on :lock-table :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
@@ -1534,4 +1557,3 @@
 ;; ============================================================================
 ;; Main entry point
 ;; ============================================================================
-

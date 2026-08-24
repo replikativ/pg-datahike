@@ -3147,6 +3147,40 @@
         (catch Exception e
           (classified-error "CREATE TABLE error: " e))))))
 
+(defn- execute-ddl-create-view [conn parsed tx-state]
+  (cond
+    (:noop? parsed) (empty-result "CREATE VIEW")
+    (:in-tx? @tx-state)
+    (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE VIEW")
+    :else
+    (try
+      (transact-recorded! conn (:tx-data parsed))
+      (empty-result "CREATE VIEW")
+      (catch Exception e
+        (classified-error "CREATE VIEW error: " e)))))
+
+(defn- execute-ddl-drop-view [conn parsed tx-state]
+  (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        view-name (:view-name parsed)
+        eid (ffirst (d/q '{:find [?e]
+                           :in [$ ?view-name]
+                           :where [[?e :datahike.pg/view-name ?view-name]]}
+                         db view-name))]
+    (cond
+      (and (nil? eid) (:if-exists? parsed)) (empty-result "DROP VIEW")
+      (nil? eid) (classified-error
+                  ""
+                  (ex-info (str "view \"" view-name "\" does not exist")
+                           {:error :undefined-table :table view-name :sqlstate "42P01"}))
+      (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP VIEW")
+      :else
+      (try
+        (transact-recorded! conn [[:db/retractEntity eid]])
+        (empty-result "DROP VIEW")
+        (catch Exception e
+          (classified-error "DROP VIEW error: " e))))))
+
 ;; ============================================================================
 ;; Query handler — the main dispatch
 ;; ============================================================================
@@ -4006,9 +4040,9 @@
    whole group is atomic. COPY is excluded — it runs its own sub-protocol
    and commits separately."
   #{:insert :update :update-with-recursive :delete :truncate
-    :ddl-create :ddl-create-sequence :ddl-alter-sequence
+    :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-create-domain
-    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-sequence})
+    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
   [{:keys [conn session-id tx-state]} _parsed]
@@ -4878,7 +4912,6 @@
       :pg-notify               (handle-pg-notify ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
       :empty-catalog      (handle-empty-catalog ctx parsed)
-      :create-view        (empty-result "CREATE VIEW")
       :create-index       (empty-result "CREATE INDEX")
       :get-fk-conname     (handle-get-fk-conname ctx parsed)
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
@@ -7387,6 +7420,9 @@
                             ;; add via ALTER TABLE without an explicit bust.
                             :ddl-create            (do (invalidate-schema-cache!)
                                                        (exec-ddl-create ctx parsed))
+                            :ddl-create-view       (do (invalidate-schema-cache!)
+                                                       (execute-ddl-create-view
+                                                        (:conn ctx) parsed (:tx-state ctx)))
                             :ddl-create-sequence   (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-sequence ctx parsed))
                             :ddl-alter-sequence    (do (invalidate-schema-cache!)
@@ -7406,6 +7442,9 @@
                                                        (exec-ddl-alter ctx parsed))
                             :ddl-drop              (do (invalidate-schema-cache!)
                                                        (exec-ddl-drop ctx parsed))
+                            :ddl-drop-view         (do (invalidate-schema-cache!)
+                                                       (execute-ddl-drop-view
+                                                        (:conn ctx) parsed (:tx-state ctx)))
                             :ddl-drop-sequence     (do (invalidate-schema-cache!)
                                                        (exec-ddl-drop-sequence ctx parsed))
                             :set-operation         (exec-set-operation ctx parsed)

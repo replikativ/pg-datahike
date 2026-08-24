@@ -229,6 +229,10 @@
   (testing "a genuinely quoted alias keeps its case — it never reaches this rule"
     (is (= "SELECT 1 AS \"Select\"" (quote-alias "SELECT 1 AS \"Select\"")))))
 
+(deftest create-view-as-select-is-not-an-alias
+  (is (= "CREATE VIEW v AS SELECT 1 AS \"select\""
+         (quote-alias "CREATE VIEW v AS SELECT 1 AS select"))))
+
 (deftest quote-reserved-alias-skip-cast
   (testing "`CAST(x AS int)` — AS introduces type, not alias, leave it"
     (is (= "SELECT CAST(1 AS int) FROM t"

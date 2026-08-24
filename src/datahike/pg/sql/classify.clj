@@ -644,7 +644,9 @@
                              :tag "CREATE EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "CREATE SCHEMA"}
       (kw=? t1 "database")  {:kind :create-database :tag "CREATE DATABASE"}
-      (kw=? t1 "view")      {:kind :create-view}
+      ;; Views are real database objects now; route through JSqlParser and
+      ;; the transactional DDL path instead of acknowledging a no-op.
+      (kw=? t1 "view")      {:kind :generic-sql}
       (kw=? t1 "index")     {:kind :create-index}
       (kw=? t1 "table")     {:kind :generic-sql}
       (kw=? t1 "sequence")  (classify-create-sequence (rest toks))

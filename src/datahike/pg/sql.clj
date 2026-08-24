@@ -52,6 +52,7 @@
             SignedExpression
             CaseExpression CastExpression ArrayConstructor JdbcParameter]
            [net.sf.jsqlparser.statement.create.table CreateTable ColumnDefinition]
+           [net.sf.jsqlparser.statement.create.view CreateView]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
            [net.sf.jsqlparser.statement.insert Insert]
            [net.sf.jsqlparser.statement.update Update UpdateSet]
@@ -78,6 +79,56 @@
 (def nextval-marker? params/nextval-marker?)
 (def resolve-nextvals! params/resolve-nextvals!)
 (def ^:private unquote-ident params/unquote-ident)
+
+(def ^:private view-name-attr :datahike.pg/view-name)
+(def ^:private view-definition-attr :datahike.pg/view-definition)
+
+(defn- translate-create-view [^CreateView cv schema db]
+  (let [view-name (unquote-ident (str (.getView cv)))
+        existing-eid (ffirst
+                      (d/q '{:find [?e]
+                             :in [$ ?name-attr ?view-name]
+                             :where [[?e ?name-attr ?view-name]]}
+                           db view-name-attr view-name))
+        table-exists? (or (contains? schema (pgs/row-marker-attr view-name))
+                          (some #(and (keyword? %)
+                                      (= view-name (namespace %)))
+                                (keys schema)))
+        replace? (.isOrReplace cv)
+        if-not-exists? (.isIfNotExists cv)
+        select (.getSelect cv)]
+    (when (seq (.getColumnNames cv))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "CREATE VIEW column name lists"})))
+    (when (and table-exists? (not existing-eid))
+      (throw (ex-info (str "relation \"" view-name "\" already exists")
+                      {:error :duplicate-table :table view-name :sqlstate "42P07"})))
+    (when (and existing-eid (not replace?) (not if-not-exists?))
+      (throw (ex-info (str "relation \"" view-name "\" already exists")
+                      {:error :duplicate-table :table view-name :sqlstate "42P07"})))
+    (when-not (instance? PlainSelect select)
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "CREATE VIEW with a non-plain SELECT"})))
+    ;; Validate now; execute the stored definition against the then-current
+    ;; snapshot whenever the view is read.
+    (stmt/translate-select ^PlainSelect select schema db)
+    (if (and existing-eid if-not-exists? (not replace?))
+      {:type :ddl-create-view :noop? true :view-name view-name :tx-data []}
+      {:type :ddl-create-view
+       :view-name view-name
+       :tx-data (cond-> []
+                  (not (contains? schema view-name-attr))
+                  (into [{:db/ident view-name-attr
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one
+                          :db/unique :db.unique/identity}
+                         {:db/ident view-definition-attr
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one}])
+                  true
+                  (conj {:db/id (or existing-eid (str (gensym "view-")))
+                         view-name-attr view-name
+                         view-definition-attr (str select)}))})))
 
 ;; Aggregate + scalar fns moved to datahike.pg.sql.fns. Re-export at the old
 ;; `datahike.pg.sql/...` names so the qualified symbols emitted by the
@@ -1775,6 +1826,10 @@
                       (not (identical? db orig-db)) (assoc :enriched-db db)
                       (seq cte-ns-map) (assoc :cte-namespaces cte-ns-map))
 
+          ;; CREATE VIEW
+                    (instance? CreateView stmt)
+                    (translate-create-view ^CreateView stmt schema db)
+
           ;; CREATE TABLE
                     (instance? CreateTable stmt)
                     (if (.getSelect ^CreateTable stmt)
@@ -1786,8 +1841,11 @@
                     (let [^Drop d stmt
                           drop-type (when-let [t (.getType d)] (str/lower-case t))
                           obj-name (-> d .getName .getName)]
-                      (if (= drop-type "sequence")
-                        {:type :ddl-drop-sequence :seq-name obj-name}
+                      (case drop-type
+                        "sequence" {:type :ddl-drop-sequence :seq-name obj-name}
+                        "view" {:type :ddl-drop-view
+                                :view-name (unquote-ident obj-name)
+                                :if-exists? (.isIfExists d)}
                         {:type :ddl-drop :table obj-name}))
 
           ;; COMMIT (JSqlParser AST)

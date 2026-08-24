@@ -60,6 +60,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.arrays :as pg-arr])
   (:import [datahike.datom Datom]
+           [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
             Alias Function LongValue DoubleValue StringValue NullValue
@@ -2278,8 +2279,30 @@
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
   [^PlainSelect select schema & [db]]
-  (let [;; FROM clause — may be a Table or a derived table (subquery)
-        from-item (.getFromItem select)
+  (let [expand-view
+        (fn [item]
+          (if (and db (instance? Table item))
+            (let [^Table table item
+                  view-name (unquote-ident (.getName table))
+                  definition (ffirst
+                              (d/q '{:find [?definition]
+                                     :in [$ ?name-attr ?definition-attr ?view-name]
+                                     :where [[?e ?name-attr ?view-name]
+                                             [?e ?definition-attr ?definition]]}
+                                   db :datahike.pg/view-name
+                                   :datahike.pg/view-definition view-name))]
+              (if definition
+                (let [^net.sf.jsqlparser.statement.select.Select wrapper
+                      (CCJSqlParserUtil/parse
+                       (str "SELECT * FROM (" definition ") AS __view"))
+                      ^PlainSelect wrapper-select (.getPlainSelect wrapper)
+                      ^ParenthesedSelect derived (.getFromItem wrapper-select)]
+                  (.setAlias derived (or (.getAlias table) (Alias. view-name)))
+                  derived)
+                item))
+            item))
+        ;; FROM clause — may be a Table, view, or derived table (subquery)
+        from-item (expand-view (.getFromItem select))
         ;; `FROM <sequence>` reads the sequence's position — nil for
         ;; every ordinary table, so this only costs a lookup when the
         ;; FROM item is a bare relation name (issue #26).
@@ -2399,7 +2422,7 @@
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
-           (let [rt (.getRightItem j)]
+           (let [rt (expand-view (.getRightItem j))]
              (cond
                ;; A correlated SRF is ALWAYS in a join/comma position —
                ;; it has to have an outer row to correlate WITH — so this
