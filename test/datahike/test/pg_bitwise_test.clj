@@ -215,6 +215,25 @@
   (is (= [oid-int4 oid-bit oid-int8]
          (oids "SELECT get_bit(B'0', 0), set_bit(B'0', 0, 1), bit_count(B'1')"))))
 
+(deftest bit-input-error-info
+  (is (false? (fns/pg-input-valid? "01010001" "bit(10)")))
+  (is (true? (fns/pg-input-valid? "01010001" "bit(8)")))
+  (doseq [[value type-name] [["01010Z01" "bit(8)"]
+                             ["x01010Z01" "bit(32)"]
+                             ["01010Z01" "varbit"]
+                             ["x01010Z01" "varbit"]]]
+    (is (false? (fns/pg-input-valid? value type-name))))
+  (is (= ["bit string length 8 does not match type bit(10)" nil nil "22026"]
+         (fns/pg-input-error-info "01010001" "bit(10)")))
+  (is (= ["\"Z\" is not a valid binary digit" nil nil "22P02"]
+         (fns/pg-input-error-info "01010Z01" "bit(8)")))
+  (is (= ["\"Z\" is not a valid hexadecimal digit" nil nil "22P02"]
+         (fns/pg-input-error-info "x01010Z01" "bit(32)")))
+  (is (= ["\"Z\" is not a valid binary digit" nil nil "22P02"]
+         (fns/pg-input-error-info "01010Z01" "varbit")))
+  (is (= ["\"Z\" is not a valid hexadecimal digit" nil nil "22P02"]
+         (fns/pg-input-error-info "x01010Z01" "varbit"))))
+
 (deftest postgres-bit-position-slice
   ;; PostgreSQL 17 bit.sql lines 162-169 exercise matches that cross byte
   ;; boundaries.  PgBit used to be stringified as a Clojure record here,

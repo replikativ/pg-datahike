@@ -50,7 +50,11 @@
       {:id :defaults-catalog-read
        :source-lines [232 240]
        :gate "test/datahike/test/pg_bitwise_test.clj"
-       :test-var "bit-defaults-and-table-shorthand"}]}
+       :test-var "bit-defaults-and-table-shorthand"}
+      {:id :input-validation
+       :source-lines [243 253]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "bit-input-error-info"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
      :blockers #{:numeric-formatting :numeric-typemods :create-function}}

@@ -388,7 +388,7 @@
     (when (or (neg? n) (>= n w))
       (throw (errors/pg-error
               :array-element-error
-              {:detail (str "bit index " n " out of valid range (0.." (dec w) ")")})))
+              {:message (str "bit index " n " out of valid range (0.." (dec w) ")")})))
     (if (= \1 (.charAt ^String (:bits b) (int n))) 1 0)))
 
 (defn set-bit
@@ -400,7 +400,7 @@
     (when (or (neg? n) (>= n w))
       (throw (errors/pg-error
               :array-element-error
-              {:detail (str "bit index " n " out of valid range (0.." (dec w) ")")})))
+              {:message (str "bit index " n " out of valid range (0.." (dec w) ")")})))
     (when-not (contains? #{0 1} new-bit)
       (throw (errors/pg-error :invalid-parameter-value
                               {:message "new bit must be 0 or 1"})))

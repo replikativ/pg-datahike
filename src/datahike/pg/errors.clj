@@ -224,7 +224,8 @@
 
    :array-element-error
    {:sqlstate "2202E"
-    :format (fn [{:keys [detail]}] (or detail "malformed array literal"))}
+    :format (fn [{:keys [message detail]}]
+              (or message detail "malformed array literal"))}
 
    ;; --- syntax / structural -------------------------------------------
    :syntax-error

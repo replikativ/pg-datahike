@@ -40,6 +40,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types]
             [datahike.pg.prng]))
@@ -3022,13 +3023,7 @@
          ("numeric" "decimal") (do (coerce/coerce-numeric s :bigdec) true)
          ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
          ("bit" "bit varying" "varbit")
-         (do (pg-bits/parse-bit-literal (str/trim s)
-                                        (contains? #{"bit varying" "varbit"} base))
-             (if modifier
-               (let [width (Long/parseLong modifier)]
-                 (if (= base "bit") (= (count (str/trim s)) width)
-                     (<= (count (str/trim s)) width)))
-               true))
+         (do (sql-cast/cast-to-bit s (str type-name) false) true)
          ("char" "character" "varchar" "character varying" "text" "name")
          (char-value)
          false)))
@@ -3059,9 +3054,20 @@
                   (str "value too long for type " display-type)
                   (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
         sqlstate (if too-long? "22001" "22P02")]
-    (if (pg-input-valid? value type-name)
-      [nil nil nil nil]
-      [message nil nil sqlstate])))
+    (if (contains? #{"bit" "bit varying" "varbit"} base)
+      ;; Preserve the typinput function's own diagnostic. In particular,
+      ;; fixed-width mismatches are 22026, while bad binary/hex digits are
+      ;; 22P02 with the offending digit named. A boolean-only validation
+      ;; pass loses both distinctions.
+      (try
+        (sql-cast/cast-to-bit (str value) (str type-name) false)
+        [nil nil nil nil]
+        (catch Throwable e
+          (let [[code msg] (errors/classify-exception e)]
+            [msg nil nil code])))
+      (if (pg-input-valid? value type-name)
+        [nil nil nil nil]
+        [message nil nil sqlstate]))))
 
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,
