@@ -5451,32 +5451,8 @@
             ;; an aggregate at all.
             [results find-aliases]
             (if (seq compound-exprs)
-              (let [new-results
-                    (mapv (fn [row]
-                            (let [rv (if (sequential? row) (vec row) [row])
-                                  binds (row-bindings query in-args row)]
-                              (reduce (fn [r {:keys [form slots]}]
-                                        (let [b (reduce (fn [m [sym idx]]
-                                                          (assoc m sym (nth r idx nil)))
-                                                        binds slots)
-                                              val (expr/interpret-form form b)]
-                                          (conj r (if (= :__null__ val) nil val))))
-                                      rv compound-exprs)))
-                          results)
-                    compound-aliases (mapv :alias compound-exprs)
-                    new-aliases (into (vec find-aliases) compound-aliases)
-                    ;; Hide the internal aggregate columns.
-                    visible-indices (into []
-                                          (keep-indexed (fn [i a]
-                                                          (when-not (and (string? a)
-                                                                         (.startsWith ^String a "__compound_"))
-                                                            i)))
-                                          new-aliases)
-                    final-results (mapv (fn [row]
-                                          (mapv #(nth row %) visible-indices))
-                                        new-results)
-                    final-aliases (mapv #(nth new-aliases %) visible-indices)]
-                [final-results final-aliases])
+              (stmt/apply-compound-projections results find-aliases query
+                                               in-args compound-exprs)
               [results find-aliases])
             ;; Correlated scalar subqueries (slice A — doc/correlated-lateral-
             ;; plan.md): run each inner SELECT per outer row with the

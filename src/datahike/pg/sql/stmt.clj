@@ -2218,6 +2218,110 @@
    marked as something other than NULL -- see `fns/filtered-out`."
   #{"array_agg" "jsonb_agg" "json_agg"})
 
+(def ^:private throwing-projection-ops
+  "Runtime arithmetic functions that can raise for some row values. A
+   Datalog planner may reorder function clauses ahead of SQL WHERE
+   predicates, so SELECT projections containing these are deferred until
+   after filtering when the query shape permits it."
+  '#{datahike.pg.sql/sql-div
+     datahike.pg.sql/sql-int-div
+     datahike.pg.sql/sql-f4div
+     datahike.pg.sql/sql-mod
+     datahike.pg.sql/sql-money-div
+     datahike.pg.sql/sql-money-div-money})
+
+(defn- throwing-projection?
+  [form clauses]
+  (boolean
+   (some throwing-projection-ops
+         (filter symbol?
+                 (tree-seq coll? seq (cons form (map first clauses)))))))
+
+(defn- inline-projection-bindings
+  "Inline THROWING SSA-style function bindings emitted for one SELECT item.
+
+   Safe storage lookup/decoder bindings remain in Datalog. A throwing
+   nested binding and every binding that depends on it move into the
+   returned post-filter form. Returns [query-clauses form]."
+  [form clauses]
+  (let [binding? #(and (vector? %) (= 2 (count %))
+                       (seq? (first %)) (symbol? (second %)))
+        deferred (volatile!
+                  (into #{}
+                        (keep (fn [clause]
+                                (when (and (binding? clause)
+                                           (some throwing-projection-ops
+                                                 (filter symbol?
+                                                         (tree-seq coll? seq
+                                                                   (first clause)))))
+                                  (second clause))))
+                        clauses))
+        above? (fn [clause]
+                 (boolean
+                  (some @deferred
+                        (filter symbol?
+                                (tree-seq coll? seq (first clause))))))
+        keep-clauses
+        (vec (remove (fn [clause]
+                       (when (and (binding? clause)
+                                  (or (contains? @deferred (second clause))
+                                      (above? clause)))
+                         (vswap! deferred conj (second clause))
+                         true))
+                     clauses))
+        by-out (into {} (keep (fn [clause]
+                                (when (and (binding? clause)
+                                           (contains? @deferred (second clause)))
+                                  [(second clause) (first clause)])))
+                     clauses)
+        inline (fn inline [x]
+                 (cond
+                   (and (symbol? x) (contains? by-out x))
+                   (inline (get by-out x))
+
+                   (seq? x) (apply list (map inline x))
+                   :else x))]
+    [keep-clauses (inline form)]))
+
+(defn apply-compound-projections
+  "Evaluate deferred SELECT projection forms and remove their hidden inputs.
+
+   Shared by the normal SELECT executor and INSERT ... SELECT, which must
+   consume the same visible row shape. Returns [rows aliases]."
+  [results aliases query in-args compound-exprs]
+  (if (seq compound-exprs)
+    (let [row-bindings
+          (fn [row]
+            (let [rv (if (sequential? row) (vec row) [row])]
+              (into (into {} (keep-indexed (fn [i e]
+                                             (when (symbol? e)
+                                               [e (nth rv i nil)])))
+                          (:find query))
+                    (zipmap (rest (:in query)) in-args))))
+          new-results
+          (mapv (fn [row]
+                  (let [rv (if (sequential? row) (vec row) [row])
+                        binds (row-bindings row)]
+                    (reduce (fn [r {:keys [form slots]}]
+                              (let [b (reduce (fn [m [sym idx]]
+                                                (assoc m sym (nth r idx nil)))
+                                              binds slots)
+                                    val (expr/interpret-form form b)]
+                                (conj r (if (= :__null__ val) nil val))))
+                            rv compound-exprs)))
+                results)
+          new-aliases (into (vec aliases) (map :alias compound-exprs))
+          visible-indices (into []
+                                (keep-indexed
+                                 (fn [i a]
+                                   (when-not (and (string? a)
+                                                  (.startsWith ^String a "__compound_"))
+                                     i)))
+                                new-aliases)]
+      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
+       (mapv #(nth new-aliases %) visible-indices)])
+    [results aliases]))
+
 (defn- filter-arg-var!
   "Bind a fresh variable to `inner-expr`'s value on the rows where
    `filter-expr` is TRUE, and to `excluded` on every other row -- the NULL
@@ -3527,24 +3631,53 @@
                               :form  form
                               :slots slots}))
                     ;; Regular non-aggregate expression
-                    (let [v (cond
-                              (seq? v)            (ctx/materialize-arg! ctx v)
-                              (not (symbol? v))   (let [var (ctx/fresh-var! ctx)
-                                                        ;; Datahike drops rows when a fn-binding
-                                                        ;; produces nil; use the :__null__ sentinel
-                                                        ;; for SQL NULL projections so the row
-                                                        ;; survives. The wire layer maps the
-                                                        ;; sentinel back to NULL on output.
-                                                        bind-v (if (nil? v) :__null__ v)]
-                                                    (ctx/add-clause! ctx [(list 'identity bind-v) var])
-                                                    var)
-                              :else               v)]
-                      (swap! find-elements conj v)
-                      ;; PG's naming rules — NOT the datalog variable
-                      ;; (`p1`, `v1`) or the expression's SQL text, which
-                      ;; is what the old fallback chain produced.
-                      (swap! find-aliases conj (or alias-str
-                                                   (figure-colname expr)))))))))
+                    (let [all-clauses (vec @(:where-clauses ctx))
+                          emitted (subvec all-clauses before)
+                          defer? (and where-expr
+                                      (nil? group-by-element)
+                                      (not has-distinct?)
+                                      (empty? (.getOrderByElements select))
+                                      (throwing-projection? v emitted))]
+                      (if defer?
+                        (let [[keep-cs form] (inline-projection-bindings v emitted)
+                              _ (reset! (:where-clauses ctx)
+                                        (into (subvec all-clauses 0 before) keep-cs))
+                              in-vars (set @(:in-params ctx))
+                              value-vars (->> (tree-seq coll? seq form)
+                                              (filter symbol?)
+                                              (filter #(and (.startsWith ^String (clojure.core/name %) "?")
+                                                            (not (contains? in-vars %))))
+                                              distinct)]
+                          ;; Carry each leaf value through the filtered query.
+                          ;; Existing projected vars are reused; new ones are
+                          ;; hidden and stripped after post-processing.
+                          (doseq [value-var value-vars
+                                  :when (not (some #{value-var} @find-elements))]
+                            (swap! find-elements conj value-var)
+                            (swap! find-aliases conj
+                                   (str "__compound_guard_" (count @find-aliases))))
+                          (swap! compound-exprs conj
+                                 {:alias (or alias-str (figure-colname expr))
+                                  :form form
+                                  :slots []}))
+                        (let [v (cond
+                                  (seq? v)          (ctx/materialize-arg! ctx v)
+                                  (not (symbol? v)) (let [var (ctx/fresh-var! ctx)
+                                                         ;; Datahike drops rows when a fn-binding
+                                                         ;; produces nil; use the :__null__ sentinel
+                                                         ;; for SQL NULL projections so the row
+                                                         ;; survives. The wire layer maps the
+                                                         ;; sentinel back to NULL on output.
+                                                          bind-v (if (nil? v) :__null__ v)]
+                                                      (ctx/add-clause! ctx [(list 'identity bind-v) var])
+                                                      var)
+                                  :else             v)]
+                          (swap! find-elements conj v)
+                          ;; PG's naming rules — NOT the datalog variable
+                          ;; (`p1`, `v1`) or the expression's SQL text, which
+                          ;; is what the old fallback chain produced.
+                          (swap! find-aliases conj (or alias-str
+                                                       (figure-colname expr)))))))))))
 
         ;; Thread each distinct correlation column (e.g. t.oid) into :find
         ;; as a trailing hidden column so every outer row carries the value
@@ -6302,6 +6435,22 @@
                             (seq inner-in-args)
                             (apply q-fn inner-query inner-db inner-in-args)
                             :else (q-fn inner-query inner-db))
+            ;; The normal SELECT executor removes trailing helper find
+            ;; elements (usually the entity id used for stable default
+            ;; ordering) before projection post-processing. INSERT-SELECT
+            ;; runs the query directly and must mirror that row shape.
+            hidden-count (long (or (:hidden-count inner-parsed) 0))
+            inner-results (if (pos? hidden-count)
+                            (mapv (fn [row]
+                                    (let [v (if (sequential? row) (vec row) [row])]
+                                      (subvec v 0 (- (count v) hidden-count))))
+                                  inner-results)
+                            inner-results)
+            [inner-results _]
+            (apply-compound-projections inner-results
+                                        (:find-aliases inner-parsed)
+                                        inner-query inner-in-args
+                                        (:compound-exprs inner-parsed))
             rows (mapv (fn [row]
                          (if (sequential? row) (vec row) [row]))
                        inner-results)
