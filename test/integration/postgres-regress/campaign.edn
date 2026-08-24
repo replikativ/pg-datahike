@@ -27,9 +27,8 @@
      :requires ["test_setup"]
      :boundaries #{:scalar-type :operators}
      :blockers #{:non-decimal-integer-input :numeric-formatting :parser-aliases}}
-    {:name "bit" :mode :discovery
+    {:name "bit" :mode :strict
      :boundaries #{:scalar-type :operators :nulls}
-     :blockers #{:bit-literal-parser :operator-coverage}
      :strict-slices
      [{:id :shift-storage
        :source-lines [174 179]

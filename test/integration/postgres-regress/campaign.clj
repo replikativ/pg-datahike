@@ -79,5 +79,8 @@
       (println (str "running wave " wave-id
                     (when mode (str " mode " (clojure.core/name mode)))
                     ": " (str/join " " names)))
-      (apply shell {:dir (str repo-root)}
-             "bash" (str (fs/file here "run.sh")) names))))
+      (let [runner ["bash" (str (fs/file here "run.sh"))]
+            command (if (= mode :strict)
+                      (into ["env" "PG_REGRESS_API_STRICT=1"] runner)
+                      runner)]
+        (apply shell {:dir (str repo-root)} (concat command names))))))

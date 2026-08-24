@@ -64,8 +64,11 @@ unmodified `test_setup.sql`, which creates and populates their shared tables.
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
 result output, unified diff, and summary. A normal mismatch (`pg_regress`
 status 1) is reported but does not fail the task. Harness failures remain
-fatal. Set `PG_REGRESS_STRICT=1` when an admitted test is expected to be fully
-green and should gate on any diff.
+fatal. Set `PG_REGRESS_STRICT=1` when an admitted test is expected to match
+raw psql output, including source-position presentation. Campaign tests in
+`:strict` mode instead gate on the documented API-normalized comparison, which
+retains messages, DETAIL/HINT fields, rows, labels, types, and formatting while
+omitting only PostgreSQL's rendered `LINE`/caret excerpts.
 
 ### Relational fixture bootstrap
 

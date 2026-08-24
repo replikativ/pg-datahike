@@ -105,7 +105,9 @@ fi
 
 shopt -s nullglob
 result_files=("${output_dir}"/results/*.out)
+all_api_match=0
 if (( ${#result_files[@]} > 0 )); then
+  all_api_match=1
   echo
   echo "Per-test target error summary:"
   printf '%-24s %8s %8s %8s %8s %8s %10s\n' \
@@ -135,6 +137,9 @@ if (( ${#result_files[@]} > 0 )); then
       else
         api_match="no"
       fi
+    fi
+    if [[ "${api_match}" != "yes" ]]; then
+      all_api_match=0
     fi
     expected_error_count="${expected_error_count:-0}"
     error_count="${error_count:-0}"
@@ -166,6 +171,14 @@ case "${regress_status}" in
     echo "Regression differences recorded (expected during compatibility work)."
     if [[ "${PG_REGRESS_STRICT:-0}" == "1" ]]; then
       exit 1
+    fi
+    if [[ "${PG_REGRESS_API_STRICT:-0}" == "1" ]]; then
+      if [[ "${all_api_match}" == "1" ]]; then
+        echo "All selected tests match after source-position normalization."
+      else
+        echo "At least one selected test differs at the SQL API boundary." >&2
+        exit 1
+      fi
     fi
     ;;
   *)
