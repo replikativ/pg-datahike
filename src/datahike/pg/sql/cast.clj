@@ -387,6 +387,9 @@
                 (instance? java.time.LocalTime v) v
                 (instance? java.time.LocalDateTime v)
                 (.toLocalTime ^java.time.LocalDateTime v)
+                (instance? java.util.Date v)
+                (-> ^java.util.Date v .toInstant
+                    (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
                 :else (let [s (str/trim (str v))
                             time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
                         (try (java.time.LocalTime/parse time-only)

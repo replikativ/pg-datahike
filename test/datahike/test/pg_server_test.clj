@@ -1803,6 +1803,32 @@
       (is (nil? (err r)))
       (is (re-matches #"\d{4}-\d{2}-\d{2}" (ffirst (rows r)))))))
 
+(deftest test-sql-temporal-value-functions
+  (testing "stable value functions share one statement clock"
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT date(now())::text = current_date::text"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT current_timestamp = now()"))))
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT now()::timetz::text = current_time::text"))))
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT now()::time::text = localtime::text"))))
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT now()::timestamp::text = localtimestamp::text")))))
+  (testing "precision-bearing keyword forms lower as value functions"
+    (is (= [["t"]]
+           (rows (.execute *handler*
+                           "SELECT length(current_timestamp::text) >= length(current_timestamp(0)::text)"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT current_timestamp = current_timestamp(7)"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT localtime = localtime(7)"))))
+    (is (= [["t"]]
+           (rows (.execute *handler* "SELECT localtimestamp = localtimestamp(7)"))))))
+
 (deftest test-insert-update-current-timestamp-keyword
   (testing "bare current_timestamp (TimeKeyExpression) in VALUES / SET (issue #14)"
     (is (nil? (err (.execute *handler* "CREATE TABLE tkey(id INTEGER, ts TIMESTAMP)"))))

@@ -187,6 +187,7 @@
    ;; Consistent with `timetz`, which already falls through to string.
    ;; The :pg/type "time" hint still drives the wire OID (1083/1266).
    "time"              :db.type/string
+   "timetz"            :db.type/string
    "time without time zone"      :db.type/string
    "time with time zone"         :db.type/string
    ;; Binary
@@ -508,7 +509,7 @@
 
 (def cast-time-types
   "SQL type names that cast to a TIME (no date component)."
-  #{"time" "time without time zone" "time with time zone"})
+  #{"time" "timetz" "time without time zone" "time with time zone"})
 
 (def cast-uuid-types
   "SQL type names that cast to UUID."

@@ -134,6 +134,13 @@
    a JSqlParser AST and re-translate on each Execute)."
   nil)
 
+(def ^:dynamic *statement-time*
+  "The wall-clock instant captured once at statement execution. SQL stable
+   value functions (now/current_timestamp/current_date/current_time and
+   their local variants) derive from this value so sibling calls agree.
+   Nil during parsing and non-server use."
+  nil)
+
 (def ^:dynamic *parse-db*
   "Bound by parse-sql to the live db snapshot so downstream helpers
    (e.g. pg-type-of-attr) can consult Datahike for attribute metadata

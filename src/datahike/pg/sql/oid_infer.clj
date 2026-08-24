@@ -867,8 +867,9 @@
       (instance? TimeKeyExpression expr)
       (let [k (some-> (.getStringValue ^TimeKeyExpression expr) str/lower-case)]
         (cond
-          (str/includes? (or k "") "date") types/oid-date
-          (str/includes? (or k "") "time") types/oid-timestamptz
+          (= k "current_date") types/oid-date
+          (= k "current_time") types/oid-time
+          (= k "current_timestamp") types/oid-timestamptz
           :else types/oid-timestamptz))
 
       ;; --- Placeholders -------------------------------------------------

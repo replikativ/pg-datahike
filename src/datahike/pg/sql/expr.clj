@@ -426,6 +426,48 @@
         ;; and the result var is the operand a null-guard has to name.
         result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) args)]
     (cond
+      ;; SQL value functions with a precision modifier parse as ordinary
+      ;; Function nodes (`current_timestamp(0)`, `localtime(3)`). They are
+      ;; stable within one statement and are not catalog function lookups.
+      (contains? #{"current_timestamp" "current_time"
+                   "localtimestamp" "localtime"} fname)
+      (let [fn-param (symbol (str "?sql-time" (swap! (:var-counter ctx) inc)))
+            temporal-fn
+            (fn [& [precision]]
+              (let [^java.util.Date statement-time
+                    (or params/*statement-time* (java.util.Date.))
+                    instant (.toInstant statement-time)
+                    p (long (min 6 (max 0 (or precision 6))))
+                    factor (long (Math/pow 10 (- 9 p)))
+                    nanos (.getNano instant)
+                    truncated (.with instant java.time.temporal.ChronoField/NANO_OF_SECOND
+                                     (* (quot nanos factor) factor))
+                    zdt (.atZone truncated java.time.ZoneOffset/UTC)]
+                (case fname
+                  "current_timestamp" (java.util.Date/from truncated)
+                  "current_time" (.toLocalTime zdt)
+                  "localtimestamp" (.toLocalDateTime zdt)
+                  "localtime" (.toLocalTime zdt))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj temporal-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; PostgreSQL exposes date(timestamp) as the function-style spelling
+      ;; of an explicit cast. It is used by the upstream expressions suite
+      ;; and by application SQL generated independently of `::date`.
+      (= fname "date")
+      (let [fn-param (symbol (str "?date-cast" (swap! (:var-counter ctx) inc)))
+            date-fn (fn [v]
+                      (sql-cast/cast-scalar
+                       v "date" {:parse-timestamp parse-timestamp-string}))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj date-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param args) result-var])
+        result-var)
+
       ;; ROW(a, b, …) — anonymous composite constructor. JSqlParser parses
       ;; it as a Function named "row". Build a PgRecord at runtime from the
       ;; field values, inferring each field's OID from its value (nested
@@ -490,7 +532,7 @@
       ;; NOW() → current timestamp as java.util.Date
       (= fname "now")
       (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-            now-fn (fn [] (java.util.Date.))]
+            now-fn (fn [] (or params/*statement-time* (java.util.Date.)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj now-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -3125,6 +3167,29 @@
                     (str/lower-case (.getColumnName ^Column expr))))
     "datahike"
 
+    ;; JSqlParser surfaces bare LOCALTIME / LOCALTIMESTAMP as unqualified
+    ;; Columns even though SQL defines them as value functions. This must
+    ;; precede the general Column branch below.
+    (and (instance? Column expr)
+         (nil? (.getTable ^Column expr))
+         (contains? #{"localtime" "localtimestamp"}
+                    (str/lower-case (.getColumnName ^Column expr))))
+    (let [key-str (str/lower-case (.getColumnName ^Column expr))
+          result-var (ctx/fresh-var! ctx)
+          fn-param (symbol (str "?sql-local-time" (swap! (:var-counter ctx) inc)))
+          value-fn (fn []
+                     (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))
+                           ^java.time.Instant instant (.toInstant st)
+                           ^java.time.ZonedDateTime zdt
+                           (.atZone instant java.time.ZoneOffset/UTC)]
+                       (if (= key-str "localtime")
+                         (.toLocalTime zdt)
+                         (.toLocalDateTime zdt))))]
+      (swap! (:in-params ctx) conj fn-param)
+      (swap! (:in-args ctx) conj value-fn)
+      (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+      result-var)
+
     ;; A bare identifier naming a table in scope is a PostgreSQL
     ;; WHOLE-ROW REFERENCE: `SELECT t FROM t` yields the composite
     ;; `(1,a)`, not NULL. `relation-in-scope?` already stopped this from
@@ -3724,15 +3789,17 @@
           now-fn (cond
                    (or (= key-str "current_timestamp")
                        (= key-str "now()"))
-                   (fn [] (java.util.Date.))
+                   (fn [] (or params/*statement-time* (java.util.Date.)))
                    ;; LocalDate (not a midnight java.util.Date) so the
                    ;; result renders as "yyyy-MM-dd" with OID 1082, like
                    ;; PG's date type.
                    (= key-str "current_date")
-                   (fn [] (java.time.LocalDate/now java.time.ZoneOffset/UTC))
+                   (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
+                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalDate)))
                    (= key-str "current_time")
-                   (fn [] (java.util.Date.))
-                   :else (fn [] (java.util.Date.)))
+                   (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
+                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalTime)))
+                   :else (fn [] (or params/*statement-time* (java.util.Date.))))
           fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj now-fn)
@@ -3783,7 +3850,7 @@
       (if (and (instance? Function left)
                (= "now" (str/lower-case (.getName ^Function left))))
         (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-              now-fn (fn [] (java.util.Date.))
+              now-fn (fn [] (or params/*statement-time* (java.util.Date.)))
               result-var (ctx/fresh-var! ctx)]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj now-fn)

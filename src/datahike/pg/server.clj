@@ -7072,14 +7072,15 @@
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
         (let [bound (vec bound-params)]
-          (or
-           ;; Tier-1 compiled lane: plain autocommit SELECT with no
-           ;; session modifiers runs its compiled executor directly.
-           (fast-select-prepared conn parsed bound session-state tx-state on-query)
-           (binding [*cached-parsed* parsed
-                     *cached-bound* bound
-                     *implicit-tx-allowed* true]
-             (.execute this (or (:sql parsed) ""))))))
+          (binding [params/*statement-time* (java.util.Date.)]
+            (or
+             ;; Tier-1 compiled lane: plain autocommit SELECT with no
+             ;; session modifiers runs its compiled executor directly.
+             (fast-select-prepared conn parsed bound session-state tx-state on-query)
+             (binding [*cached-parsed* parsed
+                       *cached-bound* bound
+                       *implicit-tx-allowed* true]
+               (.execute this (or (:sql parsed) "")))))))
 
       (executeInGroup [this sql]
         ;; Simple-query group member: a write opens/joins the 'Q''s
@@ -7094,6 +7095,7 @@
         ;; doesn't go through `parse` first) sees the registry when it
         ;; hits pg_database.
         (binding [catalog/*registered-databases* registered-databases
+                  params/*statement-time* (java.util.Date.)
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
         ;; If aborted, reject everything except ROLLBACK / ROLLBACK TO /
