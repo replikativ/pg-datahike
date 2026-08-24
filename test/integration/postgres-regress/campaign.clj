@@ -21,12 +21,13 @@
   (let [tests (mapcat :tests (:waves campaign))
         slices (for [test tests, slice (:strict-slices test)] [test slice])
         names (map :name tests)
+        prerequisites (mapcat :requires tests)
         duplicates (->> names frequencies (keep (fn [[n c]] (when (> c 1) n))) sort)
         bad-modes (remove (:modes campaign) (map :mode tests))
         missing (remove #(fs/regular-file?
                           (fs/file postgres-source "src" "test" "regress" "sql"
                                    (str % ".sql")))
-                        names)]
+                        (concat names prerequisites))]
     (when (seq duplicates) (fail! (str "duplicate tests: " (str/join ", " duplicates))))
     (when (seq bad-modes) (fail! (str "unknown modes: " (pr-str (set bad-modes)))))
     (when (seq missing) (fail! (str "missing upstream SQL: " (str/join ", " missing))))
@@ -50,6 +51,9 @@
     (doseq [[mode grouped] (sort-by key (group-by :mode tests))]
       (println (format "  %-10s %s" (clojure.core/name mode)
                        (str/join " " (map :name grouped)))))
+    (doseq [{:keys [name requires]} tests
+            :when (seq requires)]
+      (println (format "  requires   %s <- %s" name (str/join " " requires))))
     (doseq [{:keys [name strict-slices]} tests
             {:keys [id source-lines]} strict-slices]
       (println (format "  admitted   %s/%s lines %d-%d"
@@ -67,7 +71,10 @@
     (when (and mode (not ((:modes campaign) mode)))
       (fail! (str "unknown mode: " mode-arg)))
     (let [tests (cond->> (:tests wave) mode (filter #(= mode (:mode %))))
-          names (mapv :name tests)]
+          names (->> tests
+                     (mapcat #(concat (:requires %) [(:name %)]))
+                     distinct
+                     vec)]
       (when (empty? names) (fail! "selection contains no tests"))
       (println (str "running wave " wave-id
                     (when mode (str " mode " (clojure.core/name mode)))

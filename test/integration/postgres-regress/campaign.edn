@@ -11,9 +11,15 @@
      :boundaries #{:parameter-inference :type-lookup :prepared-sql}}
     {:name "errors" :mode :unmeasured
      :boundaries #{:sqlstate :name-resolution :transaction-errors}}
-    {:name "int2" :mode :unmeasured :boundaries #{:scalar-type :operators}}
-    {:name "int4" :mode :unmeasured :boundaries #{:scalar-type :operators}}
-    {:name "int8" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "int2" :mode :unmeasured
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}}
+    {:name "int4" :mode :unmeasured
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}}
+    {:name "int8" :mode :unmeasured
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}}
     {:name "bit" :mode :unmeasured :boundaries #{:scalar-type :operators :nulls}}
     {:name "numeric" :mode :unmeasured :boundaries #{:scalar-type :operators :casts}}
     {:name "money" :mode :discovery

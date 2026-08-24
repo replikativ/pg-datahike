@@ -21,6 +21,18 @@ PG_REGRESS_DB=datahike \
 bb pg-regress jsonb
 ```
 
+For independent discovery runs against a server configured with SQL database
+provisioning, create and remove a uniquely named database automatically:
+
+```bash
+PG_REGRESS_ISOLATE=1 PG_REGRESS_PORT=15436 bb pg-regress int2 int4 int8 numeric bit
+```
+
+Only the harness-generated `pgdh_regress_*` database is removed. The database
+named by `PG_REGRESS_DB` is used as the administrative connection and is never
+dropped. Isolation fails early when the target has no `CREATE DATABASE` hook,
+instead of silently reusing contaminated state.
+
 The script uses PostgreSQL 17's installed `pg_regress` and `psql` by default.
 Override them with `PG_REGRESS_BIN`, `PG_REGRESS_BINDIR`, or
 `PG_REGRESS_MAJOR`.
@@ -43,6 +55,11 @@ focused differential tests before marking a dependency-heavy file strict.
 Such admitted statement groups are recorded as `:strict-slices` with their
 exact upstream line range and executable Clojure test var; campaign validation
 fails if either provenance or gate goes stale.
+
+Tests that consume relations created by another upstream file declare it with
+`:requires`. The wave runner schedules each prerequisite once, before its first
+consumer. For example, selecting the integer suites also runs PostgreSQL's
+unmodified `test_setup.sql`, which creates and populates their shared tables.
 
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
 result output, unified diff, and summary. A normal mismatch (`pg_regress`
