@@ -29,6 +29,7 @@
 (def oid-int4       23)
 (def oid-text       25)
 (def oid-oid        26)
+(def oid-tid        27)
 (def oid-json      114)
 (def oid-money     790)
 (def oid-float4    700)
@@ -333,6 +334,7 @@
     "json"        oid-json
     "jsonb"       oid-jsonb
     "oid"         oid-oid
+    "tid"         oid-tid
     "char"        oid-char
     "bytea"       oid-bytea
     ;; bit / bit varying. Datahike has no bit type, so these columns
@@ -427,7 +429,8 @@
    oid-uuid       "uuid"
    oid-json       "json"
    oid-jsonb      "jsonb"
-   oid-oid        "oid"}
+   oid-oid        "oid"
+   oid-tid        "tid"}
 
   ;; Array OIDs, derived rather than listed so the two maps cannot drift.
   ;; Without them `format_type(1007, -1)` fell through to "text", so an
@@ -559,6 +562,7 @@
    [oid-int4      "int4"       4  "b"]
    [oid-text      "text"      -1  "b"]
    [oid-oid       "oid"        4  "b"]
+   [oid-tid       "tid"        6  "b"]
    [oid-json      "json"      -1  "b"]
    [oid-money     "money"      8  "b"]
    [oid-float4    "float4"     4  "b"]
@@ -677,7 +681,7 @@
    oid-date        :D  oid-time    :D  oid-timestamp :D  oid-timestamptz :D
    oid-interval    :T
    oid-bit         :V  oid-varbit  :V
-   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U})
+   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U})
 
 (def preferred-oids
   "`typispreferred`. One per category among the types we carry: a
