@@ -32,6 +32,9 @@
               :task (apply shell "bash test/integration/postgres-regress/run.sh"
                            *command-line-args*)}
 
+  pg-regress-bootstrap {:doc "Load PostgreSQL onek/tenk API fixtures after running test_setup on a fresh database."
+                        :task (shell "bash test/integration/postgres-regress/bootstrap-api.sh")}
+
   format {:doc "Check Clojure source formatting with cljfmt."
           :task (shell "clojure -M:format")}
 

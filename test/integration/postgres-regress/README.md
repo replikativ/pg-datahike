@@ -31,6 +31,24 @@ status 1) is reported but does not fail the task. Harness failures remain
 fatal. Set `PG_REGRESS_STRICT=1` when an admitted test is expected to be fully
 green and should gate on any diff.
 
+### Relational fixture bootstrap
+
+PostgreSQL's `test_setup.sql` loads `onek` and `tenk` with server-side
+`COPY FROM '/path'` and clones them with CTAS. Enabling arbitrary server-side
+file reads merely for the suite would be unsafe. For relational tests, use a
+fresh database and load the API fixtures through psql's client-side COPY:
+
+```bash
+PG_REGRESS_DB=regress_api bb pg-regress test_setup
+PG_REGRESS_DB=regress_api bb pg-regress-bootstrap
+PG_REGRESS_DB=regress_api bb pg-regress case subselect union join aggregates
+```
+
+The bootstrap creates `onek2`/`tenk2` when `test_setup` could not and streams
+the unmodified upstream data into all four tables. It is intentionally a
+one-shot operation: rerunning it appends the fixture rows again, so use a fresh
+regression database for each independent baseline.
+
 ## Reading the baseline
 
 The raw diff includes harmless differences such as shorter error diagnostics,
