@@ -88,7 +88,7 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
-(declare coerce-unknown-literal)
+(declare coerce-unknown-literal coerce-comparison-operands)
 (declare source-oid string-value-text)
 
 (declare translate-expr
@@ -1924,6 +1924,16 @@
                   nil))))]
     (if (some? v) v :__null__)))
 
+(defn- translate-value-comparison-operands
+  "Translate comparison operands in value position after applying the
+   same unknown-literal typinput resolution as the WHERE lowering path."
+  [ctx left right]
+  (mapv (fn [operand]
+          (if (instance? net.sf.jsqlparser.expression.Expression operand)
+            (translate-expr ctx operand)
+            operand))
+        (coerce-comparison-operands ctx left right)))
+
 (defn translate-predicate-expr
   "Translate a SQL predicate expression into a Clojure boolean form
    suitable for use inside a cond binding. Unlike translate-predicate which
@@ -1952,27 +1962,31 @@
     ;; comparison involving one.
     (instance? GreaterThan expr)
     (let [^GreaterThan e expr
-          _ (check-comparison-types! ctx '> (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-gt3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '> l r)]
+      (apply list 'datahike.pg.sql/sql-gt3? (translate-value-comparison-operands ctx l r)))
 
     (instance? GreaterThanEquals expr)
     (let [^GreaterThanEquals e expr
-          _ (check-comparison-types! ctx '>= (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-ge3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '>= l r)]
+      (apply list 'datahike.pg.sql/sql-ge3? (translate-value-comparison-operands ctx l r)))
 
     (instance? MinorThan expr)
     (let [^MinorThan e expr
-          _ (check-comparison-types! ctx '< (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-lt3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '< l r)]
+      (apply list 'datahike.pg.sql/sql-lt3? (translate-value-comparison-operands ctx l r)))
 
     (instance? MinorThanEquals expr)
     (let [^MinorThanEquals e expr
-          _ (check-comparison-types! ctx '<= (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-le3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '<= l r)]
+      (apply list 'datahike.pg.sql/sql-le3? (translate-value-comparison-operands ctx l r)))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
@@ -2007,11 +2021,11 @@
         ;; the same scale-insensitivity as in WHERE, and the same
         ;; reason not to be `=` on the canonical text.
         (let [l (.getLeftExpression e)]
-          (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
-                  'datahike.pg.sql/jsonb-eq?
-                  'datahike.pg.sql/sql-eq3?)
-                (translate-expr ctx l)
-                (translate-expr ctx right)))))
+          (apply list
+                 (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
+                   'datahike.pg.sql/jsonb-eq?
+                   'datahike.pg.sql/sql-eq3?)
+                 (translate-value-comparison-operands ctx l right)))))
 
     (instance? NotEqualsTo expr)
     ;; `not=` compared the `:__null__` sentinel structurally, so
@@ -2043,11 +2057,11 @@
           (swap! (:where-clauses ctx) conj
                  [(list fn-param col-val arr-val) result-var])
           result-var)
-        (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
-                'datahike.pg.sql/jsonb-ne?
-                'datahike.pg.sql/sql-ne3?)
-              (translate-expr ctx l)
-              (translate-expr ctx r))))
+        (apply list
+               (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
+                 'datahike.pg.sql/jsonb-ne?
+                 'datahike.pg.sql/sql-ne3?)
+               (translate-value-comparison-operands ctx l r))))
 
     (instance? IsNullExpression expr)
     ;; SQL NULL is carried as the `:__null__` sentinel, not nil — a
@@ -4127,6 +4141,20 @@
                      :else nil)]
       (when attr (get-in (:schema ctx) [attr :db/valueType])))))
 
+(defn- column-pg-type
+  "Return a column's declared PostgreSQL type, retaining distinctions
+   which Datahike's carrier cannot express (notably money vs numeric)."
+  [ctx ^Column col]
+  (when-let [resolved (try (ctx/resolve-column col
+                                               (:table-aliases ctx)
+                                               (:default-table ctx)
+                                               (:col-overrides ctx)
+                                               (:derived-aliases ctx) (:ci-index ctx))
+                           (catch Throwable _ nil))]
+    (when-let [attr (ctx/attr-of ctx resolved)]
+      (or (get-in (:schema ctx) [attr :pg/type])
+          (params/pg-type-of-attr (:db ctx) attr)))))
+
 (defn jsonb-column?
   "Whether `expr` is a column reference of `jsonb` type.
 
@@ -4244,11 +4272,13 @@
 
     (and (instance? StringValue lit)
          (instance? Column col))
-    (when-let [vt (column-vtype ctx col)]
-      (let [s (.getNotExcapedValue ^StringValue lit)
-            v (coerce/coerce-unknown s vt parse-timestamp-string)]
-        (when (not (identical? v s))   ; only signal coercion when it produced a typed value
-          v)))))
+    (let [s (.getNotExcapedValue ^StringValue lit)]
+      (if (= "money" (column-pg-type ctx col))
+        (sql-cast/cast-scalar s "money" {})
+        (when-let [vt (column-vtype ctx col)]
+          (let [v (coerce/coerce-unknown s vt parse-timestamp-string)]
+            (when (not (identical? v s)) ; signal only when coercion produced a typed value
+              v)))))))
 
 (defn- coerce-comparison-operands
   "Apply PG-style unknown-literal coercion to a `[left right]` pair of

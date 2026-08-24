@@ -85,6 +85,41 @@
                             (- p s) ".")}))
       scaled)))
 
+(def ^:private money-min-cents (biginteger Long/MIN_VALUE))
+(def ^:private money-max-cents (biginteger Long/MAX_VALUE))
+
+(defn parse-money
+  "Parse PostgreSQL's `money` input in the C locale.
+
+   The upstream regression suite fixes `lc_monetary` to C. Its input
+   accepts a dollar sign, comma separators, and either a minus sign or
+   parentheses for a negative amount. PostgreSQL stores an int64 count
+   of cents; we retain the equivalent two-scale BigDecimal carrier."
+  [v]
+  (if-not (string? v)
+    (let [^java.math.BigDecimal bd (coerce/coerce-numeric v :bigdec)]
+      (.setScale bd 2 java.math.RoundingMode/HALF_UP))
+    (let [input v
+          trimmed (str/trim v)
+          negative? (or (and (str/starts-with? trimmed "(")
+                             (str/ends-with? trimmed ")"))
+                        (str/includes? trimmed "-"))
+          numeric-text (str/replace trimmed #"[\s$,+()\-]" "")]
+      (when-not (re-matches #"(?:\d+(?:\.\d*)?|\.\d+)" numeric-text)
+        (throw (errors/pg-error :invalid-text-representation
+                                {:type "money" :value input})))
+      (let [unsigned (java.math.BigDecimal. numeric-text)
+            signed (if negative? (.negate unsigned) unsigned)
+            scaled (.setScale signed 2 java.math.RoundingMode/HALF_UP)
+            cents (.toBigIntegerExact (.movePointRight scaled 2))]
+        (when (or (neg? (.compareTo cents money-min-cents))
+                  (pos? (.compareTo cents money-max-cents)))
+          (throw (errors/pg-error
+                  :numeric-value-out-of-range
+                  {:message (str "value " (pr-str input)
+                                 " is out of range for type money")})))
+        scaled))))
+
 (def ^:private char-type-limit
   "The text types that carry a length modifier, and whether an over-long
    value is truncated or refused. PostgreSQL truncates on an EXPLICIT
@@ -307,10 +342,7 @@
         ;; value model at the SQL boundary. Locale-specific symbols remain
         ;; a presentation concern, while scale and OID stay faithful.
         :money
-        (let [bd (if (instance? java.math.BigDecimal v)
-                   v
-                   (coerce/coerce-numeric v :bigdec))]
-          (.setScale ^java.math.BigDecimal bd 2 java.math.RoundingMode/HALF_UP))
+        (parse-money v)
 
         ;; `str` on a temporal value is java.util.Date.toString, which is
         ;; both the wrong format and rendered in the JVM's default time

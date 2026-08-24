@@ -153,7 +153,48 @@
     (is (= "money" (.getColumnTypeName (.getMetaData rs) 1)))
     (is (= "66.00" (.getString rs 1))))
   (with-open [c (jdbc)]
-    (is (= ["money"] (col c 1 "SELECT pg_typeof(66::money)::text")))))
+    (is (= ["money"] (col c 1 "SELECT pg_typeof(66::money)::text")))
+    (is (= ["123.46" "-123456.78"]
+           (col c 1 (str "SELECT '$123.455'::money "
+                         "UNION ALL SELECT '($123,456.78)'::money"))))))
+
+(deftest postgres-money-comparison-slice
+  ;; PostgreSQL 17 src/test/regress/sql/money.sql lines 32-45. This is an
+  ;; admitted strict semantic slice; locale rendering and cash_words are
+  ;; separate compatibility boundaries.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE money_data (m money)")
+    (exec! c "INSERT INTO money_data VALUES ('123')")
+    (doseq [sql ["SELECT m = '$123.00' FROM money_data"
+                 "SELECT m != '$124.00' FROM money_data"
+                 "SELECT m <= '$123.00' FROM money_data"
+                 "SELECT m >= '$123.00' FROM money_data"
+                 "SELECT m < '$124.00' FROM money_data"
+                 "SELECT m > '$122.00' FROM money_data"]]
+      (is (= ["t"] (col c 1 sql)) sql))
+    (doseq [sql ["SELECT m = '$123.01' FROM money_data"
+                 "SELECT m != '$123.00' FROM money_data"
+                 "SELECT m <= '$122.99' FROM money_data"
+                 "SELECT m >= '$123.01' FROM money_data"
+                 "SELECT m > '$124.00' FROM money_data"
+                 "SELECT m < '$122.00' FROM money_data"]]
+      (is (= ["f"] (col c 1 sql)) sql))))
+
+(deftest postgres-money-assignment-slice
+  ;; PostgreSQL 17 src/test/regress/sql/money.sql lines 53-73.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE money_input (m money)")
+    (doseq [[input expected] [["$123.45" "123.45"]
+                              ["$123.451" "123.45"]
+                              ["$123.454" "123.45"]
+                              ["$123.455" "123.46"]
+                              ["$123.456" "123.46"]
+                              ["$123.459" "123.46"]]]
+      (exec! c "DELETE FROM money_input")
+      (with-open [ps (.prepareStatement c "INSERT INTO money_input VALUES (?)")]
+        (.setString ps 1 input)
+        (.executeUpdate ps))
+      (is (= [expected] (col c 1 "SELECT m FROM money_input")) input))))
 
 (deftest operator-resolution
   (with-open [c (jdbc)]

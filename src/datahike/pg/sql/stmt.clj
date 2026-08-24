@@ -5051,6 +5051,12 @@
         ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
           jsonb? (jb/serialize-jsonb val)
 
+        ;; money shares Datahike's BigDecimal carrier with numeric, but its
+        ;; SQL input function accepts currency/grouping syntax and enforces
+        ;; an int64 count-of-cents range. Dispatch on the declared type
+        ;; before the generic :db.type/bigdec assignment branch.
+          (= "money" pg-type) (sql-cast/parse-money val)
+
         ;; Native PG array column (`:pg/array-elem` recorded by DDL)
         ;; — Option C storage: serialize a PgArray (or coerce a
         ;; sequential value into one) to canonical PG text. Strings
@@ -5456,7 +5462,29 @@
    per ENTITY against an already-materialised entity-map, not as a datalog
    clause over the whole relation."
   [expr entity-map ns-str schema]
-  (let [ev (fn [e] (eval-update-expr e entity-map ns-str schema))]
+  (let [ev (fn [e] (eval-update-expr e entity-map ns-str schema))
+        ;; SELECT-list predicates and UPDATE expressions are evaluated here,
+        ;; outside expr/translate-comparison's Datalog path. Preserve the
+        ;; same PostgreSQL rule in both lowering paths: an unknown string
+        ;; literal takes the known column operand's declared type. Runtime
+        ;; class is insufficient for money because numeric shares its
+        ;; BigDecimal carrier.
+        comparison-values
+        (fn [left right]
+          (let [coerce-one
+                (fn [typed unknown v]
+                  (if (and (instance? Column typed)
+                           (instance? StringValue unknown)
+                           (let [attr (keyword ns-str
+                                               (unquote-ident
+                                                (.getColumnName ^Column typed)))]
+                             (= "money"
+                                (or (get-in schema [attr :pg/type])
+                                    (params/pg-type-of-attr nil attr)))))
+                    (sql-cast/parse-money v)
+                    v))]
+            [(coerce-one right left (ev left))
+             (coerce-one left right (ev right))]))]
     (cond
       (instance? AndExpression expr)
       (fns/sql-and3 (eval-update-cond (.getLeftExpression ^AndExpression expr) entity-map ns-str schema)
@@ -5473,17 +5501,23 @@
       (let [v (ev (.getLeftExpression ^IsNullExpression expr))]
         (if (.isNot ^IsNullExpression expr) (some? v) (nil? v)))
       (instance? EqualsTo expr)
-      (fns/sql-eq3? (ev (.getLeftExpression ^EqualsTo expr)) (ev (.getRightExpression ^EqualsTo expr)))
+      (apply fns/sql-eq3? (comparison-values (.getLeftExpression ^EqualsTo expr)
+                                             (.getRightExpression ^EqualsTo expr)))
       (instance? NotEqualsTo expr)
-      (fns/sql-ne3? (ev (.getLeftExpression ^NotEqualsTo expr)) (ev (.getRightExpression ^NotEqualsTo expr)))
+      (apply fns/sql-ne3? (comparison-values (.getLeftExpression ^NotEqualsTo expr)
+                                             (.getRightExpression ^NotEqualsTo expr)))
       (instance? GreaterThan expr)
-      (fns/sql-gt3? (ev (.getLeftExpression ^GreaterThan expr)) (ev (.getRightExpression ^GreaterThan expr)))
+      (apply fns/sql-gt3? (comparison-values (.getLeftExpression ^GreaterThan expr)
+                                             (.getRightExpression ^GreaterThan expr)))
       (instance? GreaterThanEquals expr)
-      (fns/sql-ge3? (ev (.getLeftExpression ^GreaterThanEquals expr)) (ev (.getRightExpression ^GreaterThanEquals expr)))
+      (apply fns/sql-ge3? (comparison-values (.getLeftExpression ^GreaterThanEquals expr)
+                                             (.getRightExpression ^GreaterThanEquals expr)))
       (instance? MinorThan expr)
-      (fns/sql-lt3? (ev (.getLeftExpression ^MinorThan expr)) (ev (.getRightExpression ^MinorThan expr)))
+      (apply fns/sql-lt3? (comparison-values (.getLeftExpression ^MinorThan expr)
+                                             (.getRightExpression ^MinorThan expr)))
       (instance? MinorThanEquals expr)
-      (fns/sql-le3? (ev (.getLeftExpression ^MinorThanEquals expr)) (ev (.getRightExpression ^MinorThanEquals expr)))
+      (apply fns/sql-le3? (comparison-values (.getLeftExpression ^MinorThanEquals expr)
+                                             (.getRightExpression ^MinorThanEquals expr)))
       (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
 
       ;; The predicate surface eval-update-expr does not itself decide.

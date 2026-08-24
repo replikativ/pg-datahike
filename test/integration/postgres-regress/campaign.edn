@@ -18,7 +18,16 @@
     {:name "numeric" :mode :unmeasured :boundaries #{:scalar-type :operators :casts}}
     {:name "money" :mode :discovery
      :boundaries #{:scalar-type :operators :casts :text-codec}
-     :blockers #{:locale :operator-coverage}}
+     :blockers #{:locale :operator-coverage}
+     :strict-slices
+     [{:id :comparisons
+       :source-lines [32 45]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-comparison-slice"}
+      {:id :assignment-input
+       :source-lines [53 73]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-assignment-slice"}]}
     {:name "arrays" :mode :discovery
      :boundaries #{:array-codec :array-expressions :polymorphism}
      :blockers #{:postgres-vector-types :create-function}}

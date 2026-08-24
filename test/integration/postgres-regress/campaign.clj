@@ -19,6 +19,7 @@
 
 (defn validate! []
   (let [tests (mapcat :tests (:waves campaign))
+        slices (for [test tests, slice (:strict-slices test)] [test slice])
         names (map :name tests)
         duplicates (->> names frequencies (keep (fn [[n c]] (when (> c 1) n))) sort)
         bad-modes (remove (:modes campaign) (map :mode tests))
@@ -28,14 +29,31 @@
                         names)]
     (when (seq duplicates) (fail! (str "duplicate tests: " (str/join ", " duplicates))))
     (when (seq bad-modes) (fail! (str "unknown modes: " (pr-str (set bad-modes)))))
-    (when (seq missing) (fail! (str "missing upstream SQL: " (str/join ", " missing))))))
+    (when (seq missing) (fail! (str "missing upstream SQL: " (str/join ", " missing))))
+    (doseq [[test {:keys [id source-lines gate test-var]}] slices]
+      (let [source (fs/file postgres-source "src" "test" "regress" "sql"
+                            (str (:name test) ".sql"))
+            [start end] source-lines
+            line-count (count (str/split-lines (slurp source)))
+            gate-file (fs/file repo-root gate)]
+        (when-not (and (integer? start) (integer? end)
+                       (pos? start) (<= start end line-count))
+          (fail! (str "invalid source range for " (:name test) "/" id ": " source-lines)))
+        (when-not (fs/regular-file? gate-file)
+          (fail! (str "missing strict-slice gate: " gate)))
+        (when-not (str/includes? (slurp gate-file) (str "(deftest " test-var))
+          (fail! (str "missing strict-slice test var: " test-var)))))))
 
 (defn print-campaign! []
   (doseq [{:keys [id tests] wave-name :name} (:waves campaign)]
     (println (format "wave %d — %s" id wave-name))
     (doseq [[mode grouped] (sort-by key (group-by :mode tests))]
       (println (format "  %-10s %s" (clojure.core/name mode)
-                       (str/join " " (map :name grouped)))))))
+                       (str/join " " (map :name grouped)))))
+    (doseq [{:keys [name strict-slices]} tests
+            {:keys [id source-lines]} strict-slices]
+      (println (format "  admitted   %s/%s lines %d-%d"
+                       name (clojure.core/name id) (first source-lines) (second source-lines))))))
 
 (validate!)
 

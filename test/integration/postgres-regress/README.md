@@ -40,6 +40,9 @@ fixture, `:discovery` means it is continuously useful but has classified
 prerequisites or differences, and `:strict` means its complete normalized API
 output is a gate. Promote coherent application-facing statement groups into
 focused differential tests before marking a dependency-heavy file strict.
+Such admitted statement groups are recorded as `:strict-slices` with their
+exact upstream line range and executable Clojure test var; campaign validation
+fails if either provenance or gate goes stale.
 
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
 result output, unified diff, and summary. A normal mismatch (`pg_regress`
@@ -142,4 +145,4 @@ ledger.
 | Catalog row descriptions | catalog headers such as `pg_type.h`, `pg_attribute.h`, `pg_class.h` | `type_sanity.sql` and driver metadata queries | catalog tests plus pgjdbc/ORM probes |
 | Relation resolution and errors | `src/backend/parser/parse_relation.c` | broadly exercised across the suite | unknown-table/column and catalog tests |
 | `EXPLAIN` grammar/API | `src/backend/parser/gram.y`, `src/backend/commands/explain.c` | `explain.sql` | accepted-option and unsupported-feature tests |
-| `money` | `src/backend/utils/adt/cash.c`; money entries in `pg_type.dat`, `pg_cast.dat`, and `pg_operator.dat` | `money.sql` | core OID/cast/DDL tests; full suite not admitted |
+| `money` | `src/backend/utils/adt/cash.c`; money entries in `pg_type.dat`, `pg_cast.dat`, and `pg_operator.dat` | `money.sql` | strict comparison and assignment-input slices; full locale-rendered suite remains discovery |
