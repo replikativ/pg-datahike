@@ -66,6 +66,28 @@
          (catch clojure.lang.ExceptionInfo e
            (is (= "22P02" (:sqlstate (ex-data e))))))))
 
+(deftest postgres-numeric-input-extensions
+  (testing "underscores between decimal digits"
+    (is (= (BigDecimal. "12000.123456")
+           (c/coerce-numeric "12_000.123_456" :bigdec)))
+    (is (= (BigDecimal. "2.3")
+           (c/coerce-numeric "23_000_000_000e-1_0" :bigdec))))
+  (testing "binary, octal and hexadecimal integers"
+    (is (= (BigDecimal. "299792458")
+           (c/coerce-numeric "0b10001110111100111100001001010" :bigdec)))
+    (is (= (BigDecimal. "9999999999")
+           (c/coerce-numeric "+0o112402761777" :bigdec)))
+    (is (= (BigDecimal. "3735928559")
+           (c/coerce-numeric "0x_dead_beef" :bigdec))))
+  (testing "separator and radix validation remains strict"
+    (doseq [s ["_123" "123_" "12__34" "123_.456" "1.2e_34"
+               "0b1112" "0o12345678" "0x1eg" "0x__1234"]]
+      (try
+        (c/coerce-numeric s :bigdec)
+        (is false s)
+        (catch clojure.lang.ExceptionInfo e
+          (is (= "22P02" (:sqlstate (ex-data e))) s))))))
+
 (deftest coerce-numeric-double-and-float
   (testing "double from string + double from int"
     (is (= 1.5 (c/coerce-numeric "1.5" :double)))
