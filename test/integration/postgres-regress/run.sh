@@ -120,7 +120,7 @@ if (( ${#result_files[@]} > 0 )); then
     error_count="$(rg -c '^ERROR:  ' "${result_file}" || true)"
     aborted_count="$(rg -c '^ERROR:  current transaction is aborted' "${result_file}" || true)"
     internal_count="$(rg -c \
-      'class .* cannot be cast|ClassCastException|NullPointerException|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
+      'class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
       "${result_file}" || true)"
     api_match="n/a"
     if [[ -f "${expected_file}" ]]; then
@@ -152,7 +152,7 @@ if (( ${#result_files[@]} > 0 )); then
   echo
   echo "Internal-failure signatures (first 30):"
   rg -n --no-heading \
-    'class .* cannot be cast|ClassCastException|NullPointerException|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
+    'class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
     "${result_files[@]}" | head -30 || true
 fi
 

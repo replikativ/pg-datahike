@@ -7,21 +7,32 @@
    [{:name "expressions" :mode :discovery
      :boundaries #{:expressions :type-inference :nulls}
      :blockers #{:point :create-function :planner-explain}}
-    {:name "prepare" :mode :unmeasured
-     :boundaries #{:parameter-inference :type-lookup :prepared-sql}}
-    {:name "errors" :mode :unmeasured
-     :boundaries #{:sqlstate :name-resolution :transaction-errors}}
-    {:name "int2" :mode :unmeasured
+    {:name "prepare" :mode :discovery
      :requires ["test_setup"]
-     :boundaries #{:scalar-type :operators}}
-    {:name "int4" :mode :unmeasured
+     :boundaries #{:parameter-inference :type-lookup :prepared-sql}
+     :blockers #{:sql-prepare-execute :pg-prepared-statements :fixture-data}}
+    {:name "errors" :mode :discovery
      :requires ["test_setup"]
-     :boundaries #{:scalar-type :operators}}
-    {:name "int8" :mode :unmeasured
+     :boundaries #{:sqlstate :name-resolution :transaction-errors}
+     :blockers #{:unsupported-ddl :fixture-data}}
+    {:name "int2" :mode :discovery
      :requires ["test_setup"]
-     :boundaries #{:scalar-type :operators}}
-    {:name "bit" :mode :unmeasured :boundaries #{:scalar-type :operators :nulls}}
-    {:name "numeric" :mode :unmeasured :boundaries #{:scalar-type :operators :casts}}
+     :boundaries #{:scalar-type :operators}
+     :blockers #{:non-decimal-integer-input :operator-coverage}}
+    {:name "int4" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}
+     :blockers #{:non-decimal-integer-input :operator-coverage}}
+    {:name "int8" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}
+     :blockers #{:non-decimal-integer-input :numeric-formatting :parser-aliases}}
+    {:name "bit" :mode :discovery
+     :boundaries #{:scalar-type :operators :nulls}
+     :blockers #{:array-codec :bit-literal-parser :operator-coverage}}
+    {:name "numeric" :mode :discovery
+     :boundaries #{:scalar-type :operators :casts}
+     :blockers #{:numeric-formatting :numeric-typemods :create-function}}
     {:name "money" :mode :discovery
      :boundaries #{:scalar-type :operators :casts :text-codec}
      :blockers #{:locale :operator-coverage}

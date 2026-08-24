@@ -6884,7 +6884,16 @@
   "Translate a DELETE statement to Datahike retraction query + tx-data."
   [^Delete delete schema]
   (let [table (.getTable delete)
-        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
+        _ (when-not table
+            (throw (ex-info "syntax error at end of input"
+                            {:error :syntax-error :sqlstate "42601"})))
+        raw-table (unquote-ident (.getName ^Table table))
+        _ (when-not (relation-known? schema raw-table)
+            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table raw-table})))
+        table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name
@@ -6994,7 +7003,13 @@
    and target table info for the server to execute."
   [^Update update schema db]
   (let [table (.getTable update)
-        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
+        raw-table (unquote-ident (.getName ^Table table))
+        _ (when-not (relation-known? schema raw-table)
+            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table raw-table})))
+        table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name
