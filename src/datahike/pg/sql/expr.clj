@@ -3138,6 +3138,22 @@
     (let [^Column col-expr expr
           tbl (.getTable col-expr)
           tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
+          col-name (unquote-ident (.getColumnName col-expr))
+          binding-owners (when (and (nil? tbl-name) (seq params/*from-source-aliases*))
+                           (params/binding-column-owners params/*from-bindings* col-name))
+          ;; UPDATE's target relation is represented in ctx, while each
+          ;; FROM row is a constant binding. Account for both scopes before
+          ;; choosing an unqualified FROM column.
+          target-column? (when (seq binding-owners)
+                           (try
+                             (let [resolved (ctx/resolve-column
+                                             col-expr (:table-aliases ctx)
+                                             (:default-table ctx)
+                                             (:col-overrides ctx)
+                                             (:derived-aliases ctx) (:ci-index ctx))
+                                   attr (ctx/attr-of ctx resolved)]
+                               (boolean (and attr (contains? (:schema ctx) attr))))
+                             (catch Exception _ false)))
           ;; JSqlParser parses `xs[2]` as a Column with a side-channel
           ;; `ArrayConstructor` carrying the indices: `(.getColumnName)`
           ;; returns the bare name `xs`; `(.getArrayConstructor)` is the
@@ -3149,8 +3165,17 @@
           ac (.getArrayConstructor col-expr)]
       (cond
         (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
-        ;; Bound by UPDATE ... FROM (VALUES ...) AS alias(cols)
-        (get-in params/*from-bindings* [tbl-name (unquote-ident (.getColumnName col-expr))])
+        ;; Bound by the current UPDATE ... FROM row.
+        (get-in params/*from-bindings* [tbl-name col-name])
+
+        (and (nil? tbl-name) (> (count binding-owners) 1))
+        (params/ambiguous-column! col-name)
+
+        (and (nil? tbl-name) (= 1 (count binding-owners)) target-column?)
+        (params/ambiguous-column! col-name)
+
+        (and (nil? tbl-name) (= 1 (count binding-owners)))
+        (get-in params/*from-bindings* [(first binding-owners) col-name])
 
         (some? ac)
         ;; Walk the bracket-expressions left-to-right, applying
@@ -4221,6 +4246,20 @@
                 (nil? (.getArrayConstructor ^Column right))
                 (not (jsonb-column? ctx left))
                 (not (jsonb-column? ctx right))
+                ;; UPDATE FROM values are constants for this invocation,
+                ;; not a second Datalog relation. This gate is deliberately
+                ;; UPDATE-specific; using *from-bindings* alone also catches
+                ;; correlated/LATERAL machinery and changes its join plans.
+                (not (and (seq params/*from-source-aliases*)
+                          (some (fn [^Column c]
+                                  (let [t (some-> (.getTable c) .getName unquote-ident)
+                                        cn (unquote-ident (.getColumnName c))]
+                                    (if t
+                                      (and (contains? params/*from-source-aliases* t)
+                                           (contains? (get params/*from-bindings* t) cn))
+                                      (seq (params/binding-column-owners
+                                            params/*from-bindings* cn)))))
+                                [left right])))
                 ;; NOT when either side names a table bound in
                 ;; *from-bindings*. Those columns are CONSTANTS supplied
                 ;; per outer row (UPDATE ... FROM (VALUES …), and a

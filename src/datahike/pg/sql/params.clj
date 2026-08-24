@@ -150,11 +150,35 @@
   nil)
 
 (def ^:dynamic *from-bindings*
-  "When bound (by build-update-tx handling UPDATE ... FROM (VALUES ...)),
+  "When bound (by build-update-tx handling UPDATE ... FROM),
    a map {alias-name → {col-name → literal}} used by the Column branches
    of translate-expr and eval-update-expr to substitute row-level values
-   for references like `__tmp.col` to the VALUES alias."
+   for references like `src.col` to the current FROM row."
   nil)
+
+(def ^:dynamic *from-source-aliases*
+  "Aliases in *from-bindings* that belong to an UPDATE's FROM clause.
+   The binding map can additionally contain the materialised target row
+   for correlated expressions; unqualified SQL lookup must not mistake
+   that implementation detail for another FROM item."
+  nil)
+
+(defn binding-column-owners
+  "Return the aliases in `bindings` that expose `col-name`.
+
+   Presence is tested with contains? so a SQL NULL remains a found value."
+  [bindings col-name]
+  (into [] (keep (fn [[alias row]]
+                   (when (and (or (nil? *from-source-aliases*)
+                                  (contains? *from-source-aliases* alias))
+                              (contains? row col-name))
+                     alias)))
+        bindings))
+
+(defn ambiguous-column!
+  [col-name]
+  (throw (ex-info (str "column reference \"" col-name "\" is ambiguous")
+                  {:error :ambiguous-column :column col-name :sqlstate "42702"})))
 
 (def ^:dynamic *lateral-outer-aliases*
   "When bound (by the correlated-LATERAL row producer), the set of OUTER

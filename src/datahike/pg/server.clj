@@ -2579,6 +2579,8 @@
                       ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
                       ;; plan per statement shape, values supplied at d/q time.
                       (binding [params/*from-bindings* from-bindings
+                                params/*from-source-aliases* (when from-bindings
+                                                               (set (keys from-bindings)))
                                 expr/*conjunctive-where* true]
                         (let [preds (#'sql/translate-predicate ctx where-expr)]
                           (swap! (:where-clauses ctx) into preds))))
@@ -2654,6 +2656,9 @@
                                             ;; ClassCastException on the ParamRef
                                             ;; (pgbench -M prepared).
                                             raw-val (binding [params/*from-bindings* eff-from-bindings
+                                                              params/*from-source-aliases*
+                                                              (when from-bindings
+                                                                (set (keys from-bindings)))
                                                               params/*bound-params*
                                                               (or params/*bound-params*
                                                                   (when-let [cb *cached-bound*]
@@ -2685,8 +2690,10 @@
    that need speculative tempid remapping should pass an `eid->tempid` map
    and remap the tx-data afterward.
 
-   For UPDATE ... FROM (VALUES ...) AS alias(cols), runs one update per
-   VALUES row with the alias's columns bound to that row's literals."
+   For UPDATE ... FROM, runs the target matcher once per source row with
+   that row's columns bound as constants. PostgreSQL updates a target row
+   at most once even when several source rows match; retain the first match
+   in the source's stable entity order."
   [db schema parsed]
   (if-let [{:keys [alias cols rows]} (:from-values parsed)]
     (reduce
@@ -2699,7 +2706,50 @@
              (update :tx-data into tx-data))))
      {:eids [] :tx-data []}
      rows)
-    (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil))))
+    (if-let [{source-table :table source-alias :alias} (:from-table parsed)]
+      (let [column-info (->> (pgs/column-info schema source-table db)
+                             (remove #(= "db-row-exists" (:name %)))
+                             vec)
+            marker (pgs/row-marker-attr source-table)
+            source-eids (if (contains? schema marker)
+                          ;; Row markers are deliberately not :db/indexed;
+                          ;; AVET therefore has no entries for them. AEVT is
+                          ;; still an attribute-prefix scan and remains cheap.
+                          (into [] (keep (fn [^datahike.datom.Datom datom]
+                                          (when (true? (.-v datom)) (.-e datom))))
+                                (d/datoms db :aevt marker))
+                          (->> column-info
+                               (mapcat (fn [{:keys [attr]}]
+                                         (when (and attr (not= :db/id attr))
+                                           (map (fn [^datahike.datom.Datom datom] (.-e datom))
+                                                (d/datoms db :aevt attr)))))
+                               distinct
+                               sort
+                               vec))]
+        (with-cte-namespaces parsed
+          (dissoc
+           (reduce
+            (fn [{:keys [seen] :as acc} eid]
+              (let [entity-map (into {} (map (fn [^datahike.datom.Datom datom]
+                                               [(.-a datom) (.-v datom)]))
+                                     (d/datoms db :eavt eid))
+                    row (into {}
+                              (map (fn [{:keys [name attr]}]
+                                     [name (if (= :db/id attr) eid (get entity-map attr))]))
+                              column-info)
+                    result (build-update-tx-for-bindings
+                            db schema parsed {source-alias row})
+                    fresh-eids (remove seen (:eids result))
+                    fresh-set (set fresh-eids)
+                    fresh-tx (filterv #(contains? fresh-set (second %)) (:tx-data result))]
+                (-> acc
+                    (update :seen into fresh-eids)
+                    (update :eids into fresh-eids)
+                    (update :tx-data into fresh-tx))))
+            {:seen #{} :eids [] :tx-data []}
+            source-eids)
+           :seen)))
+      (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil)))))
 
 (defn- check-update-identity-collisions!
   "Pre-flight check: before running tx-data from build-update-tx, scan

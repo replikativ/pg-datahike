@@ -5556,13 +5556,26 @@
     ;; or the VALUES alias for UPDATE ... FROM (VALUES ...))
     (instance? Column value-expr)
     (let [^Column col-expr value-expr
-          col-name (.getColumnName col-expr)
+          col-name (unquote-ident (.getColumnName col-expr))
           tbl (.getTable col-expr)
-          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))]
+          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
+          binding-owners (when (and (nil? tbl-name) (seq params/*from-source-aliases*))
+                           (params/binding-column-owners params/*from-bindings* col-name))
+          target-column? (contains? schema (keyword ns-str col-name))]
       (cond
-        ;; Bound by UPDATE ... FROM (VALUES ...) AS alias(cols)
+        ;; Bound by the current UPDATE ... FROM row (or the materialised
+        ;; target row used by correlated UPDATE expressions).
         (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
-        (get-in params/*from-bindings* [tbl-name (unquote-ident col-name)])
+        (get-in params/*from-bindings* [tbl-name col-name])
+
+        (and (nil? tbl-name) (> (count binding-owners) 1))
+        (params/ambiguous-column! col-name)
+
+        (and (nil? tbl-name) (= 1 (count binding-owners)) target-column?)
+        (params/ambiguous-column! col-name)
+
+        (and (nil? tbl-name) (= 1 (count binding-owners)))
+        (get-in params/*from-bindings* [(first binding-owners) col-name])
 
         (and tbl-name (= "EXCLUDED" (.toUpperCase ^String tbl-name)))
         (get entity-map (keyword "excluded" col-name))
@@ -6897,6 +6910,26 @@
                        (every? (fn [r] (not-any? #(= :unhandled %) r)) rows))
               {:alias alias-name :cols alias-cols :rows rows})))))))
 
+(defn- extract-update-from-table
+  "Extract the single ordinary table form supported by UPDATE ... FROM.
+   More complex FROM trees remain explicit feature gaps rather than being
+   silently ignored."
+  [^Update update schema]
+  (when-let [from-item (.getFromItem update)]
+    (when (seq (.getJoins update))
+      (throw (ex-info "UPDATE FROM with multiple relations is not supported"
+                      {:error :feature-not-supported :sqlstate "0A000"})))
+    (if (instance? Table from-item)
+      (let [{raw-name :name alias :alias} (ctx/extract-table-info from-item)
+            table-name (first (canonical-relation schema raw-name []))]
+        (when-not (or (contains? schema (pgs/row-marker-attr table-name))
+                      (some #(= table-name (namespace %)) (keys schema)))
+          (throw (ex-info (str "relation \"" raw-name "\" does not exist")
+                          {:error :undefined-table :table raw-name :sqlstate "42P01"})))
+        {:table table-name :alias alias})
+      (throw (ex-info "UPDATE FROM source is not supported"
+                      {:error :feature-not-supported :sqlstate "0A000"})))))
+
 (defn translate-update
   "Translate an UPDATE statement to Datahike retract+assert pairs.
    Handles UPDATE with WITH RECURSIVE CTE — for these, the result is
@@ -6927,9 +6960,14 @@
                              :sqlstate "42601"
                              :column dup})))
         withs (.getWithItemsList update)
-        from-values (extract-from-values update)]
-    (if (and withs (seq withs)
-             (some #(.isRecursive ^net.sf.jsqlparser.statement.select.WithItem %) withs))
+        from-values (extract-from-values update)
+        recursive? (and withs (seq withs)
+                        (some #(.isRecursive ^net.sf.jsqlparser.statement.select.WithItem %) withs))
+        ;; The recursive CTE executor owns its FROM relation, which is a
+        ;; virtual relation absent from the base schema at this point.
+        from-table (when (and (not recursive?) (not from-values))
+                     (extract-update-from-table update schema))]
+    (if recursive?
       ;; WITH RECURSIVE UPDATE: translate the CTE(s) to Datalog rule(s) and
       ;; let the server execute the iterative update.
       (let [recursive-cte (first (filter #(.isRecursive ^net.sf.jsqlparser.statement.select.WithItem %)
@@ -6982,6 +7020,7 @@
                                        :value-expr (first exprs)}))
                                   update-sets)}
         from-values (assoc :from-values from-values)
+        from-table (assoc :from-table from-table)
         (.getReturningClause update)
         (assoc :returning (extract-returning (.getReturningClause update)))))))
 
