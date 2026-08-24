@@ -345,6 +345,14 @@
                        (or (params/unquote-ident (.getName t))
                            (params/unquote-ident (.getAlias t))))
           table-real (or (get table-aliases col-table col-table)
+                         ;; An unqualified column uses default-table, which
+                         ;; may itself be a SQL alias (including a CTE name
+                         ;; redirected to its synthetic namespace). Resolve
+                         ;; that through the same map as an explicit
+                         ;; `alias.column`; otherwise execution finds the
+                         ;; right attr while OID inference silently returns
+                         ;; nil/text.
+                         (get table-aliases default-table default-table)
                          default-table)
           hint-attr (when (and hints col-table)
                       (some (fn [[attr h]]
@@ -423,8 +431,16 @@
       :else nil)))
 
 (defn- binary-arith-oid [^BinaryExpression e env]
-  (let [l (expr-oid (.getLeftExpression e) env)
-        r (expr-oid (.getRightExpression e) env)
+  (let [left (.getLeftExpression e)
+        right (.getRightExpression e)
+        l0 (expr-oid left env)
+        r0 (expr-oid right env)
+        ;; StringValue is PostgreSQL's `unknown` pseudo-type until
+        ;; operator resolution. When the opposite arithmetic operand is
+        ;; typed, its typinput determines both the selected operator and
+        ;; result OID (`real * '-10'` remains real, for example).
+        l (if (instance? StringValue left) r0 l0)
+        r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
         plus?    (instance? Addition e)
         minus?   (instance? Subtraction e)]

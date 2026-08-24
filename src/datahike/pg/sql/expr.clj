@@ -88,8 +88,11 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
+(declare coerce-unknown-literal)
+(declare source-oid string-value-text)
 
 (declare translate-expr
+         column-value!
          translate-predicate
          translate-case-expr
          translate-cast-expr
@@ -101,6 +104,40 @@
          flatten-json-chain
          interpret-form
          parse-timestamp-string)
+
+(defn- numeric-target-for-oid [oid]
+  (case oid
+    21 :long
+    23 :long
+    20 :long
+    700 :float
+    701 :double
+    1700 :bigdec
+    nil))
+
+(defn- coerce-function-unknowns
+  "Apply a function spec's argument-resolution rule to raw AST operands.
+   PostgreSQL uses a known argument type to resolve unknown literals in
+   homogeneous calls (for example div(numeric, unknown))."
+  [ctx fname arg-exprs]
+  (let [rule (get-in fns/sql-function-specs [fname :unknown-args])
+        homogeneous-count (cond
+                            (= :homogeneous rule) (count arg-exprs)
+                            (map? rule) (:homogeneous-prefix rule))]
+    (if homogeneous-count
+      (let [homogeneous-args (take homogeneous-count arg-exprs)]
+        (if-let [target (some #(numeric-target-for-oid
+                                (try (source-oid ctx %)
+                                     (catch Throwable _ nil)))
+                              homogeneous-args)]
+          (mapv (fn [idx arg]
+                  (if (and (< idx homogeneous-count)
+                           (instance? StringValue arg))
+                    (coerce/coerce-numeric (string-value-text arg) target)
+                    arg))
+                (range) arg-exprs)
+          arg-exprs))
+      arg-exprs)))
 
 (def ^:dynamic *conjunctive-where*
   "True while translating top-level AND-ed conjuncts of a WHERE (or an
@@ -367,8 +404,13 @@
         ;; empty, so they arrived with no arguments at all.
         params (or (.getParameters f)
                    (some-> (.getNamedParameters f) .getExpressions))
-        raw-args (when params
-                   (mapv #(translate-expr ctx %) params))
+        arg-exprs (when params (vec params))
+        arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
+        raw-args (when arg-exprs
+                   (mapv #(if (instance? net.sf.jsqlparser.expression.Expression %)
+                            (translate-expr ctx %)
+                            %)
+                         arg-exprs))
         ;; `position(sub IN str)` names its operands the other way round
         ;; from the function it resolves to -- PostgreSQL's gram.y swaps
         ;; them before analysis, so do the same for the keyword form only.
@@ -2268,8 +2310,11 @@
         ;; PostgreSQL raises 22P02, and `'{"b":1,"a":2}'::jsonb` was not
         ;; canonicalised.
         json-cast (get {"json" :json "jsonb" :jsonb} type-str)
-        ;; Only the text targets consult this; see source-oid.
-        src-oid (when is-text? (source-oid ctx inner))]
+        ;; Text rendering and bit-to-number reinterpretation consult the
+        ;; declared source type. Bit columns are stored as digit strings in
+        ;; Datahike, so runtime class alone cannot distinguish bit B'10'
+        ;; (integer 2) from text '10' (integer 10).
+        src-oid (source-oid ctx inner)]
     (cond
       ;; Both types VALIDATE on input; only jsonb normalises after.
       json-cast
@@ -2570,7 +2615,12 @@
                   ;; cannot see a PgBit.
                   cast-fn (null-preserving
                            (fn [v] (sql-cast/cast-scalar
-                                    v type-str
+                                    (if (and (string? v)
+                                             (contains? #{types/oid-bit types/oid-varbit} src-oid))
+                                      (pg-bits/parse-bit-literal
+                                       v (= src-oid types/oid-varbit))
+                                      v)
+                                    type-str
                                     {:explicit? true
                                      :parse-timestamp parse-timestamp-string})))]
               (swap! (:in-params ctx) conj fn-param)
@@ -2672,8 +2722,16 @@
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
   (let [env (oid-env ctx)
         oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
-        l (oid (.getLeftExpression expr))
-        r (oid (.getRightExpression expr))]
+        left (.getLeftExpression expr)
+        right (.getRightExpression expr)
+        l0 (oid left)
+        r0 (oid right)
+        ;; A quoted literal is `unknown`, not text, during PostgreSQL
+        ;; operator lookup. Against float4 it therefore selects the
+        ;; float4/float4 operator; an actually typed integer literal still
+        ;; widens the expression to float8 as documented above.
+        l (if (instance? StringValue left) r0 l0)
+        r (if (instance? StringValue right) l0 r0)]
     (when (and (= l types/oid-float4) (= r types/oid-float4))
       (get '{+ datahike.pg.sql/sql-f4+
              - datahike.pg.sql/sql-f4-
@@ -2732,6 +2790,19 @@
   [x]
   (and (map? x) (or (:aggregate x) (:compound-agg x))))
 
+(defn- coerce-arithmetic-unknown
+  "Resolve a quoted unknown operand from the other arithmetic operand's
+   numeric OID. The column-specific path keeps index/type metadata behavior;
+   the OID fallback covers casts and function expressions such as
+   `'Infinity'::numeric / '0'`."
+  [ctx typed-expr unknown-expr]
+  (or (when (instance? Column typed-expr)
+        (coerce-unknown-literal ctx typed-expr unknown-expr))
+      (when (and (instance? StringValue unknown-expr)
+                 (not (pg-bits/bit-string-literal? unknown-expr)))
+        (when-let [target (numeric-target-for-oid (source-oid ctx typed-expr))]
+          (coerce/coerce-numeric (string-value-text unknown-expr) target)))))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -2743,6 +2814,7 @@
    server-side after the query."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
   (let [left-expr (.getLeftExpression expr)
+        right-expr (.getRightExpression expr)
         ;; PG puts prefix `~` at the generic-operator precedence level,
         ;; BELOW `+ - * / %` and `^`, so `~1 + 1` means `~(1 + 1)` = -3
         ;; and `~2 * 3` means `~(2 * 3)` = -7. JSqlParser binds the `~`
@@ -2755,10 +2827,28 @@
         ;; PG too — so they deliberately do NOT come through here.
         not-prefix? (and (instance? SignedExpression left-expr)
                          (= \~ (.getSign ^SignedExpression left-expr)))
-        l (translate-expr ctx (if not-prefix?
-                                (.getExpression ^SignedExpression left-expr)
-                                left-expr))
-        r (translate-expr ctx (.getRightExpression expr))]
+        effective-left (if not-prefix?
+                         (.getExpression ^SignedExpression left-expr)
+                         left-expr)
+        ;; A quoted literal starts as PostgreSQL's pseudo-type `unknown`.
+        ;; Once the other arithmetic operand establishes a column type,
+        ;; PostgreSQL runs that type's input function before invoking the
+        ;; operator. Comparisons already did this through
+        ;; coerce-unknown-literal, but arithmetic sent the raw String to
+        ;; Clojure's +/*/... and leaked a String->Number ClassCastException.
+        ;; Reuse the same typinput dispatch here for both operand orders.
+        coerced-left (coerce-arithmetic-unknown ctx right-expr effective-left)
+        coerced-right (coerce-arithmetic-unknown ctx effective-left right-expr)
+        ;; A successful typinput result is already a Datalog-compatible
+        ;; runtime value, not a JSqlParser node; do not feed it back through
+        ;; translate-expr (which quite correctly rejects raw Float/Double
+        ;; objects as AST expressions).
+        l (if (some? coerced-left)
+            coerced-left
+            (translate-expr ctx effective-left))
+        r (if (some? coerced-right)
+            coerced-right
+            (translate-expr ctx right-expr))]
     ;; `map?`, not agg-marker? -- a defrecord IS a map, so any
     ;; record-valued operand (a numeric NaN/Infinity carrier, a PgBit, a
     ;; PgArray) was mistaken for an aggregate marker and turned the whole
@@ -2792,8 +2882,16 @@
    than here, because the operand types generally aren't known until
    execution."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr fn-sym f]
-  (let [l (translate-expr ctx (.getLeftExpression expr))
-        r (translate-expr ctx (.getRightExpression expr))
+  (let [left-expr (.getLeftExpression expr)
+        right-expr (.getRightExpression expr)
+        coerced-left (coerce-arithmetic-unknown ctx right-expr left-expr)
+        coerced-right (coerce-arithmetic-unknown ctx left-expr right-expr)
+        l (if (some? coerced-left)
+            coerced-left
+            (translate-expr ctx left-expr))
+        r (if (some? coerced-right)
+            coerced-right
+            (translate-expr ctx right-expr))
         ;; Fold only when BOTH operands are already values. A column
         ;; reference translates to a Datalog VAR (a symbol), which is
         ;; neither a seq nor a map — folding on "not a seq" applied the
@@ -2887,7 +2985,7 @@
         attr-ref (fn [c] (if (= alias-name table-name)
                            (:attr c)
                            [:aliased alias-name (:attr c)]))
-        vars (mapv #(ctx/col-var! ctx (attr-ref %)) cols)
+        vars (mapv #(column-value! ctx (attr-ref %)) cols)
         meta-cols (mapv #(select-keys % [:name :oid]) cols)
         rec-fn (fn [& vals]
                  (pg-rec/->PgRecord
@@ -2966,6 +3064,46 @@
     ;; guard every other nullable value gets.
     (swap! (:nullable-vars ctx) conj out-var)
     out-var))
+
+(defn column-value!
+  "Return a column's SQL value variable. Most Datahike scalar values are
+   already their SQL representation. NUMERIC specials use reserved
+   BigDecimals at rest, while bit/varbit use canonical digit strings; both
+   are decoded at this boundary. Join planning and literal equality can still
+   bind the raw datom directly through col-var!."
+  [ctx resolved]
+  (let [raw (ctx/col-var! ctx resolved)
+        attr (ctx/attr-of ctx resolved)
+        attr-schema (get (:schema ctx) attr)
+        pg-type (or (:pg/type attr-schema)
+                    (params/pg-type-of-attr (:db ctx) attr))
+        decode-fn (cond
+                    (= :db.type/bigdec (:db/valueType attr-schema))
+                    types/numeric-storage->value
+
+                    (contains? #{"bit" "varbit"} pg-type)
+                    (fn [v]
+                      (if (string? v)
+                        (pg-bits/parse-bit-literal v (= "varbit" pg-type))
+                        v))
+
+                    :else nil)]
+    (if decode-fn
+      (let [decode-param (symbol (str "?column-decode" (swap! (:var-counter ctx) inc)))
+            decoded (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) raw)]
+        (swap! (:in-params ctx) conj decode-param)
+        (swap! (:in-args ctx) conj decode-fn)
+        (ctx/add-clause! ctx [(list decode-param raw) decoded])
+        decoded)
+      raw)))
+
+(defn- column-storage-value
+  "Encode a typed SQL value for direct binding against a stored datom."
+  [ctx resolved v]
+  (let [attr (ctx/attr-of ctx resolved)]
+    (if (= :db.type/bigdec (get-in (:schema ctx) [attr :db/valueType]))
+      (types/numeric-value->storage v)
+      v)))
 
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
@@ -3050,7 +3188,7 @@
                                            (:default-table ctx)
                                            (:col-overrides ctx)
                                            (:derived-aliases ctx) (:ci-index ctx))]
-          (ctx/col-var! ctx resolved))))
+          (column-value! ctx resolved))))
 
     (instance? AllColumns expr)
     :*
@@ -4547,7 +4685,9 @@
                                              (:default-table ctx)
                                              (:col-overrides ctx)
                                              (:derived-aliases ctx) (:ci-index ctx))
-                pv (jsonb-canonical-operand ctx resolved (translate-expr ctx right))]
+                pv (->> (translate-expr ctx right)
+                        (jsonb-canonical-operand ctx resolved)
+                        (column-storage-value ctx resolved))]
             (cond
               (and (symbol? pv) (ctx/bind-col-param! ctx resolved pv)) []
               (and (not (symbol? pv)) (ctx/bind-col-value! ctx resolved pv)) []
@@ -4573,8 +4713,9 @@
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
                   coerced (coerce-unknown-literal ctx left right)
-                  val (jsonb-canonical-operand
-                       ctx resolved (or coerced (translate-expr ctx right)))]
+                  val (->> (or coerced (translate-expr ctx right))
+                           (jsonb-canonical-operand ctx resolved)
+                           (column-storage-value ctx resolved))]
               (cond
                 (and (vector? resolved) (= :db-id (first resolved)))
               ;; db_id = N → bind entity var

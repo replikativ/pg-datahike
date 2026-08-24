@@ -57,6 +57,7 @@
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
+            [datahike.pg.bits :as pg-bits]
             [datahike.pg.arrays :as pg-arr])
   (:import [datahike.datom Datom]
            [net.sf.jsqlparser.schema Column Table]
@@ -1275,6 +1276,7 @@
       (str "column" (inc i))))
 
 (declare correlated-subquery-refs)
+(declare eval-values-literal)
 
 (defn- lateral-rows-fn
   "Row producer for a correlated LATERAL subquery: given the outer
@@ -1649,7 +1651,7 @@
     [rows (:find-aliases parsed) nil]))
 
 (defn materialize-set-op!
-  "Run a SELECT (PlainSelect or SetOperationList) and persist its rows
+  "Run a SELECT (PlainSelect, SetOperationList, or VALUES) and persist its rows
    under `target-name/<col>` in a speculative db. Returns the same
    `{:db :schema :name :alias :aliases}` map shape as
    `materialize-derived-select!` so callers can swap them.
@@ -1663,12 +1665,41 @@
    the name the user wrote. They differ for CTEs, where the namespace is
    synthetic so a CTE cannot collide with a real table of the same name
    — see `datahike.pg.sql/cte-namespace`."
-  ([inner target-name db schema] (materialize-set-op! inner target-name db schema nil))
+  ([inner target-name db schema]
+   (materialize-set-op! inner target-name db schema nil nil))
   ([inner target-name db schema alias]
+   (materialize-set-op! inner target-name db schema alias nil))
+  ([inner target-name db schema alias explicit-aliases]
    (let [with-fn d/db-with
          is-union? (instance? net.sf.jsqlparser.statement.select.SetOperationList inner)
+         values? (instance? Values inner)
          branch-parsed
-         (if is-union?
+         (cond
+           values?
+           (let [^Values values inner
+                 raw-exprs (.getExpressions values)
+                 row-exprs (if (and (seq raw-exprs)
+                                    (instance? ParenthesedExpressionList (first raw-exprs)))
+                             (mapv #(vec (iterator-seq (.iterator ^ParenthesedExpressionList %)))
+                                   raw-exprs)
+                             [(vec raw-exprs)])
+                 rows (mapv #(mapv eval-values-literal %) row-exprs)
+                 width (count (first rows))
+                 aliases (if (= width (count explicit-aliases))
+                           (vec explicit-aliases)
+                           (mapv #(str "column" (inc %)) (range width)))]
+             (when (some #{:unhandled} (mapcat identity rows))
+               (throw (ex-info "VALUES CTE contains an unsupported expression"
+                               {:error :unsupported-feature :sqlstate "0A000"})))
+             {:op nil
+              :branches [{:literal-rows rows
+                          :find-aliases aliases
+                          :select-item-oids (mapv (fn [e]
+                                                    (try (oid/expr-oid e {:schema schema :db db})
+                                                         (catch Throwable _ nil)))
+                                                  (first row-exprs))}]})
+
+           is-union?
            (let [^net.sf.jsqlparser.statement.select.SetOperationList sol inner
                  branches (.getSelects sol)
                  ops (.getOperations sol)
@@ -1688,6 +1719,8 @@
                                   (translate-select ^PlainSelect s schema db)))
                               branches)]
              {:op op-kind :branches parsed})
+
+           :else
            {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
          sub-parsed (first (:branches branch-parsed))
          sub-aliases (:find-aliases sub-parsed)
@@ -1699,9 +1732,11 @@
          sub-oids (:select-item-oids sub-parsed)
          q-fn d/q
          run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
-                      (let [q (cond-> query
-                                (:limit p)  (assoc :limit (:limit p))
-                                (:offset p) (assoc :offset (:offset p)))
+                      (if-let [literal-rows (:literal-rows p)]
+                        literal-rows
+                        (let [q (cond-> query
+                                  (:limit p)  (assoc :limit (:limit p))
+                                  (:offset p) (assoc :offset (:offset p)))
                            ;; If translate-select materialized derived
                            ;; tables (FROM (…) AS sub) or catalog refs
                            ;; under it, the resulting query references
@@ -1709,18 +1744,18 @@
                            ;; in :enriched-db. Run against that, falling
                            ;; back to the outer db when the branch was
                            ;; a plain table reference.
-                            exec-db (or (:enriched-db p) db)
-                            raw (if (seq in-args)
-                                  (apply q-fn q exec-db in-args)
-                                  (q-fn q exec-db))
-                            raw (cond->> raw
-                                  sql-offset (drop sql-offset)
-                                  sql-limit  (take sql-limit))
-                            hc (or hidden-count 0)
-                            visible (- (count (:find query)) hc)]
-                        (if (pos? hc)
-                          (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
-                          raw)))
+                              exec-db (or (:enriched-db p) db)
+                              raw (if (seq in-args)
+                                    (apply q-fn q exec-db in-args)
+                                    (q-fn q exec-db))
+                              raw (cond->> raw
+                                    sql-offset (drop sql-offset)
+                                    sql-limit  (take sql-limit))
+                              hc (or hidden-count 0)
+                              visible (- (count (:find query)) hc)]
+                          (if (pos? hc)
+                            (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                            raw))))
          branch-rows (mapv run-branch (:branches branch-parsed))
          sub-results (case (:op branch-parsed)
                        :union-all (mapcat identity branch-rows)
@@ -1830,7 +1865,7 @@
                             (boolean? v)                              :boolean
                             (instance? java.util.Date v)              :datetime
                             (instance? java.util.UUID v)              :uuid
-                            (number? v)                               :numeric
+                            (or (number? v) (types/numeric-special? v)) :numeric
                             (or (string? v) (keyword? v) (symbol? v)) :string
                             :else                                     :unknown))
          col-vtype (fn [col-idx]
@@ -1892,13 +1927,14 @@
                                              (instance? java.math.BigInteger v) (.longValueExact ^java.math.BigInteger v)
                                              :else (long v)))
                         :db.type/double  (fn [v] (if (instance? Double v) v (double v)))
+                        ;; VALUES/UNION common-type resolution can promote
+                        ;; unknown text rows to NUMERIC based on a typed first
+                        ;; row. Use numeric's typinput rather than BigDecimal's
+                        ;; constructor so NaN/+/-Infinity follow the same
+                        ;; storage encoding as ordinary table writes.
                         :db.type/bigdec  (fn [v]
-                                           (cond
-                                             (instance? java.math.BigDecimal v) v
-                                             (instance? java.math.BigInteger v) (java.math.BigDecimal. ^java.math.BigInteger v)
-                                             (integer? v) (java.math.BigDecimal/valueOf (long v))
-                                             (float? v)   (java.math.BigDecimal/valueOf (double v))
-                                             :else        (java.math.BigDecimal. (str v))))
+                                           (-> (coerce/coerce-numeric v :bigdec)
+                                               types/numeric-value->storage))
                         :db.type/string  str
                         identity))
         ;; Always emit a row-existence marker so `t.*` expansion in
@@ -2465,6 +2501,38 @@
          joins)
         table-aliases (merge table-aliases join-aliases)
 
+        ;; PostgreSQL permits a relation alias to rename its output columns:
+        ;; `FROM v AS v1(x1)`. This matters especially for self-joining a CTE,
+        ;; where each occurrence exposes a different name for the same stored
+        ;; `:v/x` attribute. Keep the override keyed by the relation ALIAS,
+        ;; not its storage namespace, so v1(x1), v2(x2) remain independent.
+        table-column-overrides
+        (reduce
+         (fn [out ^Table table]
+           (let [{tname :name talias :alias} (ctx/extract-table-info table)
+                 alias-obj (.getAlias table)
+                 exposed (when alias-obj
+                           (some->> (.getAliasColumns ^Alias alias-obj)
+                                    (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                            (unquote-ident (.-name c))))))
+                 alias-key (or talias tname)
+                 real-name (get table-aliases alias-key tname)
+                 ;; db_id is pg-datahike's synthetic entity projection,
+                 ;; not a declared relation column and therefore does not
+                 ;; consume a name in PostgreSQL's alias column list.
+                 attrs (into [] (comp (remove #(= :db/id (:attr %)))
+                                      (map :attr))
+                             (pgs/column-info schema real-name db))]
+             (if (seq exposed)
+               (assoc out alias-key (into {} (map vector exposed attrs)))
+               out)))
+         {}
+         (cond-> (into [] (keep (fn [^Join j]
+                                  (let [rt (.getRightItem j)]
+                                    (when (instance? Table rt) rt)))
+                                (or joins [])))
+           (instance? Table from-item) (conj from-item)))
+
         ;; Aliases of derived tables in JOIN positions. translate-join
         ;; consults this to skip the ref/db_id unification path, which
         ;; assumes the right-side alias names a real entity in the live
@@ -2506,6 +2574,7 @@
                            :computed-aliases (into #{} (map :alias)
                                                    (cond-> (vec lsrf-specs)
                                                      lsrf-spec (conj lsrf-spec)))
+                           :column-overrides table-column-overrides
                            :ref-targets (pgs/validate-ref-targets!
                                          db schema
                                          (pgs/derive-ref-targets schema hints))})
@@ -3058,7 +3127,7 @@
                     ;; sees them as independent — driving cartesian
                     ;; products at best, zero rows when the duplicate
                     ;; clause confuses constraint propagation.
-                    (let [v (ctx/col-var! ctx [:aliased raw-name (:attr col)])]
+                    (let [v (expr/column-value! ctx [:aliased raw-name (:attr col)])]
                       (swap! find-elements conj v)
                       (swap! find-aliases conj (:name col)))))
 
@@ -3081,9 +3150,9 @@
                     ;; Route through the [:aliased …] form so the column
                     ;; binds against the alias's entity var, matching the
                     ;; `t.*` expansion.
-                    (let [v (ctx/col-var! ctx (if (= real ali)
-                                                (:attr col)
-                                                [:aliased ali (:attr col)]))]
+                    (let [v (expr/column-value! ctx (if (= real ali)
+                                                      (:attr col)
+                                                      [:aliased ali (:attr col)]))]
                       (swap! find-elements conj v)
                       (swap! find-aliases conj (or alias-str (:name col))))))
 
@@ -4978,6 +5047,13 @@
             (if (and target-pk-attr val-matches-pk?)
               [target-pk-attr val]
               val))
+        ;; INSERT/UPSERT construction can pass an already-coerced row back
+        ;; through this function. Keep numeric-special storage encoding
+        ;; idempotent; applying NUMERIC(p,s) to the out-of-domain sentinel
+        ;; would correctly diagnose it as an enormous finite value instead.
+          (and (= vtype :db.type/bigdec)
+               (types/numeric-special-storage? val))
+          val
         ;; BigInteger / BigInt lands here when a SQL literal overflows
         ;; Long; routed through `coerce/coerce-numeric` so :db.type/long
         ;; raises 22003 instead of silently wrapping via .longValue,
@@ -4992,6 +5068,11 @@
                              (coerce/coerce-numeric val :bigdec) num-prec num-scale)
             :db.type/long   (coerce/coerce-numeric val :long)
             val)
+        ;; BigDecimal cannot carry PostgreSQL NUMERIC's NaN/+/-Infinity.
+        ;; Store their reserved out-of-domain BigDecimal representatives so
+        ;; the attribute remains a normal, ordered :db.type/bigdec index.
+          (and (= vtype :db.type/bigdec) (types/numeric-special? val))
+          (types/numeric-value->storage val)
         ;; Numeric coercion across `:db.type/{long,double,float,bigdec}`
         ;; — handles both the string→number and number→number paths.
         ;; `coerce-numeric` raises 22003/22P02 with the right SQLSTATE.
@@ -5081,7 +5162,9 @@
         ;; Numeric/decimal: bigdec via coerce-numeric — raises 22P02 on
         ;; bad-syntax strings instead of silently keeping the original.
           (and (= vtype :db.type/bigdec) (or (string? val) (number? val)))
-          (apply-numeric-typmod (coerce/coerce-numeric val :bigdec) num-prec num-scale)
+          (types/numeric-value->storage
+           (apply-numeric-typmod (coerce/coerce-numeric val :bigdec)
+                                 num-prec num-scale))
           (and (= vtype :db.type/instant) (string? val))
           (expr/parse-timestamp-string val)
           (and (= vtype :db.type/instant) (instance? java.util.Date val)) val
@@ -5282,6 +5365,9 @@
          (catch Exception _ x))
     x))
 
+(defn- sql-numeric? [x]
+  (or (number? x) (types/numeric-special? x)))
+
 (defn- temporal-value?
   "A stored date/timestamp. Dates come back as java.util.Date from the
    :db.type/instant attribute; the java.time types appear via casts."
@@ -5446,7 +5532,11 @@
         (get entity-map (keyword "excluded" col-name))
 
         :else
-        (let [v (get entity-map (keyword ns-str col-name))
+        (let [attr (keyword ns-str col-name)
+              v (get entity-map attr)
+              v (if (= :db.type/bigdec (get-in schema [attr :db/valueType]))
+                  (types/numeric-storage->value v)
+                  v)
               ;; `a[1]` parses as a COLUMN with an array constructor
               ;; attached, not as an ArrayExpression -- so the plain column
               ;; lookup returned the WHOLE array and the subscript was
@@ -5479,7 +5569,7 @@
         ;; advancing it.
         (and (temporal-value? l0) (number? r)) (shift-days l0 (long r))
         (and (number? l) (temporal-value? r0)) (shift-days r0 (long l))
-        (and (number? l) (number? r)) (+ l r)))
+        (and (sql-numeric? l) (sql-numeric? r)) (fns/sql-+ l r)))
 
     ;; Negative literal operand: `SET x = x + -123` parses the RHS as a
     ;; SignedExpression; without this branch it fell to `(str value-expr)`
@@ -5512,15 +5602,15 @@
           (jb/serialize-jsonb result))
         ;; Numeric subtraction (num-operand: unknown-type wire params
         ;; arrive as strings — cast in numeric context like PG)
-        (and (number? (num-operand l)) (number? (num-operand r)))
-        (- (num-operand l) (num-operand r))
+        (and (sql-numeric? (num-operand l)) (sql-numeric? (num-operand r)))
+        (fns/sql-- (num-operand l) (num-operand r))
         :else nil))
 
     (instance? Multiplication value-expr)
     (let [^Multiplication e value-expr
           l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
           r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
-      (when (and (number? l) (number? r)) (* l r)))
+      (when (and (sql-numeric? l) (sql-numeric? r)) (fns/sql-* l r)))
 
     (instance? Division value-expr)
     (let [^Division e value-expr
@@ -5532,7 +5622,7 @@
       ;; the column, where PostgreSQL raises 22012 and leaves the row
       ;; alone. sql-div also brings integer division, so `SET i = 7/2`
       ;; stores 3 rather than the Ratio 7/2.
-      (when (and (number? l) (number? r)) (fns/sql-div l r)))
+      (when (and (sql-numeric? l) (sql-numeric? r)) (fns/sql-div l r)))
 
     ;; String/jsonb concatenation: col || '...'::jsonb merges jsonb; string concat otherwise
     (instance? Concat value-expr)
@@ -6000,6 +6090,11 @@
   (let [schema (enrich-schema-with-pg-array-meta schema db)
         table (.getTable insert)
         raw-table (unquote-ident (.getName ^Table table))
+        _ (when-not (relation-known? schema raw-table)
+            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table raw-table})))
         columns (.getColumns insert)
         raw-cols (if (seq columns)
                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
@@ -6715,6 +6810,8 @@
          (catch NumberFormatException _
            (java.math.BigInteger. ^String (.getStringValue ^LongValue expr))))
     (instance? DoubleValue expr)  (types/decimal-literal expr (.getValue ^DoubleValue expr))
+    (pg-bits/bit-string-literal? expr)
+    (pg-bits/to-pg-text (pg-bits/bit-string-literal-value expr))
     (instance? StringValue expr)  (.getNotExcapedValue ^StringValue expr)
     (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
     (instance? NullValue expr)    nil

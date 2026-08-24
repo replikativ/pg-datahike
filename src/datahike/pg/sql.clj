@@ -58,7 +58,7 @@
            [net.sf.jsqlparser.statement.delete Delete]
            [net.sf.jsqlparser.statement.drop Drop]
            [net.sf.jsqlparser.statement.alter Alter AlterExpression]
-           [net.sf.jsqlparser.statement SavepointStatement RollbackStatement Commit]
+           [net.sf.jsqlparser.statement ExplainStatement SavepointStatement RollbackStatement Commit]
            [net.sf.jsqlparser.statement.create.index CreateIndex]))
 
 (set! *warn-on-reflection* true)
@@ -492,6 +492,24 @@
   [^String sql]
   (rw/rewrite sql rw/default-rules))
 
+(defn- explain-prefix
+  "Extract PostgreSQL EXPLAIN options that JSqlParser 5.2 cannot parse.
+   Returns the inner statement plus a parser-compatible EXPLAIN spelling."
+  [^String sql]
+  (or
+   (when-let [[_ opts inner]
+              (re-matches #"(?is)^\s*EXPLAIN\s*\(([^)]*)\)\s*(.+?)\s*;?\s*$" sql)]
+     (let [analyze-token (second (re-find #"(?i)(?:^|,)\s*ANALY[ZS]E(?:\s+(\w+))?"
+                                          opts))]
+       {:inner inner
+        :parser-sql (str "EXPLAIN " inner)
+        :analyze? (and (some? (re-find #"(?i)(?:^|,)\s*ANALY[ZS]E\b" opts))
+                       (not (contains? #{"false" "off" "0"}
+                                       (some-> analyze-token str/lower-case))))}))
+   (when-let [[_ analyze inner]
+              (re-matches #"(?is)^\s*EXPLAIN\s+(?:(ANALY[ZS]E)\s+)?(.+?)\s*;?\s*$" sql)]
+     {:inner inner :parser-sql sql :analyze? (some? analyze)})))
+
 (defn- stmt-with-items
   "Statement-agnostic WITH-list accessor. JSqlParser exposes
    `.getWithItemsList` separately on PlainSelect / SetOperationList /
@@ -638,13 +656,19 @@
              ;; after the whole list had been folded, so a CTE body could
              ;; not see the CTE before it and the query died with
              ;; `relation "a" does not exist`.
-             (if-let [m (binding [ctx/*relation-namespaces*
-                                  (merge ctx/*relation-namespaces* ns-map)
-                                  stmt/*cte-namespaces*
-                                  (merge stmt/*cte-namespaces* ns-map)]
-                          (stmt/materialize-set-op! inner cte-ns curr-db curr-schema cte-name))]
-               [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
-               [curr-db curr-schema deferred ns-map])
+             (let [;; JSqlParser stores `WITH t(a,b) AS ...`'s column
+                   ;; names on WithItem.getWithItemList, not on the Alias
+                   ;; object (whose alias-column list is empty here).
+                   alias-cols (some->> (.getWithItemList wi)
+                                       (mapv #(params/unquote-ident (str %))))]
+               (if-let [m (binding [ctx/*relation-namespaces*
+                                    (merge ctx/*relation-namespaces* ns-map)
+                                    stmt/*cte-namespaces*
+                                    (merge stmt/*cte-namespaces* ns-map)]
+                            (stmt/materialize-set-op! inner cte-ns curr-db curr-schema
+                                                      cte-name alias-cols))]
+                 [(:db m) (:schema m) deferred (assoc ns-map cte-name cte-ns)]
+                 [curr-db curr-schema deferred ns-map]))
 
              ;; A data-modifying WITH body (INSERT/UPDATE/DELETE/MERGE,
              ;; with or without RETURNING). PostgreSQL runs these and
@@ -718,6 +742,7 @@
     ;; Classify once; pass the result into the system-query check so we
     ;; don't re-tokenize the same SQL twice per statement.
       (let [cls-info (cls/classify sql)
+            explain (explain-prefix sql)
             sys-type (catalog/system-query?* sql cls-info)]
         (cond
           sys-type
@@ -852,6 +877,11 @@
 
               base))
 
+          (and explain (:analyze? explain))
+          {:type :error
+           :message "EXPLAIN ANALYZE is not supported by datahike pgwire"
+           :sqlstate "0A000"}
+
         ;; Reject authorization/RLS/extension/COPY DDL with a clean PG
         ;; error code (0A000 feature_not_supported). The classifier tags
         ;; these with :reject-kind + :tag; handler optionally swallows
@@ -867,7 +897,7 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [stmt (ast-parse (preprocess-sql sql))
+          (let [stmt (ast-parse (preprocess-sql (or (:parser-sql explain) sql)))
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a
@@ -1631,6 +1661,31 @@
                        ;; :enriched-db — each sub-query runs against it.
                         (not (identical? db orig-db))
                         (assoc :enriched-db db)))
+
+          ;; EXPLAIN (non-ANALYZE): expose the actual lowered Datahike query.
+                    (instance? ExplainStatement stmt)
+                    (let [inner-sql (:inner explain)
+                          inner (when inner-sql (parse-sql inner-sql schema db))]
+                      (cond
+                        (nil? inner-sql)
+                        {:type :error :message "invalid EXPLAIN statement" :sqlstate "42601"}
+                        (= :error (:type inner)) inner
+                        (not= :select (:type inner))
+                        {:type :error
+                         :message "EXPLAIN currently supports SELECT statements only"
+                         :sqlstate "0A000"}
+                        :else
+                        {:type :select
+                         :query {:find [] :where []}
+                         :find-aliases ["QUERY PLAN"]
+                         :select-item-oids [types/oid-text]
+                         :has-aggregates? false
+                         :has-distinct? false
+                         :in-args []
+                         :hidden-count 0
+                         ;; This is deliberately a truthful engine plan,
+                         ;; not a fabricated PostgreSQL Seq Scan tree.
+                         :literal-row [(str "Datahike Query " (pr-str (:query inner)))]}))
 
           ;; INSERT
                     (instance? Insert stmt)

@@ -80,6 +80,30 @@ shopt -s nullglob
 result_files=("${output_dir}"/results/*.out)
 if (( ${#result_files[@]} > 0 )); then
   echo
+  echo "Per-test target error summary:"
+  printf '%-24s %8s %8s %8s %8s %8s\n' \
+    "test" "expected" "target" "delta" "aborted" "internal"
+  for result_file in "${result_files[@]}"; do
+    test_name="$(basename "${result_file}" .out)"
+    expected_file="${input_dir}/expected/${test_name}.out"
+    expected_error_count=0
+    if [[ -f "${expected_file}" ]]; then
+      expected_error_count="$(rg -c '^ERROR:  ' "${expected_file}" || true)"
+    fi
+    error_count="$(rg -c '^ERROR:  ' "${result_file}" || true)"
+    aborted_count="$(rg -c '^ERROR:  current transaction is aborted' "${result_file}" || true)"
+    internal_count="$(rg -c \
+      'class .* cannot be cast|ClassCastException|NullPointerException|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
+      "${result_file}" || true)"
+    expected_error_count="${expected_error_count:-0}"
+    error_count="${error_count:-0}"
+    printf '%-24s %8s %8s %+8d %8s %8s\n' \
+      "${test_name}" "${expected_error_count}" "${error_count}" \
+      "$((error_count - expected_error_count))" \
+      "${aborted_count:-0}" "${internal_count:-0}"
+  done
+
+  echo
   echo "Most frequent target errors:"
   rg --no-filename '^ERROR:  .+' "${result_files[@]}" \
     | sort | uniq -c | sort -nr | head -20 || true

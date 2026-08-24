@@ -38,9 +38,47 @@ alongside unsupported features and genuine wrong answers. The runner therefore
 also prints:
 
 - total diff lines as a coarse trend;
+- per-test expected/target error counts and their coarse delta, plus
+  transaction-cascade and internal-failure counts;
 - the most frequent target-side errors;
 - internal-looking signatures such as class casts, unknown Datalog variables,
   and lost connections.
+
+An `aborted` count is not a count of independent defects. One unexpected error
+inside an explicit transaction can turn every following statement into
+`current transaction is aborted`; fix or classify the first unexpected error
+before using the remainder of that test as coverage data.
+
+The error delta is also only a triage signal: matching counts do not prove that
+the same statements failed, and one missing expected error can cancel one extra
+target error. Use the unified diff to establish behavior before promoting a
+slice to a gate.
+
+## Compatibility campaign
+
+Work through upstream tests in dependency-preserving slices rather than passing
+the entire schedule at once:
+
+1. `test_setup` plus scalar types and `expressions` — literal typing, operator
+   resolution, casts, NULL/error semantics, and result OIDs.
+2. Core DDL/DML — `create_table`, `constraints`, `insert`, `update`, `delete`,
+   `copy`, and `transactions`.
+3. Relational queries — `select*`, `join`, `subselect`, `union`, aggregates,
+   grouping, arrays, windows, and CTEs.
+4. Application-facing types — date/time, UUID, enum/domain, JSON/JSONB, and
+   eventually full-text and vector extensions.
+5. Protocol/catalog surfaces — prepared statements, portals, psql, and the
+   catalog queries exercised by real drivers and ORMs.
+
+PostgreSQL's suite also tests PostgreSQL's own storage engines, planner nodes,
+server administration, procedural languages, replication, and extension APIs.
+Those are useful for discovering parser or catalog assumptions, but are not a
+release criterion for a Datahike-backed engine. Record them as deliberately
+out of scope instead of weakening errors or adding no-op implementations merely
+to reduce the diff. The release-facing target is: no internal failures, no
+silent wrong answers in the supported SQL surface, explicit SQLSTATE-bearing
+errors for unsupported features, and strict upstream slices for behavior we
+have admitted.
 
 Do not reduce the diff count by merely matching diagnostic wording. Promote
 high-value behavior into focused unit or SQLLogic tests, and treat silent wrong

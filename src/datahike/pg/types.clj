@@ -132,7 +132,7 @@
    :pg/type = this name so oid-infer round-trips the original OID rather than the
    storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
    binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
-  {18 "char", 26 "oid"})
+  {18 "char", 26 "oid", oid-bit "bit", oid-varbit "varbit"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -819,6 +819,8 @@
    oid-varchar     :db.type/string
    oid-bpchar      :db.type/string
    oid-name        :db.type/string
+   oid-bit         :db.type/string
+   oid-varbit      :db.type/string
    oid-date        :db.type/instant
    oid-time        :db.type/instant
    oid-timestamp   :db.type/instant
@@ -985,6 +987,54 @@
 (def nan-numeric (numeric-special :nan))
 (def inf-numeric (numeric-special :inf))
 (def -inf-numeric (numeric-special :-inf))
+
+;; Datahike's :db.type/bigdec quite deliberately accepts BigDecimal only,
+;; while PostgreSQL NUMERIC also has NaN and +/-Infinity. Keep those values
+;; in the ordinary AVET/EAVT numeric index by assigning them three BigDecimal
+;; representatives outside PostgreSQL's finite NUMERIC domain. PostgreSQL's
+;; on-disk numeric weight is bounded (a finite value cannot reach 10^200000),
+;; so this mapping is injective over values the SQL API is allowed to accept.
+;; The representatives preserve PostgreSQL's total order:
+;;
+;;     NaN > Infinity > every finite value > -Infinity
+;;
+;; They are an SQL storage detail, not a new Datahike value type. Decode them
+;; whenever a numeric datom crosses back into expression evaluation.
+(def ^:private numeric-special-storage-scale -200000)
+
+(def ^:private numeric-special->storage-map
+  {:nan  (java.math.BigDecimal. (java.math.BigInteger/valueOf 3)
+                                numeric-special-storage-scale)
+   :inf  (java.math.BigDecimal. (java.math.BigInteger/valueOf 2)
+                                numeric-special-storage-scale)
+   :-inf (java.math.BigDecimal. (java.math.BigInteger/valueOf -2)
+                                numeric-special-storage-scale)})
+
+(def ^:private numeric-storage->special-map
+  (into {} (map (fn [[kind value]] [value (numeric-special kind)]))
+        numeric-special->storage-map))
+
+(defn numeric-value->storage
+  "Encode a PgNumericSpecial for a :db.type/bigdec attribute. Finite
+   numeric values pass through unchanged."
+  [v]
+  (if (numeric-special? v)
+    (get numeric-special->storage-map (:kind v))
+    v))
+
+(defn numeric-special-storage?
+  "True when v is one of the three reserved at-rest NUMERIC values."
+  [v]
+  (and (instance? java.math.BigDecimal v)
+       (contains? numeric-storage->special-map v)))
+
+(defn numeric-storage->value
+  "Decode a reserved numeric BigDecimal to its SQL value. Ordinary values
+   (and the SQL NULL sentinel used inside translated queries) pass through."
+  [v]
+  (if (instance? java.math.BigDecimal v)
+    (get numeric-storage->special-map v v)
+    v))
 
 (defn numeric-special->double ^double [x]
   (case (:kind x)

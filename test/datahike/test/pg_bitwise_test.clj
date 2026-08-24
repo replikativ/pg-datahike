@@ -152,6 +152,13 @@
     (is (= "0110" (v "SELECT B'1100' << -1")))
     (is (= "1000" (v "SELECT B'1100' >> -1")))))
 
+(deftest persisted-bit-string-shifts
+  (.execute *handler* "CREATE TABLE bit_shift (id int PRIMARY KEY, b bit(4), v varbit(4))")
+  (.execute *handler* "INSERT INTO bit_shift VALUES (1, B'1100', B'0110')")
+  (is (= [["1000" "0011"]]
+         (mapv vec (.-rows ^PgWireServer$QueryResult
+                    (.execute *handler* "SELECT b << 1, v >> 1 FROM bit_shift"))))))
+
 (deftest bit-string-operands-must-be-the-same-width
   (testing "PG refuses rather than padding — the width is part of the value"
     (is (re-find #"cannot AND bit strings of different sizes"

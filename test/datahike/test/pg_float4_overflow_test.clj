@@ -79,6 +79,20 @@
       (is (= "1.100000023841858" (one c "SELECT 1.1::real::float8")))
       (is (= "f" (one c "SELECT 1.1::real = 1.1::float8"))))))
 
+(deftest arithmetic-coerces-unknown-string-literals
+  (with-open [c (jdbc)]
+    (seed! c)
+    (testing "a column resolves the quoted operand's unknown type"
+      (is (= "-11" (one c "SELECT r * '-10' FROM t")))
+      (is (= "-8.9" (one c "SELECT r + '-10' FROM t")))
+      (is (= "-0.11" (one c "SELECT r / '-10' FROM t")))
+      (is (= "11.1" (one c "SELECT r - '-10' FROM t"))))
+    (testing "resolution is symmetric"
+      (is (= "-11" (one c "SELECT '-10' * d FROM t"))))
+    (testing "the same resolution applies to PostgreSQL's power operator"
+      (is (= "double precision" (one c "SELECT pg_typeof(d ^ '2.0') FROM t")))
+      (is (= "1.2100000000000002" (one c "SELECT d ^ '2.0' FROM t"))))))
+
 (deftest float-overflow-and-underflow-raise
   (with-open [c (jdbc)]
     (testing "a result that came out infinite from finite inputs is 22003,
