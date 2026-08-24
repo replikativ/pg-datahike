@@ -141,6 +141,13 @@
    Nil during parsing and non-server use."
   nil)
 
+(def ^:dynamic *session-state*
+  "The current pgwire connection's session-state atom while SQL is being
+   translated. Session-valued expressions capture the atom (rather than a
+   snapshot) so a prepared statement observes later SET/RESET changes. Nil
+   for callers that use the SQL translator without a server session."
+  nil)
+
 (def ^:dynamic *parse-db*
   "Bound by parse-sql to the live db snapshot so downstream helpers
    (e.g. pg-type-of-attr) can consult Datahike for attribute metadata

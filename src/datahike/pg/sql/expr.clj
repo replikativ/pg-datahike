@@ -513,9 +513,8 @@
       ;; datahike.pg.sql.classify, but column-position use lands here.
       (= fname "current_database")
       (let [fn-param (symbol (str "?cur-db" (swap! (:var-counter ctx) inc)))
-            ;; Resolve the bound db-name from session-state if available;
-            ;; otherwise fall back to "datahike" (our default handler name).
-            impl-fn (fn [] "datahike")]
+            state params/*session-state*
+            impl-fn (fn [] (or (some-> state deref :db-name) "datahike"))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -523,7 +522,12 @@
 
       (= fname "current_schema")
       (let [fn-param (symbol (str "?cur-sch" (swap! (:var-counter ctx) inc)))
-            impl-fn (fn [] "public")]
+            state params/*session-state*
+            impl-fn (fn []
+                      (let [path (or (some-> state deref :search-path)
+                                     ["$user" "public"])]
+                        (or (first (filter #{"public" "pg_catalog"} path))
+                            :__null__)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
@@ -3147,6 +3151,31 @@
       (types/numeric-value->storage v)
       v)))
 
+(defn- session-value-expr!
+  "Lower a bare SQL session value to a zero-argument Datalog input fn.
+   Capture the session atom now so prepared statements observe later changes."
+  [ctx prefix value-fn]
+  (let [result-var (ctx/fresh-var! ctx)
+        fn-param (symbol (str "?" prefix (swap! (:var-counter ctx) inc)))
+        state params/*session-state*
+        impl-fn (fn [] (or (value-fn state) :__null__))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj impl-fn)
+    (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+    result-var))
+
+(defn- session-current-schema [state]
+  (let [path (or (some-> state deref :search-path) ["$user" "public"])]
+    (first (filter #{"public" "pg_catalog"} path))))
+
+(defn- bare-session-value-column? [expr]
+  (and (instance? Column expr)
+       (nil? (.getTable ^Column expr))
+       (contains? #{"current_schema" "current_catalog"
+                    "current_user" "session_user" "user" "system_user"
+                    "localtime" "localtimestamp"}
+                  (str/lower-case (.getColumnName ^Column expr)))))
+
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
    Returns a Datalog-compatible value or variable symbol."
@@ -3156,7 +3185,7 @@
     (and (instance? Column expr)
          (= "current_schema" (.getColumnName ^Column expr))
          (nil? (.getTable ^Column expr)))
-    "public"
+    (session-value-expr! ctx "cur-sch" session-current-schema)
 
     ;; CURRENT_CATALOG is the bare SQL-value spelling paired with
     ;; current_database(). Generic expressions need both operands; the
@@ -3164,7 +3193,9 @@
     (and (instance? Column expr)
          (= "current_catalog" (str/lower-case (.getColumnName ^Column expr)))
          (nil? (.getTable ^Column expr)))
-    "datahike"
+    (session-value-expr! ctx "cur-cat"
+                         (fn [state]
+                           (or (some-> state deref :db-name) "datahike")))
 
     ;; current_user / session_user / user / system_user as bare
     ;; identifiers (PG keywords; JSqlParser surfaces them as Column).
@@ -4961,7 +4992,8 @@
     (let [^IsNullExpression e expr
           not-null? (.isNot e)
           inner (.getLeftExpression e)]
-      (if (instance? Column inner)
+      (if (and (instance? Column inner)
+               (not (bare-session-value-column? inner)))
         (let [^Column col inner
               resolved (ctx/resolve-column col
                                            (:table-aliases ctx)

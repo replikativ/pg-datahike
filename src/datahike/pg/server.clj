@@ -1401,6 +1401,12 @@
       (show-setting "statement_timeout"
                     (str (or (:statement-timeout @session-state) 0)))
 
+      (= setting-name "search_path")
+      (show-setting "search_path"
+                    (if-let [path (:search-path @session-state)]
+                      (str/join ", " path)
+                      (get show-settings "search_path")))
+
       (contains? show-settings setting-name)
       (show-setting setting-name (get show-settings setting-name))
 
@@ -1420,12 +1426,37 @@
                [(into-array String ["PostgreSQL 15.0 (Datahike PgWire compatibility layer)"])])
    "SELECT 1"))
 
-(defn- handle-current-schema []
+(defn- effective-search-path [session-state]
+  (or (:search-path @session-state) ["$user" "public"]))
+
+(defn- normalize-search-path [values]
+  (->> values
+       (mapcat #(str/split (str %) #","))
+       (map str/trim)
+       (map #(if (and (>= (count %) 2)
+                      (str/starts-with? % "\"")
+                      (str/ends-with? % "\""))
+               (subs % 1 (dec (count %)))
+               %))
+       (remove str/blank?)
+       vec))
+
+(defn- set-search-path! [session-state values]
+  (if (and (= 1 (count values))
+           (= "default" (str/lower-case (str (first values)))))
+    (swap! session-state dissoc :search-path)
+    (swap! session-state assoc :search-path (normalize-search-path values))))
+
+(defn- current-schema-name [session-state]
+  (first (filter #{"public" "pg_catalog"}
+                 (effective-search-path session-state))))
+
+(defn- handle-current-schema [session-state]
   (PgWireServer$QueryResult.
    (into-array String ["current_schema"])
    (int-array [PgWireServer/OID_TEXT])
    (into-array (Class/forName "[Ljava.lang.String;")
-               [(into-array String ["public"])])
+               [(into-array String [(current-schema-name session-state)])])
    "SELECT 1"))
 
 (defn- handle-current-database
@@ -4126,7 +4157,7 @@
 (def ^:private session-guc-keys
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
-  [:as-of :since :history :branch :commit-id
+  [:as-of :since :history :branch :commit-id :search-path
    :valid-at :valid-from :valid-to :statement-timeout :isolation])
 
 (defn- handle-reset
@@ -4138,8 +4169,13 @@
    silently accepts RESET of any settable GUC, so the single-var case is
    a no-op. asyncpg's pool reset sends `RESET ALL` on every release."
   [{:keys [session-state]} parsed]
-  (when (= "all" (some-> (:var parsed) str/lower-case))
-    (swap! session-state #(apply dissoc % session-guc-keys)))
+  (let [setting (some-> (:var parsed) str/lower-case)]
+    (cond
+      (= "all" setting)
+      (swap! session-state #(apply dissoc % session-guc-keys))
+
+      (= "search_path" setting)
+      (swap! session-state dissoc :search-path)))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -4732,7 +4768,11 @@
   (let [{:keys [conn session-state schema tx-state
                 on-create-database on-delete-database registry-atom]} ctx]
     (case (:system-type parsed)
-      :set      (empty-result "SET")
+      :set
+      (do
+        (when (= "search_path" (some-> (:var parsed) str/lower-case))
+          (set-search-path! session-state (:values parsed)))
+        (empty-result "SET"))
       :prepare          (handle-prepare ctx parsed)
       :execute-prepared (handle-execute-prepared ctx parsed)
       :deallocate       (handle-deallocate ctx parsed)
@@ -4790,8 +4830,10 @@
       ;; Datahike), but PostgreSQL returns the NEW VALUE as text and
       ;; asyncpg reads it back, so returning empty-string was not
       ;; harmless: echo the value argument.
-      (single-row-result "set_config" PgWireServer/OID_TEXT
-                         (or (second (:args parsed)) ""))
+      (let [[setting value] (:args parsed)]
+        (when (= "search_path" (some-> setting str/lower-case))
+          (set-search-path! session-state [value]))
+        (single-row-result "set_config" PgWireServer/OID_TEXT (or value "")))
 
       :copy-from-stdin
       ;; SQL `COPY t [(cols)] FROM STDIN [WITH (...)];`. Returns a
@@ -4935,7 +4977,7 @@
       :show              (handle-show (:var parsed) schema session-state tx-state)
       :version           (handle-version)
       :pg-keywords       (handle-pg-keywords ctx parsed)
-      :current-schema    (handle-current-schema)
+      :current-schema    (handle-current-schema session-state)
       :current-database  (handle-current-database (:db-name @session-state))
       :now               (handle-now ctx parsed)
 
@@ -6778,7 +6820,8 @@
         ;; `*registered-databases*` bound here so any catalog probe on
         ;; `pg_database` that lands during parse materialization sees
         ;; this server's actual registry instead of the legacy fallback.
-        (binding [catalog/*registered-databases* registered-databases]
+        (binding [catalog/*registered-databases* registered-databases
+                  params/*session-state* session-state]
           (let [base-db (apply-temporal (d/db conn) session-state)
                 ;; In an open transaction, parse/validate against the
                 ;; speculative-db so a statement referencing a table
@@ -7129,6 +7172,7 @@
         ;; hits pg_database.
         (binding [catalog/*registered-databases* registered-databases
                   params/*statement-time* (java.util.Date.)
+                  params/*session-state* session-state
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
         ;; If aborted, reject everything except ROLLBACK / ROLLBACK TO /

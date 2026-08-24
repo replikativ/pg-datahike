@@ -1834,6 +1834,23 @@
          (rows (.execute *handler*
                          "SELECT current_catalog = current_database()")))))
 
+(deftest test-current-schema-follows-search-path
+  (let [prepared (.parse *handler*
+                         "SELECT coalesce(current_schema, 'missing')"
+                         (int-array 0))]
+    (is (= [["public"]] (rows (.execute *handler* "SELECT current_schema"))))
+    (is (nil? (err (.execute *handler* "SET search_path = notme"))))
+    (is (= [[nil]] (rows (.execute *handler* "SELECT current_schema"))))
+    (is (= [["t"]] (rows (.execute *handler* "SELECT current_schema IS NULL"))))
+    (is (= [["missing"]]
+           (rows (.executePrepared *handler* prepared (object-array [nil])))))
+    (is (nil? (err (.execute *handler* "SET search_path = notme, pg_catalog"))))
+    (is (= [["pg_catalog"]] (rows (.execute *handler* "SELECT current_schema"))))
+    (is (= [["notme, pg_catalog"]]
+           (rows (.execute *handler* "SHOW search_path"))))
+    (is (nil? (err (.execute *handler* "RESET search_path"))))
+    (is (= [["public"]] (rows (.execute *handler* "SELECT current_schema"))))))
+
 (deftest test-create-view-is-live-and-transactional
   (is (nil? (err (.execute *handler* "CREATE TABLE view_base (id int, n numeric)"))))
   (is (nil? (err (.execute *handler* "INSERT INTO view_base VALUES (1, 1.25)"))))

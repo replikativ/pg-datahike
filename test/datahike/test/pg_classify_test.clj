@@ -148,6 +148,7 @@
   (is (= :generic-sql      (kind "SELECT version()::text")))
   (is (= :generic-sql      (kind "SELECT current_catalog = current_database()")))
   (is (= :generic-sql      (kind "SELECT now() = current_timestamp")))
+  (is (= :generic-sql      (kind "SELECT current_schema IS NULL")))
   (is (= :current-schema   (kind "SELECT current_schema()")))
   (is (= :current-database (kind "SELECT current_database()")))
   (is (= :pg-backend-pid   (kind "SELECT pg_backend_pid()")))
@@ -225,7 +226,9 @@
     (is (= "UTC"      (:value (c/classify "SET TIME ZONE 'UTC'")))))
   (testing "SET LOCAL and SESSION modifiers"
     (is (= "search_path" (:var (c/classify "SET LOCAL search_path TO public"))))
-    (is (= "search_path" (:var (c/classify "SET SESSION search_path = public"))))))
+    (is (= "search_path" (:var (c/classify "SET SESSION search_path = public"))))
+    (is (= ["notme" "public"]
+           (:values (c/classify "SET search_path = notme, public"))))))
 
 (deftest classify-maintenance-noops
   (is (= :maintenance-noop (kind "VACUUM")))
