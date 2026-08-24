@@ -7053,12 +7053,7 @@
                   (let [all-aliases (into (vec aliases) (map :alias) ces)
                         all-oids (into (vec oids)
                                        (repeat (count ces) PgWireServer/OID_TEXT))
-                        vis (into [] (keep-indexed
-                                      (fn [i a]
-                                        (when-not (and (string? a)
-                                                       (.startsWith ^String a "__compound_"))
-                                          i))
-                                      all-aliases))]
+                        vis (stmt/compound-projection-indices all-aliases ces)]
                     [(mapv #(nth all-aliases %) vis)
                      (int-array (map #(int (nth all-oids %)) vis))])
                   [aliases oids])

@@ -1451,7 +1451,12 @@
          (and (numspecial? b) (= :nan (:kind b))))
      types/nan-numeric
      (and (number? b) (zero? b)) (throw-division-by-zero)
-     (or (numspecial? a) (numspecial? b)) (special-arith / a b)
+     (or (numspecial? a) (numspecial? b))
+     (let [q (special-arith / a b)]
+       ;; The only finite result in this branch is finite / infinity.
+       ;; numeric_div returns a scale-zero zero for it, not the 0.0 that
+       ;; BigDecimal/valueOf receives from the IEEE bridge.
+       (if (numspecial? q) q (.setScale ^java.math.BigDecimal q 0)))
      (and (integer? a) (integer? b)) (int-div a b)
      ;; numeric / numeric -- and numeric / integer, which PostgreSQL
      ;; also resolves as numeric. A float on either side outranks
@@ -1481,7 +1486,13 @@
         (and (numspecial? b) (= :nan (:kind b))))
     types/nan-numeric
     (and (number? b) (zero? b)) (throw-division-by-zero)
-    (or (numspecial? a) (numspecial? b)) (special-arith rem a b)
+    ;; numeric_mod does not use the host language's floating remainder.
+    ;; An infinite dividend has no finite remainder, while a finite value
+    ;; modulo infinity is the finite value unchanged. Clojure's `rem` on
+    ;; a Double infinity throws "Infinite or NaN", aborting PostgreSQL's
+    ;; complete special-value arithmetic matrix.
+    (numspecial? a) types/nan-numeric
+    (numspecial? b) (bigdec a)
     (and (or (decimal? a) (decimal? b)) (number? a) (number? b))
     (let [^java.math.BigDecimal x (bigdec a)
           ^java.math.BigDecimal y (bigdec b)]

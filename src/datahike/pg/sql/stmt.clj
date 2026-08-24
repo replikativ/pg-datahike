@@ -2283,6 +2283,39 @@
                    :else x))]
     [keep-clauses (inline form)]))
 
+(defn compound-projection-indices
+  "Indices that turn the physical compound-projection shape into its SQL
+   SELECT-list shape. Hidden aggregate inputs are removed and deferred
+   expressions are restored to the positions recorded while lowering."
+  [aliases compound-exprs]
+  (let [visible-indices (into []
+                              (keep-indexed
+                               (fn [i a]
+                                 (when-not (and (string? a)
+                                                (.startsWith ^String a "__compound_"))
+                                   i)))
+                              aliases)
+        positions (mapv :out-pos compound-exprs)
+        n-visible (count visible-indices)
+        reorder? (and (every? some? positions)
+                      (= (count positions) (count (distinct positions)))
+                      (every? #(< -1 % n-visible) positions))]
+    (if reorder?
+      (let [base-count (- n-visible (count compound-exprs))
+            compound-at (into {}
+                              (map-indexed (fn [i pos] [pos (+ base-count i)]))
+                              positions)
+            visible-order
+            (first
+             (reduce (fn [[order next-base] pos]
+                       (if-let [compound-idx (get compound-at pos)]
+                         [(conj order compound-idx) next-base]
+                         [(conj order next-base) (inc next-base)]))
+                     [[] 0]
+                     (range n-visible)))]
+        (mapv #(nth visible-indices %) visible-order))
+      visible-indices)))
+
 (defn apply-compound-projections
   "Evaluate deferred SELECT projection forms and remove their hidden inputs.
 
@@ -2311,13 +2344,7 @@
                             rv compound-exprs)))
                 results)
           new-aliases (into (vec aliases) (map :alias compound-exprs))
-          visible-indices (into []
-                                (keep-indexed
-                                 (fn [i a]
-                                   (when-not (and (string? a)
-                                                  (.startsWith ^String a "__compound_"))
-                                     i)))
-                                new-aliases)]
+          visible-indices (compound-projection-indices new-aliases compound-exprs)]
       [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
        (mapv #(nth new-aliases %) visible-indices)])
     [results aliases]))
@@ -3604,6 +3631,10 @@
                 ;; (`coalesce(sum(n),0)` answered `{":fn": "sum", …}`).
                 (let [sink (atom [])
                       before (count @(:where-clauses ctx))
+                      out-pos (+ (count (remove #(and (string? %)
+                                                      (.startsWith ^String % "__compound_"))
+                                                @find-aliases))
+                                 (count @compound-exprs))
                       v (expr/translate-expr (assoc ctx :hoisted-aggs sink) expr)
                       hoisted @sink]
                   (if (seq hoisted)
@@ -3628,6 +3659,7 @@
                              ;; `$1` the plan-cache rewrite left behind
                              ;; (`sum(v)/$1`).
                              {:alias (or alias-str (figure-colname expr))
+                              :out-pos out-pos
                               :form  form
                               :slots slots}))
                     ;; Regular non-aggregate expression
@@ -3658,6 +3690,7 @@
                                    (str "__compound_guard_" (count @find-aliases))))
                           (swap! compound-exprs conj
                                  {:alias (or alias-str (figure-colname expr))
+                                  :out-pos out-pos
                                   :form form
                                   :slots []}))
                         (let [v (cond

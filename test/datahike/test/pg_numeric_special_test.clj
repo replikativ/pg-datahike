@@ -72,7 +72,7 @@
     (testing "quoted unknown operands resolve from a cast expression's OID"
       (is (= "NaN" (one c "SELECT 'NaN'::numeric / '0'")))
       (is (= "NaN" (one c "SELECT 'NaN'::numeric % '0'")))
-      (is (zero? (bigdec (one c "SELECT '1'::numeric / 'Infinity'"))))
+      (is (= "0" (one c "SELECT '1'::numeric / 'Infinity'")))
       (let [e (is (thrown? SQLException
                            (one c "SELECT 'Infinity'::numeric / '0'")))]
         (is (= "22012" (.getSQLState ^SQLException e)))))
@@ -80,6 +80,26 @@
               `map?` to spot an aggregate marker -- so these came back as
               the printed form of a compound-aggregate descriptor"
       (is (not (re-find #"compound-agg" (str (one c "SELECT 'NaN'::numeric + 1"))))))))
+
+(deftest special-division-and-modulo-matrix
+  (with-open [c (jdbc)]
+    (is (= "NaN" (one c "SELECT 'Infinity'::numeric % 1")))
+    (is (= "NaN" (one c "SELECT '-Infinity'::numeric % 4.2")))
+    (is (= "4.2" (one c "SELECT 4.2 % 'Infinity'::numeric")))
+    (is (= "-1" (one c "SELECT -1 % '-Infinity'::numeric")))
+    (with-open [st (.createStatement c)
+                rs (.executeQuery
+                    st
+                    (str "WITH v(x) AS (VALUES('0'::numeric),('1'),('-1'),"
+                         "('4.2'),('inf'),('-inf'),('nan')) "
+                         "SELECT x1, x2, x1 / x2, x1 % x2, div(x1, x2) "
+                         "FROM v AS v1(x1), v AS v2(x2) WHERE x2 != 0"))]
+      (let [md (.getMetaData rs)]
+        (is (= ["x1" "x2" "?column?" "?column?" "div"]
+               (mapv #(.getColumnLabel md %) (range 1 6))))
+        (is (= 5 (.getColumnCount md))))
+      (is (= 42 (loop [n 0]
+                  (if (.next rs) (recur (inc n)) n)))))))
 
 (deftest ordering-is-postgres-total-order
   (with-open [c (jdbc)]
