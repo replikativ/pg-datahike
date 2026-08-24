@@ -256,6 +256,22 @@
                  "b3 bit varying(5) DEFAULT '1001', "
                  "b4 bit varying(5) DEFAULT B'0101')"))
   (.execute *handler* "INSERT INTO bit_defaults DEFAULT VALUES")
+  (is (= [["b1" "'1001'::\"bit\""]
+          ["b2" "'0101'::\"bit\""]
+          ["b3" "'1001'::bit varying"]
+          ["b4" "'0101'::\"bit\""]]
+         (mapv vec
+               (.-rows
+                ^PgWireServer$QueryResult
+                (.execute *handler*
+                          (str "SELECT a.attname,"
+                               " (SELECT pg_get_expr(d.adbin, d.adrelid, true)"
+                               " FROM pg_attrdef d WHERE d.adrelid = a.attrelid"
+                               " AND d.adnum = a.attnum AND a.atthasdef)"
+                               " FROM pg_attribute a"
+                               " WHERE a.attrelid = (SELECT oid FROM pg_class"
+                               " WHERE relname = 'bit_defaults')"
+                               " ORDER BY a.attnum"))))))
   (let [^PgWireServer$QueryResult result (.execute *handler* "TABLE bit_defaults")]
     (is (= [["1001" "0101" "1001" "0101"]]
            (mapv vec (.-rows result))))

@@ -43,8 +43,8 @@
        :source-lines [218 221]
        :gate "test/datahike/test/pg_bitwise_test.clj"
        :test-var "postgres-bit-overlay-slice"}
-      {:id :defaults-read
-       :source-lines [239 240]
+      {:id :defaults-catalog-read
+       :source-lines [232 240]
        :gate "test/datahike/test/pg_bitwise_test.clj"
        :test-var "bit-defaults-and-table-shorthand"}]}
     {:name "numeric" :mode :discovery

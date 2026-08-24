@@ -144,6 +144,7 @@
 
      {:kind :literal  :value <long|double|string|boolean|nil>}
      {:kind :bit      :value <canonical bit input string>}
+     {:kind :bit-coerced :value <quoted input coerced to a bit column>}
      {:kind :fn       :value <canonical fn name string>}
      {:kind :nextval  :value <sequence name string>}
      {:kind :unsupported :raw <original SQL text>}
@@ -639,7 +640,7 @@
                                               (if (and bit-type?
                                                        (= :literal (:kind spec))
                                                        (string? (:value spec)))
-                                                (assoc spec :kind :bit)
+                                                (assoc spec :kind :bit-coerced)
                                                 spec))
                                _ (when (= :unsupported (:kind default-spec))
                                    (throw (ex-info "DEFAULT expression not supported"

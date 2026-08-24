@@ -419,6 +419,62 @@
       (is (every? (fn [row] (= "0 bytes" (nth row 2)))
                   (:rows r))))))
 
+(deftest test-pg-policy-is-an-empty-real-catalog
+  (testing "psql \\d probes row-level policies even when RLS is disabled"
+    (let [r (ex (str "SELECT pol.polname, pol.polpermissive, pol.polroles,"
+                     " pol.polqual, pol.polwithcheck, pol.polcmd"
+                     " FROM pg_catalog.pg_policy pol"
+                     " WHERE pol.polrelid = 0 ORDER BY 1"))]
+      (is (nil? (:err r)) (str "got: " (:err r)))
+      (is (empty? (:rows r))))))
+
+(deftest test-pg-statistic-ext-is-an-empty-real-catalog
+  (testing "psql \\d probes extended statistics for every relation"
+    (let [r (ex (str "SELECT oid, stxrelid, stxnamespace, stxname,"
+                     " 'd' = any(stxkind), stxstattarget"
+                     " FROM pg_catalog.pg_statistic_ext"
+                     " WHERE stxrelid = 0 ORDER BY stxnamespace, stxname"))]
+      (is (nil? (:err r)) (str "got: " (:err r)))
+      (is (empty? (:rows r))))))
+
+(deftest test-publication-catalogs-are-empty-real-catalogs
+  (testing "psql \\d checks logical-replication membership unconditionally"
+    (doseq [sql ["SELECT oid, pubname, puballtables FROM pg_publication"
+                 "SELECT oid, pnpubid, pnnspid FROM pg_publication_namespace"
+                 "SELECT oid, prpubid, prrelid, prqual, prattrs FROM pg_publication_rel"]]
+      (let [r (ex sql)]
+        (is (nil? (:err r)) (str sql " got: " (:err r)))
+        (is (empty? (:rows r)) sql)))))
+
+(deftest test-pg-attrdef-reflects-persisted-defaults
+  (.execute *h* (str "CREATE TABLE catalog_defaults ("
+                     "fixed bit(4) DEFAULT B'0101', "
+                     "varying varbit(5) DEFAULT '1001')"))
+  (let [r (ex (str "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid, true)"
+                   " FROM pg_attribute a JOIN pg_attrdef d"
+                   " ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
+                   " WHERE a.attrelid = (SELECT oid FROM pg_class"
+                   " WHERE relname = 'catalog_defaults')"
+                   " ORDER BY a.attnum"))]
+    (is (nil? (:err r)) (str "got: " (:err r)))
+    (is (= [["fixed" "'0101'::\"bit\""]
+            ["varying" "'1001'::bit varying"]]
+           (:rows r))))
+  (testing "the correlated scalar shape used by psql \\d"
+    (let [r (ex (str "SELECT a.attname,"
+                     " (SELECT pg_get_expr(d.adbin, d.adrelid, true)"
+                     " FROM pg_attrdef d"
+                     " WHERE d.adrelid = a.attrelid"
+                     " AND d.adnum = a.attnum AND a.atthasdef)"
+                     " FROM pg_attribute a"
+                     " WHERE a.attrelid = (SELECT oid FROM pg_class"
+                     " WHERE relname = 'catalog_defaults')"
+                     " ORDER BY a.attnum"))]
+      (is (nil? (:err r)) (str "got: " (:err r)))
+      (is (= [["fixed" "'0101'::\"bit\""]
+              ["varying" "'1001'::bit varying"]]
+             (:rows r))))))
+
 ;; ============================================================================
 ;; OPERATOR(qual.op) and COLLATE qual.X stripping — psql `\d <table>`.
 ;;

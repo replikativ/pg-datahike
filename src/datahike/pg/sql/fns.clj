@@ -2377,7 +2377,8 @@
 
 (defn pg-get-expr
   "Return the expression text as-is (CockroachDB's approach)."
-  [expr-text _relation-oid] (str expr-text))
+  ([expr-text _relation-oid] (str expr-text))
+  ([expr-text _relation-oid _pretty?] (str expr-text)))
 
 ;; ---------------------------------------------------------------------------
 ;; Lookup tables used by translate-*.

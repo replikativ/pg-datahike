@@ -5861,13 +5861,25 @@
 
     ;; Bare column as boolean predicate: WHERE col_name means WHERE col_name = TRUE
     (instance? Column expr)
-    (let [resolved (ctx/resolve-column ^Column expr
-                                       (:table-aliases ctx)
-                                       (:default-table ctx)
-                                       (:col-overrides ctx)
-                                       (:derived-aliases ctx) (:ci-index ctx))
-          col-var (ctx/col-var! ctx resolved)]
-      [[(list '= col-var true)]])
+    (let [^Column col expr
+          table-name (some-> (.getTable col) .getName unquote-ident)]
+      (if (and table-name params/*from-bindings*
+               (contains? params/*from-bindings* table-name))
+        ;; A correlated outer boolean arrives as a concrete per-row binding,
+        ;; not as an inner-relation attribute. Resolving it through ctx made
+        ;; the inner query scan a nonexistent `:<outer>/col` datom, so psql's
+        ;; `... AND a.atthasdef` scalar subquery always returned NULL.
+        (if (true? (get-in params/*from-bindings*
+                           [table-name (unquote-ident (.getColumnName col))]))
+          []
+          [[(list 'not= 1 1)]])
+        (let [resolved (ctx/resolve-column col
+                                           (:table-aliases ctx)
+                                           (:default-table ctx)
+                                           (:col-overrides ctx)
+                                           (:derived-aliases ctx) (:ci-index ctx))
+              col-var (ctx/col-var! ctx resolved)]
+          [[(list '= col-var true)]])))
 
     ;; Boolean literals — `WHERE true` adds no constraint, `WHERE false`
     ;; emits the canonical false-sentinel so the surrounding AND
