@@ -591,6 +591,14 @@
                                (when (and (= dh-type :db.type/string) (not array-spec))
                                  (when-let [n (types/parse-char-length raw-type)]
                                    (+ n 4)))
+                               bit-typmod
+                               (when (and (= dh-type :db.type/string) (not array-spec))
+                                 ;; JSqlParser inconsistently includes the
+                                 ;; modifier in getDataType for `bit(4)`, but
+                                 ;; exposes `varbit(4)` as dataType="varbit"
+                                 ;; plus a separate argument list. `str` on
+                                 ;; ColDataType faithfully includes both.
+                                 (some-> (types/parse-bit-length (str cdt)) long))
                                char-pg-type
                                (let [b (types/base-type-name-of raw-type)]
                                  (cond
@@ -635,6 +643,7 @@
                                          :pg/array-ndim  (long (:ndim array-spec)))
                        numeric-typmod (assoc :pg/typmod numeric-typmod)
                        char-typmod (assoc :pg/typmod char-typmod)
+                       bit-typmod (assoc :pg/typmod bit-typmod)
                        char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec

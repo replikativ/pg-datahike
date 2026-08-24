@@ -29,7 +29,12 @@
      :blockers #{:non-decimal-integer-input :numeric-formatting :parser-aliases}}
     {:name "bit" :mode :discovery
      :boundaries #{:scalar-type :operators :nulls}
-     :blockers #{:array-codec :bit-literal-parser :operator-coverage}}
+     :blockers #{:bit-literal-parser :operator-coverage}
+     :strict-slices
+     [{:id :shift-storage
+       :source-lines [174 179]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "postgres-bit-shift-storage-slice"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
      :blockers #{:numeric-formatting :numeric-typemods :create-function}}

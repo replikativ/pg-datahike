@@ -34,6 +34,7 @@
   (:import [datahike.pg PgWireServer$QueryResult]))
 
 (def oid-int8 20)
+(def oid-int4 23)
 (def oid-float8 701)
 (def oid-bit 1560)
 
@@ -170,6 +171,48 @@
   (is (= [["1000" "0011"]]
          (mapv vec (.-rows ^PgWireServer$QueryResult
                     (.execute *handler* "SELECT b << 1, v >> 1 FROM bit_shift"))))))
+
+(deftest postgres-bit-shift-storage-slice
+  ;; PostgreSQL 17 bit.sql lines 174-179. Each INSERT reads every row written
+  ;; so far, producing all right shifts from 0 through 15. PgBit used to be
+  ;; stringified as a Clojure record on the second INSERT ... SELECT.
+  (.execute *handler* "CREATE TABLE bit_shift_16 (b bit(16))")
+  (.execute *handler* "INSERT INTO bit_shift_16 VALUES (B'1101100000000000')")
+  (doseq [distance [1 2 4 8]]
+    (is (nil? (err (str "INSERT INTO bit_shift_16 SELECT b >> " distance
+                        " FROM bit_shift_16")))))
+  (is (= 16 (Long/parseLong (v "SELECT count(*) FROM bit_shift_16"))))
+  (is (= (mapv #(str (apply str (repeat % \0))
+                     (subs "1101100000000000" 0 (- 16 %)))
+               (range 16))
+         (mapv first
+               (mapv vec (.-rows ^PgWireServer$QueryResult
+                          (.execute *handler*
+                                    "SELECT b FROM bit_shift_16 ORDER BY b DESC")))))))
+
+(deftest bit-column-assignment-width
+  (.execute *handler* "CREATE TABLE bit_widths (b bit(4), v varbit(4))")
+  (is (re-find #"bit string length 2 does not match type bit\(4\)"
+               (or (err "INSERT INTO bit_widths (b) VALUES (B'11')") "")))
+  (is (nil? (err "INSERT INTO bit_widths VALUES (B'11'::bit(4), B'11')")))
+  (is (= [["1100" "11"]]
+         (mapv vec (.-rows ^PgWireServer$QueryResult
+                    (.execute *handler* "SELECT b, v FROM bit_widths")))))
+  (is (re-find #"too long for type bit varying\(4\)"
+               (or (err "INSERT INTO bit_widths (v) VALUES (B'11001')") ""))))
+
+(deftest bit-access-and-count-functions
+  (is (= "1" (v "SELECT get_bit(B'0101011000100', 10)")))
+  (is (= "0101011000100101"
+         (v "SELECT set_bit(B'0101011000100100', 15, 1)")))
+  (is (re-find #"bit index 16 out of valid range \(0\.\.15\)"
+               (or (err "SELECT set_bit(B'0101011000100100', 16, 1)") "")))
+  (is (re-find #"new bit must be 0 or 1"
+               (or (err "SELECT set_bit(B'0101', 1, 2)") "")))
+  (is (= "5" (v "SELECT bit_count(B'0101011100'::bit(10))")))
+  (is (= "500" (v "SELECT bit_count(repeat('01', 500)::bit(1000))")))
+  (is (= [oid-int4 oid-bit oid-int8]
+         (oids "SELECT get_bit(B'0', 0), set_bit(B'0', 0, 1), bit_count(B'1')"))))
 
 (deftest bit-string-operands-must-be-the-same-width
   (testing "PG refuses rather than padding — the width is part of the value"

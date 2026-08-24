@@ -321,3 +321,36 @@
   [^PgBit a ^PgBit b]
   (let [c (compare (:bits a) (:bits b))]
     (if (zero? c) (compare (width a) (width b)) c)))
+
+(defn get-bit
+  "Return bit `n`, indexed left-to-right from zero like PostgreSQL get_bit."
+  [^PgBit b n]
+  (let [n (long n)
+        w (width b)]
+    (when (or (neg? n) (>= n w))
+      (throw (errors/pg-error
+              :array-element-error
+              {:detail (str "bit index " n " out of valid range (0.." (dec w) ")")})))
+    (if (= \1 (.charAt ^String (:bits b) (int n))) 1 0)))
+
+(defn set-bit
+  "Return a same-width bit value with zero-based, left-to-right bit `n` set."
+  [^PgBit b n new-bit]
+  (let [n (long n)
+        new-bit (long new-bit)
+        w (width b)]
+    (when (or (neg? n) (>= n w))
+      (throw (errors/pg-error
+              :array-element-error
+              {:detail (str "bit index " n " out of valid range (0.." (dec w) ")")})))
+    (when-not (contains? #{0 1} new-bit)
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "new bit must be 0 or 1"})))
+    (assoc b :bits (str (subs (:bits b) 0 (int n))
+                        new-bit
+                        (subs (:bits b) (inc (int n)))))))
+
+(defn bit-count
+  "Number of set bits in a bit string."
+  [^PgBit b]
+  (long (count (filter #(= \1 %) (:bits b)))))

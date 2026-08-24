@@ -5057,6 +5057,19 @@
         ;; before the generic :db.type/bigdec assignment branch.
           (= "money" pg-type) (sql-cast/parse-money val)
 
+        ;; BIT and BIT VARYING share string storage with text/json, but
+        ;; expression evaluation carries them as PgBit so width and type
+        ;; survive operators. Persist only PostgreSQL's canonical digit run;
+        ;; otherwise INSERT ... SELECT stringifies the record as
+        ;; `{:bits ...}`, and the next read fails on the opening `{`.
+        ;; Assignment coercion is deliberately non-explicit: fixed bit(n)
+        ;; requires exactly n bits, while varbit(n) accepts shorter input and
+        ;; rejects longer input instead of silently truncating it.
+          (contains? #{"bit" "varbit"} pg-type)
+          (let [target-type (str pg-type (when typmod (str "(" typmod ")")))]
+            (pg-bits/to-pg-text
+             (sql-cast/cast-to-bit val target-type false)))
+
         ;; Native PG array column (`:pg/array-elem` recorded by DDL)
         ;; — Option C storage: serialize a PgArray (or coerce a
         ;; sequential value into one) to canonical PG text. Strings
@@ -6310,7 +6323,7 @@
                                         ;; value was NULL. A NULL column is simply
                                         ;; an absent datom.
                                         coerced (when-not (= :__null__ val)
-                                                  (coerce-insert-value val attr schema))]
+                                                  (coerce-insert-value val attr schema db))]
                                     (when (some? coerced)
                                       [attr coerced])))
                                 (map vector col-names row))))

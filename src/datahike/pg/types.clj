@@ -897,6 +897,15 @@
                    (base-type-name-of type-str))
     (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str)) second Integer/parseInt)))
 
+(defn parse-bit-length
+  "The `n` of `bit(n)` / `bit varying(n)`, or nil when no modifier was
+   declared. PostgreSQL stores this directly as atttypmod (unlike character
+   types, which add VARHDRSZ)."
+  [type-str]
+  (when (contains? #{"bit" "varbit" "bit varying"}
+                   (base-type-name-of type-str))
+    (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str)) second Integer/parseInt)))
+
 (defn decode-numeric-typmod
   "Inverse of `encode-numeric-typmod`. Returns `[precision scale]` or
    `[nil nil]` for typmod -1 (unconstrained NUMERIC)."

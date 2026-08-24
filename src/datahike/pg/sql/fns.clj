@@ -3070,6 +3070,12 @@
                        :strict? true :return-oid types/oid-bool}
    "pg_input_is_valid" {:impl pg-input-valid? :arities #{2}
                         :strict? true :return-oid types/oid-bool}
+   "get_bit"          {:impl pg-bits/get-bit :arities #{2}
+                       :strict? true :return-oid types/oid-int4}
+   "set_bit"          {:impl pg-bits/set-bit :arities #{3}
+                       :strict? true :return-oid types/oid-bit}
+   "bit_count"        {:impl pg-bits/bit-count :arities #{1}
+                       :strict? true :return-oid types/oid-int8}
    "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}
