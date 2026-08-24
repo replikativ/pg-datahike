@@ -74,6 +74,12 @@
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE t (id int, v varchar(4), c char(4))")
     (exec! c "INSERT INTO t VALUES (1, 'ab', 'ab')")
+    (testing "bpchar is blank-padded at the PostgreSQL result boundary"
+      (is (= "ab  " (one c "SELECT c FROM t WHERE id = 1"))))
+    (testing "excess spaces are truncated rather than rejected"
+      (exec! c "INSERT INTO t VALUES (2, 'abcd    ', 'xy      ')")
+      (is (= "abcd" (one c "SELECT v FROM t WHERE id = 2")))
+      (is (= "xy  " (one c "SELECT c FROM t WHERE id = 2"))))
     (testing "INSERT"
       (is (thrown-with-msg? SQLException #"value too long for type character varying\(4\)"
                             (exec! c "INSERT INTO t (id, v) VALUES (2, 'abcdef')")))
@@ -86,7 +92,7 @@
       (exec! c "INSERT INTO t (id, v) VALUES (4, 'abcd')")
       (is (= "abcd" (one c "SELECT v FROM t WHERE id = 4"))))
     (testing "and the refused rows left nothing behind"
-      (is (= "2" (one c "SELECT count(*)::text FROM t"))))))
+      (is (= "3" (one c "SELECT count(*)::text FROM t"))))))
 
 (deftest extra-float-digits-is-reported
   (with-open [c (jdbc)]

@@ -2573,6 +2573,13 @@
                             (when-let [tn (get join-aliases a)] [a tn]))))))
               (or joins []))
 
+        ;; Preserve FROM occurrences for unqualified column resolution.
+        ;; The alias map necessarily collapses a self-join's two values to
+        ;; the same storage namespace; occurrence metadata lets ctx still
+        ;; raise PostgreSQL's 42702 for `FROM t x, t y ... b`.
+        table-aliases (with-meta table-aliases
+                        {:relation-aliases (mapv first star-relations)})
+
         ;; Create context
         hints (pgs/schema-hints db)
         ctx (ctx/make-ctx schema table-aliases default-table
@@ -4346,7 +4353,15 @@
                                                       (:db/unique (get schema attr)))
                                                (namespace attr)))))
                                    group-by-vars)
-                  visible (take (count @find-aliases) @find-elements)]
+                  ;; ORDER BY expressions are allowed to be hidden from the
+                  ;; projection, but they are not exempt from grouping rules:
+                  ;; `SELECT count(*) FROM t GROUP BY a ORDER BY b` is 42803.
+                  ;; Include directly-resolved order columns in the same
+                  ;; validation pass as visible target columns.
+                  visible (concat (take (count @find-aliases) @find-elements)
+                                  (keep (fn [[v _dir _nulls]]
+                                          (when (symbol? v) v))
+                                        order-by-spec))]
               (doseq [el visible]
                 (when (and (symbol? el) (not (contains? gvars el)))
                   (when-let [[alias-key attr] (var->col el)]
@@ -5121,13 +5136,10 @@
         ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
         ;; forms). Empty / blank strings stay as-is so datahike's
         ;; rejection still surfaces (an empty keyword `:` is invalid).
-          ;; NOT blank-padded. PostgreSQL stores 'ab' in a char(4) as
-          ;; 'ab  ', but the padding is only half of bpchar: comparison,
-          ;; length() and text conversion all IGNORE trailing blanks, so
-          ;; padding without those makes `WHERE c = 'ab'` miss its row
-          ;; and `length(c)` answer 4. Measured both ways -- padding
-          ;; alone is a net loss. bpchar's blank-insensitivity is its own
-          ;; change.
+          ;; Keep bpchar compact internally. PostgreSQL's padding is a wire
+          ;; representation concern; storing the blanks would make Datahike
+          ;; equality/index lookups disagree with SQL's blank-insensitive
+          ;; bpchar comparison and make length(c) include the padding.
           ;;
           ;; varchar(n) / char(n) on the WRITE path. An assignment
           ;; REFUSES an over-long value where an explicit cast truncates
@@ -5137,11 +5149,18 @@
           (and (= vtype :db.type/string) (string? val)
                (contains? #{"varchar" "bpchar"} pg-type) typmod
                (> (count ^String val) (- (long typmod) 4)))
-          (throw (errors/pg-error
-                  :string-data-right-truncation
-                  {:message (str "value too long for type "
-                                 (if (= "bpchar" pg-type) "character(" "character varying(")
-                                 (- (long typmod) 4) ")")}))
+          (let [n (- (long typmod) 4)
+                excess (subs ^String val (int n))]
+            ;; SQL permits excess trailing spaces for both character(n)
+            ;; and varchar(n); they carry no information and are truncated.
+            ;; Any non-space excess is still assignment error 22001.
+            (if (every? #(= \space %) excess)
+              (subs ^String val 0 (int n))
+              (throw (errors/pg-error
+                      :string-data-right-truncation
+                      {:message (str "value too long for type "
+                                     (if (= "bpchar" pg-type) "character(" "character varying(")
+                                     n ")")}))))
           (and (= vtype :db.type/keyword) (string? val))
           (if (clojure.string/blank? val) val (keyword val))
         ;; Already-keyword passes through. Symbols coerce to keywords.

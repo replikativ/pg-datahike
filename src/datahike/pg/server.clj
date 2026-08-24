@@ -639,9 +639,12 @@
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
    Handles empty result sets by returning proper column metadata with 0 rows.
-   Optional schema-oids: int array of OIDs to use when results are empty."
-  ([results find-aliases] (format-query-result results find-aliases nil))
+   Optional schema-oids: int array of OIDs to use when results are empty.
+   Optional typmods supply declared widths for bpchar text rendering."
+  ([results find-aliases] (format-query-result results find-aliases nil nil))
   ([results find-aliases schema-oids]
+   (format-query-result results find-aliases schema-oids nil))
+  ([results find-aliases schema-oids typmods]
    (let [col-names (into-array String find-aliases)
          result-seq (seq results)
         ;; Determine OIDs: prefer schema-oids, refine unknowns with value inference
@@ -682,9 +685,18 @@
                                           (if (sequential? row)
                                             (map-indexed
                                              (fn [i v]
-                                               (value->string
-                                                v (when (< i (alength ^ints oids))
-                                                    (aget ^ints oids i))))
+                                               (let [oid (when (< i (alength ^ints oids))
+                                                           (aget ^ints oids i))
+                                                     s (value->string v oid)
+                                                     tm (when (and typmods
+                                                                   (< i (alength ^ints typmods)))
+                                                          (aget ^ints typmods i))]
+                                                 (if (and s (= oid types/oid-bpchar)
+                                                          tm (>= tm 4)
+                                                          (< (count s) (- tm 4)))
+                                                   (str s (apply str (repeat (- (- tm 4) (count s))
+                                                                             \space)))
+                                                   s)))
                                              row)
                                             [(value->string row (when (pos? (alength ^ints oids))
                                                                   (aget ^ints oids 0)))]))))
@@ -4990,7 +5002,8 @@
                  rows (if (pos? hidden)
                         (mapv #(subvec (vec %) 0 keep-n) res)
                         res)
-                 result (format-query-result rows aliases schema-oids)]
+                 result (format-query-result rows aliases schema-oids
+                                             (when sources (nth sources 2)))]
              (if sources
                (-> ^PgWireServer$QueryResult result
                    (.withColumnSources (first sources) (second sources))
@@ -5375,7 +5388,8 @@
                              (.get ^java.util.Map select-shape-cache shape-key))]
           (if cached-shape
             (let [[schema-oids sources] cached-shape
-                  result (format-query-result results find-aliases schema-oids)]
+                  result (format-query-result results find-aliases schema-oids
+                                              (when sources (nth sources 2)))]
               (if sources
                 (-> ^PgWireServer$QueryResult result
                     (.withColumnSources (first sources) (second sources))
@@ -5421,7 +5435,8 @@
                   _ (when shape-key
                       (.put ^java.util.Map select-shape-cache shape-key
                             [schema-oids sources]))
-                  result (format-query-result results find-aliases schema-oids)]
+                  result (format-query-result results find-aliases schema-oids
+                                              (when sources (nth sources 2)))]
               (if sources
                 (-> ^PgWireServer$QueryResult result
                     (.withColumnSources (first sources) (second sources))

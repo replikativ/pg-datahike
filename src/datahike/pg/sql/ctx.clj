@@ -94,9 +94,11 @@
          ;; exactly as before. Relations absent from `ci` (catalog and
          ;; speculative tables) simply do not become candidates, so this
          ;; can only ever turn a failure into a resolution.
+         relation-aliases (:relation-aliases (meta table-aliases))
          owner (or override-owner
                    (when (and (nil? table-alias) ci (not= "db_id" col-name0)
-                              (> (count (set (vals table-aliases))) 1))
+                              (or (> (count relation-aliases) 1)
+                                  (> (count (set (vals table-aliases))) 1)))
                  ;; Group by the resolved ATTRIBUTE, not by alias.
                  ;; `table-aliases` registers BOTH `{alias -> name}` and
                  ;; `{name -> name}` for ONE from item, so `FROM pg_type t`
@@ -117,8 +119,30 @@
                                                  m
                                                  (update m a (fnil conj #{}) ak))
                                                m))
-                                           {} table-aliases)]
+                                           {} table-aliases)
+                           ;; A map cannot represent relation OCCURRENCES:
+                           ;; `FROM t x, t y` has one distinct value (`t`),
+                           ;; although an unqualified `col` is ambiguous.
+                           ;; translate-select attaches the ordered aliases
+                           ;; from the FROM list as metadata so self-joins are
+                           ;; checked without mistaking `{t t, x t}` from one
+                           ;; aliased occurrence for two relations.
+                           occurrence-candidates
+                           (when (seq relation-aliases)
+                             (into []
+                                   (keep (fn [ak]
+                                           (let [tn (get table-aliases ak ak)]
+                                             (when-let [a (pgs/canonical-attr ci tn col-name0)]
+                                               (when-not (pgs/ambiguous? a) [ak a])))))
+                                   relation-aliases))]
                        (cond
+                         (= 1 (count occurrence-candidates))
+                         (ffirst occurrence-candidates)
+
+                         (> (count occurrence-candidates) 1)
+                         (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
+                                         {:error :ambiguous-column :column col-name0}))
+
                          (= 1 (count by-attr))
                          (let [aks (val (first by-attr))]
                        ;; Prefer the default table's own alias when it is

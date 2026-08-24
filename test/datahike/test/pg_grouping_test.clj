@@ -137,8 +137,20 @@
             ungrouped column is an error even with no GROUP BY at all"
     (is (= "42803" (state "SELECT dept, count(*) FROM g"))))
 
+  (testing "a hidden ORDER BY column obeys the same grouping rule"
+    (is (= "42803" (state "SELECT count(*) FROM g GROUP BY dept ORDER BY sal")))
+    (is (= {["2"] 1 ["3"] 1}
+           (bag "SELECT count(*) FROM g GROUP BY dept ORDER BY dept"))))
+
   (testing "the message names the column the way PostgreSQL does"
     (is (re-find #"column \"g\.sal\"" (or (err "SELECT dept, sal FROM g GROUP BY dept") "")))))
+
+(deftest unqualified-self-join-columns-are-ambiguous
+  (testing "relation occurrences, not distinct storage namespaces, determine ambiguity"
+    (is (= "42702" (state "SELECT count(*) FROM g x, g y WHERE x.id = y.id GROUP BY dept")))
+    (is (= "42702" (state "SELECT count(sal) FROM g x, g y WHERE x.id = y.id GROUP BY x.dept")))
+    (is (= {["2"] 1 ["3"] 1}
+           (bag "SELECT count(*) FROM g x, g y WHERE x.id = y.id GROUP BY x.dept")))))
 
 (deftest grouping-by-the-primary-key-licenses-every-column
   (testing "PostgreSQL allows an ungrouped column when the table's PRIMARY
