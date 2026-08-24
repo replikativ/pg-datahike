@@ -1764,9 +1764,10 @@
 (defn- bit-dispatch
   "Apply `bitf` for bit-string operands, `intf` for integers."
   [bitf intf a b]
-  (if (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b))
-    (bitf a b)
-    (intf (long a) (long b))))
+  (cond
+    (or (sql-null? a) (sql-null? b)) :__null__
+    (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b)) (bitf a b)
+    :else (intf (long a) (long b))))
 
 (defn sql-bit-and [a b] (bit-dispatch pg-bits/and-bits bit-and a b))
 (defn sql-bit-or  [a b] (bit-dispatch pg-bits/or-bits  bit-or  a b))
@@ -1775,24 +1776,29 @@
 (defn sql-bit-not
   "`~` — bitwise NOT."
   [a]
-  (if (pg-bits/pg-bit? a) (pg-bits/not-bits a) (bit-not (long a))))
+  (cond
+    (sql-null? a) :__null__
+    (pg-bits/pg-bit? a) (pg-bits/not-bits a)
+    :else (bit-not (long a))))
 
 (defn sql-bit-shift-left
   "`<<`. On a bit string the width is preserved and vacated positions are
    zero-filled; on an integer it is a plain shift."
   [a n]
-  (if (pg-bits/pg-bit? a)
-    (pg-bits/shift-bits a (long n))
-    (bit-shift-left (long a) (long n))))
+  (cond
+    (or (sql-null? a) (sql-null? n)) :__null__
+    (pg-bits/pg-bit? a) (pg-bits/shift-bits a (long n))
+    :else (bit-shift-left (long a) (long n))))
 
 (defn sql-bit-shift-right
   "`>>`. Arithmetic (sign-propagating) on integers, matching PG's bare C
    `>>` on a signed operand; width-preserving and zero-filled on a bit
    string."
   [a n]
-  (if (pg-bits/pg-bit? a)
-    (pg-bits/shift-bits a (- (long n)))
-    (bit-shift-right (long a) (long n))))
+  (cond
+    (or (sql-null? a) (sql-null? n)) :__null__
+    (pg-bits/pg-bit? a) (pg-bits/shift-bits a (- (long n)))
+    :else (bit-shift-right (long a) (long n))))
 
 (defn sql-bit-length
   "SQL BIT_LENGTH — the length in BITS.

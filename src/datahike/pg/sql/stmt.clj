@@ -784,6 +784,10 @@
     (instance? LongValue expr)   (.getValue ^LongValue expr)
     (instance? DoubleValue expr) (types/decimal-literal expr (.getValue ^DoubleValue expr))
     (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
+    (instance? JdbcParameter expr)
+    (if-let [bound params/*bound-params*]
+      (nth bound (.getIndex ^JdbcParameter expr) ::corr)
+      ::corr)
     (instance? SignedExpression expr)
     (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
       (if (number? v) (- v) ::corr))
@@ -2067,9 +2071,8 @@
   "True when `tname` names something a query can scan: a user table / CTE
    / derived table whose columns live in `schema` (any attribute in that
    namespace — every pgwire table carries at least its row-marker), a CTE
-   in scope (`*cte-relations*`), or a catalog relation the catalog layer
-   synthesises (`pg_*`, `information_schema`, or any schema-qualified
-   name). Used to raise a clean 42P01 for a genuinely-absent relation
+   in scope (`*cte-relations*`), or a catalog relation already materialised
+   into that schema. Used to raise a clean 42P01 for a genuinely-absent relation
    instead of the cryptic 'Query for unknown vars' failure (SELECT *) or a
    silently-empty result (SELECT col). Column-level EAV permissiveness is
    intentionally NOT touched — an existing table's missing column still
@@ -2077,10 +2080,7 @@
   [schema tname]
   (or (nil? tname)
       (let [t (str/lower-case tname)]
-        (or (str/starts-with? t "pg_")
-            (str/starts-with? t "information_schema")
-            (str/includes? t ".")            ; schema-qualified catalog ref
-            (contains? *cte-relations* t)
+        (or (contains? *cte-relations* t)
             ;; Case-insensitive: the reference has been folded, but a
             ;; database created before folding — or a Datalog-native one —
             ;; stores `:MixedCase/...`. This also fixes a latent

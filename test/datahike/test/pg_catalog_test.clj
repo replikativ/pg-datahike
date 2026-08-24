@@ -44,7 +44,9 @@
 (defn- ex [sql]
   (let [^PgWireServer$QueryResult r (.execute *h* sql)]
     {:err (.error r)
+     :sqlstate (.sqlstate r)
      :cols (vec (.columnNames r))
+     :oids (vec (.columnOids r))
      :rows (mapv vec (.rows r))}))
 
 (defn- rows [sql] (:rows (ex sql)))
@@ -60,6 +62,22 @@
       (is (= 1 (count (:rows r))))
       (is (= "23" (first (first (:rows r))))
           "int4 OID must be 23 per pg_type.dat"))))
+
+(deftest catalog-name-columns-use-name-oid
+  (testing "NameData catalog fields advertise PostgreSQL's name OID 19"
+    (doseq [sql ["SELECT typname FROM pg_type"
+                 "SELECT attname FROM pg_attribute"
+                 "SELECT nspname FROM pg_namespace"
+                 "SELECT rolname FROM pg_roles"
+                 "SELECT datname FROM pg_database"
+                 "SELECT proname FROM pg_proc"
+                 "SELECT relname FROM pg_class"]]
+      (is (= [19] (:oids (ex sql))) sql))))
+
+(deftest unknown-pg-prefixed-relation-is-not-a-catalog
+  (let [r (ex "SELECT * FROM pg_catalog.pg_databases")]
+    (is (= "42P01" (:sqlstate r)))
+    (is (re-find #"relation .* does not exist" (or (:err r) "")))))
 
 (deftest test-pg-type-common-oids
   (testing "Common type OIDs present"

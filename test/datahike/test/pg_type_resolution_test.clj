@@ -135,6 +135,26 @@
            #"COALESCE types text and integer cannot be matched"
            (col c 1 "SELECT coalesce(s, i) FROM tr"))))))
 
+(deftest cast-target-must-exist
+  (with-open [c (jdbc)]
+    (doseq [sql ["SELECT 'ignore'::typedoesnotexist"
+                 "SELECT NULL::typedoesnotexist"]]
+      (let [e (try (col c 1 sql) nil
+                   (catch java.sql.SQLException e e))]
+        (is (some? e) sql)
+        (is (= "42704" (.getSQLState e)) sql)
+        (is (re-find #"type .* does not exist" (.getMessage e)) sql)))))
+
+(deftest money-cast-keeps-its-postgresql-type
+  (with-open [c (jdbc)
+              st (.createStatement c)
+              rs (.executeQuery st "SELECT 66::money")]
+    (is (.next rs))
+    (is (= "money" (.getColumnTypeName (.getMetaData rs) 1)))
+    (is (= "66.00" (.getString rs 1))))
+  (with-open [c (jdbc)]
+    (is (= ["money"] (col c 1 "SELECT pg_typeof(66::money)::text")))))
+
 (deftest operator-resolution
   (with-open [c (jdbc)]
     (seed! c)

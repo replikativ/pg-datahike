@@ -2355,12 +2355,16 @@
         ;; exposes the `[]` via getArrayData.
         type-str (when col-data-type
                    (str/lower-case (str col-data-type)))
+        _ (when-not (pgs/sql-type-exists? (:db ctx) type-str)
+            (throw (errors/pg-error :undefined-object
+                                    {:kind "type" :name type-str})))
         inner-raw (translate-expr ctx inner)
         ;; Type classification from centralized registry
         cast-cat (types/cast-category type-str)
         is-int? (= :integer cast-cat)
         is-float? (= :float cast-cat)
         is-numeric? (= :numeric cast-cat)
+        is-money? (= :money cast-cat)
         is-text? (= :text cast-cat)
         is-bool? (= :boolean cast-cat)
         is-date? (= :date cast-cat)
@@ -2495,7 +2499,7 @@
           ;; ::numeric still keeps arbitrary precision: cast-scalar parses
           ;; via the string form so a literal's scale survives (0.001000 →
           ;; scale 6), never via double.
-          (or is-int? is-float? is-numeric?)
+          (or is-int? is-float? is-numeric? is-money?)
           (sql-cast/cast-scalar inner-raw type-str
                                 {:explicit? true
                                  :parse-timestamp parse-timestamp-string})
@@ -2661,7 +2665,7 @@
             ;; binary, decoded to BigDecimal) — keep it; a text param
             ;; (node) parses via the string form so its scale survives.
             ;; Never route through double, which drops precision.
-            is-numeric?
+            (or is-numeric? is-money?)
             (let [fn-param (symbol (str "?cast-num" (swap! (:var-counter ctx) inc)))
                   ;; Through cast-scalar, like the int/float branch below.
                   ;; Its own copy of the coercion could not see the

@@ -460,25 +460,26 @@
   "Coerce a raw token to the target element-type. Unquoted NULL token
    → nil. Element-type drives the destination type."
   [raw quoted? elem-type]
-  (cond
-    (and (not quoted?) (some-> raw str/lower-case (= "null")))
-    nil
-    (nil? raw) nil
-    :else
-    (case elem-type
-      :int2     (Long/parseLong raw)
-      :int4     (Long/parseLong raw)
-      :int8     (Long/parseLong raw)
-      :float4   (Double/parseDouble raw)
-      :float8   (Double/parseDouble raw)
-      :bool     (let [b (coerce/parse-bool-token raw)]
-                  (when (nil? b)
-                    (throw (ex-info (str "invalid input syntax for type boolean: "
-                                         (pr-str raw))
-                                    {:error :invalid-text-representation
-                                     :type "boolean" :value raw})))
-                  b)
-      raw)))
+  (let [raw (if (and (string? raw) (not quoted?)) (str/trim raw) raw)]
+    (cond
+      (and (not quoted?) (some-> raw str/lower-case (= "null")))
+      nil
+      (nil? raw) nil
+      :else
+      (case elem-type
+        :int2     (Long/parseLong raw)
+        :int4     (Long/parseLong raw)
+        :int8     (Long/parseLong raw)
+        :float4   (Double/parseDouble raw)
+        :float8   (Double/parseDouble raw)
+        :bool     (let [b (coerce/parse-bool-token raw)]
+                    (when (nil? b)
+                      (throw (ex-info (str "invalid input syntax for type boolean: "
+                                           (pr-str raw))
+                                      {:error :invalid-text-representation
+                                       :type "boolean" :value raw})))
+                    b)
+        raw))))
 
 (defn- parse-lbound-prefix
   "If the input starts with `[lo:hi][lo:hi]…=`, consume it and return
@@ -558,7 +559,27 @@
           (recur (inc i) items current quoted? false false true)
 
           (and (not in-quote?) (= c \"))
-          (recur (inc i) items current true true false true)
+          (let [current (if (str/blank? (.toString current))
+                          (StringBuilder.)
+                          current)]
+            (recur (inc i) items current true true false true))
+
+          ;; PostgreSQL ignores whitespace surrounding an array item.
+          ;; Once a quoted item closes, only such whitespace may precede
+          ;; its delimiter; it is not part of the quoted value.
+          (and (not in-quote?) quoted? (Character/isWhitespace c))
+          (recur (inc i) items current quoted? false false true)
+
+          (and (not in-quote?) quoted? (not (#{\, \}} c)))
+          (throw (ex-info "Unexpected character after quoted array element"
+                          {:error :invalid-text-representation :type "array"
+                           :detail "unexpected character after quoted array element"
+                           :input s :at i}))
+
+          ;; Leading whitespace belongs to array syntax, not to an
+          ;; unquoted token. Trailing whitespace is removed by coerce-token.
+          (and (not in-quote?) (not pending?) (Character/isWhitespace c))
+          (recur (inc i) items current quoted? false false false)
 
           ;; Nested array — recurse, then continue from after `}`. The
           ;; slot is closed by the sub-array, so reset pending? to
@@ -663,4 +684,3 @@
         (array elem-type [] [0] (or lbounds [1]))
         (let [[coerced dims] (coerce-tree tree elem-type)]
           (array elem-type coerced dims (or lbounds (vec (repeat (max 1 (count dims)) 1)))))))))
-

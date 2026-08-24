@@ -1496,6 +1496,29 @@
                                                              -1)]
                                       :literal-rows (mapv vec rows)})
 
+                                   ;; A target-list SRF determines its row
+                                   ;; count from bound values, so Parse can
+                                   ;; only describe its shape. Execute reparses
+                                   ;; this narrow form with *bound-params* in
+                                   ;; scope and materialises the actual rows.
+                                   (and table-free?
+                                        (gs-single-item?
+                                         (first (.getSelectItems ^PlainSelect stmt)))
+                                        (pos? param-count)
+                                        (nil? params/*bound-params*))
+                                   {:type :select
+                                    :query {:find [] :where []}
+                                    :find-aliases [(or (select-item-alias
+                                                        (first (.getSelectItems ^PlainSelect stmt)))
+                                                       "generate_series")]
+                                    :has-aggregates? false
+                                    :has-distinct? false
+                                    :in-args []
+                                    :hidden-count 0
+                                    :select-item-oids [types/oid-int4]
+                                    :literal-rows []
+                                    :reparse-with-bound-params? true}
+
                                    (and table-free?
                                         (zero? param-count)
                                         (identical? db pre-cte-db))
@@ -1558,6 +1581,11 @@
                                                                  ;; .getArrayData. (str cdt) carries the full "int[]".
                                                                    type-str (str/lower-case (str (.getDataType cdt)))
                                                                    full-str (str/lower-case (str cdt))
+                                                                   _ (when-not (pgs/sql-type-exists? cte-db full-str)
+                                                                       (throw (errors/pg-error
+                                                                               :undefined-object
+                                                                               {:kind "type"
+                                                                                :name full-str})))
                                                                    ad (.getArrayData cdt)
                                                                    array? (and ad (pos? (.size ^java.util.List ad)))
                                                                    raw (cond
@@ -2175,6 +2203,7 @@
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
          cache (when (and (empty? params/*from-bindings*)
+                          (nil? params/*bound-params*)
                           (cacheable-sql-size? sql))
                  *parse-cache*)
          schema-key (when cache (hash schema))

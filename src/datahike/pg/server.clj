@@ -6820,18 +6820,36 @@
         ;; `*registered-databases*` bound here so any catalog probe on
         ;; `pg_database` that lands during parse materialization sees
         ;; this server's actual registry instead of the legacy fallback.
-        (binding [catalog/*registered-databases* registered-databases
-                  params/*session-state* session-state]
-          (let [base-db (apply-temporal (d/db conn) session-state)
+        (let [declared-param-oids
+              (into {}
+                    (keep-indexed (fn [i o]
+                                    ;; OID 0 means "unspecified; infer it",
+                                    ;; not a real PostgreSQL type. Keeping it
+                                    ;; in the map made a bare `$1` advertise
+                                    ;; OID 0 instead of the text fallback.
+                                    (when (pos? (long o)) [(inc i) o])))
+                    (seq param-oids))]
+          (binding [catalog/*registered-databases* registered-databases
+                    params/*session-state* session-state
+                    ;; Parameter types declared by the Parse message affect
+                    ;; expression resolution and lowering, not merely the
+                    ;; later ParameterDescription. For example, PostgreSQL
+                    ;; resolves `-($1)`, `pg_typeof($1)`, and overloads such
+                    ;; as `generate_series(1,$1)` from these OIDs while it
+                    ;; builds the plan. parse-sql includes this binding in
+                    ;; its cache key, so plans for different declarations
+                    ;; remain isolated.
+                    params/*declared-param-oids* declared-param-oids]
+            (let [base-db (apply-temporal (d/db conn) session-state)
                 ;; In an open transaction, parse/validate against the
                 ;; speculative-db so a statement referencing a table
                 ;; created earlier in the SAME uncommitted transaction
                 ;; (e.g. `BEGIN; CREATE TABLE t; PREPARE … SELECT FROM t`)
                 ;; resolves it. Mirrors the dispatch's db selection.
-                db (if (:in-tx? @tx-state)
-                     (or (:speculative-db @tx-state) base-db)
-                     base-db)
-                parsed (sql/parse-sql sql (dbi/-schema db) db)]
+                  db (if (:in-tx? @tx-state)
+                       (or (:speculative-db @tx-state) base-db)
+                       base-db)
+                  parsed (sql/parse-sql sql (dbi/-schema db) db)]
             ;; Surface parse-time errors (undefined relation/column,
             ;; syntax errors) as a Parse-message failure, matching
             ;; PostgreSQL: it validates the statement at Parse and raises
@@ -6841,38 +6859,32 @@
             ;; into an ErrorResponse + extended-query error-skip until
             ;; Sync. Without this, a client (e.g. asyncpg) that prepares
             ;; a SELECT on a nonexistent table sees a spurious success.
-            (when (= :error (:type parsed))
-              (throw (PgWireServer$PgProtocolException.
-                      (or (:sqlstate parsed) "42601")
-                      (or (:message parsed) "statement could not be parsed"))))
-            (let [;; Attach the original SQL so downstream code that reads
+              (when (= :error (:type parsed))
+                (throw (PgWireServer$PgProtocolException.
+                        (or (:sqlstate parsed) "42601")
+                        (or (:message parsed) "statement could not be parsed"))))
+              (let [;; Attach the original SQL so downstream code that reads
                   ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                   ;; working even though parse-sql may not have set it for
                   ;; non-system types.
                   ;;
                   ;; :declared-param-oids carries the Parse message's own
                   ;; type declarations (1-indexed to match `$N`; 0 = "you
-                  ;; infer it"). They are attached HERE rather than passed
-                  ;; into parse-sql because the parse cache is keyed by SQL
-                  ;; text alone — baking per-statement declarations into a
-                  ;; shared cached map would let one client's `$1::int2`
-                  ;; leak into another's `$1::text`. describeParams and
-                  ;; describeResult read them back off this map.
-                  parsed (assoc parsed :sql sql
-                                :declared-param-oids
-                                (into {} (map-indexed (fn [i o] [(inc i) o]))
-                                      (seq param-oids)))]
-              (when bump-dispatch! (bump-dispatch! parsed))
+                  ;; infer it"). describeParams and describeResult read the
+                  ;; same map that was bound during translation above.
+                    parsed (assoc parsed :sql sql
+                                  :declared-param-oids declared-param-oids)]
+                (when bump-dispatch! (bump-dispatch! parsed))
             ;; Pre-compute result metadata for row-producing system
             ;; queries so describeResult emits a proper RowDescription
             ;; under Extended Query mode. Pure dispatch — no side
             ;; effects — so safe even for nextval / advisory-lock / etc.
-              (if (and (= :system (:type parsed))
-                       (:system-type parsed))
-                (if-let [md (system-result-metadata parsed)]
-                  (assoc parsed :metadata md)
-                  parsed)
-                parsed)))))
+                (if (and (= :system (:type parsed))
+                         (:system-type parsed))
+                  (if-let [md (system-result-metadata parsed)]
+                    (assoc parsed :metadata md)
+                    parsed)
+                  parsed))))))
 
       (describeParams [_ parsed]
         ;; Return a Java int[] of parameter OIDs so Describe('S', …)
@@ -7147,7 +7159,22 @@
         ;; where a write outside an explicit BEGIN opens an implicit
         ;; transaction committed at Sync (commitImplicit) — making a
         ;; pipelined group (executemany / JDBC batch) atomic.
-        (let [bound (vec bound-params)]
+        (let [bound (vec bound-params)
+              ;; The cardinality of a target-list SRF such as
+              ;; generate_series(1,$1) is unknowable at Parse. Its parsed
+              ;; map carries RowDescription metadata; now that Bind supplied
+              ;; values, lower the statement to the actual literal rows.
+              parsed (if (:reparse-with-bound-params? parsed)
+                       (let [db (if (:in-tx? @tx-state)
+                                  (or (:speculative-db @tx-state) (d/db conn))
+                                  (d/db conn))]
+                         (binding [params/*bound-params* bound
+                                   params/*declared-param-oids*
+                                   (:declared-param-oids parsed)]
+                           (assoc (sql/parse-sql (:sql parsed) (dbi/-schema db) db)
+                                  :sql (:sql parsed)
+                                  :declared-param-oids (:declared-param-oids parsed))))
+                       parsed)]
           (binding [params/*statement-time* (java.util.Date.)]
             (or
              ;; Tier-1 compiled lane: plain autocommit SELECT with no
