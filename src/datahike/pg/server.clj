@@ -6567,6 +6567,7 @@
      SET datahike.history = 'true'
      RESET datahike.as_of"
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
+                                              release-conn-on-close?
                                               dispatch-stats
                                               on-create-database on-delete-database
                                               registry-atom
@@ -6642,7 +6643,11 @@
         ;; wire layer keeps the parallel tx-data list and CC tags; we
         ;; only need the running spec-db so the next dc/with sees prior
         ;; rows in the same scope.
-        batch-state (atom nil)]
+        batch-state (atom nil)
+        ;; A URL-pinned branch handler owns one reference acquired through
+        ;; d/connect. Datahike may return the same cached connection to several
+        ;; wire sessions, so each handler must release exactly its own reference.
+        conn-released? (atom false)]
     (reify PgWireServer$QueryHandler
       (close [_]
         ;; pgwire client disconnected — equivalent to a PG backend
@@ -6661,7 +6666,10 @@
         (reset! copy-state nil)
         (reset! tx-state {:in-tx? false :aborted? false
                           :session-id session-id
-                          :owned-locks #{}}))
+                          :owned-locks #{}})
+        (when (and release-conn-on-close?
+                   (compare-and-set! conn-released? false true))
+          (d/release conn)))
 
       ;; --- COPY-IN sub-protocol callbacks --------------------------------
       ;; The wire layer in PgWireServer.java routes CopyData / CopyDone /
@@ -7558,6 +7566,13 @@
        (keyword (.substring database (inc idx)))])
     [database nil]))
 
+(defn- connect-branch
+  "Acquire a Datahike connection whose reader and writer are both pinned to
+   `branch`. The returned connection is reference-counted by Datahike and must
+   be released once by the query handler that requested it."
+  [conn branch]
+  (d/connect (assoc (:config @conn) :branch branch)))
+
 (defn make-query-handler-factory
   "Build a QueryHandlerFactory that routes on the StartupMessage's
    `database` parameter.
@@ -7602,10 +7617,20 @@
                       (first names))
               [requested branch] (parse-db-name raw)]
           (if-let [conn (get registry requested)]
-            (make-query-handler conn
-                                (cond-> (assoc opts :db-name requested
-                                               :registered-databases names)
-                                  branch (assoc :initial-branch branch)))
+            (if branch
+              (let [branch-conn (connect-branch conn branch)]
+                (try
+                  (make-query-handler branch-conn
+                                      (assoc opts
+                                             :db-name requested
+                                             :registered-databases names
+                                             :release-conn-on-close? true))
+                  (catch Throwable e
+                    (d/release branch-conn)
+                    (throw e))))
+              (make-query-handler conn
+                                  (assoc opts :db-name requested
+                                         :registered-databases names)))
             (reject-unknown-db-handler requested)))))))
 
 (defn start-server

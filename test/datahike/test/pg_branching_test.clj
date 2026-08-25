@@ -40,11 +40,8 @@
                     :db/cardinality :db.cardinality/one}])
       (d/transact conn [{:person/id 1 :person/name "Alice"}])
       (let [initial-cid (get-in (d/db conn) [:meta :datahike/commit-id])]
-        ;; Create a branch that keeps the same dataset. Since Datahike's
-        ;; branching is O(1) metadata and branch writes-via-pgwire land
-        ;; on the default branch (see CHANGELOG — deferred to post-0.1),
-        ;; branches in these tests differ only by reachable commits /
-        ;; administrative state, not by data content.
+        ;; Create a branch that keeps the same initial dataset. URL-pinned
+        ;; connections below can subsequently diverge it through pgwire.
         (v/branch! conn :db :feature)
         (let [{:keys [server]} (pg/start-server {"demo" conn} {:port 0})]
           (try
@@ -122,6 +119,50 @@
     ;; Data is the same on both branches (branch! copied the head),
     ;; but the current_branch report reflects the URL-seeded pin.
     (is (= [["1"]] (rows c "SELECT count(*) FROM person")))))
+
+(deftest branch-via-url-suffix-routes-writes
+  (with-open [default (jdbc)]
+    ;; Create after server startup, so the branch inherits pg-datahike's
+    ;; internal DDL metadata schema as a real application-created branch does.
+    (is (= [["writable"]]
+           (rows default "SELECT datahike.create_branch('writable', 'db')")))
+    (with-open [feature (jdbc "demo:writable")]
+      (exec feature "INSERT INTO person VALUES (2, 'Branch Bob')")
+      (exec feature "CREATE TABLE branch_note (id int primary key, note text)")
+      (exec feature "INSERT INTO branch_note VALUES (1, 'feature only')")
+
+      (is (= [["1" "Alice"] ["2" "Branch Bob"]]
+             (rows feature "SELECT id, name FROM person ORDER BY id")))
+      (is (= [["1" "feature only"]]
+             (rows feature "SELECT id, note FROM branch_note")))
+
+      ;; Both data and schema writes must stay off the registry connection's
+      ;; default branch. Silent fallback invalidates every branch workload.
+      (is (= [["1" "Alice"]]
+             (rows default "SELECT id, name FROM person ORDER BY id")))
+      (is (thrown? SQLException
+                   (rows default "SELECT * FROM branch_note"))))))
+
+(deftest branch-via-url-suffix-shares-connection-safely
+  (with-open [default (jdbc)]
+    (rows default "SELECT datahike.create_branch('shared', 'db')")
+    (let [first-client (jdbc "demo:shared")
+          second-client (jdbc "demo:shared")]
+      (try
+        (exec first-client "INSERT INTO person VALUES (2, 'First client')")
+        (.close first-client)
+
+        ;; Datahike caches branch connections. Closing one wire client must
+        ;; release only its reference, not invalidate another client's writer.
+        (exec second-client "INSERT INTO person VALUES (3, 'Second client')")
+        (is (= [["1"] ["2"] ["3"]]
+               (rows second-client "SELECT id FROM person ORDER BY id")))
+        (is (= [["1"]]
+               (rows default "SELECT id FROM person ORDER BY id")))
+        (finally
+          (when-not (.isClosed first-client)
+            (.close first-client))
+          (.close second-client))))))
 
 (deftest set-commit-id-pins-exact-uuid
   (with-open [c (jdbc)]

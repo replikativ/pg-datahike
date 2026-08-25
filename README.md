@@ -278,12 +278,13 @@ jdbc:postgresql://localhost:5432/prod           → prod-conn, default branch
 `SET datahike.commit_id = '<uuid>'` is Datahike-unique: no other
 PG-compatible database lets you query by an exact commit identifier.
 
-**Honest footnote for 0.1**: writes always land on the connection's
-default branch, even when `SET datahike.branch` is active — pgwire
-reads respect the pinned branch, but the transaction writer is
-conn-wide. Users who need to write to a specific branch open a
-second connection on `/<db>:<branch>` or use the Clojure API
-(`datahike.versioning/branch!`, `merge!`, …). Post-0.1 item.
+`SET datahike.branch` changes the session's read view; writes continue
+to land on the connection's configured branch because the Datahike writer is
+connection-wide. A connection opened on `/<db>:<branch>` is different: its
+Datahike reader and writer are both pinned to that branch, so it is the route
+for branch-local SQL mutations. The Clojure API
+(`datahike.versioning/branch!`, `merge!`, …) remains available for workflows
+that need explicit branch administration.
 
 ## Migration & pg_dump interop
 
