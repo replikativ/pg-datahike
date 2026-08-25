@@ -215,6 +215,14 @@
   tokens currently use the C-locale spellings, which is also what the
   regression campaign fixes with lc_numeric = C."
   [value picture]
+  (when (or (instance? java.util.Date value)
+            (instance? java.time.temporal.Temporal value))
+    ;; PostgreSQL's temporal and numeric pictures are separate formatter
+    ;; families. This namespace implements only the numeric one; allowing a
+    ;; temporal value to fall into decimal-value leaks a ClassCastException.
+    (throw (errors/pg-error
+            :feature-not-supported
+            {:feature "to_char with a temporal value"})))
   (let [nodes (parse-picture picture)
         desc (assoc (analyze nodes) :float4? (instance? Float value))
         {:keys [fill? roman-nodes scientific? decimal-idx scale-idx

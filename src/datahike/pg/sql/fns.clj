@@ -1397,6 +1397,78 @@
        ;; date - date is a plain integer count of days, not an interval.
        (- (.toEpochDay (->local-date a)) (.toEpochDay (->local-date b)))))))
 
+(defn- duration->pg-interval
+  "Render a java.time.Duration in PostgreSQL's default interval style. This
+   is an interim value representation: interval columns are still stored as
+   text, but typed temporal subtraction must not fall through to numeric
+   arithmetic."
+  [^java.time.Duration duration]
+  (let [total-nanos (+ (*' (.getSeconds duration) 1000000000)
+                       (.getNano duration))
+        negative? (neg? total-nanos)
+        n (if negative? (- total-nanos) total-nanos)
+        day-nanos (*' 86400 1000000000)
+        days (quot n day-nanos)
+        rem-nanos (rem n day-nanos)
+        hours (quot rem-nanos (*' 3600 1000000000))
+        rem-nanos (rem rem-nanos (*' 3600 1000000000))
+        minutes (quot rem-nanos (*' 60 1000000000))
+        rem-nanos (rem rem-nanos (*' 60 1000000000))
+        seconds (quot rem-nanos 1000000000)
+        nanos (rem rem-nanos 1000000000)
+        fraction (when (pos? nanos)
+                   (str "." (str/replace (format "%09d" (long nanos)) #"0+$" "")))
+        clock (format "%s%02d:%02d:%02d%s"
+                      (if negative? "-" "")
+                      (long hours) (long minutes) (long seconds) (or fraction ""))
+        body (if (pos? days)
+               (let [signed-days (if negative? (- days) days)]
+                 ;; PostgreSQL pluralises -1 (the value is not +1), hence
+                 ;; "-1 days -02:00:00" rather than a global sign prefix.
+                 (str signed-days " day" (when (not= signed-days 1) "s") " " clock))
+               clock)]
+    body))
+
+(defn- ->instant
+  ^java.time.Instant [v]
+  (cond
+    (instance? java.time.Instant v) v
+    (instance? java.util.Date v) (.toInstant ^java.util.Date v)
+    (instance? java.time.LocalDateTime v)
+    (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    (instance? java.time.OffsetDateTime v) (.toInstant ^java.time.OffsetDateTime v)
+    (instance? java.time.ZonedDateTime v) (.toInstant ^java.time.ZonedDateTime v)
+    :else (throw (errors/pg-error
+                  :feature-not-supported
+                  {:feature "timestamp arithmetic outside the supported Java time range"}))))
+
+(def sql-timestamp-
+  (null-safe
+   (fn timestamp-minus [a b]
+     (duration->pg-interval
+      (java.time.Duration/between (->instant b) (->instant a))))))
+
+(defn- ->local-time
+  ^java.time.LocalTime [v]
+  (cond
+    (instance? java.time.LocalTime v) v
+    (string? v) (java.time.LocalTime/parse ^String v)
+    :else (throw (errors/pg-error :invalid-text-representation
+                                  {:type "time" :value (str v)}))))
+
+(def sql-time-
+  (null-safe
+   (fn time-minus [a b]
+     (duration->pg-interval
+      (java.time.Duration/between (->local-time b) (->local-time a))))))
+
+(def sql-unsupported-temporal-arithmetic
+  (null-safe
+   (fn [& _]
+     (throw (errors/pg-error
+             :undefined-function
+             {:function "operator for the supplied temporal argument types"})))))
+
 (defn- throw-division-by-zero []
   (throw (errors/pg-error :division-by-zero {})))
 

@@ -449,6 +449,8 @@
         l (if (instance? StringValue left) r0 l0)
         r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
+        time?    #(= % types/oid-time)
+        timestamp? #(contains? #{types/oid-timestamp types/oid-timestamptz} %)
         money?   #(= % types/oid-money)
         money-factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
                                     types/oid-float4 types/oid-float8} %)
@@ -463,6 +465,11 @@
       ;; int8 for a value the renderer emits as `2020-01-02`, which a
       ;; binary-format client then failed to decode.
       (and minus? (date? l) (date? r))     types/oid-int4
+      ;; These operators produce an interval, not a promoted number. The
+      ;; result OID matters independently of the text rendering: binary
+      ;; clients choose their decoder from RowDescription.
+      (and minus? (time? l) (time? r)) types/oid-interval
+      (and minus? (timestamp? l) (timestamp? r)) types/oid-interval
       ;; Keyed off the date operand only — see date-arith-op in expr.clj
       ;; for why the other one is not inspected.
       (and (or plus? minus?) (date? l))    types/oid-date
@@ -650,6 +657,7 @@
                         (re-find #"with time zone|timestamptz" type-str)
                         types/oid-timestamptz
                         :else types/oid-timestamp)
+           :interval  types/oid-interval
            :uuid      types/oid-uuid
            :bytes     types/oid-bytea
            :bit       types/oid-bit

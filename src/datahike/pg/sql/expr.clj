@@ -1236,9 +1236,18 @@
 
       ;; DATE_ADD(unit, amount, epoch-seconds) → add amount to timestamp
       (= fname "date_add")
-      (let [[_unit amount ts] args]
-        (swap! (:where-clauses ctx) conj [(list '+ ts amount) result-var])
-        result-var)
+      (if (contains? #{types/oid-date types/oid-time types/oid-timestamp
+                       types/oid-timestamptz}
+                     (source-oid ctx (first params)))
+        ;; PostgreSQL 18's date_add(timestamptz, interval [, zone]) is a
+        ;; different signature from the legacy three-number compatibility
+        ;; helper below. Until interval has a structural carrier, reject it
+        ;; at the SQL boundary instead of adding strings or nils.
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature "date_add with an interval"}))
+        (let [[_unit amount ts] args]
+          (swap! (:where-clauses ctx) conj [(list '+ ts amount) result-var])
+          result-var))
 
       ;; DATE_DIFF(unit, end, start) → difference in days (epoch seconds / 86400)
       (= fname "date_diff")
@@ -1269,6 +1278,15 @@
         (swap! (:in-args ctx) conj diff-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param unit end-ts start-ts) result-var])
         result-var)
+
+      ;; Temporal to_char has its own picture language in PostgreSQL. The
+      ;; mapped implementation is deliberately numeric-only.
+      (and (= fname "to_char")
+           (contains? #{types/oid-date types/oid-time types/oid-timestamp
+                        types/oid-timestamptz types/oid-interval}
+                      (source-oid ctx (first params))))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "to_char with a temporal value"}))
 
       ;; Known mapped functions. Emit via an in-param wrapping `null-safe`
       ;; so SQL NULL propagates (UPPER(NULL)=NULL etc.) instead of throwing
@@ -2884,7 +2902,7 @@
       [sym w])))
 
 (defn- date-arith-op
-  "The date-arithmetic fn to emit for `expr`, or nil to use the numeric one.
+  "The temporal-arithmetic fn to emit for `expr`, or nil to use the numeric one.
 
    `date + integer`, `date - integer` and `date - date` are separate
    operators in PostgreSQL (date_pli / date_mii / date_mi). The choice
@@ -2903,18 +2921,38 @@
    right-hand operator to be confused with, and sql-date- dispatches
    days-vs-difference on the runtime value anyway."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
-  (when (contains? #{'+ '-} op-sym)
-    (let [env (oid-env ctx)
-          oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
-          date? #(= (oid %) types/oid-date)
-          l (.getLeftExpression expr)
-          r (.getRightExpression expr)]
-      (cond
-        (date? l) (if (= op-sym '+) 'datahike.pg.sql/sql-date+ 'datahike.pg.sql/sql-date-)
+  (let [env (oid-env ctx)
+        oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
+        l (.getLeftExpression expr)
+        r (.getRightExpression expr)
+        loid (oid l)
+        roid (oid r)
+        date? #(= % types/oid-date)
+        integer? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8} %)
+        timestamp? #(contains? #{types/oid-timestamp types/oid-timestamptz} %)
+        temporal? #(contains? #{types/oid-date types/oid-time types/oid-timestamp
+                                types/oid-timestamptz types/oid-interval} %)]
+    (cond
+      (and (= op-sym '-) (date? loid) (date? roid))
+      'datahike.pg.sql/sql-date-
+        ;; An unknown right operand is normally a plan-cache parameter for
+        ;; an integer literal. Preserve that established date +/- path.
+      (and (contains? #{'+ '-} op-sym) (date? loid)
+           (or (nil? roid) (integer? roid)))
+      (if (= op-sym '+) 'datahike.pg.sql/sql-date+ 'datahike.pg.sql/sql-date-)
         ;; `integer + date` commutes. `integer - date` is not an operator
         ;; in PostgreSQL, so only `+` picks the right-hand date up.
-        (and (= op-sym '+) (date? r)) 'datahike.pg.sql/sql-date+
-        :else nil))))
+      (and (= op-sym '+) (date? roid) (or (nil? loid) (integer? loid)))
+      'datahike.pg.sql/sql-date+
+      (and (= op-sym '-) (timestamp? loid) (timestamp? roid))
+      'datahike.pg.sql/sql-timestamp-
+      (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
+      'datahike.pg.sql/sql-time-
+        ;; Any other typed temporal combination must not reach numeric +/-,
+        ;; whose Number casts leak a JVM implementation error.
+      (or (temporal? loid) (temporal? roid))
+      'datahike.pg.sql/sql-unsupported-temporal-arithmetic
+      :else nil)))
 
 (defn- agg-marker?
   "An aggregate placeholder produced by translate-expr, as distinct from
@@ -3678,6 +3716,7 @@
     (instance? SignedExpression expr)
     (let [^SignedExpression se expr
           sign (.getSign se)
+          source-type (source-oid ctx (.getExpression se))
           inner (translate-expr ctx (.getExpression se))
           inner (if (seq? inner) (ctx/materialize-arg! ctx inner) inner)]
       (case sign
@@ -3685,15 +3724,20 @@
         ;; negating INT_MIN is out of range in PostgreSQL, while Java's
         ;; `-` wraps it back to itself. `(* -1 x)` could not express that
         ;; because the multiplication carries no width.
-        \- (let [w (when-not (number? inner)
-                     (int-width-of ctx (.getExpression se)))]
-             (cond
-               (number? inner) (- inner)
-               w (list 'datahike.pg.sql/sql-int-neg w inner)
-               ;; Route through numeric-special-aware multiplication so
-               ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
-               ;; multiplication casts the carrier record to Number.
-               :else (list 'datahike.pg.sql/sql-* -1 inner)))
+        \- (if (= source-type types/oid-interval)
+             ;; Intervals are still text-backed. Until they have a
+             ;; structural value, never send that carrier through numeric
+             ;; multiplication and leak String->Number to a client.
+             (list 'datahike.pg.sql/sql-unsupported-temporal-arithmetic inner)
+             (let [w (when-not (number? inner)
+                       (int-width-of ctx (.getExpression se)))]
+               (cond
+                 (number? inner) (- inner)
+                 w (list 'datahike.pg.sql/sql-int-neg w inner)
+                 ;; Route through numeric-special-aware multiplication so
+                 ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
+                 ;; multiplication casts the carrier record to Number.
+                 :else (list 'datahike.pg.sql/sql-* -1 inner))))
         ;; `~` — bitwise NOT, over integers and bit strings alike.
         ;; Previously fell through to the identity branch below, so
         ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,

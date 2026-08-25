@@ -252,11 +252,32 @@
      :boundaries #{:scalar-type :operators :casts}
      :blockers #{:user-defined-types :create-cast :gamma-functions
                  :floating-overflow-semantics}}
-    {:name "date" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "time" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "timestamp" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "timestamptz" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "interval" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "date" :mode :discovery
+     :boundaries #{:temporal :casts :operators}
+     :blockers #{:temporal-input-validation :infinity-values
+                 :temporal-function-coverage :operator-resolution}}
+    {:name "time" :mode :discovery
+     :boundaries #{:temporal :casts :operators :typmods}
+     :blockers #{:interval-structural-type :time-zone-semantics
+                 :temporal-input-validation :temporal-typmods}}
+    {:name "timestamp" :mode :discovery
+     :boundaries #{:temporal :casts :operators :functions}
+     :blockers #{:interval-structural-type :temporal-format-pictures
+                 :temporal-constructors :infinity-values
+                 :outside-java-time-range :temporal-function-coverage
+                 :temporal-parser-grammar}}
+    {:name "timestamptz" :mode :discovery
+     :boundaries #{:temporal :casts :operators :functions :time-zones}
+     :blockers #{:interval-structural-type :temporal-format-pictures
+                 :temporal-constructors :infinity-values
+                 :outside-java-time-range :time-zone-semantics
+                 :temporal-function-coverage :temporal-parser-grammar}}
+    {:name "interval" :mode :discovery
+     :boundaries #{:temporal :casts :operators :functions}
+     :blockers #{:interval-structural-type :interval-literal-grammar
+                 :interval-arithmetic :interval-extract
+                 :temporal-format-pictures :temporal-function-coverage
+                 :copy-fixture-dependencies}}
     {:name "create_table" :mode :unmeasured :boundaries #{:ddl}}
     {:name "constraints" :mode :discovery
      :boundaries #{:ddl :constraints}

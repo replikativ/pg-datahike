@@ -372,7 +372,7 @@
     (cond
       (nil? bt) nil
 
-      (#{"jsonb" "json" "money"} bt) bt
+      (#{"jsonb" "json" "money" "interval"} bt) bt
 
       (#{"date" "time" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"
@@ -695,7 +695,7 @@
                        ;; (OID 1114) and pgjdbc rejects subsequent
                        ;; setDate binds with "Can't change resolved
                        ;; type for param …".
-                       (#{"jsonb" "json" "money"
+                       (#{"jsonb" "json" "money" "interval"
                           "date" "time" "timestamp"
                           "timestamptz" "timestamp without time zone"
                           "timestamp with time zone"
