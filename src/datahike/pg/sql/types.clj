@@ -205,6 +205,19 @@
     {:type-name type-name :if-exists? if-exists?
      :cascade? (ident-eq? (first toks) "cascade")}))
 
+(defn parse-drop-domain
+  "Parse a single-name `DROP DOMAIN [IF EXISTS] name [CASCADE|RESTRICT]`."
+  [original-sql]
+  (let [toks (database/tokenize original-sql)
+        toks (skip-kw toks "drop")
+        toks (skip-kw toks "domain")
+        if-exists? (and (ident-eq? (first toks) "if")
+                        (ident-eq? (second toks) "exists"))
+        toks (if if-exists? (drop 2 toks) toks)
+        [domain-name toks] (consume-name toks)]
+    {:domain-name domain-name :if-exists? if-exists?
+     :cascade? (ident-eq? (first toks) "cascade")}))
+
 ;; ============================================================================
 ;; CREATE TYPE … AS (composite)
 ;; ============================================================================

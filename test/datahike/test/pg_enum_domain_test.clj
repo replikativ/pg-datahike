@@ -326,6 +326,20 @@
         (is (str/includes? (or (some-> raised .getMessage) "")
                            "value for domain rgb violates check constraint \"rgb_check\""))))))
 
+(deftest drop-domain-lifecycle
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN rgb AS text")
+    (exec! c "DROP DOMAIN rgb")
+    (let [raised (try (exec! c "SELECT 'red'::rgb") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "42704" (some-> raised .getSQLState))))
+    (exec! c "DROP DOMAIN IF EXISTS rgb")
+    (exec! c "CREATE DOMAIN rgb AS text")
+    (exec! c "CREATE TABLE domain_dependent (value rgb)")
+    (let [raised (try (exec! c "DROP DOMAIN rgb") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "2BP01" (some-> raised .getSQLState))))))
+
 (deftest domain-check-between-enforces
   ;; `BETWEEN` had no clause in eval-check-predicate; the :else
   ;; fallback stringified the AST and returned truthy, so any value

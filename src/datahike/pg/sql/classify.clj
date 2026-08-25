@@ -972,6 +972,7 @@
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
       (kw=? t1 "type")      {:kind :drop-type-enum :system? true :tag "DROP TYPE"}
+      (kw=? t1 "domain")    {:kind :drop-domain :system? true :tag "DROP DOMAIN"}
 
       ;; Symmetric with classify-create — reuse the same :reject-kind
       ;; so a single :silently-accept entry covers both ends.

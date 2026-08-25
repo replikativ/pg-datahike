@@ -4161,7 +4161,7 @@
    and commits separately."
   #{:insert :update :update-with-recursive :delete :truncate
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
-    :ddl-create-enum :ddl-create-domain
+    :ddl-create-enum :ddl-drop-enum :ddl-create-domain :ddl-drop-domain
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
@@ -6395,6 +6395,43 @@
         (catch Exception e
           (classified-error "CREATE DOMAIN error: " e))))))
 
+(defn- exec-ddl-drop-domain
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        {:keys [domain-name if-exists? cascade?]} parsed]
+    (try
+      (let [eid (ffirst
+                 (d/q '{:find [?e]
+                        :in [$ ?name]
+                        :where [[?e :datahike.pg.domain/name ?name]]}
+                      db domain-name))
+            dependents (when eid
+                         (map first
+                              (d/q '{:find [?col]
+                                     :in [$ ?name]
+                                     :where [[?col :datahike.pg/domain-of ?name]]}
+                                   db domain-name)))]
+        (cond
+          (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
+          (nil? eid)
+          (throw (ex-info (str "type " (pr-str domain-name) " does not exist")
+                          {:error :undefined-object :sqlstate "42704"}))
+          (and (seq dependents) cascade?)
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "DROP DOMAIN CASCADE with dependent columns"}))
+          (seq dependents)
+          (throw (ex-info (str "cannot drop type " domain-name
+                               " because other objects depend on it")
+                          {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+          :else
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP DOMAIN")
+            (do (transact-recorded! conn [[:db/retractEntity eid]])
+                (empty-result "DROP DOMAIN")))))
+      (catch Exception e
+        (classified-error "DROP DOMAIN error: " e)))))
+
 (defn- exec-savepoint
   [ctx _parsed]
   (let [{:keys [tx-state]} ctx]
@@ -7761,6 +7798,8 @@
                                                        (exec-ddl-create-composite ctx parsed))
                             :ddl-create-domain     (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-domain ctx parsed))
+                            :ddl-drop-domain       (do (invalidate-schema-cache!)
+                                                       (exec-ddl-drop-domain ctx parsed))
                             :savepoint             (exec-savepoint ctx parsed)
                             :release-savepoint     (exec-release-savepoint ctx parsed)
                             :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
