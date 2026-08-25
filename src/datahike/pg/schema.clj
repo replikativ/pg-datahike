@@ -637,32 +637,61 @@
                             [?e :pg/table-oid ?oid]]}
                   db (row-marker-attr table-name)))))
 
-(defn next-table-oid
-  "Pick the next unused :pg/table-oid. We query via Datalog because the
-   attribute is attached to the row-marker entity, not part of the
-   :schema map."
-  [db]
-  (let [q-fn d/q
-        used (into #{}
-                   (map first)
-                   (q-fn '{:find [?oid]
-                           :where [[?e :pg/table-oid ?oid]]}
-                         db))
-        mx (if (seq used) (apply max used) (dec first-user-oid))]
-    (inc mx)))
+(declare next-user-oid)
 
-(defn next-composite-oid
-  "Next unused OID for a user composite type. Shares the user-OID space
-   with tables (PG OIDs are global) so a composite and a table never
-   collide."
+(defn next-table-oid
+  "Pick the next unused OID for a table from the shared user-object space."
+  [db]
+  (next-user-oid db))
+
+(defn next-user-oid
+  "Next unused OID in the shared PostgreSQL user-object space. Tables,
+   composite types, and enum types all draw from this allocator because
+   PostgreSQL OIDs are catalog-global, not per object kind."
   [db]
   (let [used (into #{}
                    (map first)
                    (concat
                     (d/q '{:find [?o] :where [[?e :datahike.pg.composite/oid ?o]]} db)
+                    (d/q '{:find [?o] :where [[?e :datahike.pg.enum/oid ?o]]} db)
                     (d/q '{:find [?o] :where [[?e :pg/table-oid ?o]]} db)))
         mx (if (seq used) (apply max used) (dec first-user-oid))]
     (inc mx)))
+
+(defn next-composite-oid
+  "Backward-compatible name for the shared user OID allocator."
+  [db]
+  (next-user-oid db))
+
+(defn- legacy-enum-oid [name]
+  ;; Enums created before :datahike.pg.enum/oid was introduced still need a
+  ;; stable catalog identity. Keep them in a distant user-OID band so they do
+  ;; not collide with the sequential allocator used by new objects.
+  (+ 1000000000 (mod (long (.hashCode ^String name)) 1000000000)))
+
+(defn enum-types
+  "Read the user enum registry. Returns declaration-ordered labels and a
+   stable type OID. Older registry entries without an explicit OID receive a
+   deterministic read-only fallback so upgrades do not require a migration."
+  [db]
+  (when db
+    (let [oids (into {}
+                     (d/q '{:find [?n ?o]
+                            :where [[?e :datahike.pg.enum/name ?n]
+                                    [?e :datahike.pg.enum/oid ?o]]}
+                          db))]
+      (->> (d/q '{:find [?n ?vs]
+                  :where [[?e :datahike.pg.enum/name ?n]
+                          [?e :datahike.pg.enum/values-ordered ?vs]]}
+                db)
+           (map (fn [[name values]]
+                  {:name name
+                   :oid (long (get oids name (legacy-enum-oid name)))
+                   :values (->> (clojure.string/split-lines values)
+                                (remove clojure.string/blank?)
+                                vec)}))
+           (sort-by :name)
+           vec))))
 
 (def ^:private sql-type->pg-name
   "Normalize a SQL field type name (as written in CREATE TYPE) to the

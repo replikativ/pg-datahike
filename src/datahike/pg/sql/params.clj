@@ -173,6 +173,26 @@
        (when (seq values)
          (into #{} (map (comp str first)) values))))))
 
+(def ^:private regtype-aliases
+  {"boolean" "bool" "smallint" "int2" "integer" "int4" "int" "int4"
+   "bigint" "int8" "real" "float4" "double precision" "float8"
+   "decimal" "numeric" "character varying" "varchar" "character" "bpchar"})
+
+(defn registered-type-oid
+  "Resolve PostgreSQL's regtype input syntax for built-ins and the user type
+   registries. Returns nil for an unknown name; callers decide whether their
+   boundary should raise or retain the input."
+  ([type-name] (registered-type-oid *parse-db* type-name))
+  ([db type-name]
+   (when type-name
+     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
+           canonical (get regtype-aliases bare bare)]
+       (or (get types/pg-name->oid canonical)
+           (some (fn [{:keys [name oid]}] (when (= name bare) oid))
+                 (pgs/composite-types db))
+           (some (fn [{:keys [name oid]}] (when (= name bare) oid))
+                 (pgs/enum-types db)))))))
+
 (def ^:dynamic *parse-sql*
   "Bound by parse-sql to itself so top-level translate-* entries in
    datahike.pg.sql.stmt can seed `:parse-sql` into make-ctx without a

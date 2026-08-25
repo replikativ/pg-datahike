@@ -6103,7 +6103,7 @@
    - `:datahike.pg.enum/values` — vector of strings (declaration order)
    - `:datahike.pg.enum/value-set` — same values as a `:db.type/string`
      :cardinality/many for fast membership tests"
-  [type-name values]
+  [type-name oid values]
   [;; idempotent schema attrs (ok to re-transact across CREATEs).
    {:db/ident :datahike.pg.enum/name
     :db/valueType :db.type/string
@@ -6115,10 +6115,14 @@
    {:db/ident :datahike.pg.enum/values-ordered
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.enum/oid
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
    ;; the entity itself. We store values both as a many-cardinality
    ;; set (for fast contains?) AND as a single ordered string
    ;; (newline-separated) so dump can recover declaration order.
    {:datahike.pg.enum/name type-name
+    :datahike.pg.enum/oid oid
     :datahike.pg.enum/values (set values)
     :datahike.pg.enum/values-ordered (clojure.string/join "\n" values)}])
 
@@ -6139,7 +6143,11 @@
               (throw (ex-info (str "invalid enum label " (pr-str label))
                               {:error :name-too-long :sqlstate "42622"
                                :detail "Labels must be 63 bytes or less."}))))
-        tx-data (enum-tx-data (:type-name parsed) (:values parsed))]
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))
+        oid (pgs/next-user-oid current-db)
+        tx-data (enum-tx-data (:type-name parsed) oid (:values parsed))]
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
@@ -6184,7 +6192,10 @@
 (defn- exec-ddl-create-composite
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
-        oid (pgs/next-composite-oid (d/db conn))
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))
+        oid (pgs/next-composite-oid current-db)
         tx-data (composite-tx-data (:type-name parsed) oid (:fields parsed))]
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")

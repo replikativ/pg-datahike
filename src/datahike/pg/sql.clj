@@ -1695,6 +1695,8 @@
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
                                                                  (or (nil? raw) (= :__null__ raw))
                                                                  :__null__
+                                                                 (= type-str "regtype")
+                                                                 (or (params/registered-type-oid cte-db raw) raw)
                                                                  enum-values
                                                                  (let [label (str raw)]
                                                                    (if (contains? enum-values label)

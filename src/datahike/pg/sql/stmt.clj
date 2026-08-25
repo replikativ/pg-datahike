@@ -5310,7 +5310,8 @@
             (or (when (and params/*parse-db* (some? inner))
                   (pgs/table-oid params/*parse-db* n))
                 (when (seq n) (Math/abs (.hashCode ^String n)))
-                0))})))))
+                0))
+          :resolve-regtype #(or (params/registered-type-oid params/*parse-db* %) %)})))))
 
 (defn- widen-integral
   "Widen a narrow integral result to Long. `length()` answers an

@@ -299,6 +299,7 @@
                         raises instead (matters for bit width coercion).
      :parse-timestamp — fn String → java.util.Date, from expr.clj.
      :resolve-regclass— fn String → oid, for `::regclass`.
+     :resolve-regtype — fn String → oid, for `::regtype`.
      :prefer-local-datetime? — return a LocalDateTime (microsecond
                         precision) rather than a Date for a timestamp
                         cast. See the :timestamp branch.
@@ -309,7 +310,7 @@
    Returns `v` unchanged for a target this doesn't classify, which is
    what every call site did before and keeps unknown types passing
    through rather than erroring."
-  [v type-str {:keys [explicit? parse-timestamp resolve-regclass
+  [v type-str {:keys [explicit? parse-timestamp resolve-regclass resolve-regtype
                       prefer-local-datetime? src-oid]
                :or {explicit? true}}]
   (if (or (nil? v) (= :__null__ v))
@@ -459,4 +460,5 @@
         (cond
           (= type-str "regnamespace") 2200
           (= type-str "regclass") (if resolve-regclass (resolve-regclass (str v)) v)
+          (= type-str "regtype") (if resolve-regtype (resolve-regtype (str v)) v)
           :else v)))))

@@ -60,7 +60,37 @@
                                 [?e :datahike.pg.enum/values-ordered ?vs]]
                               (d/db *conn*)))]
       (is (= "sad\nok\nhappy" vs-ord)
-          "values stored in declaration order"))))
+          "values stored in declaration order")
+      (is (pos? (ffirst (d/q '[:find ?oid :where
+                               [?e :datahike.pg.enum/name "mood"]
+                               [?e :datahike.pg.enum/oid ?oid]]
+                             (d/db *conn*))))
+          "enum receives a persistent PostgreSQL type OID"))))
+
+(deftest enum-catalogs-share-a-stable-type-oid
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (let [rows (query-rows
+                c
+                (str "SELECT t.typname, t.typtype, e.enumlabel, e.enumsortorder "
+                     "FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+                     "WHERE t.typname = 'mood' ORDER BY e.enumsortorder"))]
+      (is (= [["mood" "e" "sad" 1.0]
+              ["mood" "e" "ok" 2.0]
+              ["mood" "e" "happy" 3.0]]
+             (mapv vec rows))))
+    (is (= [[3]]
+           (mapv vec
+                 (query-rows
+                  c "SELECT COUNT(*) FROM pg_enum WHERE enumtypid = 'mood'::regtype"))))))
+
+(deftest enum-and-table-oids-do-not-collide
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (exec! c "CREATE TABLE enum_owner (id int)")
+    (let [[[enum-oid]] (query-rows c "SELECT oid FROM pg_type WHERE typname = 'mood'")
+          [[table-oid]] (query-rows c "SELECT oid FROM pg_class WHERE relname = 'enum_owner'")]
+      (is (not= enum-oid table-oid)))))
 
 (deftest create-enum-schema-qualified
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]

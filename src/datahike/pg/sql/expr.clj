@@ -2679,6 +2679,8 @@
             (or (when params/*parse-db* (pgs/table-oid params/*parse-db* n))
                 (when (seq n) (Math/abs (.hashCode ^String n)))
                 0))
+          (= type-str "regtype")
+          (or (params/registered-type-oid params/*parse-db* inner-raw) inner-raw)
           :else    inner-raw)
       ;; Variable/expression — add runtime cast binding
         (let [inner-val (ctx/materialize-arg! ctx inner-raw)
@@ -2781,6 +2783,17 @@
                                (or (when db (pgs/table-oid db n))
                                    (when (seq n) (Math/abs (.hashCode ^String n)))
                                    0))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj lookup)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+              result-var)
+
+            (= type-str "regtype")
+            (let [fn-param (symbol (str "?regtype" (swap! (:var-counter ctx) inc)))
+                  db params/*parse-db*
+                  lookup (fn [v]
+                           (when (some? v)
+                             (or (params/registered-type-oid db v) v)))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj lookup)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])

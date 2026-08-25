@@ -45,7 +45,9 @@
 (def oid-interval 1186)
 (def oid-numeric  1700)
 (def oid-uuid     2950)
+(def oid-regclass  2205)
 (def oid-regtype  2206)
+(def oid-regnamespace 4089)
 (def oid-bit      1560)
 (def oid-varbit   1562)
 (def oid-jsonb    3802)
@@ -337,6 +339,9 @@
     "jsonb"       oid-jsonb
     "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
+    "regclass"    oid-regclass
+    "regtype"     oid-regtype
+    "regnamespace" oid-regnamespace
     "tid"         oid-tid
     "char"        oid-char
     "bytea"       oid-bytea
@@ -415,7 +420,9 @@
    oid-float4     "real"
    oid-float8     "double precision"
    oid-numeric    "numeric"
+   oid-regclass   "regclass"
    oid-regtype    "regtype"
+   oid-regnamespace "regnamespace"
    oid-bit        "bit"
    oid-varbit     "bit varying"
    oid-text       "text"
@@ -591,6 +598,9 @@
    [oid-varbit    "varbit"    -1  "b"]
    [oid-jsonb     "jsonb"     -1  "b"]
    [oid-pg-lsn    "pg_lsn"     8  "b"]
+   [oid-regclass  "regclass"    4  "b"]
+   [oid-regtype   "regtype"     4  "b"]
+   [oid-regnamespace "regnamespace" 4 "b"]
    ;; Array types — one per scalar with a paired T[] OID. typtype="b"
    ;; like scalars; the typelem linkage is exposed via element-oid
    ;; lookups at query time (see datahike.pg.sql.catalog).

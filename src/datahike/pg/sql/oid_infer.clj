@@ -611,7 +611,9 @@
       :else nil)))
 
 (defn- composite-name->oid
-  "Resolve a named composite type → its OID via the registry, or nil."
+  "Resolve a named composite type to its persisted OID. Enum values remain
+   text on the wire until pgjdbc's custom-type introspection query is fully
+   supported; their catalog OID is still available through pg_type/pg_enum."
   [type-str db]
   (when (and type-str db)
     (some (fn [{:keys [name oid]}] (when (= name type-str) oid))

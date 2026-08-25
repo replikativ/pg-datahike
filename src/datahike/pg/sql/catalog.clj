@@ -709,8 +709,15 @@
                               :pg_type/typelem 0 :pg_type/typdelim ","
                               :pg_type/typnamespace 2200
                               (pgs/row-marker-attr "pg_type") true})
-                           (pgs/composite-types cte-db))]
-      (into base composites))
+                           (pgs/composite-types cte-db))
+          enums (mapv (fn [{:keys [name oid]}]
+                        {:pg_type/oid oid :pg_type/typname name
+                         :pg_type/typlen 4 :pg_type/typtype "e"
+                         :pg_type/typelem 0 :pg_type/typdelim ","
+                         :pg_type/typnamespace 2200
+                         (pgs/row-marker-attr "pg_type") true})
+                      (pgs/enum-types cte-db))]
+      (into base (concat composites enums)))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
@@ -1257,7 +1264,18 @@
     "pg_inherits"
     []
     "pg_enum"
-    []
+    (vec
+     (for [{:keys [oid values]} (pgs/enum-types cte-db)
+           [idx label] (map-indexed vector values)]
+       {:pg_enum/oid
+        ;; pg_enum rows have their own OIDs. A stable hash is sufficient for
+        ;; catalog identity; enum ordering is represented separately below.
+        (long (bit-and 0x7fffffff
+                       (.hashCode ^String (str oid ":" idx ":" label))))
+        :pg_enum/enumtypid oid
+        :pg_enum/enumsortorder (double (inc idx))
+        :pg_enum/enumlabel label
+        (pgs/row-marker-attr "pg_enum") true}))
     "pg_policy"
     []
     "pg_statistic_ext"
