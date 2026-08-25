@@ -56,8 +56,7 @@
        :test-var "bit-input-error-info"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
-     :blockers #{:numeric-formatting :numeric-series :numeric-log-precision
-                 :numeric-input-validation :parser-values-aliases
+     :blockers #{:numeric-formatting :numeric-series :lateral-values
                  :postgres-internal-functions :pg-lsn}
      :strict-slices
      [{:id :special-power-boundaries
