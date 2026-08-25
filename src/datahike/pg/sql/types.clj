@@ -130,6 +130,56 @@
      :values values
      :original-sql original-sql}))
 
+(defn parse-alter-type-enum
+  "Parse ALTER TYPE enum label mutations. Supports PostgreSQL's
+   `ADD VALUE [IF NOT EXISTS] label [BEFORE|AFTER neighbor]` and
+   `RENAME VALUE old TO new` forms."
+  [original-sql]
+  (let [toks (database/tokenize original-sql)
+        toks (skip-kw toks "alter")
+        toks (skip-kw toks "type")
+        [type-name toks] (consume-name toks)]
+    (cond
+      (and (ident-eq? (first toks) "add")
+           (ident-eq? (second toks) "value"))
+      (let [toks (drop 2 toks)
+            if-not-exists? (and (ident-eq? (first toks) "if")
+                                (ident-eq? (second toks) "not")
+                                (ident-eq? (nth toks 2 nil) "exists"))
+            toks (if if-not-exists? (drop 3 toks) toks)
+            label-token (first toks)
+            _ (when-not (= :string (first label-token))
+                (throw (ex-info "expected enum label" {:error :syntax-error})))
+            toks (rest toks)
+            placement (cond
+                        (ident-eq? (first toks) "before") :before
+                        (ident-eq? (first toks) "after") :after
+                        :else nil)
+            neighbor-token (when placement (second toks))
+            _ (when (and placement (not= :string (first neighbor-token)))
+                (throw (ex-info "expected neighboring enum label"
+                                {:error :syntax-error})))]
+        {:op :add-value :type-name type-name :label (second label-token)
+         :if-not-exists? if-not-exists? :placement placement
+         :neighbor (when neighbor-token (second neighbor-token))})
+
+      (and (ident-eq? (first toks) "rename")
+           (ident-eq? (second toks) "value"))
+      (let [old-token (nth toks 2 nil)
+            to-token (nth toks 3 nil)
+            new-token (nth toks 4 nil)]
+        (when-not (and (= :string (first old-token))
+                       (ident-eq? to-token "to")
+                       (= :string (first new-token)))
+          (throw (ex-info "malformed ALTER TYPE ... RENAME VALUE"
+                          {:error :syntax-error})))
+        {:op :rename-value :type-name type-name
+         :old-label (second old-token) :new-label (second new-token)})
+
+      :else
+      (throw (ex-info "unsupported ALTER TYPE form"
+                      {:error :unsupported-feature :sqlstate "0A000"})))))
+
 ;; ============================================================================
 ;; CREATE TYPE … AS (composite)
 ;; ============================================================================

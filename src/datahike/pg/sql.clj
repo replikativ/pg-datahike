@@ -1037,6 +1037,17 @@
                    :message (.getMessage e)
                    :sqlstate "42601"}))
 
+              :alter-type-enum
+              (try
+                (merge base {:type :ddl-alter-enum}
+                       (user-types/parse-alter-type-enum sql))
+                (catch clojure.lang.ExceptionInfo e
+                  {:type :error
+                   :message (.getMessage e)
+                   :sqlstate (or (:sqlstate (ex-data e)) "42601")})
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
               ;; TRUNCATE — fully token-classified (base carries
               ;; :tables / :restart-identity? / :cascade? from
               ;; cls-info). CASCADE would have to chase FK references

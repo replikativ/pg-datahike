@@ -162,6 +162,42 @@
            (mapv vec
                  (query-rows c "SELECT enum_first(m), enum_last(m) FROM enum_helper_source"))))))
 
+(deftest alter-enum-add-and-rename-values
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE planets AS ENUM ('venus', 'earth', 'mars')")
+    (exec! c "ALTER TYPE planets ADD VALUE 'uranus'")
+    (exec! c "ALTER TYPE planets ADD VALUE 'mercury' BEFORE 'venus'")
+    (exec! c "ALTER TYPE planets ADD VALUE 'jupiter' AFTER 'mars'")
+    (exec! c "ALTER TYPE planets ADD VALUE IF NOT EXISTS 'earth'")
+    (exec! c "ALTER TYPE planets RENAME VALUE 'uranus' TO 'neptune'")
+    (is (= [["mercury"] ["venus"] ["earth"] ["mars"] ["jupiter"] ["neptune"]]
+           (mapv vec
+                 (query-rows c (str "SELECT enumlabel FROM pg_enum "
+                                    "WHERE enumtypid = 'planets'::regtype "
+                                    "ORDER BY enumsortorder")))))
+    (is (= [["mercury" "neptune"]]
+           (mapv vec
+                 (query-rows c "SELECT enum_first(NULL::planets), enum_last(NULL::planets)"))))))
+
+(deftest alter-enum-validates-and-is-transactional
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (doseq [[sql state]
+            [["ALTER TYPE mood ADD VALUE 'sad'" "42710"]
+             ["ALTER TYPE mood ADD VALUE 'ok' AFTER 'missing'" "22023"]
+             ["ALTER TYPE mood RENAME VALUE 'missing' TO 'ok'" "22023"]]]
+      (let [raised (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> raised .getSQLState)))))
+    (.setAutoCommit c false)
+    (exec! c "ALTER TYPE mood ADD VALUE 'ok' BEFORE 'happy'")
+    (.rollback c)
+    (.setAutoCommit c true)
+    (is (= [["sad"] ["happy"]]
+           (mapv vec
+                 (query-rows c (str "SELECT enumlabel FROM pg_enum "
+                                    "WHERE enumtypid = 'mood'::regtype "
+                                    "ORDER BY enumsortorder")))))))
+
 (deftest enum-definition-rejects-duplicate-and-oversized-labels
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (doseq [[sql state]

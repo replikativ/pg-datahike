@@ -6156,6 +6156,80 @@
         (catch Exception e
           (classified-error "CREATE TYPE error: " e))))))
 
+(defn- validate-enum-label! [label]
+  (when (> (alength (.getBytes ^String label
+                               java.nio.charset.StandardCharsets/UTF_8))
+           63)
+    (throw (ex-info (str "invalid enum label " (pr-str label))
+                    {:error :name-too-long :sqlstate "42622"
+                     :detail "Labels must be 63 bytes or less."}))))
+
+(defn- exec-ddl-alter-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        type-name (:type-name parsed)
+        spec (some #(when (= type-name (:name %)) %) (pgs/enum-types db))]
+    (try
+      (when-not spec
+        (throw (ex-info (str "type " (pr-str type-name) " does not exist")
+                        {:error :undefined-object :sqlstate "42704"})))
+      (let [eid (ffirst (d/q '{:find [?e]
+                               :in [$ ?name]
+                               :where [[?e :datahike.pg.enum/name ?name]]}
+                             db type-name))
+            values (:values spec)
+            {:keys [op label if-not-exists? placement neighbor old-label new-label]} parsed
+            [new-values tx-data]
+            (case op
+              :add-value
+              (do
+                (validate-enum-label! label)
+                (if (some #{label} values)
+                  (if if-not-exists?
+                    [values []]
+                    (throw (ex-info (str "enum label " (pr-str label) " already exists")
+                                    {:error :duplicate-object :sqlstate "42710"})))
+                  (let [neighbor-idx (when neighbor (.indexOf ^java.util.List values neighbor))
+                        _ (when (and neighbor (neg? neighbor-idx))
+                            (throw (ex-info (str (pr-str neighbor)
+                                                 " is not an existing enum label")
+                                            {:error :invalid-parameter-value
+                                             :sqlstate "22023"})))
+                        idx (case placement
+                              :before neighbor-idx
+                              :after (inc neighbor-idx)
+                              (count values))
+                        updated (vec (concat (subvec values 0 idx) [label]
+                                             (subvec values idx)))]
+                    [updated [[:db/add eid :datahike.pg.enum/values label]]])))
+
+              :rename-value
+              (do
+                (validate-enum-label! new-label)
+                (when-not (some #{old-label} values)
+                  (throw (ex-info (str (pr-str old-label)
+                                       " is not an existing enum label")
+                                  {:error :invalid-parameter-value :sqlstate "22023"})))
+                (when (and (not= old-label new-label) (some #{new-label} values))
+                  (throw (ex-info (str "enum label " (pr-str new-label) " already exists")
+                                  {:error :duplicate-object :sqlstate "42710"})))
+                [(mapv #(if (= old-label %) new-label %) values)
+                 (if (= old-label new-label)
+                   []
+                   [[:db/retract eid :datahike.pg.enum/values old-label]
+                    [:db/add eid :datahike.pg.enum/values new-label]])]))
+            tx-data (cond-> (vec tx-data)
+                      (not= values new-values)
+                      (conj [:db/add eid :datahike.pg.enum/values-ordered
+                             (clojure.string/join "\n" new-values)]))]
+        (cond
+          (empty? tx-data) (empty-result "ALTER TYPE")
+          (:in-tx? @tx-state) (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")
+          :else (do (transact-recorded! conn tx-data) (empty-result "ALTER TYPE"))))
+      (catch Exception e
+        (classified-error "ALTER TYPE error: " e)))))
+
 (defn- composite-tx-data
   "Build the registry tx-data for a `CREATE TYPE … AS (..)` composite,
    stored as one entity under `:datahike.pg.composite/*`:
@@ -7604,6 +7678,8 @@
                                                        (exec-ddl-alter-sequence ctx parsed))
                             :ddl-create-enum       (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-enum ctx parsed))
+                            :ddl-alter-enum        (do (invalidate-schema-cache!)
+                                                       (exec-ddl-alter-enum ctx parsed))
                             :ddl-create-composite  (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-composite ctx parsed))
                             :ddl-create-domain     (do (invalidate-schema-cache!)

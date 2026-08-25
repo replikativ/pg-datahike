@@ -1067,7 +1067,12 @@
       ;; ALTER TYPE name OWNER TO ... is already covered by the
       ;; OWNER TO branch above.
       (kw=? t1 "type")
-      {:kind :alter-type :reject-kind :alter-type :tag "ALTER TYPE"}
+      (if (some (fn [[a b]]
+                  (or (and (kw=? a "add") (kw=? b "value"))
+                      (and (kw=? a "rename") (kw=? b "value"))))
+                (partition 2 1 toks))
+        {:kind :alter-type-enum :system? true :tag "ALTER TYPE ... VALUE"}
+        {:kind :alter-type :reject-kind :alter-type :tag "ALTER TYPE"})
       (kw=? t1 "domain")
       {:kind :alter-domain :reject-kind :alter-domain :tag "ALTER DOMAIN"}
 

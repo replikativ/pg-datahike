@@ -198,8 +198,9 @@
                  :psql-source-location-presentation}}
     {:name "enum" :mode :discovery
      :boundaries #{:user-type :casts :ordering :catalog-introspection}
-     :blockers #{:alter-type :enum-arrays :create-function
-                 :transactional-type-cascade}
+     :blockers #{:enum-comparison-ordering :enum-sortorder-oid-fidelity
+                 :transactional-new-label-safety :enum-arrays :create-function
+                 :transactional-type-cascade :drop-and-rename-type}
      :strict-slices
      [{:id :enum-input-and-diagnostics
        :source-lines [15 23]
