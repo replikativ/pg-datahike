@@ -82,6 +82,10 @@
        :source-lines [1359 1363]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
        :test-var "exponential-working-precision"}
+      {:id :round-trunc-range-boundaries
+       :source-lines [837 859]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "round-and-trunc-range-boundaries"}
       {:id :sqrt-rounding-thresholds
        :source-lines [1271 1278]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"

@@ -125,6 +125,9 @@
    below BigDecimal's intrinsic limits."
   1000)
 
+(def ^:private ^:const numeric-dscale-max 16383)
+(def ^:private ^:const numeric-max-integer-digits 131072)
+
 (def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS, NBASE = 10000
 
 (defn- nbase-weight+first
@@ -1761,25 +1764,39 @@
   ([x]
    (cond
      (integer? x) x
-     (decimal? x) (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/HALF_UP)
+     (decimal? x) (let [rounded (.setScale ^java.math.BigDecimal x 0
+                                           java.math.RoundingMode/HALF_UP)]
+                    (when (and (not (zero? (.signum rounded)))
+                               (> (- (.precision rounded) (.scale rounded))
+                                  numeric-max-integer-digits))
+                      (throw (errors/pg-error :numeric-value-out-of-range
+                                              {:message "value overflows numeric format"})))
+                    rounded)
      :else (-> (bigdec x)
                (.setScale 0 java.math.RoundingMode/HALF_UP)
                (.longValueExact))))
   ([x n]
-   (-> (bigdec x)
-       (.setScale (int n) java.math.RoundingMode/HALF_UP)
-       ;; strip to the plain numeric the wire encoder expects
-       (.stripTrailingZeros)
-       (.setScale (int n) java.math.RoundingMode/UNNECESSARY))))
+   (let [scale (int (min numeric-dscale-max (max -131073 (long n))))
+         rounded (.setScale (bigdec x) scale java.math.RoundingMode/HALF_UP)]
+     (when (and (not (zero? (.signum rounded)))
+                (> (- (.precision rounded) (.scale rounded))
+                   numeric-max-integer-digits))
+       (throw (errors/pg-error :numeric-value-out-of-range
+                               {:message "value overflows numeric format"})))
+     ;; PostgreSQL does not expose a negative display scale here.
+     (if (neg? scale) (.setScale rounded 0) rounded))))
 
 (defn- sql-trunc
   "SQL TRUNC — round toward zero. TRUNC(x, n) truncates to n decimals."
   ([x]
-   (if (integer? x)
-     x
-     (-> (bigdec x) (.setScale 0 java.math.RoundingMode/DOWN) (.longValueExact))))
+   (cond
+     (integer? x) x
+     (decimal? x) (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/DOWN)
+     :else (-> (bigdec x) (.setScale 0 java.math.RoundingMode/DOWN) (.longValueExact))))
   ([x n]
-   (-> (bigdec x) (.setScale (int n) java.math.RoundingMode/DOWN))))
+   (let [scale (int (min numeric-dscale-max (max -131072 (long n))))
+         truncated (.setScale (bigdec x) scale java.math.RoundingMode/DOWN)]
+     (if (neg? scale) (.setScale truncated 0) truncated))))
 
 (defn- sql-gcd [a b]
   (.gcd (biginteger a) (biginteger b)))
@@ -2500,8 +2517,6 @@
 ;; fuzz reached, and any drift would be in the last digit.
 
 (def ^:private ^:const numeric-max-result-scale 2000)
-(def ^:private ^:const numeric-max-integer-digits 131072)
-
 (defn- clamp-rscale ^long [^long rscale ^long dscale]
   (long (min (max rscale dscale 0) numeric-max-display-scale)))
 

@@ -178,6 +178,34 @@
                      ".9667")]]]
         (is (= expected (one c (str "SELECT exp(" input ")"))) input)))))
 
+(deftest round-and-trunc-range-boundaries
+  (with-open [c (jdbc)]
+    (testing "PostgreSQL numeric.sql lines 837-859"
+      (doseq [sql ["SELECT round(4.4e131071, -131071) = 4e131071"
+                   "SELECT round(4.5e131071, -131071) = 5e131071"
+                   "SELECT round(5e-16383, 1000000) = 5e-16383"
+                   "SELECT round(5e-16383, 16383) = 5e-16383"
+                   "SELECT round(5e-16383, 16382) = 1e-16382"
+                   "SELECT round(5e-16383, 16381) = 0"
+                   "SELECT trunc(9.9e131071, -131071) = 9e131071"
+                   "SELECT trunc(5e-16383, 1000000) = 5e-16383"
+                   "SELECT trunc(5e-16383, 16383) = 5e-16383"
+                   "SELECT trunc(5e-16383, 16382) = 0"]]
+        (is (= "t" (one c sql)) sql))
+      (doseq [sql ["SELECT round(4.5e131071, -131072)"
+                   "SELECT round(5.5e131071, -131073)"
+                   "SELECT round(5.5e131071, -1000000)"
+                   "SELECT trunc(9.9e131071, -131072)"
+                   "SELECT trunc(9.9e131071, -131073)"
+                   "SELECT trunc(9.9e131071, -1000000)"]]
+        (is (= "0" (one c sql)) sql))
+      (try
+        (one c "SELECT round(5.5e131071, -131072)")
+        (is false "rounding carry beyond numeric's maximum weight must fail")
+        (catch SQLException e
+          (is (= "22003" (.getSQLState e)))
+          (is (re-find #"value overflows numeric format" (.getMessage e))))))))
+
 (deftest square-root-rounding-thresholds
   (with-open [c (jdbc)]
     (doseq [[input expected]
