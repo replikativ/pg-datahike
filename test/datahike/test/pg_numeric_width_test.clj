@@ -54,6 +54,14 @@
               rs (.executeQuery st sql)]
     (when (.next rs) (.getString rs 1))))
 
+(defn- column [^Connection c sql]
+  (with-open [st (.createStatement c)
+              rs (.executeQuery st sql)]
+    (loop [result []]
+      (if (.next rs)
+        (recur (conj result (.getString rs 1)))
+        result))))
+
 (defn- seed! [^Connection c]
   (exec! c "CREATE TABLE t (id int primary key, s smallint, i integer, b bigint, p numeric(5,2))")
   (exec! c "INSERT INTO t VALUES (1, 10, 20, 30, 1.25)"))
@@ -172,6 +180,33 @@
                 "less than 10^3.")
            (one c (str "SELECT detail FROM "
                        "pg_input_error_info('1234.567', 'numeric(7,4)')"))))))
+
+(deftest numeric-generate-series-preserves-scale-and-validates-bounds
+  (with-open [c (jdbc)]
+    (is (= ["0.0" "1.0" "2.0" "3.0" "4.0"]
+           (column c "SELECT * FROM generate_series(0.0::numeric, 4.0::numeric)")))
+    (is (= ["0.1" "1.4" "2.7" "4.0"]
+           (column c (str "SELECT * FROM "
+                          "generate_series(0.1::numeric, 4.0::numeric, 1.3::numeric)"))))
+    (is (= ["4.0" "1.8" "-0.4"]
+           (column c (str "SELECT * FROM "
+                          "generate_series(4.0::numeric, -1.5::numeric, -2.2::numeric)"))))
+    (doseq [[sql message]
+            [["SELECT * FROM generate_series(-100::numeric, 100::numeric, 0::numeric)"
+              "step size cannot equal zero"]
+             ["SELECT * FROM generate_series(-100::numeric, 100::numeric, 'nan'::numeric)"
+              "step size cannot be NaN"]
+             ["SELECT * FROM generate_series('nan'::numeric, 100::numeric, 10::numeric)"
+              "start value cannot be NaN"]
+             ["SELECT * FROM generate_series(0::numeric, 'nan'::numeric, 10::numeric)"
+              "stop value cannot be NaN"]
+             ["SELECT * FROM generate_series('inf'::numeric, 'inf'::numeric, 10::numeric)"
+              "start value cannot be infinity"]
+             ["SELECT * FROM generate_series(0::numeric, 'inf'::numeric, 10::numeric)"
+              "stop value cannot be infinity"]
+             ["SELECT * FROM generate_series(0::numeric, 42::numeric, '-inf'::numeric)"
+              "step size cannot be infinity"]]]
+      (is (thrown-with-msg? SQLException (re-pattern message) (column c sql))))))
 
 (deftest writes-enforce-the-declared-width
   (with-open [c (jdbc)]

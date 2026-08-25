@@ -767,6 +767,7 @@
 
 (declare translate-select)
 (declare extract-value)
+(declare apply-sql-cast)
 (declare eval-corr-scalar)
 (declare ^:dynamic *eval-update-db*)
 
@@ -791,8 +792,38 @@
     (instance? SignedExpression expr)
     (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
       (if (number? v) (- v) ::corr))
+    (instance? CastExpression expr)
+    (let [v (srf-const-eval (.getLeftExpression ^CastExpression expr))]
+      (if (= ::corr v) ::corr (apply-sql-cast v ^CastExpression expr)))
     (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
     :else ::corr))
+
+(defn- numeric-series-error! [message]
+  (throw (errors/pg-error :invalid-parameter-value {:message message})))
+
+(defn- numeric-series
+  "Materialize PostgreSQL's finite NUMERIC generate_series variant.
+
+   BigDecimal addition preserves the greater operand scale, which also
+   preserves PostgreSQL's visible scale for cases such as 0.0, 1.0, ... ."
+  [start stop step]
+  (doseq [[value label] [[start "start value"] [stop "stop value"] [step "step size"]]]
+    (when (types/numeric-special? value)
+      (numeric-series-error!
+       (str label " cannot be " (if (= :nan (:kind value)) "NaN" "infinity")))))
+  (let [^java.math.BigDecimal start start
+        ^java.math.BigDecimal stop stop
+        ^java.math.BigDecimal step step
+        direction (.signum step)]
+    (when (zero? direction)
+      (numeric-series-error! "step size cannot equal zero"))
+    (loop [value start
+           result (transient [])]
+      (if (if (pos? direction)
+            (pos? (.compareTo value stop))
+            (neg? (.compareTo value stop)))
+        (persistent! result)
+        (recur (.add value step) (conj! result [value]))))))
 
 (defn- coldef-pg-type
   "The `:pg/type` for a column-definition-list entry like `a int`.
@@ -872,6 +903,8 @@
                     (cond
                       (instance? Long v)    :db.type/long
                       (instance? Double v)  :db.type/double
+                      (instance? java.math.BigDecimal v) :db.type/bigdec
+                      (types/numeric-special? v) :db.type/bigdec
                       (instance? Boolean v) :db.type/boolean
                       (inst? v)             :db.type/instant
                       :else                 :db.type/string))
@@ -909,23 +942,37 @@
            (with-ordinality ["unnest"] (mapv vector vals) [(vtype-of (first vals))] [nil])))
 
        (= fname "generate_series")
-       ;; Integer series (inclusive of stop, like PG). Numeric/timestamp
-       ;; variants are future work; non-integer args fall through to nil.
        (let [args (mapv eval-fn params)]
-         (when (and (>= (count args) 2)
-                    (every? integer? (take 3 args)))
-           (let [[start stop step] args
-                 step (long (or step 1))]
-             (when-not (zero? step)
-               (let [vals (vec (range start
-                                      (if (pos? step) (inc stop) (dec stop))
-                                      step))]
-                 ;; PG types integer generate_series as int4 — advertise
-                 ;; that so clients parse the values as numbers, not int8
-                 ;; strings.
-                 (with-ordinality ["generate_series"]
-                   (mapv (fn [v] [(long v)]) vals)
-                   [:db.type/long] ["int4"]))))))
+         (when (>= (count args) 2)
+           (let [[start stop supplied-step] args
+                 numeric? (some #(or (instance? java.math.BigDecimal %)
+                                     (types/numeric-special? %))
+                                (take 3 args))]
+             (cond
+               numeric?
+               (let [as-numeric #(if (integer? %) (bigdec %) %)
+                     start (as-numeric start)
+                     stop (as-numeric stop)
+                     step (as-numeric (or supplied-step java.math.BigDecimal/ONE))]
+                 (when (every? #(or (instance? java.math.BigDecimal %)
+                                    (types/numeric-special? %))
+                               [start stop step])
+                   (with-ordinality ["generate_series"]
+                     (numeric-series start stop step)
+                     [:db.type/bigdec] ["numeric"])))
+
+               (every? integer? (take 3 args))
+               (let [step (long (or supplied-step 1))]
+                 (when-not (zero? step)
+                   (let [vals (vec (range start
+                                          (if (pos? step) (inc stop) (dec stop))
+                                          step))]
+                     ;; PG types integer generate_series as int4 — advertise
+                     ;; that so clients parse the values as numbers, not int8
+                     ;; strings.
+                     (with-ordinality ["generate_series"]
+                       (mapv (fn [v] [(long v)]) vals)
+                       [:db.type/long] ["int4"]))))))))
 
        ;; json_to_recordset / jsonb_to_recordset expand an ARRAY of
        ;; objects into typed rows; the *_record forms take one object.

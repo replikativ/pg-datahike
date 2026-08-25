@@ -104,6 +104,10 @@
        :source-lines [1191 1195]
        :gate "test/datahike/test/pg_numeric_width_test.clj"
        :test-var "numeric-input-validation-obeys-range-and-typmod"}
+      {:id :numeric-generate-series
+       :source-lines [1370 1380]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "numeric-generate-series-preserves-scale-and-validates-bounds"}
       {:id :sqrt-rounding-thresholds
        :source-lines [1271 1278]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
