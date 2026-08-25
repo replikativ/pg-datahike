@@ -295,6 +295,17 @@
     (let [rows (query-rows c "SELECT id, y FROM film ORDER BY id")]
       (is (= [[1 2020]] (mapv vec rows))))))
 
+(deftest domain-check-enforces-on-direct-cast
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'green', 'blue', 'purple')")
+    (exec! c "CREATE DOMAIN rgb AS rainbow CHECK (VALUE IN ('red', 'green', 'blue'))")
+    (is (= [["green"]] (mapv vec (query-rows c "SELECT 'green'::rgb"))))
+    (doseq [sql ["SELECT 'purple'::rgb" "SELECT 'purple'::rainbow::rgb"]]
+      (let [raised (try (query-rows c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "23514" (some-> raised .getSQLState)))
+        (is (str/includes? (or (some-> raised .getMessage) "")
+                           "value for domain rgb violates check constraint \"rgb_check\""))))))
+
 (deftest domain-check-between-enforces
   ;; `BETWEEN` had no clause in eval-check-predicate; the :else
   ;; fallback stringified the AST and returned truthy, so any value

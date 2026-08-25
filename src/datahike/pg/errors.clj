@@ -139,8 +139,12 @@
 
    :check-violation
    {:sqlstate "23514"
-    :format (fn [{:keys [table constraint]}]
-              (when (and table constraint)
+    :format (fn [{:keys [table constraint domain]}]
+              (cond
+                (and domain constraint)
+                (str "value for domain " domain
+                     " violates check constraint \"" constraint "\"")
+                (and table constraint)
                 (str "new row for relation \"" table
                      "\" violates check constraint \"" constraint "\"")))}
 

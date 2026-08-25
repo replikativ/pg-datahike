@@ -1649,6 +1649,7 @@
                                                                                 (or (contains? types/pg-name->oid full-str)
                                                                                     (contains? types/pg-name->oid type-str))
                                                                                  (params/registered-enum-values cte-db full-str))
+                                                                   domain-spec (params/registered-domain-spec cte-db full-str)
                                                                    _ (when-not (pgs/sql-type-exists? cte-db full-str)
                                                                        (throw (errors/pg-error
                                                                                :undefined-object
@@ -1724,6 +1725,8 @@
                                                                  :__null__
                                                                  (= type-str "regtype")
                                                                  (or (params/registered-type-oid cte-db raw) raw)
+                                                                 domain-spec
+                                                                 (params/cast-domain-value cte-db domain-spec raw)
                                                                  enum-values
                                                                  (let [label (str raw)]
                                                                    (if (contains? enum-values label)

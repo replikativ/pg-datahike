@@ -2577,6 +2577,7 @@
                                (not (contains? types/pg-name->oid type-str)))
                       (params/registered-enum-values (:db ctx) type-str))
         is-enum? (some? enum-values)
+        domain-spec (params/registered-domain-spec (:db ctx) type-str)
         enum-cast (fn [v]
                     (if (or (nil? v) (= :__null__ v))
                       :__null__
@@ -2612,6 +2613,17 @@
           result-var))
 
       ;; Both types VALIDATE on input; only jsonb normalises after.
+      domain-spec
+      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+        (params/cast-domain-value (:db ctx) domain-spec inner-raw)
+        (let [fn-param (symbol (str "?domain-cast-" (swap! (:var-counter ctx) inc)))
+              result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
+              inner-val (ctx/materialize-arg! ctx inner-raw)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj #(params/cast-domain-value (:db ctx) domain-spec %))
+          (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+          result-var))
+
       json-cast
       (if (string? inner-raw)
         (do (jb/validate-json! inner-raw)
