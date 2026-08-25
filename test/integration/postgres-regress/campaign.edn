@@ -120,6 +120,10 @@
        :source-lines [1570 1574]
        :gate "test/datahike/test/pg_math_functions_test.clj"
        :test-var "factorial-and-scale-inspectors"}
+      {:id :insert-values-numeric-arithmetic
+       :source-lines [1501 1509]
+       :gate "test/datahike/test/pg_insert_coercion_test.clj"
+       :test-var "insert-values-evaluates-numeric-arithmetic"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"

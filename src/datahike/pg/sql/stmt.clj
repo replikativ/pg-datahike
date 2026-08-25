@@ -5001,6 +5001,19 @@
               (widen-integral (if (sequential? lr) (first lr) lr)))))))
     (catch Throwable _ nil)))
 
+(defn- extract-numeric-binary
+  "Evaluate a binary numeric expression in INSERT ... VALUES using the
+   same PostgreSQL arithmetic helpers as SELECT/UPDATE."
+  [left right schema db operation]
+  (let [l (extract-value left schema db)
+        r (extract-value right schema db)]
+    (cond
+      (or (nil? l) (nil? r)) nil
+      (and (or (number? l) (types/numeric-special? l))
+           (or (number? r) (types/numeric-special? r)))
+      (operation l r)
+      :else ::unhandled)))
+
 (defn extract-value
   "Extract a Clojure value from a JSqlParser expression for INSERT VALUES.
    Optional schema+db params enable scalar subquery evaluation.
@@ -5061,6 +5074,46 @@
      (instance? CastExpression e)
      (apply-sql-cast (extract-value (.getLeftExpression ^CastExpression e) schema db)
                      ^CastExpression e)
+     (instance? Addition e)
+     (let [^Addition expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-+)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Subtraction e)
+     (let [^Subtraction expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql--)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Multiplication e)
+     (let [^Multiplication expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-*)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Division e)
+     (let [^Division expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-div)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Modulo e)
+     (let [^Modulo expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-mod)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
     ;; Parenthesized single expression — unwrap
      (instance? ParenthesedExpressionList e)
      (let [^ParenthesedExpressionList pel e]
