@@ -90,6 +90,8 @@
     (is (= "1" (one c "SELECT factorial(0)")))
     (is (thrown-with-msg? SQLException #"factorial of a negative number"
                           (one c "SELECT factorial(-1)")))
+    (is (thrown-with-msg? SQLException #"value overflows numeric format"
+                          (one c "SELECT factorial(100000)")))
     (is (= "4" (one c "SELECT scale(8.4100)")) "the DECLARED scale")
     (is (= "2" (one c "SELECT min_scale(8.4100)")) "the scale still needed")
     (is (= "8.41" (one c "SELECT trim_scale(8.4100)")))))

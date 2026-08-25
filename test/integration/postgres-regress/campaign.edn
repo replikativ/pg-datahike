@@ -116,6 +116,10 @@
        :source-lines [1418 1441]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
        :test-var "logarithms-follow-postgresql-working-scales"}
+      {:id :numeric-factorial-overflow
+       :source-lines [1570 1574]
+       :gate "test/datahike/test/pg_math_functions_test.clj"
+       :test-var "factorial-and-scale-inspectors"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"

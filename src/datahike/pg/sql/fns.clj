@@ -3155,7 +3155,11 @@
      (let [v (long n)]
        (cond
          (neg? v) (throw-out-of-range "factorial of a negative number is undefined")
-         (> v 100000) (throw-out-of-range "value overflows numeric format")
+         ;; numeric.c rejects this before multiplication: 32177! is the
+         ;; largest factorial that fits NUMERIC's 131072 integer digits.
+         ;; The former 100000 guard let factorial(100000) allocate and emit
+         ;; a 456574-digit value before the regression runner could object.
+         (> v 32177) (throw-out-of-range "value overflows numeric format")
          :else (loop [i 2 acc java.math.BigInteger/ONE]
                  (if (> i v)
                    (java.math.BigDecimal. acc)
