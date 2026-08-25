@@ -1522,6 +1522,16 @@
     (collect-in-expr!
      acc
      (.getRightExpression ^net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr))
+    ;; JSqlParser represents `NOT EXISTS (…)` as a unary NotExpression
+    ;; around ExistsExpression (despite ExistsExpression also having an
+    ;; `isNot` flag in some parser paths). Without crossing this wrapper,
+    ;; catalogs referenced only by the subquery were never materialised:
+    ;; the translated not-join was sound, but searched an enriched db that
+    ;; contained the outer catalog alone.
+    (instance? net.sf.jsqlparser.expression.NotExpression expr)
+    (collect-in-expr!
+     acc
+     (.getExpression ^net.sf.jsqlparser.expression.NotExpression expr))
     (instance? net.sf.jsqlparser.expression.BinaryExpression expr)
     (let [^net.sf.jsqlparser.expression.BinaryExpression be expr]
       (-> acc

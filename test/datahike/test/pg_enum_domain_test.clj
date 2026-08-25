@@ -84,6 +84,28 @@
                  (query-rows
                   c "SELECT COUNT(*) FROM pg_enum WHERE enumtypid = 'mood'::regtype"))))))
 
+(deftest enum-catalog-has-no-orphaned-labels
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (testing "the catalog OIDs join directly"
+      (is (= [[3]]
+             (mapv vec
+                   (query-rows
+                    c (str "SELECT COUNT(*) FROM pg_enum e JOIN pg_type t "
+                           "ON t.oid = e.enumtypid WHERE t.typname = 'mood'"))))))
+    (testing "PostgreSQL's cleanup invariant works as a correlated anti-join"
+      (is (= []
+             (mapv vec
+                   (query-rows
+                    c (str "SELECT enumlabel FROM pg_enum e WHERE NOT EXISTS "
+                           "(SELECT 1 FROM pg_type t WHERE t.oid = e.enumtypid)"))))))
+    (testing "and with the outer column left unqualified, as upstream writes it"
+      (is (= []
+             (mapv vec
+                   (query-rows
+                    c (str "SELECT enumlabel FROM pg_enum WHERE NOT EXISTS "
+                           "(SELECT 1 FROM pg_type WHERE pg_type.oid = enumtypid)"))))))))
+
 (deftest enum-and-table-oids-do-not-collide
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
