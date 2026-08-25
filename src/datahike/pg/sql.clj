@@ -800,17 +800,43 @@
                             (instance? SetOperationList body) body
                             (instance? ParenthesedSelect body)
                             (.getSelect ^ParenthesedSelect body)
-                            :else nil)]
+                            :else nil)
+               recursive-step
+               (when (instance? SetOperationList inner)
+                 (let [branches (.getSelects ^SetOperationList inner)]
+                   (when (and (= 2 (count branches))
+                              (instance? PlainSelect (second branches)))
+                     (second branches))))
+               demand-limited-recursion?
+               (and recursive?
+                    (instance? PlainSelect stmt)
+                    (some? (.getLimit ^PlainSelect stmt))
+                    recursive-step
+                    (nil? (.getWhere ^PlainSelect recursive-step)))]
            (cond
              ;; Recursive WITH on UPDATE — leave to translate-update.
              (and recursive? (instance? Update stmt))
              [curr-db curr-schema deferred ns-map]
 
              recursive?
-             (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
-                               (catch Throwable _ nil))
-                   iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
-                               (catch Throwable _ nil))
+             (do
+               ;; PostgreSQL evaluates a recursive CTE on demand: an outer
+               ;; LIMIT can stop an otherwise infinite recursive term. Our
+               ;; CTE layer materializes the complete fixed point before the
+               ;; outer SELECT runs, so this shape otherwise grows without
+               ;; bound (the upstream `with.sql` corpus exhausted multiple
+               ;; gigabytes on `SELECT n+1 FROM t LIMIT 10`). Reject the
+               ;; structurally unbounded case before entering Datahike's
+               ;; recursive-rule executor. A recursive term with a WHERE
+               ;; predicate keeps the existing finite fixed-point path.
+               (when demand-limited-recursion?
+                 (throw (errors/pg-error
+                         :feature-not-supported
+                         {:feature "demand-driven recursive CTE evaluation with LIMIT"})))
+               (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
+                                 (catch Throwable _ nil))
+                     iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
+                                 (catch Throwable _ nil))
                    ;; Parameterised CTEs: prefer the iterative evaluator (it
                    ;; defers a table-full param anchor to Execute and handles
                    ;; complex bodies — asyncpg's typeinfo_tree); it bails (nil)
@@ -818,20 +844,20 @@
                    ;; ground-rule-params owns that. Non-parameterised: keep the
                    ;; proven single-rule path first, iteration as the fallback
                    ;; for bodies the rule can't represent (LEFT JOIN, etc.).
-                   paramy? (boolean (seq (try (params/ast-param-indices wi)
-                                              (catch Throwable _ nil))))
-                   m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
-               (if m
+                     paramy? (boolean (seq (try (params/ast-param-indices wi)
+                                                (catch Throwable _ nil))))
+                     m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
+                 (if m
                  ;; A parameterised recursive CTE enriches only the schema
                  ;; now and carries a `:deferred` spec for Execute-time data.
                  ;; Recursive CTEs keep their own name as the namespace
                  ;; for now — the rule/iterative evaluators thread
                  ;; :target-name end-to-end into Execute, so relocating
                  ;; them is a larger change. Tracked separately.
-                 [(:db m) (:schema m)
-                  (cond-> deferred (:deferred m) (conj (:deferred m)))
-                  ns-map]
-                 [curr-db curr-schema deferred ns-map]))
+                   [(:db m) (:schema m)
+                    (cond-> deferred (:deferred m) (conj (:deferred m)))
+                    ns-map]
+                   [curr-db curr-schema deferred ns-map])))
 
              (some? inner)
              ;; With the CTEs materialised SO FAR in scope. A WITH list is

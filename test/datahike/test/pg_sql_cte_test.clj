@@ -214,6 +214,16 @@
            (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5)
                     SELECT n FROM t ORDER BY n")))))
 
+(deftest demand-limited-unbounded-recursion-fails-before-materialization
+  (with-open [c (jdbc)]
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE t(n) AS (
+                                    SELECT 1 UNION SELECT n+1 FROM t
+                                  ) SELECT n FROM t LIMIT 10")))]
+      (is (= "0A000" (.getSQLState ^SQLException e)))
+      (is (re-find #"demand-driven recursive CTE"
+                   (.getMessage ^SQLException e))))))
+
 (deftest with-recursive-update-from-cte
   ;; Lock-in for the UPDATE WITH RECURSIVE path with a 2-column CTE — the
   ;; shape that previously triggered datahike's delta-driven-expand fast

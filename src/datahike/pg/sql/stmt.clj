@@ -3939,6 +3939,24 @@
                                                                 inner-expr)))]
                                     (try (oid/expr-oid e agg-oid-env)
                                          (catch Throwable _ nil)))
+                          ;; Interval values currently use their textual wire
+                          ;; representation internally. Feeding those strings
+                          ;; to the numeric SUM/AVG implementations leaked a
+                          ;; JVM ClassCastException. Until intervals have a
+                          ;; structural value type, refuse these two aggregate
+                          ;; overloads explicitly instead of exposing an
+                          ;; internal failure as SQL behavior.
+                          interval-arg?
+                          (or (= types/oid-interval arg-oid)
+                              (and (instance? CastExpression arg-expr)
+                                   (= "interval"
+                                      (some-> ^CastExpression arg-expr
+                                              .getColDataType str str/lower-case))))
+                          _ (when (and interval-arg?
+                                       (contains? #{"sum" "avg"} fname))
+                              (throw (errors/pg-error
+                                      :feature-not-supported
+                                      {:feature (str fname "(interval) as a window function")})))
                           agg-sym (when agg-sym
                                     (or (pick-precision-variant fname arg-oid) agg-sym))
                           win-spec (cond-> {:op op-kw

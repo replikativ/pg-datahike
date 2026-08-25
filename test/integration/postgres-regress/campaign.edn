@@ -332,8 +332,17 @@
        :source-lines [155 159]
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
        :test-var "corr-resolves-unknown-literals-as-float8"}]}
-    {:name "window" :mode :unmeasured :boundaries #{:windows}}
-    {:name "with" :mode :unmeasured :boundaries #{:ctes}}
+    {:name "window" :mode :discovery
+     :boundaries #{:windows :aggregates :expressions}
+     :blockers #{:window-groups-frames :window-exclusion
+                 :custom-functions :custom-aggregates
+                 :nested-analytic-expressions :window-find-shapes
+                 :interval-structural-type}}
+    {:name "with" :mode :discovery
+     :boundaries #{:ctes :recursive-queries}
+     :blockers #{:cte-multiple-reference :recursive-cte-lowering
+                 :recursive-views :demand-driven-recursion
+                 :recursive-type-inference}}
     {:name "limit" :mode :discovery
      :boundaries #{:relational}
      :blockers #{:backward-cursors :set-returning-projections :planner-explain
