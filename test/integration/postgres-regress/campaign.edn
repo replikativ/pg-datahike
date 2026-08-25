@@ -105,6 +105,10 @@
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "scalar-functions-pass-specials-through"}
+      {:id :width-bucket-unknown-specials
+       :source-lines [871 876]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
        :test-var "scalar-functions-pass-specials-through"}]}
     {:name "money" :mode :discovery
      :boundaries #{:scalar-type :operators :casts :text-codec}

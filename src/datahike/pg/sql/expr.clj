@@ -125,11 +125,17 @@
                             (= :homogeneous rule) (count arg-exprs)
                             (map? rule) (:homogeneous-prefix rule))]
     (if homogeneous-count
-      (let [homogeneous-args (take homogeneous-count arg-exprs)]
-        (if-let [target (some #(numeric-target-for-oid
-                                (try (source-oid ctx %)
-                                     (catch Throwable _ nil)))
-                              homogeneous-args)]
+      (let [homogeneous-args (take homogeneous-count arg-exprs)
+            targets (keep #(numeric-target-for-oid
+                            (try (source-oid ctx %)
+                                 (catch Throwable _ nil)))
+                          homogeneous-args)
+            ;; Resolve from every known argument, not merely the first.
+            ;; PostgreSQL promotes integer + numeric to numeric, and a
+            ;; float argument outranks numeric for these overloads.
+            rank {:long 0 :bigdec 1 :float 2 :double 3}
+            target (when (seq targets) (apply max-key rank targets))]
+        (if target
           (mapv (fn [idx arg]
                   (if (and (< idx homogeneous-count)
                            (instance? StringValue arg))

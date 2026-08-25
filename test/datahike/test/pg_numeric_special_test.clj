@@ -182,6 +182,10 @@
       (is (= "11" (one c "SELECT width_bucket('Infinity'::numeric, 1, 10, 10)")))
       (is (= "0" (one c "SELECT width_bucket('-Infinity'::numeric, 1, 10, 10)")))
       (is (= "889" (one c "SELECT width_bucket('NaN', 3.0, 4.0, 888)")))
+      (is (thrown-with-msg? SQLException #"bounds cannot be NaN"
+                            (one c "SELECT width_bucket(0, 'NaN', 4.0, 888)")))
+      (is (thrown-with-msg? SQLException #"bounds cannot be NaN"
+                            (one c "SELECT width_bucket(0, 3.0, 'NaN', 888)")))
       (is (= "10" (one c "SELECT width_bucket(0, -1e100::numeric, 1, 10)")))
       (is (= "10" (one c "SELECT width_bucket(0, -1e100::float8, 1, 10)")))
       (is (= "10" (one c "SELECT width_bucket(1, 1e100::numeric, 0, 10)")))
