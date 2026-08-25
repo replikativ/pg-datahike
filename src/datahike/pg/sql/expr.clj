@@ -764,9 +764,18 @@
             evar (ctx/entity-var! ctx (:default-table ctx))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj (fn [_row & more] (apply impl (or more nil))))
-        (swap! (:where-clauses ctx) conj
-               [(apply list fn-param evar args) result-var])
-        result-var)
+        (if (:aggregate-projection? ctx)
+          ;; A volatile scalar beside an aggregate belongs above the
+          ;; grouping step: PostgreSQL evaluates it once per output group,
+          ;; not once per input row.  Returning the form directly lets
+          ;; split-aggregate-projection retain it in the deferred projection.
+          ;; The wrapper ignores its first argument, so nil is the appropriate
+          ;; synthetic row token when no input entity survives grouping.
+          (apply list fn-param nil args)
+          (do
+            (swap! (:where-clauses ctx) conj
+                   [(apply list fn-param evar args) result-var])
+            result-var)))
 
       (= fname "pg_typeof")
       (let [arg-expr (first params)
@@ -1617,35 +1626,43 @@
    is a find element, not a binding. PostgreSQL draws the same line: the
    scan and the aggregate below, the projection above.
 
-   A clause is above the line when any of its inputs is (transitively) an
-   aggregate slot. Those are inlined -- their SSA-style out-variables
-   substituted back into one nested form -- and the rest are handed back
-   to the query untouched, which is what keeps an ordinary column
-   reference in the same expression (`sum(x) + id`) working.
+   Every SSA-style binding emitted while translating this SELECT item is
+   above that line once its output feeds the final projection. Those bindings
+   are inlined back into one nested form. Source-column bindings were emitted
+   before this item's clause slice and therefore remain query inputs; this is
+   what keeps an ordinary grouped column in the same expression
+   (`sum(x) + id * 2`) available without making the derived scalar a new
+   grouping key.
 
    Returns [query-clauses projection-form]."
   [v clauses agg-vars]
   (let [out-of (fn [c] (when (and (vector? c) (= 2 (count c)) (seq? (first c)))
                          (second c)))
-        deferred (volatile! (set agg-vars))
-        above? (fn [c]
-                 (boolean (some @deferred
-                                (filter symbol? (tree-seq coll? seq (first c))))))
-        keep-cs (vec (remove (fn [c]
-                               (if-let [o (out-of c)]
-                                 (when (above? c) (vswap! deferred conj o) true)
-                                 false))
-                             clauses))
+        ;; `get-else` is a source-column read, not projection work. Inlining
+        ;; it would hide the source variable from the 42803 grouping check
+        ;; and leave post-processing without a db/eid execution context.
+        source-binding? (fn [c]
+                          (and (vector? c) (seq? (first c))
+                               (= 'get-else (ffirst c))))
         by-out (into {} (keep (fn [c]
-                                (when-let [o (out-of c)]
-                                  (when (contains? @deferred o) [o (first c)])))
-                              clauses))
+                                (when (and (not (source-binding? c))
+                                           (out-of c))
+                                  [(out-of c) (first c)])))
+                     clauses)
+        expanded (volatile! (set agg-vars))
         inline (fn inline [x]
                  (cond
-                   (and (symbol? x) (contains? by-out x)) (inline (get by-out x))
+                   (and (symbol? x) (contains? by-out x))
+                   (do (vswap! expanded conj x)
+                       (inline (get by-out x)))
+
                    (seq? x) (apply list (map inline x))
-                   :else x))]
-    [keep-cs (inline v)]))
+                   :else x))
+        form (inline v)
+        keep-cs (vec (remove (fn [c]
+                               (contains? @expanded (out-of c)))
+                             clauses))]
+    [keep-cs form]))
 
 (defn translate-case-expr
   "Translate a CASE WHEN expression by compiling a Clojure function

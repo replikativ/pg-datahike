@@ -31,7 +31,7 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            CastExpression Function JdbcParameter Parenthesis NotExpression
+            AnalyticExpression CastExpression Function JdbcParameter Parenthesis NotExpression
             LongValue StringValue DoubleValue DateValue TimestampValue
             SignedExpression BinaryExpression]
            [net.sf.jsqlparser.expression.operators.relational
@@ -494,6 +494,57 @@
                            (catch Throwable _)))))))]
       (walk node)
       (persistent! columns))))
+
+(defn ast-function-names
+  "Return the lower-case names of functions reachable in an expression AST.
+
+   Nested SELECTs are separate scopes and deliberately opaque. This is used
+   before lowering to decide whether volatile scalar calls belong above an
+   aggregate grouping step; relying on traversal order (`sum(x)+random()` vs
+   `random()+sum(x)`) would otherwise change semantics."
+  [node]
+  (let [seen (java.util.IdentityHashMap.)
+        names (transient #{})]
+    (letfn [(walk [n]
+              (cond
+                (nil? n) nil
+                (.containsKey seen n) nil
+                (or (string? n) (number? n) (boolean? n) (keyword? n)) nil
+                :else
+                (do
+                  (.put seen n true)
+                  (cond
+                    (instance? Function n)
+                    (do (conj! names (str/lower-case (.getName ^Function n)))
+                        (when-let [ps (.getParameters ^Function n)] (walk ps)))
+
+                    (instance? AnalyticExpression n)
+                    (do (conj! names (str/lower-case (.getName ^AnalyticExpression n)))
+                        (doseq [^java.lang.reflect.Method m (.getMethods (class n))
+                                :let [mn (.getName m)]
+                                :when (and (zero? (count (.getParameterTypes m)))
+                                           (.startsWith mn "get")
+                                           (not= "getClass" mn)
+                                           (not= "getDataType" mn)
+                                           (not= "getName" mn))]
+                          (try (walk (.invoke m n (object-array 0)))
+                               (catch Throwable _))))
+
+                    (instance? Select n) nil
+                    (instance? java.lang.Iterable n) (doseq [v n] (walk v))
+                    (.isArray (class n)) (when-not (.isPrimitive (.getComponentType (class n)))
+                                           (doseq [v n] (walk v)))
+                    (.startsWith (.getName (class n)) "net.sf.jsqlparser.")
+                    (doseq [^java.lang.reflect.Method m (.getMethods (class n))
+                            :let [mn (.getName m)]
+                            :when (and (zero? (count (.getParameterTypes m)))
+                                       (or (.startsWith mn "get") (.startsWith mn "is"))
+                                       (not= "getClass" mn)
+                                       (not= "getDataType" mn))]
+                      (try (walk (.invoke m n (object-array 0)))
+                           (catch Throwable _)))))))]
+      (walk node)
+      (persistent! names))))
 
 ;; ---------------------------------------------------------------------------
 ;; PG OID inference

@@ -137,6 +137,7 @@
          materialize-table-function
          materialize-derived-select!
          materialize-set-op!
+         apply-compound-projections
          match-aggregate-index
          select-item-alias
          eval-values-literal
@@ -1957,7 +1958,6 @@
            :else
            {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
          sub-parsed (first (:branches branch-parsed))
-         sub-aliases (:find-aliases sub-parsed)
         ;; Per-column expected OID from the inner translate-select's
         ;; oid-infer pass. Used as a default when the materialised
         ;; rows are empty or numerically-mixed (samples alone can't
@@ -1986,11 +1986,32 @@
                                     sql-offset (drop sql-offset)
                                     sql-limit  (take sql-limit))
                               hc (or hidden-count 0)
-                              visible (- (count (:find query)) hc)]
-                          (if (pos? hc)
-                            (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
-                            raw))))
+                              visible (- (count (:find query)) hc)
+                              raw (if (pos? hc)
+                                    (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                                    raw)
+                              ;; A derived SELECT has the same logical
+                              ;; projection as a top-level SELECT. In
+                              ;; particular, expressions over aggregates are
+                              ;; represented physically by hidden aggregate
+                              ;; slots and reconstructed afterward. Persisting
+                              ;; the physical rows leaked `__compound_*` as a
+                              ;; virtual column and omitted the declared alias.
+                              [rows _]
+                              (apply-compound-projections raw (:find-aliases p)
+                                                          query in-args
+                                                          (:compound-exprs p))]
+                          rows)))
          branch-rows (mapv run-branch (:branches branch-parsed))
+         ;; Apply the same logical projection to the first branch's aliases.
+         ;; Set-operation branches must agree in width; SQL takes the exposed
+         ;; column names from this branch.
+         sub-aliases (if (seq (:compound-exprs sub-parsed))
+                       (second (apply-compound-projections
+                                [] (:find-aliases sub-parsed)
+                                (:query sub-parsed) (:in-args sub-parsed)
+                                (:compound-exprs sub-parsed)))
+                       (:find-aliases sub-parsed))
          sub-results (case (:op branch-parsed)
                        :union-all (mapcat identity branch-rows)
                        :union     (distinct (mapcat identity branch-rows))
@@ -3365,8 +3386,20 @@
                                         'datahike.pg.sql/filter-string-agg}
                                       agg-sym)
                            params (= 2 (count params)))
-                    (let [v1 (expr/translate-expr ctx (first params))
-                          v2 (expr/translate-expr ctx (second params))
+                    (let [;; CORR has only a float8 overload. PostgreSQL's
+                          ;; function resolver therefore feeds unknown string
+                          ;; literals through float8in before aggregation
+                          ;; (`corr(g, 'NaN')`). Leaving them as strings leaks
+                          ;; parser type uncertainty into the runtime and used
+                          ;; to end in a String->Number ClassCastException.
+                          translate-arg
+                          (fn [arg]
+                            (if (and (= agg-sym 'datahike.pg.sql/filter-corr)
+                                     (instance? StringValue arg))
+                              (coerce/coerce-numeric (.getValue ^StringValue arg) :double)
+                              (expr/translate-expr ctx arg)))
+                          v1 (translate-arg (first params))
+                          v2 (translate-arg (second params))
                           v1 (if (seq? v1) (ctx/materialize-arg! ctx v1) v1)
                           v2 (if (seq? v2) (ctx/materialize-arg! ctx v2) v2)
                           pair-var (ctx/fresh-var! ctx)
@@ -3897,7 +3930,13 @@
                                                       (.startsWith ^String % "__compound_"))
                                                 @find-aliases))
                                  (count @compound-exprs))
-                      v (expr/translate-expr (assoc ctx :hoisted-aggs sink) expr)
+                      aggregate-projection?
+                      (boolean (some fns/aggregate-function?
+                                     (params/ast-function-names expr)))
+                      v (expr/translate-expr (assoc ctx
+                                                    :hoisted-aggs sink
+                                                    :aggregate-projection?
+                                                    aggregate-projection?) expr)
                       hoisted @sink]
                   (if (seq hoisted)
                     (let [all (vec @(:where-clauses ctx))
@@ -4768,7 +4807,12 @@
           (let [sink (atom [])
                 before (count @(:where-clauses ctx))
                 form (expr/translate-predicate-expr
-                      (assoc ctx :hoisted-aggs sink) having-expr)
+                      (assoc ctx
+                             :hoisted-aggs sink
+                             :aggregate-projection?
+                             (boolean (some fns/aggregate-function?
+                                            (params/ast-function-names having-expr))))
+                      having-expr)
                 all (vec @(:where-clauses ctx))
                 [keep-cs pform] (expr/split-aggregate-projection
                                  form (subvec all before) (map :var @sink))

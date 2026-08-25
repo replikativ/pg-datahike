@@ -835,21 +835,31 @@
                           (or (nil? a) (= :__null__ a)
                               (nil? b) (= :__null__ b))))
                       pairs)
-        n (count valid)]
+        n (count valid)
+        xs (map #(double (first %)) valid)
+        ys (map #(double (second %)) valid)
+        ;; PostgreSQL treats an all-NaN input column as *not* constant,
+        ;; while an ordinary all-equal column still makes correlation
+        ;; undefined. This ordering matters for corr(0.1, 'NaN'): the
+        ;; finite side decides NULL before NaN contaminates the sums.
+        finite-constant? (fn [values]
+                           (and (seq values)
+                                (not (Double/isNaN (double (first values))))
+                                (apply = values)))]
     (if (< n 2)
       :__null__
-      (let [xs  (map #(double (first %))  valid)
-            ys  (map #(double (second %)) valid)
-            sx  (reduce + 0.0 xs)
-            sy  (reduce + 0.0 ys)
-            sxx (reduce + 0.0 (map #(* % %) xs))
-            syy (reduce + 0.0 (map #(* % %) ys))
-            sxy (reduce + 0.0 (map * xs ys))
-            denom (* (Math/sqrt (- (* n sxx) (* sx sx)))
-                     (Math/sqrt (- (* n syy) (* sy sy))))]
-        (if (zero? denom)
-          :__null__
-          (/ (- (* n sxy) (* sx sy)) denom))))))
+      (if (or (finite-constant? xs) (finite-constant? ys))
+        :__null__
+        (let [sx  (reduce + 0.0 xs)
+              sy  (reduce + 0.0 ys)
+              sxx (reduce + 0.0 (map #(* % %) xs))
+              syy (reduce + 0.0 (map #(* % %) ys))
+              sxy (reduce + 0.0 (map * xs ys))
+              denom (* (Math/sqrt (- (* n sxx) (* sx sx)))
+                       (Math/sqrt (- (* n syy) (* sy sy))))]
+          (if (zero? denom)
+            :__null__
+            (/ (- (* n sxy) (* sx sy)) denom)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; null-safe wrapper + SQL null-safe arithmetic

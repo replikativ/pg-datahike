@@ -298,14 +298,42 @@
        :source-lines [259 273]
        :gate "test/datahike/test/pg_returning_projection_test.clj"
        :test-var "postgres-failed-transaction-savepoint-slice"}]}
-    {:name "case" :mode :unmeasured :boundaries #{:expressions}}
+    {:name "case" :mode :discovery
+     :boundaries #{:expressions}
+     :blockers #{:create-function :enum-ddl :transaction-cascade}}
     {:name "subselect" :mode :unmeasured :boundaries #{:relational}}
-    {:name "union" :mode :unmeasured :boundaries #{:relational :common-types}}
-    {:name "join" :mode :unmeasured :boundaries #{:relational}}
-    {:name "aggregates" :mode :unmeasured :boundaries #{:aggregates}}
+    {:name "union" :mode :discovery
+     :boundaries #{:relational :common-types}
+     :blockers #{:values-cte :planner-explain :advanced-types :create-function}}
+    {:name "join" :mode :discovery
+     :boundaries #{:relational}
+     :blockers #{:planner-explain :correlated-planner-stress :advanced-join-plans
+                 :unsupported-ddl}
+     :strict-slices
+     [{:id :derived-aggregate-projection
+       :source-lines [431 442]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "derived-tables-materialize-logical-aggregate-projections"}]}
+    {:name "aggregates" :mode :discovery
+     :boundaries #{:aggregates}
+     :blockers #{:regression-aggregate-functions :custom-aggregates
+                 :planner-explain :correlated-planner-stress}
+     :strict-slices
+     [{:id :corr-unknown-nan-input
+       :source-lines [155 159]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "corr-resolves-unknown-literals-as-float8"}]}
     {:name "window" :mode :unmeasured :boundaries #{:windows}}
     {:name "with" :mode :unmeasured :boundaries #{:ctes}}
-    {:name "limit" :mode :unmeasured :boundaries #{:relational}}]}
+    {:name "limit" :mode :discovery
+     :boundaries #{:relational}
+     :blockers #{:backward-cursors :set-returning-projections :planner-explain
+                 :view-ddl :fetch-expression-grammar}
+     :strict-slices
+     [{:id :aggregate-sibling-scalar
+       :source-lines [147 153]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "grouped-projections-inline-sibling-scalars"}]}]}
 
   {:id 3
    :name "specialized application types"
