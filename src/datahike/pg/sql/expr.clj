@@ -1356,12 +1356,18 @@
                 (throw (ex-info (str "function " fname " does not exist")
                                 {:error :undefined-function :sqlstate "42883"})))
             values (:values spec)
+            safe-value (fn [value]
+                         (when (some? value)
+                           (params/assert-enum-label-safe!
+                            (:db ctx) (:name spec) value)))
             impl (case fname
-                   "enum_first" (fn [_] (first values))
-                   "enum_last" (fn [_] (last values))
+                   "enum_first" (fn [_] (safe-value (first values)))
+                   "enum_last" (fn [_] (safe-value (last values)))
                    "enum_range"
                    (fn
-                     ([_] (pg-arr/array :text values))
+                     ([_]
+                      (doseq [value values] (safe-value value))
+                      (pg-arr/array :text values))
                      ([lo hi]
                       (let [lo (when-not (fns/sql-null? lo) (str lo))
                             hi (when-not (fns/sql-null? hi) (str hi))
@@ -1370,6 +1376,7 @@
                             selected (if (and (<= 0 start) (<= start end))
                                        (subvec values start (inc end))
                                        [])]
+                        (doseq [value selected] (safe-value value))
                         (pg-arr/array :text selected)))))
             fn-param (symbol (str "?fn-" fname "-" (swap! (:var-counter ctx) inc)))]
         (swap! (:in-params ctx) conj fn-param)
@@ -2583,7 +2590,7 @@
                       :__null__
                       (let [label (str v)]
                         (if (contains? enum-values label)
-                          label
+                          (params/assert-enum-label-safe! (:db ctx) type-str label)
                           (throw (ex-info "invalid input value for enum"
                                           {:error :invalid-text-representation
                                            :enum? true :type type-str

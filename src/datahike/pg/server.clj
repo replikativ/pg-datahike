@@ -4096,6 +4096,12 @@
                            :speculative-db (:db-after rep)
                            :begin-max-tx cur)))))))))))
 
+(defn- unsafe-enum-marker-op?
+  [op]
+  (and (vector? op)
+       (= :db/add (first op))
+       (= :datahike.pg.enum/unsafe-values (nth op 2 nil))))
+
 (defn- transact-tx-buffer!
   "Commit the accumulated transaction buffer to `conn`, with the same
    concurrent-write (40001 serialization_failure) detection as an
@@ -4109,7 +4115,10 @@
   ;; lose an update. Commits are already serialized by datahike's
   ;; single writer, so the monitor adds no real concurrency cost.
   (locking commit-check-lock
-    (let [buf (:tx-buffer @tx-state)
+    (let [;; Unsafe enum-label facts exist only in the speculative DB.  Once
+          ;; the surrounding transaction commits, every added label becomes
+          ;; safe, so never persist those marker operations.
+          buf (vec (remove unsafe-enum-marker-op? (:tx-buffer @tx-state)))
           begin-max-tx (:begin-max-tx @tx-state)
           real-db (d/db conn)
           current-max-tx (when begin-max-tx (:max-tx real-db))
@@ -4161,7 +4170,8 @@
    and commits separately."
   #{:insert :update :update-with-recursive :delete :truncate
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
-    :ddl-create-enum :ddl-drop-enum :ddl-create-domain :ddl-drop-domain
+    :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
+    :ddl-create-domain :ddl-drop-domain
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
@@ -6122,6 +6132,9 @@
    {:db/ident :datahike.pg.enum/oid
     :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.enum/unsafe-values
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many}
    ;; the entity itself. We store values both as a many-cardinality
    ;; set (for fast contains?) AND as a single ordered string
    ;; (newline-separated) so dump can recover declaration order.
@@ -6226,7 +6239,26 @@
             tx-data (cond-> (vec tx-data)
                       (not= values new-values)
                       (conj [:db/add eid :datahike.pg.enum/values-ordered
-                             (clojure.string/join "\n" new-values)]))]
+                             (clojure.string/join "\n" new-values)]))
+            ;; PostgreSQL permits a newly-added label to be used in this
+            ;; transaction only when the enum type itself was also created
+            ;; here.  Mark additions to a pre-existing enum in the
+            ;; speculative DB; transact-tx-buffer! strips the marker before
+            ;; commit, while savepoint snapshots naturally retain/rollback it.
+            unsafe-add? (and (= :add-value op)
+                             (not= values new-values)
+                             (:in-tx? @tx-state)
+                             (some? (:datahike.pg.enum/name
+                                     (d/entity (d/db conn) eid))))
+            tx-data (if unsafe-add?
+                      (vec
+                       (concat
+                        [{:db/ident :datahike.pg.enum/unsafe-values
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/many}]
+                        tx-data
+                        [[:db/add eid :datahike.pg.enum/unsafe-values label]]))
+                      tx-data)]
         (cond
           (empty? tx-data) (empty-result "ALTER TYPE")
           (:in-tx? @tx-state) (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")

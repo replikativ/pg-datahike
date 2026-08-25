@@ -198,6 +198,28 @@
                                     "WHERE enumtypid = 'mood'::regtype "
                                     "ORDER BY enumsortorder")))))))
 
+(deftest new-label-on-existing-enum-is-unsafe-until-commit
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (.setAutoCommit c false)
+    (exec! c "ALTER TYPE mood ADD VALUE 'ok'")
+    (doseq [sql ["SELECT 'ok'::mood" "SELECT enum_last(NULL::mood)"
+                 "SELECT enum_range(NULL::mood)"]]
+      (exec! c "SAVEPOINT before_unsafe")
+      (let [raised (try (query-rows c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "55P04" (some-> raised .getSQLState)))
+        (is (str/includes? (or (some-> raised .getMessage) "")
+                           "must be committed before they can be used")))
+      (exec! c "ROLLBACK TO SAVEPOINT before_unsafe"))
+    (.commit c)
+    (is (= [["ok"]] (mapv vec (query-rows c "SELECT 'ok'::mood"))))
+    (.setAutoCommit c false)
+    (exec! c "CREATE TYPE fresh_mood AS ENUM ('sad')")
+    (exec! c "ALTER TYPE fresh_mood ADD VALUE 'happy'")
+    (is (= [["happy"]]
+           (mapv vec (query-rows c "SELECT 'happy'::fresh_mood"))))
+    (.rollback c)))
+
 (deftest enum-comparisons-order-and-extrema-use-declaration-order
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'yellow', 'green', 'blue')")

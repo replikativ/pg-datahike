@@ -1737,7 +1737,8 @@
                                                                  enum-values
                                                                  (let [label (str raw)]
                                                                    (if (contains? enum-values label)
-                                                                     label
+                                                                     (params/assert-enum-label-safe!
+                                                                      cte-db full-str label)
                                                                      (throw
                                                                       (ex-info "invalid input value for enum"
                                                                                {:error :invalid-text-representation

@@ -174,6 +174,39 @@
        (when (seq values)
          (into #{} (map (comp str first)) values))))))
 
+(defn unsafe-enum-values
+  "Return labels added to an existing enum in the current speculative
+   transaction.  The pgwire transaction layer removes these marker facts at
+   commit, so a committed database normally returns the empty set."
+  [db type-name]
+  (if (and db type-name
+           ;; Databases created before transactional enum-label tracking do
+           ;; not have this schema attr until their first ALTER TYPE. Avoid
+           ;; querying an unknown attr; the ALTER transaction installs it
+           ;; immediately before adding its first marker.
+           (get (:schema db) :datahike.pg.enum/unsafe-values))
+    (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)]
+      (into #{}
+            (map (comp str first))
+            (d/q '{:find [?value]
+                   :in [$ ?name]
+                   :where [[?enum :datahike.pg.enum/name ?name]
+                           [?enum :datahike.pg.enum/unsafe-values ?value]]}
+                 db bare)))
+    #{}))
+
+(defn assert-enum-label-safe!
+  "Raise PostgreSQL's unsafe-new-enum-value error when `label` was added to
+   an already-committed enum in this transaction. Returns the string label."
+  [db type-name label]
+  (let [label (str label)]
+    (when (contains? (unsafe-enum-values db type-name) label)
+      (throw (ex-info (str "unsafe use of new value " (pr-str label)
+                           " of enum type " type-name)
+                      {:sqlstate "55P04"
+                       :hint "New enum values must be committed before they can be used."})))
+    label))
+
 (def ^:private regtype-aliases
   {"boolean" "bool" "smallint" "int2" "integer" "int4" "int" "int4"
    "bigint" "int8" "real" "float4" "double precision" "float8"
@@ -235,7 +268,7 @@
           coerced (if enum-values
                     (let [label (str value)]
                       (if (contains? enum-values label)
-                        label
+                        (assert-enum-label-safe! db base label)
                         (throw (ex-info "invalid input value for enum"
                                         {:error :invalid-text-representation
                                          :enum? true :type base :value label}))))
