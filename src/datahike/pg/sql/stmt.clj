@@ -5280,7 +5280,7 @@
      (and (instance? Column e)
           (nil? (.getTable ^Column e))
           (= "default" (str/lower-case (unquote-ident (.getColumnName ^Column e)))))
-     nil
+     ::insert-default
      (instance? SignedExpression e)
      (let [^SignedExpression se e
            inner (extract-value (.getExpression se) schema db)]
@@ -5341,12 +5341,20 @@
      (if db
        (let [inner (.getSelect ^ParenthesedSelect e)]
          (if (instance? PlainSelect inner)
-           (let [parsed (translate-select ^PlainSelect inner schema db)
+           (let [parsed (if params/*parse-sql*
+                          (params/*parse-sql* (str inner) schema db)
+                          (translate-select ^PlainSelect inner schema db))
+                 _ (when (= :error (:type parsed))
+                     (throw (ex-info (:message parsed)
+                                     {:sqlstate (or (:sqlstate parsed) "XX000")})))
                  q (:query parsed)
                  in-args (:in-args parsed)
-                 results (if (seq in-args)
-                           (apply d/q q db in-args)
-                           (d/q q db))
+                 query-db (or (:enriched-db parsed) db)
+                 results (cond
+                           (:literal-rows parsed) (:literal-rows parsed)
+                           (:literal-row parsed) [(:literal-row parsed)]
+                           (seq in-args) (apply d/q q query-db in-args)
+                           :else (d/q q query-db))
                  first-row (first results)]
              (if (sequential? first-row) (first first-row) first-row))
            nil))
@@ -6714,6 +6722,26 @@
                  (if (and a (not (pgs/ambiguous? a))) (name a) c)))
              col-names)]))
 
+(defn- validate-insert-row-widths!
+  "Require every VALUES/SELECT row to match the INSERT target list.
+
+   Defaults fill columns omitted from the target list, never expressions
+   omitted from a row. Zipping columns and values silently accepted both
+   `INSERT (a,b,c) VALUES (1,2)` and its over-wide inverse."
+  [col-names rows]
+  (let [target-count (count col-names)]
+    (doseq [row rows
+            :let [value-count (count row)]
+            :when (not= target-count value-count)]
+      (throw (ex-info (if (< value-count target-count)
+                        "INSERT has more target columns than expressions"
+                        "INSERT has more expressions than target columns")
+                      {:error :syntax-error
+                       :sqlstate "42601"
+                       :target-count target-count
+                       :value-count value-count}))))
+  rows)
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
@@ -6831,9 +6859,11 @@
                                         (:find-aliases inner-parsed)
                                         inner-query inner-in-args
                                         (:compound-exprs inner-parsed))
-            rows (mapv (fn [row]
-                         (if (sequential? row) (vec row) [row]))
-                       inner-results)
+            rows (validate-insert-row-widths!
+                  col-names
+                  (mapv (fn [row]
+                          (if (sequential? row) (vec row) [row]))
+                        inner-results))
             ;; Build row-attrs the same way the VALUES branch does below.
             row-attrs
             (mapv (fn [row]
@@ -6853,7 +6883,15 @@
                                         ;; an absent datom.
                                         coerced (when-not (= :__null__ val)
                                                   (coerce-insert-value val attr schema db))]
-                                    (when (some? coerced)
+                                    ;; INSERT SELECT has no DEFAULT token: a
+                                    ;; SQL NULL is explicit and must suppress a
+                                    ;; column default.  Preserve a nil entry for
+                                    ;; the constraint/default wrapper, which
+                                    ;; validates it and removes it before the
+                                    ;; Datahike transaction is returned.
+                                    (when (or (some? coerced)
+                                              (nil? val)
+                                              (= :__null__ val))
                                       [attr coerced])))
                                 (map vector col-names row))))
                   rows)
@@ -7027,6 +7065,18 @@
                    ;; Direct list of values (single row without parens)
                    :else
                    [(mapv ev expr-list)])
+            _ (if (seq columns)
+                (validate-insert-row-widths! col-names rows)
+                ;; Without an explicit target list PostgreSQL permits a
+                ;; short VALUES row and fills trailing columns from defaults;
+                ;; it still rejects rows wider than the table.
+                (doseq [row rows
+                        :when (> (count row) num-cols)]
+                  (throw (ex-info "INSERT has more expressions than target columns"
+                                  {:error :syntax-error
+                                   :sqlstate "42601"
+                                   :target-count num-cols
+                                   :value-count (count row)}))))
             ;; Build row attribute maps
             ;; For INHERITS: resolve inherited columns to parent namespace
             row-attrs (mapv (fn [row]
@@ -7037,10 +7087,18 @@
                                                          (ctx/resolve-inherited-attr raw-attr schema db)
                                                          raw-attr)
                                                   coerced (coerce-insert-value val attr schema)]
-                                          ;; some? — `false` is a legitimate value
-                                          ;; for boolean columns, so don't use when-let.
-                                              (when (some? coerced)
-                                                [attr coerced])))
+                                          ;; DEFAULT means omitted; explicit
+                                          ;; NULL remains a present nil so a
+                                          ;; declared default is not applied.
+                                          ;; ON CONFLICT's tx-fn still owns its
+                                          ;; row maps, so retain its historical
+                                          ;; omission there until that path has
+                                          ;; the same constraint wrapper.
+                                              (cond
+                                                (= ::insert-default val) nil
+                                                (some? coerced) [attr coerced]
+                                                (nil? (.getConflictAction insert)) [attr nil]
+                                                :else nil)))
                                           (map vector col-names row))))
                             rows)
         ;; Add row-existence marker for this table
@@ -7286,10 +7344,13 @@
                                                             (let [{:keys [eid val]} (get @seq-state col)]
                                                               (when eid [:db/add eid :__seq__/value val]))))
                                                         identity-cols)]
-                               ;; Record new tempid at row position
+                                       ;; Record new tempid at row position
                                        (swap! row-refs conj tempid)
                                        (swap! affected inc)
-                                       (into [(assoc populated :db/id tempid)] seq-updates)))))
+                                       (let [clean-populated
+                                             (into {} (remove (comp nil? val)) populated)]
+                                         (into [(assoc clean-populated :db/id tempid)]
+                                               seq-updates))))))
                                row-attrs))))
                      row-attrs
                      set-params]]
@@ -7560,6 +7621,24 @@
         ns table-name
         where-expr (.getWhere update)
         update-sets (.getUpdateSets update)
+        ;; PostgreSQL does not permit qualification on the left-hand side
+        ;; of SET, even when it names the target alias.  JSqlParser preserves
+        ;; that qualifier separately on Column; dropping it silently accepted
+        ;; `UPDATE t x SET x.c = ...` as though the user wrote `c = ...`.
+        _ (when-let [qualified
+                     (first (for [^UpdateSet us update-sets
+                                  ^Column c (.getColumns us)
+                                  :let [^Table target-qualifier (.getTable c)]
+                                  :when (some-> target-qualifier .getName not-empty)]
+                              c))]
+            (let [^Table target-qualifier (.getTable ^Column qualified)
+                  qualifier (some-> target-qualifier .getName unquote-ident)]
+              (throw (ex-info (str "column \"" qualifier "\" of relation \""
+                                   table-name "\" does not exist")
+                              {:error :undefined-column
+                               :sqlstate "42703"
+                               :column qualifier
+                               :hint "SET target columns cannot be qualified with the relation name."}))))
         ;; Same hazard as the INSERT column list, different SQLSTATE:
         ;; `UPDATE t SET sal = 1, sal = 2` built one assignment map and
         ;; the last write won, reporting UPDATE 1 for a statement
@@ -7630,12 +7709,25 @@
                :alias alias-name
                :ns ns
                :where-expr where-expr
-               :assignments (mapv (fn [^UpdateSet us]
-                                    (let [cols (.getColumns us)
-                                          exprs (.getValues us)]
-                                      {:column (unquote-ident (.getColumnName ^Column (first cols)))
-                                       :value-expr (first exprs)}))
-                                  update-sets)}
+               :assignments
+               (vec
+                (mapcat
+                 (fn [^UpdateSet us]
+                   (let [cols (vec (.getColumns us))
+                         exprs (vec (.getValues us))]
+                     (when-not (= (count cols) (count exprs))
+                       ;; A multi-column assignment sourced by ROW(...) or a
+                       ;; sub-SELECT needs one evaluation yielding a record.
+                       ;; Refuse it until that lowering exists; applying only
+                       ;; the first pair is silent partial data corruption.
+                       (throw (ex-info
+                               "multi-column UPDATE from a row expression is not supported"
+                               {:error :feature-not-supported :sqlstate "0A000"})))
+                     (map (fn [^Column col value-expr]
+                            {:column (unquote-ident (.getColumnName col))
+                             :value-expr value-expr})
+                          cols exprs)))
+                 update-sets))}
         from-values (assoc :from-values from-values)
         from-table (assoc :from-table from-table)
         (.getReturningClause update)

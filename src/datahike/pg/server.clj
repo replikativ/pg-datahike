@@ -2292,8 +2292,12 @@
   (let [cols (read-column-constraints db table-name)
         has-checks? (seq (read-check-constraints db table-name))
         has-fks? (seq (read-fk-constraints db table-name))
-        has-domain-enum? (seq (read-domain-enum-checks db table-name))]
-    (if (and (empty? cols) (not has-checks?) (not has-fks?) (not has-domain-enum?))
+        has-domain-enum? (seq (read-domain-enum-checks db table-name))
+        explicit-nulls? (some (fn [entry]
+                                (and (map? entry) (some nil? (vals entry))))
+                              tx-data)]
+    (if (and (empty? cols) (not has-checks?) (not has-fks?)
+             (not has-domain-enum?) (not explicit-nulls?))
       tx-data
       [[:db.fn/call
         ;; fresh-insert-fn: conflict attribution treats this as writing no
@@ -2422,7 +2426,14 @@
                (enforce-domain-enum-checks! txdb table-name ns filled-entities))
              (when has-fks?
                (enforce-fk-on-insert! txdb table-name ns filled-entities))
-             result)))]])))
+             ;; Datahike represents SQL NULL as an absent datom.  Nil map
+             ;; entries existed only long enough to distinguish explicit
+             ;; NULL from an omitted/defaulted column above.
+             (mapv (fn [entry]
+                     (if (map? entry)
+                       (into {} (remove (comp nil? val)) entry)
+                       entry))
+                   result))))]])))
 
 (defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
@@ -6345,7 +6356,8 @@
   [ctx parsed]
   (let [{:keys [conn temp-tables]} ctx]
     (try
-      (doseq [table (or (:tables parsed) [(:table parsed)])]
+      (doseq [raw-table (or (:tables parsed) [(:table parsed)])
+              :let [table (params/unquote-ident raw-table)]]
         (drop-table-tx! conn table)
         ;; A DROP TABLE on a tracked temp table means close() must not
         ;; try to drop it again.

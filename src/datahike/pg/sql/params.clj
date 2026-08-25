@@ -223,14 +223,11 @@
    The wire layer calls this at Execute time to resolve placeholders
    inside INSERT tx-data.
 
-   Maps with nil values after substitution have those keys dissoc'd.
-   An INSERT like `INSERT INTO t (a, b) VALUES (?, ?)` with
-   `setString(1, null)` ends up as `{:t/a nil :t/b \"x\"}` here —
-   `d/transact` rejects `[:db/add eid :t/a nil]` as `:transact/syntax`,
-   but the correct PG behaviour for a nullable column is to simply
-   not assert the attribute. The translate-time row-builder already
-   drops nil literals (NullValue), but those land as ParamRef sentinels
-   at parse time and only resolve to nil here.
+   Nil map values are preserved. At the INSERT boundary a present nil
+   means explicit SQL NULL, whereas a missing key means the column was
+   omitted and its DEFAULT must run. The constraint/default wrapper
+   validates that distinction and removes nil entries immediately before
+   returning Datahike tx-data.
 
    Identity preservation: deferred call-markers (`{:fn :nextval ...}`,
    `{:fn :now}`) pass through unchanged — same Clojure object in,
@@ -246,10 +243,7 @@
                 (param-ref? v)   (fetch (:idx v))
                 (call-marker? v) v
                 (map? v)         (reduce-kv (fn [m k x]
-                                              (let [v' (walk x)]
-                                                (if (nil? v')
-                                                  m
-                                                  (assoc m k v'))))
+                                              (assoc m k (walk x)))
                                             {} v)
                 (vector? v)      (mapv walk v)
                 (seq? v)         (map walk v)

@@ -233,10 +233,30 @@
     {:name "timestamptz" :mode :unmeasured :boundaries #{:temporal}}
     {:name "interval" :mode :unmeasured :boundaries #{:temporal}}
     {:name "create_table" :mode :unmeasured :boundaries #{:ddl}}
-    {:name "constraints" :mode :unmeasured :boundaries #{:ddl :constraints}}
-    {:name "insert" :mode :unmeasured :boundaries #{:dml}}
+    {:name "constraints" :mode :discovery
+     :boundaries #{:ddl :constraints}
+     :blockers #{:deferrable-constraints :exclusion-constraints
+                 :partitioning :inheritance :not-enforced-constraints
+                 :server-side-copy :system-columns :alter-constraint-ddl}}
+    {:name "insert" :mode :discovery
+     :boundaries #{:dml :defaults :constraints :insert-select}
+     :blockers #{:composite-types :array-subscripting :rules :triggers
+                 :partitioning :system-columns}
+     :strict-slices
+     [{:id :defaults-and-row-width
+       :source-lines [4 29]
+       :gate "test/datahike/test/pg_insert_regress_test.clj"
+       :test-var "postgres-insert-default-and-row-width-slice"}]}
     {:name "insert_conflict" :mode :unmeasured :boundaries #{:dml :constraints}}
-    {:name "update" :mode :unmeasured :boundaries #{:dml}}
+    {:name "update" :mode :discovery
+     :boundaries #{:dml :update-from :row-assignment}
+     :blockers #{:row-subquery-assignment :partitioning :triggers :views
+                 :row-level-security :system-columns :create-function}
+     :strict-slices
+     [{:id :qualified-target-and-values-source
+       :source-lines [34 44]
+       :gate "test/datahike/test/pg_update_expressions_test.clj"
+       :test-var "postgres-update-from-values-and-qualified-target"}]}
     {:name "delete" :mode :strict
      :boundaries #{:dml :name-resolution}
      :blockers #{}

@@ -211,3 +211,17 @@
         (is (nil? (.error (exec h "INSERT INTO pgbench_accounts(aid) VALUES (2)"))))
         (is (= [["2"]] (rows (exec h "SELECT aid FROM pgbench_accounts")))))
       (finally (release! h)))))
+
+(deftest unquoted-drop-table-folds-case-and-removes-rows
+  (let [h (fresh-handler)]
+    (try
+      (is (nil? (.error (exec h "CREATE TABLE drop_reuse(i int UNIQUE)"))))
+      (is (nil? (.error (exec h "INSERT INTO drop_reuse VALUES (1)"))))
+      ;; PostgreSQL folds an unquoted identifier regardless of how it was
+      ;; spelled.  Failing to fold here left both the old schema and rows
+      ;; alive, so a nominally fresh table inherited stale data.
+      (is (nil? (.error (exec h "DROP TABLE DROP_REUSE"))))
+      (is (nil? (.error (exec h "CREATE TABLE drop_reuse(i int UNIQUE)"))))
+      (is (nil? (.error (exec h "INSERT INTO drop_reuse VALUES (1)"))))
+      (is (= [["1"]] (rows (exec h "SELECT * FROM drop_reuse"))))
+      (finally (release! h)))))

@@ -286,19 +286,21 @@
         index-pk-cols (when index-pk
                         (mapv (comp params/unquote-ident str)
                               (.getColumns ^Index index-pk)))
-        index-pk-name (when index-pk (.getName ^Index index-pk))
+        index-pk-name (when index-pk
+                        (params/unquote-ident (.getName ^Index index-pk)))
         index-uniques (vec (keep (fn [^Index idx]
                                    (when (= "UNIQUE" (.getType idx))
                                      {:cols (mapv (comp params/unquote-ident str)
                                                   (.getColumns idx))
-                                      :name (.getName idx)}))
+                                      :name (some-> (.getName idx) params/unquote-ident)}))
                                  indexes))
         ;; Table-level CHECK constraints — `CheckConstraint` extends
         ;; Index, so they ride along in .getIndexes. Keep the original
         ;; expression as a string; enforcement re-parses it.
         table-checks (vec (keep (fn [^Index idx]
                                   (when (instance? CheckConstraint idx)
-                                    {:name (.getName ^CheckConstraint idx)
+                                    {:name (some-> (.getName ^CheckConstraint idx)
+                                                   params/unquote-ident)
                                      :expr (str (.getExpression ^CheckConstraint idx))}))
                                 indexes))
         ;; Column-level CHECK: `col INT CHECK (…)` — extract from the
@@ -318,7 +320,7 @@
                                        ref-tbl (some-> (.getTable fk) .getName params/unquote-ident)
                                        ref-cols (mapv (comp params/unquote-ident str)
                                                       (or (.getReferencedColumnNames fk) []))]
-                                   {:name (.getName fk)
+                                   {:name (some-> (.getName fk) params/unquote-ident)
                                     :cols cols
                                     :parent-table ref-tbl
                                     :parent-cols ref-cols
@@ -621,11 +623,12 @@
                                    :else nil))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
-                               ;; NOT NULL inline; PK is implicitly NOT NULL
-                               ;; but we avoid redundant flagging so the
-                               ;; enforcement path doesn't double-error.
-                               not-null-here? (and (not pk-here?)
-                                                   (column-is-not-null? col))
+                               ;; PRIMARY KEY is implicitly NOT NULL.  The SQL
+                               ;; enforcement path reads only :pg/not-null;
+                               ;; :db.unique/identity cannot represent that
+                               ;; half of the PostgreSQL constraint by itself.
+                               not-null-here? (or pk-here?
+                                                  (column-is-not-null? col))
                                default-spec (let [spec (column-default-spec col)
                                                   bit-type? (contains?
                                                              #{"bit" "varbit" "bit varying"}
@@ -773,7 +776,15 @@
                                  :db/cardinality :db.cardinality/one
                                  :db/unique      unique})
                               tuple-attrs)
-        schema-tx (into schema-tx tuple-schema-tx)
+        ;; Datahike tuple attributes implement composite SQL uniqueness,
+        ;; but they are engine indexes rather than user columns. Hide them
+        ;; from SELECT *, pg_attribute and information_schema while keeping
+        ;; the underlying attribute available to Datahike.
+        tuple-hint-tx (mapv (fn [{:keys [ident]}]
+                              {:datahike.pg/for-ident ident
+                               :datahike.pg/hidden true})
+                            tuple-attrs)
+        schema-tx (into schema-tx (into tuple-schema-tx tuple-hint-tx))
         ;; CHECK-constraint entities. One per CHECK clause, named
         ;; deterministically so CREATE TABLE IF NOT EXISTS is
         ;; idempotent (:pg/check-name carries :db.unique/identity).

@@ -163,3 +163,38 @@
                 (catch java.sql.SQLException e e))]
         (is (some? e))
         (is (= "42702" (.getSQLState ^java.sql.SQLException e)))))))
+
+(deftest postgres-update-from-values-and-qualified-target
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE update_values (a int DEFAULT 10, b int, c text)")
+    (exec! c "INSERT INTO update_values VALUES (10,20,'foo'),(10,30,NULL)")
+    (is (= 1 (update-count
+              c
+              (str "UPDATE update_values SET a=v.i "
+                   "FROM (VALUES(100,20)) AS v(i,j) "
+                   "WHERE update_values.b=v.j"))))
+    (is (= [["100" "20" "foo"] ["10" "30" nil]]
+           (rows c "SELECT * FROM update_values ORDER BY b")))
+    (is (= 1 (update-count
+              c
+              (str "UPDATE update_values SET (c,b,a)=('bugle',b+11,DEFAULT) "
+                   "WHERE c='foo'"))))
+    (is (= [["10" "31" "bugle"] ["10" "30" nil]]
+           (rows c "SELECT * FROM update_values ORDER BY b DESC")))
+    (let [before (rows c "SELECT * FROM update_values ORDER BY b")
+          e (try
+              (exec! c (str "UPDATE update_values SET (b,a)="
+                            "(SELECT a,b FROM update_values LIMIT 1)"))
+              nil
+              (catch java.sql.SQLException e e))]
+      (is (some? e))
+      (is (= "0A000" (.getSQLState ^java.sql.SQLException e)))
+      (is (= before (rows c "SELECT * FROM update_values ORDER BY b"))))
+    (let [e (try
+              (exec! c "UPDATE update_values t SET t.b=t.b+10 WHERE t.a=10")
+              nil
+              (catch java.sql.SQLException e e))]
+      (is (some? e))
+      (is (= "42703" (.getSQLState ^java.sql.SQLException e)))
+      (is (re-find #"SET target columns cannot be qualified"
+                   (.getMessage ^java.sql.SQLException e))))))

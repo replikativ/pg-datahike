@@ -4252,16 +4252,13 @@
          (contains? #{"json" "jsonb"}
                     (some-> ^CastExpression expr .getColDataType .getDataType
                             str/lower-case)))
-    (when (instance? Column expr)
-      (let [resolved (ctx/resolve-column ^Column expr
-                                         (:table-aliases ctx)
-                                         (:default-table ctx)
-                                         (:col-overrides ctx)
-                                         (:derived-aliases ctx) (:ci-index ctx))
-            attr (ctx/attr-of ctx resolved)]
-        (and attr
-             (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
-                            (params/pg-type-of-attr (:db ctx) attr)))))))))
+    ;; UPDATE ... FROM rows are runtime constant bindings rather than
+    ;; relations in ctx.  Type probing must therefore be tolerant of an
+    ;; otherwise-unresolvable qualified binding (`v.j`), just as
+    ;; column-pg-type is.  A failed probe means "type unknown", not a
+    ;; missing-FROM error; translate-expr resolves the bound value below.
+    (and (instance? Column expr)
+         (= "jsonb" (column-pg-type ctx ^Column expr))))))
 
 (defn- json-column?
   "Whether `expr` is a column of the text-faithful `json` type.
@@ -4273,16 +4270,8 @@
    silently, comparing the stored text."
   [ctx expr]
   (boolean
-   (when (instance? Column expr)
-     (let [resolved (ctx/resolve-column ^Column expr
-                                        (:table-aliases ctx)
-                                        (:default-table ctx)
-                                        (:col-overrides ctx)
-                                        (:derived-aliases ctx) (:ci-index ctx))
-           attr (ctx/attr-of ctx resolved)]
-       (and attr
-            (= "json" (or (get-in (:schema ctx) [attr :pg/type])
-                          (params/pg-type-of-attr (:db ctx) attr))))))))
+   (and (instance? Column expr)
+        (= "json" (column-pg-type ctx ^Column expr)))))
 
 (defn- reject-json-operator!
   "PostgreSQL has no such operator on `json`; raise as it does."
