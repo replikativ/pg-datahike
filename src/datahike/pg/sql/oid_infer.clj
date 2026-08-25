@@ -34,7 +34,7 @@
             Addition BitwiseAnd BitwiseLeftShift BitwiseOr BitwiseRightShift
             BitwiseXor Concat Division Modulo Multiplication Subtraction]
            [net.sf.jsqlparser.expression.operators.conditional
-            AndExpression OrExpression]
+            AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression LikeExpression
@@ -63,8 +63,12 @@
    "trim"          types/oid-text
    "ltrim"         types/oid-text
    "rtrim"         types/oid-text
-   "substring"     types/oid-text
-   "substr"        types/oid-text
+   ;; These have text and bit overloads; both preserve the first
+   ;; argument's type. OVERLAY's keyword syntax stores its operands in
+   ;; JSqlParser's named-parameter list, handled in `function-oid` below.
+   "substring"     :arg-type
+   "substr"        :arg-type
+   "overlay"       :arg-type
    "replace"       types/oid-text
    "lpad"          types/oid-text
    "rpad"          types/oid-text
@@ -75,6 +79,7 @@
    "split_part"    types/oid-text
    "initcap"       types/oid-text
    "to_char"       types/oid-text
+   "to_number"     types/oid-numeric
    "md5"           types/oid-text
    "quote_ident"   types/oid-text
    "quote_literal" types/oid-text
@@ -117,6 +122,7 @@
    "div" types/oid-numeric
    "factorial" types/oid-numeric
    "trim_scale" types/oid-numeric
+   "numeric_inc" types/oid-numeric
    "scale" types/oid-int4
    "min_scale" types/oid-int4
    "lcm"           :arg-type
@@ -242,6 +248,8 @@
      SUM(int8) silently overflows when the sum exceeds Long/MAX_VALUE."
   {"count"          types/oid-int8
    "count_distinct" types/oid-int8
+   "bool_and"       types/oid-bool
+   "every"          types/oid-bool
    "sum"            {types/oid-int2    types/oid-int8
                      types/oid-int4    types/oid-int8
                      types/oid-int8    types/oid-numeric
@@ -412,21 +420,20 @@
       ;; here is a rewritten literal, which is never float8.
       (or (= l-oid types/oid-numeric) (= r-oid types/oid-numeric))
       types/oid-numeric
-      ;; Integers only when BOTH sides are typed. An untyped side is a
-      ;; literal the plan-cache rewrite turned into `$N`, and it may be
-      ;; a DECIMAL literal -- which is numeric and outranks int. Firing
-      ;; on one typed side reported int8 for `i4 + 1.0`, whose value is
-      ;; a numeric: psycopg2 read the int8 OID, tried int("11.0") and
-      ;; raised ValueError. Returning nil instead lets the caller fall
-      ;; back to value-based inference, which sees the real type.
       ;; Integer arithmetic keeps the WIDER operand's width -- int2+int2
       ;; is int2pl and stays int2, int4+int8 is int48pl and becomes int8.
       ;; Collapsing all three to int8 made every integer expression
       ;; report bigint, so a binary client sized for int4 was handed an
-      ;; 8-byte payload.
+      ;; 8-byte payload. One integer side also settles an UNKNOWN protocol
+      ;; parameter or quoted literal: PostgreSQL resolves `$1 + 1` and
+      ;; `'1' + int4_col` through the int4 operator. Decimal literals
+      ;; rewritten by the plan cache carry a declared NUMERIC OID and
+      ;; therefore take the numeric branch above rather than this one.
       (and (int-oid? l-oid) (int-oid? r-oid))
       (let [rank {types/oid-int2 0 types/oid-int4 1 types/oid-int8 2}]
         (if (>= (rank l-oid) (rank r-oid)) l-oid r-oid))
+      (and (int-oid? l-oid) (nil? r-oid)) l-oid
+      (and (nil? l-oid) (int-oid? r-oid)) r-oid
       (and l-oid r-oid) types/oid-int8
       :else nil)))
 
@@ -442,8 +449,13 @@
         l (if (instance? StringValue left) r0 l0)
         r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
+        money?   #(= % types/oid-money)
+        money-factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
+                                    types/oid-float4 types/oid-float8} %)
         plus?    (instance? Addition e)
-        minus?   (instance? Subtraction e)]
+        minus?   (instance? Subtraction e)
+        multiply? (instance? Multiplication e)
+        divide?  (instance? Division e)]
     (cond
       ;; PostgreSQL's date operators do not follow numeric promotion:
       ;; `date - date` is an integer count of days and `date +/- integer`
@@ -455,6 +467,15 @@
       ;; for why the other one is not inspected.
       (and (or plus? minus?) (date? l))    types/oid-date
       (and plus? (date? r))                types/oid-date
+      ;; money is a closed operator family, not ordinary numeric
+      ;; promotion. Its Datahike carrier is BigDecimal, but +, -, *, and
+      ;; scalar / retain money while money / money returns float8.
+      (and divide? (money? l) (money? r)) types/oid-float8
+      (and (or plus? minus?) (money? l) (money? r)) types/oid-money
+      (and multiply?
+           (or (and (money? l) (money-factor? r))
+               (and (money-factor? l) (money? r)))) types/oid-money
+      (and divide? (money? l) (money-factor? r)) types/oid-money
       :else (promoted-numeric l r))))
 
 (defn resolve-aggregate-result-oid
@@ -521,7 +542,7 @@
         ;; Extract arg exprs from JSqlParser's parameter list. May be null
         ;; for zero-arg fns like NOW() / PI() / RANDOM().
         args (try
-               (when-let [pl (.getParameters f)]
+               (when-let [pl (or (.getParameters f) (.getNamedParameters f))]
                  (vec (.getExpressions pl)))
                (catch Exception _ nil))
         first-arg (first args)
@@ -781,7 +802,8 @@
       ;; declares them only on bit, so even varbit operands yield bit),
       ;; otherwise the promoted integer type.
       (or (instance? BitwiseAnd expr) (instance? BitwiseOr expr)
-          (instance? BitwiseLeftShift expr) (instance? BitwiseRightShift expr))
+          (instance? BitwiseLeftShift expr) (instance? BitwiseRightShift expr)
+          (instance? XorExpression expr))
       (let [^BinaryExpression e expr
             l (expr-oid (.getLeftExpression e) env)]
         (if (or (= l types/oid-bit) (= l types/oid-varbit))

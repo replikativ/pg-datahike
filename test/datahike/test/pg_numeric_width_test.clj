@@ -54,6 +54,14 @@
               rs (.executeQuery st sql)]
     (when (.next rs) (.getString rs 1))))
 
+(defn- column [^Connection c sql]
+  (with-open [st (.createStatement c)
+              rs (.executeQuery st sql)]
+    (loop [result []]
+      (if (.next rs)
+        (recur (conj result (.getString rs 1)))
+        result))))
+
 (defn- seed! [^Connection c]
   (exec! c "CREATE TABLE t (id int primary key, s smallint, i integer, b bigint, p numeric(5,2))")
   (exec! c "INSERT INTO t VALUES (1, 10, 20, 30, 1.25)"))
@@ -97,6 +105,108 @@
         "precision was decoded and then discarded, so 22003 never fired")
     (is (thrown-with-msg? SQLException #"numeric field overflow"
                           (one c "SELECT 1000::numeric(3,0)")))))
+
+(deftest negative-scale-numeric-typmods
+  (with-open [c (jdbc)]
+    (testing "casts round to positions left of the decimal point"
+      (is (= "12000" (one c "SELECT 12345::numeric(3,-3)")))
+      (is (= "-12000" (one c "SELECT (-12345)::numeric(3,-3)")))
+      (is (= "0" (one c "SELECT scale(12345::numeric(3,-3))"))
+          "negative typmod scale controls rounding, not display scale"))
+    (exec! c "CREATE TABLE neg_scale (n numeric(3,-3))")
+    (exec! c "INSERT INTO neg_scale VALUES (12345), (654321)")
+    (is (= "12000" (one c "SELECT min(n) FROM neg_scale")))
+    (is (= "numeric(3,-3)"
+           (one c (str "SELECT format_type(a.atttypid, a.atttypmod) "
+                       "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                       "WHERE c.relname = 'neg_scale' AND a.attname = 'n'"))))
+    (is (thrown-with-msg? SQLException #"numeric field overflow"
+                          (exec! c "INSERT INTO neg_scale VALUES (999500000)")))))
+
+(deftest numeric-typmods-support-scale-greater-than-precision
+  (with-open [c (jdbc)]
+    (is (= "0.000123"
+           (one c "SELECT 0.0001234::numeric(3,6)")))
+    (is (thrown-with-msg? SQLException #"numeric field overflow"
+                          (one c "SELECT 0.0009995::numeric(3,6)")))
+    (is (thrown-with-msg? SQLException #"absolute value less than 1\."
+                          (one c "SELECT 0.9995::numeric(3,3)"))
+        "a zero limit exponent is rendered as 1, not 10^0")
+    (exec! c (str "CREATE TABLE mixed_scales ("
+                  "millions numeric(3,-6), thousands numeric(3,-3), "
+                  "units numeric(3,0), thousandths numeric(3,3), "
+                  "millionths numeric(3,6))"))
+    (exec! c (str "INSERT INTO mixed_scales VALUES "
+                  "(123456, 123, 0.123, 0.000123, 0.000000123)"))
+    (is (= "0.000000"
+           (one c "SELECT millionths FROM mixed_scales")))))
+
+(deftest integer-literals-wider-than-int8-become-exact-numeric
+  (with-open [c (jdbc)]
+    (is (= "9223372036854775808"
+           (one c "SELECT 9223372036854775808")))
+    (is (= "999999999999999999999"
+           (one c (str "SELECT mod(999999999999999999999::numeric,"
+                       "1000000000000000000000)"))))
+    (is (= "-9999999999999999999999"
+           (one c (str "SELECT div(-9999999999999999999999::numeric,"
+                       "1000000000000000000000)*1000000000000000000000 + "
+                       "mod(-9999999999999999999999::numeric,"
+                       "1000000000000000000000)"))))))
+
+(deftest postgres-numeric-text-input-extensions
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE numeric_input_extensions (n numeric)")
+    (exec! c (str "INSERT INTO numeric_input_extensions VALUES "
+                  "('12_000.123_456'), "
+                  "('0b10001110111100111100001001010'), "
+                  "('+0o112402761777'), ('-0x_dead_beef')"))
+    (is (= "12000.123456"
+           (one c "SELECT n FROM numeric_input_extensions WHERE n = 12000.123456")))
+    (is (= "299792458"
+           (one c "SELECT n FROM numeric_input_extensions WHERE n = 299792458")))
+    (is (thrown-with-msg? SQLException #"invalid input syntax for type numeric"
+                          (one c "SELECT '0x1eg'::numeric")))))
+
+(deftest numeric-input-validation-obeys-range-and-typmod
+  (with-open [c (jdbc)]
+    (is (= "f" (one c "SELECT pg_input_is_valid('1e400000', 'numeric')")))
+    (is (= "value overflows numeric format"
+           (one c "SELECT message FROM pg_input_error_info('1e400000', 'numeric')")))
+    (is (= "22003"
+           (one c "SELECT sql_error_code FROM pg_input_error_info('1e400000', 'numeric')")))
+    (is (= "f" (one c "SELECT pg_input_is_valid('1234.567', 'numeric(7,4)')")))
+    (is (= (str "A field with precision 7, scale 4 must round to an absolute value "
+                "less than 10^3.")
+           (one c (str "SELECT detail FROM "
+                       "pg_input_error_info('1234.567', 'numeric(7,4)')"))))))
+
+(deftest numeric-generate-series-preserves-scale-and-validates-bounds
+  (with-open [c (jdbc)]
+    (is (= ["0.0" "1.0" "2.0" "3.0" "4.0"]
+           (column c "SELECT * FROM generate_series(0.0::numeric, 4.0::numeric)")))
+    (is (= ["0.1" "1.4" "2.7" "4.0"]
+           (column c (str "SELECT * FROM "
+                          "generate_series(0.1::numeric, 4.0::numeric, 1.3::numeric)"))))
+    (is (= ["4.0" "1.8" "-0.4"]
+           (column c (str "SELECT * FROM "
+                          "generate_series(4.0::numeric, -1.5::numeric, -2.2::numeric)"))))
+    (doseq [[sql message]
+            [["SELECT * FROM generate_series(-100::numeric, 100::numeric, 0::numeric)"
+              "step size cannot equal zero"]
+             ["SELECT * FROM generate_series(-100::numeric, 100::numeric, 'nan'::numeric)"
+              "step size cannot be NaN"]
+             ["SELECT * FROM generate_series('nan'::numeric, 100::numeric, 10::numeric)"
+              "start value cannot be NaN"]
+             ["SELECT * FROM generate_series(0::numeric, 'nan'::numeric, 10::numeric)"
+              "stop value cannot be NaN"]
+             ["SELECT * FROM generate_series('inf'::numeric, 'inf'::numeric, 10::numeric)"
+              "start value cannot be infinity"]
+             ["SELECT * FROM generate_series(0::numeric, 'inf'::numeric, 10::numeric)"
+              "stop value cannot be infinity"]
+             ["SELECT * FROM generate_series(0::numeric, 42::numeric, '-inf'::numeric)"
+              "step size cannot be infinity"]]]
+      (is (thrown-with-msg? SQLException (re-pattern message) (column c sql))))))
 
 (deftest writes-enforce-the-declared-width
   (with-open [c (jdbc)]

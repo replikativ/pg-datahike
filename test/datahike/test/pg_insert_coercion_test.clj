@@ -141,6 +141,19 @@
           (is (= "22P02" (.getSQLState raised))
               (str "got " (.getSQLState raised) ": " (.getMessage raised))))))))
 
+(deftest insert-values-evaluates-numeric-arithmetic
+  (with-open [c (open)
+              st (.createStatement c)]
+    (.execute st "CREATE TABLE num_variance (a NUMERIC)")
+    (doseq [value ["0" "3e-500" "-3e-500"
+                   "4e-500 - 1e-16383" "-4e-500 + 1e-16383"]]
+      (.executeUpdate st (str "INSERT INTO num_variance VALUES (" value ")")))
+    (with-open [rs (.executeQuery st
+                                  (str "SELECT trim_scale(variance(a) * 1e1000) "
+                                       "FROM num_variance"))]
+      (is (.next rs))
+      (is (= "12" (.getString rs 1))))))
+
 (deftest prepared-insert-with-null-parameter
   (with-open [c (open)]
     (with-open [st (.createStatement c)]

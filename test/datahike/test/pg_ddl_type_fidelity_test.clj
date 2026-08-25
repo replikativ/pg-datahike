@@ -56,6 +56,13 @@
             ["n"  "numeric"]]
            (rows (format cols-sql "ag"))))))
 
+(deftest bit-widths-survive-into-pg-attribute
+  (run "CREATE TABLE bit_types (b bit(4), v bit varying(5), u varbit)")
+  (is (= [["b" "bit(4)"]
+          ["v" "bit varying(5)"]
+          ["u" "bit varying"]]
+         (rows (format cols-sql "bit_types")))))
+
 (deftest column-order-is-create-table-order
   ;; Was the schema map's hash order, which disagreed with column-info's
   ;; creation order — and drivers key field metadata on attnum.

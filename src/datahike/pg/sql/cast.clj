@@ -60,7 +60,9 @@
   [type-str]
   (when-let [m (re-find #"\(\s*(\d+)\s*(?:,\s*(-?\d+)\s*)?\)" (str type-str))]
     [(Integer/parseInt (nth m 1))
-     (if (nth m 2) (Integer/parseInt (nth m 2)) 0)]))
+     (if (nth m 2)
+       (types/decode-numeric-scale (Integer/parseInt (nth m 2)))
+       0)]))
 
 (defn apply-numeric-typmod
   "PostgreSQL's apply_typmod (numeric.c): round to the declared scale,
@@ -70,20 +72,69 @@
    Both halves were missing. The scale is why `123.456::numeric(10,1)`
    answered 123.456 instead of 123.5, and the precision is why
    `123456::numeric(5,2)` was accepted at all -- 22003 numeric field
-   overflow was never raised on any path."
-  [^java.math.BigDecimal v p s]
-  (let [scaled (.setScale v (int s) java.math.RoundingMode/HALF_UP)
-        ;; PG's own test: |value| must be < 10^(p-s).
-        limit (.pow (java.math.BigDecimal. "10") (int (- p s)))]
-    (if (>= (.compareTo (.abs scaled) limit) 0)
+  overflow was never raised on any path."
+  [v p s]
+  (if (types/numeric-special? v)
+    (if (= :nan (:kind v))
+      v
       (throw (errors/pg-error
               :numeric-value-out-of-range
-              ;; PostgreSQL puts the arithmetic in DETAIL, not the message.
               {:message "numeric field overflow"
                :detail (str "A field with precision " p ", scale " s
-                            " must round to an absolute value less than 10^"
-                            (- p s) ".")}))
-      scaled)))
+                            " cannot hold an infinite value.")})))
+    (let [^java.math.BigDecimal decimal v
+          scaled (.setScale decimal (int s) java.math.RoundingMode/HALF_UP)
+          result (if (neg? s) (.setScale scaled 0) scaled)
+          ;; PG's own test: |value| must be < 10^(p-s).
+          ;; scaleByPowerOfTen also covers s > p, where the exponent is
+          ;; negative (for example numeric(3,6) has a limit of 10^-3).
+          limit (.scaleByPowerOfTen java.math.BigDecimal/ONE (int (- p s)))]
+      (if (>= (.compareTo (.abs scaled) limit) 0)
+        (throw (errors/pg-error
+                :numeric-value-out-of-range
+                ;; PostgreSQL puts the arithmetic in DETAIL, not the message.
+                {:message "numeric field overflow"
+                 :detail (let [exponent (- p s)]
+                           (str "A field with precision " p ", scale " s
+                                " must round to an absolute value less than "
+                                (if (zero? exponent) "1" (str "10^" exponent))
+                                "."))}))
+        result))))
+
+(def ^:private money-min-cents (biginteger Long/MIN_VALUE))
+(def ^:private money-max-cents (biginteger Long/MAX_VALUE))
+
+(defn parse-money
+  "Parse PostgreSQL's `money` input in the C locale.
+
+   The upstream regression suite fixes `lc_monetary` to C. Its input
+   accepts a dollar sign, comma separators, and either a minus sign or
+   parentheses for a negative amount. PostgreSQL stores an int64 count
+   of cents; we retain the equivalent two-scale BigDecimal carrier."
+  [v]
+  (if-not (string? v)
+    (let [^java.math.BigDecimal bd (coerce/coerce-numeric v :bigdec)]
+      (.setScale bd 2 java.math.RoundingMode/HALF_UP))
+    (let [input v
+          trimmed (str/trim v)
+          negative? (or (and (str/starts-with? trimmed "(")
+                             (str/ends-with? trimmed ")"))
+                        (str/includes? trimmed "-"))
+          numeric-text (str/replace trimmed #"[\s$,+()\-]" "")]
+      (when-not (re-matches #"(?:\d+(?:\.\d*)?|\.\d+)" numeric-text)
+        (throw (errors/pg-error :invalid-text-representation
+                                {:type "money" :value input})))
+      (let [unsigned (java.math.BigDecimal. numeric-text)
+            signed (if negative? (.negate unsigned) unsigned)
+            scaled (.setScale signed 2 java.math.RoundingMode/HALF_UP)
+            cents (.toBigIntegerExact (.movePointRight scaled 2))]
+        (when (or (neg? (.compareTo cents money-min-cents))
+                  (pos? (.compareTo cents money-max-cents)))
+          (throw (errors/pg-error
+                  :numeric-value-out-of-range
+                  {:message (str "value " (pr-str input)
+                                 " is out of range for type money")})))
+        scaled))))
 
 (def ^:private char-type-limit
   "The text types that carry a length modifier, and whether an over-long
@@ -140,7 +191,7 @@
                     :numeric-value-out-of-range
                     {:message (str "cannot convert "
                                    (if (= :nan (:kind v)) "NaN" "infinity")
-                                   " to integer")})))
+                                   " to " tname)})))
         _ (when (and (number? v)
                      (or (Double/isNaN (double v)) (Double/isInfinite (double v))))
             ;; PostgreSQL reports these as a plain range failure for the
@@ -295,7 +346,8 @@
             ;; conversion, not through its shortest-round-trip text --
             ;; see coerce/float->numeric.
             :numeric (let [bd (if (or (instance? Float v) (instance? Double v))
-                                (coerce/float->numeric v)
+                                (or (types/double->numeric-special (double v))
+                                    (coerce/float->numeric v))
                                 (coerce/coerce-numeric v :bigdec))]
                        (if-let [[p sc] (numeric-typmod type-str)]
                          (apply-numeric-typmod bd p sc)
@@ -307,10 +359,7 @@
         ;; value model at the SQL boundary. Locale-specific symbols remain
         ;; a presentation concern, while scale and OID stay faithful.
         :money
-        (let [bd (if (instance? java.math.BigDecimal v)
-                   v
-                   (coerce/coerce-numeric v :bigdec))]
-          (.setScale ^java.math.BigDecimal bd 2 java.math.RoundingMode/HALF_UP))
+        (parse-money v)
 
         ;; `str` on a temporal value is java.util.Date.toString, which is
         ;; both the wrong format and rendered in the JVM's default time

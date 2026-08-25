@@ -117,6 +117,23 @@
     (is (= [["a" "32"] ["b" "32"]]
            (rows c "SELECT dept, sum(n)+count(*) FROM ae GROUP BY dept ORDER BY dept")))))
 
+(deftest compound-projections-preserve-select-list-order
+  (with-open [c (jdbc)]
+    (seed! c)
+    (with-open [st (.createStatement c)
+                rs (.executeQuery
+                    st
+                    (str "SELECT sum(n)+1 AS after_sum, dept, max(n)-1 AS before_max "
+                         "FROM ae GROUP BY dept ORDER BY dept"))]
+      (let [md (.getMetaData rs)]
+        (is (= ["after_sum" "dept" "before_max"]
+               (mapv #(.getColumnLabel md %) (range 1 4)))))
+      (is (= [["31" "a" "19"] ["31" "b" "29"]]
+             (loop [acc []]
+               (if (.next rs)
+                 (recur (conj acc (mapv #(.getString rs %) (range 1 4))))
+                 acc)))))))
+
 (deftest having-over-an-expression
   (with-open [c (jdbc)]
     (seed! c)

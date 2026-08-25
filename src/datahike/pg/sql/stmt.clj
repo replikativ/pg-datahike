@@ -767,6 +767,7 @@
 
 (declare translate-select)
 (declare extract-value)
+(declare apply-sql-cast)
 (declare eval-corr-scalar)
 (declare ^:dynamic *eval-update-db*)
 
@@ -791,8 +792,38 @@
     (instance? SignedExpression expr)
     (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
       (if (number? v) (- v) ::corr))
+    (instance? CastExpression expr)
+    (let [v (srf-const-eval (.getLeftExpression ^CastExpression expr))]
+      (if (= ::corr v) ::corr (apply-sql-cast v ^CastExpression expr)))
     (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
     :else ::corr))
+
+(defn- numeric-series-error! [message]
+  (throw (errors/pg-error :invalid-parameter-value {:message message})))
+
+(defn- numeric-series
+  "Materialize PostgreSQL's finite NUMERIC generate_series variant.
+
+   BigDecimal addition preserves the greater operand scale, which also
+   preserves PostgreSQL's visible scale for cases such as 0.0, 1.0, ... ."
+  [start stop step]
+  (doseq [[value label] [[start "start value"] [stop "stop value"] [step "step size"]]]
+    (when (types/numeric-special? value)
+      (numeric-series-error!
+       (str label " cannot be " (if (= :nan (:kind value)) "NaN" "infinity")))))
+  (let [^java.math.BigDecimal start start
+        ^java.math.BigDecimal stop stop
+        ^java.math.BigDecimal step step
+        direction (.signum step)]
+    (when (zero? direction)
+      (numeric-series-error! "step size cannot equal zero"))
+    (loop [value start
+           result (transient [])]
+      (if (if (pos? direction)
+            (pos? (.compareTo value stop))
+            (neg? (.compareTo value stop)))
+        (persistent! result)
+        (recur (.add value step) (conj! result [value]))))))
 
 (defn- coldef-pg-type
   "The `:pg/type` for a column-definition-list entry like `a int`.
@@ -872,6 +903,8 @@
                     (cond
                       (instance? Long v)    :db.type/long
                       (instance? Double v)  :db.type/double
+                      (instance? java.math.BigDecimal v) :db.type/bigdec
+                      (types/numeric-special? v) :db.type/bigdec
                       (instance? Boolean v) :db.type/boolean
                       (inst? v)             :db.type/instant
                       :else                 :db.type/string))
@@ -909,23 +942,37 @@
            (with-ordinality ["unnest"] (mapv vector vals) [(vtype-of (first vals))] [nil])))
 
        (= fname "generate_series")
-       ;; Integer series (inclusive of stop, like PG). Numeric/timestamp
-       ;; variants are future work; non-integer args fall through to nil.
        (let [args (mapv eval-fn params)]
-         (when (and (>= (count args) 2)
-                    (every? integer? (take 3 args)))
-           (let [[start stop step] args
-                 step (long (or step 1))]
-             (when-not (zero? step)
-               (let [vals (vec (range start
-                                      (if (pos? step) (inc stop) (dec stop))
-                                      step))]
-                 ;; PG types integer generate_series as int4 — advertise
-                 ;; that so clients parse the values as numbers, not int8
-                 ;; strings.
-                 (with-ordinality ["generate_series"]
-                   (mapv (fn [v] [(long v)]) vals)
-                   [:db.type/long] ["int4"]))))))
+         (when (>= (count args) 2)
+           (let [[start stop supplied-step] args
+                 numeric? (some #(or (instance? java.math.BigDecimal %)
+                                     (types/numeric-special? %))
+                                (take 3 args))]
+             (cond
+               numeric?
+               (let [as-numeric #(if (integer? %) (bigdec %) %)
+                     start (as-numeric start)
+                     stop (as-numeric stop)
+                     step (as-numeric (or supplied-step java.math.BigDecimal/ONE))]
+                 (when (every? #(or (instance? java.math.BigDecimal %)
+                                    (types/numeric-special? %))
+                               [start stop step])
+                   (with-ordinality ["generate_series"]
+                     (numeric-series start stop step)
+                     [:db.type/bigdec] ["numeric"])))
+
+               (every? integer? (take 3 args))
+               (let [step (long (or supplied-step 1))]
+                 (when-not (zero? step)
+                   (let [vals (vec (range start
+                                          (if (pos? step) (inc stop) (dec stop))
+                                          step))]
+                     ;; PG types integer generate_series as int4 — advertise
+                     ;; that so clients parse the values as numbers, not int8
+                     ;; strings.
+                     (with-ordinality ["generate_series"]
+                       (mapv (fn [v] [(long v)]) vals)
+                       [:db.type/long] ["int4"]))))))))
 
        ;; json_to_recordset / jsonb_to_recordset expand an ARRAY of
        ;; objects into typed rows; the *_record forms take one object.
@@ -1319,21 +1366,38 @@
       (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
                        {} (map vector corr-refs outer-vals))]
         (binding [params/*from-bindings* fb
+                  ;; Bare columns in a LATERAL VALUES/SELECT body use the
+                  ;; same unique-owner lookup as UPDATE ... FROM. Mark these
+                  ;; bindings as visible sources so `VALUES (outer_col)` can
+                  ;; resolve without a qualifier, as PostgreSQL permits.
+                  params/*from-source-aliases* (set (map first corr-refs))
                   params/*lateral-outer-aliases* (set (map first corr-refs))]
           (or (try
                 (let [p (when parse-fn (parse-fn inner-sql inner-schema query-db))
-                      q (:query p)
-                      ia (:in-args p)
-                      qdb (or (:enriched-db p) query-db)]
-                  (when q
-                    (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+                      plans (if (and (= :set-operation (:type p))
+                                     (= :union-all (:op p)))
+                              (:sub-results p)
+                              [p])
+                      first-q (some :query plans)
+                      run-plan (fn [plan]
+                                 (when-let [q (:query plan)]
+                                   (let [ia (:in-args plan)
+                                         qdb (or (:enriched-db plan)
+                                                 (:enriched-db p)
+                                                 query-db)]
+                                     (if (seq ia)
+                                       (apply d/q q qdb ia)
+                                       (d/q q qdb)))))
+                      res (vec (mapcat #(or (run-plan %) []) plans))]
+                  (when first-q
+                    (let [res res
                           ;; An aggregate over an empty relation is still
                           ;; ONE row -- `LATERAL (SELECT count(*) … WHERE
                           ;; ch.pid = t.id)` is 0 for an outer row with no
                           ;; children, not "no row". The same rule every
                           ;; other subquery evaluator applies.
                           res (or (when (empty? (seq res))
-                                    (expr/empty-aggregate-row q))
+                                    (expr/empty-aggregate-row first-q))
                                   res)]
                       ;; TAKE the visible columns. The inner's `:find`
                       ;; carries trailing bookkeeping vars — the entity
@@ -1362,6 +1426,134 @@
              (let [t (str/lower-case (str/trim (str (first es))))]
                (or (= t "true") (= t "1 = 1")))))))
 
+(defn- values-expression-rows
+  "Return a VALUES node as rows of expression ASTs. JSqlParser flattens a
+   single row but wraps each row of a multi-row VALUES in its own expression
+   list."
+  [^Values values]
+  (let [raw (vec (.getExpressions values))]
+    (if (and (seq raw) (instance? ParenthesedExpressionList (first raw)))
+      (mapv (fn [^ParenthesedExpressionList row] (vec row)) raw)
+      [raw])))
+
+(defn- column-vtype
+  "Best-effort storage type for a column expression in a virtual relation."
+  [^Column c schema]
+  (let [table (some-> (.getTable c) .getName unquote-ident str/lower-case)
+        col (str/lower-case (unquote-ident (.getColumnName c)))
+        matches (keep (fn [[k attr]]
+                        (when (and (keyword? k)
+                                   (= col (str/lower-case (name k)))
+                                   (or (nil? table)
+                                       (= table (str/lower-case (namespace k)))
+                                       (str/ends-with? (str/lower-case (namespace k))
+                                                       (str "__" table))))
+                          (:db/valueType attr)))
+                      schema)]
+    (when (= 1 (count (distinct matches))) (first matches))))
+
+(defn- expression-vtype
+  "Infer enough of an expression's Datahike carrier type to declare a
+   correlated VALUES relation. This deliberately follows numeric promotion;
+   other complex expressions retain the existing text fallback."
+  [e schema]
+  (cond
+    (instance? LongValue e) :db.type/long
+    (instance? DoubleValue e) :db.type/bigdec
+    (instance? Column e) (column-vtype e schema)
+    (instance? SignedExpression e)
+    (expression-vtype (.getExpression ^SignedExpression e) schema)
+    (instance? Parenthesis e)
+    (expression-vtype (.getExpression ^Parenthesis e) schema)
+    (instance? CastExpression e)
+    (let [^CastExpression ce e
+          target (some-> (.getColDataType ce) .getDataType str str/lower-case)]
+      (case (types/cast-category target)
+        :integer :db.type/long
+        :float :db.type/double
+        :numeric :db.type/bigdec
+        :boolean :db.type/boolean
+        :text :db.type/string
+        (expression-vtype (.getLeftExpression ce) schema)))
+    (instance? net.sf.jsqlparser.expression.BinaryExpression e)
+    (let [^net.sf.jsqlparser.expression.BinaryExpression be e
+          types (set (keep #(expression-vtype % schema)
+                           [(.getLeftExpression be) (.getRightExpression be)]))]
+      (cond
+        (types :db.type/bigdec) :db.type/bigdec
+        (types :db.type/double) :db.type/double
+        (types :db.type/long) :db.type/long
+        :else nil))
+    :else nil))
+
+(defn- lateral-values-corr-refs
+  "Correlation references made by a lateral VALUES body.
+
+   Qualified references use the normal detector. PostgreSQL also permits bare
+   outer columns here. Resolve those only when their schema attribute has one
+   logical owner in scope. Correlation arguments use the storage namespace;
+   this matters for derived relations, whose user alias has no attributes."
+  [^Values values outer-aliases schema]
+  (let [raw-qualified (or (correlated-subquery-refs values outer-aliases) #{})
+        storage-owner (fn [alias col]
+                        (let [a (str/lower-case alias)
+                              c (str/lower-case col)]
+                          (or (some (fn [k]
+                                      (let [ns (when (keyword? k)
+                                                 (str/lower-case (namespace k)))]
+                                        (when (and ns (= c (str/lower-case (name k)))
+                                                   (= ns a))
+                                          ns)))
+                                    (keys schema))
+                              (some (fn [k]
+                                      (let [ns (when (keyword? k)
+                                                 (str/lower-case (namespace k)))]
+                                        (when (and ns (= c (str/lower-case (name k)))
+                                                   (str/ends-with? ns (str "__" a))
+                                                   (contains? outer-aliases ns))
+                                          ns)))
+                                    (keys schema))
+                              alias)))
+        qualified (set (map (fn [[a c]] [(storage-owner a c) c]) raw-qualified))
+        alias-for-ns (fn [ns]
+                       (or (some #(when (= ns (str/lower-case %)) %) outer-aliases)
+                           (first
+                            (sort-by count
+                                     (filter (fn [a]
+                                               (str/ends-with?
+                                                ns (str "__" (str/lower-case a))))
+                                             outer-aliases)))))
+        candidates (reduce (fn [m k]
+                             (if (and (keyword? k)
+                                      (not= "db-row-exists" (name k)))
+                               (let [ns (str/lower-case (namespace k))]
+                                 (if-let [a (alias-for-ns ns)]
+                                   (update m (str/lower-case (name k))
+                                           (fnil conj #{}) a)
+                                   m))
+                               m))
+                           {} (keys schema))
+        sql (str values)
+        bare (for [[col aliases] candidates
+                   :when (= 1 (count aliases))
+                   :let [alias (first aliases)]
+                   :when (re-find
+                          (re-pattern
+                           (str "(?i)(?<![\\w.])"
+                                (java.util.regex.Pattern/quote col)
+                                "(?![\\w]|\\s*\\.)"))
+                          sql)]
+               [alias col])]
+    (not-empty (into (set qualified) bare))))
+
+(defn- values-as-select-sql
+  "Turn a VALUES body into SELECT branches so the existing correlated
+   subquery executor can translate each expression under outer bindings."
+  [^Values values]
+  (str/join " UNION ALL "
+            (map (fn [row] (str "SELECT " (str/join ", " (map str row))))
+                 (values-expression-rows values))))
+
 (defn- lateral-subselect->spec
   "`JOIN LATERAL (SELECT …) s ON true` whose inner references an outer
    column.
@@ -1387,12 +1579,23 @@
   [^net.sf.jsqlparser.statement.select.LateralSubSelect ls db schema
    outer-aliases var-counter]
   (let [inner (.getSelect ls)
-        corr-refs (seq (correlated-subquery-refs inner outer-aliases))]
-    (when (and corr-refs (instance? PlainSelect inner))
+        values? (instance? Values inner)
+        corr-refs (seq (if values?
+                         (lateral-values-corr-refs inner outer-aliases schema)
+                         (correlated-subquery-refs inner outer-aliases)))]
+    (when (and corr-refs (or (instance? PlainSelect inner) values?))
       (let [talias (when-let [a (.getAlias ls)]
                      (unquote-ident (str/trim (.getName ^Alias a))))
-            items (vec (.getSelectItems ^PlainSelect inner))
-            cols (vec (map-indexed (fn [i si] (select-item-col-name si i)) items))
+            alias-cols (when-let [a (.getAlias ls)]
+                         (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                      (unquote-ident (.-name c)))
+                                    (or (.getAliasColumns ^Alias a) []))))
+            items (when-not values? (vec (.getSelectItems ^PlainSelect inner)))
+            value-rows (when values? (values-expression-rows inner))
+            cols (vec (or alias-cols
+                          (map-indexed (fn [i si] (select-item-col-name si i)) items)
+                          (map-indexed (fn [i _] (str "column" (inc i)))
+                                       (first value-rows))))
             ;; Best-effort storage type: a bare column reference keeps
             ;; the type it has in the schema.
             ;;
@@ -1402,10 +1605,11 @@
             ;; :db.type/string, so the relation declared TEXT for an
             ;; integer column: Describe reported the wrong type, and
             ;; `WHERE s.v > 10` looked like text > integer.
-            inner-from-name (when-let [fi (.getFromItem ^PlainSelect inner)]
-                              (when (instance? net.sf.jsqlparser.schema.Table fi)
-                                (some-> (.getName ^net.sf.jsqlparser.schema.Table fi)
-                                        unquote-ident str/lower-case)))
+            inner-from-name (when (instance? PlainSelect inner)
+                              (when-let [fi (.getFromItem ^PlainSelect inner)]
+                                (when (instance? net.sf.jsqlparser.schema.Table fi)
+                                  (some-> (.getName ^net.sf.jsqlparser.schema.Table fi)
+                                          unquote-ident str/lower-case))))
             vtype-of (fn [^net.sf.jsqlparser.statement.select.SelectItem si]
                        (let [e (.getExpression si)]
                          (or (when (instance? Column e)
@@ -1416,7 +1620,13 @@
                                      n (str/lower-case (unquote-ident (.getColumnName c)))]
                                  (when t (get-in schema [(keyword t n) :db/valueType]))))
                              :db.type/string)))
-            vtypes (mapv vtype-of items)
+            vtypes (if values?
+                     (mapv (fn [i]
+                             (or (some #(expression-vtype (nth % i nil) schema)
+                                       value-rows)
+                                 :db.type/string))
+                           (range (count cols)))
+                     (mapv vtype-of items))
             sub-name (str "__lsub__" (or talias "anon"))
             ;; NO row marker. Every other virtual table declares one so
             ;; `count(*)` and `SELECT *` have something to enumerate, but
@@ -1437,7 +1647,7 @@
          :vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
          :ord-var (symbol (str "?" sub-name "_ord" (swap! var-counter inc)))
          :corr-refs (vec corr-refs)
-         :inner-sql (str inner)
+         :inner-sql (if values? (values-as-select-sql inner) (str inner))
          :n-cols (count cols)}))))
 
 (defn- sequence->virtual-table
@@ -1519,6 +1729,10 @@
         ;; key on the enriched schema; a fresh name per parse would make
         ;; every derived-table query a cache miss.
         sub-name (str "__sub__" (or sub-alias "anon"))
+        alias-cols (when-let [a (.getAlias ps)]
+                     (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                  (unquote-ident (.-name c)))
+                                (or (.getAliasColumns ^Alias a) []))))
         with-fn d/db-with
         inner (.getSelect ps)
         inner-ps (when (instance? PlainSelect inner) inner)
@@ -1557,6 +1771,12 @@
       ;; handle that by translating each branch, executing, and combining.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
       (materialize-set-op! inner sub-name db schema sub-alias)
+
+      ;; FROM (VALUES (...), (...)) AS v(a,b). materialize-set-op! already
+      ;; knows how to evaluate and type literal VALUES rows; this shape was
+      ;; simply never dispatched to it, so the relation silently had no rows.
+      (instance? Values inner)
+      (materialize-set-op! inner sub-name db schema sub-alias alias-cols)
 
       :else nil)))
 
@@ -2031,6 +2251,23 @@
       :alias   (or alias target-name)
       :aliases sub-aliases})))
 
+(defn- materialize-parenthesed-values!
+  "Materialize JSqlParser's FROM (VALUES ...) AS v(a,b) shape.
+
+   This parses as a ParenthesedFromItem whose alias lives on the wrapper
+   and whose child is a bare Values node."
+  [^ParenthesedFromItem pfi db schema]
+  (let [inner (.getFromItem pfi)]
+    (when (instance? Values inner)
+      (let [alias-obj (.getAlias pfi)
+            alias (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
+            aliases (when alias-obj
+                      (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                   (unquote-ident (.-name c)))
+                                 (or (.getAliasColumns ^Alias alias-obj) []))))
+            target-name (str "__values__" (or alias "anon"))]
+        (materialize-set-op! inner target-name db schema alias aliases)))))
+
 (def ^:dynamic *cte-namespaces*
   "`{cte-name -> synthetic-namespace}` for the WITH items in scope.
 
@@ -2218,6 +2455,137 @@
    marked as something other than NULL -- see `fns/filtered-out`."
   #{"array_agg" "jsonb_agg" "json_agg"})
 
+(def ^:private throwing-projection-ops
+  "Runtime arithmetic functions that can raise for some row values. A
+   Datalog planner may reorder function clauses ahead of SQL WHERE
+   predicates, so SELECT projections containing these are deferred until
+   after filtering when the query shape permits it."
+  '#{datahike.pg.sql/sql-div
+     datahike.pg.sql/sql-int-div
+     datahike.pg.sql/sql-f4div
+     datahike.pg.sql/sql-mod
+     datahike.pg.sql/sql-money-div
+     datahike.pg.sql/sql-money-div-money})
+
+(defn- throwing-projection?
+  [form clauses]
+  (boolean
+   (some throwing-projection-ops
+         (filter symbol?
+                 (tree-seq coll? seq (cons form (map first clauses)))))))
+
+(defn- inline-projection-bindings
+  "Inline THROWING SSA-style function bindings emitted for one SELECT item.
+
+   Safe storage lookup/decoder bindings remain in Datalog. A throwing
+   nested binding and every binding that depends on it move into the
+   returned post-filter form. Returns [query-clauses form]."
+  [form clauses]
+  (let [binding? #(and (vector? %) (= 2 (count %))
+                       (seq? (first %)) (symbol? (second %)))
+        deferred (volatile!
+                  (into #{}
+                        (keep (fn [clause]
+                                (when (and (binding? clause)
+                                           (some throwing-projection-ops
+                                                 (filter symbol?
+                                                         (tree-seq coll? seq
+                                                                   (first clause)))))
+                                  (second clause))))
+                        clauses))
+        above? (fn [clause]
+                 (boolean
+                  (some @deferred
+                        (filter symbol?
+                                (tree-seq coll? seq (first clause))))))
+        keep-clauses
+        (vec (remove (fn [clause]
+                       (when (and (binding? clause)
+                                  (or (contains? @deferred (second clause))
+                                      (above? clause)))
+                         (vswap! deferred conj (second clause))
+                         true))
+                     clauses))
+        by-out (into {} (keep (fn [clause]
+                                (when (and (binding? clause)
+                                           (contains? @deferred (second clause)))
+                                  [(second clause) (first clause)])))
+                     clauses)
+        inline (fn inline [x]
+                 (cond
+                   (and (symbol? x) (contains? by-out x))
+                   (inline (get by-out x))
+
+                   (seq? x) (apply list (map inline x))
+                   :else x))]
+    [keep-clauses (inline form)]))
+
+(defn compound-projection-indices
+  "Indices that turn the physical compound-projection shape into its SQL
+   SELECT-list shape. Hidden aggregate inputs are removed and deferred
+   expressions are restored to the positions recorded while lowering."
+  [aliases compound-exprs]
+  (let [visible-indices (into []
+                              (keep-indexed
+                               (fn [i a]
+                                 (when-not (and (string? a)
+                                                (.startsWith ^String a "__compound_"))
+                                   i)))
+                              aliases)
+        positions (mapv :out-pos compound-exprs)
+        n-visible (count visible-indices)
+        reorder? (and (every? some? positions)
+                      (= (count positions) (count (distinct positions)))
+                      (every? #(< -1 % n-visible) positions))]
+    (if reorder?
+      (let [base-count (- n-visible (count compound-exprs))
+            compound-at (into {}
+                              (map-indexed (fn [i pos] [pos (+ base-count i)]))
+                              positions)
+            visible-order
+            (first
+             (reduce (fn [[order next-base] pos]
+                       (if-let [compound-idx (get compound-at pos)]
+                         [(conj order compound-idx) next-base]
+                         [(conj order next-base) (inc next-base)]))
+                     [[] 0]
+                     (range n-visible)))]
+        (mapv #(nth visible-indices %) visible-order))
+      visible-indices)))
+
+(defn apply-compound-projections
+  "Evaluate deferred SELECT projection forms and remove their hidden inputs.
+
+   Shared by the normal SELECT executor and INSERT ... SELECT, which must
+   consume the same visible row shape. Returns [rows aliases]."
+  [results aliases query in-args compound-exprs]
+  (if (seq compound-exprs)
+    (let [row-bindings
+          (fn [row]
+            (let [rv (if (sequential? row) (vec row) [row])]
+              (into (into {} (keep-indexed (fn [i e]
+                                             (when (symbol? e)
+                                               [e (nth rv i nil)])))
+                          (:find query))
+                    (zipmap (rest (:in query)) in-args))))
+          new-results
+          (mapv (fn [row]
+                  (let [rv (if (sequential? row) (vec row) [row])
+                        binds (row-bindings row)]
+                    (reduce (fn [r {:keys [form slots]}]
+                              (let [b (reduce (fn [m [sym idx]]
+                                                (assoc m sym (nth r idx nil)))
+                                              binds slots)
+                                    val (expr/interpret-form form b)]
+                                (conj r (if (= :__null__ val) nil val))))
+                            rv compound-exprs)))
+                results)
+          new-aliases (into (vec aliases) (map :alias compound-exprs))
+          visible-indices (compound-projection-indices new-aliases compound-exprs)]
+      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
+       (mapv #(nth new-aliases %) visible-indices)])
+    [results aliases]))
+
 (defn- filter-arg-var!
   "Bind a fresh variable to `inner-expr`'s value on the rows where
    `filter-expr` is TRUE, and to `excluded` on every other row -- the NULL
@@ -2308,6 +2676,9 @@
         ;; FROM item is a bare relation name (issue #26).
         seq-vt (when (and db (instance? Table from-item))
                  (sequence->virtual-table ^Table from-item db))
+        values-vt (when (and db (instance? ParenthesedFromItem from-item))
+                    (materialize-parenthesed-values!
+                     ^ParenthesedFromItem from-item db schema))
         ;; A correlated SRF in FROM — `FROM t, LATERAL generate_series(1, t.n)`.
         ;; Detected here so the relation exists for SELECT * / count(*)
         ;; / OID inference; the actual per-outer-row binding is emitted
@@ -2323,6 +2694,9 @@
         ;; WITH ORDINALITY) AS sub.
         [db schema name alias]
         (cond
+          values-vt
+          [(:db values-vt) (:schema values-vt) (:name values-vt) (:alias values-vt)]
+
           (and db (instance? ParenthesedSelect from-item))
           (if-let [{sub-db :db sub-schema :schema
                     sub-name :name sub-alias :alias}
@@ -2437,7 +2811,7 @@
                  [(:db spec) (:schema spec)
                   (assoc aliases (:alias spec) (:name spec))
                   derived
-                  (conj lsrfs spec)])
+                  (conj lsrfs (assoc spec :join j))])
 
                ;; An UNCORRELATED set-returning function in join or comma
                ;; position -- `FROM t, generate_series(1, 3) g`. Its rows
@@ -2505,7 +2879,8 @@
                    [(:db spec) (:schema spec)
                     (assoc aliases (:alias spec) (:name spec))
                     derived
-                    (conj lsrfs (cond-> spec outer? (assoc :outer? true)))]))
+                    (conj lsrfs (cond-> (assoc spec :join j)
+                                  outer? (assoc :outer? true)))]))
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
@@ -2520,6 +2895,19 @@
                   ;; from-item path always registered both, which is why
                   ;; `FROM (SELECT …) s JOIN t` worked and the same
                   ;; subquery on the right did not.
+                  (cond-> (assoc aliases sub-name sub-name)
+                    (and sub-alias (not= sub-alias sub-name))
+                    (assoc sub-alias sub-name))
+                  (conj derived {:join j :alias (or sub-alias sub-name)})
+                  lsrfs]
+                 [db schema aliases derived lsrfs])
+
+               (and db (instance? ParenthesedFromItem rt))
+               (if-let [{spec-db :db spec-schema :schema
+                         sub-name :name sub-alias :alias}
+                        (materialize-parenthesed-values!
+                         ^ParenthesedFromItem rt db schema)]
+                 [spec-db spec-schema
                   (cond-> (assoc aliases sub-name sub-name)
                     (and sub-alias (not= sub-alias sub-name))
                     (assoc sub-alias sub-name))
@@ -2588,12 +2976,17 @@
                           (instance? Table rt)
                           (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
                             (when jn [(or ja jn) jn]))
-                          ;; A derived table or SRF in join position: its
-                          ;; alias is registered above; find it by looking
-                          ;; for the entry whose value is a synthetic ns.
+                          ;; A derived table or SRF in join position. Match
+                          ;; the spec to THIS join: choosing the first
+                          ;; derived item silently omitted later relations,
+                          ;; and correlated SRFs were not represented in
+                          ;; derived-joins at all.
                           :else
-                          (when-let [a (some (fn [{al :alias}] al) derived-joins)]
-                            (when-let [tn (get join-aliases a)] [a tn]))))))
+                          (when-let [{a :alias n :name}
+                                     (some (fn [spec]
+                                             (when (identical? j (:join spec)) spec))
+                                           (concat derived-joins lsrf-specs))]
+                            [a (or (get join-aliases a) n)])))))
               (or joins []))
 
         ;; Preserve FROM occurrences for unqualified column resolution.
@@ -3500,6 +3893,10 @@
                 ;; (`coalesce(sum(n),0)` answered `{":fn": "sum", …}`).
                 (let [sink (atom [])
                       before (count @(:where-clauses ctx))
+                      out-pos (+ (count (remove #(and (string? %)
+                                                      (.startsWith ^String % "__compound_"))
+                                                @find-aliases))
+                                 (count @compound-exprs))
                       v (expr/translate-expr (assoc ctx :hoisted-aggs sink) expr)
                       hoisted @sink]
                   (if (seq hoisted)
@@ -3524,27 +3921,58 @@
                              ;; `$1` the plan-cache rewrite left behind
                              ;; (`sum(v)/$1`).
                              {:alias (or alias-str (figure-colname expr))
+                              :out-pos out-pos
                               :form  form
                               :slots slots}))
                     ;; Regular non-aggregate expression
-                    (let [v (cond
-                              (seq? v)            (ctx/materialize-arg! ctx v)
-                              (not (symbol? v))   (let [var (ctx/fresh-var! ctx)
-                                                        ;; Datahike drops rows when a fn-binding
-                                                        ;; produces nil; use the :__null__ sentinel
-                                                        ;; for SQL NULL projections so the row
-                                                        ;; survives. The wire layer maps the
-                                                        ;; sentinel back to NULL on output.
-                                                        bind-v (if (nil? v) :__null__ v)]
-                                                    (ctx/add-clause! ctx [(list 'identity bind-v) var])
-                                                    var)
-                              :else               v)]
-                      (swap! find-elements conj v)
-                      ;; PG's naming rules — NOT the datalog variable
-                      ;; (`p1`, `v1`) or the expression's SQL text, which
-                      ;; is what the old fallback chain produced.
-                      (swap! find-aliases conj (or alias-str
-                                                   (figure-colname expr)))))))))
+                    (let [all-clauses (vec @(:where-clauses ctx))
+                          emitted (subvec all-clauses before)
+                          defer? (and where-expr
+                                      (nil? group-by-element)
+                                      (not has-distinct?)
+                                      (empty? (.getOrderByElements select))
+                                      (throwing-projection? v emitted))]
+                      (if defer?
+                        (let [[keep-cs form] (inline-projection-bindings v emitted)
+                              _ (reset! (:where-clauses ctx)
+                                        (into (subvec all-clauses 0 before) keep-cs))
+                              in-vars (set @(:in-params ctx))
+                              value-vars (->> (tree-seq coll? seq form)
+                                              (filter symbol?)
+                                              (filter #(and (.startsWith ^String (clojure.core/name %) "?")
+                                                            (not (contains? in-vars %))))
+                                              distinct)]
+                          ;; Carry each leaf value through the filtered query.
+                          ;; Existing projected vars are reused; new ones are
+                          ;; hidden and stripped after post-processing.
+                          (doseq [value-var value-vars
+                                  :when (not (some #{value-var} @find-elements))]
+                            (swap! find-elements conj value-var)
+                            (swap! find-aliases conj
+                                   (str "__compound_guard_" (count @find-aliases))))
+                          (swap! compound-exprs conj
+                                 {:alias (or alias-str (figure-colname expr))
+                                  :out-pos out-pos
+                                  :form form
+                                  :slots []}))
+                        (let [v (cond
+                                  (seq? v)          (ctx/materialize-arg! ctx v)
+                                  (not (symbol? v)) (let [var (ctx/fresh-var! ctx)
+                                                         ;; Datahike drops rows when a fn-binding
+                                                         ;; produces nil; use the :__null__ sentinel
+                                                         ;; for SQL NULL projections so the row
+                                                         ;; survives. The wire layer maps the
+                                                         ;; sentinel back to NULL on output.
+                                                          bind-v (if (nil? v) :__null__ v)]
+                                                      (ctx/add-clause! ctx [(list 'identity bind-v) var])
+                                                      var)
+                                  :else             v)]
+                          (swap! find-elements conj v)
+                          ;; PG's naming rules — NOT the datalog variable
+                          ;; (`p1`, `v1`) or the expression's SQL text, which
+                          ;; is what the old fallback chain produced.
+                          (swap! find-aliases conj (or alias-str
+                                                       (figure-colname expr)))))))))))
 
         ;; Thread each distinct correlation column (e.g. t.oid) into :find
         ;; as a trailing hidden column so every outer row carries the value
@@ -4666,6 +5094,7 @@
              ;; Pass enriched db when derived tables or derived-table-joins
              ;; created speculative data (FROM (…) AS sub or JOIN (…) AS sub).
              :enriched-db     (when (or (instance? ParenthesedSelect from-item)
+                                        values-vt
                                         ;; bare SRF in FROM materialised into
                                         ;; a virtual table (table-fn->virtual-table)
                                         (instance? net.sf.jsqlparser.statement.select.TableFunction from-item)
@@ -4788,6 +5217,19 @@
               (widen-integral (if (sequential? lr) (first lr) lr)))))))
     (catch Throwable _ nil)))
 
+(defn- extract-numeric-binary
+  "Evaluate a binary numeric expression in INSERT ... VALUES using the
+   same PostgreSQL arithmetic helpers as SELECT/UPDATE."
+  [left right schema db operation]
+  (let [l (extract-value left schema db)
+        r (extract-value right schema db)]
+    (cond
+      (or (nil? l) (nil? r)) nil
+      (and (or (number? l) (types/numeric-special? l))
+           (or (number? r) (types/numeric-special? r)))
+      (operation l r)
+      :else ::unhandled)))
+
 (defn extract-value
   "Extract a Clojure value from a JSqlParser expression for INSERT VALUES.
    Optional schema+db params enable scalar subquery evaluation.
@@ -4848,6 +5290,46 @@
      (instance? CastExpression e)
      (apply-sql-cast (extract-value (.getLeftExpression ^CastExpression e) schema db)
                      ^CastExpression e)
+     (instance? Addition e)
+     (let [^Addition expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-+)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Subtraction e)
+     (let [^Subtraction expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql--)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Multiplication e)
+     (let [^Multiplication expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-*)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Division e)
+     (let [^Division expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-div)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
+     (instance? Modulo e)
+     (let [^Modulo expression e
+           value (extract-numeric-binary (.getLeftExpression expression)
+                                         (.getRightExpression expression)
+                                         schema db fns/sql-mod)]
+       (if (= ::unhandled value)
+         (or (eval-const-expr e schema db) (str e))
+         value))
     ;; Parenthesized single expression — unwrap
      (instance? ParenthesedExpressionList e)
      (let [^ParenthesedExpressionList pel e]
@@ -4969,7 +5451,7 @@
    discarded, so 22003 numeric field overflow was never raised on any
    write path."
   [v p scale]
-  (if (instance? java.math.BigDecimal v)
+  (if (or (instance? java.math.BigDecimal v) (types/numeric-special? v))
     (cond
       (and p scale) (sql-cast/apply-numeric-typmod v p scale)
       scale         (.setScale ^java.math.BigDecimal v (int scale)
@@ -5050,6 +5532,25 @@
         ;; behaving like PG `json`). Canonicalize every jsonb write here — string
         ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
           jsonb? (jb/serialize-jsonb val)
+
+        ;; money shares Datahike's BigDecimal carrier with numeric, but its
+        ;; SQL input function accepts currency/grouping syntax and enforces
+        ;; an int64 count-of-cents range. Dispatch on the declared type
+        ;; before the generic :db.type/bigdec assignment branch.
+          (= "money" pg-type) (sql-cast/parse-money val)
+
+        ;; BIT and BIT VARYING share string storage with text/json, but
+        ;; expression evaluation carries them as PgBit so width and type
+        ;; survive operators. Persist only PostgreSQL's canonical digit run;
+        ;; otherwise INSERT ... SELECT stringifies the record as
+        ;; `{:bits ...}`, and the next read fails on the opening `{`.
+        ;; Assignment coercion is deliberately non-explicit: fixed bit(n)
+        ;; requires exactly n bits, while varbit(n) accepts shorter input and
+        ;; rejects longer input instead of silently truncating it.
+          (contains? #{"bit" "varbit"} pg-type)
+          (let [target-type (str pg-type (when typmod (str "(" typmod ")")))]
+            (pg-bits/to-pg-text
+             (sql-cast/cast-to-bit val target-type false)))
 
         ;; Native PG array column (`:pg/array-elem` recorded by DDL)
         ;; — Option C storage: serialize a PgArray (or coerce a
@@ -5456,7 +5957,29 @@
    per ENTITY against an already-materialised entity-map, not as a datalog
    clause over the whole relation."
   [expr entity-map ns-str schema]
-  (let [ev (fn [e] (eval-update-expr e entity-map ns-str schema))]
+  (let [ev (fn [e] (eval-update-expr e entity-map ns-str schema))
+        ;; SELECT-list predicates and UPDATE expressions are evaluated here,
+        ;; outside expr/translate-comparison's Datalog path. Preserve the
+        ;; same PostgreSQL rule in both lowering paths: an unknown string
+        ;; literal takes the known column operand's declared type. Runtime
+        ;; class is insufficient for money because numeric shares its
+        ;; BigDecimal carrier.
+        comparison-values
+        (fn [left right]
+          (let [coerce-one
+                (fn [typed unknown v]
+                  (if (and (instance? Column typed)
+                           (instance? StringValue unknown)
+                           (let [attr (keyword ns-str
+                                               (unquote-ident
+                                                (.getColumnName ^Column typed)))]
+                             (= "money"
+                                (or (get-in schema [attr :pg/type])
+                                    (params/pg-type-of-attr nil attr)))))
+                    (sql-cast/parse-money v)
+                    v))]
+            [(coerce-one right left (ev left))
+             (coerce-one left right (ev right))]))]
     (cond
       (instance? AndExpression expr)
       (fns/sql-and3 (eval-update-cond (.getLeftExpression ^AndExpression expr) entity-map ns-str schema)
@@ -5473,17 +5996,23 @@
       (let [v (ev (.getLeftExpression ^IsNullExpression expr))]
         (if (.isNot ^IsNullExpression expr) (some? v) (nil? v)))
       (instance? EqualsTo expr)
-      (fns/sql-eq3? (ev (.getLeftExpression ^EqualsTo expr)) (ev (.getRightExpression ^EqualsTo expr)))
+      (apply fns/sql-eq3? (comparison-values (.getLeftExpression ^EqualsTo expr)
+                                             (.getRightExpression ^EqualsTo expr)))
       (instance? NotEqualsTo expr)
-      (fns/sql-ne3? (ev (.getLeftExpression ^NotEqualsTo expr)) (ev (.getRightExpression ^NotEqualsTo expr)))
+      (apply fns/sql-ne3? (comparison-values (.getLeftExpression ^NotEqualsTo expr)
+                                             (.getRightExpression ^NotEqualsTo expr)))
       (instance? GreaterThan expr)
-      (fns/sql-gt3? (ev (.getLeftExpression ^GreaterThan expr)) (ev (.getRightExpression ^GreaterThan expr)))
+      (apply fns/sql-gt3? (comparison-values (.getLeftExpression ^GreaterThan expr)
+                                             (.getRightExpression ^GreaterThan expr)))
       (instance? GreaterThanEquals expr)
-      (fns/sql-ge3? (ev (.getLeftExpression ^GreaterThanEquals expr)) (ev (.getRightExpression ^GreaterThanEquals expr)))
+      (apply fns/sql-ge3? (comparison-values (.getLeftExpression ^GreaterThanEquals expr)
+                                             (.getRightExpression ^GreaterThanEquals expr)))
       (instance? MinorThan expr)
-      (fns/sql-lt3? (ev (.getLeftExpression ^MinorThan expr)) (ev (.getRightExpression ^MinorThan expr)))
+      (apply fns/sql-lt3? (comparison-values (.getLeftExpression ^MinorThan expr)
+                                             (.getRightExpression ^MinorThan expr)))
       (instance? MinorThanEquals expr)
-      (fns/sql-le3? (ev (.getLeftExpression ^MinorThanEquals expr)) (ev (.getRightExpression ^MinorThanEquals expr)))
+      (apply fns/sql-le3? (comparison-values (.getLeftExpression ^MinorThanEquals expr)
+                                             (.getRightExpression ^MinorThanEquals expr)))
       (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
 
       ;; The predicate surface eval-update-expr does not itself decide.
@@ -6255,6 +6784,22 @@
                             (seq inner-in-args)
                             (apply q-fn inner-query inner-db inner-in-args)
                             :else (q-fn inner-query inner-db))
+            ;; The normal SELECT executor removes trailing helper find
+            ;; elements (usually the entity id used for stable default
+            ;; ordering) before projection post-processing. INSERT-SELECT
+            ;; runs the query directly and must mirror that row shape.
+            hidden-count (long (or (:hidden-count inner-parsed) 0))
+            inner-results (if (pos? hidden-count)
+                            (mapv (fn [row]
+                                    (let [v (if (sequential? row) (vec row) [row])]
+                                      (subvec v 0 (- (count v) hidden-count))))
+                                  inner-results)
+                            inner-results)
+            [inner-results _]
+            (apply-compound-projections inner-results
+                                        (:find-aliases inner-parsed)
+                                        inner-query inner-in-args
+                                        (:compound-exprs inner-parsed))
             rows (mapv (fn [row]
                          (if (sequential? row) (vec row) [row]))
                        inner-results)
@@ -6276,7 +6821,7 @@
                                         ;; value was NULL. A NULL column is simply
                                         ;; an absent datom.
                                         coerced (when-not (= :__null__ val)
-                                                  (coerce-insert-value val attr schema))]
+                                                  (coerce-insert-value val attr schema db))]
                                     (when (some? coerced)
                                       [attr coerced])))
                                 (map vector col-names row))))
@@ -6850,7 +7395,16 @@
   "Translate a DELETE statement to Datahike retraction query + tx-data."
   [^Delete delete schema]
   (let [table (.getTable delete)
-        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
+        _ (when-not table
+            (throw (ex-info "syntax error at end of input"
+                            {:error :syntax-error :sqlstate "42601"})))
+        raw-table (unquote-ident (.getName ^Table table))
+        _ (when-not (relation-known? schema raw-table)
+            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table raw-table})))
+        table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name
@@ -6960,7 +7514,13 @@
    and target table info for the server to execute."
   [^Update update schema db]
   (let [table (.getTable update)
-        table-name (first (canonical-relation schema (unquote-ident (.getName ^Table table)) []))
+        raw-table (unquote-ident (.getName ^Table table))
+        _ (when-not (relation-known? schema raw-table)
+            (throw (ex-info (str "relation \"" raw-table "\" does not exist")
+                            {:error :undefined-table
+                             :sqlstate "42P01"
+                             :table raw-table})))
+        table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
         ns table-name

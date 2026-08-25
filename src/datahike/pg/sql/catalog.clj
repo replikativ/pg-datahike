@@ -91,6 +91,16 @@
     "pg_depend"
     "pg_inherits"
     "pg_enum"
+    ;; Row-level security is intentionally unsupported, so there can be no
+    ;; policy rows. psql still queries pg_policy on every `\d relation` and
+    ;; expects the catalog shape to exist even when it is empty.
+    "pg_policy"
+    ;; Extended statistics are not collected, but psql probes the catalog
+    ;; unconditionally after policies while describing every relation.
+    "pg_statistic_ext"
+    ;; Logical replication is unsupported; psql nevertheless runs its
+    ;; publication UNION query for every ordinary table it describes.
+    "pg_publication" "pg_publication_namespace" "pg_publication_rel"
     "information_schema_columns" "information_schema_tables"
     "information_schema_sequences"
     "information_schema_table_constraints"
@@ -248,6 +258,7 @@
      ;; NOT NULL marker — true for PK columns, false otherwise. pgjdbc's
      ;; field-metadata projection reads it as `a.attnotnull OR (...)`.
      {:db/ident :pg_attribute/attnotnull :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_attribute/atthasdef :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      ;; PG identity-column kind: '' = not identity, 'a' = always,
      ;; 'd' = by default. We never emit identity columns.
      {:db/ident :pg_attribute/attidentity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -335,8 +346,9 @@
      {:db/ident (pgs/row-marker-attr "pg_index") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
 
     "pg_attrdef"
-    ;; Always empty for us (no column defaults), but must exist as a
-    ;; catalog table so pgjdbc's LEFT JOIN doesn't fail to resolve.
+    ;; Synthesized from the :pg/default-* facts stored on column schema
+    ;; entities. pgjdbc LEFT JOINs this table and psql uses a correlated
+    ;; subquery over it for the Default column of `\d`.
     [{:db/ident :pg_attrdef/adrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_attrdef/adnum :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_attrdef/adbin :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -386,6 +398,47 @@
      {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
      {:db/ident :pg_enum/enumlabel :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_enum") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_policy"
+    ;; Always empty: pg-datahike does not implement row-level security. These
+    ;; are the columns psql 17's describe.c projects when describing a table.
+    [{:db/ident :pg_policy/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_policy/polname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_policy/polrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_policy/polcmd :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_policy/polpermissive :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     ;; oid[] in PostgreSQL. Canonical array text matches the representation
+     ;; used by the other virtual catalogs.
+     {:db/ident :pg_policy/polroles :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "_oid"}
+     {:db/ident :pg_policy/polqual :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_policy/polwithcheck :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_policy") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_statistic_ext"
+    ;; Always empty. Shape follows the fields projected by psql 17's
+    ;; describeOneTableDetails query.
+    [{:db/ident :pg_statistic_ext/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_statistic_ext/stxrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_statistic_ext/stxnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_statistic_ext/stxname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_statistic_ext/stxkind :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_statistic_ext/stxstattarget :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_statistic_ext") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_publication"
+    [{:db/ident :pg_publication/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication/pubname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_publication/puballtables :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_publication") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_publication_namespace"
+    [{:db/ident :pg_publication_namespace/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication_namespace/pnpubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication_namespace/pnnspid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_publication_namespace") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_publication_rel"
+    [{:db/ident :pg_publication_rel/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication_rel/prpubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication_rel/prrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication_rel/prqual :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_publication_rel/prattrs :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_publication_rel") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_constraint"
     ;; One row per CHECK / FK / PK / UNIQUE constraint. `condef` is
     ;; the synthesized text — `pg_get_constraintdef(oid)` lowers to
@@ -668,7 +721,14 @@
                           (q-fn '{:find [?ident ?typmod]
                                   :where [[?e :db/ident ?ident]
                                           [?e :pg/typmod ?typmod]]}
-                                cte-db)))]
+                                cte-db)))
+          default-idents (when cte-db
+                           (into #{}
+                                 (map first)
+                                 (d/q '{:find [?ident]
+                                        :where [[?e :db/ident ?ident]
+                                                [?e :pg/default-kind]]}
+                                      cte-db)))]
       (into
        ;; composite-type fields: attrelid = the composite's pg_class oid
        ;; (= its type oid here); atttypid = each field's PG type OID.
@@ -679,6 +739,7 @@
                :pg_attribute/attnum (long (inc idx))
                :pg_attribute/attrelid (long oid)
                :pg_attribute/attnotnull false
+               :pg_attribute/atthasdef false
                :pg_attribute/attidentity ""
                :pg_attribute/attstorage (attribute-storage (:oid f))
                :pg_attribute/atttypmod -1
@@ -726,6 +787,7 @@
            :pg_attribute/attnum (long (inc idx))
            :pg_attribute/attrelid (long tbl-oid)
            :pg_attribute/attnotnull pk?
+           :pg_attribute/atthasdef (contains? default-idents (:attr col))
            :pg_attribute/attidentity ""
            :pg_attribute/attstorage (attribute-storage (:oid col))
            :pg_attribute/atttypmod typmod
@@ -738,6 +800,7 @@
            :pg_attribute/attnum (long (inc idx))
            :pg_attribute/attrelid (long (Math/abs (.hashCode ^String name)))
            :pg_attribute/attnotnull false
+           :pg_attribute/atthasdef false
            :pg_attribute/attidentity ""
            :pg_attribute/attstorage (attribute-storage (:oid col))
            :pg_attribute/atttypmod (long (or (:typmod col) -1))
@@ -1134,11 +1197,50 @@
           :pg_index/indexdef idxdef
           (pgs/row-marker-attr "pg_index") true})))
 
-    ;; pg_attrdef — empty. LEFT JOIN in pgjdbc's field-metadata query
-    ;; means missing rows are fine; the table just needs to exist so
-    ;; JSqlParser and our catalog lookup don't fail to resolve it.
     "pg_attrdef"
-    []
+    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          defaults
+          (when cte-db
+            (into {}
+                  (for [[e ident kind]
+                        (d/q '{:find [?e ?ident ?kind]
+                               :where [[?e :db/ident ?ident]
+                                       [?e :pg/default-kind ?kind]]}
+                             cte-db)
+                        :let [p (d/pull cte-db
+                                        '[:pg/default-value :pg/default-arg]
+                                        e)]]
+                    [ident {:kind kind
+                            :value (:pg/default-value p)
+                            :arg (:pg/default-arg p)}])))
+          render (fn [{:keys [kind value arg]} col]
+                   (case kind
+                     :bit (str "'" value "'::\"bit\"")
+                     :bit-coerced
+                     (str "'" value "'::"
+                          (if (= (:oid col) types/oid-varbit)
+                            "bit varying"
+                            "\"bit\""))
+                     :nextval (str "nextval('" (or arg value) "'::regclass)")
+                     :fn (str value "()")
+                     :literal
+                     (cond
+                       (nil? value) "NULL"
+                       (= (:valuetype col) :db.type/string)
+                       (str "'" (str/replace value "'" "''") "'")
+                       :else value)
+                     (str value)))]
+      (vec
+       (for [[tname {:keys [columns]}] (sort-by key tables)
+             [idx col] (map-indexed vector columns)
+             :let [default (get defaults (:attr col))]
+             :when default
+             :let [tbl-oid (or (pgs/table-oid cte-db tname)
+                               (Math/abs (.hashCode ^String tname)))]]
+         {:pg_attrdef/adrelid (long tbl-oid)
+          :pg_attrdef/adnum (long (inc idx))
+          :pg_attrdef/adbin (render default col)
+          (pgs/row-marker-attr "pg_attrdef") true})))
     ;; pg_extension — always empty; we never install extensions.
     "pg_extension"
     []
@@ -1155,6 +1257,16 @@
     "pg_inherits"
     []
     "pg_enum"
+    []
+    "pg_policy"
+    []
+    "pg_statistic_ext"
+    []
+    "pg_publication"
+    []
+    "pg_publication_namespace"
+    []
+    "pg_publication_rel"
     []
     ;; pg_constraint — one row per UNIQUE/PK column + per CHECK + per FK.
     ;; `condef` is the rendered text that pg_get_constraintdef returns.

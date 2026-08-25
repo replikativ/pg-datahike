@@ -224,7 +224,8 @@
 
    :array-element-error
    {:sqlstate "2202E"
-    :format (fn [{:keys [detail]}] (or detail "malformed array literal"))}
+    :format (fn [{:keys [message detail]}]
+              (or message detail "malformed array literal"))}
 
    ;; --- syntax / structural -------------------------------------------
    :syntax-error
@@ -233,8 +234,8 @@
 
    :feature-not-supported
    {:sqlstate "0A000"
-    :format (fn [{:keys [feature detail]}]
-              (or detail (when feature (str feature " is not supported"))))}
+    :format (fn [{:keys [feature message detail]}]
+              (or message detail (when feature (str feature " is not supported"))))}
 
    :grouping-error
    {:sqlstate "42803"

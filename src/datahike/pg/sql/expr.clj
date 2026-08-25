@@ -71,7 +71,7 @@
             MinorThanEquals NotEqualsTo ParenthesedExpressionList
             RegExpMatchOperator Between]
            [net.sf.jsqlparser.expression.operators.conditional
-            AndExpression OrExpression]
+            AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.arithmetic
             Addition Subtraction Multiplication Division Modulo Concat
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
@@ -88,7 +88,7 @@
 ;; Forward declarations for the mutually-recursive translate-* family.
 
 (declare jsonb-column? json-column? reject-json-operator!)
-(declare coerce-unknown-literal)
+(declare coerce-unknown-literal coerce-comparison-operands)
 (declare source-oid string-value-text)
 
 (declare translate-expr
@@ -125,11 +125,17 @@
                             (= :homogeneous rule) (count arg-exprs)
                             (map? rule) (:homogeneous-prefix rule))]
     (if homogeneous-count
-      (let [homogeneous-args (take homogeneous-count arg-exprs)]
-        (if-let [target (some #(numeric-target-for-oid
-                                (try (source-oid ctx %)
-                                     (catch Throwable _ nil)))
-                              homogeneous-args)]
+      (let [homogeneous-args (take homogeneous-count arg-exprs)
+            targets (keep #(numeric-target-for-oid
+                            (try (source-oid ctx %)
+                                 (catch Throwable _ nil)))
+                          homogeneous-args)
+            ;; Resolve from every known argument, not merely the first.
+            ;; PostgreSQL promotes integer + numeric to numeric, and a
+            ;; float argument outranks numeric for these overloads.
+            rank {:long 0 :bigdec 1 :float 2 :double 3}
+            target (when (seq targets) (apply max-key rank targets))]
+        (if target
           (mapv (fn [idx arg]
                   (if (and (< idx homogeneous-count)
                            (instance? StringValue arg))
@@ -1924,6 +1930,16 @@
                   nil))))]
     (if (some? v) v :__null__)))
 
+(defn- translate-value-comparison-operands
+  "Translate comparison operands in value position after applying the
+   same unknown-literal typinput resolution as the WHERE lowering path."
+  [ctx left right]
+  (mapv (fn [operand]
+          (if (instance? net.sf.jsqlparser.expression.Expression operand)
+            (translate-expr ctx operand)
+            operand))
+        (coerce-comparison-operands ctx left right)))
+
 (defn translate-predicate-expr
   "Translate a SQL predicate expression into a Clojure boolean form
    suitable for use inside a cond binding. Unlike translate-predicate which
@@ -1952,27 +1968,31 @@
     ;; comparison involving one.
     (instance? GreaterThan expr)
     (let [^GreaterThan e expr
-          _ (check-comparison-types! ctx '> (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-gt3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '> l r)]
+      (apply list 'datahike.pg.sql/sql-gt3? (translate-value-comparison-operands ctx l r)))
 
     (instance? GreaterThanEquals expr)
     (let [^GreaterThanEquals e expr
-          _ (check-comparison-types! ctx '>= (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-ge3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '>= l r)]
+      (apply list 'datahike.pg.sql/sql-ge3? (translate-value-comparison-operands ctx l r)))
 
     (instance? MinorThan expr)
     (let [^MinorThan e expr
-          _ (check-comparison-types! ctx '< (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-lt3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '< l r)]
+      (apply list 'datahike.pg.sql/sql-lt3? (translate-value-comparison-operands ctx l r)))
 
     (instance? MinorThanEquals expr)
     (let [^MinorThanEquals e expr
-          _ (check-comparison-types! ctx '<= (.getLeftExpression e) (.getRightExpression e))]
-      (list 'datahike.pg.sql/sql-le3? (translate-expr ctx (.getLeftExpression e))
-            (translate-expr ctx (.getRightExpression e))))
+          l (.getLeftExpression e)
+          r (.getRightExpression e)
+          _ (check-comparison-types! ctx '<= l r)]
+      (apply list 'datahike.pg.sql/sql-le3? (translate-value-comparison-operands ctx l r)))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
@@ -2007,11 +2027,11 @@
         ;; the same scale-insensitivity as in WHERE, and the same
         ;; reason not to be `=` on the canonical text.
         (let [l (.getLeftExpression e)]
-          (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
-                  'datahike.pg.sql/jsonb-eq?
-                  'datahike.pg.sql/sql-eq3?)
-                (translate-expr ctx l)
-                (translate-expr ctx right)))))
+          (apply list
+                 (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
+                   'datahike.pg.sql/jsonb-eq?
+                   'datahike.pg.sql/sql-eq3?)
+                 (translate-value-comparison-operands ctx l right)))))
 
     (instance? NotEqualsTo expr)
     ;; `not=` compared the `:__null__` sentinel structurally, so
@@ -2043,11 +2063,11 @@
           (swap! (:where-clauses ctx) conj
                  [(list fn-param col-val arr-val) result-var])
           result-var)
-        (list (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
-                'datahike.pg.sql/jsonb-ne?
-                'datahike.pg.sql/sql-ne3?)
-              (translate-expr ctx l)
-              (translate-expr ctx r))))
+        (apply list
+               (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
+                 'datahike.pg.sql/jsonb-ne?
+                 'datahike.pg.sql/sql-ne3?)
+               (translate-value-comparison-operands ctx l r))))
 
     (instance? IsNullExpression expr)
     ;; SQL NULL is carried as the `:__null__` sentinel, not nil — a
@@ -2878,6 +2898,30 @@
         (when-let [target (numeric-target-for-oid (source-oid ctx typed-expr))]
           (coerce/coerce-numeric (string-value-text unknown-expr) target)))))
 
+(defn- money-arith-op
+  "Select PostgreSQL's fixed-width money operator from operand OIDs.
+   BigDecimal alone cannot make this decision because numeric uses the
+   same Datahike carrier."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
+  (let [left (.getLeftExpression expr)
+        right (.getRightExpression expr)
+        l0 (source-oid ctx left)
+        r0 (source-oid ctx right)
+        l (if (instance? StringValue left) r0 l0)
+        r (if (instance? StringValue right) l0 r0)
+        money? #(= types/oid-money %)
+        factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
+                              types/oid-float4 types/oid-float8} %)]
+    (cond
+      (and (= op-sym '+) (money? l) (money? r)) 'datahike.pg.sql/sql-money+
+      (and (= op-sym '-) (money? l) (money? r)) 'datahike.pg.sql/sql-money-
+      (and (= op-sym '*)
+           (or (and (money? l) (factor? r))
+               (and (factor? l) (money? r)))) 'datahike.pg.sql/sql-money*
+      (and (= op-sym '/) (money? l) (money? r)) 'datahike.pg.sql/sql-money-div-money
+      (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.sql/sql-money-div
+      :else nil)))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -2935,7 +2979,8 @@
       (let [lv (if (seq? l) (ctx/materialize-arg! ctx l) l)
             rv (if (seq? r) (ctx/materialize-arg! ctx r) r)
             int-op (int-arith-op ctx expr op-sym)
-            emit-op (or (date-arith-op ctx expr op-sym)
+            emit-op (or (money-arith-op ctx expr op-sym)
+                        (date-arith-op ctx expr op-sym)
                         (first int-op)
                         (float4-arith-op ctx expr op-sym)
                         (get arith-op->null-safe op-sym op-sym))
@@ -2978,6 +3023,50 @@
       (list fn-sym
             (if (seq? l) (ctx/materialize-arg! ctx l) l)
             (if (seq? r) (ctx/materialize-arg! ctx r) r)))))
+
+(defn- generic-bitwise-node?
+  [expr]
+  (or (instance? BitwiseAnd expr)
+      (instance? BitwiseOr expr)
+      (instance? BitwiseLeftShift expr)
+      (instance? BitwiseRightShift expr)))
+
+(defn- rebuild-generic-bitwise
+  "Copy a JSqlParser generic bitwise node with new children. Avoid mutating
+   the cached AST: the same parsed tree may be translated concurrently."
+  [node left right]
+  (cond
+    (instance? BitwiseAnd node)        (BitwiseAnd. left right)
+    (instance? BitwiseOr node)         (BitwiseOr. left right)
+    (instance? BitwiseLeftShift node)  (BitwiseLeftShift. left right)
+    (instance? BitwiseRightShift node) (BitwiseRightShift. left right)))
+
+(defn- normalize-xor-tree
+  "Give rewritten PostgreSQL `#` the generic-operator precedence.
+
+   JSqlParser parses `a XOR b | c` as `a XOR (b | c)`. PostgreSQL parses
+   `a # b | c` as `(a # b) | c`, because both operators occupy one
+   left-associative level. Rotate every generic bitwise node on XOR's right
+   edge, producing fresh nodes so AST-cache entries remain immutable."
+  [left right]
+  (if (generic-bitwise-node? right)
+    (rebuild-generic-bitwise
+     right
+     (normalize-xor-tree left
+                         (.getLeftExpression
+                          ^net.sf.jsqlparser.expression.BinaryExpression right))
+     (.getRightExpression
+      ^net.sf.jsqlparser.expression.BinaryExpression right))
+    (XorExpression. left right)))
+
+(defn- translate-hash-xor
+  [ctx ^XorExpression expr]
+  (let [normalized (normalize-xor-tree (.getLeftExpression expr)
+                                       (.getRightExpression expr))]
+    (if (instance? XorExpression normalized)
+      (translate-binary-fn ctx normalized
+                           'datahike.pg.sql/sql-bit-xor fns/sql-bit-xor)
+      (translate-expr ctx normalized))))
 
 (defn flatten-json-chain
   "Flatten a JsonExpression into {:base Expression :chain [[key-expr op-str] ...]} pairs.
@@ -3564,7 +3653,10 @@
              (cond
                (number? inner) (- inner)
                w (list 'datahike.pg.sql/sql-int-neg w inner)
-               :else (list '* -1 inner)))
+               ;; Route through numeric-special-aware multiplication so
+               ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
+               ;; multiplication casts the carrier record to Number.
+               :else (list 'datahike.pg.sql/sql-* -1 inner)))
         ;; `~` — bitwise NOT, over integers and bit strings alike.
         ;; Previously fell through to the identity branch below, so
         ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,
@@ -3621,9 +3713,9 @@
     ;; above `*` and left-associative, which JSqlParser also matches, so
     ;; `2 ^ 3 ^ 3` = 512 and `2 ^ 3 * 2` = 16.
     ;;
-    ;; `#` itself stays a syntax error: JSqlParser cannot lex it as an
-    ;; operator at all, and emulating it textually could not reproduce
-    ;; its precedence. See unsupported-operator-error in sql.clj.
+    ;; Bare `#` is token-rewritten to JSqlParser's XorExpression. Its AST is
+    ;; normalized below because the parser gives XOR lower precedence than
+    ;; these operators while PostgreSQL puts them all at one level.
     (instance? BitwiseAnd expr)
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-and fns/sql-bit-and)
     (instance? BitwiseOr expr)
@@ -3634,6 +3726,8 @@
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-right fns/sql-bit-shift-right)
     (instance? BitwiseXor expr)
     (translate-binary-fn ctx expr 'datahike.pg.sql/sql-power-op fns/sql-power-op)
+    (instance? XorExpression expr)
+    (translate-hash-xor ctx expr)
 
     ;; PG operators that overload on arrays: @> (contains), <@ (contained
     ;; by), && (overlap). JSqlParser uses JsonOperator for @> and <@,
@@ -4127,6 +4221,20 @@
                      :else nil)]
       (when attr (get-in (:schema ctx) [attr :db/valueType])))))
 
+(defn- column-pg-type
+  "Return a column's declared PostgreSQL type, retaining distinctions
+   which Datahike's carrier cannot express (notably money vs numeric)."
+  [ctx ^Column col]
+  (when-let [resolved (try (ctx/resolve-column col
+                                               (:table-aliases ctx)
+                                               (:default-table ctx)
+                                               (:col-overrides ctx)
+                                               (:derived-aliases ctx) (:ci-index ctx))
+                           (catch Throwable _ nil))]
+    (when-let [attr (ctx/attr-of ctx resolved)]
+      (or (get-in (:schema ctx) [attr :pg/type])
+          (params/pg-type-of-attr (:db ctx) attr)))))
+
 (defn jsonb-column?
   "Whether `expr` is a column reference of `jsonb` type.
 
@@ -4244,11 +4352,13 @@
 
     (and (instance? StringValue lit)
          (instance? Column col))
-    (when-let [vt (column-vtype ctx col)]
-      (let [s (.getNotExcapedValue ^StringValue lit)
-            v (coerce/coerce-unknown s vt parse-timestamp-string)]
-        (when (not (identical? v s))   ; only signal coercion when it produced a typed value
-          v)))))
+    (let [s (.getNotExcapedValue ^StringValue lit)]
+      (if (= "money" (column-pg-type ctx col))
+        (sql-cast/cast-scalar s "money" {})
+        (when-let [vt (column-vtype ctx col)]
+          (let [v (coerce/coerce-unknown s vt parse-timestamp-string)]
+            (when (not (identical? v s)) ; signal only when coercion produced a typed value
+              v)))))))
 
 (defn- coerce-comparison-operands
   "Apply PG-style unknown-literal coercion to a `[left right]` pair of
@@ -5806,13 +5916,25 @@
 
     ;; Bare column as boolean predicate: WHERE col_name means WHERE col_name = TRUE
     (instance? Column expr)
-    (let [resolved (ctx/resolve-column ^Column expr
-                                       (:table-aliases ctx)
-                                       (:default-table ctx)
-                                       (:col-overrides ctx)
-                                       (:derived-aliases ctx) (:ci-index ctx))
-          col-var (ctx/col-var! ctx resolved)]
-      [[(list '= col-var true)]])
+    (let [^Column col expr
+          table-name (some-> (.getTable col) .getName unquote-ident)]
+      (if (and table-name params/*from-bindings*
+               (contains? params/*from-bindings* table-name))
+        ;; A correlated outer boolean arrives as a concrete per-row binding,
+        ;; not as an inner-relation attribute. Resolving it through ctx made
+        ;; the inner query scan a nonexistent `:<outer>/col` datom, so psql's
+        ;; `... AND a.atthasdef` scalar subquery always returned NULL.
+        (if (true? (get-in params/*from-bindings*
+                           [table-name (unquote-ident (.getColumnName col))]))
+          []
+          [[(list 'not= 1 1)]])
+        (let [resolved (ctx/resolve-column col
+                                           (:table-aliases ctx)
+                                           (:default-table ctx)
+                                           (:col-overrides ctx)
+                                           (:derived-aliases ctx) (:ci-index ctx))
+              col-var (ctx/col-var! ctx resolved)]
+          [[(list '= col-var true)]])))
 
     ;; Boolean literals — `WHERE true` adds no constraint, `WHERE false`
     ;; emits the canonical false-sentinel so the surrounding AND

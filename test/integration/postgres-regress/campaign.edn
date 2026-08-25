@@ -1,0 +1,255 @@
+{:postgres-major 17
+ :modes #{:unmeasured :discovery :strict}
+ :waves
+ [{:id 1
+   :name "expression, type, and error foundations"
+   :tests
+   [{:name "expressions" :mode :discovery
+     :boundaries #{:expressions :type-inference :nulls}
+     :blockers #{:point :create-function :planner-explain}}
+    {:name "prepare" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:parameter-inference :type-lookup :prepared-sql}
+     :blockers #{:sql-prepare-execute :pg-prepared-statements :fixture-data}}
+    {:name "errors" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:sqlstate :name-resolution :transaction-errors}
+     :blockers #{:unsupported-ddl :fixture-data}}
+    {:name "int2" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}
+     :blockers #{:non-decimal-integer-input :operator-coverage}}
+    {:name "int4" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}
+     :blockers #{:non-decimal-integer-input :operator-coverage}}
+    {:name "int8" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators}
+     :blockers #{:non-decimal-integer-input :numeric-formatting :parser-aliases}}
+    {:name "bit" :mode :strict
+     :boundaries #{:scalar-type :operators :nulls}
+     :strict-slices
+     [{:id :shift-storage
+       :source-lines [174 179]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "postgres-bit-shift-storage-slice"}
+      {:id :position
+       :source-lines [162 169]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "postgres-bit-position-slice"}
+      {:id :bitwise-width-errors
+       :source-lines [118 121]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "hash-xor"}
+      {:id :overlay
+       :source-lines [218 221]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "postgres-bit-overlay-slice"}
+      {:id :defaults-catalog-read
+       :source-lines [232 240]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "bit-defaults-and-table-shorthand"}
+      {:id :input-validation
+       :source-lines [243 253]
+       :gate "test/datahike/test/pg_bitwise_test.clj"
+       :test-var "bit-input-error-info"}]}
+    {:name "numeric" :mode :discovery
+     :boundaries #{:scalar-type :operators :casts}
+     ;; The remaining raw pg_regress diff is classified: row order in
+     ;; statements without ORDER BY, psql's server-source LINE/CONTEXT
+     ;; decoration, and spacing in one deliberately exotic picture made of
+     ;; interleaved quoted literals. None changes numeric values, SQLSTATEs,
+     ;; result OIDs, or ordinary application-facing pictures.
+     :blockers #{}
+     :accepted-differences #{:unordered-output-without-order-by
+                             :psql-source-location-presentation
+                             :exotic-quoted-picture-padding}
+     :strict-slices
+     [{:id :special-power-boundaries
+       :source-lines [730 748]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "special-power-follows-postgres-posix-table"}
+      {:id :special-float-conversions
+       :source-lines [791 802]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "float-specials-cast-to-numeric"}
+      {:id :finite-power-range
+       :source-lines [1284 1287]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "finite-power-range-boundaries"}
+      {:id :finite-power-precision
+       :source-lines [1290 1301]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "formerly-inaccurate-power-results"}
+      {:id :non-integral-power-precision
+       :source-lines [1336 1342]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "non-integral-power-precision"}
+      {:id :exponential-working-precision
+       :source-lines [1359 1363]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "exponential-working-precision"}
+      {:id :round-trunc-range-boundaries
+       :source-lines [837 859]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "round-and-trunc-range-boundaries"}
+      {:id :multiplication-storage-scale
+       :source-lines [1244 1244]
+       :gate "test/datahike/test/pg_numeric_literal_test.clj"
+       :test-var "numeric-multiplication-caps-storage-scale"}
+      {:id :negative-typmod-display-scale
+       :source-lines [1222 1222]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "negative-scale-numeric-typmods"}
+      {:id :zero-weight-typmod-detail
+       :source-lines [1229 1229]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "numeric-typmods-support-scale-greater-than-precision"}
+      {:id :numeric-input-validation
+       :source-lines [1191 1195]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "numeric-input-validation-obeys-range-and-typmod"}
+      {:id :numeric-generate-series
+       :source-lines [1370 1380]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "numeric-generate-series-preserves-scale-and-validates-bounds"}
+      {:id :sqrt-rounding-thresholds
+       :source-lines [1271 1278]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "square-root-rounding-thresholds"}
+      {:id :numeric-log-working-scales
+       :source-lines [1418 1441]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "logarithms-follow-postgresql-working-scales"}
+      {:id :numeric-factorial-overflow
+       :source-lines [1570 1574]
+       :gate "test/datahike/test/pg_math_functions_test.clj"
+       :test-var "factorial-and-scale-inspectors"}
+      {:id :insert-values-numeric-arithmetic
+       :source-lines [1501 1509]
+       :gate "test/datahike/test/pg_insert_coercion_test.clj"
+       :test-var "insert-values-evaluates-numeric-arithmetic"}
+      {:id :derived-values-numeric-functions
+       :source-lines [1538 1563]
+       :gate "test/datahike/test/pg_math_functions_test.clj"
+       :test-var "numeric-functions-scan-derived-values-relations"}
+      {:id :numeric-inc-unary-matrix
+       :source-lines [671 676]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "scalar-functions-pass-specials-through"}
+      {:id :width-bucket-extreme-spans
+       :source-lines [940 943]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "scalar-functions-pass-specials-through"}
+      {:id :width-bucket-unknown-specials
+       :source-lines [871 876]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "scalar-functions-pass-specials-through"}
+      {:id :lateral-values-width-bucket-matrix
+       :source-lines [945 965]
+       :gate "test/datahike/test/pg_lateral_srf_test.clj"
+       :test-var "correlated-lateral-values"}
+      {:id :numeric-format-pictures
+       :source-lines [967 1062]
+       :gate "test/datahike/test/pg_numeric_format_test.clj"
+       :test-var "numeric-picture-output"}
+      {:id :numeric-format-input
+       :source-lines [1064 1123]
+       :gate "test/datahike/test/pg_numeric_format_test.clj"
+       :test-var "numeric-picture-input"}
+      {:id :correlated-numeric-series-star
+       :source-lines [1370 1380]
+       :gate "test/datahike/test/pg_lateral_srf_test.clj"
+       :test-var "star-expands-every-correlated-srf"}
+      {:id :numeric-to-pg-lsn
+       :source-lines [1577 1584]
+       :gate "test/datahike/test/pg_numeric_format_test.clj"
+       :test-var "numeric-to-pg-lsn"}]}
+    {:name "money" :mode :discovery
+     :boundaries #{:scalar-type :operators :casts :text-codec}
+     :blockers #{:locale :operator-coverage}
+     :strict-slices
+     [{:id :comparisons
+       :source-lines [32 45]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-comparison-slice"}
+      {:id :assignment-input
+       :source-lines [53 73]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-assignment-slice"}
+      {:id :division-rounding
+       :source-lines [108 118]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-arithmetic-slice"}
+      {:id :arithmetic-overflow
+       :source-lines [139 148]
+       :gate "test/datahike/test/pg_type_resolution_test.clj"
+       :test-var "postgres-money-arithmetic-slice"}]}
+    {:name "arrays" :mode :discovery
+     :boundaries #{:array-codec :array-expressions :polymorphism}
+     :blockers #{:postgres-vector-types :create-function}}
+    {:name "uuid" :mode :unmeasured :boundaries #{:scalar-type :array-codec}}
+    {:name "enum" :mode :unmeasured :boundaries #{:user-type :casts :ordering}}
+    {:name "domain" :mode :unmeasured
+     :boundaries #{:user-type :casts :constraints}
+     :blockers #{:domain-constraint-coverage}}
+    {:name "create_type" :mode :unmeasured :boundaries #{:type-ddl :type-lookup}}
+    {:name "type_sanity" :mode :unmeasured
+     :boundaries #{:catalogs :type-registry}
+     :blockers #{:postgres-internal-catalog-completeness}}
+    {:name "opr_sanity" :mode :unmeasured
+     :boundaries #{:catalogs :operator-registry}
+     :blockers #{:postgres-internal-catalog-completeness}}
+    {:name "misc_sanity" :mode :unmeasured
+     :boundaries #{:catalogs}
+     :blockers #{:postgres-internal-catalog-completeness}}
+    {:name "namespace" :mode :unmeasured :boundaries #{:name-resolution :schemas}}
+    {:name "rangefuncs" :mode :discovery
+     :boundaries #{:set-returning-functions :lateral :parameter-inference}
+     :blockers #{:create-function :fixture-dependencies}}
+    {:name "explain" :mode :discovery
+     :boundaries #{:utility-grammar :errors}
+     :blockers #{:postgres-planner-output :helper-functions}}]}
+
+  {:id 2
+   :name "application DDL, DML, and relational SQL"
+   :tests
+   [{:name "boolean" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "char" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "name" :mode :unmeasured :boundaries #{:scalar-type :catalogs}}
+    {:name "varchar" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "text" :mode :unmeasured :boundaries #{:scalar-type}}
+    {:name "float4" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "float8" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+    {:name "date" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "time" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "timestamp" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "timestamptz" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "interval" :mode :unmeasured :boundaries #{:temporal}}
+    {:name "create_table" :mode :unmeasured :boundaries #{:ddl}}
+    {:name "constraints" :mode :unmeasured :boundaries #{:ddl :constraints}}
+    {:name "insert" :mode :unmeasured :boundaries #{:dml}}
+    {:name "insert_conflict" :mode :unmeasured :boundaries #{:dml :constraints}}
+    {:name "update" :mode :unmeasured :boundaries #{:dml}}
+    {:name "delete" :mode :unmeasured :boundaries #{:dml}}
+    {:name "returning" :mode :unmeasured :boundaries #{:dml :result-metadata}}
+    {:name "transactions" :mode :unmeasured :boundaries #{:transactions}}
+    {:name "case" :mode :unmeasured :boundaries #{:expressions}}
+    {:name "subselect" :mode :unmeasured :boundaries #{:relational}}
+    {:name "union" :mode :unmeasured :boundaries #{:relational :common-types}}
+    {:name "join" :mode :unmeasured :boundaries #{:relational}}
+    {:name "aggregates" :mode :unmeasured :boundaries #{:aggregates}}
+    {:name "window" :mode :unmeasured :boundaries #{:windows}}
+    {:name "with" :mode :unmeasured :boundaries #{:ctes}}
+    {:name "limit" :mode :unmeasured :boundaries #{:relational}}]}
+
+  {:id 3
+   :name "specialized application types"
+   :tests
+   [{:name "json" :mode :unmeasured :boundaries #{:json}}
+    {:name "jsonb" :mode :discovery :boundaries #{:jsonb}}
+    {:name "jsonpath" :mode :unmeasured :boundaries #{:jsonpath}}
+    {:name "sqljson" :mode :unmeasured :boundaries #{:sql-json}}
+    {:name "tsearch" :mode :unmeasured :boundaries #{:full-text}}
+    {:name "tsdicts" :mode :unmeasured :boundaries #{:full-text}}]}]}

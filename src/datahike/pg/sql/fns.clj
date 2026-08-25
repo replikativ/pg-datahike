@@ -40,6 +40,8 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.numeric-format :as numfmt]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types]
             [datahike.pg.prng]))
@@ -123,6 +125,9 @@
    high cap; 1000 is enough headroom for any realistic AVG and well
    below BigDecimal's intrinsic limits."
   1000)
+
+(def ^:private ^:const numeric-dscale-max 16383)
+(def ^:private ^:const numeric-max-integer-digits 131072)
 
 (def ^:private ^:const dec-digits 4)                ;; DEC_DIGITS, NBASE = 10000
 
@@ -388,6 +393,12 @@
    (never NULL — COUNT of empty is 0)."
   [coll]
   (count (remove #(or (nil? %) (= :__null__ %)) coll)))
+
+(defn filter-bool-and
+  "BOOL_AND/EVERY over non-NULL inputs; an empty/all-NULL group is NULL."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs) :__null__ (every? true? vs))))
 
 (def filtered-out
   "Marker for a row an aggregate FILTER excluded.
@@ -1212,6 +1223,33 @@
   [f underflow?]
   (fn [a b] (checked-float (f a b) a b underflow?)))
 
+(defn- ensure-numeric-range
+  "Reject a finite BigDecimal whose integer part exceeds PostgreSQL
+   numeric's 131072 decimal-digit limit.  Zero has no numeric weight,
+   regardless of the scale carried by BigDecimal."
+  ^java.math.BigDecimal [^java.math.BigDecimal v]
+  (when (and (not (zero? (.signum v)))
+             (> (- (.precision v) (.scale v)) numeric-max-integer-digits))
+    (throw (errors/pg-error :numeric-value-out-of-range
+                            {:message "value overflows numeric format"})))
+  v)
+
+(defn- numeric-mul
+  "PostgreSQL numeric_mul: exact product, rounded only when the sum of
+   operand scales exceeds NUMERIC_DSCALE_MAX."
+  ^java.math.BigDecimal [a b]
+  (let [product (.multiply (bigdec a) (bigdec b))
+        rounded (if (> (.scale product) numeric-dscale-max)
+                  (.setScale product numeric-dscale-max java.math.RoundingMode/HALF_UP)
+                  product)]
+    (ensure-numeric-range rounded)))
+
+(defn- generic-mul [a b]
+  (cond
+    (and (decimal? a) (or (decimal? b) (integer? b))) (numeric-mul a b)
+    (and (decimal? b) (integer? a)) (numeric-mul a b)
+    :else (* a b)))
+
 (defn- special-aware
   "Route an operation through the special-value path when either operand
    is a numeric NaN or +-Infinity, which no BigDecimal operator accepts."
@@ -1223,7 +1261,76 @@
 
 (def sql-+ (null-safe (special-aware (long-overflow->pg (float-checked + false)) +)))
 (def sql-- (null-safe (special-aware (long-overflow->pg (float-checked - false)) -)))
-(def sql-* (null-safe (special-aware (long-overflow->pg (float-checked * true)) *)))
+(def sql-* (null-safe (special-aware (long-overflow->pg (float-checked generic-mul true)) *)))
+
+(declare throw-division-by-zero)
+
+;; PostgreSQL money is an int64 count of cents. Datahike carries the SQL
+;; value as a scale-2 BigDecimal, so arithmetic must explicitly return to
+;; cents or the carrier silently becomes unbounded numeric.
+(defn- money-out-of-range []
+  (throw (errors/pg-error :numeric-value-out-of-range
+                          {:message "money out of range"})))
+
+(defn- money->cents ^long [v]
+  (try
+    (.longValueExact (.movePointRight ^java.math.BigDecimal (bigdec v) 2))
+    (catch ArithmeticException _ (money-out-of-range))))
+
+(defn- cents->money ^java.math.BigDecimal [^long cents]
+  (java.math.BigDecimal/valueOf cents 2))
+
+(def sql-money+
+  (null-safe
+   (fn [a b]
+     (try (cents->money (Math/addExact (money->cents a) (money->cents b)))
+          (catch ArithmeticException _ (money-out-of-range))))))
+
+(def sql-money-
+  (null-safe
+   (fn [a b]
+     (try (cents->money (Math/subtractExact (money->cents a) (money->cents b)))
+          (catch ArithmeticException _ (money-out-of-range))))))
+
+(defn- checked-money-float-cents ^long [^double result]
+  ;; FLOAT8_FITS_IN_INT64 uses an exclusive 2^63 upper bound. Long/MAX_VALUE
+  ;; itself rounds to 2^63 as a double, so comparing against (double MAX)
+  ;; would incorrectly accept it and Java's narrowing conversion would clamp.
+  (let [two63 (Math/scalb (double 1.0) (int 63))]
+    (if (or (Double/isNaN result) (Double/isInfinite result)
+            (>= result two63) (< result (- two63)))
+      (money-out-of-range)
+      (long result))))
+
+(def sql-money*
+  (null-safe
+   (fn [a b]
+     (let [[money factor] (if (decimal? a) [a b] [b a])
+           cents (money->cents money)]
+       (if (integer? factor)
+         (try (cents->money (Math/multiplyExact cents (long factor)))
+              (catch ArithmeticException _ (money-out-of-range)))
+         (cents->money
+          (checked-money-float-cents
+           (Math/rint (* (double cents) (double factor))))))))))
+
+(def sql-money-div
+  (null-safe
+   (fn [money divisor]
+     (let [cents (money->cents money)]
+       (cond
+         (and (number? divisor) (zero? divisor)) (throw-division-by-zero)
+         (integer? divisor) (cents->money (quot cents (long divisor)))
+         :else (cents->money
+                (checked-money-float-cents
+                 (Math/rint (/ (double cents) (double divisor))))))))))
+
+(def sql-money-div-money
+  (null-safe
+   (fn [a b]
+     (let [divisor (money->cents b)]
+       (when (zero? divisor) (throw-division-by-zero))
+       (/ (double (money->cents a)) (double divisor))))))
 
 ;; ---------------------------------------------------------------------------
 ;; date arithmetic
@@ -1381,7 +1488,12 @@
          (and (numspecial? b) (= :nan (:kind b))))
      types/nan-numeric
      (and (number? b) (zero? b)) (throw-division-by-zero)
-     (or (numspecial? a) (numspecial? b)) (special-arith / a b)
+     (or (numspecial? a) (numspecial? b))
+     (let [q (special-arith / a b)]
+       ;; The only finite result in this branch is finite / infinity.
+       ;; numeric_div returns a scale-zero zero for it, not the 0.0 that
+       ;; BigDecimal/valueOf receives from the IEEE bridge.
+       (if (numspecial? q) q (.setScale ^java.math.BigDecimal q 0)))
      (and (integer? a) (integer? b)) (int-div a b)
      ;; numeric / numeric -- and numeric / integer, which PostgreSQL
      ;; also resolves as numeric. A float on either side outranks
@@ -1411,7 +1523,13 @@
         (and (numspecial? b) (= :nan (:kind b))))
     types/nan-numeric
     (and (number? b) (zero? b)) (throw-division-by-zero)
-    (or (numspecial? a) (numspecial? b)) (special-arith rem a b)
+    ;; numeric_mod does not use the host language's floating remainder.
+    ;; An infinite dividend has no finite remainder, while a finite value
+    ;; modulo infinity is the finite value unchanged. Clojure's `rem` on
+    ;; a Double infinity throws "Infinite or NaN", aborting PostgreSQL's
+    ;; complete special-value arithmetic matrix.
+    (numspecial? a) types/nan-numeric
+    (numspecial? b) (bigdec a)
     (and (or (decimal? a) (decimal? b)) (number? a) (number? b))
     (let [^java.math.BigDecimal x (bigdec a)
           ^java.math.BigDecimal y (bigdec b)]
@@ -1653,54 +1771,92 @@
           (neg? d) -1.0
           :else 0.0)))
 
+(defn- sql-floor [x]
+  (if (decimal? x)
+    (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/FLOOR)
+    (Math/floor (double x))))
+
+(defn- sql-ceil [x]
+  (if (decimal? x)
+    (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/CEILING)
+    (Math/ceil (double x))))
+
 (defn- sql-round
   "SQL ROUND — half away from zero, i.e. PG's NUMERIC rounding
    (numeric.c:11657 round_var). `Math/round` breaks ties toward
-   positive infinity and returns a long, so round(-2.5) came back -2
-   instead of -3.
+   positive infinity and returns a long, so round(-2.5) would be -2
+   instead of -3.  Preserve BigDecimal for numeric inputs: PostgreSQL's
+   result is still numeric and can be far wider than int8.
 
-   Deliberately NOT float8 semantics. PG's round(float8) is `rint()`,
-   which is half-to-EVEN — round(2.5::float8) is 2, not 3. We apply the
-   numeric rule to every input because a decimal literal like `2.5` is
-   numeric in PG but arrives here as a Double: dispatching on the
-   runtime type would make `SELECT round(2.5)` answer 2 where PG
-   answers 3, which is the more visible divergence. The right fix is
-   upstream — type decimal literals as numeric — and this should
-   become type-dispatched once that lands.
+   Untyped decimal literals can still arrive as Double through older
+   expression paths. Treat those as numeric here (HALF_UP) until overload
+   resolution carries the declared float8 type into function dispatch.
 
    Two-arg ROUND(x, n) rounds to n decimal places; PG defines it for
    numeric only and returns numeric, so compute in BigDecimal rather
    than reintroducing binary-float error."
   ([x]
-   (if (integer? x)
-     x
-     (-> (bigdec x) (.setScale 0 java.math.RoundingMode/HALF_UP) (.longValueExact))))
+   (cond
+     (integer? x) x
+     (decimal? x) (let [rounded (.setScale ^java.math.BigDecimal x 0
+                                           java.math.RoundingMode/HALF_UP)]
+                    (ensure-numeric-range rounded))
+     :else (-> (bigdec x)
+               (.setScale 0 java.math.RoundingMode/HALF_UP)
+               (.longValueExact))))
   ([x n]
-   (-> (bigdec x)
-       (.setScale (int n) java.math.RoundingMode/HALF_UP)
-       ;; strip to the plain numeric the wire encoder expects
-       (.stripTrailingZeros)
-       (.setScale (int n) java.math.RoundingMode/UNNECESSARY))))
+   (let [scale (int (min numeric-dscale-max (max -131073 (long n))))
+         rounded (.setScale (bigdec x) scale java.math.RoundingMode/HALF_UP)]
+     (ensure-numeric-range rounded)
+     ;; PostgreSQL does not expose a negative display scale here.
+     (if (neg? scale) (.setScale rounded 0) rounded))))
 
 (defn- sql-trunc
   "SQL TRUNC — round toward zero. TRUNC(x, n) truncates to n decimals."
   ([x]
-   (if (integer? x)
-     x
-     (-> (bigdec x) (.setScale 0 java.math.RoundingMode/DOWN) (.longValueExact))))
+   (cond
+     (integer? x) x
+     (decimal? x) (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/DOWN)
+     :else (-> (bigdec x) (.setScale 0 java.math.RoundingMode/DOWN) (.longValueExact))))
   ([x n]
-   (-> (bigdec x) (.setScale (int n) java.math.RoundingMode/DOWN))))
+   (let [scale (int (min numeric-dscale-max (max -131072 (long n))))
+         truncated (.setScale (bigdec x) scale java.math.RoundingMode/DOWN)]
+     (if (neg? scale) (.setScale truncated 0) truncated))))
+
+(defn- aligned-numeric-integers [a b]
+  (let [^java.math.BigDecimal x (bigdec a)
+        ^java.math.BigDecimal y (bigdec b)
+        scale (max (.scale x) (.scale y))]
+    [(.unscaledValue (.setScale x scale))
+     (.unscaledValue (.setScale y scale))
+     scale]))
 
 (defn- sql-gcd [a b]
-  (.gcd (biginteger a) (biginteger b)))
+  (cond
+    (or (numspecial? a) (numspecial? b)) types/nan-numeric
+    (or (decimal? a) (decimal? b))
+    (let [[^java.math.BigInteger x ^java.math.BigInteger y scale]
+          (aligned-numeric-integers a b)]
+      (java.math.BigDecimal. (.gcd x y) (int scale)))
+    :else (.gcd (biginteger a) (biginteger b))))
 
 (defn- sql-lcm
   "SQL LCM. lcm(0, x) = 0 (PG defines it so, no error)."
   [a b]
-  (let [x (biginteger a) y (biginteger b)]
-    (if (or (zero? a) (zero? b))
-      (biginteger 0)
-      (.abs (.divide (.multiply x y) (.gcd x y))))))
+  (cond
+    (or (numspecial? a) (numspecial? b)) types/nan-numeric
+    (or (decimal? a) (decimal? b))
+    (let [[^java.math.BigInteger x ^java.math.BigInteger y scale]
+          (aligned-numeric-integers a b)
+          value (if (or (zero? (.signum x)) (zero? (.signum y)))
+                  java.math.BigInteger/ZERO
+                  (.abs (.divide (.multiply x y) (.gcd x y))))]
+      (ensure-numeric-range (java.math.BigDecimal. value (int scale))))
+    :else
+    (let [x (biginteger a) y (biginteger b)]
+      (if (or (zero? a) (zero? b))
+        (biginteger 0)
+        (.abs (.divide (.multiply x y) (.gcd x y)))))))
 
 (defn- throw-width-bucket [detail]
   (throw (errors/pg-error :invalid-argument-for-width-bucket {:message detail})))
@@ -1720,19 +1876,47 @@
         h (->num-double high)
         n (long cnt)]
     (when (<= n 0) (throw-width-bucket "count must be greater than zero"))
+    (when (> n Integer/MAX_VALUE) (throw-out-of-range "integer out of range"))
     (when (or (Double/isNaN l) (Double/isNaN h))
       (throw-width-bucket "lower and upper bounds cannot be NaN"))
     (when (or (Double/isInfinite l) (Double/isInfinite h))
       (throw-width-bucket "lower and upper bounds must be finite"))
     (when (= l h) (throw-width-bucket "lower bound cannot equal upper bound"))
-    (let [asc? (< l h)
+    (let [overflow-bucket (fn []
+                            (if (= n Integer/MAX_VALUE)
+                              (throw-out-of-range "integer out of range")
+                              (inc n)))
+          asc? (< l h)
           below? (if asc? (< o l) (> o l))
           above? (if asc? (>= o h) (<= o h))]
       (cond
-        (Double/isNaN o) (inc n)
+        (Double/isNaN o) (overflow-bucket)
         below? 0
-        above? (inc n)
-        :else (inc (long (Math/floor (* n (/ (- o l) (- h l))))))))))
+        above? (overflow-bucket)
+        :else
+        ;; Computing `(o-l)/(h-l)` as a double rounds to exactly 1 for
+        ;; ranges such as [-1e100, 1] with operand 0, incorrectly placing
+        ;; an interior value in the overflow bucket. Work from the nearer
+        ;; endpoint using decimal arithmetic: the complementary form keeps
+        ;; even a 1e-100 distance visible.
+        (let [bd-o (java.math.BigDecimal/valueOf o)
+              bd-l (java.math.BigDecimal/valueOf l)
+              bd-h (java.math.BigDecimal/valueOf h)
+              from-low (.abs (.subtract bd-o bd-l))
+              from-high (.abs (.subtract bd-h bd-o))
+              span (.add from-low from-high)
+              buckets (java.math.BigDecimal/valueOf n)
+              near-low? (<= (.compareTo from-low from-high) 0)
+              distance (if near-low? from-low from-high)
+              scaled (.divide (.multiply buckets distance)
+                              span java.math.MathContext/DECIMAL128)
+              offset (.longValue (.setScale scaled 0
+                                            (if near-low?
+                                              java.math.RoundingMode/FLOOR
+                                              java.math.RoundingMode/CEILING)))]
+          (if near-low?
+            (inc offset)
+            (inc (- n offset))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; SQL string function implementations
@@ -1944,15 +2128,26 @@
 (defn sql-overlay
   "`overlay(string placing new from start [for count])`. `count` defaults
    to the LENGTH OF THE REPLACEMENT, not to the rest of the string."
-  ([s new start] (sql-overlay s new start (count (->s new))))
+  ([s new start]
+   (if (pg-bits/pg-bit? s)
+     (let [replacement (if (pg-bits/pg-bit? new)
+                         new
+                         (pg-bits/parse-bit-literal (str new)))]
+       (pg-bits/overlay-bits s replacement start))
+     (sql-overlay s new start (count (->s new)))))
   ([s new start cnt]
-   (let [^String t (->s s)
-         n (.length t)
-         start (long start)
-         cnt (long cnt)
-         lo (max 0 (dec start))
-         hi (min n (max lo (+ lo (max 0 cnt))))]
-     (str (subs t 0 (min lo n)) (->s new) (subs t hi)))))
+   (if (pg-bits/pg-bit? s)
+     (let [replacement (if (pg-bits/pg-bit? new)
+                         new
+                         (pg-bits/parse-bit-literal (str new)))]
+       (pg-bits/overlay-bits s replacement start cnt))
+     (let [^String t (->s s)
+           n (.length t)
+           start (long start)
+           cnt (long cnt)
+           lo (max 0 (dec start))
+           hi (min n (max lo (+ lo (max 0 cnt))))]
+       (str (subs t 0 (min lo n)) (->s new) (subs t hi))))))
 
 (defn sql-quote-ident
   "Double-quote an identifier only when it needs it -- PostgreSQL leaves a
@@ -2160,18 +2355,22 @@
   ([s start len]
    (if (or (sql-null? s) (sql-null? start) (and (some? len) (sql-null? len)))
      :__null__
-     (let [^String st (str s)
-           n (.length st)
-           start (long start)
-           _ (when (and len (neg? (long len)))
-               (throw (ex-info "negative substring length not allowed"
-                               {:error :invalid-parameter-value
-                                :message "negative substring length not allowed"})))
-           ;; Half-open window [start, start+len) in 1-based positions.
-           to (if len (+ start (long len)) (inc n))
-           lo (max 1 start)
-           hi (min (inc n) to)]
-       (if (<= hi lo) "" (subs st (dec lo) (dec hi)))))))
+     (if (pg-bits/pg-bit? s)
+       (if (some? len)
+         (pg-bits/substring-bits s start len)
+         (pg-bits/substring-bits s start))
+       (let [^String st (str s)
+             n (.length st)
+             start (long start)
+             _ (when (and len (neg? (long len)))
+                 (throw (ex-info "negative substring length not allowed"
+                                 {:error :invalid-parameter-value
+                                  :message "negative substring length not allowed"})))
+             ;; Half-open window [start, start+len) in 1-based positions.
+             to (if len (+ start (long len)) (inc n))
+             lo (max 1 start)
+             hi (min (inc n) to)]
+         (if (<= hi lo) "" (subs st (dec lo) (dec hi))))))))
 
 (defn sql-position
   "1-based position of `substring` in `string`, 0 if not found.
@@ -2181,8 +2380,10 @@
    gram.y swaps the operands before they reach the function, so the SQL
    form is handled at the call site (see translate-function-call)."
   [string substring]
-  (let [idx (.indexOf (str string) (str substring))]
-    (if (neg? idx) 0 (inc idx))))
+  (if (and (pg-bits/pg-bit? string) (pg-bits/pg-bit? substring))
+    (pg-bits/position-bits string substring)
+    (let [idx (.indexOf (str string) (str substring))]
+      (if (neg? idx) 0 (inc idx)))))
 
 ;; ---------------------------------------------------------------------------
 ;; PostgreSQL catalog function stubs
@@ -2291,7 +2492,8 @@
 
 (defn pg-get-expr
   "Return the expression text as-is (CockroachDB's approach)."
-  [expr-text _relation-oid] (str expr-text))
+  ([expr-text _relation-oid] (str expr-text))
+  ([expr-text _relation-oid _pretty?] (str expr-text)))
 
 ;; ---------------------------------------------------------------------------
 ;; Lookup tables used by translate-*.
@@ -2314,6 +2516,8 @@
    spec (PG: 'count(expression) returns the number of non-null input
    rows')."
   {"count"          'datahike.pg.sql/filter-count
+   "bool_and"       'datahike.pg.sql/filter-bool-and
+   "every"          'datahike.pg.sql/filter-bool-and
    "sum"            'datahike.pg.sql/filter-sum
    "avg"            'datahike.pg.sql/filter-avg
    "min"            'datahike.pg.sql/filter-min
@@ -2369,7 +2573,6 @@
 ;; fuzz reached, and any drift would be in the last digit.
 
 (def ^:private ^:const numeric-max-result-scale 2000)
-
 (defn- clamp-rscale ^long [^long rscale ^long dscale]
   (long (min (max rscale dscale 0) numeric-max-display-scale)))
 
@@ -2390,6 +2593,17 @@
                 (max (double (- numeric-max-result-scale)))
                 (min (double numeric-max-result-scale)))]
     (clamp-rscale (- numeric-min-sig-digits (long val)) (.scale a))))
+
+(defn- result-working-precision
+  "Turn PostgreSQL's display scale and an estimated decimal weight into
+   BigDecimal significant-digit precision, with `guard` working digits."
+  ^long [^long rscale ^double result-weight ^long guard]
+  (let [integer-digits (if (and (Double/isFinite result-weight)
+                                (pos? result-weight)
+                                (<= result-weight numeric-max-integer-digits))
+                         (inc (long (Math/floor result-weight)))
+                         0)]
+    (+ integer-digits rscale guard)))
 
 (defn- estimate-ln-dweight
   "numeric.c estimate_ln_dweight — the decimal weight of ln(x), which is
@@ -2413,16 +2627,24 @@
   (clamp-rscale (- numeric-min-sig-digits (estimate-ln-dweight a)) (.scale a)))
 
 (def ^:private ln10-str
-  "2.30258509299404568401799145468436420760110148862877297603333")
+  ;; Kept beyond NUMERIC_MIN_SIG_DIGITS because a high-scale input can ask
+  ;; log() for many more displayed digits. bd-ln's decimal range reduction
+  ;; multiplies this constant by the input exponent; a short constant made
+  ;; the tail of log(1.234567e-89) drift despite ample MathContext precision.
+  (str "2.30258509299404568401799145468436420760110148862877297603332790096757260967735248"
+       "02359972050895982983419677840422862486334095254650828067566662873690987816894829"))
 
 (defn- bd-ln
   "ln to `prec` significant digits. Reduce x = m*10^k with 1 <= m < 10,
    then ln(m) by the atanh series 2*atanh((m-1)/(m+1)) -- which converges
    quickly because the argument is bounded well away from the series'
-   singularity."
+   singularity.  Keep values near one unreduced: reducing 0.999... to
+   9.999... - ln(10) loses precisely the tiny logarithm to cancellation."
   ^java.math.BigDecimal [^java.math.BigDecimal x ^long prec]
   (let [mc (java.math.MathContext. (int (+ prec 15)))
-        k (long (- (.precision x) (.scale x) 1))
+        near-one? (and (>= (.compareTo x (java.math.BigDecimal. "0.9")) 0)
+                       (<= (.compareTo x (java.math.BigDecimal. "1.1")) 0))
+        k (if near-one? 0 (long (- (.precision x) (.scale x) 1)))
         m (.movePointLeft x (int k))
         y (.divide (.subtract m java.math.BigDecimal/ONE)
                    (.add m java.math.BigDecimal/ONE) mc)
@@ -2525,6 +2747,74 @@
 
 (declare numeric-power numeric-log)
 
+(defn- numeric-integral?
+  "PostgreSQL's numeric_is_integral for the finite values represented here.
+   Infinity is treated as integral by numeric_power's special-value rules;
+   NaN is handled before this predicate is reached."
+  [x]
+  (or (and (numspecial? x) (not= :nan (:kind x)))
+      (and (number? x)
+           (<= (.scale (.stripTrailingZeros (bigdec x))) 0))))
+
+(defn- numeric-sign ^long [x]
+  (if (numspecial? x)
+    (case (:kind x) :inf 1 :-inf -1 :nan 0)
+    (long (.signum (bigdec x)))))
+
+(defn- numeric-special-power
+  "numeric_power's POSIX special-value table from PostgreSQL numeric.c.
+
+   Java's Math/pow is close, but differs at the identities PostgreSQL
+   deliberately handles before invoking its finite power algorithm:
+   NaN^0, 1^NaN, and (-1)^+/-Infinity are all 1."
+  [base exponent]
+  (cond
+    (and (numspecial? base) (= :nan (:kind base)))
+    (if (and (not (numspecial? exponent)) (zero? (numeric-sign exponent)))
+      java.math.BigDecimal/ONE
+      types/nan-numeric)
+
+    (and (numspecial? exponent) (= :nan (:kind exponent)))
+    (if (and (not (numspecial? base)) (zero? (.compareTo (bigdec base) java.math.BigDecimal/ONE)))
+      java.math.BigDecimal/ONE
+      types/nan-numeric)
+
+    :else
+    (let [sign-base (numeric-sign base)
+          sign-exp (numeric-sign exponent)]
+      (cond
+        (and (zero? sign-base) (neg? sign-exp))
+        (throw-power-domain "zero raised to a negative power is undefined")
+
+        (and (neg? sign-base) (not (numeric-integral? exponent)))
+        (throw-power-domain
+         "a negative number raised to a non-integer power yields a complex result")
+
+        (and (not (numspecial? base))
+             (zero? (.compareTo (bigdec base) java.math.BigDecimal/ONE)))
+        java.math.BigDecimal/ONE
+
+        (zero? sign-exp) java.math.BigDecimal/ONE
+        (and (zero? sign-base) (pos? sign-exp)) java.math.BigDecimal/ZERO
+
+        (numspecial? exponent)
+        (let [abs-base-compare
+              (if (numspecial? base)
+                1
+                (.compareTo (.abs (bigdec base)) java.math.BigDecimal/ONE))]
+          (cond
+            (zero? abs-base-compare) java.math.BigDecimal/ONE
+            (= (pos? abs-base-compare) (pos? sign-exp)) types/inf-numeric
+            :else java.math.BigDecimal/ZERO))
+
+        (= :inf (:kind base))
+        (if (pos? sign-exp) types/inf-numeric java.math.BigDecimal/ZERO)
+
+        ;; Only -Infinity with a finite, non-zero integral exponent remains.
+        (neg? sign-exp) java.math.BigDecimal/ZERO
+        (.testBit (.toBigIntegerExact (bigdec exponent)) 0) types/-inf-numeric
+        :else types/inf-numeric))))
+
 (defn sql-power-op
   "The `^` operator. PostgreSQL resolves it to numeric_power whenever an
    operand is numeric, exactly as the power() function does -- so
@@ -2532,7 +2822,7 @@
   [b e]
   (cond
     (or (numspecial? b) (numspecial? e))
-    (numeric-double-result (sql-power (->num-double b) (->num-double e)))
+    (numeric-special-power b e)
     (or (decimal? b) (decimal? e)) (numeric-power (bigdec b) (bigdec e))
     :else (sql-power b e)))
 
@@ -2549,13 +2839,17 @@
   (when (neg? (.signum a))
     (throw (errors/pg-error :invalid-argument-for-power-function
                             {:message "cannot take square root of a negative number"})))
-  (let [rs (sqrt-rscale a)]
-    (.setScale (.sqrt a (java.math.MathContext. (int (+ rs 20))))
-               (int rs) java.math.RoundingMode/HALF_UP)))
+  ;; Result scale is independent of working precision. Using rs+20 as a
+  ;; MathContext precision loses guard digits when the result has a large
+  ;; integer part; bd-sqrt accounts for the input precision before applying
+  ;; PostgreSQL's final HALF_UP rounding at rs.
+  (bd-sqrt a (sqrt-rscale a)))
 
 (defn- numeric-exp ^java.math.BigDecimal [^java.math.BigDecimal a]
-  (let [rs (exp-rscale a)]
-    (.setScale (bd-exp a (+ rs 20)) (int rs) java.math.RoundingMode/HALF_UP)))
+  (let [rs (exp-rscale a)
+        result-weight (* (.doubleValue a) 0.434294481903252)
+        p (result-working-precision rs result-weight 20)]
+    (.setScale (bd-exp a p) (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- numeric-ln ^java.math.BigDecimal [^java.math.BigDecimal a]
   (cond
@@ -2577,12 +2871,25 @@
       (throw-logarithm-error (if (zero? (.signum bad))
                                "cannot take logarithm of zero"
                                "cannot take logarithm of a negative number"))))
-  (let [rs (ln-rscale x)
-        p (+ rs 25)
-        mc (java.math.MathContext. (int p))
-        lb (bd-ln base p)]
+  (let [base-weight (estimate-ln-dweight base)
+        num-weight (estimate-ln-dweight x)
+        result-weight (- num-weight base-weight)
+        ;; numeric.c log_var: unlike ln(), the result's scale depends on
+        ;; BOTH inputs and on the estimated weight of the quotient.
+        rs (clamp-rscale (- numeric-min-sig-digits result-weight)
+                         (max (.scale base) (.scale x)))
+        base-rscale (max 0 (+ rs result-weight (- base-weight) 8))
+        num-rscale (max 0 (+ rs result-weight (- num-weight) 8))
+        precision-for-rscale (fn [rscale dweight]
+                               (max 1 (+ rscale (max 0 (inc dweight)))))
+        base-precision (precision-for-rscale base-rscale base-weight)
+        num-precision (precision-for-rscale num-rscale num-weight)
+        result-precision (+ (precision-for-rscale rs result-weight) 8)
+        mc (java.math.MathContext. (int result-precision))
+        lb (bd-ln base base-precision)]
     (when (zero? (.signum lb)) (throw-division-by-zero))
-    (.setScale (.divide (bd-ln x p) lb mc) (int rs) java.math.RoundingMode/HALF_UP)))
+    (.setScale (.divide (bd-ln x num-precision) lb mc)
+               (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- power-rscale
   "numeric.c power_var_int: the result's decimal weight is about
@@ -2595,6 +2902,22 @@
     (clamp-rscale (- numeric-min-sig-digits (long f))
                   (max (.scale base) (.scale e)))))
 
+(defn- power-result-weight
+  "Approximate log10(abs(base)^exponent) without narrowing BASE to double.
+   The near-one case is why this uses the BigDecimal ln implementation:
+   PostgreSQL's regression suite raises (1 - 1.5e-1000) to a huge power,
+  which becomes exactly 1.0 as a double even though its logarithm matters."
+  ^double [^java.math.BigDecimal base ^java.math.BigDecimal exponent]
+  (let [abs-base (.abs base)
+        base-double (.doubleValue abs-base)
+        exponent-double (.doubleValue exponent)]
+    (if (and (= 1.0 base-double)
+             (not (zero? (.compareTo abs-base java.math.BigDecimal/ONE))))
+      (let [mc (java.math.MathContext. 32)
+            ln-product (.multiply exponent (bd-ln abs-base 32) mc)]
+        (* (.doubleValue ln-product) 0.434294481903252))
+      (* exponent-double (Math/log10 base-double)))))
+
 (defn- numeric-power ^java.math.BigDecimal [^java.math.BigDecimal base ^java.math.BigDecimal e]
   (cond
     (and (zero? (.signum base)) (neg? (.signum e)))
@@ -2606,13 +2929,34 @@
     (throw (errors/pg-error
             :invalid-argument-for-power-function
             {:message "a negative number raised to a non-integer power yields a complex result"})))
-  (let [rs (power-rscale base e)
-        p (+ rs 25)
+  (let [abs-base (.abs base)
+        base-is-one? (zero? (.compareTo abs-base java.math.BigDecimal/ONE))
+        result-weight (when-not (or (zero? (.signum base)) base-is-one?)
+                        (power-result-weight base e))
+        rs (if base-is-one?
+             (clamp-rscale numeric-min-sig-digits (max (.scale base) (.scale e)))
+             (power-rscale base e))
+        ;; MathContext precision counts all significant digits, not just
+        ;; digits after the decimal point.  PostgreSQL's rscale tells us the
+        ;; latter, so retain the estimated integer part as well.  Omitting it
+        ;; rounded 1.2^345 after 26 significant digits and filled the rest
+        ;; with zeroes.
+        p (result-working-precision rs (double (or result-weight 0.0)) 25)
         mc (java.math.MathContext. (int p))]
     (cond
       (zero? (.signum base))
       (.setScale (if (zero? (.signum e)) java.math.BigDecimal/ONE java.math.BigDecimal/ZERO)
                  (int rs) java.math.RoundingMode/HALF_UP)
+      base-is-one?
+      (.setScale (if (and (neg? (.signum base))
+                          (.testBit (.toBigIntegerExact e) 0))
+                   (.negate java.math.BigDecimal/ONE)
+                   java.math.BigDecimal/ONE)
+                 (int rs) java.math.RoundingMode/UNNECESSARY)
+      (> result-weight numeric-max-integer-digits)
+      (throw-out-of-range "value overflows numeric format")
+      (< (inc result-weight) (- numeric-max-display-scale))
+      (.setScale java.math.BigDecimal/ZERO (int numeric-max-display-scale))
       ;; integer exponent within int range: exact repeated multiplication,
       ;; which also handles a negative base
       (and (zero? (.scale (.stripTrailingZeros e)))
@@ -2849,11 +3193,35 @@
      (let [v (long n)]
        (cond
          (neg? v) (throw-out-of-range "factorial of a negative number is undefined")
-         (> v 100000) (throw-out-of-range "value overflows numeric format")
+         ;; numeric.c rejects this before multiplication: 32177! is the
+         ;; largest factorial that fits NUMERIC's 131072 integer digits.
+         ;; The former 100000 guard let factorial(100000) allocate and emit
+         ;; a 456574-digit value before the regression runner could object.
+         (> v 32177) (throw-out-of-range "value overflows numeric format")
          :else (loop [i 2 acc java.math.BigInteger/ONE]
                  (if (> i v)
                    (java.math.BigDecimal. acc)
                    (recur (inc i) (.multiply acc (java.math.BigInteger/valueOf i))))))))))
+
+(def ^:private max-pg-lsn
+  (java.math.BigInteger. "18446744073709551615"))
+
+(defn sql-pg-lsn
+  "Convert NUMERIC to PostgreSQL's unsigned 64-bit WAL address type."
+  [x]
+  (when (types/numeric-special? x)
+    (throw (errors/pg-error
+            :feature-not-supported
+            {:message (if (= :nan (:kind x))
+                        "cannot convert NaN to pg_lsn"
+                        "cannot convert infinity to pg_lsn")})))
+  (let [^java.math.BigDecimal n (coerce/coerce-numeric x :bigdec)
+        value (.toBigInteger (.setScale n 0 java.math.RoundingMode/HALF_UP))]
+    (when (or (neg? (.signum value))
+              (pos? (.compareTo value max-pg-lsn)))
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "pg_lsn out of range"})))
+    (types/pg-lsn value)))
 
 (def sql-scale
   "scale(numeric) — the declared display scale."
@@ -2900,6 +3268,12 @@
   (fn [x & more]
     (if (types/numeric-special? x) :__null__ (apply f x more))))
 
+(defn- validate-numeric-input! [value type-name]
+  (let [parsed (coerce/coerce-numeric (str value) :bigdec)]
+    (if-let [[precision scale] (sql-cast/numeric-typmod type-name)]
+      (sql-cast/apply-numeric-typmod parsed precision scale)
+      parsed)))
+
 (defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
@@ -2932,16 +3306,10 @@
          ("oid") (let [n (Long/parseLong (str/trim s))]
                    (<= 0 n 4294967295))
          ("float4" "real" "float8" "double precision") (float-value)
-         ("numeric" "decimal") (do (coerce/coerce-numeric s :bigdec) true)
+         ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
          ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
          ("bit" "bit varying" "varbit")
-         (do (pg-bits/parse-bit-literal (str/trim s)
-                                        (contains? #{"bit varying" "varbit"} base))
-             (if modifier
-               (let [width (Long/parseLong modifier)]
-                 (if (= base "bit") (= (count (str/trim s)) width)
-                     (<= (count (str/trim s)) width)))
-               true))
+         (do (sql-cast/cast-to-bit s (str type-name) false) true)
          ("char" "character" "varchar" "character varying" "text" "name")
          (char-value)
          false)))
@@ -2972,9 +3340,27 @@
                   (str "value too long for type " display-type)
                   (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
         sqlstate (if too-long? "22001" "22P02")]
-    (if (pg-input-valid? value type-name)
-      [nil nil nil nil]
-      [message nil nil sqlstate])))
+    (if (contains? #{"bit" "bit varying" "varbit" "numeric" "decimal"} base)
+      ;; Preserve the typinput function's own diagnostic. In particular,
+      ;; fixed-width mismatches are 22026, while bad binary/hex digits are
+      ;; 22P02 with the offending digit named. A boolean-only validation
+      ;; pass loses both distinctions.
+      (try
+        (if (contains? #{"numeric" "decimal"} base)
+          (validate-numeric-input! value type-name)
+          (sql-cast/cast-to-bit (str value) (str type-name) false))
+        [nil nil nil nil]
+        (catch Throwable e
+          (let [[code msg fields] (errors/classify-exception e)
+                detail (when fields (.get ^java.util.Map fields "D"))]
+            ;; Several typinput categories carry their primary diagnostic in
+            ;; :detail so the category formatter can use it as the ERROR.
+            ;; pg_input_error_info must not repeat that identical string in
+            ;; its separate DETAIL column.
+            [msg (when (not= msg detail) detail) nil code])))
+      (if (pg-input-valid? value type-name)
+        [nil nil nil nil]
+        [message nil nil sqlstate]))))
 
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,
@@ -3001,6 +3387,14 @@
                        :strict? true :return-oid types/oid-bool}
    "pg_input_is_valid" {:impl pg-input-valid? :arities #{2}
                         :strict? true :return-oid types/oid-bool}
+   "get_bit"          {:impl pg-bits/get-bit :arities #{2}
+                       :strict? true :return-oid types/oid-int4}
+   "set_bit"          {:impl pg-bits/set-bit :arities #{3}
+                       :strict? true :return-oid types/oid-bit}
+   "bit_count"        {:impl pg-bits/bit-count :arities #{1}
+                       :strict? true :return-oid types/oid-int8}
+   "pg_lsn"           {:impl sql-pg-lsn :arities #{1}
+                       :strict? true :return-oid types/oid-pg-lsn}
    "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}
@@ -3020,9 +3414,9 @@
    ;; bit string is the bit count; octet_length is ceil(bits/8).
    "length"   sql-length
    "abs"      (special-abs clojure.core/abs)
-   "floor"    (special-passthrough #(Math/floor (double %)))
-   "ceil"     (special-passthrough #(Math/ceil (double %)))
-   "ceiling"  #(Math/ceil (double %))
+   "floor"    (special-passthrough sql-floor)
+   "ceil"     (special-passthrough sql-ceil)
+   "ceiling"  (special-passthrough sql-ceil)
    ;; The 2-argument forms take a SET OF CHARACTERS to strip, not a
    ;; prefix -- and str/triml takes only one argument, so `ltrim(s, 'ab')`
    ;; raised a raw ArityException.
@@ -3097,6 +3491,12 @@
    "scale"    (special-null sql-scale)
    "min_scale" (special-null sql-min-scale)
    "trim_scale" (special-passthrough sql-trim-scale)
+   ;; PostgreSQL exposes numeric_inc in pg_proc and exercises it directly in
+   ;; numeric.sql. Reuse the numeric operator so range and special values
+   ;; follow the same path as `x + 1`.
+   "numeric_inc" (fn [x] (sql-+ x java.math.BigDecimal/ONE))
+   "to_char" numfmt/to-char
+   "to_number" numfmt/to-number
    "lcm"      sql-lcm
    "width_bucket" sql-width-bucket
    "pi"       (fn [] Math/PI)
@@ -3264,12 +3664,13 @@
    "round"    #{1 2}     ; round(x); round(x, decimals)
    "trunc"    #{1 2}
    "power"    #{2} "pow" #{2} "atan2" #{2} "mod" #{2} "gcd" #{2} "lcm" #{2}
+   "to_char" #{2} "to_number" #{2}
    "sind" #{1} "cosd" #{1} "tand" #{1} "cotd" #{1}
    "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
    "erf" #{1} "erfc" #{1}
    "random" #{0} "setseed" #{1} "random_normal" #{0 1 2}
    "div" #{2} "factorial" #{1}
-   "scale" #{1} "min_scale" #{1} "trim_scale" #{1}
+   "scale" #{1} "min_scale" #{1} "trim_scale" #{1} "numeric_inc" #{1}
    "width_bucket" #{4}
    "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
    "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}

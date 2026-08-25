@@ -119,13 +119,58 @@
    nil input. Empty / whitespace-only strings raise 22P02."
   [s]
   (when (some? s)
-    (let [t (.trim ^String s)]
+    (let [raw (str s)
+          t (.trim ^String raw)]
       (if (.isEmpty t)
-        (throw (pg-error "22P02" "invalid input syntax for numeric: \"\""))
+        (throw (pg-error "22P02"
+                         (str "invalid input syntax for type numeric: \"" raw "\"")))
         (try (BigDecimal. t)
              (catch NumberFormatException _
                (throw (pg-error "22P02"
-                                (str "invalid input syntax for numeric: \"" t \")))))))))
+                                (str "invalid input syntax for type numeric: \"" raw \")))))))))
+
+(def ^:private ^:const numeric-max-integer-digits 131072)
+
+(defn- check-numeric-input-range ^BigDecimal [^BigDecimal value]
+  (when (and (not (zero? (.signum value)))
+             (> (- (.precision value) (.scale value))
+                numeric-max-integer-digits))
+    (throw (pg-error "22003" "value overflows numeric format")))
+  value)
+
+(defn ^BigDecimal parse-numeric-text
+  "PostgreSQL `numeric_in` for finite values.
+
+   In addition to decimal/scientific notation, PostgreSQL 17 accepts a
+   single underscore between digits and base-prefixed binary, octal and
+   hexadecimal integers. An underscore directly after the base prefix is
+   also accepted. BigDecimal itself supports none of those extensions, so
+   validate their placement before removing separators or converting the
+   integer radix."
+  [s]
+  (when (some? s)
+    (let [raw (str s)
+          t (.trim ^String raw)
+          invalid! #(throw (pg-error "22P02"
+                                     (format "invalid input syntax for type numeric: \"%s\"" raw)))]
+      (check-numeric-input-range
+       (if-let [[_ sign prefix digits]
+                (re-matches (re-pattern "(?i)^([+-]?)(0[box])(_?[0-9a-f](?:_?[0-9a-f])*)$") t)]
+         (let [radix (case (Character/toLowerCase (char (last prefix)))
+                       \b 2
+                       \o 8
+                       \x 16)
+               body  (str/replace-first digits "_" "")]
+           (if (every? #(or (= \_ %) (<= 0 (Character/digit (char %) radix))) body)
+             (let [unsigned (str/replace body "_" "")
+                   signed   (str (when (= "-" sign) "-") unsigned)]
+               (try
+                 (BigDecimal. (BigInteger. signed radix))
+                 (catch NumberFormatException _ (invalid!))))
+             (invalid!)))
+         (if (re-matches (re-pattern "^[+-]?(?:(?:[0-9](?:_?[0-9])*)(?:\\.(?:[0-9](?:_?[0-9])*)?)?|\\.(?:[0-9](?:_?[0-9])*))(?:[eE][+-]?[0-9](?:_?[0-9])*)?$") t)
+           (parse-decimal (str/replace t "_" ""))
+           (invalid!)))))))
 
 (defn float->numeric
   "PostgreSQL's float -> numeric conversion, which is NOT
@@ -185,7 +230,7 @@
         (instance? clojure.lang.BigInt v)
         (BigDecimal. (.toBigInteger ^clojure.lang.BigInt v))
         (number? v) (bigdec v)
-        (string? v) (parse-decimal v)
+        (string? v) (parse-numeric-text v)
         :else (throw (pg-error "22P02"
                                (str "cannot coerce " (class v) " to numeric")
                                {:value v})))

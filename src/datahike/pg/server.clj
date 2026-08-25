@@ -398,6 +398,7 @@
      ;; exponent form in its numeric output -- it answers 1000.
      ;; numeric NaN / +-Infinity -- see types/numeric-special.
      (types/numeric-special? v) (types/numeric-special-text v)
+     (types/pg-lsn? v) (str v)
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      (uuid? v)    (str v)
      (symbol? v)  (str v)
@@ -1734,6 +1735,10 @@
                     (re-matches #"-?\d+\.\d+" value) (Double/parseDouble value)
                     :else value)
                   (catch Exception _ value))
+    ;; Bit defaults must remain strings even when the digit run happens to
+    ;; look numeric. :literal retains its legacy numeric inference for
+    ;; existing database metadata.
+    (:bit :bit-coerced) value
     :fn      (case value
                "now"           (java.util.Date.)
                "current_date"  (java.time.LocalDate/now java.time.ZoneOffset/UTC)
@@ -3005,7 +3010,8 @@
      :pg/table-oid     — only on row-marker attrs; stable per-table OID
                          populating pg_class / pg_attribute / pg_index.
      :pg/not-null      — enforced at INSERT/UPDATE. PG error 23502.
-     :pg/default-kind  — :literal | :fn | :nextval. Consumed by
+     :pg/default-kind  — :literal | :bit | :bit-coerced | :fn | :nextval.
+                         Consumed by
                          INSERT-time default materialization.
      :pg/default-value — string form of the literal or function name.
      :pg/default-arg   — argument for :nextval (sequence name).
@@ -5446,32 +5452,8 @@
             ;; an aggregate at all.
             [results find-aliases]
             (if (seq compound-exprs)
-              (let [new-results
-                    (mapv (fn [row]
-                            (let [rv (if (sequential? row) (vec row) [row])
-                                  binds (row-bindings query in-args row)]
-                              (reduce (fn [r {:keys [form slots]}]
-                                        (let [b (reduce (fn [m [sym idx]]
-                                                          (assoc m sym (nth r idx nil)))
-                                                        binds slots)
-                                              val (expr/interpret-form form b)]
-                                          (conj r (if (= :__null__ val) nil val))))
-                                      rv compound-exprs)))
-                          results)
-                    compound-aliases (mapv :alias compound-exprs)
-                    new-aliases (into (vec find-aliases) compound-aliases)
-                    ;; Hide the internal aggregate columns.
-                    visible-indices (into []
-                                          (keep-indexed (fn [i a]
-                                                          (when-not (and (string? a)
-                                                                         (.startsWith ^String a "__compound_"))
-                                                            i)))
-                                          new-aliases)
-                    final-results (mapv (fn [row]
-                                          (mapv #(nth row %) visible-indices))
-                                        new-results)
-                    final-aliases (mapv #(nth new-aliases %) visible-indices)]
-                [final-results final-aliases])
+              (stmt/apply-compound-projections results find-aliases query
+                                               in-args compound-exprs)
               [results find-aliases])
             ;; Correlated scalar subqueries (slice A — doc/correlated-lateral-
             ;; plan.md): run each inner SELECT per outer row with the
@@ -6397,7 +6379,7 @@
     (format-query-result combined (or find-aliases (:find-aliases left-query)))))
 
 (defn- exec-error
-  "Parse-time failure handler. Returns a plain `:message` string,
+  "Parse-time failure handler. Returns a PostgreSQL ErrorResponse,
    optionally with an explicit :sqlstate (for known-unsupported DDL
    like GRANT/REVOKE/RLS — see CT6). Without one, run the message
    through the regex classifier so pgJDBC sees e.g. 42601 for syntax
@@ -6424,7 +6406,10 @@
         ;; in_failed_sql_transaction state.
         (when (:in-tx? @tx-state)
           (swap! tx-state assoc :aborted? true))
-        (error-result msg code)))))
+        (let [^PgWireServer$QueryResult result (error-result msg code)]
+          (if-let [fields (:error-fields parsed)]
+            (.withErrorFields result fields)
+            result))))))
 
 (defn- columns-from-schema
   "When `COPY t FROM stdin` is invoked WITHOUT an explicit column
@@ -6862,7 +6847,8 @@
               (when (= :error (:type parsed))
                 (throw (PgWireServer$PgProtocolException.
                         (or (:sqlstate parsed) "42601")
-                        (or (:message parsed) "statement could not be parsed"))))
+                        (or (:message parsed) "statement could not be parsed")
+                        (:error-fields parsed))))
               (let [;; Attach the original SQL so downstream code that reads
                   ;; `(:sql parsed)` (e.g. SAVEPOINT name regex) keeps
                   ;; working even though parse-sql may not have set it for
@@ -7068,12 +7054,7 @@
                   (let [all-aliases (into (vec aliases) (map :alias) ces)
                         all-oids (into (vec oids)
                                        (repeat (count ces) PgWireServer/OID_TEXT))
-                        vis (into [] (keep-indexed
-                                      (fn [i a]
-                                        (when-not (and (string? a)
-                                                       (.startsWith ^String a "__compound_"))
-                                          i))
-                                      all-aliases))]
+                        vis (stmt/compound-projection-indices all-aliases ces)]
                     [(mapv #(nth all-aliases %) vis)
                      (int-array (map #(int (nth all-oids %)) vis))])
                   [aliases oids])

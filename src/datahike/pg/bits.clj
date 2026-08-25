@@ -187,6 +187,62 @@
   [^PgBit a ^PgBit b]
   (make-bit (str (:bits a) (:bits b)) true))
 
+(defn substring-bits
+  "PostgreSQL `substring(bit, start [, length])`.
+
+   The requested window is 1-based and may begin before or end after the
+   value; only its overlap is returned.  A negative length is rejected.
+   PostgreSQL declares the result as `bit`, even when the input reached the
+   function through the implicit varbit-to-bit cast."
+  ([b start] (substring-bits b start nil))
+  ([^PgBit b start length]
+   (let [digits (:bits b)
+         n (count digits)
+         start (long start)
+         _ (when (and (some? length) (neg? (long length)))
+             (throw (ex-info "negative substring length not allowed"
+                             {:error :invalid-parameter-value
+                              :message "negative substring length not allowed"})))
+         to (if (some? length) (+ start (long length)) (inc n))
+         lo (max 1 start)
+         hi (min (inc n) to)]
+     (make-bit (if (<= hi lo) "" (subs digits (dec lo) (dec hi))) false))))
+
+(defn position-bits
+  "One-based position of `needle` in `haystack`, or zero when absent.
+
+   PostgreSQL's bitposition has one deliberate difference from Java/text
+   search: an empty bit string contains no match, even for an empty needle."
+  [^PgBit haystack ^PgBit needle]
+  (if (zero? (width haystack))
+    0
+    (let [idx (.indexOf ^String (:bits haystack) ^String (:bits needle))]
+      (if (neg? idx) 0 (inc idx)))))
+
+(defn overlay-bits
+  "PostgreSQL `overlay(bit placing bit from start [for length])`.
+
+   This is the SQL-standard definition: prefix before `start`, replacement,
+   then the suffix after the replaced window.  Starting beyond the end
+   appends immediately (there is no zero fill)."
+  ([target replacement start]
+   (overlay-bits target replacement start (width replacement)))
+  ([^PgBit target ^PgBit replacement start length]
+   (let [start (long start)
+         length (long length)
+         _ (when (or (not (pos? start)) (neg? length))
+             (throw (ex-info "negative substring length not allowed"
+                             {:error :invalid-parameter-value
+                              :message "negative substring length not allowed"})))
+         digits (:bits target)
+         n (count digits)
+         prefix-end (min n (dec start))
+         suffix-start (min n (+ (dec start) length))]
+     (make-bit (str (subs digits 0 prefix-end)
+                    (:bits replacement)
+                    (subs digits suffix-start))
+               false))))
+
 ;; ---------------------------------------------------------------------------
 ;; SQL literals
 ;;
@@ -201,11 +257,13 @@
 ;; time, and it cannot depend on the translator (the translator already
 ;; depends on it).
 
-(def ^:private hex-bit-literal-re
+(def ^:private quoted-hex-bit-literal-re
   ;; The quoted form only. JSqlParser also produces HexValue for the
   ;; `0x4A` spelling, which PostgreSQL does not accept at all, so
-  ;; matching it here would invent syntax rather than mirror PG.
-  #"(?i)^x'[0-9a-f]*'$")
+  ;; matching it here would invent syntax rather than mirror PG. Match
+  ;; malformed quoted bodies too so they reach bit_in-style validation
+  ;; and report the offending digit instead of "HexValue unsupported".
+  #"(?is)^x'.*'$")
 
 (defn bit-string-literal?
   "True for a SQL bit-string literal — `B'1001000'` or `X'4A'`.
@@ -218,7 +276,7 @@
              (and p (.equalsIgnoreCase ^String p "B"))))
       (and (instance? net.sf.jsqlparser.expression.HexValue expr)
            (some? (re-matches
-                   hex-bit-literal-re
+                   quoted-hex-bit-literal-re
                    (str (.getValue ^net.sf.jsqlparser.expression.HexValue expr)))))))
 
 (defn bit-string-literal-value
@@ -321,3 +379,36 @@
   [^PgBit a ^PgBit b]
   (let [c (compare (:bits a) (:bits b))]
     (if (zero? c) (compare (width a) (width b)) c)))
+
+(defn get-bit
+  "Return bit `n`, indexed left-to-right from zero like PostgreSQL get_bit."
+  [^PgBit b n]
+  (let [n (long n)
+        w (width b)]
+    (when (or (neg? n) (>= n w))
+      (throw (errors/pg-error
+              :array-element-error
+              {:message (str "bit index " n " out of valid range (0.." (dec w) ")")})))
+    (if (= \1 (.charAt ^String (:bits b) (int n))) 1 0)))
+
+(defn set-bit
+  "Return a same-width bit value with zero-based, left-to-right bit `n` set."
+  [^PgBit b n new-bit]
+  (let [n (long n)
+        new-bit (long new-bit)
+        w (width b)]
+    (when (or (neg? n) (>= n w))
+      (throw (errors/pg-error
+              :array-element-error
+              {:message (str "bit index " n " out of valid range (0.." (dec w) ")")})))
+    (when-not (contains? #{0 1} new-bit)
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "new bit must be 0 or 1"})))
+    (assoc b :bits (str (subs (:bits b) 0 (int n))
+                        new-bit
+                        (subs (:bits b) (inc (int n)))))))
+
+(defn bit-count
+  "Number of set bits in a bit string."
+  [^PgBit b]
+  (long (count (filter #(= \1 %) (:bits b)))))

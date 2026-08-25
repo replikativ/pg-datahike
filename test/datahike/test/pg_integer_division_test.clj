@@ -106,6 +106,20 @@
     (is (thrown? Exception (one c "SELECT 1 / 0"))
         "the zero check runs before dividing, for integers too")))
 
+(deftest where-filters-before-throwing-projections
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE guarded_div (a numeric, b numeric)")
+    (exec! c "INSERT INTO guarded_div VALUES (1,0),(4,2)")
+    (is (= [["2.0000000000000000"]]
+           (rows c "SELECT a / b FROM guarded_div WHERE b != 0")))
+    (is (= [["2.0000"]]
+           (rows c "SELECT round(a / b, 4) FROM guarded_div WHERE b != 0")))
+    (exec! c "CREATE TABLE guarded_result (v numeric)")
+    (exec! c (str "INSERT INTO guarded_result "
+                  "SELECT round(a / b, 4) FROM guarded_div WHERE b != 0"))
+    (is (= [["2.0000"]]
+           (rows c "SELECT v FROM guarded_result")))))
+
 (deftest arithmetic-over-aggregates-uses-the-same-division
   (with-open [c (jdbc)]
     (seed! c)

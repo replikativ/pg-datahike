@@ -122,6 +122,18 @@
          (rows "SELECT * FROM generate_series(1, array_upper(current_schemas(false), 1) + 2)")))
   (is (= [["1"] ["2"]] (rows "SELECT * FROM generate_series(1,2)"))))
 
+(deftest star-expands-every-correlated-srf
+  ;; The numeric regression suite uses the first generated value as the
+  ;; lower bound of the second.  `SELECT i.*, j.*` already worked, while
+  ;; the unqualified star used to omit j because join-position SRFs were
+  ;; absent from the ordered relation list.
+  (is (= [["1" "1"] ["1" "2"] ["1" "3"]
+          ["2" "2"] ["2" "3"] ["3" "3"]]
+         (rows "SELECT *
+                  FROM generate_series(1::numeric,3::numeric) i,
+                       generate_series(i,3) j
+                 ORDER BY i,j"))))
+
 ;; ---------------------------------------------------------------------------
 ;; LATERAL SUBQUERIES — `JOIN LATERAL (SELECT …) s ON true`
 
@@ -238,3 +250,16 @@
   (seed2!)
   (is (= [["10"] ["11"] ["20"]]
          (rows "SELECT s.v FROM (SELECT v FROM c) s ORDER BY s.v"))))
+
+(deftest correlated-lateral-values
+  ;; PostgreSQL's numeric regression suite uses this shape to feed the
+  ;; width_bucket edge-case matrix. Both the bare outer references and the
+  ;; reserved-word alias `sample` are accepted by PostgreSQL.
+  (is (= [["10" "5" "-10" "10" "3"]
+          ["10" "10" "10" "-10" "4"]]
+         (rows "SELECT v.big, sample.oper, sample.low, sample.high, sample.cnt
+                  FROM (SELECT 10.0::float8 AS big) v,
+                       LATERAL (VALUES (big/2, -big, big, 3),
+                                       (big, big, -big, 4))
+                         AS sample(oper,low,high,cnt)
+                 ORDER BY cnt"))))

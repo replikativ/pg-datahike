@@ -72,6 +72,10 @@
     ;; 42883 itself is asserted in pg-type-resolution-test.
     (is (nil? (run-param-oids "SELECT * FROM t WHERE age = CAST(? AS TEXT)")))))
 
+(deftest standalone-system-cast-uses-postgresql-oid
+  (testing "SELECT $1::tid advertises TID (27), selecting asyncpg's TID codec"
+    (is (= {1 27} (run-param-oids "SELECT ?::tid")))))
+
 (deftest cast-on-col-side-still-resolves
   (testing "WHERE CAST(col AS TEXT) = ? — param maps to col-side comparand"
     ;; Cast on col side should still give us a sensible OID for the

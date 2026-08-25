@@ -90,9 +90,22 @@
     (is (= "1" (one c "SELECT factorial(0)")))
     (is (thrown-with-msg? SQLException #"factorial of a negative number"
                           (one c "SELECT factorial(-1)")))
+    (is (thrown-with-msg? SQLException #"value overflows numeric format"
+                          (one c "SELECT factorial(100000)")))
     (is (= "4" (one c "SELECT scale(8.4100)")) "the DECLARED scale")
     (is (= "2" (one c "SELECT min_scale(8.4100)")) "the scale still needed")
     (is (= "8.41" (one c "SELECT trim_scale(8.4100)")))))
+
+(deftest numeric-functions-scan-derived-values-relations
+  (with-open [c (jdbc)]
+    (is (= "42,6,210"
+           (one c (str "SELECT a || ',' || gcd(a,b) || ',' || lcm(a,b) "
+                       "FROM (VALUES (42::numeric, 30::numeric)) AS v(a,b)"))))
+    (is (= "8.75000" (one c "SELECT gcd(4331.250::numeric, 463.75000::numeric)")))
+    (is (= "118518.96000"
+           (one c "SELECT lcm(4232.820::numeric, 132.72000::numeric)")))
+    (is (= "NaN" (one c "SELECT gcd('Infinity'::numeric, 42::numeric)")))
+    (is (= "-Infinity" (one c "SELECT -('Infinity'::numeric)")))))
 
 (deftest erf-and-erfc
   (with-open [c (jdbc)]

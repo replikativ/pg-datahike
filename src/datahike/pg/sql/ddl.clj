@@ -143,12 +143,16 @@
    the schema entity. Shape:
 
      {:kind :literal  :value <long|double|string|boolean|nil>}
+     {:kind :bit      :value <canonical bit input string>}
+     {:kind :bit-coerced :value <quoted input coerced to a bit column>}
      {:kind :fn       :value <canonical fn name string>}
      {:kind :nextval  :value <sequence name string>}
      {:kind :unsupported :raw <original SQL text>}
 
    The literal branch handles numbers, single-quoted strings, boolean
-   keywords, and NULL. The :fn branch covers the stateless current-*
+   keywords, and NULL. The :bit branch prevents a digit-only bit default
+   from being reinterpreted as a number by delayed materialization. The
+   :fn branch covers the stateless current-*
    functions PG users rely on. :nextval is the only stateful default
    we support and it ties into our existing sequence infrastructure.
    Unknown expressions land in :unsupported so CREATE TABLE can
@@ -212,6 +216,15 @@
             {:kind :literal
              :value (-> base (subs 1 (dec (count base)))
                         (str/replace "''" "'"))}
+            ;; SQL-standard bit literal.  Defaults are materialized after
+            ;; INSERT expression coercion, so persist the canonical digit
+            ;; run used by bit/varbit columns. Hex keeps its input prefix so
+            ;; the column's bit coercion can expand each digit to four bits.
+            (re-matches #"(?i)b'[01]*'" base)
+            {:kind :bit :value (subs base 2 (dec (count base)))}
+            (re-matches #"(?i)x'[0-9a-f]*'" base)
+            {:kind :bit
+             :value (str "x" (subs base 2 (dec (count base))))}
             ;; Known zero-arg functions. Match either form: `now`,
             ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`. Also
             ;; accept the AT TIME ZONE wrapper Odoo uses
@@ -591,6 +604,14 @@
                                (when (and (= dh-type :db.type/string) (not array-spec))
                                  (when-let [n (types/parse-char-length raw-type)]
                                    (+ n 4)))
+                               bit-typmod
+                               (when (and (= dh-type :db.type/string) (not array-spec))
+                                 ;; JSqlParser inconsistently includes the
+                                 ;; modifier in getDataType for `bit(4)`, but
+                                 ;; exposes `varbit(4)` as dataType="varbit"
+                                 ;; plus a separate argument list. `str` on
+                                 ;; ColDataType faithfully includes both.
+                                 (some-> (types/parse-bit-length (str cdt)) long))
                                char-pg-type
                                (let [b (types/base-type-name-of raw-type)]
                                  (cond
@@ -605,7 +626,22 @@
                                ;; enforcement path doesn't double-error.
                                not-null-here? (and (not pk-here?)
                                                    (column-is-not-null? col))
-                               default-spec (column-default-spec col)
+                               default-spec (let [spec (column-default-spec col)
+                                                  bit-type? (contains?
+                                                             #{"bit" "varbit" "bit varying"}
+                                                             (types/base-type-name-of raw-type))]
+                                              ;; A quoted unknown literal is
+                                              ;; coerced to the declared bit
+                                              ;; type at CREATE time in PG.
+                                              ;; Preserve that intent: the
+                                              ;; delayed default evaluator's
+                                              ;; legacy :literal path parses
+                                              ;; digit-only strings as longs.
+                                              (if (and bit-type?
+                                                       (= :literal (:kind spec))
+                                                       (string? (:value spec)))
+                                                (assoc spec :kind :bit-coerced)
+                                                spec))
                                _ (when (= :unsupported (:kind default-spec))
                                    (throw (ex-info "DEFAULT expression not supported"
                                                    {:error :feature-not-supported
@@ -635,6 +671,7 @@
                                          :pg/array-ndim  (long (:ndim array-spec)))
                        numeric-typmod (assoc :pg/typmod numeric-typmod)
                        char-typmod (assoc :pg/typmod char-typmod)
+                       bit-typmod (assoc :pg/typmod bit-typmod)
                        char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec

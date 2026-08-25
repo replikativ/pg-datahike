@@ -31,7 +31,7 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            CastExpression JdbcParameter Parenthesis NotExpression
+            CastExpression Function JdbcParameter Parenthesis NotExpression
             LongValue StringValue DoubleValue DateValue TimestampValue
             SignedExpression BinaryExpression]
            [net.sf.jsqlparser.expression.operators.relational
@@ -696,8 +696,14 @@
                          (cond
                            (instance? SignedExpression n)
                            (recur (.getExpression ^SignedExpression n))
-                           (instance? LongValue n)      types/oid-int8
-                           (instance? DoubleValue n)    types/oid-float8
+                           (instance? LongValue n)
+                           (let [v (.getValue ^LongValue n)]
+                             (if (<= Integer/MIN_VALUE v Integer/MAX_VALUE)
+                               types/oid-int4
+                               types/oid-int8))
+                           ;; PostgreSQL assigns an unadorned decimal literal
+                           ;; NUMERIC, not FLOAT8.
+                           (instance? DoubleValue n)    types/oid-numeric
                            (instance? StringValue n)    types/oid-text
                            (instance? DateValue n)      types/oid-date
                            (instance? TimestampValue n) types/oid-timestamp
@@ -768,7 +774,8 @@
                              ;; `? OP <literal>` — borrow the literal's type
                              ;; when there's no column comparand.
                              :else
-                             (when-let [oid (literal-oid comparand)]
+                             (when-let [oid (or (cast-target-oid comparand)
+                                                (literal-oid comparand))]
                                (.put result (.getIndex p) oid)))))
            ;; `col = ANY($n)` / `= ALL($n)` — JSqlParser parses the RHS as a
            ;; Function named any/all/some wrapping the parameter. Return that
@@ -877,14 +884,48 @@
                                 (when-let [oid (cast-target-oid n)]
                                   (.put result (.getIndex ^JdbcParameter inner) oid))))
                             (walk (.getLeftExpression ^CastExpression n)))
+                         ;; COALESCE/GREATEST/LEAST/NULLIF use PostgreSQL's
+                         ;; common-type selection. An unknown parameter can
+                         ;; therefore borrow a concrete sibling's type, just
+                         ;; as it can from the other side of an operator.
+                         ;; Do not apply this to arbitrary functions: overload
+                         ;; resolution may legitimately reject an unknown arg
+                         ;; as ambiguous (for example abs($1)).
+                          (instance? Function n)
+                          (let [^Function f n
+                                name (some-> (.getName f) str/lower-case)
+                                args (vec (or (some-> (.getParameters f) .getExpressions)
+                                              []))]
+                            (when (#{"coalesce" "greatest" "least" "nullif"} name)
+                              (when-let [comparand
+                                         (some (fn [arg]
+                                                 (let [base (unwrap arg)]
+                                                   (when (and (not (instance? JdbcParameter base))
+                                                              (or (cast-target-oid arg)
+                                                                  (literal-oid base)))
+                                                     arg)))
+                                               args)]
+                                (doseq [arg args]
+                                  (let [base (unwrap arg)]
+                                    (when (instance? JdbcParameter base)
+                                      (bind-param! base arg comparand))))))
+                            (doseq [arg args] (walk arg)))
                          ;; Arithmetic / concatenation / etc. — any other
                          ;; BinaryExpression (Addition, Subtraction, …). Recurse
                          ;; both sides so a nested `$n::T` or `col OP $n` deeper
                          ;; in the expression is still typed. (Comparisons,
                          ;; AND/OR are matched above; this is the fallback.)
                           (instance? BinaryExpression n)
-                          (do (walk (.getLeftExpression ^BinaryExpression n))
-                              (walk (.getRightExpression ^BinaryExpression n)))))))]
+                          (let [l (.getLeftExpression ^BinaryExpression n)
+                                r (.getRightExpression ^BinaryExpression n)
+                                lb (unwrap l)
+                                rb (unwrap r)]
+                            (when (instance? JdbcParameter lb)
+                              (bind-param! lb l rb))
+                            (when (instance? JdbcParameter rb)
+                              (bind-param! rb r lb))
+                            (walk l)
+                            (walk r))))))]
        (walk expr)
        (when (pos? (.size result)) (into {} result)))
      (catch Throwable _ nil))))

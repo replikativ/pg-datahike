@@ -118,6 +118,18 @@
        (is (= #{["10"] ["20"]} (set (rows "SELECT a AS x FROM uc GROUP BY x"))))
        (is (= [["10"] ["20"]] (rows "SELECT a AS x FROM uc ORDER BY x ASC"))))
 
+     (testing "all DML rejects a missing target before lowering"
+       (doseq [sql ["INSERT INTO nonesuch VALUES (1)"
+                    "UPDATE nonesuch SET a = 1"
+                    "DELETE FROM nonesuch"]]
+         (is (= "42P01" (state sql)) sql)
+         (is (= "relation \"nonesuch\" does not exist" (err sql)) sql)))
+
+     (testing "DELETE requires a target relation"
+       (is (= "42601" (state "DELETE FROM")))
+       (is (not (re-find #"Cannot invoke|NullPointerException"
+                         (or (err "DELETE FROM") "")))))
+
      (testing "whole-row and star references"
        (is (= [["1" "10" "x"] ["2" "20" "y"]] (rows "SELECT * FROM uc ORDER BY id")))
        (is (= [["1" "10" "x"]] (rows "SELECT u.* FROM uc u WHERE u.id = 1"))))

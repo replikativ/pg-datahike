@@ -17,6 +17,8 @@ target_host="${PG_REGRESS_HOST:-127.0.0.1}"
 target_port="${PG_REGRESS_PORT:-15432}"
 target_user="${PG_REGRESS_USER:-datahike}"
 target_db="${PG_REGRESS_DB:-datahike}"
+admin_db="${target_db}"
+isolated_db=""
 
 if [[ $# -eq 0 ]]; then
   echo "usage: bb pg-regress TEST [TEST ...]" >&2
@@ -33,6 +35,28 @@ fi
 if [[ ! -x "${pg_bindir}/psql" ]]; then
   echo "psql not executable under PG_REGRESS_BINDIR: ${pg_bindir}" >&2
   exit 2
+fi
+
+cleanup_isolated_db() {
+  if [[ -n "${isolated_db}" ]]; then
+    "${pg_bindir}/psql" \
+      --host="${target_host}" --port="${target_port}" --username="${target_user}" \
+      --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
+      --command="DROP DATABASE IF EXISTS \"${isolated_db}\"" >/dev/null || true
+  fi
+}
+
+if [[ "${PG_REGRESS_ISOLATE:-0}" == "1" ]]; then
+  # The name is generated entirely by this script, so cleanup can never
+  # target a caller-supplied database. SQL CREATE/DROP DATABASE requires a
+  # server configured with :database-template or provisioning hooks.
+  isolated_db="pgdh_regress_$(date -u +%Y%m%d%H%M%S)_$$"
+  trap cleanup_isolated_db EXIT INT TERM
+  "${pg_bindir}/psql" \
+    --host="${target_host}" --port="${target_port}" --username="${target_user}" \
+    --dbname="${admin_db}" --set=ON_ERROR_STOP=1 \
+    --command="CREATE DATABASE \"${isolated_db}\"" >/dev/null
+  target_db="${isolated_db}"
 fi
 
 input_dir="${postgres_source}/src/test/regress"
@@ -52,6 +76,9 @@ mkdir -p "${output_dir}"
 
 echo "PostgreSQL source: ${postgres_source}"
 echo "Target:            ${target_host}:${target_port}/${target_db} as ${target_user}"
+if [[ -n "${isolated_db}" ]]; then
+  echo "Isolation:         disposable database (admin: ${admin_db})"
+fi
 echo "Tests:             $*"
 echo "Artifacts:         ${output_dir}"
 
@@ -78,7 +105,9 @@ fi
 
 shopt -s nullglob
 result_files=("${output_dir}"/results/*.out)
+all_api_match=0
 if (( ${#result_files[@]} > 0 )); then
+  all_api_match=1
   echo
   echo "Per-test target error summary:"
   printf '%-24s %8s %8s %8s %8s %8s %10s\n' \
@@ -93,7 +122,7 @@ if (( ${#result_files[@]} > 0 )); then
     error_count="$(rg -c '^ERROR:  ' "${result_file}" || true)"
     aborted_count="$(rg -c '^ERROR:  current transaction is aborted' "${result_file}" || true)"
     internal_count="$(rg -c \
-      'class .* cannot be cast|ClassCastException|NullPointerException|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
+      'class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
       "${result_file}" || true)"
     api_match="n/a"
     if [[ -f "${expected_file}" ]]; then
@@ -108,6 +137,9 @@ if (( ${#result_files[@]} > 0 )); then
       else
         api_match="no"
       fi
+    fi
+    if [[ "${api_match}" != "yes" ]]; then
+      all_api_match=0
     fi
     expected_error_count="${expected_error_count:-0}"
     error_count="${error_count:-0}"
@@ -125,7 +157,7 @@ if (( ${#result_files[@]} > 0 )); then
   echo
   echo "Internal-failure signatures (first 30):"
   rg -n --no-heading \
-    'class .* cannot be cast|ClassCastException|NullPointerException|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
+    'class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|Query for unknown vars|SQLSTATE XX000|server closed the connection' \
     "${result_files[@]}" | head -30 || true
 fi
 
@@ -139,6 +171,14 @@ case "${regress_status}" in
     echo "Regression differences recorded (expected during compatibility work)."
     if [[ "${PG_REGRESS_STRICT:-0}" == "1" ]]; then
       exit 1
+    fi
+    if [[ "${PG_REGRESS_API_STRICT:-0}" == "1" ]]; then
+      if [[ "${all_api_match}" == "1" ]]; then
+        echo "All selected tests match after source-position normalization."
+      else
+        echo "At least one selected test differs at the SQL API boundary." >&2
+        exit 1
+      fi
     fi
     ;;
   *)

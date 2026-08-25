@@ -21,15 +21,54 @@ PG_REGRESS_DB=datahike \
 bb pg-regress jsonb
 ```
 
+For independent discovery runs against a server configured with SQL database
+provisioning, create and remove a uniquely named database automatically:
+
+```bash
+PG_REGRESS_ISOLATE=1 PG_REGRESS_PORT=15436 bb pg-regress int2 int4 int8 numeric bit
+```
+
+Only the harness-generated `pgdh_regress_*` database is removed. The database
+named by `PG_REGRESS_DB` is used as the administrative connection and is never
+dropped. Isolation fails early when the target has no `CREATE DATABASE` hook,
+instead of silently reusing contaminated state.
+
 The script uses PostgreSQL 17's installed `pg_regress` and `psql` by default.
 Override them with `PG_REGRESS_BIN`, `PG_REGRESS_BINDIR`, or
 `PG_REGRESS_MAJOR`.
 
+The compatibility campaign is machine-readable in `campaign.edn`. List its
+waves and current admission modes, or run a whole wave (optionally restricted
+to one mode), with:
+
+```bash
+bb pg-regress-wave
+bb pg-regress-wave 1
+bb pg-regress-wave 1 discovery
+```
+
+`:unmeasured` means the upstream file has not yet been triaged on a clean
+fixture, `:discovery` means it is continuously useful but has classified
+prerequisites or differences, and `:strict` means its complete normalized API
+output is a gate. Promote coherent application-facing statement groups into
+focused differential tests before marking a dependency-heavy file strict.
+Such admitted statement groups are recorded as `:strict-slices` with their
+exact upstream line range and executable Clojure test var; campaign validation
+fails if either provenance or gate goes stale.
+
+Tests that consume relations created by another upstream file declare it with
+`:requires`. The wave runner schedules each prerequisite once, before its first
+consumer. For example, selecting the integer suites also runs PostgreSQL's
+unmodified `test_setup.sql`, which creates and populates their shared tables.
+
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
 result output, unified diff, and summary. A normal mismatch (`pg_regress`
 status 1) is reported but does not fail the task. Harness failures remain
-fatal. Set `PG_REGRESS_STRICT=1` when an admitted test is expected to be fully
-green and should gate on any diff.
+fatal. Set `PG_REGRESS_STRICT=1` when an admitted test is expected to match
+raw psql output, including source-position presentation. Campaign tests in
+`:strict` mode instead gate on the documented API-normalized comparison, which
+retains messages, DETAIL/HINT fields, rows, labels, types, and formatting while
+omitting only PostgreSQL's rendered `LINE`/caret excerpts.
 
 ### Relational fixture bootstrap
 
@@ -61,8 +100,8 @@ also prints:
 - `api-match`, which compares complete output after removing only PostgreSQL's
   `LINE n:` source excerpt and caret presentation from errors;
 - the most frequent target-side errors;
-- internal-looking signatures such as class casts, unknown Datalog variables,
-  and lost connections.
+- internal-looking signatures such as JVM cast/nil failures, unknown Datalog
+  variables, and lost connections.
 
 An `aborted` count is not a count of independent defects. One unexpected error
 inside an explicit transaction can turn every following statement into
@@ -126,4 +165,4 @@ ledger.
 | Catalog row descriptions | catalog headers such as `pg_type.h`, `pg_attribute.h`, `pg_class.h` | `type_sanity.sql` and driver metadata queries | catalog tests plus pgjdbc/ORM probes |
 | Relation resolution and errors | `src/backend/parser/parse_relation.c` | broadly exercised across the suite | unknown-table/column and catalog tests |
 | `EXPLAIN` grammar/API | `src/backend/parser/gram.y`, `src/backend/commands/explain.c` | `explain.sql` | accepted-option and unsupported-feature tests |
-| `money` | `src/backend/utils/adt/cash.c`; money entries in `pg_type.dat`, `pg_cast.dat`, and `pg_operator.dat` | `money.sql` | core OID/cast/DDL tests; full suite not admitted |
+| `money` | `src/backend/utils/adt/cash.c`; money entries in `pg_type.dat`, `pg_cast.dat`, and `pg_operator.dat` | `money.sql` | strict comparison, assignment-input, division-rounding, and arithmetic-overflow slices; full locale-rendered suite remains discovery |

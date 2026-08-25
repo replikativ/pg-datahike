@@ -298,7 +298,7 @@
            (v "SELECT jsonb_extract_path('{\"f4\":{\"f6\":\"stringy\"}}'::jsonb, 'f4', 'f6')")))
     (is (= "stringy"
            (v "SELECT jsonb_extract_path_text('{\"f4\":{\"f6\":\"stringy\"}}'::jsonb, 'f4', 'f6')"))))
-  (testing "bare # is still PostgreSQL's XOR and still unsupported"
+  (testing "a trailing bare # is still malformed XOR syntax"
     (is (= "42601" (state "SELECT 42#")))))
 
 (deftest path-expression-in-update

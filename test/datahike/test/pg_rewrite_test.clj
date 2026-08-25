@@ -194,6 +194,27 @@
       (is (re-find #"idx_auto_\d+" out))
       (is (re-find #"SELECT 1 FROM" out)))))
 
+(deftest negative-numeric-scale-is-packed-for-jsqlparser
+  (let [rewrite #(rw/rewrite % [rw/negative-numeric-scale-rule])]
+    (is (= "CREATE TABLE t (n numeric(3,2042), d decimal(4,2045))"
+           (rewrite "CREATE TABLE t (n numeric(3,-6), d decimal(4,-3))")))
+    (testing "ordinary signs and opaque source regions are untouched"
+      (doseq [sql ["SELECT -6::numeric"
+                   "SELECT 'numeric(3,-6)'"
+                   "-- numeric(3,-6)\nSELECT 1"
+                   "CREATE TABLE t (n numeric(3,-1001))"
+                   "CREATE TABLE t (n numeric(3,6))"]]
+        (is (= sql (rewrite sql)))))))
+
+(deftest wide-integer-literals-use-parser-safe-numeric-notation
+  (let [rewrite #(rw/rewrite % [rw/wide-integer-literal-rule])]
+    (is (= "SELECT 9223372036854775807, 9223372036854775808e0"
+           (rewrite "SELECT 9223372036854775807, 9223372036854775808")))
+    (is (= "SELECT -9999999999999999999999e0::numeric"
+           (rewrite "SELECT -9999999999999999999999::numeric")))
+    (is (= "SELECT '9999999999999999999999', 1.0e30"
+           (rewrite "SELECT '9999999999999999999999', 1.0e30")))))
+
 ;; ============================================================================
 ;; quote-reserved-alias-rule
 ;;
@@ -211,7 +232,12 @@
     (is (= "SELECT 1 AS \"from\""   (quote-alias "SELECT 1 AS from")))
     (is (= "SELECT 1 AS \"where\""  (quote-alias "SELECT 1 AS where")))
     (is (= "SELECT 1 AS \"when\""   (quote-alias "SELECT 1 AS when")))
-    (is (= "SELECT 1 AS \"join\""   (quote-alias "SELECT 1 AS join")))))
+    (is (= "SELECT 1 AS \"join\""   (quote-alias "SELECT 1 AS join")))
+    (is (= "SELECT 1 AS \"sample\"" (quote-alias "SELECT 1 AS sample")))))
+
+(deftest quote-sample-alias-reference
+  (is (= "SELECT \"sample\".x FROM t AS \"sample\""
+         (quote-alias "SELECT sample.x FROM t AS sample"))))
 
 (deftest quote-reserved-alias-folds-case
   ;; This assertion is REVERSED from what it used to be, and the old

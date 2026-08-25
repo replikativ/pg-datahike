@@ -16,7 +16,8 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager SQLException]))
+  (:import [java.sql Connection DriverManager SQLException]
+           [org.postgresql.util PSQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -33,10 +34,13 @@
 
 (use-fixtures :each ns-fixture)
 
-(defn- ^Connection jdbc []
-  (DriverManager/getConnection
-   (str "jdbc:postgresql://127.0.0.1:" *port*
-        "/n?user=x&password=x&sslmode=disable&binaryTransfer=false")))
+(defn- ^Connection jdbc
+  ([] (jdbc nil))
+  ([query-mode]
+   (DriverManager/getConnection
+    (str "jdbc:postgresql://127.0.0.1:" *port*
+         "/n?user=x&password=x&sslmode=disable&binaryTransfer=false"
+         (when query-mode (str "&preferQueryMode=" query-mode))))))
 
 (defn- one [^Connection c sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
@@ -68,7 +72,7 @@
     (testing "quoted unknown operands resolve from a cast expression's OID"
       (is (= "NaN" (one c "SELECT 'NaN'::numeric / '0'")))
       (is (= "NaN" (one c "SELECT 'NaN'::numeric % '0'")))
-      (is (zero? (bigdec (one c "SELECT '1'::numeric / 'Infinity'"))))
+      (is (= "0" (one c "SELECT '1'::numeric / 'Infinity'")))
       (let [e (is (thrown? SQLException
                            (one c "SELECT 'Infinity'::numeric / '0'")))]
         (is (= "22012" (.getSQLState ^SQLException e)))))
@@ -77,12 +81,78 @@
               the printed form of a compound-aggregate descriptor"
       (is (not (re-find #"compound-agg" (str (one c "SELECT 'NaN'::numeric + 1"))))))))
 
+(deftest special-division-and-modulo-matrix
+  (with-open [c (jdbc)]
+    (is (= "NaN" (one c "SELECT 'Infinity'::numeric % 1")))
+    (is (= "NaN" (one c "SELECT '-Infinity'::numeric % 4.2")))
+    (is (= "4.2" (one c "SELECT 4.2 % 'Infinity'::numeric")))
+    (is (= "-1" (one c "SELECT -1 % '-Infinity'::numeric")))
+    (with-open [st (.createStatement c)
+                rs (.executeQuery
+                    st
+                    (str "WITH v(x) AS (VALUES('0'::numeric),('1'),('-1'),"
+                         "('4.2'),('inf'),('-inf'),('nan')) "
+                         "SELECT x1, x2, x1 / x2, x1 % x2, div(x1, x2) "
+                         "FROM v AS v1(x1), v AS v2(x2) WHERE x2 != 0"))]
+      (let [md (.getMetaData rs)]
+        (is (= ["x1" "x2" "?column?" "?column?" "div"]
+               (mapv #(.getColumnLabel md %) (range 1 6))))
+        (is (= 5 (.getColumnCount md))))
+      (is (= 42 (loop [n 0]
+                  (if (.next rs) (recur (inc n)) n)))))))
+
 (deftest ordering-is-postgres-total-order
   (with-open [c (jdbc)]
     (is (= "t" (one c "SELECT 'NaN'::numeric = 'NaN'::numeric")))
     (is (= "t" (one c "SELECT 'NaN'::numeric > 1000000")))
     (is (= "t" (one c "SELECT 'Infinity'::numeric > 1e308")))
     (is (= "f" (one c "SELECT '-Infinity'::numeric > 0")))))
+
+(deftest special-power-follows-postgres-posix-table
+  (with-open [c (jdbc)]
+    (testing "the identities Java Math/pow does not implement"
+      (is (= "1" (one c "SELECT power('NaN'::numeric, 0)")))
+      (is (= "1" (one c "SELECT power(1::numeric, 'NaN')")))
+      (is (= "1" (one c "SELECT power(-1::numeric, 'Infinity')")))
+      (is (= "1" (one c "SELECT power(-1::numeric, '-Infinity')"))))
+    (testing "infinite bases retain the sign for positive odd exponents"
+      (is (= "-Infinity" (one c "SELECT power('-Infinity'::numeric, 3)")))
+      (is (= "Infinity" (one c "SELECT power('-Infinity'::numeric, 4)")))
+      (is (= "0" (one c "SELECT power('-Infinity'::numeric, -3)")))
+      (is (= "-Infinity"
+             (one c (str "SELECT power('-Infinity'::numeric, "
+                         "99999999999999999999999999999999999999999)")))
+          "parity must not narrow an arbitrary-precision exponent to int64"))
+    (testing "PostgreSQL numeric.sql lines 730-748"
+      (doseq [[base exponent expected]
+              [["-1" "inf" "1"]
+               ["-2" "3" "-8.0000000000000000"]
+               ["-2" "-1" "-0.5000000000000000"]
+               ["-2" "inf" "Infinity"]
+               ["-2" "-inf" "0"]
+               ["inf" "-2" "0"]
+               ["inf" "-inf" "0"]
+               ["-inf" "2" "Infinity"]
+               ["-inf" "3" "-Infinity"]
+               ["-inf" "-2" "0"]
+               ["-inf" "-3" "0"]
+               ["-inf" "0" "1"]
+               ["-inf" "inf" "Infinity"]
+               ["-inf" "-inf" "0"]]]
+        (is (= expected
+               (one c (str "SELECT power('" base "'::numeric, '"
+                           exponent "'::numeric)")))))
+      (doseq [[base exponent]
+              [["0" "-1"] ["0" "-inf"] ["-2" "3.3"]
+               ["-2" "-1.5"] ["-inf" "4.5"]]]
+        (is (thrown? SQLException
+                     (one c (str "SELECT power('" base "'::numeric, '"
+                                 exponent "'::numeric)"))))))
+    (testing "domain errors still precede the special result table"
+      (is (thrown-with-msg? SQLException #"zero raised to a negative power"
+                            (one c "SELECT power(0::numeric, '-Infinity')")))
+      (is (thrown-with-msg? SQLException #"negative number raised to a non-integer"
+                            (one c "SELECT power('-Infinity'::numeric, 4.5)"))))))
 
 (deftest scalar-functions-pass-specials-through
   (with-open [c (jdbc)]
@@ -104,12 +174,33 @@
                             (one c "SELECT div('Infinity'::numeric, '0')")))
       (is (thrown-with-msg? SQLException #"negative"
                             (one c "SELECT log('-Infinity'::numeric, '10')"))))
+    (testing "numeric ceil and floor do not manufacture a floating negative zero"
+      (is (= "0" (one c "SELECT ceil(-0.000001::numeric)")))
+      (is (= "0" (one c "SELECT ceiling(-0.000001::numeric)")))
+      (is (= "-1" (one c "SELECT floor(-0.000001::numeric)"))))
+    (testing "numeric_inc is the PostgreSQL numeric addition helper"
+      (is (= "5.2" (one c "SELECT numeric_inc(4.2::numeric)")))
+      (is (= "Infinity" (one c "SELECT numeric_inc('Infinity'::numeric)")))
+      (is (= "-Infinity" (one c "SELECT numeric_inc('-Infinity'::numeric)")))
+      (is (= "NaN" (one c "SELECT numeric_inc('NaN'::numeric)"))))
     (testing "width_bucket accepts special operands but rejects special bounds"
       (is (= "11" (one c "SELECT width_bucket('Infinity'::numeric, 1, 10, 10)")))
       (is (= "0" (one c "SELECT width_bucket('-Infinity'::numeric, 1, 10, 10)")))
       (is (= "889" (one c "SELECT width_bucket('NaN', 3.0, 4.0, 888)")))
+      (is (thrown-with-msg? SQLException #"bounds cannot be NaN"
+                            (one c "SELECT width_bucket(0, 'NaN', 4.0, 888)")))
+      (is (thrown-with-msg? SQLException #"bounds cannot be NaN"
+                            (one c "SELECT width_bucket(0, 3.0, 'NaN', 888)")))
+      (is (= "10" (one c "SELECT width_bucket(0, -1e100::numeric, 1, 10)")))
+      (is (= "10" (one c "SELECT width_bucket(0, -1e100::float8, 1, 10)")))
+      (is (= "10" (one c "SELECT width_bucket(1, 1e100::numeric, 0, 10)")))
+      (is (= "10" (one c "SELECT width_bucket(1, 1e100::float8, 0, 10)")))
       (is (thrown-with-msg? SQLException #"bounds must be finite"
-                            (one c "SELECT width_bucket(0::numeric, 'Infinity'::numeric, 5, 10)"))))
+                            (one c "SELECT width_bucket(0::numeric, 'Infinity'::numeric, 5, 10)")))
+      (is (thrown-with-msg? SQLException #"integer out of range"
+                            (one c "SELECT width_bucket(1::float8, 0, 1, 2147483647)")))
+      (is (thrown-with-msg? SQLException #"integer out of range"
+                            (one c "SELECT width_bucket(0::float8, 1, 0, 2147483647)"))))
     (testing "scale has nothing to report for a special"
       (is (nil? (one c "SELECT scale('NaN'::numeric)"))))
     (testing "and the optional second argument still works -- the
@@ -125,10 +216,48 @@
     (is (thrown-with-msg? SQLException #"cannot convert infinity to integer"
                           (one c "SELECT 'Infinity'::numeric::int")))))
 
+(deftest float-specials-cast-to-numeric
+  (with-open [c (jdbc)]
+    (doseq [[source expected] [["'NaN'::float8" "NaN"]
+                               ["'Infinity'::float8" "Infinity"]
+                               ["'-Infinity'::float8" "-Infinity"]
+                               ["'NaN'::float4" "NaN"]
+                               ["'Infinity'::float4" "Infinity"]
+                               ["'-Infinity'::float4" "-Infinity"]]]
+      (is (= expected (one c (str "SELECT " source "::numeric")))))
+    (doseq [target ["float8" "float4"]
+            [source expected] [["'NaN'::numeric" "NaN"]
+                               ["'Infinity'::numeric" "Infinity"]
+                               ["'-Infinity'::numeric" "-Infinity"]]]
+      (is (= expected (one c (str "SELECT " source "::" target)))))))
+
+(deftest constrained-numeric-rejects-infinity-but-allows-nan
+  (with-open [c (jdbc)]
+    (is (= "NaN" (one c "SELECT 'NaN'::numeric(4,4)")))
+    (is (thrown-with-msg? SQLException #"numeric field overflow"
+                          (one c "SELECT 'Infinity'::numeric(4,4)")))
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE constrained_special (n numeric(3,-3))")
+      (.executeUpdate st "INSERT INTO constrained_special VALUES ('NaN')")
+      (is (thrown-with-msg? SQLException #"numeric field overflow"
+                            (.executeUpdate st "INSERT INTO constrained_special VALUES ('Inf')"))))))
+
+(deftest parse-time-numeric-errors-preserve-detail-fields
+  (doseq [query-mode [nil "simple"]]
+    (with-open [c (jdbc query-mode)]
+      (try
+        (one c "SELECT 'Infinity'::numeric(4,4)")
+        (is false (or query-mode "extended"))
+        (catch PSQLException e
+          (is (= "22003" (.getSQLState e)))
+          (is (= (str "A field with precision 4, scale 4 "
+                      "cannot hold an infinite value.")
+                 (some-> e .getServerErrorMessage .getDetail))))))))
+
 (deftest numeric-specials-persist-in-tables
   (with-open [c (jdbc)]
     (with-open [st (.createStatement c)]
-      (.execute st "CREATE TABLE measurements (id int PRIMARY KEY, n numeric(20,2))")
+      (.execute st "CREATE TABLE measurements (id int PRIMARY KEY, n numeric)")
       ;; This is the first transaction-breaking statement in PostgreSQL's
       ;; numeric regression test. Keep it in an explicit transaction so a
       ;; rejected special cannot hide behind an auto-commit boundary.
