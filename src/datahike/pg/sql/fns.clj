@@ -387,6 +387,23 @@
   [coll]
   (order-agg "max" pos? coll))
 
+(defn- filter-enum-extreme [pick coll]
+  (let [pairs (remove (fn [[_rank value]] (sql-null? value)) coll)]
+    (if (empty? pairs)
+      :__null__
+      (second (reduce (fn [a b] (if (pick (compare (first b) (first a))) b a))
+                      pairs)))))
+
+(defn filter-enum-min
+  "MIN over `[declaration-rank label]` pairs, returning the label."
+  [coll]
+  (filter-enum-extreme neg? coll))
+
+(defn filter-enum-max
+  "MAX over `[declaration-rank label]` pairs, returning the label."
+  [coll]
+  (filter-enum-extreme pos? coll))
+
 (defn filter-count
   "SQL COUNT(col) — counts non-NULL values. Unlike COUNT(*), which counts
    all rows, COUNT(col) skips rows where col IS NULL. Returns a long

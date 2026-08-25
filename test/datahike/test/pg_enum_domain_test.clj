@@ -198,6 +198,27 @@
                                     "WHERE enumtypid = 'mood'::regtype "
                                     "ORDER BY enumsortorder")))))))
 
+(deftest enum-comparisons-order-and-extrema-use-declaration-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'yellow', 'green', 'blue')")
+    (exec! c "CREATE TABLE enum_order (col rainbow)")
+    (exec! c "INSERT INTO enum_order VALUES ('green'), ('red'), ('blue'), ('yellow')")
+    (is (= [["red"] ["yellow"] ["green"] ["blue"]]
+           (mapv vec (query-rows c "SELECT col FROM enum_order ORDER BY col"))))
+    (is (= [["red"] ["yellow"] ["green"] ["blue"]]
+           (mapv vec (query-rows c "SELECT * FROM enum_order ORDER BY col"))))
+    (is (= [["green"] ["blue"]]
+           (mapv vec
+                 (query-rows c "SELECT col FROM enum_order WHERE col > 'yellow' ORDER BY col"))))
+    (is (= [["red" "blue"]]
+           (mapv vec (query-rows c "SELECT min(col), max(col) FROM enum_order"))))
+    (is (= [["red"] ["yellow"] ["green"] ["blue"]]
+           (mapv vec
+                 (query-rows
+                  c (str "SELECT enumlabel FROM pg_enum "
+                         "WHERE enumtypid = 'rainbow'::regtype "
+                         "ORDER BY enumlabel::rainbow")))))))
+
 (deftest enum-definition-rejects-duplicate-and-oversized-labels
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (doseq [[sql state]

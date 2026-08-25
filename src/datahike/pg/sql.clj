@@ -206,6 +206,8 @@
 (def sql-not-null?         fns/sql-not-null?)
 (def filter-min            fns/filter-min)
 (def filter-max            fns/filter-max)
+(def filter-enum-min       fns/filter-enum-min)
+(def filter-enum-max       fns/filter-enum-max)
 (def filter-count          fns/filter-count)
 (def filter-bool-and       fns/filter-bool-and)
 (def filter-count-distinct fns/filter-count-distinct)

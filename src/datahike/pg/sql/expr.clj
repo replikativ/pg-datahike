@@ -340,10 +340,31 @@
 
     :else nil))
 
-(defn- enum-spec-for-exprs [ctx exprs]
+(defn enum-spec-for-exprs [ctx exprs]
+  "Return the registry spec for the first enum-typed SQL expression. Public
+   for statement lowering, which must use the same type recovery for ORDER BY
+   and aggregates as predicate lowering does."
   (when-let [enum-name (some #(enum-name-of-expr ctx %) exprs)]
     (some #(when (= enum-name (:name %)) %)
           (pgs/enum-types (:db ctx)))))
+
+(defn enum-rank-var!
+  "Bind the declaration-order rank of enum `value` and return its logic var.
+   SQL NULL remains the null sentinel so the normal server-side NULL ordering
+   path continues to apply."
+  [ctx spec value]
+  (let [rank-by-label (zipmap (:values spec) (range))
+        fn-param (symbol (str "?enum-rank-" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        rank-fn (fn [v]
+                  (if (fns/sql-null? v)
+                    :__null__
+                    (get rank-by-label (str v) Long/MAX_VALUE)))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj rank-fn)
+    (swap! (:where-clauses ctx) conj [(list fn-param value) result-var])
+    (swap! (:nullable-vars ctx) conj result-var)
+    result-var))
 
 (def common-type-fns
   "The functions whose result type PostgreSQL resolves with
@@ -4796,7 +4817,9 @@
      ;; column-to-column comparison all fell through to here and
      ;; answered false. Decide it BEFORE coerce-comparison-operands,
      ;; which replaces the AST nodes this test needs.
-     (let [jsonb-cmp? (and (contains? #{'= 'not=} op)
+     (let [enum-spec (when (contains? #{'< '> '<= '>=} op)
+                       (enum-spec-for-exprs ctx [left right]))
+           jsonb-cmp? (and (contains? #{'= 'not=} op)
                            (or (jsonb-column? ctx left)
                                (jsonb-column? ctx right)))
            [left right] (coerce-comparison-operands ctx left right)
@@ -4808,9 +4831,22 @@
                (translate-expr ctx right) right)
            l (if (seq? l) (ctx/materialize-arg! ctx l) l)
            r (if (seq? r) (ctx/materialize-arg! ctx r) r)
-           guards (ctx/null-guard-clauses ctx [l r])]
+           guards (ctx/null-guard-clauses ctx [l r])
+           enum-cmp-param
+           (when enum-spec
+             (let [rank (zipmap (:values enum-spec) (range))
+                   cmp (case op < < > > <= <= >= >=)
+                   p (symbol (str "?enum-cmp-" (swap! (:var-counter ctx) inc)))]
+               (swap! (:in-params ctx) conj p)
+               (swap! (:in-args ctx) conj
+                      (fn [a b]
+                        (cmp (get rank (str a) Long/MAX_VALUE)
+                             (get rank (str b) Long/MAX_VALUE))))
+               p))]
        (conj guards
              (cond
+               enum-cmp-param
+               [(list enum-cmp-param l r)]
                (and jsonb-cmp? (= op '=))
                [(list 'datahike.pg.sql/jsonb-eq? l r)]
                jsonb-cmp?

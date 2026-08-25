@@ -3519,6 +3519,19 @@
                           v (if (symbol? v)
                               v
                               (ctx/materialize-arg! ctx (list 'identity v)))
+                          enum-spec (when (and inner-expr
+                                               (contains? #{"min" "max"} fname))
+                                      (expr/enum-spec-for-exprs ctx [inner-expr]))
+                          [agg-sym v]
+                          (if enum-spec
+                            (let [rank-var (expr/enum-rank-var! ctx enum-spec v)
+                                  pair-var (ctx/fresh-var! ctx)]
+                              (ctx/add-clause! ctx [(list 'vector rank-var v) pair-var])
+                              [(if (= fname "min")
+                                 'datahike.pg.sql/filter-enum-min
+                                 'datahike.pg.sql/filter-enum-max)
+                               pair-var])
+                            [agg-sym v])
                                 ;; Per-input-type variant for SUM/AVG. Compute
                                 ;; OID against the original AST expression
                                 ;; (post-ref-deref `v` is a logic var with no
@@ -4304,6 +4317,33 @@
                                                 "NULLS_FIRST" :first
                                                 "NULLS_LAST"  :last
                                                 nil)
+                                        order-source-expr
+                                        (cond
+                                          (instance? LongValue expr)
+                                          (let [pos (.getValue ^LongValue expr)]
+                                            (when (<= 1 pos (count select-items))
+                                              (.getExpression ^SelectItem
+                                               (nth select-items (dec pos)))))
+
+                                          (instance? Column expr)
+                                          (let [col-name (.getColumnName ^Column expr)
+                                                tbl (.getTable ^Column expr)
+                                                alias-idx (when (nil? tbl)
+                                                            (some (fn [[i a]]
+                                                                    (when (= a col-name) i))
+                                                                  (map-indexed vector fa-snap)))]
+                                            (if (and alias-idx (< alias-idx (count select-items)))
+                                              (let [selected (.getExpression ^SelectItem
+                                                              (nth select-items alias-idx))]
+                                                ;; `SELECT * ... ORDER BY col`: star expansion
+                                                ;; creates one find alias per physical column,
+                                                ;; but `select-items` still contains only the
+                                                ;; single `*` AST node. Keep the ORDER BY column
+                                                ;; as the type source in that case.
+                                                (if (instance? AllColumns selected) expr selected))
+                                              expr))
+
+                                          :else expr)
                                         ;; Check if ORDER BY references a SELECT alias
                                         v (cond
                                             ;; A bare integer constant is a 1-based
@@ -4383,6 +4423,13 @@
                                                    (not in-find?)
                                                    (not (contains? agg-syms (first v))))
                                             (ctx/materialize-arg! ctx v)
+                                            v)
+                                        enum-spec (expr/enum-spec-for-exprs
+                                                   ctx [order-source-expr])
+                                        v (if (and enum-spec
+                                                   (not (seq? v))
+                                                   (not (map? v)))
+                                            (expr/enum-rank-var! ctx enum-spec v)
                                             v)
                                         ;; An aggregate written out in ORDER BY rather
                                         ;; than referenced by alias. PostgreSQL allows it
