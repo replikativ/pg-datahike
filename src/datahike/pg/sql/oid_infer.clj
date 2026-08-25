@@ -189,6 +189,9 @@
    ;; pg_typeof returns regtype, not text — this is the OID the
    ;; reporter of #19 saw and mistook for the bit type's own.
    "pg_typeof"     types/oid-regtype
+   "enum_first"    :arg-type
+   "enum_last"     :arg-type
+   "enum_range"    types/oid-text-array
    "version"       types/oid-text
    "format_type"   types/oid-text
    "current_setting" types/oid-text

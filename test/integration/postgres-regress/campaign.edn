@@ -199,7 +199,7 @@
     {:name "enum" :mode :discovery
      :boundaries #{:user-type :casts :ordering :catalog-introspection}
      :blockers #{:alter-type :enum-arrays :create-function
-                 :transactional-type-cascade :enum-helper-functions}
+                 :transactional-type-cascade}
      :strict-slices
      [{:id :enum-input-and-diagnostics
        :source-lines [15 23]

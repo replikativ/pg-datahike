@@ -311,6 +311,40 @@
   [ctx expr]
   (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
 
+(defn- enum-name-of-expr
+  "Recover the declared enum type from a cast or stored enum column. Enum
+   values themselves are strings, so runtime inspection cannot distinguish
+   two enum types (or an enum from text); the SQL expression must carry it."
+  [ctx expr]
+  (cond
+    (instance? CastExpression expr)
+    (let [type-name (some-> ^CastExpression expr .getColDataType str str/lower-case)]
+      (when (params/registered-enum-values (:db ctx) type-name)
+        (-> type-name (str/split #"\.") last params/unquote-ident)))
+
+    (instance? Column expr)
+    (when-let [resolved (try (ctx/resolve-column ^Column expr
+                                                 (:table-aliases ctx)
+                                                 (:default-table ctx)
+                                                 (:col-overrides ctx)
+                                                 (:derived-aliases ctx)
+                                                 (:ci-index ctx))
+                             (catch Throwable _ nil))]
+      (when-let [attr (ctx/attr-of ctx resolved)]
+        (ffirst
+         (d/q '{:find [?name]
+                :in [$ ?ident]
+                :where [[?e :db/ident ?ident]
+                        [?e :datahike.pg/enum-of ?name]]}
+              (:db ctx) attr))))
+
+    :else nil))
+
+(defn- enum-spec-for-exprs [ctx exprs]
+  (when-let [enum-name (some #(enum-name-of-expr ctx %) exprs)]
+    (some #(when (= enum-name (:name %)) %)
+          (pgs/enum-types (:db ctx)))))
+
 (def common-type-fns
   "The functions whose result type PostgreSQL resolves with
    `select_common_type` over their arguments rather than taking the
@@ -1290,6 +1324,38 @@
 
       ;; User-defined enum input is database metadata, so the pure scalar
       ;; helper cannot validate it without this translation-time closure.
+      (contains? #{"enum_first" "enum_last" "enum_range"} fname)
+      (let [argc (count args)
+            valid-arity? (if (= fname "enum_range") (contains? #{1 2} argc) (= 1 argc))
+            _ (when-not valid-arity?
+                (throw (errors/pg-error :undefined-function
+                                        {:function fname :arity argc})))
+            spec (enum-spec-for-exprs ctx arg-exprs)
+            _ (when-not spec
+                (throw (ex-info (str "function " fname " does not exist")
+                                {:error :undefined-function :sqlstate "42883"})))
+            values (:values spec)
+            impl (case fname
+                   "enum_first" (fn [_] (first values))
+                   "enum_last" (fn [_] (last values))
+                   "enum_range"
+                   (fn
+                     ([_] (pg-arr/array :text values))
+                     ([lo hi]
+                      (let [lo (when-not (fns/sql-null? lo) (str lo))
+                            hi (when-not (fns/sql-null? hi) (str hi))
+                            start (if lo (.indexOf ^java.util.List values lo) 0)
+                            end (if hi (.indexOf ^java.util.List values hi) (dec (count values)))
+                            selected (if (and (<= 0 start) (<= start end))
+                                       (subvec values start (inc end))
+                                       [])]
+                        (pg-arr/array :text selected)))))
+            fn-param (symbol (str "?fn-" fname "-" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       (= fname "pg_input_is_valid")
       (let [_ (fns/check-arity! fname (count args))
             db (:db ctx)

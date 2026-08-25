@@ -147,6 +147,21 @@
                       c (str "SELECT message, sql_error_code FROM "
                              "pg_input_error_info('angry', 'mood')")))))))
 
+(deftest enum-ordered-helper-functions
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (is (= [["sad" "happy" "{sad,ok,happy}" "{ok,happy}"]]
+           (mapv vec
+                 (query-rows
+                  c (str "SELECT enum_first(NULL::mood), enum_last('ok'::mood), "
+                         "enum_range(NULL::mood)::text, "
+                         "enum_range('ok'::mood, NULL)::text")))))
+    (exec! c "CREATE TABLE enum_helper_source (m mood)")
+    (exec! c "INSERT INTO enum_helper_source VALUES ('ok')")
+    (is (= [["sad" "happy"]]
+           (mapv vec
+                 (query-rows c "SELECT enum_first(m), enum_last(m) FROM enum_helper_source"))))))
+
 (deftest enum-definition-rejects-duplicate-and-oversized-labels
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (doseq [[sql state]
