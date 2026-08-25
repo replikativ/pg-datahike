@@ -341,7 +341,7 @@
     "null" "true" "false" "is" "on"
     "asc" "desc" "cross" "inner" "outer" "left" "right" "full"
     "limit" "offset" "fetch" "for" "of"
-    "by" "into" "values" "returning" "using"})
+    "by" "into" "values" "returning" "using" "sample"})
 
 (defn- inside-cast-parens?
   "True if the token at idx sits inside an unmatched paren group opened
@@ -378,16 +378,26 @@
 (defn quote-reserved-alias-rule
   "Find `AS <reserved-kw>` outside of `CAST(... AS ...)` contexts and
    replace `<reserved-kw>` with `\"<reserved-kw>\"` so JSqlParser
-   accepts it as an identifier. PG already treats the two forms
-   equivalently (both produce the same column label)."
+   accepts it as an identifier. Also quote `sample.` references: JSqlParser
+   reserves SAMPLE as query syntax even after PostgreSQL has accepted it as a
+   relation alias. PG already treats the quoted lower-case forms equivalently."
   [toks]
   (let [n (count toks)]
     (loop [i 0, acc []]
-      (if (>= i (dec n))
+      (if (>= i n)
         acc
-        (let [t (nth toks i)]
-          (if-not (= "as" (kw-text t))
+        (let [t (nth toks i)
+              next-t (nth toks (inc i) nil)]
+          (cond
+            ;; `sample.col`: once SAMPLE was used as a relation alias,
+            ;; JSqlParser still reads this as its sampling-clause keyword.
+            (and (= "sample" (kw-text t)) (punct? next-t "."))
+            (recur (inc i) (conj acc [(:pos t) (:end t) "\"sample\""]))
+
+            (not= "as" (kw-text t))
             (recur (inc i) acc)
+
+            :else
             (let [next-t (nth toks (inc i) nil)
                   nt-kw (kw-text next-t)]
               (if (and nt-kw

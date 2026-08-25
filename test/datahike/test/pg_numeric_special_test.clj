@@ -191,7 +191,11 @@
       (is (= "10" (one c "SELECT width_bucket(1, 1e100::numeric, 0, 10)")))
       (is (= "10" (one c "SELECT width_bucket(1, 1e100::float8, 0, 10)")))
       (is (thrown-with-msg? SQLException #"bounds must be finite"
-                            (one c "SELECT width_bucket(0::numeric, 'Infinity'::numeric, 5, 10)"))))
+                            (one c "SELECT width_bucket(0::numeric, 'Infinity'::numeric, 5, 10)")))
+      (is (thrown-with-msg? SQLException #"integer out of range"
+                            (one c "SELECT width_bucket(1::float8, 0, 1, 2147483647)")))
+      (is (thrown-with-msg? SQLException #"integer out of range"
+                            (one c "SELECT width_bucket(0::float8, 1, 0, 2147483647)"))))
     (testing "scale has nothing to report for a special"
       (is (nil? (one c "SELECT scale('NaN'::numeric)"))))
     (testing "and the optional second argument still works -- the

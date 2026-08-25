@@ -232,7 +232,12 @@
     (is (= "SELECT 1 AS \"from\""   (quote-alias "SELECT 1 AS from")))
     (is (= "SELECT 1 AS \"where\""  (quote-alias "SELECT 1 AS where")))
     (is (= "SELECT 1 AS \"when\""   (quote-alias "SELECT 1 AS when")))
-    (is (= "SELECT 1 AS \"join\""   (quote-alias "SELECT 1 AS join")))))
+    (is (= "SELECT 1 AS \"join\""   (quote-alias "SELECT 1 AS join")))
+    (is (= "SELECT 1 AS \"sample\"" (quote-alias "SELECT 1 AS sample")))))
+
+(deftest quote-sample-alias-reference
+  (is (= "SELECT \"sample\".x FROM t AS \"sample\""
+         (quote-alias "SELECT sample.x FROM t AS sample"))))
 
 (deftest quote-reserved-alias-folds-case
   ;; This assertion is REVERSED from what it used to be, and the old

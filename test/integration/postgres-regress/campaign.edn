@@ -56,7 +56,7 @@
        :test-var "bit-input-error-info"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
-     :blockers #{:numeric-formatting :numeric-series :lateral-values
+     :blockers #{:numeric-formatting :numeric-series
                  :postgres-internal-functions :pg-lsn}
      :strict-slices
      [{:id :special-power-boundaries
@@ -134,7 +134,11 @@
       {:id :width-bucket-unknown-specials
        :source-lines [871 876]
        :gate "test/datahike/test/pg_numeric_special_test.clj"
-       :test-var "scalar-functions-pass-specials-through"}]}
+       :test-var "scalar-functions-pass-specials-through"}
+      {:id :lateral-values-width-bucket-matrix
+       :source-lines [945 965]
+       :gate "test/datahike/test/pg_lateral_srf_test.clj"
+       :test-var "correlated-lateral-values"}]}
     {:name "money" :mode :discovery
      :boundaries #{:scalar-type :operators :casts :text-codec}
      :blockers #{:locale :operator-coverage}

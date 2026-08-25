@@ -1366,21 +1366,38 @@
       (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
                        {} (map vector corr-refs outer-vals))]
         (binding [params/*from-bindings* fb
+                  ;; Bare columns in a LATERAL VALUES/SELECT body use the
+                  ;; same unique-owner lookup as UPDATE ... FROM. Mark these
+                  ;; bindings as visible sources so `VALUES (outer_col)` can
+                  ;; resolve without a qualifier, as PostgreSQL permits.
+                  params/*from-source-aliases* (set (map first corr-refs))
                   params/*lateral-outer-aliases* (set (map first corr-refs))]
           (or (try
                 (let [p (when parse-fn (parse-fn inner-sql inner-schema query-db))
-                      q (:query p)
-                      ia (:in-args p)
-                      qdb (or (:enriched-db p) query-db)]
-                  (when q
-                    (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
+                      plans (if (and (= :set-operation (:type p))
+                                     (= :union-all (:op p)))
+                              (:sub-results p)
+                              [p])
+                      first-q (some :query plans)
+                      run-plan (fn [plan]
+                                 (when-let [q (:query plan)]
+                                   (let [ia (:in-args plan)
+                                         qdb (or (:enriched-db plan)
+                                                 (:enriched-db p)
+                                                 query-db)]
+                                     (if (seq ia)
+                                       (apply d/q q qdb ia)
+                                       (d/q q qdb)))))
+                      res (vec (mapcat #(or (run-plan %) []) plans))]
+                  (when first-q
+                    (let [res res
                           ;; An aggregate over an empty relation is still
                           ;; ONE row -- `LATERAL (SELECT count(*) … WHERE
                           ;; ch.pid = t.id)` is 0 for an outer row with no
                           ;; children, not "no row". The same rule every
                           ;; other subquery evaluator applies.
                           res (or (when (empty? (seq res))
-                                    (expr/empty-aggregate-row q))
+                                    (expr/empty-aggregate-row first-q))
                                   res)]
                       ;; TAKE the visible columns. The inner's `:find`
                       ;; carries trailing bookkeeping vars — the entity
@@ -1409,6 +1426,134 @@
              (let [t (str/lower-case (str/trim (str (first es))))]
                (or (= t "true") (= t "1 = 1")))))))
 
+(defn- values-expression-rows
+  "Return a VALUES node as rows of expression ASTs. JSqlParser flattens a
+   single row but wraps each row of a multi-row VALUES in its own expression
+   list."
+  [^Values values]
+  (let [raw (vec (.getExpressions values))]
+    (if (and (seq raw) (instance? ParenthesedExpressionList (first raw)))
+      (mapv (fn [^ParenthesedExpressionList row] (vec row)) raw)
+      [raw])))
+
+(defn- column-vtype
+  "Best-effort storage type for a column expression in a virtual relation."
+  [^Column c schema]
+  (let [table (some-> (.getTable c) .getName unquote-ident str/lower-case)
+        col (str/lower-case (unquote-ident (.getColumnName c)))
+        matches (keep (fn [[k attr]]
+                        (when (and (keyword? k)
+                                   (= col (str/lower-case (name k)))
+                                   (or (nil? table)
+                                       (= table (str/lower-case (namespace k)))
+                                       (str/ends-with? (str/lower-case (namespace k))
+                                                       (str "__" table))))
+                          (:db/valueType attr)))
+                      schema)]
+    (when (= 1 (count (distinct matches))) (first matches))))
+
+(defn- expression-vtype
+  "Infer enough of an expression's Datahike carrier type to declare a
+   correlated VALUES relation. This deliberately follows numeric promotion;
+   other complex expressions retain the existing text fallback."
+  [e schema]
+  (cond
+    (instance? LongValue e) :db.type/long
+    (instance? DoubleValue e) :db.type/bigdec
+    (instance? Column e) (column-vtype e schema)
+    (instance? SignedExpression e)
+    (expression-vtype (.getExpression ^SignedExpression e) schema)
+    (instance? Parenthesis e)
+    (expression-vtype (.getExpression ^Parenthesis e) schema)
+    (instance? CastExpression e)
+    (let [^CastExpression ce e
+          target (some-> (.getColDataType ce) .getDataType str str/lower-case)]
+      (case (types/cast-category target)
+        :integer :db.type/long
+        :float :db.type/double
+        :numeric :db.type/bigdec
+        :boolean :db.type/boolean
+        :text :db.type/string
+        (expression-vtype (.getLeftExpression ce) schema)))
+    (instance? net.sf.jsqlparser.expression.BinaryExpression e)
+    (let [^net.sf.jsqlparser.expression.BinaryExpression be e
+          types (set (keep #(expression-vtype % schema)
+                           [(.getLeftExpression be) (.getRightExpression be)]))]
+      (cond
+        (types :db.type/bigdec) :db.type/bigdec
+        (types :db.type/double) :db.type/double
+        (types :db.type/long) :db.type/long
+        :else nil))
+    :else nil))
+
+(defn- lateral-values-corr-refs
+  "Correlation references made by a lateral VALUES body.
+
+   Qualified references use the normal detector. PostgreSQL also permits bare
+   outer columns here. Resolve those only when their schema attribute has one
+   logical owner in scope. Correlation arguments use the storage namespace;
+   this matters for derived relations, whose user alias has no attributes."
+  [^Values values outer-aliases schema]
+  (let [raw-qualified (or (correlated-subquery-refs values outer-aliases) #{})
+        storage-owner (fn [alias col]
+                        (let [a (str/lower-case alias)
+                              c (str/lower-case col)]
+                          (or (some (fn [k]
+                                      (let [ns (when (keyword? k)
+                                                 (str/lower-case (namespace k)))]
+                                        (when (and ns (= c (str/lower-case (name k)))
+                                                   (= ns a))
+                                          ns)))
+                                    (keys schema))
+                              (some (fn [k]
+                                      (let [ns (when (keyword? k)
+                                                 (str/lower-case (namespace k)))]
+                                        (when (and ns (= c (str/lower-case (name k)))
+                                                   (str/ends-with? ns (str "__" a))
+                                                   (contains? outer-aliases ns))
+                                          ns)))
+                                    (keys schema))
+                              alias)))
+        qualified (set (map (fn [[a c]] [(storage-owner a c) c]) raw-qualified))
+        alias-for-ns (fn [ns]
+                       (or (some #(when (= ns (str/lower-case %)) %) outer-aliases)
+                           (first
+                            (sort-by count
+                                     (filter (fn [a]
+                                               (str/ends-with?
+                                                ns (str "__" (str/lower-case a))))
+                                             outer-aliases)))))
+        candidates (reduce (fn [m k]
+                             (if (and (keyword? k)
+                                      (not= "db-row-exists" (name k)))
+                               (let [ns (str/lower-case (namespace k))]
+                                 (if-let [a (alias-for-ns ns)]
+                                   (update m (str/lower-case (name k))
+                                           (fnil conj #{}) a)
+                                   m))
+                               m))
+                           {} (keys schema))
+        sql (str values)
+        bare (for [[col aliases] candidates
+                   :when (= 1 (count aliases))
+                   :let [alias (first aliases)]
+                   :when (re-find
+                          (re-pattern
+                           (str "(?i)(?<![\\w.])"
+                                (java.util.regex.Pattern/quote col)
+                                "(?![\\w]|\\s*\\.)"))
+                          sql)]
+               [alias col])]
+    (not-empty (into (set qualified) bare))))
+
+(defn- values-as-select-sql
+  "Turn a VALUES body into SELECT branches so the existing correlated
+   subquery executor can translate each expression under outer bindings."
+  [^Values values]
+  (str/join " UNION ALL "
+            (map (fn [row] (str "SELECT " (str/join ", " (map str row))))
+                 (values-expression-rows values))))
+
 (defn- lateral-subselect->spec
   "`JOIN LATERAL (SELECT …) s ON true` whose inner references an outer
    column.
@@ -1434,12 +1579,23 @@
   [^net.sf.jsqlparser.statement.select.LateralSubSelect ls db schema
    outer-aliases var-counter]
   (let [inner (.getSelect ls)
-        corr-refs (seq (correlated-subquery-refs inner outer-aliases))]
-    (when (and corr-refs (instance? PlainSelect inner))
+        values? (instance? Values inner)
+        corr-refs (seq (if values?
+                         (lateral-values-corr-refs inner outer-aliases schema)
+                         (correlated-subquery-refs inner outer-aliases)))]
+    (when (and corr-refs (or (instance? PlainSelect inner) values?))
       (let [talias (when-let [a (.getAlias ls)]
                      (unquote-ident (str/trim (.getName ^Alias a))))
-            items (vec (.getSelectItems ^PlainSelect inner))
-            cols (vec (map-indexed (fn [i si] (select-item-col-name si i)) items))
+            alias-cols (when-let [a (.getAlias ls)]
+                         (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                      (unquote-ident (.-name c)))
+                                    (or (.getAliasColumns ^Alias a) []))))
+            items (when-not values? (vec (.getSelectItems ^PlainSelect inner)))
+            value-rows (when values? (values-expression-rows inner))
+            cols (vec (or alias-cols
+                          (map-indexed (fn [i si] (select-item-col-name si i)) items)
+                          (map-indexed (fn [i _] (str "column" (inc i)))
+                                       (first value-rows))))
             ;; Best-effort storage type: a bare column reference keeps
             ;; the type it has in the schema.
             ;;
@@ -1449,10 +1605,11 @@
             ;; :db.type/string, so the relation declared TEXT for an
             ;; integer column: Describe reported the wrong type, and
             ;; `WHERE s.v > 10` looked like text > integer.
-            inner-from-name (when-let [fi (.getFromItem ^PlainSelect inner)]
-                              (when (instance? net.sf.jsqlparser.schema.Table fi)
-                                (some-> (.getName ^net.sf.jsqlparser.schema.Table fi)
-                                        unquote-ident str/lower-case)))
+            inner-from-name (when (instance? PlainSelect inner)
+                              (when-let [fi (.getFromItem ^PlainSelect inner)]
+                                (when (instance? net.sf.jsqlparser.schema.Table fi)
+                                  (some-> (.getName ^net.sf.jsqlparser.schema.Table fi)
+                                          unquote-ident str/lower-case))))
             vtype-of (fn [^net.sf.jsqlparser.statement.select.SelectItem si]
                        (let [e (.getExpression si)]
                          (or (when (instance? Column e)
@@ -1463,7 +1620,13 @@
                                      n (str/lower-case (unquote-ident (.getColumnName c)))]
                                  (when t (get-in schema [(keyword t n) :db/valueType]))))
                              :db.type/string)))
-            vtypes (mapv vtype-of items)
+            vtypes (if values?
+                     (mapv (fn [i]
+                             (or (some #(expression-vtype (nth % i nil) schema)
+                                       value-rows)
+                                 :db.type/string))
+                           (range (count cols)))
+                     (mapv vtype-of items))
             sub-name (str "__lsub__" (or talias "anon"))
             ;; NO row marker. Every other virtual table declares one so
             ;; `count(*)` and `SELECT *` have something to enumerate, but
@@ -1484,7 +1647,7 @@
          :vars (mapv (fn [c] (symbol (str "?" sub-name "_" c))) cols)
          :ord-var (symbol (str "?" sub-name "_ord" (swap! var-counter inc)))
          :corr-refs (vec corr-refs)
-         :inner-sql (str inner)
+         :inner-sql (if values? (values-as-select-sql inner) (str inner))
          :n-cols (count cols)}))))
 
 (defn- sequence->virtual-table

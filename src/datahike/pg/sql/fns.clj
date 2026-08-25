@@ -1869,18 +1869,23 @@
         h (->num-double high)
         n (long cnt)]
     (when (<= n 0) (throw-width-bucket "count must be greater than zero"))
+    (when (> n Integer/MAX_VALUE) (throw-out-of-range "integer out of range"))
     (when (or (Double/isNaN l) (Double/isNaN h))
       (throw-width-bucket "lower and upper bounds cannot be NaN"))
     (when (or (Double/isInfinite l) (Double/isInfinite h))
       (throw-width-bucket "lower and upper bounds must be finite"))
     (when (= l h) (throw-width-bucket "lower bound cannot equal upper bound"))
-    (let [asc? (< l h)
+    (let [overflow-bucket (fn []
+                            (if (= n Integer/MAX_VALUE)
+                              (throw-out-of-range "integer out of range")
+                              (inc n)))
+          asc? (< l h)
           below? (if asc? (< o l) (> o l))
           above? (if asc? (>= o h) (<= o h))]
       (cond
-        (Double/isNaN o) (inc n)
+        (Double/isNaN o) (overflow-bucket)
         below? 0
-        above? (inc n)
+        above? (overflow-bucket)
         :else
         ;; Computing `(o-l)/(h-l)` as a double rounds to exactly 1 for
         ;; ranges such as [-1e100, 1] with operand 0, incorrectly placing
