@@ -86,6 +86,10 @@
        :source-lines [837 859]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
        :test-var "round-and-trunc-range-boundaries"}
+      {:id :multiplication-storage-scale
+       :source-lines [1244 1244]
+       :gate "test/datahike/test/pg_numeric_literal_test.clj"
+       :test-var "numeric-multiplication-caps-storage-scale"}
       {:id :sqrt-rounding-thresholds
        :source-lines [1271 1278]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"

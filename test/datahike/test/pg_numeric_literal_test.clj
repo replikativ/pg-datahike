@@ -112,6 +112,16 @@
       (is (= "1.50" (one c "SELECT 3.0 - 1.50")))
       (is (= "0.0" (one c "SELECT -0.5 + 0.5"))))))
 
+(deftest numeric-multiplication-caps-storage-scale
+  (with-open [c (jdbc)]
+    (testing "PostgreSQL numeric.sql line 1244 rounds an exact product at NUMERIC_DSCALE_MAX"
+      (is (= "0.01"
+             (one c (str "SELECT trim_scale((0.1 - 2e-16383)"
+                         " * (0.1 - 3e-16383))"))))
+      (is (= "16383"
+             (one c (str "SELECT scale((0.1 - 2e-16383)"
+                         " * (0.1 - 3e-16383))")))))))
+
 (deftest division-uses-select-div-scale
   (with-open [c (jdbc)]
     (testing "not the operands' scale -- at least 16 significant digits"

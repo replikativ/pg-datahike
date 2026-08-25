@@ -1216,6 +1216,33 @@
   [f underflow?]
   (fn [a b] (checked-float (f a b) a b underflow?)))
 
+(defn- ensure-numeric-range
+  "Reject a finite BigDecimal whose integer part exceeds PostgreSQL
+   numeric's 131072 decimal-digit limit.  Zero has no numeric weight,
+   regardless of the scale carried by BigDecimal."
+  ^java.math.BigDecimal [^java.math.BigDecimal v]
+  (when (and (not (zero? (.signum v)))
+             (> (- (.precision v) (.scale v)) numeric-max-integer-digits))
+    (throw (errors/pg-error :numeric-value-out-of-range
+                            {:message "value overflows numeric format"})))
+  v)
+
+(defn- numeric-mul
+  "PostgreSQL numeric_mul: exact product, rounded only when the sum of
+   operand scales exceeds NUMERIC_DSCALE_MAX."
+  ^java.math.BigDecimal [a b]
+  (let [product (.multiply (bigdec a) (bigdec b))
+        rounded (if (> (.scale product) numeric-dscale-max)
+                  (.setScale product numeric-dscale-max java.math.RoundingMode/HALF_UP)
+                  product)]
+    (ensure-numeric-range rounded)))
+
+(defn- generic-mul [a b]
+  (cond
+    (and (decimal? a) (or (decimal? b) (integer? b))) (numeric-mul a b)
+    (and (decimal? b) (integer? a)) (numeric-mul a b)
+    :else (* a b)))
+
 (defn- special-aware
   "Route an operation through the special-value path when either operand
    is a numeric NaN or +-Infinity, which no BigDecimal operator accepts."
@@ -1227,7 +1254,7 @@
 
 (def sql-+ (null-safe (special-aware (long-overflow->pg (float-checked + false)) +)))
 (def sql-- (null-safe (special-aware (long-overflow->pg (float-checked - false)) -)))
-(def sql-* (null-safe (special-aware (long-overflow->pg (float-checked * true)) *)))
+(def sql-* (null-safe (special-aware (long-overflow->pg (float-checked generic-mul true)) *)))
 
 (declare throw-division-by-zero)
 
@@ -1766,23 +1793,14 @@
      (integer? x) x
      (decimal? x) (let [rounded (.setScale ^java.math.BigDecimal x 0
                                            java.math.RoundingMode/HALF_UP)]
-                    (when (and (not (zero? (.signum rounded)))
-                               (> (- (.precision rounded) (.scale rounded))
-                                  numeric-max-integer-digits))
-                      (throw (errors/pg-error :numeric-value-out-of-range
-                                              {:message "value overflows numeric format"})))
-                    rounded)
+                    (ensure-numeric-range rounded))
      :else (-> (bigdec x)
                (.setScale 0 java.math.RoundingMode/HALF_UP)
                (.longValueExact))))
   ([x n]
    (let [scale (int (min numeric-dscale-max (max -131073 (long n))))
          rounded (.setScale (bigdec x) scale java.math.RoundingMode/HALF_UP)]
-     (when (and (not (zero? (.signum rounded)))
-                (> (- (.precision rounded) (.scale rounded))
-                   numeric-max-integer-digits))
-       (throw (errors/pg-error :numeric-value-out-of-range
-                               {:message "value overflows numeric format"})))
+     (ensure-numeric-range rounded)
      ;; PostgreSQL does not expose a negative display scale here.
      (if (neg? scale) (.setScale rounded 0) rounded))))
 
