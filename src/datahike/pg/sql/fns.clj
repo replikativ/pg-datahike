@@ -1747,25 +1747,24 @@
 (defn- sql-round
   "SQL ROUND — half away from zero, i.e. PG's NUMERIC rounding
    (numeric.c:11657 round_var). `Math/round` breaks ties toward
-   positive infinity and returns a long, so round(-2.5) came back -2
-   instead of -3.
+   positive infinity and returns a long, so round(-2.5) would be -2
+   instead of -3.  Preserve BigDecimal for numeric inputs: PostgreSQL's
+   result is still numeric and can be far wider than int8.
 
-   Deliberately NOT float8 semantics. PG's round(float8) is `rint()`,
-   which is half-to-EVEN — round(2.5::float8) is 2, not 3. We apply the
-   numeric rule to every input because a decimal literal like `2.5` is
-   numeric in PG but arrives here as a Double: dispatching on the
-   runtime type would make `SELECT round(2.5)` answer 2 where PG
-   answers 3, which is the more visible divergence. The right fix is
-   upstream — type decimal literals as numeric — and this should
-   become type-dispatched once that lands.
+   Untyped decimal literals can still arrive as Double through older
+   expression paths. Treat those as numeric here (HALF_UP) until overload
+   resolution carries the declared float8 type into function dispatch.
 
    Two-arg ROUND(x, n) rounds to n decimal places; PG defines it for
    numeric only and returns numeric, so compute in BigDecimal rather
    than reintroducing binary-float error."
   ([x]
-   (if (integer? x)
-     x
-     (-> (bigdec x) (.setScale 0 java.math.RoundingMode/HALF_UP) (.longValueExact))))
+   (cond
+     (integer? x) x
+     (decimal? x) (.setScale ^java.math.BigDecimal x 0 java.math.RoundingMode/HALF_UP)
+     :else (-> (bigdec x)
+               (.setScale 0 java.math.RoundingMode/HALF_UP)
+               (.longValueExact))))
   ([x n]
    (-> (bigdec x)
        (.setScale (int n) java.math.RoundingMode/HALF_UP)
@@ -2524,6 +2523,17 @@
                 (min (double numeric-max-result-scale)))]
     (clamp-rscale (- numeric-min-sig-digits (long val)) (.scale a))))
 
+(defn- result-working-precision
+  "Turn PostgreSQL's display scale and an estimated decimal weight into
+   BigDecimal significant-digit precision, with `guard` working digits."
+  ^long [^long rscale ^double result-weight ^long guard]
+  (let [integer-digits (if (and (Double/isFinite result-weight)
+                                (pos? result-weight)
+                                (<= result-weight numeric-max-integer-digits))
+                         (inc (long (Math/floor result-weight)))
+                         0)]
+    (+ integer-digits rscale guard)))
+
 (defn- estimate-ln-dweight
   "numeric.c estimate_ln_dweight — the decimal weight of ln(x), which is
    what decides how many digits ln has to produce. Near 1 it uses
@@ -2552,10 +2562,13 @@
   "ln to `prec` significant digits. Reduce x = m*10^k with 1 <= m < 10,
    then ln(m) by the atanh series 2*atanh((m-1)/(m+1)) -- which converges
    quickly because the argument is bounded well away from the series'
-   singularity."
+   singularity.  Keep values near one unreduced: reducing 0.999... to
+   9.999... - ln(10) loses precisely the tiny logarithm to cancellation."
   ^java.math.BigDecimal [^java.math.BigDecimal x ^long prec]
   (let [mc (java.math.MathContext. (int (+ prec 15)))
-        k (long (- (.precision x) (.scale x) 1))
+        near-one? (and (>= (.compareTo x (java.math.BigDecimal. "0.9")) 0)
+                       (<= (.compareTo x (java.math.BigDecimal. "1.1")) 0))
+        k (if near-one? 0 (long (- (.precision x) (.scale x) 1)))
         m (.movePointLeft x (int k))
         y (.divide (.subtract m java.math.BigDecimal/ONE)
                    (.add m java.math.BigDecimal/ONE) mc)
@@ -2757,8 +2770,10 @@
   (bd-sqrt a (sqrt-rscale a)))
 
 (defn- numeric-exp ^java.math.BigDecimal [^java.math.BigDecimal a]
-  (let [rs (exp-rscale a)]
-    (.setScale (bd-exp a (+ rs 20)) (int rs) java.math.RoundingMode/HALF_UP)))
+  (let [rs (exp-rscale a)
+        result-weight (* (.doubleValue a) 0.434294481903252)
+        p (result-working-precision rs result-weight 20)]
+    (.setScale (bd-exp a p) (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- numeric-ln ^java.math.BigDecimal [^java.math.BigDecimal a]
   (cond
@@ -2832,7 +2847,12 @@
         rs (if base-is-one?
              (clamp-rscale numeric-min-sig-digits (max (.scale base) (.scale e)))
              (power-rscale base e))
-        p (+ rs 25)
+        ;; MathContext precision counts all significant digits, not just
+        ;; digits after the decimal point.  PostgreSQL's rscale tells us the
+        ;; latter, so retain the estimated integer part as well.  Omitting it
+        ;; rounded 1.2^345 after 26 significant digits and filled the rest
+        ;; with zeroes.
+        p (result-working-precision rs (double (or result-weight 0.0)) 25)
         mc (java.math.MathContext. (int p))]
     (cond
       (zero? (.signum base))
