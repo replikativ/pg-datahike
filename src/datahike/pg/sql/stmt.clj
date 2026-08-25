@@ -80,7 +80,7 @@
            [net.sf.jsqlparser.expression.operators.arithmetic
             Addition Subtraction Multiplication Division Concat]
            [net.sf.jsqlparser.statement.select
-            PlainSelect SelectItem AllColumns OrderByElement
+            PlainSelect SelectItem AllColumns AllTableColumns OrderByElement
             GroupByElement Limit Offset Join
             ParenthesedSelect ParenthesedFromItem SetOperationList
             Values]
@@ -6480,15 +6480,46 @@
                      :expr (str value-expr)}))))
 
 (defn extract-returning
-  "Extract RETURNING clause column names from a ReturningClause.
-   Returns nil if no RETURNING, :* for RETURNING *, or [col-name ...] for specific columns."
+  "Preserve a RETURNING target list as typed descriptors.
+
+   RETURNING is a SELECT-like projection, not a list of column names: it
+   admits `*`, `table.*`, arbitrary expressions and aliases.  Keeping the
+   expression AST here lets the write executor evaluate the projection over
+   each affected row and lets Describe infer the same result shape before
+   execution."
   [returning-clause]
   (when returning-clause
-    (let [items (vec returning-clause)]
-      (if (and (= 1 (count items))
-               (instance? AllColumns (.getExpression ^SelectItem (first items))))
-        :*
-        (mapv #(unquote-ident (.getColumnName ^Column (.getExpression ^SelectItem %))) items)))))
+    (mapv (fn [^SelectItem item]
+            (let [item-expr (.getExpression item)]
+              (cond
+                (instance? AllColumns item-expr)
+                {:kind :star}
+
+                (instance? AllTableColumns item-expr)
+                {:kind :star
+                 :table (some-> ^AllTableColumns item-expr .getTable .getName unquote-ident)}
+
+                :else
+                {:kind :expr
+                 :expr item-expr
+                 :name (or (select-item-alias item) (figure-colname item-expr))})))
+          returning-clause)))
+
+(defn- reject-hidden-target-name!
+  "A DML target alias completely hides the target's original relation name."
+  [statement raw-table alias-name]
+  (when (and alias-name (not= alias-name raw-table))
+    (when (some (fn [^Column col]
+                  (when-let [table (.getTable col)]
+                    (= raw-table (unquote-ident (.getName ^Table table)))))
+                (params/ast-columns statement))
+      (throw (ex-info (str "invalid reference to FROM-clause entry for table \""
+                           raw-table "\"")
+                      {:error :undefined-table
+                       :sqlstate "42P01"
+                       :table raw-table
+                       :hint (str "Perhaps you meant to reference the table alias \""
+                                  alias-name "\".")})))))
 
 ;; Per-schema cache for enriched-schema. NOT a pure function of the
 ;; schema map: the :pg/array-elem / :pg/typmod / :pg/type facts live on
@@ -7407,6 +7438,7 @@
         table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
+        _ (reject-hidden-target-name! delete raw-table alias-name)
         ns table-name
         where-expr (.getWhere delete)]
     (cond-> {:type :delete
@@ -7498,11 +7530,12 @@
                       {:error :feature-not-supported :sqlstate "0A000"})))
     (if (instance? Table from-item)
       (let [{raw-name :name alias :alias} (ctx/extract-table-info from-item)
+            _ (when-not (relation-known? schema raw-name)
+                (throw (ex-info (str "relation \"" raw-name "\" does not exist")
+                                {:error :undefined-table
+                                 :sqlstate "42P01"
+                                 :table raw-name})))
             table-name (first (canonical-relation schema raw-name []))]
-        (when-not (or (contains? schema (pgs/row-marker-attr table-name))
-                      (some #(= table-name (namespace %)) (keys schema)))
-          (throw (ex-info (str "relation \"" raw-name "\" does not exist")
-                          {:error :undefined-table :table raw-name :sqlstate "42P01"})))
         {:table table-name :alias alias})
       (throw (ex-info "UPDATE FROM source is not supported"
                       {:error :feature-not-supported :sqlstate "0A000"})))))
@@ -7523,6 +7556,7 @@
         table-name (first (canonical-relation schema raw-table []))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
+        _ (reject-hidden-target-name! update raw-table alias-name)
         ns table-name
         where-expr (.getWhere update)
         update-sets (.getUpdateSets update)

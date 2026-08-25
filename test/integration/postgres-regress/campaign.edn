@@ -237,9 +237,38 @@
     {:name "insert" :mode :unmeasured :boundaries #{:dml}}
     {:name "insert_conflict" :mode :unmeasured :boundaries #{:dml :constraints}}
     {:name "update" :mode :unmeasured :boundaries #{:dml}}
-    {:name "delete" :mode :unmeasured :boundaries #{:dml}}
-    {:name "returning" :mode :unmeasured :boundaries #{:dml :result-metadata}}
-    {:name "transactions" :mode :unmeasured :boundaries #{:transactions}}
+    {:name "delete" :mode :strict
+     :boundaries #{:dml :name-resolution}
+     :blockers #{}
+     :strict-slices
+     [{:id :target-alias-scope
+       :source-lines [11 18]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "target-alias-hides-original-relation-name"}]}
+    {:name "returning" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:dml :result-metadata :expressions :defaults}
+     :blockers #{:rules :views :create-function :inheritance :partitioning
+                 :update-from :delete-using}
+     :strict-slices
+     [{:id :simple-dml-projections
+       :source-lines [7 21]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "postgres-returning-simple-projection-slice"}]}
+    {:name "transactions" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:transactions :savepoints :error-recovery}
+     :blockers #{:transaction-characteristics :read-only-transactions
+                 :sql-functions :cursor-subtransactions :system-columns}
+     :strict-slices
+     [{:id :begin-end-abort
+       :source-lines [5 36]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "postgres-transaction-begin-end-abort-slice"}
+      {:id :failed-savepoint-recovery
+       :source-lines [259 273]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "postgres-failed-transaction-savepoint-slice"}]}
     {:name "case" :mode :unmeasured :boundaries #{:expressions}}
     {:name "subselect" :mode :unmeasured :boundaries #{:relational}}
     {:name "union" :mode :unmeasured :boundaries #{:relational :common-types}}

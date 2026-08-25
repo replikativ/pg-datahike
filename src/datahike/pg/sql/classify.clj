@@ -1416,6 +1416,10 @@
                         {:kind :commit}
                         {:kind :generic-sql}))
           "rollback" (classify-rollback rest-toks)
+          ;; PostgreSQL's historical ABORT [WORK|TRANSACTION] spelling is
+          ;; exactly ROLLBACK.  It still appears in the upstream transaction
+          ;; regression file and in older application code.
+          "abort"    {:kind :rollback}
           "savepoint" {:kind :savepoint :name (ident-text (first rest-toks))}
           "release"  (let [nm (if (kw=? (first rest-toks) "savepoint")
                                 (ident-text (second rest-toks))

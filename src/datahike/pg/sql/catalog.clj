@@ -1629,7 +1629,7 @@
   #{:set :show
     :prepare :execute-prepared :deallocate
     :declare-cursor :fetch-cursor :close-cursor :move-cursor
-    :begin :commit :savepoint :release-savepoint :rollback-to-savepoint
+    :begin :commit :rollback :savepoint :release-savepoint :rollback-to-savepoint
     :discard-all :discard-scoped
     ;; RESET ALL / RESET <var> (datahike.* + statement_timeout RESETs are
     ;; intercepted earlier in the simple-query path; everything else

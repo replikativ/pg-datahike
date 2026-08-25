@@ -33,6 +33,7 @@
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
+            [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -42,6 +43,7 @@
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
             PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException PgParamCodec]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
+           [net.sf.jsqlparser.schema Column]
            [net.sf.jsqlparser.statement.select PlainSelect Limit Offset]
            [net.sf.jsqlparser.expression LongValue]))
 
@@ -1477,48 +1479,64 @@
 ;; DML execution
 ;; ============================================================================
 
+(defn- returning-items
+  "Expand a parsed RETURNING projection to executable output descriptors."
+  [returning db table-name table-alias schema]
+  (let [columns (->> (pgs/column-info schema table-name db)
+                     (remove #(= "db_id" (:name %)))
+                     vec)
+        aliases (cond-> {table-name table-name} table-alias (assoc table-alias table-name))
+        env {:db db :schema schema :default-table table-name :table-aliases aliases}]
+    (vec
+     (mapcat
+      (fn [{:keys [kind table expr name] :as item}]
+        (if (= :star kind)
+          (do
+            (when (and table (not (contains? aliases table)))
+              (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
+                              {:error :undefined-table :sqlstate "42P01" :table table})))
+            (map (fn [{:keys [name oid]}]
+                   {:kind :column
+                    :name name
+                    :attr (#'sql/resolve-inherited-attr
+                           (keyword table-name name) schema db)
+                    :oid oid})
+                 columns))
+          [(assoc item :name name :oid (or (oid/expr-oid expr env)
+                                           PgWireServer/OID_TEXT))]))
+      returning))))
+
 (defn- build-returning-result
-  "Build a QueryResult for RETURNING clause from entity IDs.
-   returning: :* for all columns, or [col-name ...] for specific columns.
+  "Build a QueryResult for a RETURNING projection from affected entity IDs.
    db: database to read values from (db-after for INSERT/UPDATE, db-before for DELETE).
    eids: entity IDs to return.
    table-name: the table name (namespace prefix for attributes).
    schema: database schema."
-  [returning db eids table-name schema]
-  (let [col-names (if (= :* returning)
-                    (let [cols (pgs/column-info schema table-name db)]
-                      (mapv :name (rest cols)))  ;; skip db_id
-                    returning)
-        ;; Resolve inherited attrs: for INHERITS, some columns live in parent namespace
-        raw-attrs (mapv #(keyword table-name %) col-names)
-        attrs (mapv #(#'sql/resolve-inherited-attr % schema db) raw-attrs)
+  [returning db eids table-name table-alias schema command]
+  (let [items (returning-items returning db table-name table-alias schema)
+        col-names (mapv :name items)
         rows (for [eid eids]
                (let [datoms (d/datoms db :eavt eid)
                      entity-map (into {} (map (fn [^datahike.datom.Datom d]
                                                 [(.-a d) (.-v d)])
                                               datoms))]
-                 (mapv (fn [attr] (get entity-map attr)) attrs)))
+                 (binding [stmt/*eval-update-db* db]
+                   (mapv (fn [{:keys [kind attr expr]}]
+                           (if (= :column kind)
+                             (get entity-map attr)
+                             (stmt/eval-update-expr expr entity-map table-name schema)))
+                         items))))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [row rows]
                                  (into-array String (map value->string row))))
         col-name-array (into-array String col-names)
-        ;; Derive OIDs from column-info so the declared :pg/type wins
-        ;; (e.g. int4 columns report 23, not the storage type int8/20).
-        ;; This MUST match what the extended-protocol Describe advertises
-        ;; for the same RETURNING shape — otherwise a binary-format client
-        ;; (asyncpg) decodes the row against the wrong width. Fall back to
-        ;; the storage valueType, then text, for anything column-info
-        ;; doesn't surface (expressions, inherited renames).
-        by-name (into {} (map (juxt :name :oid)) (pgs/column-info schema table-name db))
-        oids (int-array (map (fn [cn attr]
-                               (int (or (get by-name cn)
-                                        (when-let [vtype (get-in schema [attr :db/valueType])]
-                                          (pgs/oid-for-valuetype vtype))
-                                        PgWireServer/OID_TEXT)))
-                             col-names attrs))]
+        oids (int-array (map #(int (or (:oid %) PgWireServer/OID_TEXT)) items))
+        tag (case command
+              :update (str "UPDATE " (count eids))
+              :delete (str "DELETE " (count eids))
+              (str "INSERT 0 " (count eids)))]
     (PgWireServer$QueryResult.
-     col-name-array oids row-arrays
-     (str "INSERT 0 " (count eids)))))
+     col-name-array oids row-arrays tag)))
 
 ;; ----------------------------------------------------------------------------
 ;; Per-schema memoisation for constraint metadata.
@@ -2308,6 +2326,28 @@
                                    nxt (when eid (+ (or curr 0) incr))]
                                (when eid
                                  [nxt [:db/add eid :__seq__/value nxt]])))
+                 ;; Identity generation and constraint/default application
+                 ;; are both transaction functions.  When a SERIAL column
+                 ;; is omitted, auto-populate-identity wraps the row maps
+                 ;; first; treating that wrapper as an opaque non-map meant
+                 ;; DEFAULT values on OTHER columns were never applied.
+                 ;; Expand only our tagged fresh-insert wrapper inside this
+                 ;; outer tx-fn, preserving arbitrary user/Datahike tx-fns.
+                 input-tx-data
+                 (vec (mapcat (fn [entry]
+                                (if (and (vector? entry)
+                                         (= :db.fn/call (first entry))
+                                         ;; The identity/default wrapper takes
+                                         ;; only txdb.  The uniqueness guard is
+                                         ;; tagged fresh too, but carries its row
+                                         ;; payload as a third item and must be
+                                         ;; left for Datahike to invoke with both
+                                         ;; arguments.
+                                         (= 2 (count entry))
+                                         (-> entry second meta :datahike.pg/fresh-insert))
+                                  ((second entry) txdb)
+                                  [entry]))
+                              tx-data))
                  result
                  (reduce
                   (fn [acc entry]
@@ -2369,7 +2409,7 @@
                              cols)]
                         (into (conj acc filled) seq-ops))))
                   []
-                  tx-data)
+                  input-tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
@@ -2421,7 +2461,7 @@
               data-eids (if (seq ordered-eids)
                           (filterv has-row? ordered-eids)
                           (filterv has-row? (vals tempids)))]
-          (build-returning-result returning db data-eids table-name schema))
+          (build-returning-result returning db data-eids table-name (:alias parsed) schema :insert))
         (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
@@ -2556,7 +2596,7 @@
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
-                             (build-returning-result returning db eids table schema))
+                             (build-returning-result returning db eids table (:alias parsed) schema :delete))
           ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
           ;; to retract atomically alongside the parent deletion.
           cascade-eids (collect-fk-cascade-retractions! db table eids)
@@ -2671,6 +2711,7 @@
         ;; consults for UPDATE…FROM(VALUES) bindings; we extend the
         ;; same map with the outer row keyed by alias-or-table.
         outer-key (or alias table)
+        column-constraints (read-column-constraints db table)
         tx-data (vec (keep identity
                            (mapcat
                             (fn [eid]
@@ -2691,16 +2732,32 @@
                                             ;; `SET bal = bal + $1` used to throw
                                             ;; ClassCastException on the ParamRef
                                             ;; (pgbench -M prepared).
-                                            raw-val (binding [params/*from-bindings* eff-from-bindings
-                                                              params/*from-source-aliases*
-                                                              (when from-bindings
-                                                                (set (keys from-bindings)))
-                                                              params/*bound-params*
-                                                              (or params/*bound-params*
-                                                                  (when-let [cb *cached-bound*]
-                                                                    (vec (rest cb))))
-                                                              stmt/*eval-update-db* db]
-                                                      (sql/eval-update-expr value-expr entity-map ns schema))
+                                            default? (and (instance? Column value-expr)
+                                                          (nil? (.getTable ^Column value-expr))
+                                                          (= "default"
+                                                             (str/lower-case
+                                                              (.getColumnName ^Column value-expr))))
+                                            raw-val (if default?
+                                                      (when-let [[kind value arg]
+                                                                 (:default (get column-constraints column))]
+                                                        (let [v (eval-default kind value arg)]
+                                                          (when (and (vector? v)
+                                                                     (= ::nextval (first v)))
+                                                            (throw (ex-info
+                                                                    "UPDATE SET DEFAULT for sequence-backed columns is not supported"
+                                                                    {:error :feature-not-supported
+                                                                     :sqlstate "0A000"})))
+                                                          v))
+                                                      (binding [params/*from-bindings* eff-from-bindings
+                                                                params/*from-source-aliases*
+                                                                (when from-bindings
+                                                                  (set (keys from-bindings)))
+                                                                params/*bound-params*
+                                                                (or params/*bound-params*
+                                                                    (when-let [cb *cached-bound*]
+                                                                      (vec (rest cb))))
+                                                                stmt/*eval-update-db* db]
+                                                        (sql/eval-update-expr value-expr entity-map ns schema)))
                                             resolved (resolve-param raw-val)
                                             ;; `db` so coerce-insert-value can
                                             ;; resolve :pg/type when the schema
@@ -2916,7 +2973,8 @@
       (if returning
         ;; RETURNING: read values from db-after
         (let [db-after (if tx-report (:db-after tx-report) db)]
-          (build-returning-result returning db-after eids table (:schema db-after)))
+          (build-returning-result returning db-after eids table (:alias parsed)
+                                  (:schema db-after) :update))
         (empty-result (str "UPDATE " (count eids)))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
@@ -4084,13 +4142,20 @@
 (defn- handle-commit
   [{:keys [conn session-id tx-state]} _parsed]
   (if (:in-tx? @tx-state)
-    (try
-      (transact-tx-buffer! conn tx-state)
-      (end-tx! session-id tx-state)
-      (tag-tx-status (empty-result "COMMIT") tx-state)
-      (catch Exception e
+    (if (:aborted? @tx-state)
+      ;; PostgreSQL accepts COMMIT in a failed transaction, discards all
+      ;; buffered work, and reports ROLLBACK.  Rejecting COMMIT with 25P02
+      ;; leaves clients permanently stuck until they happen to issue an
+      ;; explicit ROLLBACK.
+      (do (end-tx! session-id tx-state)
+          (tag-tx-status (empty-result "ROLLBACK") tx-state))
+      (try
+        (transact-tx-buffer! conn tx-state)
         (end-tx! session-id tx-state)
-        (classified-error "COMMIT failed: " e)))
+        (tag-tx-status (empty-result "COMMIT") tx-state)
+        (catch Exception e
+          (end-tx! session-id tx-state)
+          (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
@@ -5643,7 +5708,8 @@
                   data-eids (if (seq ordered-eids)
                               (filterv has-row? ordered-eids)
                               (filterv has-row? (vals tempids-map)))]
-              (build-returning-result returning db-after data-eids table-name (:schema db-after)))
+              (build-returning-result returning db-after data-eids table-name (:alias parsed)
+                                      (:schema db-after) :insert))
             (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
@@ -5735,7 +5801,11 @@
                             (-> ts
                                 (update :tx-buffer into commit-tx-data)
                                 (assoc :speculative-db (:db-after spec-report)))))
-          (empty-result (str "UPDATE " (count eids))))
+          (if-let [returning (:returning parsed)]
+            (let [db-after (:db-after spec-report)]
+              (build-returning-result returning db-after eids (:table parsed)
+                                      (:alias parsed) (:schema db-after) :update))
+            (empty-result (str "UPDATE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
@@ -5766,6 +5836,10 @@
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
               _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
+              returning-result (when-let [returning (:returning parsed)]
+                                 (build-returning-result returning spec-db eids
+                                                         (:table parsed) (:alias parsed)
+                                                         (:schema spec-db) :delete))
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
               spec-report (dc/with spec-db spec-tx-data)
@@ -5775,7 +5849,7 @@
                             (-> ts
                                 (update :tx-buffer into commit-tx-data)
                                 (assoc :speculative-db (:db-after spec-report)))))
-          (empty-result (str "DELETE " (count eids))))
+          (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
@@ -6949,15 +7023,10 @@
                      (d/db conn))
                 schema (dbi/-schema db)
                 table-ns (or (:ns parsed) (:table parsed))
-                cols (pgs/column-info schema table-ns db)
-                by-name (into {} (map (juxt :name identity)) cols)
-                ret (:returning parsed)
-                names (vec (if (= ret ["*"])
-                             (remove #(= "db_id" %) (map :name cols))
-                             ret))
-                oids (int-array
-                      (for [c names]
-                        (int (or (:oid (get by-name c)) PgWireServer/OID_TEXT))))]
+                items (returning-items (:returning parsed) db table-ns
+                                       (:alias parsed) schema)
+                names (mapv :name items)
+                oids (int-array (map #(int (or (:oid %) PgWireServer/OID_TEXT)) items))]
             (PgWireServer$QueryResult.
              (into-array String names)
              oids
@@ -7198,13 +7267,12 @@
         ;; "current transaction is aborted, commands ignored until end of
         ;; transaction block" (in_failed_sql_transaction). Tag tx status
         ;; 'E' so the wire layer carries the right ReadyForQuery marker.
-        ;; Check aborted-tx state. Allowed while aborted: ROLLBACK,
-        ;; ROLLBACK TO, and RELEASE — these let a client escape the
-        ;; aborted state (either ending the tx or popping back to a
-        ;; valid savepoint). classify does the routing.
+        ;; Check aborted-tx state. Allowed while aborted: COMMIT (which
+        ;; rolls back), ROLLBACK, and ROLLBACK TO. RELEASE is *not* allowed:
+        ;; PostgreSQL returns 25P02 and preserves the savepoint so a later
+        ;; ROLLBACK TO can still recover.
             (if (and (:aborted? @tx-state)
-                     (not (contains? #{:rollback :rollback-to-savepoint
-                                       :release-savepoint}
+                     (not (contains? #{:commit :rollback :rollback-to-savepoint}
                                      (:kind (cls/classify sql)))))
               (tag-tx-status
                (error-result

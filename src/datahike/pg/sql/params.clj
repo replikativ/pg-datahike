@@ -39,6 +39,7 @@
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.statement.insert Insert]
+           [net.sf.jsqlparser.statement.select Select]
            [net.sf.jsqlparser.statement.update Update UpdateSet]))
 
 (set! *warn-on-reflection* true)
@@ -462,6 +463,43 @@
                           #{} ms))
                        :else #{}))))]
     (into (sorted-set) (walk node))))
+
+(defn ast-columns
+  "Return every distinct top-level Column reachable from a JSqlParser AST.
+
+   This deliberately uses the same guarded reflective traversal as
+   `ast-param-indices`; statement-level name-resolution checks need to see
+   columns inside predicates and RETURNING expressions without maintaining a
+   second, inevitably incomplete list of AST node classes.  Nested SELECTs
+   form their own name-resolution scope and are deliberately opaque here."
+  [node]
+  (let [seen (java.util.IdentityHashMap.)
+        columns (transient [])]
+    (letfn [(walk [n]
+              (cond
+                (nil? n) nil
+                (.containsKey seen n) nil
+                (or (string? n) (number? n) (boolean? n) (keyword? n)) nil
+                :else
+                (do
+                  (.put seen n true)
+                  (cond
+                    (instance? Column n) (conj! columns n)
+                    (instance? Select n) nil
+                    (instance? java.lang.Iterable n) (doseq [v n] (walk v))
+                    (.isArray (class n)) (when-not (.isPrimitive (.getComponentType (class n)))
+                                           (doseq [v n] (walk v)))
+                    (.startsWith (.getName (class n)) "net.sf.jsqlparser.")
+                    (doseq [^java.lang.reflect.Method m (.getMethods (class n))
+                            :let [mn (.getName m)]
+                            :when (and (zero? (count (.getParameterTypes m)))
+                                       (or (.startsWith mn "get") (.startsWith mn "is"))
+                                       (not= "getClass" mn)
+                                       (not= "getDataType" mn))]
+                      (try (walk (.invoke m n (object-array 0)))
+                           (catch Throwable _)))))))]
+      (walk node)
+      (persistent! columns))))
 
 ;; ---------------------------------------------------------------------------
 ;; PG OID inference
