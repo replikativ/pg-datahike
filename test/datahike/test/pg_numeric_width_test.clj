@@ -102,7 +102,9 @@
   (with-open [c (jdbc)]
     (testing "casts round to positions left of the decimal point"
       (is (= "12000" (one c "SELECT 12345::numeric(3,-3)")))
-      (is (= "-12000" (one c "SELECT (-12345)::numeric(3,-3)"))))
+      (is (= "-12000" (one c "SELECT (-12345)::numeric(3,-3)")))
+      (is (= "0" (one c "SELECT scale(12345::numeric(3,-3))"))
+          "negative typmod scale controls rounding, not display scale"))
     (exec! c "CREATE TABLE neg_scale (n numeric(3,-3))")
     (exec! c "INSERT INTO neg_scale VALUES (12345), (654321)")
     (is (= "12000" (one c "SELECT min(n) FROM neg_scale")))
@@ -119,6 +121,9 @@
            (one c "SELECT 0.0001234::numeric(3,6)")))
     (is (thrown-with-msg? SQLException #"numeric field overflow"
                           (one c "SELECT 0.0009995::numeric(3,6)")))
+    (is (thrown-with-msg? SQLException #"absolute value less than 1\."
+                          (one c "SELECT 0.9995::numeric(3,3)"))
+        "a zero limit exponent is rendered as 1, not 10^0")
     (exec! c (str "CREATE TABLE mixed_scales ("
                   "millions numeric(3,-6), thousands numeric(3,-3), "
                   "units numeric(3,0), thousandths numeric(3,3), "

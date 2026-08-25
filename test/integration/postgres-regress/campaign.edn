@@ -90,6 +90,14 @@
        :source-lines [1244 1244]
        :gate "test/datahike/test/pg_numeric_literal_test.clj"
        :test-var "numeric-multiplication-caps-storage-scale"}
+      {:id :negative-typmod-display-scale
+       :source-lines [1222 1222]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "negative-scale-numeric-typmods"}
+      {:id :zero-weight-typmod-detail
+       :source-lines [1229 1229]
+       :gate "test/datahike/test/pg_numeric_width_test.clj"
+       :test-var "numeric-typmods-support-scale-greater-than-precision"}
       {:id :sqrt-rounding-thresholds
        :source-lines [1271 1278]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"

@@ -84,6 +84,7 @@
                             " cannot hold an infinite value.")})))
     (let [^java.math.BigDecimal decimal v
           scaled (.setScale decimal (int s) java.math.RoundingMode/HALF_UP)
+          result (if (neg? s) (.setScale scaled 0) scaled)
           ;; PG's own test: |value| must be < 10^(p-s).
           ;; scaleByPowerOfTen also covers s > p, where the exponent is
           ;; negative (for example numeric(3,6) has a limit of 10^-3).
@@ -93,10 +94,12 @@
                 :numeric-value-out-of-range
                 ;; PostgreSQL puts the arithmetic in DETAIL, not the message.
                 {:message "numeric field overflow"
-                 :detail (str "A field with precision " p ", scale " s
-                              " must round to an absolute value less than 10^"
-                              (- p s) ".")}))
-        scaled))))
+                 :detail (let [exponent (- p s)]
+                           (str "A field with precision " p ", scale " s
+                                " must round to an absolute value less than "
+                                (if (zero? exponent) "1" (str "10^" exponent))
+                                "."))}))
+        result))))
 
 (def ^:private money-min-cents (biginteger Long/MIN_VALUE))
 (def ^:private money-max-cents (biginteger Long/MAX_VALUE))
