@@ -1050,6 +1050,20 @@
                 (catch Throwable e
                   {:type :error :message (.getMessage e) :sqlstate "42601"}))
 
+              :rename-type-enum
+              (try
+                (merge base {:type :ddl-rename-enum}
+                       (user-types/parse-rename-type sql))
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
+              :drop-type-enum
+              (try
+                (merge base {:type :ddl-drop-enum}
+                       (user-types/parse-drop-type sql))
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
               ;; TRUNCATE — fully token-classified (base carries
               ;; :tables / :restart-identity? / :cascade? from
               ;; cls-info). CASCADE would have to chase FK references

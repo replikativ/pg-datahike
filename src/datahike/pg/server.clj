@@ -6230,6 +6230,75 @@
       (catch Exception e
         (classified-error "ALTER TYPE error: " e)))))
 
+(defn- enum-registry-eid [db type-name]
+  (ffirst (d/q '{:find [?e]
+                 :in [$ ?name]
+                 :where [[?e :datahike.pg.enum/name ?name]]}
+               db type-name)))
+
+(defn- exec-ddl-rename-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        {:keys [type-name new-name]} parsed]
+    (try
+      (let [eid (enum-registry-eid db type-name)]
+        (when-not eid
+          (throw (ex-info (str "type " (pr-str type-name) " does not exist")
+                          {:error :undefined-object :sqlstate "42704"})))
+        (when (pgs/sql-type-exists? db new-name)
+          (throw (ex-info (str "type " (pr-str new-name) " already exists")
+                          {:error :duplicate-object :sqlstate "42710"})))
+        (let [column-eids (map first
+                               (d/q '{:find [?col]
+                                      :in [$ ?name]
+                                      :where [[?col :datahike.pg/enum-of ?name]]}
+                                    db type-name))
+              tx-data (into [[:db/retract eid :datahike.pg.enum/name type-name]
+                             [:db/add eid :datahike.pg.enum/name new-name]]
+                            (mapcat (fn [col]
+                                      [[:db/retract col :datahike.pg/enum-of type-name]
+                                       [:db/add col :datahike.pg/enum-of new-name]])
+                                    column-eids))]
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")
+            (do (transact-recorded! conn tx-data) (empty-result "ALTER TYPE")))))
+      (catch Exception e
+        (classified-error "ALTER TYPE error: " e)))))
+
+(defn- exec-ddl-drop-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        {:keys [type-name if-exists? cascade?]} parsed]
+    (try
+      (let [eid (enum-registry-eid db type-name)
+            dependents (when eid
+                         (map first
+                              (d/q '{:find [?col]
+                                     :in [$ ?name]
+                                     :where [[?col :datahike.pg/enum-of ?name]]}
+                                   db type-name)))]
+        (cond
+          (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
+          (nil? eid)
+          (throw (ex-info (str "type " (pr-str type-name) " does not exist")
+                          {:error :undefined-object :sqlstate "42704"}))
+          (and (seq dependents) cascade?)
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "DROP TYPE CASCADE with dependent columns"}))
+          (seq dependents)
+          (throw (ex-info (str "cannot drop type " type-name
+                               " because other objects depend on it")
+                          {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+          :else
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP TYPE")
+            (do (transact-recorded! conn [[:db/retractEntity eid]])
+                (empty-result "DROP TYPE")))))
+      (catch Exception e
+        (classified-error "DROP TYPE error: " e)))))
+
 (defn- composite-tx-data
   "Build the registry tx-data for a `CREATE TYPE … AS (..)` composite,
    stored as one entity under `:datahike.pg.composite/*`:
@@ -7680,6 +7749,10 @@
                                                        (exec-ddl-create-enum ctx parsed))
                             :ddl-alter-enum        (do (invalidate-schema-cache!)
                                                        (exec-ddl-alter-enum ctx parsed))
+                            :ddl-rename-enum       (do (invalidate-schema-cache!)
+                                                       (exec-ddl-rename-enum ctx parsed))
+                            :ddl-drop-enum         (do (invalidate-schema-cache!)
+                                                       (exec-ddl-drop-enum ctx parsed))
                             :ddl-create-composite  (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-composite ctx parsed))
                             :ddl-create-domain     (do (invalidate-schema-cache!)

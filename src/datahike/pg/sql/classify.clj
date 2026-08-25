@@ -971,6 +971,7 @@
                              :tag "DROP EXTENSION"}
       (kw=? t1 "schema")    {:kind :schema-noop :tag "DROP SCHEMA"}
       (kw=? t1 "database")  {:kind :drop-database :tag "DROP DATABASE"}
+      (kw=? t1 "type")      {:kind :drop-type-enum :system? true :tag "DROP TYPE"}
 
       ;; Symmetric with classify-create — reuse the same :reject-kind
       ;; so a single :silently-accept entry covers both ends.
@@ -1067,11 +1068,18 @@
       ;; ALTER TYPE name OWNER TO ... is already covered by the
       ;; OWNER TO branch above.
       (kw=? t1 "type")
-      (if (some (fn [[a b]]
-                  (or (and (kw=? a "add") (kw=? b "value"))
-                      (and (kw=? a "rename") (kw=? b "value"))))
-                (partition 2 1 toks))
+      (cond
+        (some (fn [[a b]]
+                (or (and (kw=? a "add") (kw=? b "value"))
+                    (and (kw=? a "rename") (kw=? b "value"))))
+              (partition 2 1 toks))
         {:kind :alter-type-enum :system? true :tag "ALTER TYPE ... VALUE"}
+
+        (some (fn [[a b]] (and (kw=? a "rename") (kw=? b "to")))
+              (partition 2 1 toks))
+        {:kind :rename-type-enum :system? true :tag "ALTER TYPE ... RENAME TO"}
+
+        :else
         {:kind :alter-type :reject-kind :alter-type :tag "ALTER TYPE"})
       (kw=? t1 "domain")
       {:kind :alter-domain :reject-kind :alter-domain :tag "ALTER DOMAIN"}

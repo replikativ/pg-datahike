@@ -180,6 +180,31 @@
       (throw (ex-info "unsupported ALTER TYPE form"
                       {:error :unsupported-feature :sqlstate "0A000"})))))
 
+(defn parse-rename-type
+  "Parse `ALTER TYPE old_name RENAME TO new_name`."
+  [original-sql]
+  (let [toks (database/tokenize original-sql)
+        toks (skip-kw toks "alter")
+        toks (skip-kw toks "type")
+        [type-name toks] (consume-name toks)
+        toks (skip-kw toks "rename")
+        toks (skip-kw toks "to")
+        [new-name _] (consume-name toks)]
+    {:type-name type-name :new-name new-name}))
+
+(defn parse-drop-type
+  "Parse a single-name `DROP TYPE [IF EXISTS] name [CASCADE|RESTRICT]`."
+  [original-sql]
+  (let [toks (database/tokenize original-sql)
+        toks (skip-kw toks "drop")
+        toks (skip-kw toks "type")
+        if-exists? (and (ident-eq? (first toks) "if")
+                        (ident-eq? (second toks) "exists"))
+        toks (if if-exists? (drop 2 toks) toks)
+        [type-name toks] (consume-name toks)]
+    {:type-name type-name :if-exists? if-exists?
+     :cascade? (ident-eq? (first toks) "cascade")}))
+
 ;; ============================================================================
 ;; CREATE TYPE … AS (composite)
 ;; ============================================================================

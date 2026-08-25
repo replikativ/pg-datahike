@@ -219,6 +219,26 @@
                          "WHERE enumtypid = 'rainbow'::regtype "
                          "ORDER BY enumlabel::rainbow")))))))
 
+(deftest enum-type-rename-and-drop-lifecycle
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (exec! c "CREATE TABLE enum_lifecycle (m mood)")
+    (exec! c "ALTER TYPE mood RENAME TO feeling")
+    (exec! c "INSERT INTO enum_lifecycle VALUES ('happy')")
+    (is (= [["happy"]] (mapv vec (query-rows c "SELECT m FROM enum_lifecycle"))))
+    (is (= [[2]]
+           (mapv vec
+                 (query-rows
+                  c "SELECT count(*) FROM pg_enum WHERE enumtypid = 'feeling'::regtype"))))
+    (let [raised (try (exec! c "DROP TYPE feeling") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "2BP01" (some-> raised .getSQLState))))
+    (exec! c "DROP TABLE enum_lifecycle")
+    (exec! c "DROP TYPE feeling")
+    (is (= [[0]]
+           (mapv vec (query-rows c "SELECT count(*) FROM pg_type WHERE typname = 'feeling'"))))
+    (exec! c "DROP TYPE IF EXISTS feeling")))
+
 (deftest enum-definition-rejects-duplicate-and-oversized-labels
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (doseq [[sql state]

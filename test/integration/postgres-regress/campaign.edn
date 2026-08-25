@@ -200,7 +200,7 @@
      :boundaries #{:user-type :casts :ordering :catalog-introspection}
      :blockers #{:enum-sortorder-oid-fidelity :transactional-new-label-safety
                  :enum-arrays :create-function
-                 :transactional-type-cascade :drop-and-rename-type}
+                 :transactional-type-cascade}
      :strict-slices
      [{:id :enum-input-and-diagnostics
        :source-lines [15 23]

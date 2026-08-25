@@ -1669,7 +1669,8 @@
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.
-    :create-type-enum :create-type-composite :alter-type-enum :create-domain
+    :create-type-enum :create-type-composite :alter-type-enum
+    :rename-type-enum :drop-type-enum :create-domain
     ;; CREATE / ALTER SEQUENCE — JSqlParser's grammar covers only a
     ;; subset of PG's option list (INCREMENT BY but not INCREMENT,
     ;; no AS / IF NOT EXISTS / NO MINVALUE / signed values) and has no
