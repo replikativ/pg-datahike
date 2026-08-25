@@ -124,6 +124,10 @@
        :source-lines [1501 1509]
        :gate "test/datahike/test/pg_insert_coercion_test.clj"
        :test-var "insert-values-evaluates-numeric-arithmetic"}
+      {:id :derived-values-numeric-functions
+       :source-lines [1538 1563]
+       :gate "test/datahike/test/pg_math_functions_test.clj"
+       :test-var "numeric-functions-scan-derived-values-relations"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"

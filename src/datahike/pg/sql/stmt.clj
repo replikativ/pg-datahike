@@ -1566,6 +1566,10 @@
         ;; key on the enriched schema; a fresh name per parse would make
         ;; every derived-table query a cache miss.
         sub-name (str "__sub__" (or sub-alias "anon"))
+        alias-cols (when-let [a (.getAlias ps)]
+                     (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                  (unquote-ident (.-name c)))
+                                (or (.getAliasColumns ^Alias a) []))))
         with-fn d/db-with
         inner (.getSelect ps)
         inner-ps (when (instance? PlainSelect inner) inner)
@@ -1604,6 +1608,12 @@
       ;; handle that by translating each branch, executing, and combining.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
       (materialize-set-op! inner sub-name db schema sub-alias)
+
+      ;; FROM (VALUES (...), (...)) AS v(a,b). materialize-set-op! already
+      ;; knows how to evaluate and type literal VALUES rows; this shape was
+      ;; simply never dispatched to it, so the relation silently had no rows.
+      (instance? Values inner)
+      (materialize-set-op! inner sub-name db schema sub-alias alias-cols)
 
       :else nil)))
 
@@ -2078,6 +2088,23 @@
       :alias   (or alias target-name)
       :aliases sub-aliases})))
 
+(defn- materialize-parenthesed-values!
+  "Materialize JSqlParser's FROM (VALUES ...) AS v(a,b) shape.
+
+   This parses as a ParenthesedFromItem whose alias lives on the wrapper
+   and whose child is a bare Values node."
+  [^ParenthesedFromItem pfi db schema]
+  (let [inner (.getFromItem pfi)]
+    (when (instance? Values inner)
+      (let [alias-obj (.getAlias pfi)
+            alias (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
+            aliases (when alias-obj
+                      (seq (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
+                                   (unquote-ident (.-name c)))
+                                 (or (.getAliasColumns ^Alias alias-obj) []))))
+            target-name (str "__values__" (or alias "anon"))]
+        (materialize-set-op! inner target-name db schema alias aliases)))))
+
 (def ^:dynamic *cte-namespaces*
   "`{cte-name -> synthetic-namespace}` for the WITH items in scope.
 
@@ -2486,6 +2513,9 @@
         ;; FROM item is a bare relation name (issue #26).
         seq-vt (when (and db (instance? Table from-item))
                  (sequence->virtual-table ^Table from-item db))
+        values-vt (when (and db (instance? ParenthesedFromItem from-item))
+                    (materialize-parenthesed-values!
+                     ^ParenthesedFromItem from-item db schema))
         ;; A correlated SRF in FROM — `FROM t, LATERAL generate_series(1, t.n)`.
         ;; Detected here so the relation exists for SELECT * / count(*)
         ;; / OID inference; the actual per-outer-row binding is emitted
@@ -2501,6 +2531,9 @@
         ;; WITH ORDINALITY) AS sub.
         [db schema name alias]
         (cond
+          values-vt
+          [(:db values-vt) (:schema values-vt) (:name values-vt) (:alias values-vt)]
+
           (and db (instance? ParenthesedSelect from-item))
           (if-let [{sub-db :db sub-schema :schema
                     sub-name :name sub-alias :alias}
@@ -2698,6 +2731,19 @@
                   ;; from-item path always registered both, which is why
                   ;; `FROM (SELECT …) s JOIN t` worked and the same
                   ;; subquery on the right did not.
+                  (cond-> (assoc aliases sub-name sub-name)
+                    (and sub-alias (not= sub-alias sub-name))
+                    (assoc sub-alias sub-name))
+                  (conj derived {:join j :alias (or sub-alias sub-name)})
+                  lsrfs]
+                 [db schema aliases derived lsrfs])
+
+               (and db (instance? ParenthesedFromItem rt))
+               (if-let [{spec-db :db spec-schema :schema
+                         sub-name :name sub-alias :alias}
+                        (materialize-parenthesed-values!
+                         ^ParenthesedFromItem rt db schema)]
+                 [spec-db spec-schema
                   (cond-> (assoc aliases sub-name sub-name)
                     (and sub-alias (not= sub-alias sub-name))
                     (assoc sub-alias sub-name))
@@ -4879,6 +4925,7 @@
              ;; Pass enriched db when derived tables or derived-table-joins
              ;; created speculative data (FROM (…) AS sub or JOIN (…) AS sub).
              :enriched-db     (when (or (instance? ParenthesedSelect from-item)
+                                        values-vt
                                         ;; bare SRF in FROM materialised into
                                         ;; a virtual table (table-fn->virtual-table)
                                         (instance? net.sf.jsqlparser.statement.select.TableFunction from-item)

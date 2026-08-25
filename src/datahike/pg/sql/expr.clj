@@ -3653,7 +3653,10 @@
              (cond
                (number? inner) (- inner)
                w (list 'datahike.pg.sql/sql-int-neg w inner)
-               :else (list '* -1 inner)))
+               ;; Route through numeric-special-aware multiplication so
+               ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
+               ;; multiplication casts the carrier record to Number.
+               :else (list 'datahike.pg.sql/sql-* -1 inner)))
         ;; `~` — bitwise NOT, over integers and bit strings alike.
         ;; Previously fell through to the identity branch below, so
         ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,

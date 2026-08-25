@@ -1816,16 +1816,40 @@
          truncated (.setScale (bigdec x) scale java.math.RoundingMode/DOWN)]
      (if (neg? scale) (.setScale truncated 0) truncated))))
 
+(defn- aligned-numeric-integers [a b]
+  (let [^java.math.BigDecimal x (bigdec a)
+        ^java.math.BigDecimal y (bigdec b)
+        scale (max (.scale x) (.scale y))]
+    [(.unscaledValue (.setScale x scale))
+     (.unscaledValue (.setScale y scale))
+     scale]))
+
 (defn- sql-gcd [a b]
-  (.gcd (biginteger a) (biginteger b)))
+  (cond
+    (or (numspecial? a) (numspecial? b)) types/nan-numeric
+    (or (decimal? a) (decimal? b))
+    (let [[^java.math.BigInteger x ^java.math.BigInteger y scale]
+          (aligned-numeric-integers a b)]
+      (java.math.BigDecimal. (.gcd x y) (int scale)))
+    :else (.gcd (biginteger a) (biginteger b))))
 
 (defn- sql-lcm
   "SQL LCM. lcm(0, x) = 0 (PG defines it so, no error)."
   [a b]
-  (let [x (biginteger a) y (biginteger b)]
-    (if (or (zero? a) (zero? b))
-      (biginteger 0)
-      (.abs (.divide (.multiply x y) (.gcd x y))))))
+  (cond
+    (or (numspecial? a) (numspecial? b)) types/nan-numeric
+    (or (decimal? a) (decimal? b))
+    (let [[^java.math.BigInteger x ^java.math.BigInteger y scale]
+          (aligned-numeric-integers a b)
+          value (if (or (zero? (.signum x)) (zero? (.signum y)))
+                  java.math.BigInteger/ZERO
+                  (.abs (.divide (.multiply x y) (.gcd x y))))]
+      (ensure-numeric-range (java.math.BigDecimal. value (int scale))))
+    :else
+    (let [x (biginteger a) y (biginteger b)]
+      (if (or (zero? a) (zero? b))
+        (biginteger 0)
+        (.abs (.divide (.multiply x y) (.gcd x y)))))))
 
 (defn- throw-width-bucket [detail]
   (throw (errors/pg-error :invalid-argument-for-width-bucket {:message detail})))
