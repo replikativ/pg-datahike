@@ -123,6 +123,7 @@
 ;; Forward declarations — mutually recursive statement translators.
 
 (declare translate-select
+         translate-select*
          translate-insert
          translate-update
          translate-delete
@@ -2289,6 +2290,36 @@
             target-name (str "__values__" (or alias "anon"))]
         (materialize-set-op! inner target-name db schema alias aliases)))))
 
+(defn- unwrap-derived-parentheses
+  "Normalize redundant FROM parentheses around a derived SELECT.
+
+   JSqlParser represents `FROM ((SELECT ...)) alias` as a
+   ParenthesedFromItem around a ParenthesedSelect, while the ordinary derived
+   path consumes ParenthesedSelect directly. Parenthesized join groups are
+   intentionally left alone; only wrappers with no internal joins and an
+   eventual derived SELECT are transparent. The outer alias belongs to the
+   resulting derived relation and is transferred to it."
+  [item]
+  (let [original item]
+    (loop [current item outer-alias nil]
+      (if (and (instance? ParenthesedFromItem current)
+               (empty? (.getJoins ^ParenthesedFromItem current)))
+        (let [^ParenthesedFromItem pfi current
+              alias (or outer-alias (.getAlias pfi))]
+          (recur (.getFromItem pfi) alias))
+        (if (instance? ParenthesedSelect current)
+          (do (when outer-alias
+                (.setAlias ^ParenthesedSelect current outer-alias))
+              current)
+          original)))))
+
+(def ^:dynamic *anonymous-derived-counter*
+  "Query-tree-local counter used to give unaliased derived relations distinct,
+   deterministic storage namespaces. Nested translate-select calls inherit the
+   same atom so an inner anonymous relation cannot collide with one owned by an
+   outer SELECT."
+  nil)
+
 (def ^:dynamic *cte-namespaces*
   "`{cte-name -> synthetic-namespace}` for the WITH items in scope.
 
@@ -2665,10 +2696,29 @@
     case-var))
 
 (defn translate-select
+  "Translate a SELECT while sharing anonymous relation identities across its
+   complete nested query tree."
+  [^PlainSelect select schema & [db]]
+  (binding [*anonymous-derived-counter*
+            (or *anonymous-derived-counter* (atom -1))]
+    (translate-select* select schema db)))
+
+(defn translate-select*
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
   [^PlainSelect select schema & [db]]
-  (let [expand-view
+  (let [name-anonymous-derived
+        (fn [item]
+          (when (and (instance? ParenthesedSelect item)
+                     (nil? (.getAlias ^ParenthesedSelect item)))
+            ;; PostgreSQL 17 permits a derived relation without an explicit
+            ;; alias. Give each occurrence a stable query-local identity so
+            ;; two anonymous subqueries do not both materialize into
+            ;; `__sub__anon` and merge their rows/columns.
+            (.setAlias ^ParenthesedSelect item
+                       (Alias. (str "__anon_" (swap! *anonymous-derived-counter* inc)))))
+          item)
+        expand-view
         (fn [item]
           (if (and db (instance? Table item))
             (let [^Table table item
@@ -2691,7 +2741,10 @@
                 item))
             item))
         ;; FROM clause — may be a Table, view, or derived table (subquery)
-        from-item (expand-view (.getFromItem select))
+        from-item (-> (.getFromItem select)
+                      unwrap-derived-parentheses
+                      expand-view
+                      name-anonymous-derived)
         ;; `FROM <sequence>` reads the sequence's position — nil for
         ;; every ordinary table, so this only costs a lookup when the
         ;; FROM item is a bare relation name (issue #26).
@@ -2817,7 +2870,12 @@
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
-           (let [rt (expand-view (.getRightItem j))]
+           (let [raw-rt (.getRightItem j)
+                 rt (-> raw-rt
+                        unwrap-derived-parentheses
+                        expand-view
+                        name-anonymous-derived)
+                 _ (when-not (identical? raw-rt rt) (.setRightItem j rt))]
              (cond
                ;; A correlated SRF is ALWAYS in a join/comma position —
                ;; it has to have an outer row to correlate WITH — so this

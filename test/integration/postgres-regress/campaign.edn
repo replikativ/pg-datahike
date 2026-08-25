@@ -301,7 +301,16 @@
     {:name "case" :mode :discovery
      :boundaries #{:expressions}
      :blockers #{:create-function :enum-ddl :transaction-cascade}}
-    {:name "subselect" :mode :unmeasured :boundaries #{:relational}}
+    {:name "subselect" :mode :discovery
+     :boundaries #{:relational :name-resolution}
+     :blockers #{:subquery-datalog-shapes :correlated-subqueries
+                 :any-all-subqueries :set-returning-functions
+                 :parser-grammar :unsupported-ddl :lateral-outer-join}
+     :strict-slices
+     [{:id :redundant-derived-parentheses
+       :source-lines [13 16]
+       :gate "test/datahike/test/pg_derived_join_test.clj"
+       :test-var "redundant-parentheses-around-derived-relations"}]}
     {:name "union" :mode :discovery
      :boundaries #{:relational :common-types}
      :blockers #{:values-cte :planner-explain :advanced-types :create-function}}
