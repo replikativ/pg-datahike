@@ -210,7 +210,12 @@
      :blockers #{:create-function :fixture-dependencies}}
     {:name "explain" :mode :discovery
      :boundaries #{:utility-grammar :errors}
-     :blockers #{:postgres-planner-output :helper-functions}}]}
+     :blockers #{:postgres-planner-output :helper-functions}
+     :strict-slices
+     [{:id :costs-off-literal-select
+       :source-lines [64 64]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-explain-costs-off-slice"}]}]}
 
   {:id 2
    :name "application DDL, DML, and relational SQL"

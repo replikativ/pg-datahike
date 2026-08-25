@@ -128,6 +128,18 @@
                          (rows c "EXPLAIN (ANALYZE TRUE) SELECT * FROM emp")))]
       (is (= "0A000" (.getSQLState ^SQLException e))))))
 
+(deftest postgres-explain-costs-off-slice
+  ;; PostgreSQL 17 src/test/regress/sql/explain.sql:64. Keep the literal-only
+  ;; form from issue #93: JSqlParser rejects PostgreSQL's parenthesized EXPLAIN
+  ;; options unless the compatibility prefix is stripped before AST parsing.
+  (with-open [c (jdbc)
+              st (.createStatement c)
+              rs (.executeQuery st "EXPLAIN (COSTS OFF) SELECT 42")]
+    (is (= "QUERY PLAN" (.. rs getMetaData (getColumnLabel 1))))
+    (is (.next rs))
+    (is (re-find #"^Datahike Query " (.getString rs 1)))
+    (is (false? (.next rs)))))
+
 (deftest values-cte-materializes-declared-columns
   ;; PostgreSQL's scalar regression tests use this shape heavily for
   ;; tables of bit patterns. Values is a Select body in JSqlParser, but it
