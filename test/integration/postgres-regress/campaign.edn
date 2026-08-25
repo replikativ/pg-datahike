@@ -247,7 +247,16 @@
        :source-lines [4 29]
        :gate "test/datahike/test/pg_insert_regress_test.clj"
        :test-var "postgres-insert-default-and-row-width-slice"}]}
-    {:name "insert_conflict" :mode :unmeasured :boundaries #{:dml :constraints}}
+    {:name "insert_conflict" :mode :discovery
+     :boundaries #{:dml :constraints :unique-index-inference}
+     :blockers #{:expression-indexes :partial-indexes :operator-classes
+                 :collations :exclusion-constraints :views :partitioning
+                 :system-columns :explain-dml}
+     :strict-slices
+     [{:id :self-conflict-command-cardinality
+       :source-lines [436 464]
+       :gate "test/datahike/test/pg_on_conflict_params_test.clj"
+       :test-var "self-conflicts-follow-postgres-command-cardinality"}]}
     {:name "update" :mode :discovery
      :boundaries #{:dml :update-from :row-assignment}
      :blockers #{:row-subquery-assignment :partitioning :triggers :views

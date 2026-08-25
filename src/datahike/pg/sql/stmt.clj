@@ -6689,7 +6689,28 @@
                         {:error :feature-not-supported :sqlstate "0A000"})))
       (cond
         (seq idx-cols)
-        (mapv #(keyword ns (unquote-ident %)) idx-cols)
+        (let [attrs (vec (distinct (map #(keyword ns (unquote-ident %)) idx-cols)))
+              _ (doseq [attr attrs]
+                  (when-not (get schema attr)
+                    (throw (ex-info (str "column \"" (name attr) "\" does not exist")
+                                    {:error :undefined-column
+                                     :sqlstate "42703"
+                                     :column (name attr)}))))
+              unique-colsets
+              (into #{}
+                    (keep (fn [[attr m]]
+                            (when (and (keyword? attr)
+                                       (= table-name (namespace attr))
+                                       (some? (:db/unique m)))
+                              (if (= :db.type/tuple (:db/valueType m))
+                                (set (:db/tupleAttrs m))
+                                #{attr}))))
+                    schema)]
+          (when-not (contains? unique-colsets (set attrs))
+            (throw (ex-info
+                    "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+                    {:error :invalid-column-reference :sqlstate "42P10"})))
+          attrs)
 
         cname
         (or (constraint-name->conflict-cols cname table-name ns schema db)
@@ -6698,6 +6719,51 @@
                             {:error :undefined-object :sqlstate "42704"})))
 
         :else nil))))
+
+(defn- conflict-update-assignments
+  "Validate and flatten ON CONFLICT DO UPDATE's SET list.
+
+   Simple tuple assignment is represented by parallel column/value lists and
+   can be lowered pairwise. A row-subquery has multiple targets but one value
+   expression; reject that explicitly instead of applying only its first pair."
+  [^net.sf.jsqlparser.statement.insert.InsertConflictAction conflict-action
+   table-name ns schema]
+  (mapv
+   identity
+   (mapcat
+    (fn [^UpdateSet us]
+      (let [cols (vec (.getColumns us))
+            values (vec (.getValues us))]
+        (when-not (= (count cols) (count values))
+          (throw (ex-info "multi-column ON CONFLICT update from a row expression is not supported"
+                          {:error :feature-not-supported :sqlstate "0A000"})))
+        (map (fn [^Column col value-expr]
+               (when-let [^Table qualifier (.getTable col)]
+                 (throw (ex-info
+                         (str "column \"" (unquote-ident (.getName qualifier))
+                              "\" of relation \"" table-name "\" does not exist")
+                         {:error :undefined-column
+                          :sqlstate "42703"
+                          :hint "SET target columns cannot be qualified with the relation name."})))
+               (let [col-name (unquote-ident (.getColumnName col))
+                     attr (keyword ns col-name)]
+                 (when-not (get schema attr)
+                   (throw (ex-info (str "column \"" col-name "\" does not exist")
+                                   {:error :undefined-column
+                                    :sqlstate "42703"
+                                    :column col-name})))
+                 (doseq [^Column ref (params/ast-columns value-expr)
+                         :let [qualifier (some-> ref .getTable .getName unquote-ident)
+                               ref-name (unquote-ident (.getColumnName ref))]
+                         :when (and (= "excluded" (some-> qualifier str/lower-case))
+                                    (not (get schema (keyword ns ref-name))))]
+                   (throw (ex-info (str "column excluded." ref-name " does not exist")
+                                   {:error :undefined-column
+                                    :sqlstate "42703"
+                                    :column ref-name})))
+                 {:attr attr :col-name col-name :value-expr value-expr}))
+             cols values)))
+    (.getUpdateSets conflict-action))))
 
 (defn- canonical-relation
   "Resolve a folded table name back to the name it is STORED under, and
@@ -6782,7 +6848,30 @@
         ^net.sf.jsqlparser.statement.insert.InsertConflictAction
         conflict-action (.getConflictAction insert)
         ^net.sf.jsqlparser.statement.insert.InsertConflictTarget
-        conflict-target (.getConflictTarget insert)]
+        conflict-target (.getConflictTarget insert)
+        target-alias (some-> ^Table table .getAlias .getName unquote-ident)
+        _ (when conflict-action
+            (reject-hidden-target-name! conflict-action raw-table target-alias))
+        _ (when (some (fn [^Column col]
+                        (= "excluded"
+                           (some-> col .getTable .getName unquote-ident str/lower-case)))
+                      (params/ast-columns (.getReturningClause insert)))
+            (throw (ex-info
+                    "invalid reference to FROM-clause entry for table \"excluded\""
+                    {:error :undefined-table
+                     :sqlstate "42P01"
+                     :table "excluded"
+                     :detail (str "There is an entry for table \"excluded\", but it cannot "
+                                  "be referenced from this part of the query.")})))
+        _ (when (and conflict-action
+                     (= (.getConflictActionType conflict-action)
+                        net.sf.jsqlparser.statement.insert.ConflictActionType/DO_UPDATE)
+                     (nil? conflict-target))
+            (throw (ex-info
+                    "ON CONFLICT DO UPDATE requires inference specification or constraint name"
+                    {:error :syntax-error
+                     :sqlstate "42601"
+                     :hint "For example, ON CONFLICT (column_name)."})))]
     (cond
       ;; Handle DEFAULT VALUES — insert with no explicit column values
       (.isOnlyDefaultValues ^Insert insert)
@@ -6943,11 +7032,7 @@
                 update-where (.getWhereExpression conflict-action)
                 update-assignments
                 (when-not do-nothing?
-                  (mapv (fn [^net.sf.jsqlparser.statement.update.UpdateSet us]
-                          {:attr (keyword ns (unquote-ident
-                                              (.getColumnName ^Column (first (.getColumns us)))))
-                           :value-expr (first (.getValues us))})
-                        (.getUpdateSets conflict-action)))]
+                  (conflict-update-assignments conflict-action table-name ns schema))]
             (cond-> {:type :insert
                      :row-refs row-refs
                      :affected-count affected
@@ -7135,12 +7220,7 @@
                 ;; Parse DO UPDATE SET assignments
                     update-assignments
                     (when-not do-nothing?
-                      (mapv (fn [^net.sf.jsqlparser.statement.update.UpdateSet us]
-                              (let [col-name (unquote-ident (.getColumnName ^Column (first (.getColumns us))))
-                                    attr (keyword ns col-name)
-                                    value-expr (first (.getValues us))]
-                                {:attr attr :col-name col-name :value-expr value-expr}))
-                            (.getUpdateSets conflict-action)))
+                      (conflict-update-assignments conflict-action table-name ns schema))
                 ;; DO UPDATE SET may itself carry placeholders
                 ;; (`SET title = $2`, `SET n = n + $3`). Those live in the
                 ;; JSqlParser value-expr, which eval-update-expr only
@@ -7239,7 +7319,31 @@
                                                                        0)
                                                           increment 1]
                                                     :when seq-eid]
-                                                [col {:eid seq-eid :val curr-val :inc increment}])))]
+                                                [col {:eid seq-eid :val curr-val :inc increment}])))
+                             ;; PostgreSQL arbitrates all proposed rows as one
+                             ;; command.  The txdb is the pre-command snapshot,
+                             ;; so it cannot reveal a duplicate emitted earlier
+                             ;; by this same tx-fn; retain those arbiter keys
+                             ;; explicitly. DO NOTHING keeps the first row,
+                             ;; while DO UPDATE must raise cardinality_violation
+                             ;; instead of updating/upserting the same row twice.
+                             seen-arbiters (atom {})
+                             seen-existing-rows (atom #{})
+                             ;; Targetless ON CONFLICT means every unique
+                             ;; constraint, not equality across every inserted
+                             ;; column.  Build its scalar/tuple arbiter column
+                             ;; sets from the Datahike schema.
+                             targetless-arbiters
+                             (when-not conflict-cols
+                               (into []
+                                     (keep (fn [[attr m]]
+                                             (when (and (keyword? attr)
+                                                        (= table-name (namespace attr))
+                                                        (some? (:db/unique m)))
+                                               (if (= :db.type/tuple (:db/valueType m))
+                                                 (vec (:db/tupleAttrs m))
+                                                 [attr]))))
+                                     (:schema txdb)))]
                          (vec (mapcat
                                (fn [attrs]
                          ;; Build multi-column conflict query:
@@ -7248,22 +7352,44 @@
                          ;; PG checks all unique constraints — fall back to all
                          ;; inserted attribute keys (the natural-key case for m2m
                          ;; relation tables).
-                                 (let [effective-cols (or conflict-cols (vec (keys attrs)))
-                                       conflict-pairs (mapv (fn [col] [col (get attrs col)]) effective-cols)
-                                       all-vals-present? (and (seq conflict-pairs)
-                                                              (every? (fn [[_ v]] (some? v)) conflict-pairs))
-                                       existing (when all-vals-present?
-                                                  (ffirst
-                                                   (q-fn
-                                                    {:find '[?e]
-                                                     :where (mapv (fn [[col val]] ['?e col val])
-                                                                  conflict-pairs)}
-                                                    txdb)))]
-                                   (if existing
-                                     (do
-                               ;; Record existing eid at row position (DO UPDATE)
-                                       (swap! row-refs conj existing)
-                                       (if (or do-nothing?
+                                 (let [arbiter-cols (if conflict-cols
+                                                      [conflict-cols]
+                                                      targetless-arbiters)
+                                       candidate-pairs
+                                       (mapv (fn [cols]
+                                               (mapv (fn [col] [col (get attrs col)]) cols))
+                                             arbiter-cols)
+                                       conflict-pair-sets
+                                       (filterv (fn [pairs]
+                                                  (and (seq pairs)
+                                                       (every? (fn [[_ v]] (some? v)) pairs)))
+                                                candidate-pairs)
+                                       arbiter-keys conflict-pair-sets
+                                       existing (some (fn [pairs]
+                                                        (ffirst
+                                                         (q-fn
+                                                          {:find '[?e]
+                                                           :where (mapv
+                                                                   (fn [[col val]] ['?e col val])
+                                                                   pairs)}
+                                                          txdb)))
+                                                      conflict-pair-sets)
+                                       prior (or (some #(get @seen-arbiters %) arbiter-keys)
+                                                 (when (contains? @seen-existing-rows existing)
+                                                   existing))]
+                                   (cond
+                                     prior
+                                     (if do-nothing?
+                                       []
+                                       (throw (ex-info
+                                               "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                                               {:error :cardinality-violation
+                                                :sqlstate "21000"
+                                                :hint (str "Ensure that no rows proposed for insertion within "
+                                                           "the same command have duplicate constrained values.")})))
+
+                                     existing
+                                     (if (or do-nothing?
                                        ;; DO UPDATE … WHERE cond — the
                                        ;; conflicting row is left alone
                                        ;; when the condition isn't TRUE.
@@ -7272,60 +7398,73 @@
                                        ;; the same map the SET
                                        ;; expressions see. UNKNOWN counts
                                        ;; as not-true, per WHERE.
-                                               (and update-where
-                                                    (let [old-map (into {} (map (fn [^Datom d]
-                                                                                  [(.-a d) (.-v d)]))
-                                                                        (d/datoms txdb :eavt existing))
-                                                          excluded-map (into {} (map (fn [[k v]]
-                                                                                       [(keyword "excluded" (name k)) v]))
-                                                                             attrs)]
-                                                      (binding [params/*bound-params*
-                                                                (or set-params params/*bound-params*)]
-                                                        (not (true? (eval-check-predicate
-                                                                     update-where
-                                                                     (merge old-map excluded-map)
-                                                                     ns schema)))))))
-                                         [] ;; DO NOTHING / condition not met
+                                             (and update-where
+                                                  (let [old-map (into {} (map (fn [^Datom d]
+                                                                                [(.-a d) (.-v d)]))
+                                                                      (d/datoms txdb :eavt existing))
+                                                        excluded-map (into {} (map (fn [[k v]]
+                                                                                     [(keyword "excluded" (name k)) v]))
+                                                                           attrs)]
+                                                    (binding [params/*bound-params*
+                                                              (or set-params params/*bound-params*)]
+                                                      (not (true? (eval-check-predicate
+                                                                   update-where
+                                                                   (merge old-map excluded-map)
+                                                                   ns schema)))))))
+                                       [] ;; DO NOTHING / condition not met
                                  ;; DO UPDATE SET
-                                         (do
-                                           (swap! affected inc)
-                                           (vec (keep
-                                                 (fn [{:keys [attr col-name value-expr]}]
-                                                   (let [;; Evaluate the update expression
-                                                         new-val
-                                                         (cond
+                                       (do
+                                         (doseq [arbiter-key arbiter-keys]
+                                           (swap! seen-arbiters assoc arbiter-key existing))
+                                         (swap! seen-existing-rows conj existing)
+                                         (swap! row-refs conj existing)
+                                         (swap! affected inc)
+                                         (vec (keep
+                                               (fn [{:keys [attr col-name value-expr]}]
+                                                 (let [old-val (ffirst
+                                                                (q-fn
+                                                                 {:find '[?v]
+                                                                  :in '[$ ?e ?a]
+                                                                  :where [['?e '?a '?v]]}
+                                                                 txdb existing attr))
+                                                         ;; Evaluate the update expression
+                                                       new-val
+                                                       (cond
                                                 ;; Simple: EXCLUDED.col → use new value
-                                                           (and (instance? net.sf.jsqlparser.schema.Column value-expr)
-                                                                (when-let [t (.getTable ^net.sf.jsqlparser.schema.Column value-expr)]
-                                                                  (= "EXCLUDED" (.toUpperCase (.getName ^Table t)))))
-                                                           (get attrs attr)
+                                                         (and (instance? net.sf.jsqlparser.schema.Column value-expr)
+                                                              (when-let [t (.getTable ^net.sf.jsqlparser.schema.Column value-expr)]
+                                                                (= "EXCLUDED" (.toUpperCase (.getName ^Table t)))))
+                                                         (get attrs attr)
 
                                                 ;; Expression: e.g. v + EXCLUDED.v
                                                 ;; Evaluate using server's eval-update-expr
-                                                           :else
-                                                           (let [;; Build entity map with current values + EXCLUDED values
-                                                                 old-datoms (d/datoms txdb :eavt existing)
-                                                                 old-map (into {} (map (fn [^Datom d]
-                                                                                         [(.-a d) (.-v d)])
-                                                                                       old-datoms))
+                                                         :else
+                                                         (let [;; Build entity map with current values + EXCLUDED values
+                                                               old-datoms (d/datoms txdb :eavt existing)
+                                                               old-map (into {} (map (fn [^Datom d]
+                                                                                       [(.-a d) (.-v d)])
+                                                                                     old-datoms))
                                                       ;; EXCLUDED.col → use attrs from the INSERT values
-                                                                 excluded-map (into {} (map (fn [[k v]]
-                                                                                              [(keyword "excluded" (name k)) v])
-                                                                                            attrs))
-                                                                 combined (merge old-map excluded-map)]
+                                                               excluded-map (into {} (map (fn [[k v]]
+                                                                                            [(keyword "excluded" (name k)) v])
+                                                                                          attrs))
+                                                               combined (merge old-map excluded-map)]
                                                   ;; set-params (0-based, ParamRefs already
                                                   ;; substituted by the wire layer) lets
                                                   ;; eval-update-expr resolve `$N` operands
                                                   ;; inline — same idiom the UPDATE path uses.
-                                                             (binding [params/*bound-params*
-                                                                       (or set-params params/*bound-params*)]
-                                                               (eval-update-expr
-                                                                value-expr combined ns schema))))]
-                                                     (when (some? new-val)
-                                                       [:db/add existing attr
-                                                        (or (coerce-insert-value new-val attr schema) new-val)])))
-                                                 update-assignments)))))
+                                                           (binding [params/*bound-params*
+                                                                     (or set-params params/*bound-params*)]
+                                                             (eval-update-expr
+                                                              value-expr combined ns schema))))]
+                                                   (if (nil? new-val)
+                                                     (when (some? old-val)
+                                                       [:db/retract existing attr old-val])
+                                                     [:db/add existing attr
+                                                      (or (coerce-insert-value new-val attr schema) new-val)])))
+                                               update-assignments))))
                              ;; No conflict — normal insert with identity population
+                                     :else
                                      (let [tempid (str (gensym "upsert-"))
                                    ;; Auto-populate identity columns
                                            populated (reduce
@@ -7345,6 +7484,8 @@
                                                               (when eid [:db/add eid :__seq__/value val]))))
                                                         identity-cols)]
                                        ;; Record new tempid at row position
+                                       (doseq [arbiter-key arbiter-keys]
+                                         (swap! seen-arbiters assoc arbiter-key tempid))
                                        (swap! row-refs conj tempid)
                                        (swap! affected inc)
                                        (let [clean-populated

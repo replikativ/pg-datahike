@@ -87,6 +87,62 @@
           (recur (conj acc (mapv #(.getObject rs (int %)) (range 1 (inc n)))))
           acc)))))
 
+(deftest self-conflicts-follow-postgres-command-cardinality
+  (with-open [c (open)]
+    (ddl! c "CREATE TABLE selfconflict (id INT PRIMARY KEY, v INT)")
+    (testing "DO NOTHING retains the first proposed row"
+      (ddl! c (str "INSERT INTO selfconflict VALUES (1,1),(1,2) "
+                   "ON CONFLICT (id) DO NOTHING"))
+      (is (= [[1 1]] (rows c "SELECT * FROM selfconflict"))))
+    (testing "DO UPDATE cannot affect one arbiter row twice"
+      (let [e (try
+                (ddl! c (str "INSERT INTO selfconflict VALUES (2,1),(2,2) "
+                             "ON CONFLICT (id) DO UPDATE SET v=EXCLUDED.v"))
+                nil
+                (catch java.sql.SQLException e e))]
+        (is (some? e))
+        (is (= "21000" (.getSQLState ^java.sql.SQLException e)))
+        (is (re-find #"cannot affect row a second time"
+                     (.getMessage ^java.sql.SQLException e))))
+      (is (= [[1 1]] (rows c "SELECT * FROM selfconflict"))
+          "the failing multi-row statement is atomic"))))
+
+(deftest conflict-target-must-name-a-real-unique-constraint
+  (with-open [c (open)]
+    (ddl! c "CREATE TABLE arbiter (id INT PRIMARY KEY, code TEXT, n INT, UNIQUE (code,n))")
+    (doseq [[sql state]
+            [[(str "INSERT INTO arbiter VALUES (1,'a',1) "
+                   "ON CONFLICT DO UPDATE SET n=EXCLUDED.n") "42601"]
+             [(str "INSERT INTO arbiter VALUES (1,'a',1) "
+                   "ON CONFLICT (code) DO UPDATE SET n=EXCLUDED.n") "42P10"]
+             [(str "INSERT INTO arbiter VALUES (1,'a',1) "
+                   "ON CONFLICT (missing) DO UPDATE SET n=EXCLUDED.n") "42703"]]]
+      (let [e (try (ddl! c sql) nil (catch java.sql.SQLException e e))]
+        (is (some? e))
+        (is (= state (.getSQLState ^java.sql.SQLException e)))))
+    (ddl! c (str "INSERT INTO arbiter VALUES (1,'a',1) "
+                 "ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n"))
+    (ddl! c (str "INSERT INTO arbiter VALUES (2,'a',1) "
+                 "ON CONFLICT (n,code,code) DO UPDATE SET id=EXCLUDED.id"))
+    (ddl! c (str "INSERT INTO arbiter VALUES (2,'b',NULL) "
+                 "ON CONFLICT (id) DO UPDATE "
+                 "SET (code,n)=(EXCLUDED.code,EXCLUDED.n)"))
+    (is (= [[2 "b" nil]] (rows c "SELECT * FROM arbiter")))
+    (doseq [sql [(str "INSERT INTO arbiter VALUES (2,'x',2) ON CONFLICT (id) "
+                      "DO UPDATE SET arbiter.code='x'")
+                 (str "INSERT INTO arbiter VALUES (2,'x',2) ON CONFLICT (id) "
+                      "DO UPDATE SET code=EXCLUDED.missing")]]
+      (let [e (try (ddl! c sql) nil (catch java.sql.SQLException e e))]
+        (is (some? e))
+        (is (= "42703" (.getSQLState ^java.sql.SQLException e)))))
+    (doseq [sql [(str "INSERT INTO arbiter AS a VALUES (2,'x',2) ON CONFLICT (id) "
+                      "DO UPDATE SET code=arbiter.code")
+                 (str "INSERT INTO arbiter VALUES (2,'x',2) ON CONFLICT (id) "
+                      "DO UPDATE SET code=EXCLUDED.code RETURNING EXCLUDED.code")]]
+      (let [e (try (ddl! c sql) nil (catch java.sql.SQLException e e))]
+        (is (some? e))
+        (is (= "42P01" (.getSQLState ^java.sql.SQLException e)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; DO UPDATE / DO NOTHING with parameters in VALUES
 
@@ -121,7 +177,7 @@
 (deftest param-on-conflict-without-target
   (testing "ON CONFLICT DO NOTHING with no conflict target (all-columns check)"
     (with-open [c (open)]
-      (ddl! c "CREATE TABLE tag (a BIGINT, b TEXT)")
+      (ddl! c "CREATE TABLE tag (a BIGINT, b TEXT, UNIQUE (a,b))")
       (with-open [ps (.prepareStatement
                       c "INSERT INTO tag (a, b) VALUES (?, ?) ON CONFLICT DO NOTHING")]
         (.setLong ps 1 1) (.setString ps 2 "x") (.executeUpdate ps)
