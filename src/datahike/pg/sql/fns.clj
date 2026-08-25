@@ -40,6 +40,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.numeric-format :as numfmt]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types]
@@ -392,6 +393,12 @@
    (never NULL — COUNT of empty is 0)."
   [coll]
   (count (remove #(or (nil? %) (= :__null__ %)) coll)))
+
+(defn filter-bool-and
+  "BOOL_AND/EVERY over non-NULL inputs; an empty/all-NULL group is NULL."
+  [coll]
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
+    (if (empty? vs) :__null__ (every? true? vs))))
 
 (def filtered-out
   "Marker for a row an aggregate FILTER excluded.
@@ -2509,6 +2516,8 @@
    spec (PG: 'count(expression) returns the number of non-null input
    rows')."
   {"count"          'datahike.pg.sql/filter-count
+   "bool_and"       'datahike.pg.sql/filter-bool-and
+   "every"          'datahike.pg.sql/filter-bool-and
    "sum"            'datahike.pg.sql/filter-sum
    "avg"            'datahike.pg.sql/filter-avg
    "min"            'datahike.pg.sql/filter-min
@@ -3194,6 +3203,26 @@
                    (java.math.BigDecimal. acc)
                    (recur (inc i) (.multiply acc (java.math.BigInteger/valueOf i))))))))))
 
+(def ^:private max-pg-lsn
+  (java.math.BigInteger. "18446744073709551615"))
+
+(defn sql-pg-lsn
+  "Convert NUMERIC to PostgreSQL's unsigned 64-bit WAL address type."
+  [x]
+  (when (types/numeric-special? x)
+    (throw (errors/pg-error
+            :feature-not-supported
+            {:message (if (= :nan (:kind x))
+                        "cannot convert NaN to pg_lsn"
+                        "cannot convert infinity to pg_lsn")})))
+  (let [^java.math.BigDecimal n (coerce/coerce-numeric x :bigdec)
+        value (.toBigInteger (.setScale n 0 java.math.RoundingMode/HALF_UP))]
+    (when (or (neg? (.signum value))
+              (pos? (.compareTo value max-pg-lsn)))
+      (throw (errors/pg-error :invalid-parameter-value
+                              {:message "pg_lsn out of range"})))
+    (types/pg-lsn value)))
+
 (def sql-scale
   "scale(numeric) — the declared display scale."
   (null-safe (fn [v] (long (.scale (bigdec v))))))
@@ -3322,8 +3351,13 @@
           (sql-cast/cast-to-bit (str value) (str type-name) false))
         [nil nil nil nil]
         (catch Throwable e
-          (let [[code msg fields] (errors/classify-exception e)]
-            [msg (when fields (.get ^java.util.Map fields "D")) nil code])))
+          (let [[code msg fields] (errors/classify-exception e)
+                detail (when fields (.get ^java.util.Map fields "D"))]
+            ;; Several typinput categories carry their primary diagnostic in
+            ;; :detail so the category formatter can use it as the ERROR.
+            ;; pg_input_error_info must not repeat that identical string in
+            ;; its separate DETAIL column.
+            [msg (when (not= msg detail) detail) nil code])))
       (if (pg-input-valid? value type-name)
         [nil nil nil nil]
         [message nil nil sqlstate]))))
@@ -3359,6 +3393,8 @@
                        :strict? true :return-oid types/oid-bit}
    "bit_count"        {:impl pg-bits/bit-count :arities #{1}
                        :strict? true :return-oid types/oid-int8}
+   "pg_lsn"           {:impl sql-pg-lsn :arities #{1}
+                       :strict? true :return-oid types/oid-pg-lsn}
    "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}
@@ -3459,6 +3495,8 @@
    ;; numeric.sql. Reuse the numeric operator so range and special values
    ;; follow the same path as `x + 1`.
    "numeric_inc" (fn [x] (sql-+ x java.math.BigDecimal/ONE))
+   "to_char" numfmt/to-char
+   "to_number" numfmt/to-number
    "lcm"      sql-lcm
    "width_bucket" sql-width-bucket
    "pi"       (fn [] Math/PI)
@@ -3626,6 +3664,7 @@
    "round"    #{1 2}     ; round(x); round(x, decimals)
    "trunc"    #{1 2}
    "power"    #{2} "pow" #{2} "atan2" #{2} "mod" #{2} "gcd" #{2} "lcm" #{2}
+   "to_char" #{2} "to_number" #{2}
    "sind" #{1} "cosd" #{1} "tand" #{1} "cotd" #{1}
    "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
    "erf" #{1} "erfc" #{1}

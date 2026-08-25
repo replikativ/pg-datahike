@@ -122,6 +122,18 @@
          (rows "SELECT * FROM generate_series(1, array_upper(current_schemas(false), 1) + 2)")))
   (is (= [["1"] ["2"]] (rows "SELECT * FROM generate_series(1,2)"))))
 
+(deftest star-expands-every-correlated-srf
+  ;; The numeric regression suite uses the first generated value as the
+  ;; lower bound of the second.  `SELECT i.*, j.*` already worked, while
+  ;; the unqualified star used to omit j because join-position SRFs were
+  ;; absent from the ordered relation list.
+  (is (= [["1" "1"] ["1" "2"] ["1" "3"]
+          ["2" "2"] ["2" "3"] ["3" "3"]]
+         (rows "SELECT *
+                  FROM generate_series(1::numeric,3::numeric) i,
+                       generate_series(i,3) j
+                 ORDER BY i,j"))))
+
 ;; ---------------------------------------------------------------------------
 ;; LATERAL SUBQUERIES — `JOIN LATERAL (SELECT …) s ON true`
 

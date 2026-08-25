@@ -18,7 +18,7 @@
      agg(x) FILTER (…) OVER (…)        the filter was ignored
      OVER w  (a WINDOW clause)         no partition, no order, no frame
      SELECT … FROM (SELECT … OVER …)   failed to run at all"
-  (:require [clojure.test :refer [deftest is use-fixtures testing]]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [java.sql Connection DriverManager]))
@@ -250,11 +250,11 @@
                          "SELECT id, s FROM r ORDER BY id"))))
     (is (= ["5"] (col c 1 "SELECT count(*) FROM (SELECT sum(v) OVER (ORDER BY id) FROM wp) t")))))
 
-(deftest unknown-window-function-raises
+(deftest bool-and-window-aggregate
   (with-open [c (jdbc)]
     (seed! c)
-    ;; Not silently NULL for every row.
-    (testing "an unimplemented window aggregate says so"
-      (is (thrown-with-msg?
-           org.postgresql.util.PSQLException #"(?i)not supported"
-           (col c 2 "SELECT id, bool_and(v > 5) OVER (ORDER BY id) FROM wp ORDER BY id"))))))
+    ;; bool_and was added for numeric.sql's Roman round-trip and composes
+    ;; with the generic aggregate-window path. PostgreSQL ignores the final
+    ;; NULL input, so every cumulative frame remains true.
+    (is (= ["t" "t" "t" "t" "t"]
+           (col c 2 "SELECT id, bool_and(v > 5) OVER (ORDER BY id) FROM wp ORDER BY id")))))

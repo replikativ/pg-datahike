@@ -49,6 +49,7 @@
 (def oid-bit      1560)
 (def oid-varbit   1562)
 (def oid-jsonb    3802)
+(def oid-pg-lsn   3220)
 
 ;; Array OIDs — every scalar type has a paired `T[]` OID. PG catalog
 ;; rows: `SELECT typname, oid, typelem FROM pg_type WHERE typelem <> 0`.
@@ -333,6 +334,7 @@
     "uuid"        oid-uuid
     "json"        oid-json
     "jsonb"       oid-jsonb
+    "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
     "tid"         oid-tid
     "char"        oid-char
@@ -429,6 +431,7 @@
    oid-uuid       "uuid"
    oid-json       "json"
    oid-jsonb      "jsonb"
+   oid-pg-lsn     "pg_lsn"
    oid-oid        "oid"
    oid-tid        "tid"}
 
@@ -580,6 +583,7 @@
    [oid-bit       "bit"       -1  "b"]
    [oid-varbit    "varbit"    -1  "b"]
    [oid-jsonb     "jsonb"     -1  "b"]
+   [oid-pg-lsn    "pg_lsn"     8  "b"]
    ;; Array types — one per scalar with a paired T[] OID. typtype="b"
    ;; like scalars; the typelem linkage is exposed via element-oid
    ;; lookups at query time (see datahike.pg.sql.catalog).
@@ -634,6 +638,7 @@
    oid-uuid      16
    oid-json      -1
    oid-jsonb     -1
+   oid-pg-lsn     8
    oid-oid        4
    ;; Array types are always variable-length on the wire.
    oid-bool-array        -1
@@ -681,7 +686,8 @@
    oid-date        :D  oid-time    :D  oid-timestamp :D  oid-timestamptz :D
    oid-interval    :T
    oid-bit         :V  oid-varbit  :V
-   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U})
+   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U
+   oid-pg-lsn      :U})
 
 (def preferred-oids
   "`typispreferred`. One per category among the types we carry: a
@@ -1049,6 +1055,17 @@
             :uuid    :uuid
             :text))))))
 
+(defrecord PgLsn [^java.math.BigInteger value]
+  Object
+  (toString [_]
+    (let [mask (java.math.BigInteger. "FFFFFFFF" 16)
+          hi (.shiftRight value 32)
+          lo (.and value mask)]
+      (format "%X/%08X" hi lo))))
+
+(defn pg-lsn? [x] (instance? PgLsn x))
+(defn pg-lsn [^java.math.BigInteger value] (->PgLsn value))
+
 (defrecord PgNumericSpecial [kind])
 
 (defn numeric-special
@@ -1169,6 +1186,7 @@
     ;; reported as text (25).
     (decimal? v)          oid-numeric
     (numeric-special? v)  oid-numeric
+    (pg-lsn? v)           oid-pg-lsn
     (boolean? v)          oid-bool
     (inst? v)             oid-timestamp
     ;; ::date / ::time cast results are java.time locals (issue #13);
@@ -1213,6 +1231,11 @@
       ;; `0.0 / -1` is `-0` there. `zero?` is true for both zeros, so the
       ;; sign has to come from the bit pattern.
       (zero? d)             (if (neg? (Double/doubleToRawLongBits d)) "-0" "0")
+      ;; Java and PostgreSQL both use shortest-round-trip output, but their
+      ;; boundary choice differs for the two least positive subnormals.
+      ;; PostgreSQL's Ryu formatter emits the familiar one-digit forms.
+      (and float4? (= (float v) Float/MIN_VALUE)) "1e-45"
+      (and (not float4?) (= d Double/MIN_VALUE)) "5e-324"
       :else
       (let [s (if float4? (Float/toString (float v)) (Double/toString d))
             minus? (str/starts-with? s "-")

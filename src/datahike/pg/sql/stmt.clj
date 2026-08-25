@@ -2811,7 +2811,7 @@
                  [(:db spec) (:schema spec)
                   (assoc aliases (:alias spec) (:name spec))
                   derived
-                  (conj lsrfs spec)])
+                  (conj lsrfs (assoc spec :join j))])
 
                ;; An UNCORRELATED set-returning function in join or comma
                ;; position -- `FROM t, generate_series(1, 3) g`. Its rows
@@ -2879,7 +2879,8 @@
                    [(:db spec) (:schema spec)
                     (assoc aliases (:alias spec) (:name spec))
                     derived
-                    (conj lsrfs (cond-> spec outer? (assoc :outer? true)))]))
+                    (conj lsrfs (cond-> (assoc spec :join j)
+                                  outer? (assoc :outer? true)))]))
 
                (and db (instance? ParenthesedSelect rt))
                (if-let [{spec-db :db spec-schema :schema
@@ -2975,12 +2976,17 @@
                           (instance? Table rt)
                           (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]
                             (when jn [(or ja jn) jn]))
-                          ;; A derived table or SRF in join position: its
-                          ;; alias is registered above; find it by looking
-                          ;; for the entry whose value is a synthetic ns.
+                          ;; A derived table or SRF in join position. Match
+                          ;; the spec to THIS join: choosing the first
+                          ;; derived item silently omitted later relations,
+                          ;; and correlated SRFs were not represented in
+                          ;; derived-joins at all.
                           :else
-                          (when-let [a (some (fn [{al :alias}] al) derived-joins)]
-                            (when-let [tn (get join-aliases a)] [a tn]))))))
+                          (when-let [{a :alias n :name}
+                                     (some (fn [spec]
+                                             (when (identical? j (:join spec)) spec))
+                                           (concat derived-joins lsrf-specs))]
+                            [a (or (get join-aliases a) n)])))))
               (or joins []))
 
         ;; Preserve FROM occurrences for unqualified column resolution.

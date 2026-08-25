@@ -119,13 +119,15 @@
    nil input. Empty / whitespace-only strings raise 22P02."
   [s]
   (when (some? s)
-    (let [t (.trim ^String s)]
+    (let [raw (str s)
+          t (.trim ^String raw)]
       (if (.isEmpty t)
-        (throw (pg-error "22P02" "invalid input syntax for numeric: \"\""))
+        (throw (pg-error "22P02"
+                         (str "invalid input syntax for type numeric: \"" raw "\"")))
         (try (BigDecimal. t)
              (catch NumberFormatException _
                (throw (pg-error "22P02"
-                                (str "invalid input syntax for numeric: \"" t \")))))))))
+                                (str "invalid input syntax for type numeric: \"" raw \")))))))))
 
 (def ^:private ^:const numeric-max-integer-digits 131072)
 
@@ -147,9 +149,10 @@
    integer radix."
   [s]
   (when (some? s)
-    (let [t (.trim ^String s)
+    (let [raw (str s)
+          t (.trim ^String raw)
           invalid! #(throw (pg-error "22P02"
-                                     (format "invalid input syntax for numeric: \"%s\"" t)))]
+                                     (format "invalid input syntax for type numeric: \"%s\"" raw)))]
       (check-numeric-input-range
        (if-let [[_ sign prefix digits]
                 (re-matches (re-pattern "(?i)^([+-]?)(0[box])(_?[0-9a-f](?:_?[0-9a-f])*)$") t)]

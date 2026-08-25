@@ -79,6 +79,7 @@
    "split_part"    types/oid-text
    "initcap"       types/oid-text
    "to_char"       types/oid-text
+   "to_number"     types/oid-numeric
    "md5"           types/oid-text
    "quote_ident"   types/oid-text
    "quote_literal" types/oid-text
@@ -247,6 +248,8 @@
      SUM(int8) silently overflows when the sum exceeds Long/MAX_VALUE."
   {"count"          types/oid-int8
    "count_distinct" types/oid-int8
+   "bool_and"       types/oid-bool
+   "every"          types/oid-bool
    "sum"            {types/oid-int2    types/oid-int8
                      types/oid-int4    types/oid-int8
                      types/oid-int8    types/oid-numeric

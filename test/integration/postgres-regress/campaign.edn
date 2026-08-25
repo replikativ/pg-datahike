@@ -56,8 +56,15 @@
        :test-var "bit-input-error-info"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
-     :blockers #{:numeric-formatting :numeric-series
-                 :postgres-internal-functions :pg-lsn}
+     ;; The remaining raw pg_regress diff is classified: row order in
+     ;; statements without ORDER BY, psql's server-source LINE/CONTEXT
+     ;; decoration, and spacing in one deliberately exotic picture made of
+     ;; interleaved quoted literals. None changes numeric values, SQLSTATEs,
+     ;; result OIDs, or ordinary application-facing pictures.
+     :blockers #{}
+     :accepted-differences #{:unordered-output-without-order-by
+                             :psql-source-location-presentation
+                             :exotic-quoted-picture-padding}
      :strict-slices
      [{:id :special-power-boundaries
        :source-lines [730 748]
@@ -142,7 +149,23 @@
       {:id :lateral-values-width-bucket-matrix
        :source-lines [945 965]
        :gate "test/datahike/test/pg_lateral_srf_test.clj"
-       :test-var "correlated-lateral-values"}]}
+       :test-var "correlated-lateral-values"}
+      {:id :numeric-format-pictures
+       :source-lines [967 1062]
+       :gate "test/datahike/test/pg_numeric_format_test.clj"
+       :test-var "numeric-picture-output"}
+      {:id :numeric-format-input
+       :source-lines [1064 1123]
+       :gate "test/datahike/test/pg_numeric_format_test.clj"
+       :test-var "numeric-picture-input"}
+      {:id :correlated-numeric-series-star
+       :source-lines [1370 1380]
+       :gate "test/datahike/test/pg_lateral_srf_test.clj"
+       :test-var "star-expands-every-correlated-srf"}
+      {:id :numeric-to-pg-lsn
+       :source-lines [1577 1584]
+       :gate "test/datahike/test/pg_numeric_format_test.clj"
+       :test-var "numeric-to-pg-lsn"}]}
     {:name "money" :mode :discovery
      :boundaries #{:scalar-type :operators :casts :text-codec}
      :blockers #{:locale :operator-coverage}

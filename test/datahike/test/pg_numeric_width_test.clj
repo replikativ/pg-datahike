@@ -165,7 +165,7 @@
            (one c "SELECT n FROM numeric_input_extensions WHERE n = 12000.123456")))
     (is (= "299792458"
            (one c "SELECT n FROM numeric_input_extensions WHERE n = 299792458")))
-    (is (thrown-with-msg? SQLException #"invalid input syntax for numeric"
+    (is (thrown-with-msg? SQLException #"invalid input syntax for type numeric"
                           (one c "SELECT '0x1eg'::numeric")))))
 
 (deftest numeric-input-validation-obeys-range-and-typmod

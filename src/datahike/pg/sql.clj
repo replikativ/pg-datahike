@@ -207,6 +207,7 @@
 (def filter-min            fns/filter-min)
 (def filter-max            fns/filter-max)
 (def filter-count          fns/filter-count)
+(def filter-bool-and       fns/filter-bool-and)
 (def filter-count-distinct fns/filter-count-distinct)
 (def filter-variance-samp  fns/filter-variance-samp)
 (def filter-stddev-samp    fns/filter-stddev-samp)

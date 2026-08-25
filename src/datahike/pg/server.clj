@@ -398,6 +398,7 @@
      ;; exponent form in its numeric output -- it answers 1000.
      ;; numeric NaN / +-Infinity -- see types/numeric-special.
      (types/numeric-special? v) (types/numeric-special-text v)
+     (types/pg-lsn? v) (str v)
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      (uuid? v)    (str v)
      (symbol? v)  (str v)
