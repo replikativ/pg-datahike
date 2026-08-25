@@ -127,6 +127,10 @@
        :source-lines [1538 1563]
        :gate "test/datahike/test/pg_math_functions_test.clj"
        :test-var "numeric-functions-scan-derived-values-relations"}
+      {:id :numeric-inc-unary-matrix
+       :source-lines [671 676]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "scalar-functions-pass-specials-through"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"

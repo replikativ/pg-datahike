@@ -178,6 +178,11 @@
       (is (= "0" (one c "SELECT ceil(-0.000001::numeric)")))
       (is (= "0" (one c "SELECT ceiling(-0.000001::numeric)")))
       (is (= "-1" (one c "SELECT floor(-0.000001::numeric)"))))
+    (testing "numeric_inc is the PostgreSQL numeric addition helper"
+      (is (= "5.2" (one c "SELECT numeric_inc(4.2::numeric)")))
+      (is (= "Infinity" (one c "SELECT numeric_inc('Infinity'::numeric)")))
+      (is (= "-Infinity" (one c "SELECT numeric_inc('-Infinity'::numeric)")))
+      (is (= "NaN" (one c "SELECT numeric_inc('NaN'::numeric)"))))
     (testing "width_bucket accepts special operands but rejects special bounds"
       (is (= "11" (one c "SELECT width_bucket('Infinity'::numeric, 1, 10, 10)")))
       (is (= "0" (one c "SELECT width_bucket('-Infinity'::numeric, 1, 10, 10)")))

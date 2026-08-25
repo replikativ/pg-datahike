@@ -3455,6 +3455,10 @@
    "scale"    (special-null sql-scale)
    "min_scale" (special-null sql-min-scale)
    "trim_scale" (special-passthrough sql-trim-scale)
+   ;; PostgreSQL exposes numeric_inc in pg_proc and exercises it directly in
+   ;; numeric.sql. Reuse the numeric operator so range and special values
+   ;; follow the same path as `x + 1`.
+   "numeric_inc" (fn [x] (sql-+ x java.math.BigDecimal/ONE))
    "lcm"      sql-lcm
    "width_bucket" sql-width-bucket
    "pi"       (fn [] Math/PI)
@@ -3627,7 +3631,7 @@
    "erf" #{1} "erfc" #{1}
    "random" #{0} "setseed" #{1} "random_normal" #{0 1 2}
    "div" #{2} "factorial" #{1}
-   "scale" #{1} "min_scale" #{1} "trim_scale" #{1}
+   "scale" #{1} "min_scale" #{1} "trim_scale" #{1} "numeric_inc" #{1}
    "width_bucket" #{4}
    "upper"    #{1} "lower" #{1} "initcap" #{1} "reverse" #{1}
    "length"   #{1} "char_length" #{1} "octet_length" #{1} "bit_length" #{1}

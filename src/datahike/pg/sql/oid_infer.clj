@@ -121,6 +121,7 @@
    "div" types/oid-numeric
    "factorial" types/oid-numeric
    "trim_scale" types/oid-numeric
+   "numeric_inc" types/oid-numeric
    "scale" types/oid-int4
    "min_scale" types/oid-int4
    "lcm"           :arg-type
