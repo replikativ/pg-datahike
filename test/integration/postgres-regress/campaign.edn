@@ -220,13 +220,38 @@
   {:id 2
    :name "application DDL, DML, and relational SQL"
    :tests
-   [{:name "boolean" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "char" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "name" :mode :unmeasured :boundaries #{:scalar-type :catalogs}}
-    {:name "varchar" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "text" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "float4" :mode :unmeasured :boundaries #{:scalar-type :operators}}
-    {:name "float8" :mode :unmeasured :boundaries #{:scalar-type :operators}}
+   [{:name "boolean" :mode :strict
+     :boundaries #{:scalar-type :casts :errors}
+     :blockers #{}}
+    {:name "char" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :casts}
+     :blockers #{:internal-char-type :temporary-table-shadowing}}
+    {:name "name" :mode :discovery
+     :boundaries #{:scalar-type :catalogs}
+     :blockers #{:parse-ident :named-function-arguments :procedural-blocks}}
+    {:name "varchar" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :typmods}
+     :blockers #{:temporary-table-shadowing}}
+    {:name "text" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :functions :expressions}
+     :blockers #{:variadic-function-grammar :to-date :format-semantics}
+     :strict-slices
+     [{:id :negative-left-right-lengths
+       :source-lines [39 39]
+       :gate "test/datahike/test/pg_string_datetime_fns_test.clj"
+       :test-var "text-regression-boundaries"}]}
+    {:name "float4" :mode :discovery
+     :boundaries #{:scalar-type :operators :casts}
+     :blockers #{:user-defined-types :create-cast :binary-send-functions
+                 :floating-overflow-semantics}}
+    {:name "float8" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators :casts}
+     :blockers #{:user-defined-types :create-cast :gamma-functions
+                 :floating-overflow-semantics}}
     {:name "date" :mode :unmeasured :boundaries #{:temporal}}
     {:name "time" :mode :unmeasured :boundaries #{:temporal}}
     {:name "timestamp" :mode :unmeasured :boundaries #{:temporal}}

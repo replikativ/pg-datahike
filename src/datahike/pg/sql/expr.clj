@@ -1125,6 +1125,26 @@
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
+      ;; CONCAT_WS(separator, value, ...) skips NULL values but a NULL
+      ;; separator makes the whole result NULL. It is variadic and non-strict
+      ;; in every argument after the separator.
+      (= fname "concat_ws")
+      (let [oids (mapv #(source-oid ctx %) params)
+            fn-param (symbol (str "?pg-concat-ws-fn" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj
+               (fn [sep & vs]
+                 (if (fns/sql-null? sep)
+                   :__null__
+                   (let [rendered (keep-indexed
+                                   (fn [i v]
+                                     (when-not (fns/sql-null? v)
+                                       (types/->pg-text v (nth oids (inc i) nil))))
+                                   vs)]
+                     (str/join (str sep) rendered)))))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       ;; SUBSTR/SUBSTRING(s, start [, len])
       ;; Through sql-substring rather than a raw `subs`: `subs` throws on
       ;; the `:__null__` sentinel ("class Keyword cannot be cast to

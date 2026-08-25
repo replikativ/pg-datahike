@@ -1935,12 +1935,36 @@
   "SQL LENGTH / CHAR_LENGTH. Bit strings measure in bits, not in the
    record's map entries."
   [v]
-  (if (pg-bits/pg-bit? v) (pg-bits/width v) (count v)))
+  (cond
+    (pg-bits/pg-bit? v) (pg-bits/width v)
+    (string? v) (count v)
+    (bytes? v) (alength ^bytes v)
+    :else
+    (throw (errors/pg-error
+            :undefined-function
+            {:function (str "length("
+                            (get types/oid->pg-name
+                                 (types/infer-oid-from-value v)
+                                 "unknown")
+                            ")")
+             :hint (str "No function matches the given name and argument types. "
+                        "You might need to add explicit type casts.")}))))
 
 (defn sql-octet-length
   "SQL OCTET_LENGTH. For a bit string PG reports ceil(bits / 8)."
   [v]
-  (if (pg-bits/pg-bit? v) (pg-bits/octet-length v) (count v)))
+  (cond
+    (pg-bits/pg-bit? v) (pg-bits/octet-length v)
+    (string? v) (alength (.getBytes ^String v java.nio.charset.StandardCharsets/UTF_8))
+    (bytes? v) (alength ^bytes v)
+    :else
+    (throw (errors/pg-error
+            :undefined-function
+            {:function (str "octet_length("
+                            (get types/oid->pg-name
+                                 (types/infer-oid-from-value v)
+                                 "unknown")
+                            ")")}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bitwise operators — `&` `|` `~` `<<` `>>`, over integers and bit strings.
@@ -2033,12 +2057,22 @@
   [s] (str/replace (str s) #"\b\w" str/upper-case))
 
 (defn sql-left
-  "Return first n characters of string."
-  [s n] (let [s (str s) n (long n)] (subs s 0 (min n (count s)))))
+  "Return first n characters of string. A negative n removes |n| trailing
+   characters, matching PostgreSQL's text_left."
+  [s n]
+  (let [s (str s)
+        n (long n)
+        end (if (neg? n) (+ (count s) n) n)]
+    (subs s 0 (max 0 (min end (count s))))))
 
 (defn sql-right
-  "Return last n characters of string."
-  [s n] (let [s (str s) n (long n)] (subs s (max 0 (- (count s) n)))))
+  "Return last n characters of string. A negative n removes |n| leading
+   characters, matching PostgreSQL's text_right."
+  [s n]
+  (let [s (str s)
+        n (long n)
+        start (if (neg? n) (- n) (- (count s) n))]
+    (subs s (max 0 (min start (count s))))))
 
 (defn- ->s ^String [v] (str v))
 
