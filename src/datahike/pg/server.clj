@@ -2376,7 +2376,17 @@
 
                                    default
                                    (let [[kind value arg] default
-                                         v (eval-default kind value arg)]
+                                         raw-v (eval-default kind value arg)
+                                         ;; DEFAULT expressions undergo the
+                                         ;; target column's assignment cast in
+                                         ;; PostgreSQL. This happens here,
+                                         ;; after volatile defaults such as
+                                         ;; now() are materialized inside the
+                                         ;; transaction function; parse-time
+                                         ;; coercion only saw an opaque marker.
+                                         v (when (some? raw-v)
+                                             (#'sql/coerce-insert-value
+                                              raw-v ns-attr (dbi/-schema txdb) txdb))]
                                      (cond
                                        (and (vector? v) (= ::nextval (first v)))
                                        (let [[nxt seq-tx] (bump-seq! (second v))]

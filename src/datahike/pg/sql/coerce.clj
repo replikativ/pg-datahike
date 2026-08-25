@@ -27,9 +27,11 @@
    Both errors are encoded as `ex-info` with `:sqlstate`; the wire
    layer's `handler.clj` already lifts those into ErrorResponse
    messages."
+  (:refer-clojure :exclude [parse-uuid])
   (:require [datahike.pg.types :as types]
             [clojure.string :as str])
-  (:import [java.math BigInteger BigDecimal]))
+  (:import [java.math BigInteger BigDecimal]
+           [java.util.concurrent.atomic AtomicLong]))
 
 (set! *warn-on-reflection* true)
 
@@ -41,6 +43,83 @@
    `sqlstate` is the 5-char SQLSTATE; `msg` is the human-readable text."
   ([sqlstate msg]      (pg-error sqlstate msg nil))
   ([sqlstate msg data] (ex-info msg (merge {:sqlstate sqlstate} data))))
+
+(defn parse-uuid
+  "Parse PostgreSQL's uuid input syntax. Besides the canonical spelling,
+   uuid_in accepts surrounding braces, omitted hyphens, and hyphens after
+   any group of four hexadecimal digits. Return java.util.UUID or raise
+  22P02; callers that need a predicate can wrap this with `safe`."
+  [value]
+  (let [raw (str value)]
+    (try
+      (let [braced? (str/starts-with? raw "{")
+            s (if braced?
+                (do
+                  (when-not (str/ends-with? raw "}")
+                    (throw (IllegalArgumentException. "unclosed UUID brace")))
+                  (subs raw 1 (dec (count raw))))
+                raw)
+            _ (when (or (str/includes? s "{") (str/includes? s "}"))
+                (throw (IllegalArgumentException. "misplaced UUID brace")))
+            _ (when (re-find #"(?:^-|-$|--)" s)
+                (throw (IllegalArgumentException. "misplaced UUID hyphen")))
+            [hex n]
+            (reduce (fn [[^StringBuilder out n] ch]
+                      (let [digit (Character/digit ^char ch 16)]
+                        (cond
+                          (not= -1 digit)
+                          [(.append out ch) (inc n)]
+
+                          (= ch \-)
+                          (if (and (pos? n) (zero? (mod n 4)))
+                            [out n]
+                            (throw (IllegalArgumentException. "misplaced UUID hyphen")))
+
+                          :else
+                          (throw (IllegalArgumentException. "non-hex UUID digit")))))
+                    [(StringBuilder.) 0]
+                    s)
+            digits (str hex)]
+        (when-not (= n 32)
+          (throw (IllegalArgumentException. "wrong UUID length")))
+        (java.util.UUID/fromString
+         (str (subs digits 0 8) "-" (subs digits 8 12) "-"
+              (subs digits 12 16) "-" (subs digits 16 20) "-"
+              (subs digits 20 32))))
+      (catch Exception _
+        (throw (pg-error "22P02"
+                         (str "invalid input syntax for type uuid: \"" raw "\"")
+                         {:type "uuid" :value raw}))))))
+
+(defonce ^:private ^AtomicLong uuid-v7-ticks
+  ;; Milliseconds plus a 12-bit monotonic fraction. A process-local state is
+  ;; sufficient: PostgreSQL only promises monotonicity within a backend.
+  (AtomicLong. -1))
+
+(defn generate-uuid-v7
+  "Generate an RFC 9562 UUIDv7 using the current Unix millisecond and random
+   payload bits. Shared by expression evaluation and deferred INSERT execution."
+  []
+  (let [wall-tick (bit-shift-left
+                   (bit-and (System/currentTimeMillis) 0xFFFFFFFFFFFF) 12)
+        tick (loop []
+               (let [previous (.get uuid-v7-ticks)
+                     candidate (max wall-tick (inc previous))]
+                 (if (.compareAndSet uuid-v7-ticks previous candidate)
+                   candidate
+                   (recur))))
+        millis (unsigned-bit-shift-right tick 12)
+        fraction (bit-and tick 0x0FFF)
+        random (java.util.UUID/randomUUID)
+        msb (unchecked-long
+             (bit-or (bit-shift-left millis 16)
+                     0x7000
+                     fraction))
+        lsb (unchecked-long
+             (bit-or Long/MIN_VALUE
+                     (bit-and (.getLeastSignificantBits random)
+                              0x3FFFFFFFFFFFFFFF)))]
+    (java.util.UUID. msb lsb)))
 
 (defn ^long bigint->long
   "BigInteger → primitive long, or raise `22003 numeric_value_out_of_range`."
@@ -352,7 +431,7 @@
    ;; those spellings and BigDecimal otherwise.
    :db.type/bigdec  (safe #(coerce-numeric % :bigdec))
    :db.type/boolean parse-bool-token
-   :db.type/uuid    (safe #(java.util.UUID/fromString (.trim ^String %)))
+   :db.type/uuid    (safe parse-uuid)
    :db.type/string  identity
    ;; SQL has no keyword literal; clients send the bare name as a
    ;; string. `(keyword "draft") → :draft`, `(keyword "foo/bar") →

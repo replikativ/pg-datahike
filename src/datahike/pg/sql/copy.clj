@@ -64,6 +64,7 @@
             quote \"\\\"\", escape = quote, header :false
      binary: rejected at this layer (returns :feature-not-supported)"
   (:require [clojure.string :as str]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.sql.database :as database]))
 
 ;; ----------------------------------------------------------------------------
@@ -505,7 +506,7 @@
           :db.type/string    raw
           :db.type/keyword   (keyword raw)
           :db.type/symbol    (symbol raw)
-          :db.type/uuid      (java.util.UUID/fromString raw)
+          :db.type/uuid      (coerce/parse-uuid raw)
           ;; PG's bytea OUTPUT form, which is what COPY carries:
           ;; `\x` followed by hex pairs. Without this the raw STRING
           ;; reached the transactor and datahike rejected it —

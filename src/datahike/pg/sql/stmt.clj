@@ -5500,6 +5500,12 @@
             "localtimestamp" "localtime" "current_date" "current_time"} fname)
          {:fn :now}
 
+         ;; UUID generators are volatile too. A concrete UUID folded into
+         ;; the parse cache would be reused by every execution of the same
+         ;; INSERT shape and immediately violate uniqueness.
+         (#{"gen_random_uuid" "uuidv4" "uuidv7"} fname)
+         {:fn (if (= "uuidv7" fname) :uuid-v7 :random-uuid)}
+
          ;; Any other function. This was `(str e)`, which stored the SQL
          ;; TEXT: `INSERT INTO t VALUES (1, repeat('x',5))` put the
          ;; 14-character string `repeat('x', 5)` in the column.
@@ -5837,11 +5843,12 @@
         ;; falling through to coerce-unknown.
           (and (= vtype :db.type/uuid) (instance? java.util.UUID val)) val
           (and (= vtype :db.type/uuid) (string? val))
-          (try (java.util.UUID/fromString val) (catch Exception _ val))
+          (coerce/parse-uuid val)
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
           (and (= vtype :db.type/string) (or (map? val) (sequential? val)))
           (jb/serialize-jsonb val)
-          (and (= vtype :db.type/string) (not (string? val))) (str val)
+          (and (= vtype :db.type/string) (not (string? val)))
+          (types/->pg-text val nil)
         ;; bytea: decode PG `\xHEX` hex literal to byte array; fall back to
         ;; raw UTF-8 bytes for non-hex strings so the value stays representable.
           (and (= vtype :db.type/bytes) (string? val))

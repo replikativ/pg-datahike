@@ -28,6 +28,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -266,7 +267,7 @@
   "Function markers translate-* may emit for SQL constructs that must
    be re-evaluated per execute (i.e. NOT cacheable as a parse-time
    value). Resolved by `resolve-nextvals!` against a per-fn resolver."
-  #{:nextval :now :eval})
+  #{:nextval :now :eval :random-uuid :uuid-v7})
 
 (defn call-marker?
   "True if v is a deferred function-call marker emitted by translate-*
@@ -317,6 +318,8 @@
                      (case (:fn v)
                        :nextval (nextval-fn (:seq-name v))
                        :now     (java.util.Date.)
+                       :random-uuid (java.util.UUID/randomUUID)
+                       :uuid-v7 (coerce/generate-uuid-v7)
                       ;; An arbitrary scalar expression in INSERT
                       ;; VALUES. Deferred rather than folded at parse
                       ;; time for the same reason `now()` is: the parse

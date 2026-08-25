@@ -171,6 +171,11 @@
    "current_date"  types/oid-date
    "current_time"  types/oid-time
    "localtime"     types/oid-time
+   "gen_random_uuid" types/oid-uuid
+   "uuidv4"        types/oid-uuid
+   "uuidv7"        types/oid-uuid
+   "uuid_extract_version" types/oid-int4
+   "uuid_extract_timestamp" types/oid-timestamptz
    ;; date_trunc has three overloads and each RETURNS its second
    ;; argument's type (pg_proc.dat): timestamptz, timestamp, interval.
    ;; Reporting timestamptz for all of them made `date_trunc('day', ts)`

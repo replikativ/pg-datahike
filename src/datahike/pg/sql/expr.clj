@@ -2334,6 +2334,11 @@
    Returns the original string if all parsing attempts fail."
   [^String s]
   (let [trimmed (str/trim s)
+        ;; PostgreSQL accepts verbose timestamps with POSIX-style GMT zone
+        ;; names. In that notation GMT+05 means five hours WEST of UTC (the
+        ;; sign is intentionally opposite an ISO offset).
+        [_ verbose-local posix-sign zone-hour zone-minute]
+        (re-matches #"(?i)^[a-z]+,\s+(.+)\s+GMT([+-])(\d{2}):(\d{2})$" trimmed)
         ;; Strip trailing timezone offset from date-only strings:
         ;; "2000-09-07 -07" → "2000-09-07", "2000-09-07 +00" → "2000-09-07"
         date-only (second (re-find #"^(\d{4}-\d{2}-\d{2})\s+[+-]\d{2}$" trimmed))
@@ -2343,6 +2348,18 @@
                        (str/replace #"\+(\d{2})$" "+$1:00")
                        (str/replace #"(?<=\d)-(\d{2})$" "-$1:00"))]
     (or
+     (when verbose-local
+       (try
+         (let [local (java.time.LocalDateTime/parse
+                      verbose-local
+                      (java.time.format.DateTimeFormatter/ofPattern
+                       "MMMM d, uuuu h:mm:ss.SS a"
+                       java.util.Locale/ENGLISH))
+               iso-sign (if (= posix-sign "+") "-" "+")
+               offset (java.time.ZoneOffset/of
+                       (str iso-sign zone-hour ":" zone-minute))]
+           (java.util.Date/from (.toInstant local offset)))
+         (catch Exception _ nil)))
      ;; Date-only with timezone offset stripped
      (when date-only
        (try
@@ -2607,7 +2624,7 @@
                      (try (java.time.LocalTime/parse time-only)
                           (catch Exception _ s)))
           is-ts?   (parse-timestamp-string (str inner-raw))
-          is-uuid? (java.util.UUID/fromString (str inner-raw))
+          is-uuid? (coerce/parse-uuid inner-raw)
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
           (= type-str "regnamespace") 2200
@@ -2701,7 +2718,7 @@
 
             is-uuid?
             (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))
-                  uuid-fn (fn [v] (java.util.UUID/fromString (str v)))]
+                  uuid-fn coerce/parse-uuid]
               (swap! (:in-params ctx) conj uuid-fn-param)
               (swap! (:in-args ctx) conj (null-preserving uuid-fn))
               (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
@@ -4437,8 +4454,23 @@
    typed Clojure value (Long/Double/Boolean/UUID/Date/...). The
    caller's translate-expr branch handles both."
   [ctx left right]
-  [(or (coerce-unknown-literal ctx right left) left)
-   (or (coerce-unknown-literal ctx left right) right)])
+  (let [coerce-for-expr
+        (fn [typed lit]
+          (when (instance? StringValue lit)
+            (when-let [vtype (some-> (source-oid ctx typed)
+                                     types/dh-type-for-oid)]
+              ;; Text expressions need no typinput coercion, and using the
+              ;; parser node's raw body here would undo E'' escape decoding.
+              (when-not (= :db.type/string vtype)
+                (coerce/coerce-unknown
+                 (.getNotExcapedValue ^StringValue lit)
+                 vtype parse-timestamp-string)))))]
+    [(or (coerce-unknown-literal ctx right left)
+         (coerce-for-expr right left)
+         left)
+     (or (coerce-unknown-literal ctx left right)
+         (coerce-for-expr left right)
+         right)]))
 
 (def ^:private op-sym->sql
   "The SQL spelling of a comparison operator, for PostgreSQL's

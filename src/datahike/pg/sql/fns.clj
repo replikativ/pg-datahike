@@ -3423,7 +3423,7 @@
                    (<= 0 n 4294967295))
          ("float4" "real" "float8" "double precision") (float-value)
          ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
-         ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
+         ("uuid") (do (coerce/parse-uuid s) true)
          ("bit" "bit varying" "varbit")
          (do (sql-cast/cast-to-bit s (str type-name) false) true)
          ("char" "character" "varchar" "character varying" "text" "name")
@@ -3522,6 +3522,48 @@
    "jsonb_exists_all" {:impl jb/jsonb-exists-all? :arities #{2}
                        :strict? true :return-oid types/oid-bool}})
 
+(defn sql-uuid-v7
+  "Generate an RFC 9562 UUIDv7 using the current Unix millisecond and random
+   payload bits. The one-argument PostgreSQL form offsets the timestamp by an
+  interval; it stays explicit until intervals have a structural carrier."
+  ([]
+   (coerce/generate-uuid-v7))
+  ([_offset]
+   (throw (errors/pg-error :feature-not-supported
+                           {:feature "uuidv7 with an interval offset"}))))
+
+(defn sql-uuid-extract-version [value]
+  (let [uuid (if (instance? java.util.UUID value)
+               value
+               (coerce/parse-uuid value))
+        version (.version ^java.util.UUID uuid)]
+    ;; RFC 9562 UUIDs use the RFC variant. PostgreSQL returns NULL for a
+    ;; bit-pattern that spells a version nibble but has another variant.
+    (if (and (= 2 (.variant ^java.util.UUID uuid)) (<= 1 version 8))
+      version
+      :__null__)))
+
+(defn sql-uuid-extract-timestamp [value]
+  (let [uuid (if (instance? java.util.UUID value)
+               value
+               (coerce/parse-uuid value))
+        version (.version ^java.util.UUID uuid)]
+    (if-not (= 2 (.variant ^java.util.UUID uuid))
+      :__null__
+      (case version
+        ;; UUIDv1 stores 100ns ticks since the Gregorian UUID epoch,
+        ;; 1582-10-15. java.util.UUID reconstructs that 60-bit field.
+        1 (let [unix-100ns (- (.timestamp ^java.util.UUID uuid)
+                              122192928000000000)]
+            (java.util.Date. (Math/floorDiv unix-100ns 10000)))
+        ;; UUIDv7 stores unsigned Unix milliseconds in its top 48 bits.
+        7 (let [millis (bit-and
+                        (unsigned-bit-shift-right
+                         (.getMostSignificantBits ^java.util.UUID uuid) 16)
+                        0xFFFFFFFFFFFF)]
+            (java.util.Date. millis))
+        :__null__))))
+
 (def ^:private legacy-sql-fn->clj-fn
   {"upper"    str/upper-case
    "lower"    str/lower-case
@@ -3598,6 +3640,11 @@
    "erf"      sql-erf
    "erfc"     sql-erfc
    "random"   (fn [] (sql-random))
+   "gen_random_uuid" (fn [] (java.util.UUID/randomUUID))
+   "uuidv4"   (fn [] (java.util.UUID/randomUUID))
+   "uuidv7"   sql-uuid-v7
+   "uuid_extract_version" sql-uuid-extract-version
+   "uuid_extract_timestamp" sql-uuid-extract-timestamp
    "setseed"  sql-setseed
    "random_normal" (fn ([] (sql-random-normal))
                      ([m] (sql-random-normal m))
@@ -3785,6 +3832,8 @@
    "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
    "erf" #{1} "erfc" #{1}
    "random" #{0} "setseed" #{1} "random_normal" #{0 1 2}
+   "gen_random_uuid" #{0} "uuidv4" #{0} "uuidv7" #{0 1}
+   "uuid_extract_version" #{1} "uuid_extract_timestamp" #{1}
    "div" #{2} "factorial" #{1}
    "scale" #{1} "min_scale" #{1} "trim_scale" #{1} "numeric_inc" #{1}
    "width_bucket" #{4}

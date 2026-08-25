@@ -99,6 +99,13 @@
     (is (ok? r))
     (is (some? (first (first (rows r)))))))
 
+(deftest temporal-default-is-assignment-coerced-to-text
+  (is (ok? (run "CREATE TABLE dtft (id INT PRIMARY KEY, created TEXT DEFAULT NOW())")))
+  (is (ok? (run "INSERT INTO dtft (id) VALUES (1)")))
+  (let [created (ffirst (rows (run "SELECT created FROM dtft WHERE id = 1")))]
+    (is (string? created))
+    (is (re-find #"^\d{4}-\d{2}-\d{2} " created))))
+
 ;; ============================================================================
 ;; CHECK constraints (23514)
 ;; ============================================================================

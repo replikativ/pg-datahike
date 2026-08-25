@@ -189,22 +189,39 @@
     {:name "arrays" :mode :discovery
      :boundaries #{:array-codec :array-expressions :polymorphism}
      :blockers #{:postgres-vector-types :create-function}}
-    {:name "uuid" :mode :unmeasured :boundaries #{:scalar-type :array-codec}}
-    {:name "enum" :mode :unmeasured :boundaries #{:user-type :casts :ordering}}
-    {:name "domain" :mode :unmeasured
+    {:name "uuid" :mode :discovery
+     :boundaries #{:scalar-type :input-codec :operators :volatile-functions
+                   :type-inference :temporal-extraction}
+     :blockers #{:create-index-catalog-and-enforcement
+                 :nullable-left-join-lowering :uuid-v7-interval-offset
+                 :complex-series-window-lowering :planner-explain
+                 :psql-source-location-presentation}}
+    {:name "enum" :mode :discovery
+     :boundaries #{:user-type :casts :ordering}
+     :blockers #{:alter-type :enum-arrays :create-function
+                 :transactional-type-cascade}}
+    {:name "domain" :mode :discovery
      :boundaries #{:user-type :casts :constraints}
-     :blockers #{:domain-constraint-coverage}}
-    {:name "create_type" :mode :unmeasured :boundaries #{:type-ddl :type-lookup}}
-    {:name "type_sanity" :mode :unmeasured
+     :blockers #{:alter-domain :domain-constraint-coverage
+                 :domain-arrays-and-composites :create-function
+                 :dump-domain-syntax}}
+    {:name "create_type" :mode :discovery
+     :boundaries #{:type-ddl :type-lookup}
+     :blockers #{:user-defined-base-types :range-and-multirange-types
+                 :shell-types :create-function}}
+    {:name "type_sanity" :mode :discovery
      :boundaries #{:catalogs :type-registry}
      :blockers #{:postgres-internal-catalog-completeness}}
-    {:name "opr_sanity" :mode :unmeasured
+    {:name "opr_sanity" :mode :discovery
      :boundaries #{:catalogs :operator-registry}
      :blockers #{:postgres-internal-catalog-completeness}}
-    {:name "misc_sanity" :mode :unmeasured
+    {:name "misc_sanity" :mode :discovery
      :boundaries #{:catalogs}
      :blockers #{:postgres-internal-catalog-completeness}}
-    {:name "namespace" :mode :unmeasured :boundaries #{:name-resolution :schemas}}
+    {:name "namespace" :mode :discovery
+     :boundaries #{:name-resolution :schemas}
+     :blockers #{:search-path-completeness :temporary-namespaces
+                 :catalog-roles :create-function}}
     {:name "rangefuncs" :mode :discovery
      :boundaries #{:set-returning-functions :lateral :parameter-inference}
      :blockers #{:create-function :fixture-dependencies}}
@@ -278,7 +295,12 @@
                  :interval-arithmetic :interval-extract
                  :temporal-format-pictures :temporal-function-coverage
                  :copy-fixture-dependencies}}
-    {:name "create_table" :mode :unmeasured :boundaries #{:ddl}}
+    {:name "create_table" :mode :discovery
+     :boundaries #{:ddl :type-metadata :defaults}
+     :blockers #{:typed-tables :partition-routing :inheritance
+                 :storage-options :system-columns :server-functions
+                 :prepared-create-table-as :without-oids-grammar
+                 :postgres-internal-catalog-completeness}}
     {:name "constraints" :mode :discovery
      :boundaries #{:ddl :constraints}
      :blockers #{:deferrable-constraints :exclusion-constraints

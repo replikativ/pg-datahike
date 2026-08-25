@@ -395,7 +395,7 @@
 
         :uuid (if (instance? java.util.UUID v)
                 v
-                (java.util.UUID/fromString (str v)))
+                (coerce/parse-uuid v))
 
         :bytes (cond
                  (bytes? v)  v
