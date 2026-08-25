@@ -219,6 +219,26 @@
                          "WHERE enumtypid = 'rainbow'::regtype "
                          "ORDER BY enumlabel::rainbow")))))))
 
+(deftest enum-foreign-keys-use-nominal-types-and-default-primary-key
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'blue')")
+    (exec! c "CREATE TYPE bogus AS ENUM ('red', 'blue')")
+    (exec! c "CREATE TABLE enum_parent (id rainbow PRIMARY KEY)")
+    (exec! c "CREATE TABLE enum_child (parent rainbow REFERENCES enum_parent)")
+    (exec! c "INSERT INTO enum_parent VALUES ('red')")
+    (exec! c "INSERT INTO enum_child VALUES ('red')")
+    (doseq [sql ["INSERT INTO enum_child VALUES ('blue')"
+                 "DELETE FROM enum_parent"]]
+      (let [raised (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "23503" (some-> raised .getSQLState)))))
+    (let [raised (try
+                   (exec! c "CREATE TABLE enum_bogus (parent bogus REFERENCES enum_parent)")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (= "42804" (some-> raised .getSQLState)))
+      (is (str/includes? (some-> raised .getMessage)
+                         "cannot be implemented")))))
+
 (deftest enum-type-rename-and-drop-lifecycle
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")

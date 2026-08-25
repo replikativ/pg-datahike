@@ -131,11 +131,14 @@
 
    :foreign-key-violation
    {:sqlstate "23503"
-    :format (fn [{:keys [table constraint detail]}]
+    :format (fn [{:keys [table parent-table constraint operation]}]
               (when (and table constraint)
-                (cond-> (str "insert or update on table \"" table
-                             "\" violates foreign key constraint \"" constraint "\"")
-                  detail (str ": " detail))))}
+                (if (contains? #{:delete :update-parent} operation)
+                  (str "update or delete on table \"" parent-table
+                       "\" violates foreign key constraint \"" constraint
+                       "\" on table \"" table "\"")
+                  (str "insert or update on table \"" table
+                       "\" violates foreign key constraint \"" constraint "\""))))}
 
    :check-violation
    {:sqlstate "23514"

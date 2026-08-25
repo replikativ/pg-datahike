@@ -2,8 +2,9 @@
   "Tests for the token-driven SQL source rewriter. The core invariant
    is that each rule produces spans based on token kinds, so hostile
    inputs like `SELECT 'REFERENCES'` or `-- REFERENCES` do NOT trigger
-   the REFERENCES stripper."
-  (:require [clojure.test :refer [deftest testing is]]
+   the REFERENCES lifter."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest testing is]]
             [datahike.pg.sql.rewrite :as rw]))
 
 ;; ============================================================================
@@ -14,18 +15,20 @@
   (rw/rewrite sql [rw/inline-references-rule]))
 
 (deftest inline-references-basic
-  (testing "bare inline REFERENCES stripped"
-    (is (= "CREATE TABLE c (id INT, pid INT  )"
-           (strip-refs "CREATE TABLE c (id INT, pid INT REFERENCES p(id))"))))
-  (testing "inline REFERENCES without cols"
-    (is (= "CREATE TABLE c (id INT, pid INT  )"
-           (strip-refs "CREATE TABLE c (id INT, pid INT REFERENCES p)")))))
+  (testing "bare inline REFERENCES is lifted to a table constraint"
+    (let [out (strip-refs "CREATE TABLE c (id INT, pid INT REFERENCES p(id))")]
+      (is (re-find #"FOREIGN KEY\s*\(\s*pid\s*\)\s+REFERENCES\s+p\s*\(\s*id\s*\)" out))
+      (is (not (re-find #"INT\s+REFERENCES" out)))))
+  (testing "omitted parent columns survive parsing through an internal sentinel"
+    (let [out (strip-refs "CREATE TABLE c (id INT, pid INT REFERENCES p)")]
+      (is (re-find #"REFERENCES\s+p\s*\(\s*__pg_default_pk__\s*\)" out)))))
 
-(deftest inline-references-with-restrict-action-stripped
-  (is (= "CREATE TABLE c (pid INT  )"
-         (strip-refs "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE RESTRICT)")))
-  (is (= "CREATE TABLE c (pid INT  )"
-         (strip-refs "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE NO ACTION)"))))
+(deftest inline-references-with-restrict-action-lifted
+  (doseq [action ["RESTRICT" "NO ACTION"]]
+    (let [out (strip-refs
+               (str "CREATE TABLE c (pid INT REFERENCES p(id) ON DELETE " action ")"))]
+      (is (re-find #"FOREIGN KEY\s*\(\s*pid\s*\)" out))
+      (is (str/includes? out (str "ON DELETE " action))))))
 
 (deftest inline-references-on-delete-cascade-lifts-to-table-fk
   (testing "ON DELETE CASCADE — inline form is lifted to a table-level
@@ -190,7 +193,7 @@
                  "CREATE INDEX ON c (pid);\n"
                  "SELECT FROM c WHERE pid IS NOT NULL")]
     (let [out (rw/rewrite sql rw/default-rules)]
-      (is (not (re-find #"\bREFERENCES\b" out)))
+      (is (re-find #"FOREIGN KEY\s*\(\s*pid\s*\)\s+REFERENCES" out))
       (is (re-find #"idx_auto_\d+" out))
       (is (re-find #"SELECT 1 FROM" out)))))
 

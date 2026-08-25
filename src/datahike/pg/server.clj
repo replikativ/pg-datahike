@@ -2051,9 +2051,9 @@
                                :detail (str "Key ("
                                             (str/join ", " child-cols)
                                             ")=("
-                                            (str/join ", " (map pr-str child-vals))
+                                            (str/join ", " (map str child-vals))
                                             ") is not present in table \""
-                                            parent-table "\"")})))))))))
+                                            parent-table "\".")})))))))))
 
 (defn- find-fk-children
   "Find child eids that reference any of the parent eids via the given FK.
@@ -2116,13 +2116,15 @@
             (throw (ex-info "foreign key still referenced"
                             {:error :foreign-key-violation
                              :table (:child-table fk)
+                             :parent-table t
+                             :operation :delete
                              :constraint name
                              :detail (str "Key ("
                                           (str/join ", " parent-cols)
                                           ")=("
-                                          (str/join ", " (map pr-str parent-vals))
+                                          (str/join ", " (map str parent-vals))
                                           ") is still referenced from table \""
-                                          (:child-table fk) "\"")})))
+                                          (:child-table fk) "\".")})))
           ;; CASCADE: collect new child eids, recurse on those.
           (let [cascades (get by-action :cascade)
                 new-by-table
@@ -2209,13 +2211,15 @@
           (throw (ex-info "foreign key still referenced"
                           {:error :foreign-key-violation
                            :table child-table
+                           :parent-table table-name
+                           :operation :update-parent
                            :constraint name
                            :detail (str "Key ("
                                         (str/join ", " parent-cols)
                                         ")=("
-                                        (str/join ", " (map pr-str parent-vals))
+                                        (str/join ", " (map str parent-vals))
                                         ") is still referenced from table \""
-                                        child-table "\"")})))))))
+                                        child-table "\".")})))))))
 
 (defn- read-column-constraints*
   [db table-name]
