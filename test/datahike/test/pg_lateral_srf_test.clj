@@ -244,6 +244,18 @@
                            (SELECT v FROM c WHERE c.tid = t.id) s ON s.v > 10"))]
     (is (re-find #"OUTER JOIN LATERAL" (or e "")))))
 
+(deftest postgres-right-full-lateral-reference-slice
+  ;; PostgreSQL join.sql lines 3431-3432. These are validation errors, not
+  ;; executable joins: attempting to lower the missing outer binding can turn
+  ;; the SRF into unbounded work.
+  (seed!)
+  (doseq [join-type ["RIGHT" "FULL"]]
+    (let [r (run (str "SELECT t.id, g FROM t " join-type
+                      " JOIN LATERAL generate_series(0, t.n) g ON true"))]
+      (is (= "42P10" (.-sqlstate ^PgWireServer$QueryResult r)))
+      (is (re-find #"invalid reference to FROM-clause entry for table \"t\""
+                   (or (.-error ^PgWireServer$QueryResult r) ""))))))
+
 (deftest an-uncorrelated-derived-table-is-untouched
   ;; Only a LATERAL whose inner references an outer column takes the new
   ;; path; a plain derived table still materialises once.

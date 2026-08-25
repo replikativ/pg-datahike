@@ -158,6 +158,37 @@
     (.isCross join) :cross
     :else           :inner))
 
+(defn validate-lateral-join-shapes!
+  "Reject a RIGHT/FULL JOIN whose table function has a correlated column
+   argument. PostgreSQL permits a LATERAL reference to the left side only for
+   INNER and LEFT joins. This must run on the pristine parser AST: later
+   translation passes may replace the table function while deriving schemas."
+  [statement]
+  (when-let [^PlainSelect select
+             (cond
+               (instance? PlainSelect statement) statement
+               (instance? net.sf.jsqlparser.statement.select.Select statement)
+               (.getPlainSelect ^net.sf.jsqlparser.statement.select.Select statement)
+               :else nil)]
+    (doseq [^Join j (.getJoins select)
+            :when (or (.isRight j) (.isFull j))
+            :let [rt (.getRightItem j)]
+            :when (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+            :let [tf ^net.sf.jsqlparser.statement.select.TableFunction rt
+                  params (vec (or (.getParameters (.getFunction tf)) []))
+                  ^Column outer-col (some #(when (instance? Column %) %) params)]
+            :when outer-col]
+      (let [outer-table (some-> outer-col .getTable .getName unquote-ident)]
+        (throw
+         (ex-info
+          (str "invalid reference to FROM-clause entry for table \""
+               (or outer-table "?") "\"")
+          {:error :invalid-column-reference
+           :sqlstate "42P10"
+           :table outer-table
+           :detail (str "The combining JOIN type must be INNER or LEFT "
+                        "for a LATERAL reference.")}))))))
+
 (defn translate-join
   "Add join clauses for a SQL JOIN to the context.
    For INNER joins with ref-based ON (a.ref_col = b.db_id), unifies the ref
@@ -2872,6 +2903,7 @@
         ;; reduce walks the joins.
         outer-alias-set (into #{} (comp (keep identity) (map str/lower-case))
                               [name alias])
+        _ (validate-lateral-join-shapes! select)
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
@@ -8208,6 +8240,80 @@
        :in-params in-params
        :in-args in-args})))
 
+(defn- recursive-cte-branches
+  "Split a WITH RECURSIVE item into [anchor recursive]. PostgreSQL requires
+   recursive references to have the form `<anchor> UNION [ALL] <recursive>`;
+   rejecting other set operations before lowering prevents invalid recursion
+   from becoming unbounded work. Returns nil for a non-recursive PlainSelect,
+   which callers may handle as an anchor-only item."
+  [^net.sf.jsqlparser.statement.select.WithItem wi]
+  (let [select (let [s (.getSelect wi)]
+                 (if (instance? ParenthesedSelect s)
+                   (.getSelect ^ParenthesedSelect s) s))]
+    (cond
+      (instance? PlainSelect select)
+      nil
+
+      (instance? SetOperationList select)
+      (let [^SetOperationList sol select
+            selects (.getSelects sol)
+            ops (.getOperations sol)]
+        (when-not (and (= 2 (count selects))
+                       (= 1 (count ops))
+                       (instance? net.sf.jsqlparser.statement.select.UnionOp
+                                  (first ops)))
+          (throw (errors/pg-error
+                  :syntax-error
+                  {:message (str "recursive query \"" (str/trim (str (.getAlias wi)))
+                                 "\" does not have the form non-recursive-term "
+                                 "UNION [ALL] recursive-term")})))
+        (when-not (every? #(instance? PlainSelect %) selects)
+          (throw (errors/pg-error
+                  :feature-not-supported
+                  {:feature "nested recursive UNION branches"})))
+        (let [^PlainSelect recursive (second selects)
+              cte-name (str/lower-case
+                        (unquote-ident (str/trim (str (.getAlias wi)))))
+              table-name (fn [item]
+                           (when (instance? Table item)
+                             (str/lower-case
+                              (unquote-ident (.getName ^Table item)))))]
+          ;; PostgreSQL parse_agg.c/checkWellFormedRecursionWalker rejects a
+          ;; recursive self-reference on the nullable side of every outer
+          ;; join. Letting it reach fixed-point evaluation can keep producing
+          ;; NULL-extended rows after the client has gone away.
+          (reduce
+           (fn [left-names ^Join join]
+             (let [right-name (table-name (.getRightItem join))
+                   left-ref? (contains? left-names cte-name)
+                   right-ref? (= right-name cte-name)
+                   invalid? (or (and (.isLeft join) right-ref?)
+                                (and (.isRight join) left-ref?)
+                                (and (.isFull join) (or left-ref? right-ref?)))]
+               (when invalid?
+                 (throw
+                  (ex-info
+                   (str "recursive reference to query \"" cte-name
+                        "\" must not appear within an outer join")
+                   {:error :invalid-recursion
+                    :sqlstate "42P19"
+                    :query cte-name})))
+               (cond-> left-names right-name (conj right-name))))
+           (cond-> #{} (table-name (.getFromItem recursive))
+                   (conj (table-name (.getFromItem recursive))))
+           (.getJoins recursive))
+          [(first selects) recursive]))
+
+      :else nil)))
+
+(defn validate-recursive-cte-shape!
+  "Raise PostgreSQL's structural error for a recursive CTE whose recursive
+   reference is not combined with its anchor by UNION [ALL]. Called before
+   fallback evaluators, whose capability probes intentionally catch errors."
+  [^net.sf.jsqlparser.statement.select.WithItem wi]
+  (recursive-cte-branches wi)
+  nil)
+
 (defn translate-recursive-cte
   "Translate a WITH RECURSIVE CTE definition into a Datalog rule.
    Returns: {:rule [...] :rule-name sym :col-names [...] :rule-vars [...]
@@ -8234,19 +8340,12 @@
                                    [(keyword cte-name c)
                                     {:db/valueType :db.type/string
                                      :db/cardinality :db.cardinality/one}]))
-        select (.getSelect wi)
-        select (if (instance? ParenthesedSelect select)
-                 (.getSelect ^ParenthesedSelect select)
-                 select)
-        [anchor recursive]
-        (cond
-          (instance? SetOperationList select)
-          (let [^SetOperationList sol select
-                selects (.getSelects sol)]
-            (when (= 2 (count selects))
-              [(first selects) (second selects)]))
-          (instance? PlainSelect select)
-          [select nil])
+        select (let [s (.getSelect wi)]
+                 (if (instance? ParenthesedSelect s)
+                   (.getSelect ^ParenthesedSelect s) s))
+        [anchor recursive] (or (recursive-cte-branches wi)
+                               (when (instance? PlainSelect select)
+                                 [select nil]))
         anchor-result (when anchor
                         (translate-cte-branch anchor cte-name col-names rule-vars
                                               rule-name schema db nil))
@@ -8537,20 +8636,6 @@
          :name    target-name
          :alias   target-name
          :aliases col-names}))))
-
-(defn- recursive-cte-branches
-  "Split a WITH RECURSIVE item into [anchor recursive] PlainSelects, or nil
-   if it isn't the expected `<anchor> UNION [ALL] <recursive>` shape."
-  [^net.sf.jsqlparser.statement.select.WithItem wi]
-  (let [select (let [s (.getSelect wi)]
-                 (if (instance? ParenthesedSelect s)
-                   (.getSelect ^ParenthesedSelect s) s))]
-    (when (instance? SetOperationList select)
-      (let [selects (.getSelects ^SetOperationList select)]
-        (when (and (= 2 (count selects))
-                   (instance? PlainSelect (first selects))
-                   (instance? PlainSelect (second selects)))
-          [(first selects) (second selects)])))))
 
 (defn- visible-query-rows
   "Run a translate-select result's :query against `exec-db`, dropping any

@@ -825,6 +825,12 @@
 
              recursive?
              (do
+               ;; Capability fallbacks below deliberately catch translation
+               ;; failures while probing two evaluators. Structural SQL
+               ;; errors must be validated outside those catches, or an
+               ;; invalid INTERSECT/EXCEPT recursion degrades into an unknown
+               ;; CTE relation and may execute without a fixed point.
+               (stmt/validate-recursive-cte-shape! wi)
                ;; PostgreSQL evaluates a recursive CTE on demand: an outer
                ;; LIMIT can stop an otherwise infinite recursive term. Our
                ;; CTE layer materializes the complete fixed point before the
@@ -1144,7 +1150,16 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [stmt (ast-parse (preprocess-sql (or (:parser-sql explain) sql)))
+          (let [^String parser-sql (preprocess-sql (or (:parser-sql explain) sql))
+                ;; Translation mutates some JSqlParser relation nodes while
+                ;; materialising derived schemas. Validate this rare invalid
+                ;; shape on an independent pristine AST, so neither the
+                ;; validator nor later passes share cursor-like AST objects.
+                _ (when (re-find #"(?is)\b(?:right|full)\s+(?:outer\s+)?join\s+lateral\b"
+                                 parser-sql)
+                    (stmt/validate-lateral-join-shapes!
+                     (CCJSqlParserUtil/parse parser-sql)))
+                stmt (ast-parse parser-sql)
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a

@@ -403,7 +403,11 @@
      [{:id :derived-aggregate-projection
        :source-lines [431 442]
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
-       :test-var "derived-tables-materialize-logical-aggregate-projections"}]}
+       :test-var "derived-tables-materialize-logical-aggregate-projections"}
+      {:id :right-full-lateral-reference
+       :source-lines [3431 3432]
+       :gate "test/datahike/test/pg_lateral_srf_test.clj"
+       :test-var "postgres-right-full-lateral-reference-slice"}]}
     {:name "aggregates" :mode :discovery
      :boundaries #{:aggregates}
      :blockers #{:regression-aggregate-functions :custom-aggregates
@@ -423,7 +427,16 @@
      :boundaries #{:ctes :recursive-queries}
      :blockers #{:cte-multiple-reference :recursive-cte-lowering
                  :recursive-views :demand-driven-recursion
-                 :recursive-type-inference}}
+                 :recursive-type-inference}
+     :strict-slices
+     [{:id :recursive-set-operation-shape
+       :source-lines [916 924]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-set-operation-shape-slice"}
+      {:id :recursive-outer-join
+       :source-lines [977 992]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-outer-join-slice"}]}
     {:name "limit" :mode :discovery
      :boundaries #{:relational}
      :blockers #{:backward-cursors :set-returning-projections :planner-explain
