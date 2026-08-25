@@ -160,6 +160,19 @@
     (is (thrown-with-msg? SQLException #"invalid input syntax for numeric"
                           (one c "SELECT '0x1eg'::numeric")))))
 
+(deftest numeric-input-validation-obeys-range-and-typmod
+  (with-open [c (jdbc)]
+    (is (= "f" (one c "SELECT pg_input_is_valid('1e400000', 'numeric')")))
+    (is (= "value overflows numeric format"
+           (one c "SELECT message FROM pg_input_error_info('1e400000', 'numeric')")))
+    (is (= "22003"
+           (one c "SELECT sql_error_code FROM pg_input_error_info('1e400000', 'numeric')")))
+    (is (= "f" (one c "SELECT pg_input_is_valid('1234.567', 'numeric(7,4)')")))
+    (is (= (str "A field with precision 7, scale 4 must round to an absolute value "
+                "less than 10^3.")
+           (one c (str "SELECT detail FROM "
+                       "pg_input_error_info('1234.567', 'numeric(7,4)')"))))))
+
 (deftest writes-enforce-the-declared-width
   (with-open [c (jdbc)]
     (seed! c)

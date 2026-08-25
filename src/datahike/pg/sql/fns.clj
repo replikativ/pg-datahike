@@ -3188,6 +3188,12 @@
   (fn [x & more]
     (if (types/numeric-special? x) :__null__ (apply f x more))))
 
+(defn- validate-numeric-input! [value type-name]
+  (let [parsed (coerce/coerce-numeric (str value) :bigdec)]
+    (if-let [[precision scale] (sql-cast/numeric-typmod type-name)]
+      (sql-cast/apply-numeric-typmod parsed precision scale)
+      parsed)))
+
 (defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
@@ -3220,7 +3226,7 @@
          ("oid") (let [n (Long/parseLong (str/trim s))]
                    (<= 0 n 4294967295))
          ("float4" "real" "float8" "double precision") (float-value)
-         ("numeric" "decimal") (do (coerce/coerce-numeric s :bigdec) true)
+         ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
          ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
          ("bit" "bit varying" "varbit")
          (do (sql-cast/cast-to-bit s (str type-name) false) true)
@@ -3254,17 +3260,19 @@
                   (str "value too long for type " display-type)
                   (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
         sqlstate (if too-long? "22001" "22P02")]
-    (if (contains? #{"bit" "bit varying" "varbit"} base)
+    (if (contains? #{"bit" "bit varying" "varbit" "numeric" "decimal"} base)
       ;; Preserve the typinput function's own diagnostic. In particular,
       ;; fixed-width mismatches are 22026, while bad binary/hex digits are
       ;; 22P02 with the offending digit named. A boolean-only validation
       ;; pass loses both distinctions.
       (try
-        (sql-cast/cast-to-bit (str value) (str type-name) false)
+        (if (contains? #{"numeric" "decimal"} base)
+          (validate-numeric-input! value type-name)
+          (sql-cast/cast-to-bit (str value) (str type-name) false))
         [nil nil nil nil]
         (catch Throwable e
-          (let [[code msg] (errors/classify-exception e)]
-            [msg nil nil code])))
+          (let [[code msg fields] (errors/classify-exception e)]
+            [msg (when fields (.get ^java.util.Map fields "D")) nil code])))
       (if (pg-input-valid? value type-name)
         [nil nil nil nil]
         [message nil nil sqlstate]))))

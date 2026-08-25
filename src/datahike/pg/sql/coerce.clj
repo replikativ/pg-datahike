@@ -127,6 +127,15 @@
                (throw (pg-error "22P02"
                                 (str "invalid input syntax for numeric: \"" t \")))))))))
 
+(def ^:private ^:const numeric-max-integer-digits 131072)
+
+(defn- check-numeric-input-range ^BigDecimal [^BigDecimal value]
+  (when (and (not (zero? (.signum value)))
+             (> (- (.precision value) (.scale value))
+                numeric-max-integer-digits))
+    (throw (pg-error "22003" "value overflows numeric format")))
+  value)
+
 (defn ^BigDecimal parse-numeric-text
   "PostgreSQL `numeric_in` for finite values.
 
@@ -141,23 +150,24 @@
     (let [t (.trim ^String s)
           invalid! #(throw (pg-error "22P02"
                                      (format "invalid input syntax for numeric: \"%s\"" t)))]
-      (if-let [[_ sign prefix digits]
-               (re-matches (re-pattern "(?i)^([+-]?)(0[box])(_?[0-9a-f](?:_?[0-9a-f])*)$") t)]
-        (let [radix (case (Character/toLowerCase (char (last prefix)))
-                      \b 2
-                      \o 8
-                      \x 16)
-              body  (str/replace-first digits "_" "")]
-          (if (every? #(or (= \_ %) (<= 0 (Character/digit (char %) radix))) body)
-            (let [unsigned (str/replace body "_" "")
-                  signed   (str (when (= "-" sign) "-") unsigned)]
-              (try
-                (BigDecimal. (BigInteger. signed radix))
-                (catch NumberFormatException _ (invalid!))))
-            (invalid!)))
-        (if (re-matches (re-pattern "^[+-]?(?:(?:[0-9](?:_?[0-9])*)(?:\\.(?:[0-9](?:_?[0-9])*)?)?|\\.(?:[0-9](?:_?[0-9])*))(?:[eE][+-]?[0-9](?:_?[0-9])*)?$") t)
-          (parse-decimal (str/replace t "_" ""))
-          (invalid!))))))
+      (check-numeric-input-range
+       (if-let [[_ sign prefix digits]
+                (re-matches (re-pattern "(?i)^([+-]?)(0[box])(_?[0-9a-f](?:_?[0-9a-f])*)$") t)]
+         (let [radix (case (Character/toLowerCase (char (last prefix)))
+                       \b 2
+                       \o 8
+                       \x 16)
+               body  (str/replace-first digits "_" "")]
+           (if (every? #(or (= \_ %) (<= 0 (Character/digit (char %) radix))) body)
+             (let [unsigned (str/replace body "_" "")
+                   signed   (str (when (= "-" sign) "-") unsigned)]
+               (try
+                 (BigDecimal. (BigInteger. signed radix))
+                 (catch NumberFormatException _ (invalid!))))
+             (invalid!)))
+         (if (re-matches (re-pattern "^[+-]?(?:(?:[0-9](?:_?[0-9])*)(?:\\.(?:[0-9](?:_?[0-9])*)?)?|\\.(?:[0-9](?:_?[0-9])*))(?:[eE][+-]?[0-9](?:_?[0-9])*)?$") t)
+           (parse-decimal (str/replace t "_" ""))
+           (invalid!)))))))
 
 (defn float->numeric
   "PostgreSQL's float -> numeric conversion, which is NOT
