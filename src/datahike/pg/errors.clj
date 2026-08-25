@@ -147,8 +147,10 @@
    ;; --- input / data ---------------------------------------------------
    :invalid-text-representation
    {:sqlstate "22P02"
-    :format (fn [{:keys [type value detail]}]
+    :format (fn [{:keys [type value detail enum?]}]
               (cond
+                (and enum? type (some? value))
+                (str "invalid input value for enum " type ": " (pr-str value))
                 (and type value)
                 (str "invalid input syntax for type " type ": " (pr-str value))
                 detail detail

@@ -199,7 +199,20 @@
     {:name "enum" :mode :discovery
      :boundaries #{:user-type :casts :ordering}
      :blockers #{:alter-type :enum-arrays :create-function
-                 :transactional-type-cascade}}
+                 :transactional-type-cascade :pg-enum-catalog}
+     :strict-slices
+     [{:id :enum-input-and-diagnostics
+       :source-lines [15 23]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "registered-enum-remains-a-valid-cast-target"}
+      {:id :enum-definition-validation
+       :source-lines [26 27]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-definition-rejects-duplicate-and-oversized-labels"}
+      {:id :enum-label-length
+       :source-lines [62 64]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-definition-rejects-duplicate-and-oversized-labels"}]}
     {:name "domain" :mode :discovery
      :boundaries #{:user-type :casts :constraints}
      :blockers #{:alter-domain :domain-constraint-coverage

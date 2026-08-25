@@ -927,7 +927,12 @@
        (let [[value type-name] (mapv eval-fn params)]
          (when (= 2 (count params))
            (with-ordinality ["message" "detail" "hint" "sql_error_code"]
-             [(fns/pg-input-error-info value type-name)]
+             [(if-let [values (params/registered-enum-values type-name)]
+                (if (contains? values (str value))
+                  [nil nil nil nil]
+                  [(str "invalid input value for enum " type-name ": "
+                        (pr-str (str value))) nil nil "22P02"])
+                (fns/pg-input-error-info value type-name))]
              [:db.type/string :db.type/string :db.type/string :db.type/string]
              ["text" "text" "text" "text"])))
 

@@ -89,7 +89,42 @@
 (deftest registered-enum-remains-a-valid-cast-target
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
-    (is (= [["happy"]] (mapv vec (query-rows c "SELECT 'happy'::mood"))))))
+    (is (= [["happy"]] (mapv vec (query-rows c "SELECT 'happy'::mood"))))
+    (let [raised (try
+                   (query-rows c "SELECT 'angry'::mood")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (= "22P02" (some-> raised .getSQLState)))
+      (is (re-find #"invalid input value for enum mood"
+                   (or (some-> raised .getMessage) ""))))
+    (exec! c "CREATE TABLE enum_cast_source (v text)")
+    (exec! c "INSERT INTO enum_cast_source VALUES ('happy'), ('angry')")
+    (let [raised (try
+                   (query-rows c "SELECT v::mood FROM enum_cast_source")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (= "22P02" (some-> raised .getSQLState))))))
+
+(deftest enum-input-validation-uses-the-registry
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (is (= [[true false]]
+           (mapv vec (query-rows
+                      c (str "SELECT pg_input_is_valid('happy', 'mood'), "
+                             "pg_input_is_valid('angry', 'mood')")))))
+    (is (= [["invalid input value for enum mood: \"angry\"" "22P02"]]
+           (mapv vec (query-rows
+                      c (str "SELECT message, sql_error_code FROM "
+                             "pg_input_error_info('angry', 'mood')")))))))
+
+(deftest enum-definition-rejects-duplicate-and-oversized-labels
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [[sql state]
+            [["CREATE TYPE duplicate_mood AS ENUM ('sad', 'ok', 'sad')" "42710"]
+             [(str "CREATE TYPE long_mood AS ENUM ('" (apply str (repeat 64 "x")) "')")
+              "42622"]]]
+      (let [raised (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> raised .getSQLState)))))))
 
 ;; ============================================================================
 ;; DOMAIN

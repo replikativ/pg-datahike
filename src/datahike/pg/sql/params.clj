@@ -158,6 +158,21 @@
    execute path."
   nil)
 
+(defn registered-enum-values
+  "Return the declared label set for a CREATE TYPE ... AS ENUM registry
+   entry, or nil when `type-name` is not a registered enum."
+  ([type-name] (registered-enum-values *parse-db* type-name))
+  ([db type-name]
+   (when (and db type-name)
+     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
+           values (d/q '{:find [?value]
+                         :in [$ ?name]
+                         :where [[?enum :datahike.pg.enum/name ?name]
+                                 [?enum :datahike.pg.enum/values ?value]]}
+                       db bare)]
+       (when (seq values)
+         (into #{} (map (comp str first)) values))))))
+
 (def ^:dynamic *parse-sql*
   "Bound by parse-sql to itself so top-level translate-* entries in
    datahike.pg.sql.stmt can seed `:parse-sql` into make-ctx without a

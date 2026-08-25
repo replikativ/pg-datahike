@@ -1618,6 +1618,10 @@
                                                                  ;; .getArrayData. (str cdt) carries the full "int[]".
                                                                    type-str (str/lower-case (str (.getDataType cdt)))
                                                                    full-str (str/lower-case (str cdt))
+                                                                   enum-values (when-not
+                                                                                (or (contains? types/pg-name->oid full-str)
+                                                                                    (contains? types/pg-name->oid type-str))
+                                                                                 (params/registered-enum-values cte-db full-str))
                                                                    _ (when-not (pgs/sql-type-exists? cte-db full-str)
                                                                        (throw (errors/pg-error
                                                                                :undefined-object
@@ -1691,6 +1695,15 @@
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
                                                                  (or (nil? raw) (= :__null__ raw))
                                                                  :__null__
+                                                                 enum-values
+                                                                 (let [label (str raw)]
+                                                                   (if (contains? enum-values label)
+                                                                     label
+                                                                     (throw
+                                                                      (ex-info "invalid input value for enum"
+                                                                               {:error :invalid-text-representation
+                                                                                :enum? true :type full-str
+                                                                                :value label}))))
                                                                  :else
                                                                  (sql-cast/cast-scalar
                                                                   raw type-str

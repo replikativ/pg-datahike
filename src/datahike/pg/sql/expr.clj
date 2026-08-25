@@ -1288,6 +1288,22 @@
       (throw (errors/pg-error :feature-not-supported
                               {:feature "to_char with a temporal value"}))
 
+      ;; User-defined enum input is database metadata, so the pure scalar
+      ;; helper cannot validate it without this translation-time closure.
+      (= fname "pg_input_is_valid")
+      (let [_ (fns/check-arity! fname (count args))
+            db (:db ctx)
+            valid? (fn [value type-name]
+                     (if-let [values (params/registered-enum-values db type-name)]
+                       (contains? values (str value))
+                       (fns/pg-input-valid? value type-name)))
+            fn-param (symbol (str "?fn-pg-input-is-valid-"
+                                  (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj (fns/null-safe valid?))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       ;; Known mapped functions. Emit via an in-param wrapping `null-safe`
       ;; so SQL NULL propagates (UPPER(NULL)=NULL etc.) instead of throwing
       ;; when a raw Clojure fn receives the `:__null__` keyword sentinel.
@@ -2470,6 +2486,20 @@
         is-uuid? (= :uuid cast-cat)
         is-bit? (or (= :bit cast-cat) (= :varbit cast-cat))
         is-array? (= :array cast-cat)
+        enum-values (when (and (nil? cast-cat)
+                               (not (contains? types/pg-name->oid type-str)))
+                      (params/registered-enum-values (:db ctx) type-str))
+        is-enum? (some? enum-values)
+        enum-cast (fn [v]
+                    (if (or (nil? v) (= :__null__ v))
+                      :__null__
+                      (let [label (str v)]
+                        (if (contains? enum-values label)
+                          label
+                          (throw (ex-info "invalid input value for enum"
+                                          {:error :invalid-text-representation
+                                           :enum? true :type type-str
+                                           :value label}))))))
         ;; `::json` / `::jsonb`. `cast-category` has no json branch, so
         ;; these fell through every arm and the value passed UNCHANGED —
         ;; the cast was a no-op that only set the wire OID, so
@@ -2483,6 +2513,17 @@
         ;; (integer 2) from text '10' (integer 10).
         src-oid (source-oid ctx inner)]
     (cond
+      is-enum?
+      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+        (enum-cast inner-raw)
+        (let [fn-param (symbol (str "?cast-enum" (swap! (:var-counter ctx) inc)))
+              result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
+              inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj enum-cast)
+          (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+          result-var))
+
       ;; Both types VALIDATE on input; only jsonb normalises after.
       json-cast
       (if (string? inner-raw)

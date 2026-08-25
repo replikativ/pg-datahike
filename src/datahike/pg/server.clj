@@ -6125,6 +6125,20 @@
 (defn- exec-ddl-create-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
+        values (:values parsed)
+        duplicate (some (fn [[label n]] (when (> n 1) label))
+                        (frequencies values))
+        _ (when duplicate
+            (throw (ex-info (str "enum label " (pr-str duplicate)
+                                 " used more than once")
+                            {:error :duplicate-object :sqlstate "42710"})))
+        _ (doseq [label values]
+            (when (> (alength (.getBytes ^String label
+                                         java.nio.charset.StandardCharsets/UTF_8))
+                     63)
+              (throw (ex-info (str "invalid enum label " (pr-str label))
+                              {:error :name-too-long :sqlstate "42622"
+                               :detail "Labels must be 63 bytes or less."}))))
         tx-data (enum-tx-data (:type-name parsed) (:values parsed))]
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
