@@ -2589,7 +2589,12 @@
   (clamp-rscale (- numeric-min-sig-digits (estimate-ln-dweight a)) (.scale a)))
 
 (def ^:private ln10-str
-  "2.30258509299404568401799145468436420760110148862877297603333")
+  ;; Kept beyond NUMERIC_MIN_SIG_DIGITS because a high-scale input can ask
+  ;; log() for many more displayed digits. bd-ln's decimal range reduction
+  ;; multiplies this constant by the input exponent; a short constant made
+  ;; the tail of log(1.234567e-89) drift despite ample MathContext precision.
+  (str "2.30258509299404568401799145468436420760110148862877297603332790096757260967735248"
+       "02359972050895982983419677840422862486334095254650828067566662873690987816894829"))
 
 (defn- bd-ln
   "ln to `prec` significant digits. Reduce x = m*10^k with 1 <= m < 10,
@@ -2828,12 +2833,25 @@
       (throw-logarithm-error (if (zero? (.signum bad))
                                "cannot take logarithm of zero"
                                "cannot take logarithm of a negative number"))))
-  (let [rs (ln-rscale x)
-        p (+ rs 25)
-        mc (java.math.MathContext. (int p))
-        lb (bd-ln base p)]
+  (let [base-weight (estimate-ln-dweight base)
+        num-weight (estimate-ln-dweight x)
+        result-weight (- num-weight base-weight)
+        ;; numeric.c log_var: unlike ln(), the result's scale depends on
+        ;; BOTH inputs and on the estimated weight of the quotient.
+        rs (clamp-rscale (- numeric-min-sig-digits result-weight)
+                         (max (.scale base) (.scale x)))
+        base-rscale (max 0 (+ rs result-weight (- base-weight) 8))
+        num-rscale (max 0 (+ rs result-weight (- num-weight) 8))
+        precision-for-rscale (fn [rscale dweight]
+                               (max 1 (+ rscale (max 0 (inc dweight)))))
+        base-precision (precision-for-rscale base-rscale base-weight)
+        num-precision (precision-for-rscale num-rscale num-weight)
+        result-precision (+ (precision-for-rscale rs result-weight) 8)
+        mc (java.math.MathContext. (int result-precision))
+        lb (bd-ln base base-precision)]
     (when (zero? (.signum lb)) (throw-division-by-zero))
-    (.setScale (.divide (bd-ln x p) lb mc) (int rs) java.math.RoundingMode/HALF_UP)))
+    (.setScale (.divide (bd-ln x num-precision) lb mc)
+               (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- power-rscale
   "numeric.c power_var_int: the result's decimal weight is about

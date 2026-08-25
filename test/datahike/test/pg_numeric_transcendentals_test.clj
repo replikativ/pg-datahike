@@ -80,6 +80,22 @@
          arguments coerce to numeric")
     (is (= "numeric" (one c "SELECT pg_typeof(log(2,64))")))))
 
+(deftest logarithms-follow-postgresql-working-scales
+  (with-open [c (jdbc)]
+    (doseq [[sql expected]
+            [["SELECT log(1.234567e-89)"
+              (str "-88.908485335913737256374964929449251872930523363064431433128258"
+                   "69985819779294142441287021741054275")]
+             ["SELECT log(1.23e-89, 6.4689e45)"
+              (str "-0.515248920778185698397705497175648487965356816847920188542558"
+                   "8841094788842469115325262329756")]
+             ["SELECT log(0.99923, 4.58934e34)" "-103611.55579544132"]
+             ["SELECT log(1.000016, 8.452010e18)" "2723830.2877097365"]
+             ["SELECT log(3.1954752e47, 9.4792021e-73)"
+              (str "-1.516133723506883021429173861434593616086001576927791644753518"
+                   "42333265418126982165")]]]
+      (is (= expected (one c sql)) sql))))
+
 (deftest domain-errors-keep-their-own-sqlstates
   (with-open [c (jdbc)]
     (is (thrown-with-msg? SQLException #"cannot take logarithm of zero"

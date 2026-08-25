@@ -112,6 +112,10 @@
        :source-lines [1271 1278]
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
        :test-var "square-root-rounding-thresholds"}
+      {:id :numeric-log-working-scales
+       :source-lines [1418 1441]
+       :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
+       :test-var "logarithms-follow-postgresql-working-scales"}
       {:id :width-bucket-extreme-spans
        :source-lines [940 943]
        :gate "test/datahike/test/pg_numeric_special_test.clj"
