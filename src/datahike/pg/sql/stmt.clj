@@ -911,6 +911,17 @@
           i (.lastIndexOf n ".")]
       (if (neg? i) n (subs n (inc i))))))
 
+(defn- target-list-srf?
+  "Whether expr is a set-returning function supported by ProjectSet.
+
+   Keep this deliberately narrower than `known-srf-names`: several entries in
+   that set are scalar compatibility shims when used outside FROM.  These two
+   functions have unambiguous PostgreSQL set semantics in a SELECT list."
+  [expr]
+  (and (instance? Function expr)
+       (contains? #{"generate_series" "unnest"}
+                  (srf-base-name (.getName ^Function expr)))))
+
 (defn materialize-table-function
   "Produce rows for a `TableFunction` FROM item. Supports the common
    constant-arg set-returning functions:
@@ -1139,6 +1150,53 @@
        (with-ordinality [fname] [[(java.util.Date.)]] [:db.type/instant] [nil])
 
        :else nil))))
+
+(defn- project-set-values
+  "Evaluate one top-level target-list SRF for a base result row."
+  [^Function f args]
+  (let [params (vec (or (.getParameters f) []))
+        values (mapv #(if (= :__null__ %) nil %) args)
+        by-expr (java.util.IdentityHashMap.)]
+    (doseq [[e v] (map vector params values)]
+      (.put by-expr e v))
+    (if-let [materialized
+             (materialize-table-function
+              (net.sf.jsqlparser.statement.select.TableFunction. f)
+              (fn [e]
+                (if (.containsKey by-expr e)
+                  (.get by-expr e)
+                  ::corr)))]
+      (mapv first (:rows materialized))
+      [])))
+
+(defn apply-project-set
+  "Expand base SELECT rows using PostgreSQL ProjectSet semantics.
+
+   Every SRF is evaluated once per base row. Multiple SRFs advance in
+   parallel to the longest result and shorter results are padded with SQL
+   NULL. A base row disappears only when every SRF is empty."
+  [rows specs]
+  (let [apply-level
+        (fn [rows level-specs]
+          (vec
+           (mapcat
+            (fn [row]
+              (let [row (if (sequential? row) (vec row) [row])
+                    values (mapv (fn [{:keys [function arg-indices]}]
+                                   (project-set-values
+                                    function (mapv #(nth row % nil) arg-indices)))
+                                 level-specs)
+                    n (reduce max 0 (map count values))]
+                (for [i (range n)]
+                  (reduce (fn [out [{:keys [out-pos]} vs]]
+                            (assoc out out-pos (if (< i (count vs))
+                                                 (nth vs i)
+                                                 :__null__)))
+                          row
+                          (map vector level-specs values)))))
+            rows)))]
+    (reduce apply-level rows
+            (map second (sort-by first (group-by :level specs))))))
 
 (defn- table-fn->virtual-table
   "Materialise a constant-arg `TableFunction` FROM item into a virtual
@@ -2011,7 +2069,9 @@
         ;; :db/valueType with what describeResult will tell clients.
          sub-oids (:select-item-oids sub-parsed)
          q-fn d/q
-         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count] :as p}]
+         run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count
+                                 project-set project-order-by project-limit project-offset]
+                          :as p}]
                       (if-let [literal-rows (:literal-rows p)]
                         literal-rows
                         (let [q (cond-> query
@@ -2028,9 +2088,18 @@
                               raw (if (seq in-args)
                                     (apply q-fn q exec-db in-args)
                                     (q-fn q exec-db))
+                              _ (when (seq project-order-by)
+                                  (throw (errors/pg-error
+                                          :feature-not-supported
+                                          {:feature "derived SELECT ordered by a set-returning function"})))
+                              raw (if (seq project-set)
+                                    (apply-project-set raw project-set)
+                                    raw)
                               raw (cond->> raw
                                     sql-offset (drop sql-offset)
-                                    sql-limit  (take sql-limit))
+                                    sql-limit  (take sql-limit)
+                                    project-offset (drop project-offset)
+                                    project-limit (take project-limit))
                               hc (or hidden-count 0)
                               visible (- (count (:find query)) hc)
                               raw (if (pos? hc)
@@ -3362,6 +3431,41 @@
         has-aggregates? (atom false)
         compound-exprs (atom [])  ;; [{:alias str :op sym :l-idx int :r-idx int}]
         window-specs (atom [])    ;; [{:op kw :partition-by [idx] :order-by [[idx dir]] :frame {...}}]
+        project-set-specs (atom [])
+        lower-project-srf!
+        (fn lower-project-srf! [^Function f alias-str visible?]
+          (let [children (atom [])
+                arg-vars
+                (mapv (fn [arg]
+                        (if (target-list-srf? arg)
+                          (let [{:keys [out-var] :as child}
+                                (lower-project-srf! ^Function arg nil false)]
+                            (swap! children conj child)
+                            out-var)
+                          (let [v (expr/translate-expr ctx arg)]
+                            (cond
+                              (symbol? v) v
+                              (seq? v) (ctx/materialize-arg! ctx v)
+                              :else (ctx/materialize-arg!
+                                     ctx (list 'identity
+                                               (if (nil? v) :__null__ v)))))))
+                      (vec (or (.getParameters f) [])))
+                level (if (seq @children)
+                        (inc (reduce max (map :level @children)))
+                        0)
+                out-var (ctx/fresh-var! ctx)
+                out-pos (when visible? (count @find-elements))
+                spec {:function f :arg-vars arg-vars :level level
+                      :out-var out-var :out-pos out-pos}]
+            (ctx/add-clause! ctx [(list 'identity :__null__) out-var])
+            (doseq [child @children]
+              (swap! project-set-specs conj child))
+            (swap! project-set-specs conj spec)
+            (when visible?
+              (swap! find-elements conj out-var)
+              (swap! find-aliases conj
+                     (or alias-str (srf-base-name (.getName f)))))
+            spec))
 
         ;; Lightweight oid-env — built before aggregate dispatch so the
         ;; SUM/AVG branches can pick the numeric-precision runtime
@@ -4059,6 +4163,14 @@
                      (fns/aggregate-function? (str/lower-case (.getName ^Function expr))))
                 (emit-agg! ^Function expr alias-str)
 
+                ;; PostgreSQL evaluates a top-level set-returning function in
+                ;; the SELECT list through a ProjectSet node. Keep one
+                ;; placeholder in the visible projection and carry the SRF
+                ;; arguments as trailing hidden columns; exec-select expands
+                ;; each base row after its base ORDER BY and before LIMIT.
+                (target-list-srf? expr)
+                (lower-project-srf! ^Function expr alias-str true)
+
                 ;; Regular column or expression
                 :else
                 ;; An aggregate may be nested ANYWHERE in this expression --
@@ -4162,6 +4274,25 @@
                           ;; is what the old fallback chain produced.
                           (swap! find-aliases conj (or alias-str
                                                        (figure-colname expr)))))))))))
+
+        ;; ProjectSet arguments must survive the base Datalog query so the
+        ;; executor can evaluate each SRF per base row. Append them after all
+        ;; visible SELECT items, preserving the SQL projection positions.
+        project-base-find-count (count @find-elements)
+        _ (doseq [v (mapcat :arg-vars @project-set-specs)
+                  :when (neg? (.indexOf ^java.util.List @find-elements v))]
+            (swap! find-elements conj v))
+        project-set-specs
+        (mapv (fn [spec]
+                (assoc spec
+                       :out-pos (or (:out-pos spec)
+                                    (.indexOf ^java.util.List @find-elements
+                                              (:out-var spec)))
+                       :arg-indices (mapv #(.indexOf ^java.util.List
+                                            @find-elements %)
+                                          (:arg-vars spec))))
+              @project-set-specs)
+        project-set-hidden (- (count @find-elements) project-base-find-count)
 
         ;; Thread each distinct correlation column (e.g. t.oid) into :find
         ;; as a trailing hidden column so every outer row carries the value
@@ -4442,6 +4573,15 @@
                                               (if alias-idx
                                                 (nth fe-snap alias-idx)
                                                 (expr/translate-expr ctx expr)))
+
+                                            (target-list-srf? expr)
+                                            (or (some (fn [{:keys [function out-var]}]
+                                                        (when (= (str function) (str expr))
+                                                          out-var))
+                                                      project-set-specs)
+                                                (throw (errors/pg-error
+                                                        :feature-not-supported
+                                                        {:feature "ORDER BY an unprojected set-returning function"})))
 
                                             :else (expr/translate-expr ctx expr))
                                         ;; Materialize expression results for ORDER BY.
@@ -5211,7 +5351,8 @@
                                              (and (symbol? v)
                                                   (contains? nullable-vars v)))
                                            order-by-spec)))
-        [find-elems-vec hidden-count order-by-flat sql-order-by]
+        project-out-vars (into #{} (map :out-var) project-set-specs)
+        [find-elems-vec hidden-count order-by-flat sql-order-by project-order-by]
         (if order-by-spec
           (let [;; seq? covers an aggregate form contributed by ORDER BY that
                 ;; the projection did not emit — it rides on :hidden-count
@@ -5234,12 +5375,24 @@
                             (let [idx (.indexOf ^java.util.List extended-find v)]
                               (when (>= idx 0) [idx dir nulls])))
                           order-by-spec))
-                hidden (+ (count missing) having-hidden group-by-hidden)]
-            (if has-nullable-order?
+                hidden (+ project-set-hidden (count missing)
+                          having-hidden group-by-hidden)
+                project-order? (some project-out-vars (map first order-by-spec))]
+            (cond
+              project-order?
+              ;; An SRF output does not exist until ProjectSet has expanded
+              ;; the base rows, so the complete SQL sort belongs above that
+              ;; stage. Sorting the placeholder in Datalog is a no-op and can
+              ;; produce the wrong order for mixed base/SRF keys.
+              [extended-find hidden nil nil ob3]
+
+              has-nullable-order?
               ;; Nullable ORDER BY → server-side sort (don't emit :order-by to Datahike)
-              [extended-find hidden nil ob3]
+              [extended-find hidden nil ob3 nil]
+
+              :else
               ;; Non-nullable → Datahike handles it
-              [extended-find hidden ob nil]))
+              [extended-find hidden ob nil nil]))
           ;; No explicit SQL ORDER BY: default to a deterministic order on
           ;; the primary FROM table's entity var. Entity ids are issued
           ;; monotonically by d/transact, so this matches insertion order —
@@ -5264,9 +5417,11 @@
                                   (conj find-elems-vec evar)
                                   find-elems-vec)
                   idx (if (neg? already) (dec (count extended-find)) already)
-                  hidden (+ (if (neg? already) 1 0) having-hidden group-by-hidden)]
-              [extended-find hidden [idx :asc] nil])
-            [find-elems-vec (+ having-hidden group-by-hidden) nil nil]))
+                  hidden (+ project-set-hidden (if (neg? already) 1 0)
+                            having-hidden group-by-hidden)]
+              [extended-find hidden [idx :asc] nil nil])
+            [find-elems-vec (+ project-set-hidden having-hidden group-by-hidden)
+             nil nil nil]))
 
         in-params @(:in-params ctx)
         in-args @(:in-args ctx)
@@ -5331,6 +5486,23 @@
                       :else elem))
                   find-elems-vec)))
 
+        ;; These plan shapes require ProjectSet to move across another
+        ;; executor stage. Running it in the generic pre-window/pre-DISTINCT
+        ;; position produces plausible but wrong rows (for example a window
+        ;; count sees the expanded rows). Keep the boundary explicit until
+        ;; those stages carry projection-position metadata and can be ordered
+        ;; exactly like PostgreSQL's plan.
+        _project-window-boundary
+        (when (and (seq project-set-specs) (seq @window-specs))
+          (throw (errors/pg-error
+                  :feature-not-supported
+                  {:feature "combining window functions with target-list set-returning functions"})))
+        _project-distinct-on-boundary
+        (when (and (seq project-set-specs) (seq distinct-on-items))
+          (throw (errors/pg-error
+                  :feature-not-supported
+                  {:feature "DISTINCT ON with target-list set-returning functions"})))
+
         query-map (cond-> {:find  find-elems-vec
                            :where (vec where-clauses)}
                     ;; Add :in clause if we have extra params (CASE fns, etc.)
@@ -5345,8 +5517,12 @@
 
     (cond-> {:query           query-map
              ;; When server-side sort is needed, limit/offset are applied there too
-             :limit           (when-not sql-order-by limit-val)
-             :offset          (when-not sql-order-by offset-val)
+             :limit           (when (and (empty? project-set-specs)
+                                         (not sql-order-by))
+                                limit-val)
+             :offset          (when (and (empty? project-set-specs)
+                                         (not sql-order-by))
+                                offset-val)
              :find-aliases    @find-aliases
              ;; OID per find-alias for Extended Query Describe. nil slots
              ;; fall back to value-based inference at Execute time (via
@@ -5381,9 +5557,15 @@
                                 db)
              ;; Server-side sort for nullable ORDER BY columns
              :sql-order-by    sql-order-by
-             :sql-limit       (when sql-order-by limit-val)
-             :sql-offset      (when sql-order-by offset-val)
+             :sql-limit       (when (and (empty? project-set-specs) sql-order-by)
+                                limit-val)
+             :sql-offset      (when (and (empty? project-set-specs) sql-order-by)
+                                offset-val)
              :fetch-with-ties? fetch-with-ties?
+             :project-set     (when (seq project-set-specs) project-set-specs)
+             :project-order-by project-order-by
+             :project-limit   (when (seq project-set-specs) limit-val)
+             :project-offset  (when (seq project-set-specs) offset-val)
              ;; Compound aggregate expressions (MAX(a)-MIN(a)) for server-side computation
              :compound-exprs  (when (seq @compound-exprs) @compound-exprs)
              ;; Window function specs for server-side post-processing
@@ -7229,6 +7411,18 @@
                             (seq inner-in-args)
                             (apply q-fn inner-query inner-db inner-in-args)
                             :else (q-fn inner-query inner-db))
+            _ (when (seq (:project-order-by inner-parsed))
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:feature "INSERT ... SELECT ordered by a set-returning function"})))
+            inner-results (if-let [specs (seq (:project-set inner-parsed))]
+                            (let [expanded (apply-project-set inner-results specs)]
+                              (cond->> expanded
+                                (:project-offset inner-parsed)
+                                (drop (:project-offset inner-parsed))
+                                (:project-limit inner-parsed)
+                                (take (:project-limit inner-parsed))))
+                            inner-results)
             ;; The normal SELECT executor removes trailing helper find
             ;; elements (usually the entity id used for stable default
             ;; ordering) before projection post-processing. INSERT-SELECT

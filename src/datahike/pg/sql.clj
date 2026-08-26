@@ -666,6 +666,16 @@
           rows (if (seq (:in-args selected))
                  (apply d/q (:query selected) query-db (:in-args selected))
                  (d/q (:query selected) query-db))
+          _ (when (seq (:project-order-by selected))
+              (throw (errors/pg-error
+                      :feature-not-supported
+                      {:feature "CREATE TABLE AS SELECT ordered by a set-returning function"})))
+          rows (if-let [specs (seq (:project-set selected))]
+                 (let [expanded (stmt/apply-project-set rows specs)]
+                   (cond->> expanded
+                     (:project-offset selected) (drop (:project-offset selected))
+                     (:project-limit selected)  (take (:project-limit selected))))
+                 rows)
           hidden (long (or (:hidden-count selected) 0))
           visible-rows (mapv (fn [row]
                                (let [row (if (sequential? row) (vec row) [row])]
@@ -1447,16 +1457,6 @@
                                                   (some-> (.getColumnName ^net.sf.jsqlparser.schema.Column e)
                                                           clojure.string/lower-case)))
                                   (instance? net.sf.jsqlparser.expression.BooleanValue e))))
-                          unnest-single-item?
-                          (fn [^SelectItem item]
-                           ;; SELECT unnest(...) is a set-returning function
-                           ;; that the narrow table-free pattern below
-                           ;; expands into literal-rows — must take the
-                           ;; direct-eval branch even though Function isn't
-                           ;; in the trivial set.
-                            (let [e (.getExpression item)]
-                              (and (instance? Function e)
-                                   (= "unnest" (str/lower-case (.getName ^Function e))))))
                           gs-single-item?
                           (fn [^SelectItem item]
                            ;; SELECT generate_series(a,b[,c]) — a set-returning
@@ -1471,10 +1471,13 @@
                           table-free? (and (nil? (.getFromItem ^PlainSelect stmt))
                                            (nil? (.getWhere ^PlainSelect stmt))
                                            (let [items (.getSelectItems ^PlainSelect stmt)]
-                                             (or (every? trivial-table-free-item? items)
-                                                 (and (= 1 (count items))
-                                                      (or (unnest-single-item? (first items))
-                                                          (gs-single-item? (first items)))))))
+                                             ;; Target-list SRFs use the general
+                                             ;; ProjectSet lowering even when no
+                                             ;; FROM relation exists. The former
+                                             ;; one-item shortcut could not zip
+                                             ;; multiple SRFs and skipped SQL
+                                             ;; ORDER BY / OFFSET / LIMIT.
+                                             (every? trivial-table-free-item? items)))
                 ;; Narrow support for PG's set-returning-function idiom
                 ;;   SELECT unnest(array_fill(expr, ARRAY[count]))  — N rows of expr
                 ;;   SELECT unnest(ARRAY[e1,e2,e3])                 — N distinct rows
