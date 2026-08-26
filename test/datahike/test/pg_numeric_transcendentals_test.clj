@@ -18,7 +18,8 @@
    Expectations are a PostgreSQL 17 oracle's."
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql :as sql])
   (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
@@ -40,6 +41,12 @@
   (DriverManager/getConnection
    (str "jdbc:postgresql://127.0.0.1:" *port*
         "/t?user=x&password=x&sslmode=disable&binaryTransfer=false")))
+
+(defn- ^Connection jdbc-simple []
+  (DriverManager/getConnection
+   (str "jdbc:postgresql://127.0.0.1:" *port*
+        "/t?user=x&password=x&sslmode=disable&binaryTransfer=false"
+        "&preferQueryMode=simple")))
 
 (defn- one [^Connection c sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
@@ -221,6 +228,29 @@
         (catch SQLException e
           (is (= "22003" (.getSQLState e)))
           (is (re-find #"value overflows numeric format" (.getMessage e))))))))
+
+(deftest wide-numeric-literals-bypass-query-form-hashing
+  (let [parsed (sql/parse-sql
+                "SELECT round(4.4e131071, -131071) = 4e131071" {} nil)
+        wide? #(and (instance? java.math.BigDecimal %)
+                    (> (.precision ^java.math.BigDecimal %) 4096))
+        inputs (filter wide? (:in-args parsed))]
+    (is (= 2 (count inputs))
+        "both wide literals travel through Datalog scalar inputs")
+    (is (not-any? wide? (tree-seq coll? seq (:query parsed)))
+        "Datahike must not hasheq a 131072-digit BigDecimal in the query form")
+    (is (= [[131072 0] [131072 0]]
+           (mapv (fn [^java.math.BigDecimal v] [(.precision v) (.scale v)])
+                 inputs))
+        "parameterization preserves the exact PostgreSQL value and display scale")
+    (with-open [c (jdbc-simple)]
+      (is (= "t" (one c "SELECT round(4.4e131071, -131071) = 4e131071"))
+          "the simple-query executor binds the lifted scalar inputs too"))
+    (with-open [c (jdbc)]
+      (let [nonzero-wide (str (apply str (repeat 4097 "1")) "e0")]
+        (is (= "1" (one c (str "SELECT 1 WHERE false OR "
+                               nonzero-wide " = " nonzero-wide)))
+            "scoped clauses retain generated scalar-input bindings")))))
 
 (deftest square-root-rounding-thresholds
   (with-open [c (jdbc)]

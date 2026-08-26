@@ -89,6 +89,12 @@
 
 (declare jsonb-column? json-column? reject-json-operator!)
 (declare coerce-unknown-literal coerce-comparison-operands)
+
+(def ^:private ^:const max-inline-numeric-precision
+  "BigDecimals wider than this travel as Datalog inputs instead of query-form
+   constants. The cutoff is far above ordinary application numerics while
+   bounding the cost of Clojure's scale-insensitive numeric hash."
+  4096)
 (declare source-oid string-value-text)
 
 (declare translate-expr
@@ -3688,7 +3694,23 @@
     ;; so the literal is rebuilt from the ORIGINAL TOKEN, which
     ;; JSqlParser preserves in the node's string form.
     (instance? DoubleValue expr)
-    (types/decimal-literal expr (.getValue ^DoubleValue expr))
+    (let [v (types/decimal-literal expr (.getValue ^DoubleValue expr))]
+      ;; Clojure's numeric `hasheq` calls BigDecimal.stripTrailingZeros.
+      ;; For a valid PostgreSQL value such as 4e131071, that repeatedly
+      ;; divides a 131072-digit BigInteger while Datahike hashes the query
+      ;; form, turning a constant SELECT into minutes of CPU on JDK 21.
+      ;; Keep unusually wide literals out of the query form and pass them
+      ;; through Datalog's ordinary scalar-input boundary instead. This does
+      ;; not change the BigDecimal value or its display scale, and leaves
+      ;; normal literals embedded for the usual small-query fast path.
+      (if (and (instance? java.math.BigDecimal v)
+               (> (.precision ^java.math.BigDecimal v)
+                  max-inline-numeric-precision))
+        (let [p (symbol (str "?wide-numeric" (swap! (:var-counter ctx) inc)))]
+          (swap! (:in-params ctx) conj p)
+          (swap! (:in-args ctx) conj v)
+          p)
+        v))
 
     ;; Bit-string literals — MUST precede the plain StringValue branch,
     ;; which JSqlParser also uses for `B'1001000'` (prefix "B").
