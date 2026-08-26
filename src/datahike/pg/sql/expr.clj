@@ -63,7 +63,7 @@
             Alias ArrayExpression Function LongValue DoubleValue StringValue NullValue
             BooleanValue Parenthesis NotExpression CaseExpression WhenClause
             SignedExpression CastExpression TimeKeyExpression JsonExpression
-            ExtractExpression TrimFunction
+            ExtractExpression TrimFunction BinaryExpression
             TimezoneExpression ArrayConstructor JdbcParameter JdbcNamedParameter]
            [net.sf.jsqlparser.expression.operators.relational
             DoubleAnd EqualsTo ExistsExpression ExpressionList
@@ -98,7 +98,7 @@
    constants. The cutoff is far above ordinary application numerics while
    bounding the cost of Clojure's scale-insensitive numeric hash."
   4096)
-(declare source-oid string-value-text)
+(declare source-oid string-value-text op-sym->sql)
 
 (declare translate-expr
          column-value!
@@ -112,7 +112,11 @@
          translate-binary-arith
          strict-subquery-values
          strict-subquery-rows
+         strict-subquery-row
          in-left-asts
+         row-expression?
+         row-comparison-expression?
+         translate-row-comparison
          analyze-in-subquery!
          analyze-exists-subquery!
          uncorrelated-in-values-var!
@@ -2235,6 +2239,9 @@
             (translate-predicate-expr ctx (.getLeftExpression e))
             (translate-predicate-expr ctx (.getRightExpression e))))
 
+    (row-comparison-expression? expr)
+    (translate-row-comparison ctx expr)
+
     ;; The NaN-aware comparisons, as in translate-comparison: PostgreSQL
     ;; sorts NaN above everything, and IEEE-754 answers false for every
     ;; comparison involving one.
@@ -3674,14 +3681,62 @@
         (vec (mapcat identity rows))))
     (run-subquery-leaf p db)))
 
-(defn- check-in-output-type! [left-oid right-oid]
-  (when-not (types/comparison-compatible? '= left-oid right-oid)
-    (throw (errors/pg-error
-            :undefined-function
-            {:detail (str "operator does not exist: "
-                          (get types/oid->pg-name left-oid "?") " = "
-                          (get types/oid->pg-name right-oid "?"))
-             :hint "No operator matches the given name and argument types. You might need to add explicit type casts."}))))
+(def ^:private row-op->sym
+  {:= '= :<> 'not= :< '< :<= '<= :> '> :>= '>=})
+
+(defn- check-row-field-type! [op left-oid right-oid]
+  (let [op-sym (get row-op->sym op '=)]
+    (when-not (types/comparison-compatible? op-sym left-oid right-oid)
+      (throw (errors/pg-error
+              :undefined-function
+              {:detail (str "operator does not exist: "
+                            (get types/oid->pg-name left-oid "?") " "
+                            (get op-sym->sql op-sym (str op-sym)) " "
+                            (get types/oid->pg-name right-oid "?"))
+               :hint "No operator matches the given name and argument types. You might need to add explicit type casts."})))))
+
+(defn- check-row-runtime-field-type! [op left-oid right-oid]
+  ;; comparison-compatible? deliberately treats uncategorized types leniently
+  ;; for common-type selection. Operator lookup cannot: PostgreSQL provides
+  ;; neither int4[] = int8[] nor enum = text. UNKNOWN remains coercible, and
+  ;; equal custom OIDs still name the same operator family.
+  (when (and left-oid right-oid
+             (not= left-oid right-oid)
+             (or (nil? (get types/oid->category left-oid))
+                 (nil? (get types/oid->category right-oid))))
+    (let [op-sym (get row-op->sym op '=)]
+      (throw (errors/pg-error
+              :undefined-function
+              {:detail (str "operator does not exist: "
+                            (get types/oid->pg-name left-oid "?") " "
+                            (get op-sym->sql op-sym (str op-sym)) " "
+                            (get types/oid->pg-name right-oid "?"))
+               :hint "No operator matches the given name and argument types. You might need to add explicit type casts."}))))
+  (check-row-field-type! op left-oid right-oid)
+  (let [ordering? (contains? #{:< :<= :> :>=} op)
+        oids (remove nil? [left-oid right-oid])
+        unsupported (some (fn [oid]
+                            (when (or (= oid types/oid-jsonb)
+                                      ;; These use storage carriers whose JVM
+                                      ;; equality is not PostgreSQL equality
+                                      ;; (notably 1 day = 24 hours). Typed
+                                      ;; dispatch must precede support here.
+                                      (contains? #{types/oid-time
+                                                   types/oid-interval
+                                                   types/oid-timetz}
+                                                 oid)
+                                      (and ordering?
+                                           (or (contains? types/array-oid->element-oid oid)
+                                               (nil? (get types/oid->pg-name oid)))))
+                              oid))
+                          oids)]
+    (when unsupported
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "row comparison for "
+                             (or (get types/oid->pg-name unsupported)
+                                 "a user-defined type")
+                             " is not implemented")})))))
 
 (defn- in-left-asts [left]
   (cond
@@ -3694,17 +3749,52 @@
 
     :else [left]))
 
-(defn- check-in-output-types! [left-oids right-oids right-resolution-oids]
+(defn- row-expression?
+  "True for an explicit SQL row constructor, not a scalar parenthesis."
+  [expr]
+  (or (and (instance? ParenthesedExpressionList expr)
+           (> (.size ^ParenthesedExpressionList expr) 1))
+      (and (instance? Function expr)
+           (= "row" (some-> ^Function expr .getName str/lower-case)))))
+
+(defn- row-comparison-op [expr]
+  (cond
+    (instance? EqualsTo expr) :=
+    (instance? NotEqualsTo expr) :<>
+    (instance? MinorThan expr) :<
+    (instance? MinorThanEquals expr) :<=
+    (instance? GreaterThan expr) :>
+    (instance? GreaterThanEquals expr) :>=))
+
+(defn- row-comparison-expression?
+  "Recognise PostgreSQL row comparisons and row-vs-Sublink comparisons.
+
+   A multi-column scalar subquery is only legal on the right of an explicit
+   row expression. A subquery on the left retains ordinary scalar-subquery
+   width rules."
+  [expr]
+  (when (row-comparison-op expr)
+    (let [^BinaryExpression expr expr
+          left (.getLeftExpression expr)
+          right (.getRightExpression expr)]
+      (and (row-expression? left)
+           (or (row-expression? right)
+               (instance? ParenthesedSelect right))))))
+
+(defn- check-row-output-types! [op left-oids right-oids comparison-oids]
   (when (not= (count left-oids) (count right-oids))
     (throw (errors/pg-error
             :syntax-error
             {:message (if (< (count right-oids) (count left-oids))
                         "subquery has too few columns"
                         "subquery has too many columns")})))
-  (doseq [[left-oid right-oid resolution-oid]
-          (map vector left-oids right-oids right-resolution-oids)]
-    (when (and left-oid resolution-oid)
-      (check-in-output-type! left-oid right-oid))))
+  (doseq [[left-oid right-oid comparison-oid]
+          (map vector left-oids right-oids comparison-oids)]
+    (when (and left-oid comparison-oid)
+      (check-row-field-type! op left-oid right-oid))))
+
+(defn- check-in-output-types! [left-oids right-oids right-resolution-oids]
+  (check-row-output-types! := left-oids right-oids right-resolution-oids))
 
 (defn- strict-subquery-rows
   "Execute an IN subquery and return all visible rows.
@@ -3712,42 +3802,48 @@
    Expected left OIDs establish row width and per-position operator
    compatibility before any result is consumed. Translation errors remain
    SQL answers rather than being collapsed into an empty RHS."
-  [parse-fn inner schema db left-oids relation-namespaces]
-  (let [runtime-db params/*runtime-db*
+  ([parse-fn inner schema db left-oids relation-namespaces]
+   (strict-subquery-rows parse-fn inner schema db left-oids relation-namespaces
+                         {:op := :unknown-from-left? true}))
+  ([parse-fn inner schema db left-oids relation-namespaces
+    {:keys [op unknown-from-left?]
+     :or {op := unknown-from-left? true}}]
+   (let [runtime-db params/*runtime-db*
         ;; Query-local relations live only in the enriched parse-time DB.
         ;; Ordinary prepared subqueries must instead read the current
         ;; execution snapshot.
-        runtime-schema (when runtime-db
-                         (try (dbi/-schema runtime-db)
-                              (catch Throwable _ nil)))
-        fallback-schema (when db
-                          (try (dbi/-schema db)
+         runtime-schema (when runtime-db
+                          (try (dbi/-schema runtime-db)
                                (catch Throwable _ nil)))
-        enriched? (and db runtime-schema
-                       (some #(not (contains? runtime-schema %))
-                             (keys fallback-schema)))
-        db (cond
-             (seq relation-namespaces) db
-             enriched? db
-             runtime-db runtime-db
-             :else db)
-        p (binding [ctx/*relation-namespaces* relation-namespaces]
-            (parse-fn (str inner) schema db))
-        output-oids (parsed-output-oids p)
-        resolution-oids (if (= :set-operation (:type p))
-                          output-oids
-                          (leaf-resolution-oids p))
-        _ (when left-oids
-            (check-in-output-types! left-oids output-oids resolution-oids))
-        target-oids (mapv (fn [left-oid output-oid resolution-oid]
-                            (if (and left-oid (nil? resolution-oid))
-                              left-oid
-                              output-oid))
-                          left-oids output-oids resolution-oids)
-        rows (run-parsed-subquery p db)]
-    (if (seq target-oids)
-      (mapv #(set-ops/coerce-row % target-oids) rows)
-      rows)))
+         fallback-schema (when db
+                           (try (dbi/-schema db)
+                                (catch Throwable _ nil)))
+         enriched? (and db runtime-schema
+                        (some #(not (contains? runtime-schema %))
+                              (keys fallback-schema)))
+         db (cond
+              (seq relation-namespaces) db
+              enriched? db
+              runtime-db runtime-db
+              :else db)
+         p (binding [ctx/*relation-namespaces* relation-namespaces]
+             (parse-fn (str inner) schema db))
+         output-oids (parsed-output-oids p)
+         resolution-oids (if (= :set-operation (:type p))
+                           output-oids
+                           (leaf-resolution-oids p))
+         comparison-oids (if unknown-from-left? resolution-oids output-oids)
+         _ (when left-oids
+             (check-row-output-types! op left-oids output-oids comparison-oids))
+         target-oids (mapv (fn [left-oid output-oid resolution-oid]
+                             (if (and unknown-from-left? left-oid (nil? resolution-oid))
+                               left-oid
+                               output-oid))
+                           left-oids output-oids resolution-oids)
+         rows (run-parsed-subquery p db)]
+     (if (seq target-oids)
+       (mapv #(set-ops/coerce-row % target-oids) rows)
+       rows))))
 
 (defn- strict-subquery-values
   "Execute a scalar IN subquery and return every value in its output column.
@@ -3762,6 +3858,18 @@
    (mapv first
          (strict-subquery-rows parse-fn inner schema db
                                [left-oid] relation-namespaces))))
+
+(defn- strict-subquery-row
+  "Execute a row-valued scalar subquery with PostgreSQL cardinality rules."
+  [parse-fn inner schema db left-oids relation-namespaces op]
+  (let [rows (strict-subquery-rows parse-fn inner schema db left-oids
+                                   relation-namespaces
+                                   {:op op :unknown-from-left? false})]
+    (case (count rows)
+      0 (vec (repeat (count left-oids) :__null__))
+      1 (first rows)
+      (throw (ex-info "more than one row returned by a subquery used as an expression"
+                      {:error :cardinality-violation :sqlstate "21000"})))))
 
 (defn- correlation-oids [ctx corr-refs]
   (reduce (fn [m [alias col]]
@@ -3917,6 +4025,200 @@
     (ctx/add-clause! ctx [(apply list fn-param (concat left-values arg-vars)) result-var])
     (swap! (:nullable-vars ctx) conj result-var)
     result-var))
+
+(defn- resolved-outer-column-ref [ctx ^Column col]
+  (let [col-name (-> col .getColumnName unquote-ident str/lower-case)
+        resolved (ctx/resolve-column col
+                                     (:table-aliases ctx)
+                                     (:default-table ctx)
+                                     (:col-overrides ctx)
+                                     (:derived-aliases ctx)
+                                     (:ci-index ctx))
+        attr (ctx/attr-of ctx resolved)
+        aliases (distinct (concat (:relation-aliases (meta (:table-aliases ctx)))
+                                  (keys (:table-aliases ctx))
+                                  [(:default-table ctx)]))
+        owners (keep (fn [alias]
+                       (when alias
+                         (let [qualified (Column. (Table. ^String (name alias))
+                                                  ^String col-name)]
+                           (when (= resolved
+                                    (ctx/resolve-column qualified
+                                                        (:table-aliases ctx)
+                                                        (:default-table ctx)
+                                                        (:col-overrides ctx)
+                                                        (:derived-aliases ctx)
+                                                        (:ci-index ctx)))
+                             alias))))
+                     aliases)
+        owner (or (when (some #{(:default-table ctx)} owners)
+                    (:default-table ctx))
+                  (first owners))]
+    (ctx/validate-column! ctx attr)
+    (when-not owner
+      (throw (errors/pg-error :undefined-column {:column col-name})))
+    [(name owner) col-name]))
+
+(defn- row-subquery-correlation-refs [ctx inner]
+  (let [qualified (correlated-subquery-refs inner (outer-alias-set ctx))
+        ;; An inner SELECT without FROM resolves its unqualified columns in
+        ;; the outer scope. PostgreSQL's own ROWCOMPARE regression uses
+        ;; `(SELECT f1, f2)` in precisely this shape.
+        unqualified (when (and (instance? PlainSelect inner)
+                               (nil? (.getFromItem ^PlainSelect inner)))
+                      (into #{}
+                            (keep (fn [^Column col]
+                                    (when (str/blank?
+                                           (some-> col .getTable .getName))
+                                      (resolved-outer-column-ref ctx col))))
+                            (mapcat params/ast-columns
+                                    (plain-select-scope-nodes inner))))]
+    (not-empty (into (set qualified) unqualified))))
+
+(defn- analyze-row-comparison-subquery!
+  [ctx op left-oids inner corr-refs]
+  (let [corr-oids (correlation-oids ctx corr-refs)
+        null-bindings (reduce (fn [m [alias col]]
+                                (assoc-in m [alias col] :__null__))
+                              {} corr-refs)
+        parsed (binding [params/*from-bindings* null-bindings
+                         params/*from-binding-oids* corr-oids
+                         params/*from-source-aliases* (set (map first corr-refs))
+                         params/*lateral-outer-aliases* (set (map first corr-refs))]
+                 ((:parse-sql ctx) (str inner) (:schema ctx) (:db ctx)))
+        _ (validate-parsed-in-plan! parsed)
+        output-oids (parsed-output-oids parsed)]
+    ;; Unlike IN, a subquery's UNKNOWN output is resolved to text before a
+    ;; RowCompareExpr selects its per-field operators.
+    (check-row-output-types! op left-oids output-oids output-oids)
+    (doseq [[left-oid right-oid] (map vector left-oids output-oids)]
+      (check-row-runtime-field-type! op left-oid right-oid))
+    output-oids))
+
+(defn- translate-row-fields [ctx asts counterpart-oids]
+  (mapv (fn [ast counterpart-oid]
+          (let [v (translate-expr ctx ast)]
+            (if (and counterpart-oid (oid-infer/untyped-literal? ast))
+              (set-ops/coerce-value v counterpart-oid)
+              v)))
+        asts counterpart-oids))
+
+(defn- row-comparison-result-var!
+  [ctx op left-values right-values]
+  (let [width (count left-values)
+        values (mapv #(if (seq? %) (ctx/materialize-arg! ctx %) %)
+                     (concat left-values right-values))
+        fn-param (symbol (str "?row-cmp" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        evaluate (fn [& args]
+                   (fns/sql-row-compare3 op
+                                         (take width args)
+                                         (drop width args)))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj evaluate)
+    (ctx/add-clause! ctx [(apply list fn-param values) result-var])
+    (swap! (:nullable-vars ctx) conj result-var)
+    result-var))
+
+(defn- uncorrelated-row-subquery-var!
+  [ctx op inner left-oids]
+  (let [parse-fn (:parse-sql ctx)
+        schema (:schema ctx)
+        fallback-db (:db ctx)
+        relation-namespaces ctx/*relation-namespaces*
+        fn-param (symbol (str "?row-sublink" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        evaluate (fn []
+                   (strict-subquery-row parse-fn inner schema fallback-db left-oids
+                                        relation-namespaces op))]
+    (reset! (:runtime-subqueries? ctx) true)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj evaluate)
+    (ctx/add-clause! ctx [(list fn-param) result-var])
+    result-var))
+
+(defn- row-subquery-result-var!
+  [ctx op rhs-var left-values]
+  (let [left-values (mapv #(if (seq? %) (ctx/materialize-arg! ctx %) %) left-values)
+        fn-param (symbol (str "?row-sublink-cmp" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        evaluate (fn [rhs & lhs] (fns/sql-row-compare3 op lhs rhs))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj evaluate)
+    (ctx/add-clause! ctx [(apply list fn-param rhs-var left-values) result-var])
+    (swap! (:nullable-vars ctx) conj result-var)
+    result-var))
+
+(defn- correlated-row-subquery-comparison-var!
+  [ctx op inner left-values left-oids corr-refs]
+  (let [parse-fn (:parse-sql ctx)
+        schema (:schema ctx)
+        db (:db ctx)
+        relation-namespaces ctx/*relation-namespaces*
+        corr-refs (vec corr-refs)
+        corr-oids (correlation-oids ctx corr-refs)
+        corr-values (mapv (fn [[alias col]]
+                            (translate-expr ctx (Column. (Table. ^String alias)
+                                                         ^String col)))
+                          corr-refs)
+        left-values (mapv #(if (seq? %) (ctx/materialize-arg! ctx %) %) left-values)
+        left-width (count left-values)
+        fn-param (symbol (str "?corr-row-sublink" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        evaluate (fn [& args]
+                   (let [lhs (vec (take left-width args))
+                         outer-values (drop left-width args)
+                         bindings (reduce (fn [m [[alias col] v]]
+                                            (assoc-in m [alias col] v))
+                                          {} (map vector corr-refs outer-values))
+                         rhs (binding [params/*from-bindings* bindings
+                                       params/*from-binding-oids* corr-oids
+                                       params/*from-source-aliases*
+                                       (set (map first corr-refs))
+                                       params/*lateral-outer-aliases*
+                                       (set (map first corr-refs))]
+                               (strict-subquery-row parse-fn inner schema db left-oids
+                                                    relation-namespaces op))]
+                     (fns/sql-row-compare3 op lhs rhs)))]
+    (reset! (:runtime-subqueries? ctx) true)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj evaluate)
+    (ctx/add-clause! ctx
+                     [(apply list fn-param (concat left-values corr-values)) result-var])
+    (swap! (:nullable-vars ctx) conj result-var)
+    result-var))
+
+(defn- translate-row-comparison [ctx expr]
+  (let [^BinaryExpression expr expr
+        op (row-comparison-op expr)
+        left-asts (in-left-asts (.getLeftExpression expr))
+        right (.getRightExpression expr)
+        inner (when (instance? ParenthesedSelect right)
+                (.getSelect ^ParenthesedSelect right))]
+    (if inner
+      (let [left-oids (mapv #(operand-type-oid ctx %) left-asts)
+            corr-refs (row-subquery-correlation-refs ctx inner)
+            right-oids (analyze-row-comparison-subquery!
+                        ctx op left-oids inner corr-refs)
+            left-values (translate-row-fields ctx left-asts right-oids)]
+        (if (seq corr-refs)
+          (correlated-row-subquery-comparison-var!
+           ctx op inner left-values left-oids corr-refs)
+          (let [rhs-var (uncorrelated-row-subquery-var! ctx op inner left-oids)]
+            (row-subquery-result-var! ctx op rhs-var left-values))))
+      (let [right-asts (in-left-asts right)]
+        (when-not (= (count left-asts) (count right-asts))
+          (throw (errors/pg-error
+                  :syntax-error
+                  {:message "unequal number of entries in row expressions"})))
+        (let [left-oids (mapv #(operand-type-oid ctx %) left-asts)
+              right-oids (mapv #(operand-type-oid ctx %) right-asts)]
+          (doseq [[left-oid right-oid] (map vector left-oids right-oids)]
+            (check-row-runtime-field-type! op left-oid right-oid))
+          (row-comparison-result-var!
+           ctx op
+           (translate-row-fields ctx left-asts right-oids)
+           (translate-row-fields ctx right-asts left-oids)))))))
 
 (defn- analyze-exists-subquery!
   "Validate a correlated EXISTS body before the outer relation is scanned."
@@ -5700,6 +6002,10 @@
        ctx (binding [*conjunctive-where* false]
              [(translate-predicate ctx (.getLeftExpression e))
               (translate-predicate ctx (.getRightExpression e))])))
+
+    (row-comparison-expression? expr)
+    (let [result (translate-row-comparison ctx expr)]
+      [[(list 'true? result)]])
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr

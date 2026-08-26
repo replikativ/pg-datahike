@@ -2,7 +2,7 @@
  {:scalar-and-structural-types
   #{"box" "circle" "geometry" "inet" "line" "lseg"
     "macaddr" "macaddr8" "multirangetypes" "oid" "path" "pg_lsn"
-    "point" "polygon" "rangetypes" "regproc" "rowtypes" "timetz"
+    "point" "polygon" "rangetypes" "regproc" "timetz"
     "txid" "xid"}
 
   :expressions-and-builtins

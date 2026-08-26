@@ -55,6 +55,15 @@
        :source-lines [243 253]
        :gate "test/datahike/test/pg_bitwise_test.clj"
        :test-var "bit-input-error-info"}]}
+    {:name "rowtypes" :mode :discovery
+     :boundaries #{:structural-type :row-comparisons :nulls}
+     :blockers #{:composite-type-ddl :composite-storage :custom-operators
+                 :fixture-data :planner-explain}
+     :strict-slices
+     [{:id :standard-row-comparison-semantics
+       :source-lines [98 109]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "row-comparisons-follow-postgresql-semantics"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
      ;; The remaining raw pg_regress diff is classified: row order in
@@ -412,7 +421,19 @@
       {:id :row-in-subquery
        :source-lines [80 83]
        :gate "test/datahike/test/pg_correlated_subquery_test.clj"
-       :test-var "postgres-17-row-in-regression-slice"}]}
+       :test-var "postgres-17-row-in-regression-slice"}
+      {:id :correlated-row-comparison-subquery
+       :source-lines [90 90]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "postgres-17-row-comparison-subquery-slice"}
+      {:id :uncorrelated-row-comparison-subquery
+       :source-lines [95 95]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "postgres-17-row-comparison-subquery-slice"}
+      {:id :row-comparison-subquery-cardinality
+       :source-lines [97 97]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "postgres-17-row-comparison-subquery-slice"}]}
     {:name "union" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:relational :common-types}

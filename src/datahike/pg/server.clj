@@ -7822,6 +7822,18 @@
                                                               toids))]
                                               (sql/parse-sql tsql schema db))]
                                       (when (and p (not= :error (:type p))
+                                                 ;; Runtime subqueries reparse
+                                                 ;; their inner SELECT during
+                                                 ;; execution. A one-shot
+                                                 ;; numeric template would
+                                                 ;; leave its generated $N
+                                                 ;; placeholders trapped in
+                                                 ;; that inner SQL after the
+                                                 ;; outer ParamRefs were
+                                                 ;; resolved. Parse the
+                                                 ;; original literal SQL for
+                                                 ;; these plans instead.
+                                                 (not (:runtime-subqueries? p))
                                                  (contains? #{:select :update :delete}
                                                             (:type p)))
                                         (when bump-dispatch! (bump-dispatch! p))

@@ -982,6 +982,7 @@
     ;; Parse the text side with the record's element type and compare.
     (and (pg-arr/array? a) (string? b)) (sql-eq? a (pg-arr/from-pg-text b (:elem-type a)))
     (and (pg-arr/array? b) (string? a)) (sql-eq? (pg-arr/from-pg-text a (:elem-type b)) b)
+    (and (bytes? a) (bytes? b)) (java.util.Arrays/equals ^bytes a ^bytes b)
     ;; DATE and TIMESTAMP use different JVM carriers across literal, cast,
     ;; stored-column and set-operation paths. PostgreSQL resolves the
     ;; cross-type operator before execution; compare their canonical temporal
@@ -1017,6 +1018,20 @@
       ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
       ;; sql-eq? already answers false the same way, via `=`.
       (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
+      (and (temporal-instant a) (temporal-instant b))
+      (pred (compare (temporal-instant a) (temporal-instant b)) 0)
+      (and (bytes? a) (bytes? b))
+      (pred (java.util.Arrays/compareUnsigned ^bytes a ^bytes b) 0)
+      (and (instance? java.util.UUID a) (instance? java.util.UUID b))
+      (let [^java.util.UUID a a
+            ^java.util.UUID b b
+            high (Long/compareUnsigned (.getMostSignificantBits a)
+                                       (.getMostSignificantBits b))
+            cmp (if (zero? high)
+                  (Long/compareUnsigned (.getLeastSignificantBits a)
+                                        (.getLeastSignificantBits b))
+                  high)]
+        (pred cmp 0))
       (or (nan-num? a) (nan-num? b)
           (types/numeric-special? a) (types/numeric-special? b))
       (pred (order-cmp a b) 0)
@@ -1208,6 +1223,34 @@
    one is NULL."
   [left right]
   (reduce sql-and3 true (map sql-eq3? left right)))
+
+(defn sql-row-compare3
+  "Compare two SQL rows under PostgreSQL's three-valued rules.
+
+   Equality examines every field, so a later FALSE dominates an earlier
+   UNKNOWN. Ordering is lexicographic: it stops at the first unequal pair,
+   and a NULL in any pair reached before that makes the result UNKNOWN."
+  [op left right]
+  (when-not (= (count left) (count right))
+    (throw (ex-info "unequal number of entries in row expressions"
+                    {:error :syntax-error :sqlstate "42601"})))
+  (case op
+    := (sql-row-eq3? left right)
+    :<> (sql-not3 (sql-row-eq3? left right))
+    (let [strict-op (case op
+                      :< sql-lt3?
+                      :<= sql-lt3?
+                      :> sql-gt3?
+                      :>= sql-gt3?)
+          equal-result (contains? #{:<= :>=} op)]
+      (loop [left (seq left), right (seq right)]
+        (if-not left
+          equal-result
+          (let [a (first left), b (first right)]
+            (cond
+              (or (sql-null? a) (sql-null? b)) :__null__
+              (sql-eq? a b) (recur (next left) (next right))
+              :else (strict-op a b))))))))
 
 (defn sql-row-in3?
   "SQL row-valued `IN` under three-valued logic.

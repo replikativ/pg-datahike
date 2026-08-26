@@ -434,6 +434,140 @@
           (.next rs)
           (is (= "t" (.getString rs 1))))))))
 
+(deftest row-comparisons-follow-postgresql-semantics
+  (with-open [c (jdbc)]
+    (testing "equality examines every field under three-valued logic"
+      (is (= "t" (one c "SELECT ROW(1,2) = ROW(1,2)")))
+      (is (= "t" (one c "SELECT (1,2) = (1,2)")))
+      (is (= "f" (one c "SELECT ROW(1,2,3) = ROW(1,NULL,4)")))
+      (is (= "t" (one c "SELECT ROW(1,2,3) <> ROW(1,NULL,4)")))
+      (is (nil? (one c "SELECT ROW(1,2) = ROW(1,NULL)"))))
+    (testing "ordering stops at the first unequal pair"
+      (is (= "t" (one c "SELECT ROW(1,2) < ROW(1,3)")))
+      (is (= "f" (one c "SELECT ROW(1,2) < ROW(1,1)")))
+      (is (nil? (one c "SELECT ROW(1,2) < ROW(1,NULL)")))
+      (is (= "t" (one c "SELECT ROW(1,2,3) < ROW(1,3,NULL)")))
+      (is (= "t" (one c "SELECT ROW(1,2) <= ROW(1,2)")))
+      (is (= "t" (one c "SELECT ROW(1,2) >= ROW(1,2)")))
+      (is (= "t" (one c "SELECT ROW(2,0) > ROW(1,NULL)")))
+      (is (= "t"
+             (one c (str "SELECT ROW(date '2020-01-01',1) < "
+                         "ROW(timestamp '2020-01-02',1)")))
+          "cross-type temporal fields compare through their common timeline"))
+    (testing "operator selection and width checking are per field"
+      (is (= "t" (one c "SELECT ROW(1,2) = ROW('1','2')")))
+      (is (= "t" (one c "SELECT ROW(1,2) = ROW(1::bigint,2::numeric)")))
+      (is (= "42601" (sqlstate c "SELECT ROW(1,2) = ROW(1)")))
+      (is (= "42883" (sqlstate c "SELECT ROW(1,2) < ROW(1::text,2)")))
+      (is (= "t"
+             (one c (str "SELECT ROW('80000000-0000-0000-0000-000000000000'::uuid) > "
+                         "ROW('00000000-0000-0000-0000-000000000000'::uuid)")))
+          "UUID fields use PostgreSQL's unsigned byte ordering")
+      (is (= "t"
+             (one c "SELECT ROW(ARRAY[1]::int4[]) = ROW(ARRAY[1]::int4[])")))
+      (is (= "42883"
+             (sqlstate c (str "SELECT ROW(ARRAY[1]::int4[]) = "
+                              "ROW(ARRAY[1]::int8[])"))))
+      (is (= "42883"
+             (sqlstate c (str "SELECT ROW(ARRAY[1]::int4[]) = "
+                              "ROW('{1}'::text)"))))
+      (is (= "0A000"
+             (sqlstate c "SELECT ROW('{}'::jsonb) = ROW('{}'::jsonb)"))
+          "specialized field families fail explicitly until row dispatch supports them")
+      (is (= "0A000"
+             (sqlstate c (str "SELECT ROW('1 day'::interval) = "
+                              "ROW('24 hours'::interval)"))))
+      (is (= "0A000"
+             (sqlstate c (str "SELECT ROW('12:00+00'::timetz) = "
+                              "ROW('12:00+00'::timetz)"))))
+      (is (= "0A000"
+             (sqlstate c (str "SELECT ROW('12:00'::time) = "
+                              "ROW('12:00'::time)"))))
+      (is (= "0A000"
+             (sqlstate c "SELECT ROW(ARRAY[1]) < ROW(ARRAY[2])"))))
+    (testing "predicate position retains lexicographic and NULL behavior"
+      (exec! c "CREATE TABLE row_ordering (a int, b int)")
+      (exec! c "INSERT INTO row_ordering VALUES (1,2),(2,3),(2,NULL),(3,1)")
+      (is (= ["1" "2"]
+             (col c 1 "SELECT a FROM row_ordering WHERE (a,b) < (2,4) ORDER BY a,b"))))))
+
+(deftest row-comparison-scalar-subqueries-enforce-shape-and-cardinality
+  (with-open [c (jdbc)]
+    (is (= "t" (one c "SELECT ROW(1,2) = (SELECT 1,2)")))
+    (is (= "t" (one c "SELECT ROW('1',2) = (SELECT 1,2)")))
+    (is (= "t" (one c "SELECT ROW(1,2) < (SELECT 1,3)")))
+    (is (nil? (one c "SELECT ROW(1,2) = (SELECT 1,2 WHERE false)")))
+    (is (nil? (one c "SELECT ROW(1,2) <> (SELECT 1,NULL::int)")))
+    (is (= "21000"
+           (sqlstate c (str "SELECT ROW(1,2) = "
+                            "(SELECT 1,2 UNION ALL SELECT 1,2)"))))
+    (is (= "42601" (sqlstate c "SELECT ROW(1,2) = (SELECT 1)")))
+    (is (= "42883" (sqlstate c "SELECT ROW(1,2) = (SELECT '1','2')"))
+        "a subquery UNKNOWN output resolves to text, unlike an IN sublink")
+    (testing "unqualified outward references preserve SQL name resolution"
+      (exec! c "CREATE TABLE outer_left (a int)")
+      (exec! c "CREATE TABLE outer_right (b int, c int)")
+      (exec! c "INSERT INTO outer_left VALUES (9)")
+      (exec! c "INSERT INTO outer_right VALUES (1,2)")
+      (is (= "t"
+             (one c (str "SELECT ROW(1,2) = (SELECT b,c) "
+                         "FROM outer_left l, outer_right r")))
+          "a column owned by a non-default joined relation binds to its owner")
+      (is (= "42703"
+             (sqlstate c (str "SELECT ROW(1,2) = (SELECT missing,c) "
+                              "FROM outer_left l, outer_right r"))))
+      (exec! c "CREATE TABLE outer_ambiguous (b int, c int)")
+      (is (= "42702"
+             (sqlstate c (str "SELECT ROW(1,2) = (SELECT b,c) "
+                              "FROM outer_right r, outer_ambiguous x")))))))
+
+(deftest postgres-17-row-comparison-subquery-slice
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE rowcompare_subselect (f1 int, f2 int)")
+    (exec! c (str "INSERT INTO rowcompare_subselect VALUES "
+                  "(1,2),(2,3),(3,4),(1,1),(2,2),(3,3),(6,7),(8,9)"))
+    (is (= ["t" "f" "f" "f" "f" "f" "f" "f"]
+           (col c 1 (str "SELECT ROW(1,2) = (SELECT f1,f2) "
+                         "FROM rowcompare_subselect ORDER BY db_id"))))
+    (is (= (vec (repeat 8 "f"))
+           (col c 1 (str "SELECT ROW(1,2) = (SELECT 3,4) "
+                         "FROM rowcompare_subselect ORDER BY db_id"))))
+    (is (= "21000"
+           (sqlstate c (str "SELECT ROW(1,2) = "
+                            "(SELECT f1,f2 FROM rowcompare_subselect)"))))))
+
+(deftest prepared-row-comparison-subquery-reads-the-execution-snapshot
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE rowcompare_singleton (a int, b int)")
+    (exec! c "INSERT INTO rowcompare_singleton VALUES (1,2)")
+    (with-open [statement (.prepareStatement
+                           c "SELECT ROW(3,4) = (SELECT a,b FROM rowcompare_singleton)")
+                parameterized (.prepareStatement
+                               c (str "SELECT ROW(?::int,?::int) = "
+                                      "(SELECT a,b FROM rowcompare_singleton)"))]
+      (letfn [(answer []
+                (with-open [rs (.executeQuery statement)]
+                  (.next rs)
+                  (.getString rs 1)))
+              (param-answer [a b]
+                (.setInt parameterized 1 a)
+                (.setInt parameterized 2 b)
+                (with-open [rs (.executeQuery parameterized)]
+                  (.next rs)
+                  (.getString rs 1)))]
+        (is (= "f" (answer)))
+        (is (= "t" (param-answer 1 2)))
+        (exec! c "UPDATE rowcompare_singleton SET a=3,b=4")
+        (is (= "t" (answer)))
+        (is (= "t" (param-answer 3 4)))
+        (is (= "f" (param-answer 1 2)))))))
+
+(deftest simple-query-number-templating-does-not-capture-inner-parameters
+  (let [handler (pg/make-query-handler *conn*)
+        result (.execute handler "SELECT ROW(1,2) = (SELECT 1,2)")]
+    (is (nil? (.error result)) (.error result))
+    (is (= [["t"]] (mapv vec (.rows result))))))
+
 (deftest postgres-17-correlated-in-regression-slice
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE subselect_tbl (f1 integer, f2 integer, f3 float)")
