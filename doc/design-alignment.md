@@ -78,21 +78,22 @@ These need execution beyond one `d/q` over one snapshot:
 - **Portal streaming / row limits**. Extended-protocol `Execute` with a row cap
   (`PortalSuspended`) — driver `fetchSize`, server-side cursors over large
   results. Today all rows materialise from one `d/q`.
-- **Set-returning functions in the SELECT list** (`SELECT generate_series(1,3)`
-  → N rows; PG's ProjectSet). Currently serialised rather than expanded to rows.
+- **ProjectSet around grouping, windows, and `DISTINCT ON`**. Target-list SRFs
+  now expand into rows, zip same-level SRFs with NULL padding, preserve nested
+  levels, and feed derived tables, CTAS, INSERT…SELECT, set operations, sorting,
+  and limits. PostgreSQL can place different ProjectSet levels on either side
+  of grouping, window, and distinct stages according to their references; the
+  combinations that need that movable stage are still rejected explicitly.
 
 ## Coverage tail (incremental, fits the model)
 
 - **Range / multirange types** (`int4range`, `tsrange`, …): text round-trips,
   but the binary Range codec and range constructor functions are not yet
   implemented.
-- **Remaining type tail**: `interval`, the internal `"char"`, `aclitem`,
-  full `numeric` precision edges, integer-range overflow enforcement
-  (an `int4` column currently accepts values > 2³¹; PG errors).
+- **Remaining type tail**: structural `interval`, the internal `"char"`,
+  `aclitem`, range types, and less common polymorphic/operator overloads.
 - **Wider catalog coverage**: `pg_stat_activity`, `pg_index`, `pg_constraint`,
   `pg_proc`, etc. — added as tools require them.
-- **Unknown-relation error (`42P01`)**: a missing table reads as empty (EAV)
-  rather than erroring.
 - **Extensions / `CREATE FUNCTION` / plpgsql / `DO`**: not implemented.
 
 ## Intrinsic boundaries (Datahike)
