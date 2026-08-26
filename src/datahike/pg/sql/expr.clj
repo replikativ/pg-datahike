@@ -112,6 +112,7 @@
          translate-binary-arith
          strict-subquery-values
          analyze-in-subquery!
+         analyze-exists-subquery!
          uncorrelated-in-values-var!
          outer-alias-set
          correlated-in-var!
@@ -2125,6 +2126,23 @@
     (when (seq outer-aliases)
       (not-empty (refs inner (set outer-aliases))))))
 
+(defn- nested-subquery-body?
+  "True when a SELECT body contains another SELECT below its own scope."
+  [inner]
+  (cond
+    (instance? ParenthesedSelect inner)
+    (nested-subquery-body? (.getSelect ^ParenthesedSelect inner))
+
+    (instance? PlainSelect inner)
+    (let [^PlainSelect ps inner
+          joins (or (.getJoins ps) [])
+          nodes (concat (plain-select-scope-nodes ps)
+                        [(.getFromItem ps)]
+                        (map #(.getRightItem ^Join %) joins))]
+      (boolean (seq (mapcat nested-selects-in nodes))))
+
+    :else false))
+
 (defn eval-correlated-scalar
   "Evaluate one SQL fragment for a correlated subquery against `query-db`
    with `*from-bindings*` already bound by the caller. `subquery?` true ->
@@ -3546,7 +3564,7 @@
             (:sql-offset p))
     (throw (errors/pg-error
             :feature-not-supported
-            {:message "this IN subquery requires SELECT post-processing that is not implemented"}))))
+            {:message "this subquery requires SELECT post-processing that is not implemented"}))))
 
 (defn- raw-in-subquery-having?
   "True when a SELECT AST contains a HAVING clause in any set-op branch.
@@ -3761,6 +3779,20 @@
     (ctx/add-clause! ctx [(apply list fn-param col arg-vars) result-var])
     (swap! (:nullable-vars ctx) conj result-var)
     result-var))
+
+(defn- analyze-exists-subquery!
+  "Validate a correlated EXISTS body before the outer relation is scanned."
+  [ctx inner corr-refs]
+  (let [corr-oids (correlation-oids ctx corr-refs)
+        null-bindings (reduce (fn [m [alias col]]
+                                (assoc-in m [alias col] :__null__))
+                              {} corr-refs)
+        parsed (binding [params/*from-bindings* null-bindings
+                         params/*from-binding-oids* corr-oids
+                         params/*lateral-outer-aliases* (set (map first corr-refs))]
+                 ((:parse-sql ctx) (str inner) (:schema ctx) (:db ctx)))]
+    (throw-subquery-error! parsed)
+    (validate-parsed-in-plan! parsed)))
 
 (defn- correlated-scalar-var!
   "Bind a variable to a CORRELATED scalar subquery's value, evaluated once
@@ -5186,19 +5218,20 @@
              ;; Unifying on a shared logic var makes the join key VALUE
              ;; equality, which is type-sensitive -- so two numeric
              ;; columns of different storage types would never unify and
-             ;; `WHERE n = f` (numeric vs float8) answered no rows.
-             ;; PostgreSQL promotes and compares. Fall through to the
-             ;; predicate, which is sql-eq? and does exactly that.
+             ;; `WHERE n = f` (numeric vs float8) answered no rows. Raw
+             ;; equality also disagrees with PostgreSQL on floating NaN.
+             ;; Fall through to sql-eq?, which handles both semantics.
              numeric-vtypes #{:db.type/long :db.type/double
                               :db.type/float :db.type/bigdec}
              vtype-of (fn [res]
-                        (when-let [a (and (keyword? res) res)]
+                        (when-let [a (ctx/attr-of ctx res)]
                           (get-in (:schema ctx) [a :db/valueType])))
              lv (vtype-of l-res)
              rv (vtype-of r-res)
              cross-numeric? (and lv rv (not= lv rv)
-                                 (numeric-vtypes lv) (numeric-vtypes rv))]
-         (when (and l-res r-res (not cross-numeric?)
+                                 (numeric-vtypes lv) (numeric-vtypes rv))
+             floating? (some #{:db.type/float :db.type/double} [lv rv])]
+         (when (and l-res r-res (not cross-numeric?) (not floating?)
                     (ctx/unify-inner-equijoin! ctx l-res r-res))
            [])))
      ;; jsonb `=` / `<>` compare VALUES and are numeric-scale
@@ -6185,13 +6218,28 @@
     (instance? ExistsExpression expr)
     (let [^ExistsExpression e expr
           not-exists? (.isNot e)
-          sub-select (.getRightExpression e)]
+          sub-select (.getRightExpression e)
+          inner (cond
+                  (instance? ParenthesedSelect sub-select)
+                  (.getSelect ^ParenthesedSelect sub-select)
+                  (instance? PlainSelect sub-select) sub-select
+                  :else nil)
+          corr-refs (when inner
+                      (correlated-subquery-refs inner (outer-alias-set ctx)))
+          _ (when (seq corr-refs)
+              (analyze-exists-subquery! ctx inner corr-refs))
+          _ (when (and (seq corr-refs) (nested-subquery-body? inner))
+              (throw (errors/pg-error
+                      :feature-not-supported
+                      {:message "correlated EXISTS containing nested subqueries is not implemented"})))]
       (if-let [db (:db ctx)]
         ;; Try correlated EXISTS first: translate inner query to Datalog patterns
         ;; and use not-join/or-join for correlation with the outer query.
-        ;; Falls back to uncorrelated execution if no db or parsing fails.
+        ;; Uncorrelated forms can fall back to standalone execution; a failed
+        ;; correlated lowering is reported explicitly rather than misread.
         (let [schema (:schema ctx)
-              outer-aliases (:table-aliases ctx)]
+              outer-aliases (:table-aliases ctx)
+              snapshot (ctx/snapshot ctx)]
           (try
             (let [;; Parse inner SELECT with a fresh context that knows about outer aliases
                   inner-ps (cond
@@ -6227,7 +6275,17 @@
                                         combined-aliases
                                         (or inner-joins []))
                       ;; Create inner ctx with combined aliases
-                      inner-ctx (ctx/make-ctx schema combined-aliases inner-alias {:db db :parse-sql (:parse-sql ctx)})
+                      inner-ctx (assoc (ctx/make-ctx schema combined-aliases inner-alias
+                                                     {:db db :parse-sql (:parse-sql ctx)})
+                                       ;; The inner translation is part of the same
+                                       ;; prepared statement.  Sharing these slots
+                                       ;; makes repeated `$1` references reuse ?p1
+                                       ;; and keeps generated function parameters
+                                       ;; globally fresh across both scopes.
+                                       :var-counter (:var-counter ctx)
+                                       :in-params (:in-params ctx)
+                                       :in-args (:in-args ctx)
+                                       :param-placeholders (:param-placeholders ctx))
                       ;; Copy outer entity vars so correlation references resolve
                       _ (reset! (:entity-vars inner-ctx) @(:entity-vars ctx))
                       _ (reset! (:col->var inner-ctx) @(:col->var ctx))
@@ -6289,11 +6347,15 @@
                       eq-preds (filter (fn [c]
                                          (or
                                           ;; Bare list form: (= ?a ?b)
-                                          (and (seq? c) (= '= (first c)) (= 3 (count c)))
+                                          (and (seq? c)
+                                               (contains? #{'= 'datahike.pg.sql/sql-eq?}
+                                                          (first c))
+                                               (= 3 (count c)))
                                           ;; Wrapped form: [(= ?a ?b)]
                                           (and (vector? c) (= 1 (count c))
                                                (seq? (first c))
-                                               (= '= (first (first c)))
+                                               (contains? #{'= 'datahike.pg.sql/sql-eq?}
+                                                          (first (first c)))
                                                (= 3 (count (first c))))))
                                        new-clauses)
                       ;; For each equality predicate, check if one var is bound
@@ -6301,7 +6363,7 @@
                       ;; E.g. [(= ?d_module_id ?m_id)] where ?m_id comes from
                       ;; [?m_eid :mod/id ?m_id] (outer entity ?m_eid)
                       ;;
-                      ;; Build a map: var → {:clause … :evar … :attr …}.
+                      ;; Build a map: var → {:clauses […] :evar … :attr …}.
                       ;;
                       ;; Two clause shapes bind a var to an entity+attr:
                       ;; - Plain data pattern: `[?e :attr ?v]` (3 elems).
@@ -6310,12 +6372,12 @@
                       ;;   result var). Emitted by ctx/col-var! for any
                       ;;   nullable attribute post-B2.
                       ;;
-                      ;; Downstream correlation-rewriting needs the
-                      ;; evar (to decide if an outer binding drives it)
-                      ;; and the original clause (to relocate it into
-                      ;; the outer context). Keep both in the source
-                      ;; map so the get-else shape is handled uniformly.
-                      inner-var-sources
+                      ;; Downstream correlation-rewriting needs the evar (to
+                      ;; decide if an outer binding drives it) and all source
+                      ;; clauses (to relocate them into the outer context).
+                      ;; Keep both so get-else and decoded values are handled
+                      ;; uniformly.
+                      direct-var-sources
                       (into {}
                             (keep (fn [c]
                                     (cond
@@ -6324,7 +6386,7 @@
                                            (keyword? (second c))
                                            (symbol? (nth c 2)))
                                       [(nth c 2)
-                                       {:clause c :evar (first c) :attr (second c)}]
+                                       {:clauses [c] :evar (first c) :attr (second c)}]
 
                                       (and (vector? c) (= 2 (count c))
                                            (seq? (first c))
@@ -6333,10 +6395,52 @@
                                       (let [[_ _ evar attr _] (first c)
                                             v (second c)]
                                         (when (and (symbol? evar) (keyword? attr))
-                                          [v {:clause c :evar evar :attr attr}]))
+                                          [v {:clauses [c] :evar evar :attr attr}]))
                                       :else nil)))
                             new-clauses)
-                      correlation-rewrites
+                      ;; NUMERIC storage decoding introduces
+                      ;; `[(?column-decode ?raw) ?sql-value]`. Carry the
+                      ;; raw datom's source through that binding so the
+                      ;; correlation planner can compare declared storage
+                      ;; types and relocate the complete outer binding.
+                      inner-var-sources
+                      (reduce (fn [sources c]
+                                (if (and (vector? c) (= 2 (count c))
+                                         (seq? (first c))
+                                         (symbol? (ffirst c))
+                                         (str/starts-with? (name (ffirst c)) "?column-decode")
+                                         (symbol? (second c)))
+                                  (let [raw (second (first c))]
+                                    (if-let [source (sources raw)]
+                                      (assoc sources (second c)
+                                             (update source :clauses conj c))
+                                      sources))
+                                  sources))
+                              direct-var-sources
+                              new-clauses)
+                      numeric-vtypes #{:db.type/long :db.type/double
+                                       :db.type/float :db.type/bigdec}
+                      storage-unifiable?
+                      (fn [eq-clause left-source right-source]
+                        (let [op (first (if (seq? eq-clause)
+                                          eq-clause
+                                          (first eq-clause)))
+                              lv (get-in schema [(:attr left-source) :db/valueType])
+                              rv (get-in schema [(:attr right-source) :db/valueType])
+                              floating-vtypes #{:db.type/float :db.type/double}]
+                          ;; Raw `=` is emitted only where Datalog value
+                          ;; unification is already the intended comparison.
+                          ;; sql-eq? additionally performs PostgreSQL numeric
+                          ;; promotion and NaN equality. It must remain an
+                          ;; explicit predicate for cross-storage numerics and
+                          ;; floating columns (where NaN = NaN is true in SQL).
+                          (or (= '= op)
+                              (and (not (floating-vtypes lv))
+                                   (not (floating-vtypes rv))
+                                   (not (and lv rv (not= lv rv)
+                                             (numeric-vtypes lv)
+                                             (numeric-vtypes rv)))))))
+                      correlations
                       (keep (fn [eq-clause]
                               (let [[_ v1 v2] (if (seq? eq-clause)
                                                 eq-clause
@@ -6347,19 +6451,28 @@
                                 (cond
                                   (and (symbol? v2) (outer-bound? v2) (symbol? v1))
                                   {:eq-clause eq-clause :outer-var v2 :inner-var v1
-                                   :outer-pattern (:clause (inner-var-sources v2))}
+                                   :outer-source (inner-var-sources v2)
+                                   :inner-source (inner-var-sources v1)
+                                   :outer-patterns (:clauses (inner-var-sources v2))}
                                   (and (symbol? v1) (outer-bound? v1) (symbol? v2))
                                   {:eq-clause eq-clause :outer-var v1 :inner-var v2
-                                   :outer-pattern (:clause (inner-var-sources v1))}
+                                   :outer-source (inner-var-sources v1)
+                                   :inner-source (inner-var-sources v2)
+                                   :outer-patterns (:clauses (inner-var-sources v1))}
                                   :else nil)))
                             eq-preds)
+                      correlation-rewrites
+                      (filter (fn [{:keys [eq-clause outer-source inner-source]}]
+                                (and inner-source
+                                     (storage-unifiable? eq-clause outer-source inner-source)))
+                              correlations)
                       ;; Move outer-bound patterns outside the not-join
-                      patterns-to-move (set (keep :outer-pattern correlation-rewrites))
+                      patterns-to-move (set (mapcat :outer-patterns correlations))
                       ;; Move these patterns to the outer ctx
                       _ (doseq [pat patterns-to-move]
                           (swap! (:where-clauses ctx) conj pat))
                       ;; Correlation vars: use the VALUE vars, not entity vars
-                      corr-value-vars (set (keep :outer-var correlation-rewrites))
+                      corr-value-vars (set (keep :outer-var correlations))
                       ;; Remove equality predicates that are now handled by correlation
                       eq-clauses-to-remove (set (map :eq-clause correlation-rewrites))
                       ;; Rewrite inner patterns: replace ?inner_var with
@@ -6386,7 +6499,8 @@
                                            (not (eq-clauses-to-remove eq-clause))
                                            s1 s2
                                            (not (outer-evars (:evar s1)))
-                                           (not (outer-evars (:evar s2))))
+                                           (not (outer-evars (:evar s2)))
+                                           (storage-unifiable? eq-clause s1 s2))
                                   ;; Both are inner vars — unify v2 → v1
                                   {:eq-clause eq-clause :keep v1 :replace v2})))
                             eq-preds)
@@ -6423,18 +6537,16 @@
                                                        :else (rewrite-form c)))
                                                    new-clauses))
                       ;; Final correlation vars: prefer value vars, fall back to entity vars
-                      all-inner-vars (set (mapcat (fn [clause]
-                                                    (cond
-                                                      (vector? clause) (filter symbol? clause)
-                                                      (seq? clause) (filter symbol? (flatten clause))
-                                                      :else []))
-                                                  optimized-clauses))
+                      all-inner-vars (set (mapcat ctx/collect-vars optimized-clauses))
                       entity-corr-vars (set/intersection outer-evars all-inner-vars)
-                      corr-vars (vec (set/union corr-value-vars entity-corr-vars))
-                      inner-in-params @(:in-params inner-ctx)
-                      inner-in-args @(:in-args inner-ctx)
-                      _ (swap! (:in-params ctx) into inner-in-params)
-                      _ (swap! (:in-args ctx) into inner-in-args)]
+                      ;; A projected/filter-bound outer column is already in
+                      ;; col->var, so the fresh inner ctx reuses its var but
+                      ;; does not repeat its source pattern. Detect that shared
+                      ;; value directly in the optimized clauses as well.
+                      existing-value-corr-vars (set/intersection outer-col-vars all-inner-vars)
+                      corr-vars (vec (set/union corr-value-vars
+                                                existing-value-corr-vars
+                                                entity-corr-vars))]
                   (let [eval-uncorrelated
                         (fn []
                           ;; Inner has no reference to outer vars: just run
@@ -6497,21 +6609,15 @@
                     []
                     [[(list 'not= 1 1)]]))))
             (catch Exception _ex
-              ;; Fallback to uncorrelated execution on any translation error
-              (let [inner-sql (str sub-select)
-                    inner-parsed ((:parse-sql ctx) inner-sql schema db)
-                    inner-query (:query inner-parsed)
-                    inner-in-args (:in-args inner-parsed)
-                    query-db (or (:enriched-db inner-parsed) db)
-                    inner-results (if (seq inner-in-args)
-                                    (apply d/q
-                                           inner-query query-db inner-in-args)
-                                    (d/q
-                                     inner-query query-db))
-                    has-results? (boolean (seq inner-results))]
-                (if (if not-exists? (not has-results?) has-results?)
-                  []
-                  [[(list 'not= 1 1)]])))))
+                ;; Translation is side-effecting. Roll back every partial
+                ;; clause/input before reporting the unsupported shape;
+                ;; otherwise leaked inner vars corrupt later translation.
+              (ctx/restore! ctx snapshot)
+              (if (seq corr-refs)
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:message "this correlated EXISTS shape is not implemented"}))
+                (throw _ex)))))
         (throw (ex-info "EXISTS subquery requires database context"
                         {:error :internal-error
                          :detail "EXISTS subquery requires database context"
