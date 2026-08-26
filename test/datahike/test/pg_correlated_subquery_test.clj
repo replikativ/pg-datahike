@@ -339,6 +339,101 @@
         (is (= #{"t" "f"} (set (answers setop-cte)))
             "set-operation branches propagate runtime-subquery freshness")))))
 
+(deftest row-valued-in-subqueries-follow-postgresql-three-valued-semantics
+  (with-open [c (jdbc)]
+    (testing "row equality folds fields before membership folds RHS rows"
+      (is (= "t" (one c "SELECT (1,2) IN (SELECT 1,2)")))
+      (is (= "t" (one c "SELECT ROW(1,2) IN (SELECT 1,2)")))
+      (is (= "t" (one c "SELECT (1,2) IN (SELECT '1','2')"))
+          "plain UNKNOWN outputs are coerced from the corresponding left fields")
+      (is (= "t" (one c (str "SELECT (1,2) IN "
+                             "(SELECT '1','2' UNION ALL SELECT 1,2)")))
+          "set operations resolve each output field across their branches")
+      (is (nil? (one c "SELECT (1,2) IN (SELECT 1,NULL)")))
+      (is (= "f" (one c "SELECT (1,2) IN (SELECT 2,NULL)"))
+          "a false field dominates a NULL field within one row")
+      (is (nil? (one c (str "SELECT (1,2) IN "
+                            "(SELECT 2,NULL::int UNION ALL SELECT 1,NULL::int)"))))
+      (is (= "t" (one c (str "SELECT (1,2) IN "
+                             "(SELECT 1,NULL::int UNION ALL SELECT 1,2)")))
+          "a true RHS row dominates an unknown RHS row")
+      (is (= "f" (one c "SELECT (NULL::int,2) IN (SELECT 1,3)")))
+      (is (nil? (one c "SELECT (NULL::int,2) IN (SELECT 1,2)"))))
+    (testing "empty RHS follows ANY semantics even for NULL left fields"
+      (is (= "f" (one c "SELECT (NULL::int,2) IN (SELECT 1,2 WHERE false)")))
+      (is (= "t" (one c "SELECT (NULL::int,2) NOT IN (SELECT 1,2 WHERE false)"))))
+    (testing "width and type errors are raised during analysis"
+      (is (= "42601" (sqlstate c "SELECT (1,2) IN (SELECT 1)")))
+      (is (= "42601" (sqlstate c "SELECT (1,2) IN (SELECT 1,2,3)")))
+      (is (= "42883"
+             (sqlstate c (str "SELECT (1,2) IN "
+                              "(SELECT '1','2' UNION ALL SELECT '1','2')")))
+          "an all-UNKNOWN set-operation output resolves to text, as in PostgreSQL")
+      (exec! c "CREATE TABLE empty_row_outer (a int, b int)")
+      (exec! c "CREATE TABLE empty_row_inner (a int, b text)")
+      (is (= "42883"
+             (sqlstate c (str "SELECT a FROM empty_row_outer o WHERE (a,b) IN "
+                              "(SELECT a,b FROM empty_row_inner)")))
+          "empty relations cannot hide an operator mismatch"))))
+
+(deftest postgres-17-row-in-regression-slice
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE row_subselect (f1 integer, f2 integer, f3 float)")
+    (exec! c (str "INSERT INTO row_subselect VALUES "
+                  "(1,2,3),(2,3,4),(3,4,5),(1,1,1),"
+                  "(2,2,2),(3,3,3),(6,7,8),(8,9,NULL)"))
+    (is (= [["1" "2"] ["6" "7"] ["8" "9"]]
+           (rows c (str "SELECT f1,f2 FROM row_subselect WHERE (f1,f2) NOT IN "
+                        "(SELECT f2,CAST(f3 AS int4) FROM row_subselect "
+                        "WHERE f3 IS NOT NULL) ORDER BY f1,f2"))))
+    (is (= ["1" "2" "2" "3" "3"]
+           (col c 1 (str "SELECT f1 FROM row_subselect upper_row WHERE (f1,f2) IN "
+                         "(SELECT f2,CAST(f3 AS int4) FROM row_subselect "
+                         "WHERE f3 IS NOT NULL) ORDER BY f1"))))))
+
+(deftest correlated-row-in-reads-the-execution-snapshot
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE row_owners (owner int, a int, b int)")
+    (exec! c "CREATE TABLE row_owned (owner int, a int, b int)")
+    (exec! c "INSERT INTO row_owners VALUES (1,10,20),(2,30,40)")
+    (exec! c "INSERT INTO row_owned VALUES (1,10,20)")
+    (with-open [statement (.prepareStatement
+                           c (str "SELECT owner FROM row_owners o WHERE (a,b) IN "
+                                  "(SELECT a,b FROM row_owned i WHERE i.owner=o.owner) "
+                                  "ORDER BY owner"))
+                parameterized (.prepareStatement
+                               c (str "SELECT owner FROM row_owners o WHERE (?::int,b) IN "
+                                      "(SELECT a,b FROM row_owned i WHERE i.owner=o.owner) "
+                                      "ORDER BY owner"))
+                uncorrelated (.prepareStatement
+                              c "SELECT (30,40) IN (SELECT a,b FROM row_owned)")]
+      (letfn [(answers []
+                (with-open [rs (.executeQuery statement)]
+                  (loop [out []]
+                    (if (.next rs)
+                      (recur (conj out (.getString rs 1)))
+                      out))))
+              (param-answers [n]
+                (.setInt parameterized 1 n)
+                (with-open [rs (.executeQuery parameterized)]
+                  (loop [out []]
+                    (if (.next rs)
+                      (recur (conj out (.getString rs 1)))
+                      out))))]
+        (is (= ["1"] (answers)))
+        (is (= ["1"] (param-answers 10)))
+        (is (= [] (param-answers 30)))
+        (is (= "f" (one c "SELECT (30,40) IN (SELECT a,b FROM row_owned)")))
+        (with-open [rs (.executeQuery uncorrelated)]
+          (.next rs)
+          (is (= "f" (.getString rs 1))))
+        (exec! c "INSERT INTO row_owned VALUES (2,30,40)")
+        (is (= ["1" "2"] (answers)))
+        (is (= ["2"] (param-answers 30)))
+        (with-open [rs (.executeQuery uncorrelated)]
+          (.next rs)
+          (is (= "t" (.getString rs 1))))))))
+
 (deftest postgres-17-correlated-in-regression-slice
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE subselect_tbl (f1 integer, f2 integer, f3 float)")

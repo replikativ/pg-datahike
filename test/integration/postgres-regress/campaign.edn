@@ -404,7 +404,15 @@
       {:id :correlated-exists-disjunction
        :source-lines [579 590]
        :gate "test/datahike/test/pg_correlated_subquery_test.clj"
-       :test-var "correlated-exists-is-safe-in-boolean-composition"}]}
+       :test-var "correlated-exists-is-safe-in-boolean-composition"}
+      {:id :row-not-in-subquery
+       :source-lines [59 62]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "postgres-17-row-in-regression-slice"}
+      {:id :row-in-subquery
+       :source-lines [80 83]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "postgres-17-row-in-regression-slice"}]}
     {:name "union" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:relational :common-types}
