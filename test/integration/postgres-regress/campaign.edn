@@ -504,9 +504,21 @@
        :gate "test/datahike/test/pg_srf_rows_test.clj"
        :test-var "target-list-project-set-order-and-limit"}
       {:id :project-set-ctas
-       :source-lines [109 109]
+       :source-lines [109 111]
        :gate "test/datahike/test/pg_srf_rows_test.clj"
-       :test-var "project-set-is-consumed-by-data-producing-statements"}]}]}
+       :test-var "project-set-is-consumed-by-data-producing-statements"}
+      {:id :project-set-placement-errors
+       :source-lines [69 83]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "project-set-placement-errors-follow-postgres"}
+      {:id :project-set-dml-and-limit-errors
+       :source-lines [113 127]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "project-set-placement-errors-follow-postgres"}
+      {:id :project-set-limit-error
+       :source-lines [158 159]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "project-set-placement-errors-follow-postgres"}]}]}
 
   {:id 3
    :name "specialized application types"

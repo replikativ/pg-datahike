@@ -30,6 +30,9 @@
 (defn- state [sql]
   (try (.-sqlstate ^PgWireServer$QueryResult (run sql))
        (catch Exception e (:sqlstate (ex-data e)))))
+(defn- error [sql]
+  (try (.-error ^PgWireServer$QueryResult (run sql))
+       (catch Exception e (.getMessage e))))
 
 (deftest virtual-tables-carry-a-row-marker
   (testing "without a row-existence marker `count(*)` and `SELECT *` had
@@ -92,6 +95,44 @@
     (is (= "0A000"
            (state "SELECT DISTINCT ON (generate_series(1,2))
                           generate_series(1,2)")))))
+
+(deftest project-set-placement-errors-follow-postgres
+  ;; PostgreSQL 17 tsrf.sql:69-83, 113-127, 158-159. These checks must
+  ;; happen before execution, especially RETURNING, so an invalid statement
+  ;; cannot mutate data and only then discover that its projection is illegal.
+  (doseq [[sql message]
+          [["SELECT CASE WHEN true THEN generate_series(1,3) ELSE 0 END"
+            #"not allowed in CASE"]
+           ["SELECT coalesce(generate_series(1,3), 0)"
+            #"not allowed in COALESCE"]
+           ["SELECT min(generate_series(1,3))"
+            #"aggregate function calls cannot contain"]
+           ["SELECT min(generate_series(1,3)) OVER ()"
+            #"window function calls cannot contain"]
+           ["VALUES (1, generate_series(1,2))"
+            #"not allowed in VALUES"]
+           ["SELECT 1 LIMIT generate_series(1,3)"
+            #"not allowed in LIMIT"]
+           ["SELECT 1 OFFSET generate_series(1,3)"
+            #"not allowed in OFFSET"]
+           ["SELECT * FROM int4mul(generate_series(1,2), 10)"
+            #"top level of FROM"]]]
+    (is (= "0A000" (state sql)) sql)
+    (is (re-find message (or (error sql) "")) sql))
+
+  (run "CREATE TABLE ps_write (id integer PRIMARY KEY)")
+  (is (= "INSERT 0 2"
+         (.-commandTag ^PgWireServer$QueryResult
+          (run "INSERT INTO ps_write VALUES(generate_series(4,5))"))))
+  (is (= [["4"] ["5"]]
+         (rows "SELECT id FROM ps_write ORDER BY id")))
+  (is (= "0A000"
+         (state "UPDATE ps_write SET id = generate_series(4,9)")))
+  (is (= "0A000"
+         (state "INSERT INTO ps_write VALUES (1)
+                 RETURNING generate_series(1,3)")))
+  (is (= [["2"]] (rows "SELECT count(*) FROM ps_write"))
+      "an invalid RETURNING projection must fail before the write"))
 
 (deftest project-set-is-consumed-by-data-producing-statements
   ;; ProjectSet is a logical executor stage. Statements which execute a
