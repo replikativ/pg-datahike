@@ -27,7 +27,7 @@
            [net.sf.jsqlparser.expression
             ArrayConstructor ArrayExpression BinaryExpression BooleanValue
             CaseExpression CastExpression DoubleValue Expression ExtractExpression
-            Function JdbcNamedParameter JdbcParameter LongValue NotExpression
+            Function JdbcNamedParameter JdbcParameter JsonExpression LongValue NotExpression
             NullValue Parenthesis SignedExpression StringValue TimeKeyExpression
             TimestampValue TimeValue DateValue WhenClause]
            [net.sf.jsqlparser.expression.operators.arithmetic
@@ -37,7 +37,7 @@
             AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.relational
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
-            InExpression IsBooleanExpression IsNullExpression LikeExpression
+            InExpression IsBooleanExpression IsNullExpression JsonOperator LikeExpression
             MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
             RegExpMatchOperator]))
 
@@ -66,9 +66,9 @@
    ;; These have text and bit overloads; both preserve the first
    ;; argument's type. OVERLAY's keyword syntax stores its operands in
    ;; JSqlParser's named-parameter list, handled in `function-oid` below.
-   "substring"     :arg-type
-   "substr"        :arg-type
-   "overlay"       :arg-type
+   "substring"     :text-or-bit
+   "substr"        :text-or-bit
+   "overlay"       :text-or-bit
    "replace"       types/oid-text
    "lpad"          types/oid-text
    "rpad"          types/oid-text
@@ -91,6 +91,34 @@
    "to_json"       types/oid-json
    "row_to_json"   types/oid-json
    "json_agg"      types/oid-json
+   "json_object_agg" types/oid-json
+   "json_build_array" types/oid-json
+   "json_build_object" types/oid-json
+   "json_object" types/oid-json
+   "json_strip_nulls" types/oid-json
+   "json_extract_path" types/oid-json
+   "json_extract_path_text" types/oid-text
+   "json_array_elements" types/oid-json
+   "json_array_elements_text" types/oid-text
+   "json_array_length" types/oid-int4
+   "json_object_keys" types/oid-text
+   "to_jsonb" types/oid-jsonb
+   "jsonb_agg" types/oid-jsonb
+   "jsonb_object_agg" types/oid-jsonb
+   "jsonb_build_array" types/oid-jsonb
+   "jsonb_build_object" types/oid-jsonb
+   "jsonb_strip_nulls" types/oid-jsonb
+   "jsonb_set" types/oid-jsonb
+   "jsonb_insert" types/oid-jsonb
+   "jsonb_extract_path" types/oid-jsonb
+   "jsonb_extract_path_text" types/oid-text
+   "jsonb_array_elements" types/oid-jsonb
+   "jsonb_array_elements_text" types/oid-text
+   "jsonb_array_length" types/oid-int4
+   "jsonb_object_keys" types/oid-text
+   "jsonb_typeof" types/oid-text
+   "json_typeof" types/oid-text
+   "jsonb_pretty" types/oid-text
    ;; Length functions → INT4
    "length"        types/oid-int4
    "char_length"   types/oid-int4
@@ -102,14 +130,14 @@
    "ascii"         types/oid-int4
    ;; Math — return matches arg
    "abs"           :arg-type
-   "ceil"          :arg-type
-   "ceiling"       :arg-type
-   "floor"         :arg-type
-   "round"         :arg-type
-   "trunc"         :arg-type
-   "sign"          :arg-type
-   "mod"           :arg-type
-   "gcd"           :arg-type
+   "ceil"          :numeric-or-float8
+   "ceiling"       :numeric-or-float8
+   "floor"         :numeric-or-float8
+   "round"         :numeric-or-float8
+   "trunc"         :numeric-or-float8
+   "sign"          :numeric-or-float8
+   "mod"           :common-type
+   "gcd"           :common-type
    ;; Degree trig is float8 -> float8; erf/erfc likewise. div, factorial
    ;; and trim_scale are numeric; scale / min_scale answer an int4.
    "sind" types/oid-float8 "cosd" types/oid-float8
@@ -125,7 +153,7 @@
    "numeric_inc" types/oid-numeric
    "scale" types/oid-int4
    "min_scale" types/oid-int4
-   "lcm"           :arg-type
+   "lcm"           :common-type
    "width_bucket"  types/oid-int4
    ;; Math — always float
    "sqrt"          :numeric-or-float8
@@ -144,7 +172,7 @@
    "log"           :numeric-or-float8
    "log10"         :numeric-or-float8
    "power"         :numeric-or-float8
-   "pow"           types/oid-float8
+   "pow"           :numeric-or-float8
    "sin"           types/oid-float8
    "cos"           types/oid-float8
    "tan"           types/oid-float8
@@ -159,7 +187,7 @@
    ;; `coalesce(numeric, float8)` is float8: numeric coerces to float8
    ;; implicitly and float8 does not coerce back.
    "coalesce"      :common-type
-   "nullif"        :common-type
+   "nullif"        :first-arg
    "greatest"      :common-type
    "least"         :common-type
    ;; Date/time — constants + truncation
@@ -169,7 +197,7 @@
    "statement_timestamp"  types/oid-timestamptz
    "localtimestamp" types/oid-timestamp
    "current_date"  types/oid-date
-   "current_time"  types/oid-time
+   "current_time"  types/oid-timetz
    "localtime"     types/oid-time
    "gen_random_uuid" types/oid-uuid
    "uuidv4"        types/oid-uuid
@@ -220,12 +248,12 @@
    "cardinality"   types/oid-int4
    "array_to_string" types/oid-text
    ;; Array → array returning (passthrough element type)
-   "array_append"  :arg-type
-   "array_prepend" :arg-type
-   "array_cat"     :arg-type
+   "array_append"  :compatible-array-first
+   "array_prepend" :compatible-array-second
+   "array_cat"     :compatible-array-pair
    "array_position" types/oid-int4
-   "array_remove"  :arg-type
-   "array_replace" :arg-type
+   "array_remove"  :compatible-array-first
+   "array_replace" :compatible-array-first
    "array_fill"    :arg-array})
 
 (def sql-aggregate->return-oid
@@ -333,6 +361,20 @@
    ;; array_agg(x) → x's array OID; string_agg(x, sep) → text.
    "array_agg"       :arg-array
    "string_agg"      types/oid-text})
+
+(def sql-window->return-oid
+  "Window function return types from PostgreSQL's pg_proc catalog."
+  {"row_number" types/oid-int8
+   "rank" types/oid-int8
+   "dense_rank" types/oid-int8
+   "ntile" types/oid-int4
+   "percent_rank" types/oid-float8
+   "cume_dist" types/oid-float8
+   "lag" :arg-type
+   "lead" :arg-type
+   "first_value" :arg-type
+   "last_value" :arg-type
+   "nth_value" :arg-type})
 
 ;; ---------------------------------------------------------------------------
 ;; Inference
@@ -544,6 +586,20 @@
   [e env]
   (when-not (untyped-literal? e) (expr-oid e env)))
 
+(defn- compatible-array-oid
+  "Resolve PostgreSQL's anycompatiblearray family to a result array OID."
+  [args env array-indexes]
+  (let [array-oids (keep #(some-> (nth args % nil) (expr-oid env)) array-indexes)
+        element-oids (keep types/array-oid->element-oid array-oids)
+        scalar-oids (keep-indexed (fn [i arg]
+                                    (when-not (contains? (set array-indexes) i)
+                                      (resolution-oid arg env)))
+                                  args)
+        common (types/select-common-type (vec (concat element-oids scalar-oids))
+                                         "array function" false)]
+    (or (get types/element-oid->array-oid common)
+        (first array-oids))))
+
 (defn- function-oid
   "Resolve a scalar or aggregate function reference. `:arg-type`
    sentinel in the registry means 'propagate the first argument's type'.
@@ -596,6 +652,16 @@
         (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
+      (= rule :first-arg) (when first-arg (expr-oid first-arg env))
+      (= rule :text-or-bit)
+      (let [o (when first-arg (expr-oid first-arg env))]
+        (cond
+          (contains? #{types/oid-bit types/oid-varbit} o) types/oid-bit
+          (= o types/oid-bytea) types/oid-bytea
+          :else types/oid-text))
+      (= rule :compatible-array-first) (compatible-array-oid args env [0])
+      (= rule :compatible-array-second) (compatible-array-oid args env [1])
+      (= rule :compatible-array-pair) (compatible-array-oid args env [0 1])
       (= rule :arg-array)
       (when-let [element-oid (some-> first-arg (expr-oid env))]
         (get types/element-oid->array-oid element-oid types/oid-text-array))
@@ -628,6 +694,8 @@
       ;; numeric is precisely the Describe/Execute mismatch that
       ;; corrupts a binary client.
       (if (or (and (= fname "log") (= 2 (count args)))
+              (and (contains? #{"round" "trunc"} fname)
+                   (= 2 (count args)))
               (some #(= types/oid-numeric (expr-oid % env)) (remove nil? args)))
         types/oid-numeric
         types/oid-float8)
@@ -682,7 +750,9 @@
                         :else types/oid-text)
            :boolean   types/oid-bool
            :date      types/oid-date
-           :time      types/oid-time
+           :time      (if (contains? #{"timetz" "time with time zone"} type-str)
+                        types/oid-timetz
+                        types/oid-time)
            :timestamp (cond
                         (re-find #"with time zone|timestamptz" type-str)
                         types/oid-timestamptz
@@ -774,7 +844,15 @@
 
       ;; --- Column reference ---------------------------------------------
       (instance? Column expr)
-      (column-oid expr env)
+      (case (some-> ^Column expr .getColumnName str/lower-case)
+        "localtime" types/oid-time
+        "localtimestamp" types/oid-timestamp
+        "current_schema" types/oid-name
+        "current_catalog" types/oid-name
+        "current_user" types/oid-name
+        "session_user" types/oid-name
+        "user" types/oid-name
+        (column-oid expr env))
 
       ;; --- Parenthesis / sign wrappers ----------------------------------
       (instance? Parenthesis expr)
@@ -814,6 +892,7 @@
       (instance? LikeExpression expr)    types/oid-bool
       (instance? ExistsExpression expr)  types/oid-bool
       (instance? RegExpMatchOperator expr) types/oid-bool
+      (instance? JsonOperator expr)      types/oid-bool
       (instance? EqualsTo expr)          types/oid-bool
       (instance? NotEqualsTo expr)       types/oid-bool
       (instance? GreaterThan expr)       types/oid-bool
@@ -860,16 +939,51 @@
           types/oid-float8))
 
       ;; --- Concat (||) ---------------------------------------------------
-      ;; bit || bit is `bitcat`, whose result is always bit varying (the
-      ;; widths add, so no fixed-width type fits) — PG resolves the
-      ;; varbit operator, not the text one. Everything else concatenates
-      ;; as text.
+      ;; `||` is overloaded for bit strings, jsonb and PostgreSQL's
+      ;; anycompatiblearray family. Resolve those nominal types before the
+      ;; text fallback so binary clients select the matching codec.
       (instance? Concat expr)
-      (let [^BinaryExpression e expr]
-        (if (and (some-> (.getLeftExpression e) (expr-oid env) (= types/oid-bit))
-                 (some-> (.getRightExpression e) (expr-oid env) (= types/oid-bit)))
+      (let [^BinaryExpression e expr
+            left (.getLeftExpression e)
+            right (.getRightExpression e)
+            loid (expr-oid left env)
+            roid (expr-oid right env)
+            l-resolution (resolution-oid left env)
+            r-resolution (resolution-oid right env)
+            l-array? (contains? types/array-oid->element-oid loid)
+            r-array? (contains? types/array-oid->element-oid roid)]
+        (cond
+          (and (contains? #{types/oid-bit types/oid-varbit} loid)
+               (contains? #{types/oid-bit types/oid-varbit} roid))
           types/oid-varbit
-          types/oid-text))
+
+          (and (or (= loid types/oid-jsonb) (nil? l-resolution))
+               (or (= roid types/oid-jsonb) (nil? r-resolution))
+               (or (= loid types/oid-jsonb) (= roid types/oid-jsonb)))
+          types/oid-jsonb
+
+          (and (= loid types/oid-bytea) (= roid types/oid-bytea))
+          types/oid-bytea
+
+          (or l-array? r-array?)
+          (compatible-array-oid [left right] env
+                                (cond
+                                  (and l-array? r-array?) [0 1]
+                                  l-array? [0]
+                                  :else [1]))
+
+          :else types/oid-text))
+
+      ;; JSON access keeps the input family for -> and #>, while the
+      ;; corresponding text variants ->> and #>> return text.
+      (instance? JsonExpression expr)
+      (let [^JsonExpression je expr
+            op (some-> (.getOperators je) last str)
+            base-oid (expr-oid (.getExpression je) env)]
+        (if (contains? #{"->>" "#>>"} op)
+          types/oid-text
+          (when (contains? #{types/oid-json types/oid-jsonb} base-oid)
+            base-oid)))
 
       ;; --- Array constructor / subscript --------------------------------
       ;; ARRAY[…] → T[] where T is the LUB of element OIDs; fall back
@@ -878,8 +992,12 @@
       (let [elem-oids (->> (.getExpressions ^ArrayConstructor expr)
                            (keep #(expr-oid % env))
                            vec)
-            first-oid (or (first elem-oids) types/oid-text)]
-        (get types/element-oid->array-oid first-oid types/oid-text-array))
+            common-oid (types/select-common-type elem-oids "ARRAY" true)]
+        ;; A multidimensional array has the same type OID as its element
+        ;; arrays in PostgreSQL; there is no separate array-of-array OID.
+        (if (contains? types/array-oid->element-oid common-oid)
+          common-oid
+          (get types/element-oid->array-oid common-oid types/oid-text-array)))
 
       ;; arr[N] / arr[lo:hi] → element OID (for single subscript)
       ;; or the container's array OID (for slice).
@@ -917,16 +1035,22 @@
                              (.getExpression
                               ^net.sf.jsqlparser.statement.select.OrderByElement
                               (first obs)))))
-            arg-oid (when arg-expr (expr-oid arg-expr env))]
+            arg-oid (when arg-expr (expr-oid arg-expr env))
+            default-oid (when-let [default-expr (.getDefaultValue ae)]
+                          (resolution-oid default-expr env))]
         (or (resolve-aggregate-result-oid fname arg-oid)
-            (let [rule (get sql-fn->return-oid fname)]
+            (let [rule (or (get sql-window->return-oid fname)
+                           (get sql-fn->return-oid fname))]
               (cond
                 (integer? rule)    rule
+                (and (contains? #{"lag" "lead"} fname) default-oid)
+                (types/select-common-type [arg-oid default-oid]
+                                          (str/upper-case fname) false)
                 (= rule :arg-type) arg-oid
                 :else              nil))))
 
-      ;; --- EXTRACT() --- always returns float8 in PG --------------------
-      (instance? ExtractExpression expr) types/oid-float8
+      ;; EXTRACT is numeric; date_part (the function spelling) is float8.
+      (instance? ExtractExpression expr) types/oid-numeric
 
       ;; --- CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP
       ;; (parsed as TimeKeyExpression by JSqlParser) ----------------------
@@ -934,7 +1058,7 @@
       (let [k (some-> (.getStringValue ^TimeKeyExpression expr) str/lower-case)]
         (cond
           (= k "current_date") types/oid-date
-          (= k "current_time") types/oid-time
+          (= k "current_time") types/oid-timetz
           (= k "current_timestamp") types/oid-timestamptz
           :else types/oid-timestamptz))
 

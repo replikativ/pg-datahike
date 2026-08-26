@@ -850,7 +850,7 @@
              :pg_proc/proargtypes (or args "")
              (pgs/row-marker-attr "pg_proc") true})
           [["now" "s" 0 1184 ""] ["current_timestamp" "s" 0 1184 ""]
-           ["current_date" "s" 0 1082 ""] ["current_time" "s" 0 1083 ""]
+           ["current_date" "s" 0 1082 ""] ["current_time" "s" 0 1266 ""]
            ["timeofday" "v" 0 25 ""] ["clock_timestamp" "v" 0 1184 ""]
            ["statement_timestamp" "s" 0 1184 ""]
            ["transaction_timestamp" "s" 0 1184 ""]

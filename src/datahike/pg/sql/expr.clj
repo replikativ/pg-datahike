@@ -506,7 +506,7 @@
                     zdt (.atZone truncated java.time.ZoneOffset/UTC)]
                 (case fname
                   "current_timestamp" (java.util.Date/from truncated)
-                  "current_time" (.toLocalTime zdt)
+                  "current_time" (.toOffsetTime (.toOffsetDateTime zdt))
                   "localtimestamp" (.toLocalDateTime zdt)
                   "localtime" (.toLocalTime zdt))))]
         (swap! (:in-params ctx) conj fn-param)
@@ -2764,12 +2764,10 @@
                                .toLocalDate)))))
         ;; ::time — extract the LocalTime so serialization emits only
         ;; "HH:MM:SS[.fff]" and drops any date component the input had.
-          is-time? (let [s (str/trim (str inner-raw))
-                       ;; Accept "HH:MM:SS[.f]", "YYYY-MM-DD HH:MM:SS[.f]",
-                       ;; and ISO-8601 with T separator.
-                         time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                     (try (java.time.LocalTime/parse time-only)
-                          (catch Exception _ s)))
+          is-time? (sql-cast/cast-scalar
+                    inner-raw type-str
+                    {:explicit? true
+                     :parse-timestamp parse-timestamp-string})
           is-ts?   (parse-timestamp-string (str inner-raw))
           is-uuid? (coerce/parse-uuid inner-raw)
         ;; ::regnamespace — resolve schema name to namespace OID
@@ -2828,22 +2826,10 @@
             is-time?
             (let [fn-param (symbol (str "?cast-time" (swap! (:var-counter ctx) inc)))
                   time-fn (fn [v]
-                            (when v
-                              (cond
-                                (instance? java.util.Date v)
-                                (-> ^java.util.Date v .toInstant
-                                    (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
-                                (instance? java.time.Instant v)
-                                (-> ^java.time.Instant v
-                                    (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
-                                (instance? java.time.LocalTime v) v
-                                (instance? java.time.LocalDateTime v)
-                                (.toLocalTime ^java.time.LocalDateTime v)
-                                :else
-                                (let [s (str/trim (str v))
-                                      time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                                  (try (java.time.LocalTime/parse time-only)
-                                       (catch Exception _ s))))))]
+                            (sql-cast/cast-scalar
+                             v type-str
+                             {:explicit? true
+                              :parse-timestamp parse-timestamp-string}))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj (null-preserving time-fn))
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var]))
@@ -4087,6 +4073,8 @@
                         ;; PgBit records themselves.
                         (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b))
                         (pg-bits/concat-bits a b)
+                        (and (bytes? a) (bytes? b))
+                        (byte-array (concat a b))
                         ;; Append/prepend scalar to array — PG allows
                         ;; `arr || scalar` and `scalar || arr`.
                         (pg-arr/array? a)
@@ -4218,7 +4206,8 @@
                             (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalDate)))
                    (= key-str "current_time")
                    (fn [] (let [^java.util.Date st (or params/*statement-time* (java.util.Date.))]
-                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalTime)))
+                            (-> st .toInstant (.atZone java.time.ZoneOffset/UTC)
+                                .toOffsetDateTime .toOffsetTime)))
                    :else (fn [] (or params/*statement-time* (java.util.Date.))))
           fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))]
       (swap! (:in-params ctx) conj fn-param)

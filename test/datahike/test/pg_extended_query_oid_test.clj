@@ -32,8 +32,21 @@
 (def oid-int4      23)
 (def oid-int8      20)
 (def oid-text      25)
+(def oid-name      19)
+(def oid-float4   700)
 (def oid-float8   701)
 (def oid-numeric 1700)
+(def oid-json      114)
+(def oid-jsonb    3802)
+(def oid-bytea      17)
+(def oid-bit      1560)
+(def oid-varbit   1562)
+(def oid-int4-array 1007)
+(def oid-int8-array 1016)
+(def oid-time     1083)
+(def oid-timestamp 1114)
+(def oid-timetz   1266)
+(def oid-timetz-array 1270)
 (def oid-timestamptz 1184)
 (def oid-date     1082)
 
@@ -100,6 +113,10 @@
 (defn- exec-rows [sql]
   (let [^PgWireServer$QueryResult r (.execute *handler* sql)]
     (mapv vec (.-rows r))))
+
+(defn- assert-describe-and-execute-oids [expected sql]
+  (is (= expected (describe-oids sql)) (str "Describe: " sql))
+  (is (= expected (exec-oids sql)) (str "Execute: " sql)))
 
 ;; Table-free literal SELECTs — Metabase `can-connect?` path
 
@@ -205,6 +222,120 @@
   (testing "SELECT COALESCE(name, 'N/A') FROM employee -> TEXT"
     (is (= [oid-text] (describe-oids "SELECT COALESCE(name, 'N/A') FROM employee")))))
 
+(deftest postgres-function-signature-oids
+  (testing "polymorphic numeric functions follow PostgreSQL overload resolution"
+    (assert-describe-and-execute-oids
+     [oid-int4] "SELECT nullif(1::int4, 2::int8)")
+    (assert-describe-and-execute-oids
+     [oid-int8] "SELECT mod(1::int4, 2::int8)")
+    (assert-describe-and-execute-oids
+     [oid-numeric] "SELECT pow(2::numeric, 3::numeric)"))
+  (testing "varchar overlay resolves through PostgreSQL's text overload"
+    (assert-describe-and-execute-oids
+     [oid-text] "SELECT overlay('abc'::varchar placing 'x' from 2)"))
+  (testing "real resolves to the float8 ceil overload"
+    (assert-describe-and-execute-oids
+     [oid-float8] "SELECT ceil(1.25::real)"))
+  (testing "EXTRACT syntax returns numeric while date_part returns float8"
+    (assert-describe-and-execute-oids
+     [oid-numeric oid-float8]
+     "SELECT extract(year FROM DATE '2020-01-01'), date_part('year', DATE '2020-01-01')")))
+
+(deftest postgres-array-result-oids
+  (testing "constructors select a common element type and preserve dimensions"
+    (assert-describe-and-execute-oids
+     [oid-int8-array] "SELECT ARRAY[1, 2147483648]")
+    (assert-describe-and-execute-oids
+     [oid-int4-array] "SELECT ARRAY[ARRAY[1,2], ARRAY[3,4]]"))
+  (testing "array_prepend returns its second argument's array family"
+    (assert-describe-and-execute-oids
+     [oid-int4-array] "SELECT array_prepend(0, ARRAY[1,2])")))
+
+(deftest postgres-json-function-oids
+  (assert-describe-and-execute-oids
+   [oid-json oid-jsonb oid-int4 oid-text]
+   (str "SELECT json_build_object('a',1), jsonb_build_object('a',1), "
+        "jsonb_array_length('[1]'::jsonb), "
+        "jsonb_extract_path_text('{\"a\":1}'::jsonb, 'a')")))
+
+(deftest postgres-json-access-operator-oids
+  (assert-describe-and-execute-oids
+   [oid-jsonb oid-text oid-json oid-text]
+   (str "SELECT '{\"a\":1}'::jsonb->'a', '{\"a\":1}'::jsonb->>'a', "
+        "'{\"a\":1}'::json->'a', '{\"a\":1}'::json->>'a'")))
+
+(deftest declared-json-and-jsonb-column-oids-stay-distinct
+  (exec-rows "CREATE TABLE oid_json_probe (j json, b jsonb)")
+  (assert-describe-and-execute-oids
+   [oid-json oid-jsonb] "SELECT j, b FROM oid_json_probe"))
+
+(deftest derived-columns-preserve-collapsed-storage-oids
+  (assert-describe-and-execute-oids
+   [oid-int4 oid-float4 oid-json oid-timestamptz]
+   (str "SELECT i, r, j, z FROM (SELECT 1::int4 AS i, 1::real AS r, "
+        "'{\"a\":1}'::json AS j, now() AS z) AS q")))
+
+(deftest postgres-window-function-oids
+  (assert-describe-and-execute-oids
+   [oid-int8 oid-int8 oid-int4 oid-float8 oid-int8]
+   (str "SELECT row_number() OVER (), rank() OVER (ORDER BY id), "
+        "ntile(2) OVER (ORDER BY id), percent_rank() OVER (ORDER BY id), "
+        "lag(id) OVER (ORDER BY id) FROM employee")))
+
+(deftest window-output-preserves-select-list-position
+  (is (= [["1" "1" "11"] ["2" "2" "12"] ["3" "3" "13"]]
+         (exec-rows
+          (str "SELECT id, row_number() OVER (ORDER BY id), id + 10 "
+               "FROM employee ORDER BY id")))))
+
+(deftest window-output-position-accounts-for-wildcard-expansion
+  (assert-describe-and-execute-oids
+   [oid-int8 oid-text oid-float8 oid-int8]
+   "SELECT *, row_number() OVER (ORDER BY id) FROM employee")
+  (assert-describe-and-execute-oids
+   [oid-int8 oid-int8 oid-text oid-float8]
+   "SELECT row_number() OVER (ORDER BY id), * FROM employee"))
+
+(deftest set-operation-common-oids-match-describe-and-execute
+  (assert-describe-and-execute-oids
+   [oid-int4] "SELECT 1::int4 UNION ALL SELECT 2")
+  (assert-describe-and-execute-oids
+   [oid-int8] "SELECT 1::int4 UNION ALL SELECT 2147483648::int8")
+  (assert-describe-and-execute-oids
+   [oid-float8] "SELECT 1::numeric UNION ALL SELECT 2::float8")
+  (assert-describe-and-execute-oids
+   [oid-int4] "SELECT NULL UNION ALL SELECT 2::int4")
+  (assert-describe-and-execute-oids
+   [oid-int4] "SELECT '1' UNION ALL SELECT 2::int4"))
+
+(deftest set-operation-values-are-coerced-to-the-common-carrier
+  (let [sql (str "SELECT DATE '2020-01-01' "
+                 "UNION ALL SELECT TIMESTAMP '2020-01-02 03:04:05'")]
+    (assert-describe-and-execute-oids [oid-timestamp] sql)
+    (is (= [["2020-01-01 00:00"] ["2020-01-02 03:04:05"]]
+           (exec-rows sql)))))
+
+(deftest postgres-system-function-oids
+  (assert-describe-and-execute-oids
+   [oid-name] "SELECT current_database()")
+  (assert-describe-and-execute-oids
+   [oid-name] "SELECT current_schema()")
+  (assert-describe-and-execute-oids
+   [oid-timestamptz] "SELECT now()")
+  (assert-describe-and-execute-oids
+   [oid-timetz] "SELECT current_time"))
+
+(deftest postgres-local-time-oids
+  (assert-describe-and-execute-oids
+   [oid-time oid-timestamp] "SELECT localtime, localtimestamp"))
+
+(deftest declared-time-zone-column-oids-stay-distinct
+  (exec-rows
+   (str "CREATE TABLE oid_time_probe "
+        "(t time without time zone, z time with time zone, za time with time zone[])"))
+  (assert-describe-and-execute-oids
+   [oid-time oid-timetz oid-timetz-array] "SELECT t, z, za FROM oid_time_probe"))
+
 ;; Binary arithmetic — numeric promotion
 
 (deftest describe-add-long-long
@@ -225,6 +356,47 @@
 (deftest describe-concat-strings
   (testing "SELECT name || ' (emp)' FROM employee -> TEXT"
     (is (= [oid-text] (describe-oids "SELECT name || ' (emp)' FROM employee")))))
+
+(deftest overloaded-concat-preserves-postgres-result-family
+  (assert-describe-and-execute-oids
+   [oid-jsonb] "SELECT '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb")
+  (assert-describe-and-execute-oids
+   [oid-jsonb] "SELECT '{\"a\":1}'::jsonb || '{}'")
+  (assert-describe-and-execute-oids
+   [oid-bytea] "SELECT '\\x01'::bytea || '\\x02'::bytea")
+  (assert-describe-and-execute-oids
+   [oid-varbit] "SELECT B'10' || B'01'")
+  (assert-describe-and-execute-oids
+   [oid-int8-array] "SELECT ARRAY[1] || ARRAY[2147483648]")
+  (assert-describe-and-execute-oids
+   [oid-int4-array] "SELECT 0 || ARRAY[1,2]")
+  (assert-describe-and-execute-oids
+   [oid-int4-array] "SELECT ARRAY[1,2] || 3"))
+
+(deftest overloaded-scalar-functions-report-declared-return-type
+  (assert-describe-and-execute-oids
+   [oid-float8 oid-numeric oid-text oid-bit]
+   (str "SELECT floor(1::real), round(1::numeric, 0), "
+        "substring('abc'::varchar FROM 1), substring(B'101' FROM 1)")))
+
+(deftest lag-default-participates-in-common-type-resolution
+  (exec-rows "CREATE TABLE oid_lag_probe (v int4)")
+  (exec-rows "INSERT INTO oid_lag_probe VALUES (1), (2)")
+  (assert-describe-and-execute-oids
+   [oid-int8]
+   (str "SELECT lag(v, 1, 2147483648::int8) OVER (ORDER BY v) "
+        "FROM oid_lag_probe")))
+
+(deftest timetz-binary-codec-round-trips-scalar-and-array
+  (let [value (java.time.OffsetTime/parse "12:34:56.123456-07:30")
+        bytes (datahike.pg.PgParamCodec/encodeBinary oid-timetz value)]
+    (is (= 12 (alength bytes)))
+    (is (= value (datahike.pg.PgParamCodec/decodeBinary oid-timetz bytes))))
+  (doseq [text ["12:34:56+00" "12:34:56+02"]]
+    (is (some? (datahike.pg.PgParamCodec/encodeBinary oid-timetz text))))
+  (let [text "{12:34:56+02:00,01:02:03-07:30}"
+        bytes (datahike.pg.PgParamCodec/encodeArrayBinary oid-timetz-array text)]
+    (is (= text (datahike.pg.PgParamCodec/decodeArrayBinary oid-timetz-array bytes)))))
 
 ;; Comparisons / logical → BOOL
 ;;
@@ -327,6 +499,14 @@
       (vec (for [i (range 1 (inc (.getColumnCount md)))]
              (.getColumnType md i))))))
 
+(defn- meta-type-names [sql]
+  (with-open [^Connection c (jdbc-conn)
+              ^PreparedStatement ps (.prepareStatement c sql)
+              ^ResultSet rs (.executeQuery ps)]
+    (let [^ResultSetMetaData md (.getMetaData rs)]
+      (vec (for [i (range 1 (inc (.getColumnCount md)))]
+             (.getColumnTypeName md i))))))
+
 (deftest pgjdbc-extended-select-one
   (testing "Metabase's exact check: PreparedStatement rs.getObject(1) is Long 1"
     (with-open [^Connection c (jdbc-conn)
@@ -356,6 +536,22 @@
   (testing "CAST(... AS BIGINT) reports BIGINT"
     (is (= [Types/BIGINT]
            (meta-types "SELECT CAST(salary AS BIGINT) FROM employee")))))
+
+(deftest pgjdbc-extended-metadata-semantic-types
+  (is (= ["jsonb" "numeric" "int4" "timetz"]
+         (meta-type-names
+          (str "SELECT jsonb_build_object('a',1), "
+               "extract(year FROM DATE '2020-01-01'), "
+               "ntile(2) OVER (ORDER BY id), current_time FROM employee")))))
+
+(deftest pgjdbc-current-time-decodes-as-offset-time
+  (with-open [^Connection c (jdbc-conn)
+              ^PreparedStatement ps (.prepareStatement c "SELECT current_time")
+              ^ResultSet rs (.executeQuery ps)]
+    (is (.next rs))
+    (let [v (.getObject rs 1 java.time.OffsetTime)]
+      (is (instance? java.time.OffsetTime v))
+      (is (= java.time.ZoneOffset/UTC (.getOffset ^java.time.OffsetTime v))))))
 
 (deftest pgjdbc-declared-parameter-types-drive-lowering
   (testing "the Parse message's int4 OID types unary operators and pg_typeof"

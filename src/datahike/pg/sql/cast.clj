@@ -444,17 +444,24 @@
                                 (.atZone java.time.ZoneOffset/UTC) .toLocalDate))))
                       v)))
 
-        :time (cond
-                (instance? java.time.LocalTime v) v
-                (instance? java.time.LocalDateTime v)
-                (.toLocalTime ^java.time.LocalDateTime v)
-                (instance? java.util.Date v)
-                (-> ^java.util.Date v .toInstant
-                    (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
-                :else (let [s (str/trim (str v))
-                            time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                        (try (java.time.LocalTime/parse time-only)
-                             (catch Exception _ v))))
+        :time (let [timetz? (contains? #{"timetz" "time with time zone"}
+                                       (types/base-type-name-of type-str))
+                    local (cond
+                            (instance? java.time.OffsetTime v)
+                            (if timetz? v (.toLocalTime ^java.time.OffsetTime v))
+                            (instance? java.time.LocalTime v) v
+                            (instance? java.time.LocalDateTime v)
+                            (.toLocalTime ^java.time.LocalDateTime v)
+                            (instance? java.util.Date v)
+                            (-> ^java.util.Date v .toInstant
+                                (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
+                            :else (let [s (str/trim (str v))
+                                        time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
+                                    (try (java.time.LocalTime/parse time-only)
+                                         (catch Exception _ v))))]
+                (if (and timetz? (instance? java.time.LocalTime local))
+                  (java.time.OffsetTime/of ^java.time.LocalTime local java.time.ZoneOffset/UTC)
+                  local))
 
         ;; Not a width-classified category — the OID-name types.
         (cond

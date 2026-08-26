@@ -40,6 +40,7 @@
 (def oid-void     2278)
 (def oid-date     1082)
 (def oid-time     1083)
+(def oid-timetz   1266)
 (def oid-timestamp 1114)
 (def oid-timestamptz 1184)
 (def oid-interval 1186)
@@ -70,6 +71,7 @@
 (def oid-bpchar-array      1014)
 (def oid-date-array        1182)
 (def oid-time-array        1183)
+(def oid-timetz-array      1270)
 (def oid-timestamp-array   1115)
 (def oid-timestamptz-array 1185)
 (def oid-numeric-array     1231)
@@ -94,6 +96,7 @@
    oid-bpchar      oid-bpchar-array
    oid-date        oid-date-array
    oid-time        oid-time-array
+   oid-timetz      oid-timetz-array
    oid-timestamp   oid-timestamp-array
    oid-timestamptz oid-timestamptz-array
    oid-numeric     oid-numeric-array
@@ -122,6 +125,7 @@
    :bpchar      oid-bpchar
    :date        oid-date
    :time        oid-time
+   :timetz      oid-timetz
    :timestamp   oid-timestamp
    :timestamptz oid-timestamptz
    :numeric     oid-numeric
@@ -140,8 +144,14 @@
    :pg/type = this name so oid-infer round-trips the original OID rather than the
    storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
    binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
-  {18 "char", 26 "oid", oid-name "name", oid-money "money",
-   oid-interval "interval", oid-bit "bit", oid-varbit "varbit"})
+  {oid-char "char", oid-int2 "int2", oid-int4 "int4", oid-oid "oid",
+   oid-name "name", oid-money "money", oid-float4 "float4",
+   oid-varchar "varchar", oid-bpchar "bpchar", oid-date "date",
+   oid-time "time", oid-timetz "timetz", oid-timestamptz "timestamptz",
+   oid-interval "interval", oid-bit "bit", oid-varbit "varbit",
+   oid-json "json", oid-jsonb "jsonb", oid-bytea "bytea",
+   oid-pg-lsn "pg_lsn", oid-regclass "regclass", oid-regtype "regtype",
+   oid-regnamespace "regnamespace", oid-tid "tid"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -255,7 +265,8 @@
    "date"              :date
    "time"              :time
    "time without time zone"          :time
-   "time with time zone"             :time
+   "time with time zone"             :timetz
+   "timetz"                          :timetz
    "uuid"              :uuid
    "json"              :json
    "jsonb"             :jsonb
@@ -331,6 +342,7 @@
     "numeric"     oid-numeric
     "date"        oid-date
     "time"        oid-time
+    "timetz"      oid-timetz
     "timestamp"   oid-timestamp
     "timestamptz" oid-timestamptz
     "interval"    oid-interval
@@ -433,6 +445,7 @@
    oid-bytea      "bytea"
    oid-date       "date"
    oid-time       "time without time zone"
+   oid-timetz     "time with time zone"
    oid-timestamp  "timestamp without time zone"
    oid-timestamptz "timestamp with time zone"
    oid-interval   "interval"
@@ -589,6 +602,7 @@
    [oid-name      "name"      64  "b"]
    [oid-date      "date"       4  "b"]
    [oid-time      "time"       8  "b"]
+   [oid-timetz    "timetz"    12  "b"]
    [oid-timestamp "timestamp"  8  "b"]
    [oid-timestamptz "timestamptz" 8 "b"]
    [oid-interval  "interval"  16  "b"]
@@ -618,6 +632,7 @@
    [oid-bpchar-array      "_bpchar"      -1 "b"]
    [oid-date-array        "_date"        -1 "b"]
    [oid-time-array        "_time"        -1 "b"]
+   [oid-timetz-array      "_timetz"      -1 "b"]
    [oid-timestamp-array   "_timestamp"   -1 "b"]
    [oid-timestamptz-array "_timestamptz" -1 "b"]
    [oid-numeric-array     "_numeric"     -1 "b"]
@@ -648,6 +663,7 @@
    oid-bytea     -1
    oid-date       4
    oid-time       8
+   oid-timetz    12
    oid-timestamp  8
    oid-timestamptz 8
    oid-interval  16
@@ -672,6 +688,7 @@
    oid-bpchar-array      -1
    oid-date-array        -1
    oid-time-array        -1
+   oid-timetz-array      -1
    oid-timestamp-array   -1
    oid-timestamptz-array -1
    oid-numeric-array     -1
@@ -700,7 +717,8 @@
    oid-int2        :N  oid-int4    :N  oid-int8   :N
    oid-float4      :N  oid-float8  :N  oid-numeric :N  oid-money :N  oid-oid :N
    oid-text        :S  oid-varchar :S  oid-bpchar :S  oid-name :S  oid-char :S
-   oid-date        :D  oid-time    :D  oid-timestamp :D  oid-timestamptz :D
+   oid-date        :D  oid-time    :D  oid-timetz :D
+   oid-timestamp   :D  oid-timestamptz :D
    oid-interval    :T
    oid-bit         :V  oid-varbit  :V
    oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U
@@ -877,6 +895,7 @@
    oid-varbit      :db.type/string
    oid-date        :db.type/instant
    oid-time        :db.type/instant
+   oid-timetz      :db.type/string
    oid-timestamp   :db.type/instant
    oid-timestamptz :db.type/instant
    oid-uuid        :db.type/uuid
@@ -1004,7 +1023,7 @@
         (= oid oid-bit)     (format "bit(%d)" tm)
         (= oid oid-varbit)  (format "bit varying(%d)" tm)
         (= oid oid-time)    (format "time(%d) without time zone" tm)
-        (= oid 1266)        (format "time(%d) with time zone" tm)
+        (= oid oid-timetz)  (format "time(%d) with time zone" tm)
         (= oid oid-timestamp)   (format "timestamp(%d) without time zone" tm)
         (= oid oid-timestamptz) (format "timestamp(%d) with time zone" tm)
         :else base))))
@@ -1068,7 +1087,9 @@
             :text    :text
             :boolean :bool
             :date    :date
-            :time    :time
+            :time    (if (contains? #{"timetz" "time with time zone"} elem)
+                       :timetz
+                       :time)
             :timestamp :timestamp
             :uuid    :uuid
             :text))))))
@@ -1211,6 +1232,7 @@
     ;; without these they reported as text.
     (instance? java.time.LocalDate v)     oid-date
     (instance? java.time.LocalTime v)     oid-time
+    (instance? java.time.OffsetTime v)    oid-timetz
     (instance? java.time.LocalDateTime v) oid-timestamp
     (uuid? v)             oid-uuid
     :else                 oid-text))
@@ -1298,6 +1320,7 @@
    (cond
      (instance? java.time.LocalDate v)     (str v)
      (instance? java.time.LocalTime v)     (str v)
+     (instance? java.time.OffsetTime v)    (str/replace (str v) #"Z$" "+00")
      (instance? java.time.LocalDateTime v) (str/replace (str v) "T" " ")
 
      (and (inst? v) (= src-oid oid-date))

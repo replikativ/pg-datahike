@@ -30,6 +30,7 @@
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
@@ -364,6 +365,7 @@
     ;; timestamp through a lossy date-only conversion.
      (instance? java.time.LocalDate v) (str v)       ;; "2017-03-13"
      (instance? java.time.LocalTime v) (str v)       ;; "14:25:48.130861"
+     (instance? java.time.OffsetTime v) (str/replace (str v) #"Z$" "+00")
      (instance? java.time.LocalDateTime v)           ;; "2017-03-13 14:25:48.130861"
      (-> (str v) (str/replace "T" " "))
      ;; A `date` COLUMN stores a java.util.Date (Datahike has only
@@ -614,7 +616,7 @@
                               base)))]
       (int-array
        (map-indexed
-        (fn [i alias]
+        (fn [i _alias]
           (let [fvar (when (< i (count find-vars)) (nth find-vars i))
                 attr (when (symbol? fvar) (get var->attr fvar))
                 props (when attr (get schema attr))]
@@ -622,7 +624,7 @@
               (if-let [pgtype (and pgtype-map (get pgtype-map attr))]
                 (case pgtype
                   "jsonb" types/oid-jsonb
-                  "json"  types/oid-jsonb
+                  "json"  types/oid-json
                   ;; Native PG array column: `:pg/type "_T"` resolves
                   ;; via pg-name->oid to the corresponding array OID
                   ;; (`_int4` → 1007 etc.). Fall back to the storage
@@ -630,14 +632,87 @@
                   (or (get types/pg-name->oid pgtype)
                       (oid-for-props props)))
                 (oid-for-props props))
-              (or (some (fn [[attr-kw p]]
-                          (when (and (keyword? attr-kw)
-                                     (= (name attr-kw) alias)
-                                     (not (str/starts-with? (str (namespace attr-kw)) "__")))
-                            (oid-for-props p)))
-                        schema)
-                  -1))))
+              ;; An output alias is not a relation-qualified column identity.
+              ;; Guessing by `(name attr)` could silently borrow an unrelated
+              ;; table's OID when schemas contain repeated names such as `id`.
+              -1)))
         find-aliases)))))
+
+(defn- select-output-oids
+  "Static visible output OIDs for one translated SELECT branch."
+  [parsed db]
+  (let [aliases (:find-aliases parsed)
+        ;; :find-aliases already contains only projected columns. Hidden
+        ;; ORDER-BY/entity-id terms exist solely in (:find query), so
+        ;; subtracting :hidden-count here erased real result columns.
+        visible (count aliases)
+        resolved (compute-schema-oids parsed (or (:enriched-db parsed) db))
+        item-oids (effective-item-oids
+                   (assoc parsed :select-item-oids
+                          (:select-item-resolution-oids parsed)))]
+    (mapv (fn [i]
+            (let [schema-oid (aget ^ints resolved i)
+                  item-oid (when item-oids (nth item-oids i nil))]
+              (cond
+                (some? item-oid) item-oid
+                (not= schema-oid -1) schema-oid
+                :else nil)))
+          (range visible))))
+
+(defn- set-operation-output-oids
+  "Resolve PostgreSQL's per-column common type across set-op branches."
+  [sub-results db]
+  (let [branch-oids (mapv #(select-output-oids % db) sub-results)
+        width (count (first branch-oids))]
+    (when-not (every? #(= width (count %)) branch-oids)
+      (throw (ex-info "each set-operation query must have the same number of columns"
+                      {:error :syntax-error :sqlstate "42601"})))
+    ;; Set operations are binary and left-associative. Resolving all leaves
+    ;; in one pass is observably different when an early UNKNOWN/UNKNOWN
+    ;; pair becomes text before a later branch is considered.
+    (reduce (fn [resolved branch]
+              (mapv (fn [left right]
+                      (types/select-common-type [left right] "UNION" true))
+                    resolved branch))
+            (first branch-oids)
+            (rest branch-oids))))
+
+(defn- coerce-set-operation-value
+  "Coerce a set-operation leaf to its analyzer-selected common OID."
+  [v target-oid]
+  (cond
+    (or (nil? v) (= :__null__ v)) :__null__
+
+    (and (contains? types/array-oid->element-oid target-oid)
+         (pg-arr/array? v))
+    (pg-arr/array (types/cast-array-elem-kw (get types/oid->pg-name target-oid))
+                  (:elements v))
+
+    (= target-oid types/oid-timestamp)
+    (cond
+      (instance? java.time.LocalDate v)
+      (.atStartOfDay ^java.time.LocalDate v)
+      :else (sql-cast/cast-scalar v "timestamp" {:explicit? true}))
+
+    (= target-oid types/oid-timestamptz)
+    (cond
+      (instance? java.time.LocalDate v)
+      (-> ^java.time.LocalDate v .atStartOfDay
+          (.toInstant java.time.ZoneOffset/UTC) java.util.Date/from)
+      (instance? java.time.LocalDateTime v)
+      (-> ^java.time.LocalDateTime v
+          (.toInstant java.time.ZoneOffset/UTC) java.util.Date/from)
+      :else v)
+
+    :else
+    (if-let [target-name (get types/oid->pg-name target-oid)]
+      (sql-cast/cast-scalar v target-name {:explicit? true})
+      v)))
+
+(defn- coerce-set-operation-row [row result-oids]
+  (if (sequential? row)
+    (mapv coerce-set-operation-value row result-oids)
+    [(coerce-set-operation-value row (first result-oids))]))
 
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
@@ -1457,7 +1532,7 @@
 (defn- handle-current-schema [session-state]
   (PgWireServer$QueryResult.
    (into-array String ["current_schema"])
-   (int-array [PgWireServer/OID_TEXT])
+   (int-array [types/oid-name])
    (into-array (Class/forName "[Ljava.lang.String;")
                [(into-array String [(current-schema-name session-state)])])
    "SELECT 1"))
@@ -1470,7 +1545,7 @@
   [db-name]
   (PgWireServer$QueryResult.
    (into-array String ["current_database"])
-   (int-array [PgWireServer/OID_TEXT])
+   (int-array [types/oid-name])
    (into-array (Class/forName "[Ljava.lang.String;")
                [(into-array String [(or db-name "datahike")])])
    "SELECT 1"))
@@ -3741,10 +3816,10 @@
    handle-* emits at Execute."
   [parsed]
   (case (:system-type parsed)
-    :current-database       {:names ["current_database"]           :oids [PgWireServer/OID_TEXT]}
-    :current-schema         {:names ["current_schema"]             :oids [PgWireServer/OID_TEXT]}
+    :current-database       {:names ["current_database"]           :oids [types/oid-name]}
+    :current-schema         {:names ["current_schema"]             :oids [types/oid-name]}
     :version                {:names ["version"]                    :oids [PgWireServer/OID_TEXT]}
-    :now                    {:names ["now"]                        :oids [PgWireServer/OID_TIMESTAMP]}
+    :now                    {:names ["now"]                        :oids [types/oid-timestamptz]}
     :pg-backend-pid         {:names ["pg_backend_pid"]             :oids [PgWireServer/OID_INT4]}
     :txid-current           {:names ["txid_current"]               :oids [PgWireServer/OID_INT8]}
     :pg-keywords            {:names ["string_agg"]                 :oids [PgWireServer/OID_TEXT]}
@@ -4363,7 +4438,7 @@
 
 (defn- handle-now [_ctx _parsed]
   (single-row-result "now"
-                     PgWireServer/OID_TIMESTAMP
+                     types/oid-timestamptz
                      (value->string (java.util.Date.))))
 
 (defn- handle-pg-keywords [_ctx _parsed]
@@ -5197,6 +5272,37 @@
    (DDL mints a new schema map → recompile)."
   (pg-cache/bounded-cache 512))
 
+(defn- window-projection-indices
+  "Indices that restore window outputs to their SQL target-list positions.
+
+   The Datalog query carries ordinary outputs and hidden __win_* inputs;
+   the window executor appends computed values. PostgreSQL exposes neither
+   implementation detail and preserves the original SELECT-list order."
+  [base-aliases window-specs]
+  (let [base-indices (vec (keep-indexed
+                           (fn [i a]
+                             (when-not (and (string? a)
+                                            (.startsWith ^String a "__win_"))
+                               i))
+                           base-aliases))
+        window-start (count base-aliases)
+        window-by-pos (into {}
+                            (map-indexed
+                             (fn [i spec]
+                               [(or (:out-pos spec)
+                                    (+ (count base-indices) i))
+                                (+ window-start i)]))
+                            window-specs)
+        n (+ (count base-indices) (count window-specs))]
+    (loop [pos 0
+           base (seq base-indices)
+           out []]
+      (if (= pos n)
+        out
+        (if-let [window-idx (get window-by-pos pos)]
+          (recur (inc pos) base (conj out window-idx))
+          (recur (inc pos) (next base) (conj out (first base))))))))
+
 (defn- compile-fast-select
   "Compile a parsed plain SELECT into a direct executor: datalog query +
    ParamRef argument template + precomputed result shape. Returns nil when
@@ -5562,13 +5668,7 @@
                                         (or (:alias spec) (name (:op spec))))
                                       window-specs)
                     new-aliases (into (vec find-aliases) win-aliases)
-                    ;; Hide internal window helper columns (__win_*)
-                    visible-indices (into []
-                                          (keep-indexed (fn [i a]
-                                                          (when-not (and (string? a)
-                                                                         (.startsWith ^String a "__win_"))
-                                                            i)))
-                                          new-aliases)
+                    visible-indices (window-projection-indices find-aliases window-specs)
                     final-results (mapv (fn [row]
                                           (mapv #(nth row % nil) visible-indices))
                                         windowed)
@@ -5669,6 +5769,18 @@
                                                (nth item-oids i))]
                                       (aset out i
                                             (int (if io io so)))))
+                                  out)
+                                schema-oids)
+              ;; Window outputs are appended after the visible base
+              ;; projection. Use their catalog-derived OIDs rather than
+              ;; runtime classes: ntile is represented by a Long here but is
+              ;; int4 in PostgreSQL, while lag/lead retain their input OID.
+                  schema-oids (if (seq window-specs)
+                                (let [out (aclone ^ints schema-oids)
+                                      fallback-start (- (alength out) (count window-specs))]
+                                  (doseq [[i spec] (map-indexed vector window-specs)]
+                                    (when-let [o (:oid spec)]
+                                      (aset out (or (:out-pos spec) (+ fallback-start i)) (int o))))
                                   out)
                                 schema-oids)
               ;; Correlated subqueries: the spliced columns aren't schema/
@@ -6689,6 +6801,7 @@
         ;; runs against the enriched speculative
         ;; db, not the handler's raw connection db.
         query-db (or enriched-db db)
+        result-oids (set-operation-output-oids sub-results query-db)
         ;; Execute each sub-query and strip any hidden ORDER-BY
         ;; columns before combining — sub-queries may add entity-id
         ;; (or similar) to :find for server-side sort, which must
@@ -6724,9 +6837,11 @@
                                             row))
                                         raw)
                                    raw)]
-                     {:results results :find-aliases find-aliases}))
+                     {:results (map #(coerce-set-operation-row % result-oids) results)
+                      :find-aliases find-aliases}))
         executed (mapv exec-sub sub-results)
-        find-aliases (:find-aliases (first executed))
+        find-aliases (vec (:find-aliases (first executed)))
+        wire-oids (int-array (map int result-oids))
         ;; Combine results based on operation type
         combined (case op
                    :union-all (mapcat :results executed)
@@ -6743,7 +6858,7 @@
         ordered (if-let [ob (:sql-order-by parsed)]
                   (sort (null-safe-order-cmp ob) combined)
                   combined)]
-    (format-query-result ordered find-aliases)))
+    (format-query-result ordered find-aliases wire-oids)))
 
 (defn- exec-full-join
   [ctx parsed]
@@ -7435,18 +7550,15 @@
                         ;; AVG; anything else falls back to text, which is the
                         ;; same default the aggregate columns here already use.
                         win-oid (fn [sp]
-                                  (case (:op sp)
-                                    (:count :row_number :row-number :rank :dense_rank
-                                            :dense-rank :ntile) PgWireServer/OID_INT8
-                                    :avg PgWireServer/OID_NUMERIC
-                                    PgWireServer/OID_TEXT))
+                                  (or (:oid sp)
+                                      (case (:op sp)
+                                        (:count :row_number :row-number :rank :dense_rank
+                                                :dense-rank) PgWireServer/OID_INT8
+                                        :ntile PgWireServer/OID_INT4
+                                        :avg PgWireServer/OID_NUMERIC
+                                        PgWireServer/OID_TEXT)))
                         all-oids (into (vec oids) (map win-oid) wspecs)
-                        vis (into [] (keep-indexed
-                                      (fn [i a]
-                                        (when-not (and (string? a)
-                                                       (.startsWith ^String a "__win_"))
-                                          i))
-                                      all-aliases))]
+                        vis (window-projection-indices aliases wspecs)]
                     [(mapv #(nth all-aliases %) vis)
                      (int-array (map #(int (nth all-oids %)) vis))])
                   [aliases oids])
@@ -7500,23 +7612,12 @@
           ;; arity + column types, so the first branch is canonical.
           (= :set-operation (:type parsed))
           (when-let [sub (first (:sub-results parsed))]
-            (let [aliases (:find-aliases sub)
+            (let [aliases (vec (:find-aliases sub))
                   db (if (:in-tx? @tx-state)
                        (or (:speculative-db @tx-state) (d/db conn))
                        (d/db conn))
-                  resolved (compute-schema-oids sub db)
-                  item-oids (:select-item-oids sub)
                   oids (int-array
-                        (for [i (range (count aliases))]
-                          (let [schema-oid (aget ^ints resolved i)
-                                item-oid (when item-oids
-                                           (nth item-oids i nil))]
-                            (cond
-                              ;; item-oid (literals/casts) wins over the
-                              ;; alias-name fallback — see the :select branch.
-                              (some? item-oid)     item-oid
-                              (not= schema-oid -1) schema-oid
-                              :else                PgWireServer/OID_TEXT))))]
+                        (map int (set-operation-output-oids (:sub-results parsed) db)))]
               (PgWireServer$QueryResult.
                (into-array String aliases)
                oids

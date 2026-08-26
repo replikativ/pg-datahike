@@ -99,6 +99,7 @@ public final class PgWireServer {
     public static final int OID_VARCHAR_ARRAY     = 1015;
     public static final int OID_DATE_ARRAY        = 1182;
     public static final int OID_TIME_ARRAY        = 1183;
+    public static final int OID_TIMETZ_ARRAY      = 1270;
     public static final int OID_TIMESTAMP_ARRAY   = 1115;
     public static final int OID_TIMESTAMPTZ_ARRAY = 1185;
     public static final int OID_NUMERIC_ARRAY     = 1231;

@@ -411,6 +411,8 @@
     (cond
       (nil? bt) nil
 
+      array? nil
+
       (#{"jsonb" "json" "money" "interval"} bt) bt
 
       (#{"date" "time" "timestamp" "timestamptz"
@@ -419,10 +421,9 @@
       (cond
         (= "timestamp without time zone" bt) "timestamp"
         (= "timestamp with time zone" bt)    "timestamptz"
-        (#{"time without time zone" "time with time zone"} bt) "time"
+        (= "time without time zone" bt) "time"
+        (= "time with time zone" bt)    "timetz"
         :else bt)
-
-      array? nil
 
       (#{:bit :varbit} (types/cast-category bt))
       (if (= :varbit (types/cast-category bt)) "varbit" "bit")
@@ -654,12 +655,13 @@
                                  ;; ColDataType faithfully includes both.
                                  (some-> (types/parse-bit-length (str cdt)) long))
                                char-pg-type
-                               (let [b (types/base-type-name-of raw-type)]
-                                 (cond
-                                   (contains? #{"char" "character" "bpchar"} b) "bpchar"
-                                   (contains? #{"varchar" "character varying"} b) "varchar"
-                                   (= "name" b) "name"
-                                   :else nil))
+                               (when-not array-spec
+                                 (let [b (types/base-type-name-of raw-type)]
+                                   (cond
+                                     (contains? #{"char" "character" "bpchar"} b) "bpchar"
+                                     (contains? #{"varchar" "character varying"} b) "varchar"
+                                     (= "name" b) "name"
+                                     :else nil)))
                                pk-here? (or (and single-pk-col (= col-name single-pk-col))
                                             (contains? pk-cols-set col-name))
                                ;; PRIMARY KEY is implicitly NOT NULL.  The SQL
@@ -734,18 +736,19 @@
                        ;; (OID 1114) and pgjdbc rejects subsequent
                        ;; setDate binds with "Can't change resolved
                        ;; type for param …".
-                       (#{"jsonb" "json" "money" "interval"
-                          "date" "time" "timestamp"
-                          "timestamptz" "timestamp without time zone"
-                          "timestamp with time zone"
-                          "time without time zone"
-                          "time with time zone"} base-type)
+                       (and (not array-spec)
+                            (#{"jsonb" "json" "money" "interval"
+                               "date" "time" "timestamp"
+                               "timestamptz" "timestamp without time zone"
+                               "timestamp with time zone"
+                               "time without time zone"
+                               "time with time zone"} base-type))
                        (assoc :pg/type
                               (cond
                                 (#{"timestamp without time zone"} base-type) "timestamp"
                                 (#{"timestamp with time zone"} base-type)    "timestamptz"
-                                (#{"time without time zone"
-                                   "time with time zone"} base-type) "time"
+                                (= "time without time zone" base-type) "time"
+                                (= "time with time zone" base-type) "timetz"
                                 :else base-type))
 
                        ;; bit / bit varying columns. Like jsonb they
