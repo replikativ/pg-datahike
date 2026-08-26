@@ -829,7 +829,7 @@
     (instance? StringValue expr) (expr/string-value-text ^StringValue expr)
     (instance? JdbcParameter expr)
     (if-let [bound params/*bound-params*]
-      (nth bound (.getIndex ^JdbcParameter expr) ::corr)
+      (nth bound (dec (long (.getIndex ^JdbcParameter expr))) ::corr)
       ::corr)
     (instance? SignedExpression expr)
     (let [v (srf-const-eval (.getExpression ^SignedExpression expr))]
@@ -4405,6 +4405,7 @@
         oid-env {:db db :schema schema
                  :table-aliases table-aliases
                  :default-table default-table
+                 :from-binding-oids params/*from-binding-oids*
                  :hints (pgs/schema-hints db)}
         ;; OID inference per select-item. The expr-oid walker handles
         ;; AnalyticExpression (windows, WITHIN GROUP) and arithmetic
@@ -5641,6 +5642,7 @@
              ;; N sort keys -- no second resolution path needed.
              :distinct-on-n   (when (seq distinct-on-items) (count distinct-on-items))
              :in-args         in-args
+             :runtime-subqueries? @(:runtime-subqueries? ctx)
              :hidden-count    hidden-count
              ;; Pass enriched db when derived tables or derived-table-joins
              ;; created speculative data (FROM (…) AS sub or JOIN (…) AS sub).

@@ -361,6 +361,7 @@
    :with-vars     (atom #{})
    :in-params     (atom [])       ;; extra :in parameter symbols for CASE fns etc.
    :in-args       (atom [])
+   :runtime-subqueries? (atom false)
    :left-join-evars (atom #{})    ;; entity vars from LEFT JOIN right side (don't get-else on these)
    ;; Vars emitted by col-var! that are bound via get-else and thus may
    ;; carry the `:__null__` sentinel. Predicates involving these need
@@ -383,7 +384,7 @@
 
 (def ^:private snapshot-keys
   [:var-counter :col->var :entity-vars :where-clauses :find-elements
-   :with-vars :in-params :in-args :left-join-evars :nullable-vars
+   :with-vars :in-params :in-args :runtime-subqueries? :left-join-evars :nullable-vars
    :required-join-patterns :param-placeholders])
 
 (defn snapshot

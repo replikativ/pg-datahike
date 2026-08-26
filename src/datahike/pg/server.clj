@@ -30,12 +30,12 @@
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
-            [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
+            [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
             [datahike.pg.types :as types]
@@ -676,43 +676,6 @@
                     resolved branch))
             (first branch-oids)
             (rest branch-oids))))
-
-(defn- coerce-set-operation-value
-  "Coerce a set-operation leaf to its analyzer-selected common OID."
-  [v target-oid]
-  (cond
-    (or (nil? v) (= :__null__ v)) :__null__
-
-    (and (contains? types/array-oid->element-oid target-oid)
-         (pg-arr/array? v))
-    (pg-arr/array (types/cast-array-elem-kw (get types/oid->pg-name target-oid))
-                  (:elements v))
-
-    (= target-oid types/oid-timestamp)
-    (cond
-      (instance? java.time.LocalDate v)
-      (.atStartOfDay ^java.time.LocalDate v)
-      :else (sql-cast/cast-scalar v "timestamp" {:explicit? true}))
-
-    (= target-oid types/oid-timestamptz)
-    (cond
-      (instance? java.time.LocalDate v)
-      (-> ^java.time.LocalDate v .atStartOfDay
-          (.toInstant java.time.ZoneOffset/UTC) java.util.Date/from)
-      (instance? java.time.LocalDateTime v)
-      (-> ^java.time.LocalDateTime v
-          (.toInstant java.time.ZoneOffset/UTC) java.util.Date/from)
-      :else v)
-
-    :else
-    (if-let [target-name (get types/oid->pg-name target-oid)]
-      (sql-cast/cast-scalar v target-name {:explicit? true})
-      v)))
-
-(defn- coerce-set-operation-row [row result-oids]
-  (if (sequential? row)
-    (mapv coerce-set-operation-value row result-oids)
-    [(coerce-set-operation-value row (first result-oids))]))
 
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
@@ -5313,6 +5276,7 @@
   (when (and (= :select (:type parsed))
              (:query parsed) (seq (:find-aliases parsed))
              (nil? (:enriched-db parsed))
+             (not (:runtime-subqueries? parsed))
              (nil? (:correlated-subqueries parsed))
              (nil? (:compound-exprs parsed))
              (nil? (:window-specs parsed))
@@ -5463,9 +5427,13 @@
                       limit  (assoc :limit limit)
                       offset (assoc :offset offset)
                       :always (assoc :cancel (current-cancel)))
-            results (if (seq in-args)
-                      (run-param-query q-input #(apply d/q q-input query-db in-args))
-                      (run-param-query q-input #(d/q q-input query-db)))
+            ;; Runtime subquery closures execute inside d/q. Bind the
+            ;; statement's effective query DB, not merely the connection's raw
+            ;; snapshot: CTEs and derived relations live in `query-db`.
+            results (binding [params/*runtime-db* query-db]
+                      (if (seq in-args)
+                        (run-param-query q-input #(apply d/q q-input query-db in-args))
+                        (run-param-query q-input #(d/q q-input query-db))))
             ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
             ;; Extract the `id` column from each result row, check the
             ;; server-wide lock registry, and either:
@@ -6813,9 +6781,10 @@
                               project-set project-order-by project-limit
                               project-offset fetch-with-ties?]}]
                    (let [q-input (assoc query :cancel (current-cancel))
-                         raw (if (seq in-args)
-                               (apply d/q q-input query-db in-args)
-                               (run-param-query q-input #(d/q q-input query-db)))
+                         raw (binding [params/*runtime-db* query-db]
+                               (if (seq in-args)
+                                 (apply d/q q-input query-db in-args)
+                                 (run-param-query q-input #(d/q q-input query-db))))
                          raw (if (seq project-set)
                                (stmt/apply-project-set raw project-set)
                                raw)
@@ -6839,7 +6808,7 @@
                                             row))
                                         raw)
                                    raw)]
-                     {:results (map #(coerce-set-operation-row % result-oids) results)
+                     {:results (map #(set-ops/coerce-row % result-oids) results)
                       :find-aliases find-aliases}))
         executed (mapv exec-sub sub-results)
         find-aliases (vec (:find-aliases (first executed)))
@@ -7653,7 +7622,7 @@
                        (let [db (if (:in-tx? @tx-state)
                                   (or (:speculative-db @tx-state) (d/db conn))
                                   (d/db conn))]
-                         (binding [params/*bound-params* bound
+                         (binding [params/*bound-params* (vec (rest bound))
                                    params/*declared-param-oids*
                                    (:declared-param-oids parsed)]
                            (assoc (sql/parse-sql (:sql parsed) (dbi/-schema db) db)
@@ -7667,6 +7636,10 @@
              (fast-select-prepared conn parsed bound session-state tx-state on-query)
              (binding [*cached-parsed* parsed
                        *cached-bound* bound
+                       ;; Translator/evaluator parameter vectors are 0-based;
+                       ;; *cached-bound* retains the wire protocol's unused
+                       ;; slot 0 for ParamRef substitution.
+                       params/*bound-params* (vec (rest bound))
                        *implicit-tx-allowed* true]
                (.execute this (or (:sql parsed) "")))))))
 
@@ -7794,15 +7767,32 @@
                             (if-let [cached *cached-parsed*]
                               {:parsed
                                (if-let [bound *cached-bound*]
-                                 ;; Re-coerce INSERT values after ParamRef
-                                 ;; substitution so untyped text params
-                                 ;; (e.g. node-postgres "270" → int column)
-                                 ;; narrow to the column's :db/valueType.
-                                 ;; `db` lets coerce-insert-value resolve
-                                 ;; :pg/type; without it a parameterised INSERT
-                                 ;; into a jsonb column skipped canonicalization.
-                                 (coerce-insert-tx-data
-                                  (resolve-param-refs cached bound) schema db)
+                                 (let [;; A runtime subquery over a CTE or
+                                       ;; derived relation needs query-local
+                                       ;; enrichment rebuilt from the SAME
+                                       ;; effective snapshot selected above
+                                       ;; (branch/as-of/cursor/transaction),
+                                       ;; not from head at Bind time.
+                                       cached (if (and (:runtime-subqueries? cached)
+                                                       (:enriched-db cached))
+                                                (binding [params/*bound-params* (vec (rest bound))
+                                                          params/*declared-param-oids*
+                                                          (:declared-param-oids cached)]
+                                                  (assoc (sql/parse-sql sql schema db)
+                                                         :sql (:sql cached)
+                                                         :declared-param-oids
+                                                         (:declared-param-oids cached)))
+                                                cached)]
+                                   ;; Re-coerce INSERT values after ParamRef
+                                   ;; substitution so untyped text params
+                                   ;; (e.g. node-postgres "270" → int column)
+                                   ;; narrow to the column's :db/valueType.
+                                   ;; `db` lets coerce-insert-value resolve
+                                   ;; :pg/type; without it a parameterised
+                                   ;; INSERT into a jsonb column skipped
+                                   ;; canonicalization.
+                                   (coerce-insert-tx-data
+                                    (resolve-param-refs cached bound) schema db))
                                  cached)}
                               ;; Simple-protocol plan stability: rewrite
                               ;; bare number literals to $N so every cache
@@ -7949,11 +7939,12 @@
                                      (not (:in-tx? @tx-state))
                                      (contains? write-parse-types (:type parsed)))
                             (open-implicit-tx! ctx))
-                          (case (:type parsed)
-                            :system                (exec-system ctx parsed)
-                            :select                (exec-select ctx parsed)
-                            :insert                (exec-insert ctx parsed)
-                            :update-with-recursive (exec-update-with-recursive ctx parsed)
+                          (binding [params/*runtime-db* db]
+                            (case (:type parsed)
+                              :system                (exec-system ctx parsed)
+                              :select                (exec-select ctx parsed)
+                              :insert                (exec-insert ctx parsed)
+                              :update-with-recursive (exec-update-with-recursive ctx parsed)
                             ;; Templated simple-protocol UPDATE/DELETE ride
                             ;; the prepared-statement machinery: the exec
                             ;; paths re-translate WHERE and evaluate SET
@@ -7961,60 +7952,60 @@
                             ;; unused), so bind the templater's captured
                             ;; literals here. `or` keeps the real
                             ;; executePrepared binding when not templated.
-                            :update                (binding [*cached-bound*
-                                                             (or templated-bound *cached-bound*)]
-                                                     (exec-update ctx parsed))
-                            :delete                (binding [*cached-bound*
-                                                             (or templated-bound *cached-bound*)]
-                                                     (exec-delete ctx parsed))
-                            :truncate              (exec-truncate ctx parsed)
+                              :update                (binding [*cached-bound*
+                                                               (or templated-bound *cached-bound*)]
+                                                       (exec-update ctx parsed))
+                              :delete                (binding [*cached-bound*
+                                                               (or templated-bound *cached-bound*)]
+                                                       (exec-delete ctx parsed))
+                              :truncate              (exec-truncate ctx parsed)
                             ;; Every DDL exec-* invalidates the per-schema cache.
                             ;; PG metadata (`:pg/not-null` etc.) lives on schema-
                             ;; attribute entities but not in `(dbi/-schema db)`, so
                             ;; identity-keyed caches can't detect a constraint
                             ;; add via ALTER TABLE without an explicit bust.
-                            :ddl-create            (do (invalidate-schema-cache!)
-                                                       (exec-ddl-create ctx parsed))
-                            :ddl-create-view       (do (invalidate-schema-cache!)
-                                                       (execute-ddl-create-view
-                                                        (:conn ctx) parsed (:tx-state ctx)))
-                            :ddl-create-sequence   (do (invalidate-schema-cache!)
-                                                       (exec-ddl-create-sequence ctx parsed))
-                            :ddl-alter-sequence    (do (invalidate-schema-cache!)
-                                                       (exec-ddl-alter-sequence ctx parsed))
-                            :ddl-create-enum       (do (invalidate-schema-cache!)
-                                                       (exec-ddl-create-enum ctx parsed))
-                            :ddl-alter-enum        (do (invalidate-schema-cache!)
-                                                       (exec-ddl-alter-enum ctx parsed))
-                            :ddl-rename-enum       (do (invalidate-schema-cache!)
-                                                       (exec-ddl-rename-enum ctx parsed))
-                            :ddl-drop-enum         (do (invalidate-schema-cache!)
-                                                       (exec-ddl-drop-enum ctx parsed))
-                            :ddl-create-composite  (do (invalidate-schema-cache!)
-                                                       (exec-ddl-create-composite ctx parsed))
-                            :ddl-create-domain     (do (invalidate-schema-cache!)
-                                                       (exec-ddl-create-domain ctx parsed))
-                            :ddl-drop-domain       (do (invalidate-schema-cache!)
-                                                       (exec-ddl-drop-domain ctx parsed))
-                            :savepoint             (exec-savepoint ctx parsed)
-                            :release-savepoint     (exec-release-savepoint ctx parsed)
-                            :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
-                            :ddl-create-index      (do (invalidate-schema-cache!)
-                                                       (exec-ddl-create-index ctx parsed))
-                            :ddl-alter             (do (invalidate-schema-cache!)
-                                                       (exec-ddl-alter ctx parsed))
-                            :ddl-drop              (do (invalidate-schema-cache!)
-                                                       (exec-ddl-drop ctx parsed))
-                            :ddl-drop-view         (do (invalidate-schema-cache!)
-                                                       (execute-ddl-drop-view
-                                                        (:conn ctx) parsed (:tx-state ctx)))
-                            :ddl-drop-sequence     (do (invalidate-schema-cache!)
-                                                       (exec-ddl-drop-sequence ctx parsed))
-                            :set-operation         (exec-set-operation ctx parsed)
-                            :full-join             (exec-full-join ctx parsed)
-                            :error                 (exec-error ctx parsed)
+                              :ddl-create            (do (invalidate-schema-cache!)
+                                                         (exec-ddl-create ctx parsed))
+                              :ddl-create-view       (do (invalidate-schema-cache!)
+                                                         (execute-ddl-create-view
+                                                          (:conn ctx) parsed (:tx-state ctx)))
+                              :ddl-create-sequence   (do (invalidate-schema-cache!)
+                                                         (exec-ddl-create-sequence ctx parsed))
+                              :ddl-alter-sequence    (do (invalidate-schema-cache!)
+                                                         (exec-ddl-alter-sequence ctx parsed))
+                              :ddl-create-enum       (do (invalidate-schema-cache!)
+                                                         (exec-ddl-create-enum ctx parsed))
+                              :ddl-alter-enum        (do (invalidate-schema-cache!)
+                                                         (exec-ddl-alter-enum ctx parsed))
+                              :ddl-rename-enum       (do (invalidate-schema-cache!)
+                                                         (exec-ddl-rename-enum ctx parsed))
+                              :ddl-drop-enum         (do (invalidate-schema-cache!)
+                                                         (exec-ddl-drop-enum ctx parsed))
+                              :ddl-create-composite  (do (invalidate-schema-cache!)
+                                                         (exec-ddl-create-composite ctx parsed))
+                              :ddl-create-domain     (do (invalidate-schema-cache!)
+                                                         (exec-ddl-create-domain ctx parsed))
+                              :ddl-drop-domain       (do (invalidate-schema-cache!)
+                                                         (exec-ddl-drop-domain ctx parsed))
+                              :savepoint             (exec-savepoint ctx parsed)
+                              :release-savepoint     (exec-release-savepoint ctx parsed)
+                              :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
+                              :ddl-create-index      (do (invalidate-schema-cache!)
+                                                         (exec-ddl-create-index ctx parsed))
+                              :ddl-alter             (do (invalidate-schema-cache!)
+                                                         (exec-ddl-alter ctx parsed))
+                              :ddl-drop              (do (invalidate-schema-cache!)
+                                                         (exec-ddl-drop ctx parsed))
+                              :ddl-drop-view         (do (invalidate-schema-cache!)
+                                                         (execute-ddl-drop-view
+                                                          (:conn ctx) parsed (:tx-state ctx)))
+                              :ddl-drop-sequence     (do (invalidate-schema-cache!)
+                                                         (exec-ddl-drop-sequence ctx parsed))
+                              :set-operation         (exec-set-operation ctx parsed)
+                              :full-join             (exec-full-join ctx parsed)
+                              :error                 (exec-error ctx parsed)
                             ;; fallback
-                            (error-result (str "Unknown parse result type: " (:type parsed))))))))
+                              (error-result (str "Unknown parse result type: " (:type parsed)))))))))
                   (catch Exception e
                     (when (:in-tx? @tx-state) (swap! tx-state assoc :aborted? true))
                     (classified-error "" e)))))))))))

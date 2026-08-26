@@ -396,12 +396,15 @@
    type rendering, so we must promote to the array OID at this layer
    (not the underlying scalar) for the wire-level array literal to be
    parsed as an array on the client side."
-  [^Column col {:keys [db schema table-aliases default-table hints]}]
+  [^Column col {:keys [db schema table-aliases default-table hints
+                       from-binding-oids]}]
   (when schema
     (let [col-name   (params/unquote-ident (.getColumnName col))
           col-table  (when-let [t (.getTable col)]
                        (or (params/unquote-ident (.getName t))
                            (params/unquote-ident (.getAlias t))))
+          bound-oid  (when col-table
+                       (get-in from-binding-oids [col-table col-name]))
           table-real (or (get table-aliases col-table col-table)
                          ;; An unqualified column uses default-table, which
                          ;; may itself be a SQL alias (including a CTE name
@@ -432,6 +435,9 @@
           pg-type-name (when (and db attr) (#'params/pg-type-of-attr db attr))
           pg-name-oid  (when pg-type-name (get types/pg-name->oid pg-type-name))]
       (cond
+        ;; A pre-analyzed correlated reference is represented by NULL at
+        ;; runtime, but retains the outer column's declared SQL type here.
+        bound-oid bound-oid
         ;; Native PG array column wins over the storage-type fallback.
         pg-name-oid pg-name-oid
         (nil? base-oid) nil

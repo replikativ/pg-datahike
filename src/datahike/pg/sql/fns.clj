@@ -942,6 +942,18 @@
       :db.type/bigdec (bigdec v)
       v)))
 
+(defn- temporal-instant
+  "Canonical instant for the temporal carriers used by SQL translation."
+  [v]
+  (cond
+    (instance? java.util.Date v) (.toInstant ^java.util.Date v)
+    (instance? java.time.Instant v) v
+    (instance? java.time.LocalDateTime v)
+    (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    (instance? java.time.LocalDate v)
+    (.toInstant (.atStartOfDay ^java.time.LocalDate v) java.time.ZoneOffset/UTC)
+    :else nil))
+
 (defn sql-eq?
   "SQL `=`. Numbers compare BY VALUE across types.
 
@@ -970,6 +982,12 @@
     ;; Parse the text side with the record's element type and compare.
     (and (pg-arr/array? a) (string? b)) (sql-eq? a (pg-arr/from-pg-text b (:elem-type a)))
     (and (pg-arr/array? b) (string? a)) (sql-eq? (pg-arr/from-pg-text a (:elem-type b)) b)
+    ;; DATE and TIMESTAMP use different JVM carriers across literal, cast,
+    ;; stored-column and set-operation paths. PostgreSQL resolves the
+    ;; cross-type operator before execution; compare their canonical temporal
+    ;; values here instead of leaking Java class identity into SQL equality.
+    (and (temporal-instant a) (temporal-instant b))
+    (= (temporal-instant a) (temporal-instant b))
     ;; A numeric special compares by PostgreSQL's total order, and equals
     ;; only its own kind.
     (or (numspecial? a) (numspecial? b))
@@ -1170,11 +1188,13 @@
 (defn sql-in3?
   "`x IN (…)` in VALUE position, three-valued.
 
-   NULL if x is NULL. Otherwise TRUE on a hit; on a miss the answer is
-   UNKNOWN when the list contains a NULL (x might have equalled it) and
-   FALSE only when every element is known and none matched."
+   FALSE for an empty RHS, including when x is NULL. Otherwise NULL if x
+   is NULL, TRUE on a hit, and on a miss UNKNOWN when the list contains a
+   NULL (x might have equalled it)."
   [vals v]
   (cond
+    ;; ANY over an empty set is FALSE even for a NULL left operand.
+    (empty? vals)                 false
     (sql-null? v)               :__null__
     (some #(sql-eq? % v) vals)  true
     (some sql-null? vals)       :__null__

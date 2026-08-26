@@ -1967,19 +1967,34 @@
                           operations (.getOperations sol)
                 ;; Parse each sub-select
                           sub-results (mapv (fn [s]
-                                              (if (instance? PlainSelect s)
-                                                (translate-select ^PlainSelect s schema db)
-                                                {:error (str "Unsupported set operation member: " (type s))}))
+                                              (let [s (loop [s s]
+                                                        (if (instance? ParenthesedSelect s)
+                                                          (recur (.getSelect ^ParenthesedSelect s))
+                                                          s))]
+                                                (if (instance? PlainSelect s)
+                                                  (translate-select ^PlainSelect s schema db)
+                                                  {:type :error
+                                                   :sqlstate "0A000"
+                                                   :message (str "Unsupported set operation member: "
+                                                                 (type s))})))
                                             selects)
-                ;; Determine operation type from first operation
-                          op-type (when (seq operations)
-                                    (let [op (first operations)]
-                                      (cond
-                                        (instance? UnionOp op)
-                                        (if (.isAll ^UnionOp op) :union-all :union)
-                                        (instance? IntersectOp op) :intersect
-                                        (instance? ExceptOp op) :except
-                                        :else :union-all)))
+                          op-kind (fn [op]
+                                    (cond
+                                      (instance? UnionOp op)
+                                      (if (.isAll ^UnionOp op) :union-all :union)
+                                      (instance? IntersectOp op)
+                                      (if (.isAll ^IntersectOp op) :intersect-all :intersect)
+                                      (instance? ExceptOp op)
+                                      (if (.isAll ^ExceptOp op) :except-all :except)
+                                      :else :unknown))
+                          operation-kinds (mapv op-kind operations)
+                          ;; The top-level executor retains its historical
+                          ;; first-op field; nested consumers inspect the full
+                          ;; vector and reject shapes they cannot preserve.
+                          op-type (case (first operation-kinds)
+                                    :intersect-all :intersect
+                                    :except-all :except
+                                    (first operation-kinds))
                           ;; The trailing ORDER BY belongs to the WHOLE set
                           ;; operation, not to its last member, and it was
                           ;; being dropped: `… EXCEPT … ORDER BY 1` came back
@@ -2014,7 +2029,10 @@
                                     obes))))]
                       (cond-> {:type :set-operation
                                :op op-type
-                               :sub-results sub-results}
+                               :set-ops operation-kinds
+                               :sub-results sub-results
+                               :runtime-subqueries?
+                               (boolean (some :runtime-subqueries? sub-results))}
                         (seq set-order-by) (assoc :sql-order-by set-order-by)
                        ;; Top-level catalog materialisation propagates
                        ;; to the server's set-operation executor via
