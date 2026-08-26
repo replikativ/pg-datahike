@@ -5140,6 +5140,21 @@
               c))
           0)))))
 
+(defn- take-with-ties
+  "Take the first `n` sorted rows and every following row equal to the
+   boundary under the ORDER BY comparator. OFFSET has already been applied;
+   comparator equality is equality across all ORDER BY expressions."
+  [n cmp rows]
+  (if (nil? n)
+    rows
+    (let [prefix (vec (take n rows))]
+      (if (empty? prefix)
+        prefix
+        (let [boundary (peek prefix)]
+          (concat prefix
+                  (take-while #(zero? (cmp boundary %))
+                              (drop n rows))))))))
+
 (defn- top-k-sort
   "Return the first `k` rows of `rows` in ascending `cmp` order —
    exactly what (take k (sort cmp rows)) yields, including the stable
@@ -5297,7 +5312,7 @@
         {:keys [query find-aliases limit offset
                 having has-aggregates? has-distinct?
                 in-args hidden-count compound-exprs window-specs
-                sql-order-by sql-limit sql-offset
+                sql-order-by sql-limit sql-offset fetch-with-ties?
                 enriched-db literal-row literal-rows for-update]} parsed]
     (if (or literal-row literal-rows)
       ;; Table-free SELECT: return literal row(s) directly.
@@ -5445,6 +5460,7 @@
                             k (when sql-limit
                                 (+ (long sql-limit) (long (or sql-offset 0))))
                             use-top-k? (and k
+                                            (not fetch-with-ties?)
                                             (nil? having)
                                             (empty? window-specs)
                                             (< (* 2 k) (count results)))]
@@ -5459,9 +5475,12 @@
                             ;; The trim happens after the window pass instead.
                             (if (seq window-specs)
                               sorted
-                              (cond->> sorted
-                                sql-offset (drop sql-offset)
-                                sql-limit  (take sql-limit))))))
+                              (let [offset-results (cond->> sorted
+                                                     sql-offset (drop sql-offset))]
+                                (if fetch-with-ties?
+                                  (take-with-ties sql-limit null-safe-cmp offset-results)
+                                  (cond->> offset-results
+                                    sql-limit (take sql-limit))))))))
                       results)
             ;; DISTINCT ON (exprs): keep the FIRST row of each run sharing
             ;; those expressions. They are the leading ORDER BY keys, so the

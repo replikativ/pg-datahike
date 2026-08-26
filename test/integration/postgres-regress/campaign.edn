@@ -458,6 +458,7 @@
        :gate "test/datahike/test/pg_sql_cte_test.clj"
        :test-var "cte-names-are-not-writable-relations"}]}
     {:name "limit" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:relational}
      :blockers #{:backward-cursors :set-returning-projections :planner-explain
                  :view-ddl :fetch-expression-grammar}
@@ -465,7 +466,15 @@
      [{:id :aggregate-sibling-scalar
        :source-lines [147 153]
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
-       :test-var "grouped-projections-inline-sibling-scalars"}]}]}
+       :test-var "grouped-projections-inline-sibling-scalars"}
+      {:id :fetch-first-with-ties
+       :source-lines [157 175]
+       :gate "test/datahike/test/pg_topk_test.clj"
+       :test-var "test-fetch-first-with-ties"}
+      {:id :fetch-first-structural-errors
+       :source-lines [176 184]
+       :gate "test/datahike/test/pg_topk_test.clj"
+       :test-var "test-fetch-first-with-ties-errors"}]}]}
 
   {:id 3
    :name "specialized application types"
