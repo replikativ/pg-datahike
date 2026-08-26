@@ -9,6 +9,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetTime;
 import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.UUID;
@@ -59,6 +60,7 @@ public final class PgParamCodec {
         m.put(PgWireServer.OID_VARCHAR_ARRAY,     PgWireServer.OID_VARCHAR);
         m.put(PgWireServer.OID_DATE_ARRAY,        PgWireServer.OID_DATE);
         m.put(PgWireServer.OID_TIME_ARRAY,        PgWireServer.OID_TIME);
+        m.put(PgWireServer.OID_TIMETZ_ARRAY,      PgWireServer.OID_TIMETZ);
         m.put(PgWireServer.OID_TIMESTAMP_ARRAY,   PgWireServer.OID_TIMESTAMP);
         m.put(PgWireServer.OID_TIMESTAMPTZ_ARRAY, PgWireServer.OID_TIMESTAMPTZ);
         m.put(PgWireServer.OID_NUMERIC_ARRAY,     PgWireServer.OID_NUMERIC);
@@ -413,6 +415,7 @@ public final class PgParamCodec {
                 case PgWireServer.OID_UUID -> UUID.fromString(tok.trim());
                 case PgWireServer.OID_DATE,
                      PgWireServer.OID_TIME,
+                     PgWireServer.OID_TIMETZ,
                      PgWireServer.OID_TIMESTAMP,
                      PgWireServer.OID_TIMESTAMPTZ -> tok;   // delegate to encodeBinary's parser
                 default -> tok;                              // text/varchar/etc.
@@ -580,7 +583,8 @@ public final class PgParamCodec {
             case PgWireServer.OID_DATE,
                  PgWireServer.OID_TIMESTAMP,
                  PgWireServer.OID_TIMESTAMPTZ,
-                 PgWireServer.OID_TIME ->
+                 PgWireServer.OID_TIME,
+                 PgWireServer.OID_TIMETZ ->
                 s;
             // jsonb / json — pass through as text; jsonb.clj parses on demand.
             case PgWireServer.OID_JSONB,
@@ -618,6 +622,16 @@ public final class PgParamCodec {
         return Double.parseDouble(v.toString());
     }
 
+    /** Accept PostgreSQL's compact zone forms (+00, +02) as ISO offsets. */
+    private static OffsetTime parseOffsetTime(Object value) {
+        if (value instanceof OffsetTime ot) return ot;
+        String s = value.toString().trim();
+        if (s.matches(".*[+-]\\d{2}$")) s = s + ":00";
+        else if (s.matches(".*[+-]\\d{4}$"))
+            s = s.substring(0, s.length() - 2) + ":" + s.substring(s.length() - 2);
+        return OffsetTime.parse(s);
+    }
+
     /**
      * Encode a Java/Clojure value as PG binary for the given OID, or
      * return null when binary is not supported for this type. Caller
@@ -646,6 +660,7 @@ public final class PgParamCodec {
             || oid == PgWireServer.OID_TIMESTAMP
             || oid == PgWireServer.OID_TIMESTAMPTZ
             || oid == PgWireServer.OID_TIME
+            || oid == PgWireServer.OID_TIMETZ
             || oid == PgWireServer.OID_TEXT
             || oid == PgWireServer.OID_VARCHAR
             || oid == PgWireServer.OID_NAME
@@ -896,6 +911,16 @@ public final class PgParamCodec {
                     yield ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(micros).array();
                 }
 
+                case PgWireServer.OID_TIMETZ -> {
+                    OffsetTime t = parseOffsetTime(value);
+                    long micros = t.toLocalTime().toNanoOfDay() / 1_000L;
+                    // PostgreSQL stores seconds WEST of UTC; ZoneOffset uses
+                    // seconds east of UTC, hence the sign reversal.
+                    int zone = -t.getOffset().getTotalSeconds();
+                    yield ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+                              .putLong(micros).putInt(zone).array();
+                }
+
                 case PgWireServer.OID_TEXT,
                      PgWireServer.OID_VARCHAR,
                      PgWireServer.OID_NAME,
@@ -1034,6 +1059,14 @@ public final class PgParamCodec {
             // time_recv — int64 microseconds since midnight.
             case PgWireServer.OID_TIME ->
                 LocalTime.ofNanoOfDay(buf.getLong() * 1000L);
+
+            // timetz_recv — local wall-clock microseconds followed by
+            // seconds west of UTC.
+            case PgWireServer.OID_TIMETZ -> {
+                LocalTime time = LocalTime.ofNanoOfDay(buf.getLong() * 1000L);
+                ZoneOffset offset = ZoneOffset.ofTotalSeconds(-buf.getInt());
+                yield OffsetTime.of(time, offset);
+            }
 
             // text/varchar/name — bytes are already UTF-8.
             case PgWireServer.OID_TEXT,

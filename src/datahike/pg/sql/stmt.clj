@@ -4201,10 +4201,26 @@
                                       {:feature (str fname "(interval) as a window function")})))
                           agg-sym (when agg-sym
                                     (or (pick-precision-variant fname arg-oid) agg-sym))
+                          result-oid (try (oid/expr-oid expr agg-oid-env)
+                                          (catch Throwable _ nil))
+                          item-index (.indexOf ^java.util.List select-items item)
+                          visible-base (count (remove (fn [a]
+                                                        (and (string? a)
+                                                             (or (.startsWith ^String a "__win_")
+                                                                 (.startsWith ^String a "__compound_"))))
+                                                      @find-aliases))
+                          prior-correlated (count (filter #(< (:out-pos %) item-index)
+                                                          correlated-subqs))
+                          output-pos (+ visible-base
+                                        (count @window-specs)
+                                        (count @compound-exprs)
+                                        prior-correlated)
                           win-spec (cond-> {:op op-kw
+                                            :out-pos output-pos
                                             :partition-by (or part-idxs [])
                                             :order-by (or ob-specs [])
                                             :frame frame}
+                                     result-oid (assoc :oid result-oid)
                                      count-star? (assoc :count-star? true)
                                      col-idx (assoc :col-idx col-idx)
                                      arg2-idx (assoc :arg2-idx arg2-idx)
@@ -4406,10 +4422,10 @@
         ;; the parse cache is keyed by SQL text while the parameter's
         ;; declared type is per-Parse-message. describeResult resolves
         ;; index → OID against :declared-param-oids at Describe time.
-        [select-item-oids* select-item-param-idx*]
-        (let [[oids idxs]
+        [select-item-oids* select-item-resolution-oids* select-item-param-idx*]
+        (let [[oids resolution-oids idxs]
               (reduce
-               (fn [[v pv] ^SelectItem item]
+               (fn [[v rv pv] ^SelectItem item]
                  (let [expr (.getExpression item)]
                    (cond
                            ;; AllTableColumns must come BEFORE AllColumns
@@ -4426,17 +4442,20 @@
                            cols (pgs/column-info schema real db)
                            picked (remove #(= "db_id" (:name %)) cols)]
                        [(into v (map :oid) picked)
+                        (into rv (map :oid) picked)
                         (into pv (repeat (count picked) nil))])
                      (instance? AllColumns expr)
                      (let [cols (pgs/column-info
                                  schema (get table-aliases default-table default-table) db)
                            picked (remove #(= "db_id" (:name %)) cols)]
                        [(into v (map :oid) picked)
+                        (into rv (map :oid) picked)
                         (into pv (repeat (count picked) nil))])
                      :else
                      [(conj v (oid/expr-oid expr oid-env))
+                      (conj rv (oid/resolution-oid expr oid-env))
                       (conj pv (oid/param-placeholder-index expr))])))
-               [[] []]
+               [[] [] []]
                    ;; loop-items excludes deferred correlated subqueries, so
                    ;; these OIDs line up with the non-subquery part of
                    ;; find-aliases (the __corr_ tail pads to nil below).
@@ -4447,8 +4466,9 @@
                 ;; lines up index-for-index with find-aliases.
               n (count @find-aliases)
               pad (fn [acc] (vec (take n (concat acc (repeat nil)))))]
-          [(pad oids) (pad idxs)])
+          [(pad oids) (pad resolution-oids) (pad idxs)])
         select-item-oids select-item-oids*
+        select-item-resolution-oids select-item-resolution-oids*
         select-item-param-idx select-item-param-idx*
 
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
@@ -5604,6 +5624,11 @@
              ;; fall back to value-based inference at Execute time (via
              ;; compute-schema-oids) or TEXT when neither path resolves.
              :select-item-oids select-item-oids
+             ;; Unlike an ordinary projection, UNION/INTERSECT/EXCEPT keep
+             ;; bare strings, NULL and undeclared parameters as UNKNOWN while
+             ;; finding a per-column common type. This parallel vector
+             ;; preserves that analyzer-only distinction.
+             :select-item-resolution-oids select-item-resolution-oids
              ;; Index-aligned with :select-item-oids — the 1-based `$N`
              ;; for output columns that are a bare placeholder, so
              ;; describeResult can type them from the Parse message's
