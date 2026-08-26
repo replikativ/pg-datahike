@@ -8282,12 +8282,24 @@
    reject them before lowering."
   [select relation]
   (let [quoted (java.util.regex.Pattern/quote
-                (str/lower-case (unquote-ident relation)))]
+                (str/lower-case (unquote-ident relation)))
+        sql (str/lower-case (str select))]
     (boolean
-     (re-find (re-pattern (str "(?is)\\b(?:from|(?:(?:inner|left|right|full|cross)\\s+)?join)"
-                               "\\s+(?:only\\s+)?(?:\\\"?"
-                               quoted "\\\"?)(?=\\s|[,);]|$)"))
-              (str/lower-case (str select))))))
+     (or
+      (re-find (re-pattern (str "(?is)\\b(?:from|(?:(?:inner|left|right|full|cross)\\s+)?join)"
+                                "\\s+(?:only\\s+)?(?:\\\"?"
+                                quoted "\\\"?)(?=\\s|[,);]|$)"))
+               sql)
+      ;; JSqlParser renders an implicit CROSS JOIN as `FROM left, right`.
+      ;; Require a relation-position follower after the optional alias so a
+      ;; projection such as `SELECT 1, cte_name FROM stored` is not mistaken
+      ;; for a recursive scan merely because it also contains a comma.
+      (re-find (re-pattern (str "(?is),\\s+(?:only\\s+)?(?:\\\"?"
+                                quoted "\\\"?)"
+                                "(?:\\s+(?:as\\s+)?[a-z_][a-z0-9_$]*)?"
+                                "\\s*(?=,|\\bwhere\\b|\\b(?:inner|left|right|full|cross)?\\s*join\\b|"
+                                "\\bgroup\\b|\\border\\b|\\blimit\\b|\\bunion\\b|\\)|$)"))
+               sql)))))
 
 (defn recursive-cte-self-reference?
   "True when a WITH RECURSIVE item actually references its own relation."

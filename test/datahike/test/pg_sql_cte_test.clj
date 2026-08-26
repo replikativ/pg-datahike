@@ -241,6 +241,20 @@
            (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5)
                     SELECT n FROM t ORDER BY n")))))
 
+(deftest recursive-self-reference-through-comma-join
+  ;; A comma-separated FROM item is an implicit CROSS JOIN and can carry the
+  ;; recursive self-reference just like an explicit JOIN. asyncpg's type
+  ;; introspection uses `FROM (...) ti, typeinfo_tree tt`; classifying that
+  ;; CTE as non-recursive leaves the outer scan with a phantom relation.
+  (with-open [c (jdbc)]
+    (is (= [["1"] ["2"] ["3"]]
+           (rows c "WITH RECURSIVE t(n) AS (
+                      SELECT 1
+                      UNION ALL
+                      SELECT t.n + 1 FROM node seed, t
+                      WHERE seed.id = 1 AND t.n < 3
+                    ) SELECT n FROM t ORDER BY n")))))
+
 (deftest postgres-recursive-scalar-values-anchor
   ;; PostgreSQL 17 src/test/regress/sql/with.sql:26-33. VALUES is a SELECT
   ;; body in JSqlParser, including when it is used as a scalar subquery in a
