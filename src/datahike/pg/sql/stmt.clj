@@ -4527,12 +4527,51 @@
                     (let [rc (.getRowCount ^Limit limit-expr)]
                       (when (instance? LongValue rc)
                         (.getValue ^LongValue rc))))
-        ;; FETCH FIRST N ROWS ONLY (SQL:2008 syntax, used by Hibernate)
+        ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
+        ;; field.  It crashes for the SQL-standard default count and for
+        ;; expression counts, so always inspect getExpression instead.
         fetch-expr (.getFetch select)
-        limit-val (or limit-val
-                      (when fetch-expr
-                        (let [^net.sf.jsqlparser.statement.select.Fetch f fetch-expr]
-                          (.getRowCount f))))
+        fetch-param (when fetch-expr
+                      (.getFetchParam
+                       ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        fetch-with-ties? (and fetch-param
+                              (str/includes? (str/upper-case (str fetch-param))
+                                             "WITH TIES"))
+        fetch-count-expr (when fetch-expr
+                           (.getExpression
+                            ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        fetch-count (when fetch-expr
+                      (cond
+                        ;; An omitted count defaults to one.
+                        (nil? fetch-count-expr) 1
+                        ;; PostgreSQL rejects a bare NULL for WITH TIES, but
+                        ;; deliberately permits a computed NULL such as
+                        ;; (NULL + 1), which behaves as no limit.
+                        (instance? NullValue fetch-count-expr)
+                        (when fetch-with-ties?
+                          (throw
+                           (errors/pg-error
+                            :invalid-row-count-in-limit-clause
+                            {:message "row count cannot be null in FETCH FIRST ... WITH TIES clause"})))
+                        :else (extract-value fetch-count-expr schema db)))
+        _ (when (and (some? fetch-count)
+                     (not (integer? fetch-count)))
+            (throw
+             (errors/pg-error
+              :feature-not-supported
+              {:detail (str "FETCH FIRST row count expression is not supported: "
+                            fetch-count-expr)})))
+        _ (when (and (integer? fetch-count) (neg? fetch-count))
+            (throw
+             (errors/pg-error
+              :invalid-row-count-in-limit-clause
+              {:message "FETCH FIRST row count must not be negative"})))
+        limit-val (if fetch-expr fetch-count limit-val)
+        _ (when (and fetch-with-ties? (empty? order-by))
+            (throw
+             (errors/pg-error
+              :syntax-error
+              {:message "WITH TIES cannot be specified without ORDER BY clause"})))
         offset-expr (.getOffset select)
         offset-val (when offset-expr
                      (let [ofs (.getOffset ^Offset offset-expr)]
@@ -4556,6 +4595,12 @@
                                   (.isNoWait select)     :nowait
                                   :else                  :block)
                       :table (or alias name)})
+        _ (when (and fetch-with-ties?
+                     (= :skip (:wait for-update)))
+            (throw
+             (errors/pg-error
+              :syntax-error
+              {:message "SKIP LOCKED and WITH TIES options cannot be used together"})))
 
         ;; LEFT JOIN post-processing: wrap right-table patterns in or-join
         ;; (RIGHT JOINs are rewritten to LEFT JOINs at AST level before reaching here)
@@ -5155,7 +5200,8 @@
                                           (not= nulls (if (= dir :asc) :last :first))))
                                    order-by-spec))
         has-nullable-order? (and order-by-spec
-                                 (or explicit-nulls?
+                                 (or fetch-with-ties?
+                                     explicit-nulls?
                                      ;; DISTINCT ON keeps the FIRST row per
                                      ;; ON-key, so it needs the rows in a
                                      ;; known order HERE, in the same pass
@@ -5337,6 +5383,7 @@
              :sql-order-by    sql-order-by
              :sql-limit       (when sql-order-by limit-val)
              :sql-offset      (when sql-order-by offset-val)
+             :fetch-with-ties? fetch-with-ties?
              ;; Compound aggregate expressions (MAX(a)-MIN(a)) for server-side computation
              :compound-exprs  (when (seq @compound-exprs) @compound-exprs)
              ;; Window function specs for server-side post-processing

@@ -145,6 +145,15 @@
     (is (nil? (.error r)) (str sql " → " (.error r)))
     (rows r)))
 
+(defn- with-ties-reference [rows n]
+  (let [prefix (vec (take n rows))]
+    (if (empty? prefix)
+      prefix
+      (let [boundary (first (peek prefix))]
+        (vec (concat prefix
+                     (take-while #(= boundary (first %))
+                                 (drop n rows))))))))
+
 (deftest test-e2e-limit-slices-match-full-sort
   ;; `val` is nullable → server-side sort; `id` tiebreak makes the
   ;; order total so slice comparison is exact.
@@ -172,3 +181,56 @@
       (let [mixed (q "SELECT id, val FROM t ORDER BY val DESC, id ASC")]
         (is (= (vec (take 8 (drop 4 mixed)))
                (q "SELECT id, val FROM t ORDER BY val DESC, id ASC LIMIT 8 OFFSET 4")))))))
+
+(deftest test-fetch-first-with-ties
+  (let [full (q "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val")]
+    (testing "explicit and omitted counts include the complete boundary peer group"
+      (is (= (with-ties-reference full 2)
+             (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                     "FETCH FIRST 2 ROWS WITH TIES"))))
+      (is (= (with-ties-reference full 1)
+             (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                     "FETCH FIRST ROWS WITH TIES")))))
+    (testing "ONLY still takes exactly the requested number"
+      (is (= (vec (take 2 full))
+             (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                     "FETCH FIRST 2 ROWS ONLY")))))
+    (testing "OFFSET is applied before the WITH TIES boundary"
+      (let [offset-full (vec (drop 1 full))]
+        (is (= (with-ties-reference offset-full 2)
+               (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                       "OFFSET 1 FETCH FIRST 2 ROWS WITH TIES"))))))
+    (testing "constant expressions and SQL NULL row counts follow PostgreSQL"
+      (is (= (with-ties-reference full 5)
+             (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                     "FETCH FIRST (5::bigint) ROWS WITH TIES"))))
+      (is (= full
+             (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                     "FETCH FIRST NULL ROWS ONLY"))))
+      ;; PostgreSQL intentionally rejects only the bare-NULL WITH TIES form;
+      ;; a NULL hidden inside an expression is treated as LIMIT ALL.
+      (is (= full
+             (q (str "SELECT val FROM t WHERE val IS NOT NULL ORDER BY val "
+                     "FETCH FIRST (NULL + 1) ROWS WITH TIES")))))))
+
+(deftest test-fetch-first-with-ties-errors
+  (testing "WITH TIES requires ORDER BY"
+    (let [^PgWireServer$QueryResult r
+          (.execute *h* "SELECT id FROM t FETCH FIRST 2 ROWS WITH TIES")]
+      (is (= "42601" (.sqlstate r)))
+      (is (= "WITH TIES cannot be specified without ORDER BY clause"
+             (.error r)))))
+  (testing "a bare NULL count has PostgreSQL's dedicated SQLSTATE"
+    (let [^PgWireServer$QueryResult r
+          (.execute *h* (str "SELECT id FROM t ORDER BY id "
+                             "FETCH FIRST NULL ROWS WITH TIES"))]
+      (is (= "2201W" (.sqlstate r)))
+      (is (= "row count cannot be null in FETCH FIRST ... WITH TIES clause"
+             (.error r)))))
+  (testing "SKIP LOCKED cannot be combined with WITH TIES"
+    (let [^PgWireServer$QueryResult r
+          (.execute *h* (str "SELECT id FROM t ORDER BY id "
+                             "FETCH FIRST 1 ROW WITH TIES FOR UPDATE SKIP LOCKED"))]
+      (is (= "42601" (.sqlstate r)))
+      (is (= "SKIP LOCKED and WITH TIES options cannot be used together"
+             (.error r))))))
