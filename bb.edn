@@ -32,6 +32,10 @@
               :task (apply shell "bash test/integration/postgres-regress/run.sh"
                            *command-line-args*)}
 
+  pg-regress-with-fixtures {:doc "Run relation-dependent PostgreSQL tests in an isolated, automatically bootstrapped database."
+                            :task (apply shell "bash test/integration/postgres-regress/run-with-api-fixtures.sh"
+                                         *command-line-args*)}
+
   pg-regress-wave {:doc "List/run a PostgreSQL compatibility wave or its inventory. Usage: bb pg-regress-wave [inventory|WAVE [MODE]]."
                    :task (apply shell "bb test/integration/postgres-regress/campaign.clj"
                                 *command-line-args*)}
