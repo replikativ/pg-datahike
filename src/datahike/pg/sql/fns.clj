@@ -1200,6 +1200,24 @@
     (some sql-null? vals)       :__null__
     :else                       false))
 
+(defn sql-row-eq3?
+  "SQL row `=` under three-valued logic.
+
+   FALSE dominates UNKNOWN within a row, so `(1, 2) = (2, NULL)` is
+   FALSE. The result is UNKNOWN only when no field is false and at least
+   one is NULL."
+  [left right]
+  (reduce sql-and3 true (map sql-eq3? left right)))
+
+(defn sql-row-in3?
+  "SQL row-valued `IN` under three-valued logic.
+
+   TRUE from any RHS row dominates UNKNOWN. An empty RHS is FALSE even
+   for a NULL-bearing left row. Width and type compatibility are checked
+   by the analyzer before this runtime fold."
+  [rows left]
+  (reduce sql-or3 false (map #(sql-row-eq3? left %) rows)))
+
 (defn sql-between3?
   "`x BETWEEN lo AND hi` in VALUE position: `lo <= x AND x <= hi` under
    Kleene AND, so any NULL operand makes it UNKNOWN rather than false."
