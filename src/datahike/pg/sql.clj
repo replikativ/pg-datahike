@@ -727,6 +727,19 @@
     (instance? SetOperationList body)  (vec (mapcat plain-selects-in (.getSelects ^SetOperationList body)))
     :else                              []))
 
+(defn- select-contains-with?
+  "Whether a SELECT body carries a WITH list at any nested set-op level."
+  [body]
+  (or (seq (stmt-with-items body))
+      (cond
+        (instance? ParenthesedSelect body)
+        (select-contains-with? (.getSelect ^ParenthesedSelect body))
+
+        (instance? SetOperationList body)
+        (some select-contains-with? (.getSelects ^SetOperationList body))
+
+        :else false)))
+
 (defn- cte-body-param-oids
   "Walk every WITH-CTE body of `stmt` for bind-param OIDs (WHERE / JOIN-ON /
    SELECT-list of each contained PlainSelect). Merged into the statement's
@@ -797,7 +810,12 @@
                ;; rules say they should.
                cte-name   (params/unquote-ident raw-name)
                cte-ns     (cte-namespace (inc (count ns-map)) cte-name)
-               recursive? (.isRecursive wi)
+               ;; JSqlParser marks every item after WITH RECURSIVE as
+               ;; recursive. PostgreSQL applies fixed-point semantics only to
+               ;; items that actually reference themselves; ordinary items
+               ;; must keep using normal CTE materialisation.
+               recursive? (and (.isRecursive wi)
+                               (stmt/recursive-cte-self-reference? wi))
                body       (try (.getParenthesedStatement wi)
                                (catch Throwable _ nil))
                inner      (cond
@@ -819,6 +837,19 @@
                     recursive-step
                     (nil? (.getWhere ^PlainSelect recursive-step)))]
            (cond
+             ;; `WITH RECURSIVE` marks every WithItem recursive in
+             ;; JSqlParser, including INSERT/UPDATE/DELETE bodies that are
+             ;; not select-shaped.  Detect those before recursive validation:
+             ;; WithItem.getSelect() force-casts their ParenthesedInsert (etc.)
+             ;; to ParenthesedSelect and otherwise leaks a ClassCastException.
+             (or (instance? Insert body)
+                 (instance? Update body)
+                 (instance? Delete body))
+             (throw (ex-info (str "WITH clause containing a data-modifying "
+                                  "statement is not supported")
+                             {:error :unsupported-feature
+                              :sqlstate "0A000"}))
+
              ;; Recursive WITH on UPDATE — leave to translate-update.
              (and recursive? (instance? Update stmt))
              [curr-db curr-schema deferred ns-map]
@@ -868,7 +899,24 @@
                    [(:db m) (:schema m)
                     (cond-> deferred (:deferred m) (conj (:deferred m)))
                     ns-map]
-                   [curr-db curr-schema deferred ns-map])))
+                   ;; Both fixed-point compilers declined the shape. Leaving
+                   ;; the CTE unmaterialised lets its outer scan construct an
+                   ;; invalid Datalog query ("Query for unknown vars"). Make
+                   ;; the capability boundary explicit and SQLSTATE-bearing.
+                   (throw (errors/pg-error
+                           :feature-not-supported
+                           {:feature (str "recursive CTE shape for " cte-name)})))))
+
+             ;; materialize-set-op! translates set-operation branches
+             ;; directly and does not recursively fold a WITH list attached to
+             ;; the CTE body. Pretending the nested relation is absent yields
+             ;; a misleading 42P01 (and formerly an invalid Datalog query).
+             ;; Keep this uncommon, valid PostgreSQL shape as an explicit
+             ;; capability boundary until nested folds can share this scope.
+             (and (some? inner) (select-contains-with? inner))
+             (throw (errors/pg-error
+                     :feature-not-supported
+                     {:feature "nested WITH inside a CTE body"}))
 
              (some? inner)
              ;; With the CTEs materialised SO FAR in scope. A WITH list is
@@ -899,14 +947,6 @@
              ;; unknown columns became an error it reported a missing
              ;; FROM-clause entry, which points at the wrong thing. Say
              ;; what is actually true.
-             (or (instance? Insert body)
-                 (instance? Update body)
-                 (instance? Delete body))
-             (throw (ex-info (str "WITH clause containing a data-modifying "
-                                  "statement is not supported")
-                             {:error :unsupported-feature
-                              :sqlstate "0A000"}))
-
              ;; A shape we don't recognise — skip rather than crash. The
              ;; outer translate-* will surface a clearer error if the
              ;; body's results are actually needed.
@@ -1765,26 +1805,11 @@
                                                                   {:explicit? true
                                                                    :prefer-local-datetime? true
                                                                    :parse-timestamp expr/parse-timestamp-string})))
-                                                   ;; Scalar subquery in projection —
-                                                   ;; execute and take first value
+                                                             ;; Scalar subquery in projection —
+                                                             ;; execute and take first value
                                                              (instance? ParenthesedSelect expr)
                                                              (if cte-db
-                                                               (let [inner-parsed (parse-sql (str expr) cte-schema cte-db)
-                                                                     inner-query (:query inner-parsed)
-                                                                     inner-in-args (:in-args inner-parsed)
-                                                                     q-fn d/q
-                                                                     rows (if (seq inner-in-args)
-                                                                            (apply q-fn inner-query cte-db inner-in-args)
-                                                                            (q-fn inner-query cte-db))
-                                                                    ;; An aggregate over an empty relation is
-                                                                    ;; still ONE row -- see
-                                                                    ;; expr/empty-aggregate-row. The table-free
-                                                                    ;; folder is a THIRD consumer of that rule.
-                                                                     rows (or (when (empty? (seq rows))
-                                                                                (expr/empty-aggregate-row inner-query))
-                                                                              rows)
-                                                                     first-row (first rows)
-                                                                     v (if (sequential? first-row) (first first-row) first-row)]
+                                                               (let [v (expr/translate-expr fake-ctx expr)]
                                                                  (if (or (nil? v) (= :__null__ v)) :__null__ v))
                                                                :__null__)
                                                    ;; ARRAY[…] / ARRAY[[…],[…]] — format

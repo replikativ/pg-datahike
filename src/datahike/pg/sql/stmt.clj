@@ -710,14 +710,23 @@
     ;; `SELECT (SELECT id FROM t)` is `id`, and a subquery whose column
     ;; is itself unnamed propagates `?column?`.
     (instance? ParenthesedSelect expr)
-    (let [inner (.getPlainSelect ^ParenthesedSelect expr)
-          ^SelectItem it (first (some-> inner .getSelectItems))]
-      (if it
-        [(or (select-item-alias it)
-             (first (figure-colname* (.getExpression it)))
-             "?column?")
-         2]
-        [nil 0]))
+    (let [inner (.getSelect ^ParenthesedSelect expr)]
+      (cond
+        (instance? PlainSelect inner)
+        (let [^SelectItem it (first (.getSelectItems ^PlainSelect inner))]
+          (if it
+            [(or (select-item-alias it)
+                 (first (figure-colname* (.getExpression it)))
+                 "?column?")
+             2]
+            [nil 0]))
+
+        ;; PostgreSQL names VALUES relation columns column1, column2, …;
+        ;; the scalar form necessarily exposes only its first column.
+        (instance? Values inner)
+        ["column1" 2]
+
+        :else [nil 0]))
 
     (instance? net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr)
     ["exists" 2]
@@ -2414,6 +2423,21 @@
             (some (fn [[k _]] (and (keyword? k)
                                    (= (str/lower-case (namespace k)) t)))
                   schema)))))
+
+(defn- stored-relation-known?
+  "True when tname has a physical schema namespace.
+
+   SELECT sources may resolve a materialised CTE through *cte-relations*, but
+   INSERT/UPDATE/DELETE targets may not: PostgreSQL CTEs are read-only names,
+   and a same-named stored table remains the DML target when one exists."
+  [schema tname]
+  (let [t (some-> tname str/lower-case)]
+    (boolean
+     (and t
+          (some (fn [[k _]]
+                  (and (keyword? k)
+                       (= (str/lower-case (namespace k)) t)))
+                schema)))))
 
 (defn correlated-subquery-refs
   "Given a scalar-subquery `inner` (a JSqlParser Select) and the set of
@@ -7028,17 +7052,31 @@
   (let [schema (enrich-schema-with-pg-array-meta schema db)
         table (.getTable insert)
         raw-table (unquote-ident (.getName ^Table table))
-        _ (when-not (relation-known? schema raw-table)
+        _ (when-not (stored-relation-known? schema raw-table)
             (throw (ex-info (str "relation \"" raw-table "\" does not exist")
                             {:error :undefined-table
                              :sqlstate "42P01"
                              :table raw-table})))
         columns (.getColumns insert)
+        parent-table (when db
+                       (ffirst (d/q
+                                '{:find [?p]
+                                  :where [[?e :__inherit__/child ?c]
+                                          [?e :__inherit__/parent ?p]]
+                                  :in [$ ?c]}
+                                db raw-table)))
         raw-cols (if (seq columns)
                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
-                   (or (pgs/column-order-from-db db raw-table)
-                       (when-let [cols (pgs/column-info schema raw-table)]
-                         (mapv :name (rest cols)))))
+                   (let [own-order (or (pgs/column-order-from-db db raw-table)
+                                       (when-let [cols (pgs/column-info schema raw-table)]
+                                         (mapv :name (rest cols))))
+                         parent-order (when parent-table
+                                        (pgs/column-order-from-db db parent-table))]
+                     ;; PostgreSQL orders inherited columns before the
+                     ;; child's own columns for INSERT without a target list.
+                     ;; An empty child column-order is still a real value, so
+                     ;; plain `or` previously hid the parent completely.
+                     (vec (distinct (concat parent-order own-order)))))
         [table-name col-names] (canonical-relation schema raw-table raw-cols)
         ;; PostgreSQL rejects a target column named twice. We built a
         ;; map from the column list, so the last value silently won and
@@ -7405,13 +7443,6 @@
                         (mapv #(assoc % marker true) row-attrs)
                         row-attrs)
         ;; For INHERITS: also add parent's row-marker so parent queries find this entity
-            parent-table (when db
-                           (ffirst (d/q
-                                    '{:find [?p]
-                                      :where [[?e :__inherit__/child ?c]
-                                              [?e :__inherit__/parent ?p]]
-                                      :in [$ ?c]}
-                                    db table-name)))
             row-attrs (if parent-table
                         (let [parent-marker (pgs/row-marker-attr parent-table)]
                           (if (get schema parent-marker)
@@ -7844,7 +7875,7 @@
             (throw (ex-info "syntax error at end of input"
                             {:error :syntax-error :sqlstate "42601"})))
         raw-table (unquote-ident (.getName ^Table table))
-        _ (when-not (relation-known? schema raw-table)
+        _ (when-not (stored-relation-known? schema raw-table)
             (throw (ex-info (str "relation \"" raw-table "\" does not exist")
                             {:error :undefined-table
                              :sqlstate "42P01"
@@ -7962,7 +7993,7 @@
   [^Update update schema db]
   (let [table (.getTable update)
         raw-table (unquote-ident (.getName ^Table table))
-        _ (when-not (relation-known? schema raw-table)
+        _ (when-not (stored-relation-known? schema raw-table)
             (throw (ex-info (str "relation \"" raw-table "\" does not exist")
                             {:error :undefined-table
                              :sqlstate "42P01"
@@ -8240,6 +8271,43 @@
        :in-params in-params
        :in-args in-args})))
 
+(defn- select-references-relation?
+  "Whether a SELECT-shaped node contains a FROM/JOIN reference to relation.
+
+   JSqlParser's WithItem.isRecursive reports the clause keyword, not whether
+   this particular CTE is self-referential. PostgreSQL permits ordinary CTEs
+   inside WITH RECURSIVE, so use the relation reference to choose the
+   fixed-point path. The lexical walk intentionally includes nested subqueries:
+   those are still self-references and PostgreSQL's recursion validator must
+   reject them before lowering."
+  [select relation]
+  (let [quoted (java.util.regex.Pattern/quote
+                (str/lower-case (unquote-ident relation)))
+        sql (str/lower-case (str select))]
+    (boolean
+     (or
+      (re-find (re-pattern (str "(?is)\\b(?:from|(?:(?:inner|left|right|full|cross)\\s+)?join)"
+                                "\\s+(?:only\\s+)?(?:\\\"?"
+                                quoted "\\\"?)(?=\\s|[,);]|$)"))
+               sql)
+      ;; JSqlParser renders an implicit CROSS JOIN as `FROM left, right`.
+      ;; Require a relation-position follower after the optional alias so a
+      ;; projection such as `SELECT 1, cte_name FROM stored` is not mistaken
+      ;; for a recursive scan merely because it also contains a comma.
+      (re-find (re-pattern (str "(?is),\\s+(?:only\\s+)?(?:\\\"?"
+                                quoted "\\\"?)"
+                                "(?:\\s+(?:as\\s+)?[a-z_][a-z0-9_$]*)?"
+                                "\\s*(?=,|\\bwhere\\b|\\b(?:inner|left|right|full|cross)?\\s*join\\b|"
+                                "\\bgroup\\b|\\border\\b|\\blimit\\b|\\bunion\\b|\\)|$)"))
+               sql)))))
+
+(defn recursive-cte-self-reference?
+  "True when a WITH RECURSIVE item actually references its own relation."
+  [^net.sf.jsqlparser.statement.select.WithItem wi]
+  (let [body (try (.getParenthesedStatement wi) (catch Throwable _ nil))]
+    (and body
+         (select-references-relation? body (str/trim (str (.getAlias wi)))))))
+
 (defn- recursive-cte-branches
   "Split a WITH RECURSIVE item into [anchor recursive]. PostgreSQL requires
    recursive references to have the form `<anchor> UNION [ALL] <recursive>`;
@@ -8252,7 +8320,11 @@
                    (.getSelect ^ParenthesedSelect s) s))]
     (cond
       (instance? PlainSelect select)
-      nil
+      (throw (errors/pg-error
+              :syntax-error
+              {:message (str "recursive query \"" (str/trim (str (.getAlias wi)))
+                             "\" does not have the form non-recursive-term "
+                             "UNION [ALL] recursive-term")}))
 
       (instance? SetOperationList select)
       (let [^SetOperationList sol select
@@ -8271,9 +8343,17 @@
           (throw (errors/pg-error
                   :feature-not-supported
                   {:feature "nested recursive UNION branches"})))
-        (let [^PlainSelect recursive (second selects)
-              cte-name (str/lower-case
+        (let [cte-name (str/lower-case
                         (unquote-ident (str/trim (str (.getAlias wi)))))
+              _ (when (select-references-relation? (first selects) cte-name)
+                  (throw
+                   (ex-info
+                    (str "recursive reference to query \"" cte-name
+                         "\" must not appear within its non-recursive term")
+                    {:error :invalid-recursion
+                     :sqlstate "42P19"
+                     :query cte-name})))
+              ^PlainSelect recursive (second selects)
               table-name (fn [item]
                            (when (instance? Table item)
                              (str/lower-case

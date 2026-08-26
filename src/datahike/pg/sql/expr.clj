@@ -76,7 +76,7 @@
             Addition Subtraction Multiplication Division Modulo Concat
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
-            PlainSelect SelectItem AllColumns ParenthesedSelect Join]))
+            PlainSelect SelectItem AllColumns ParenthesedSelect Join Values]))
 
 (set! *warn-on-reflection* true)
 
@@ -4356,36 +4356,56 @@
     (or (instance? ParenthesedSelect expr) (instance? PlainSelect expr))
     (let [inner (if (instance? ParenthesedSelect expr)
                   (.getSelect ^ParenthesedSelect expr)
-                  expr)
-          db    (:db ctx)
-          corr-refs (when (and db (instance? PlainSelect inner) (:parse-sql ctx))
-                      (seq (correlated-subquery-refs inner (outer-alias-set ctx))))]
-      (if corr-refs
-        (correlated-scalar-var! ctx inner corr-refs)
-        (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
-          (try
-            (let [parse-fn   (:parse-sql ctx)
-                  inner-sql  (str inner)
-                  parsed     (parse-fn inner-sql (:schema ctx) db)
-                  q          (:query parsed)
-                  in-args    (:in-args parsed)
-                  query-db   (or (:enriched-db parsed) db)
-                  q-fn       d/q
-                  results    (if (seq in-args)
-                               (apply q-fn q query-db in-args)
-                               (q-fn q query-db))
+                  expr)]
+      ;; `SELECT (VALUES (1))` is PostgreSQL's scalar-subquery spelling for
+      ;; a one-row, one-column VALUES relation. JSqlParser puts Values behind
+      ;; ParenthesedSelect, but the ordinary scalar-subquery executor below
+      ;; only understands PlainSelect and used to pass a nil query to d/q.
+      ;; A scalar VALUES expression needs no nested query: lower its sole
+      ;; expression in the current context and enforce scalar cardinality.
+      (if (instance? Values inner)
+        (let [raw (vec (.getExpressions ^Values inner))
+              rows (if (and (seq raw)
+                            (instance? ParenthesedExpressionList (first raw)))
+                     (mapv #(vec ^ParenthesedExpressionList %) raw)
+                     [raw])]
+          (when (> (count rows) 1)
+            (throw (ex-info "more than one row returned by a subquery used as an expression"
+                            {:error :cardinality-violation :sqlstate "21000"})))
+          (let [row (first rows)]
+            (when (not= 1 (count row))
+              (throw (ex-info "subquery must return only one column"
+                              {:error :syntax-error :sqlstate "42601"})))
+            (translate-expr ctx (first row))))
+        (let [db    (:db ctx)
+              corr-refs (when (and db (instance? PlainSelect inner) (:parse-sql ctx))
+                          (seq (correlated-subquery-refs inner (outer-alias-set ctx))))]
+          (if corr-refs
+            (correlated-scalar-var! ctx inner corr-refs)
+            (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
+              (try
+                (let [parse-fn   (:parse-sql ctx)
+                      inner-sql  (str inner)
+                      parsed     (parse-fn inner-sql (:schema ctx) db)
+                      q          (:query parsed)
+                      in-args    (:in-args parsed)
+                      query-db   (or (:enriched-db parsed) db)
+                      q-fn       d/q
+                      results    (if (seq in-args)
+                                   (apply q-fn q query-db in-args)
+                                   (q-fn q query-db))
                 ;; An aggregate over an empty relation is still ONE row --
                 ;; `(SELECT count(*) FROM t WHERE false)` is 0, not NULL.
                 ;; The rule lives with the other consumers; see
                 ;; stmt/empty-aggregate-row.
-                  results    (or (when (empty? (seq results))
-                                   (empty-aggregate-row q))
-                                 results)
-                  first-row  (first results)
-                  v          (if (sequential? first-row) (first first-row) first-row)]
-              (if (some? v) v :__null__))
-            (catch Throwable _ :__null__))
-          :__null__)))
+                      results    (or (when (empty? (seq results))
+                                       (empty-aggregate-row q))
+                                     results)
+                      first-row  (first results)
+                      v          (if (sequential? first-row) (first first-row) first-row)]
+                  (if (some? v) v :__null__))
+                (catch Throwable _ :__null__))
+              :__null__)))))
 
     :else
     (throw (ex-info "unsupported SQL expression"

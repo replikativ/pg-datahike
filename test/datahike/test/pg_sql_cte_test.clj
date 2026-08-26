@@ -199,7 +199,34 @@
       (is (= "0A000" (.getSQLState ^org.postgresql.util.PSQLException e)))
       (is (re-find #"data-modifying" (.getMessage ^org.postgresql.util.PSQLException e))))
     ;; Side-effect rule: the INSERT inside the CTE must not have run.
-    (is (empty? (rows c "SELECT id FROM emp WHERE id = 99")))))
+    (is (empty? (rows c "SELECT id FROM emp WHERE id = 99")))
+
+    ;; PostgreSQL permits the RECURSIVE keyword even when the CTE body is
+    ;; data-modifying rather than recursive. JSqlParser still marks the item
+    ;; recursive, so this must take the same explicit unsupported path before
+    ;; recursive SELECT-shape validation touches WithItem.getSelect().
+    (let [e (is (thrown? org.postgresql.util.PSQLException
+                         (rows c "WITH RECURSIVE i AS (
+                                    INSERT INTO emp(id, name, dept, salary)
+                                    VALUES (100, 'Y', 'Eng', 2.0) RETURNING id
+                                  ) SELECT id FROM i")))]
+      (is (= "0A000" (.getSQLState ^org.postgresql.util.PSQLException e)))
+      (is (re-find #"data-modifying" (.getMessage ^org.postgresql.util.PSQLException e))))
+    (is (empty? (rows c "SELECT id FROM emp WHERE id = 100")))))
+
+(deftest cte-names-are-not-writable-relations
+  ;; PostgreSQL with.sql's `WITH with_test AS (...) INSERT INTO with_test`
+  ;; resolves the INSERT target only among stored relations. A CTE can still
+  ;; be the SELECT source, and a same-named physical table remains the target.
+  (with-open [c (jdbc)]
+    (let [e (is (thrown? SQLException
+                         (update-count c "WITH phantom AS (SELECT 42)
+                                          INSERT INTO phantom VALUES (1)")))]
+      (is (= "42P01" (.getSQLState ^SQLException e))))
+    (is (zero? (update-count c "CREATE TABLE shadowed (i INTEGER)")))
+    (is (= 1 (update-count c "WITH shadowed AS (SELECT 42 AS i)
+                               INSERT INTO shadowed SELECT * FROM shadowed")))
+    (is (= [["42"]] (rows c "SELECT i FROM shadowed")))))
 
 ;; ---------------------------------------------------------------------------
 ;; WITH RECURSIVE in SELECT
@@ -213,6 +240,40 @@
     (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
            (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5)
                     SELECT n FROM t ORDER BY n")))))
+
+(deftest recursive-self-reference-through-comma-join
+  ;; A comma-separated FROM item is an implicit CROSS JOIN and can carry the
+  ;; recursive self-reference just like an explicit JOIN. asyncpg's type
+  ;; introspection uses `FROM (...) ti, typeinfo_tree tt`; classifying that
+  ;; CTE as non-recursive leaves the outer scan with a phantom relation.
+  (with-open [c (jdbc)]
+    (is (= [["1"] ["2"] ["3"]]
+           (rows c "WITH RECURSIVE t(n) AS (
+                      SELECT 1
+                      UNION ALL
+                      SELECT t.n + 1 FROM node seed, t
+                      WHERE seed.id = 1 AND t.n < 3
+                    ) SELECT n FROM t ORDER BY n")))))
+
+(deftest postgres-recursive-scalar-values-anchor
+  ;; PostgreSQL 17 src/test/regress/sql/with.sql:26-33. VALUES is a SELECT
+  ;; body in JSqlParser, including when it is used as a scalar subquery in a
+  ;; projection. Lower its sole expression directly so the recursive anchor
+  ;; binds n instead of leaking an unbound CTE entity variable.
+  (with-open [c (jdbc)]
+    (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
+           (rows c "WITH RECURSIVE t(n) AS (
+                      SELECT (VALUES(1))
+                      UNION ALL
+                      SELECT n+1 FROM t WHERE n < 5
+                    ) SELECT * FROM t")))
+    (is (= [["1"]] (rows c "SELECT (VALUES(1))")))
+    (let [e (is (thrown? SQLException
+                         (rows c "SELECT (VALUES(1), (2))")))]
+      (is (= "21000" (.getSQLState ^SQLException e))))
+    (let [e (is (thrown? SQLException
+                         (rows c "SELECT (VALUES(1, 2))")))]
+      (is (= "42601" (.getSQLState ^SQLException e))))))
 
 (deftest demand-limited-unbounded-recursion-fails-before-materialization
   (with-open [c (jdbc)]
@@ -236,6 +297,58 @@
         (is (= "42601" (.getSQLState ^SQLException e)))
         (is (re-find #"does not have the form non-recursive-term UNION"
                      (.getMessage ^SQLException e)))))))
+
+(deftest recursive-keyword-does-not-make-every-cte-recursive
+  ;; WITH RECURSIVE permits ordinary CTE items; fixed-point lowering applies
+  ;; only when an item references itself.
+  (with-open [c (jdbc)]
+    (is (= [["1"]]
+           (rows c "WITH RECURSIVE x(n) AS (SELECT 1),
+                          y(n) AS (SELECT * FROM x)
+                    SELECT * FROM y")))
+    ;; PostgreSQL with.sql lines 936-942 additionally nests a WITH inside the
+    ;; ordinary item. That scope is not implemented yet, but it must not be
+    ;; misclassified as recursive or reported as a nonexistent relation.
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE x(n) AS (
+                                    WITH x1 AS (SELECT 1 AS n)
+                                    SELECT 0 UNION SELECT * FROM x1
+                                  ) SELECT * FROM x")))]
+      (is (= "0A000" (.getSQLState ^SQLException e)))
+      (is (re-find #"nested WITH" (.getMessage ^SQLException e))))))
+
+(deftest malformed-recursive-self-references-fail-before-lowering
+  ;; PostgreSQL with.sql lines 930-935. These previously reached Datahike as
+  ;; queries containing unbound CTE entity vars.
+  (with-open [c (jdbc)]
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE x(n) AS (SELECT n FROM x)
+                                  SELECT * FROM x")))]
+      (is (= "42601" (.getSQLState ^SQLException e)))
+      (is (re-find #"does not have the form non-recursive-term UNION"
+                   (.getMessage ^SQLException e))))
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE x(n) AS (
+                                    SELECT n FROM x UNION ALL SELECT 1
+                                  ) SELECT * FROM x")))]
+      (is (= "42P19" (.getSQLState ^SQLException e)))
+      (is (re-find #"must not appear within its non-recursive term"
+                   (.getMessage ^SQLException e))))))
+
+(deftest unsupported-recursive-shape-does-not-leak-invalid-datalog
+  ;; Forward CTE dependencies under WITH RECURSIVE are legal PostgreSQL but
+  ;; not yet available to either fixed-point compiler. Keep that capability
+  ;; gap explicit instead of leaving x unmaterialised and leaking
+  ;; "Query for unknown vars" from Datahike.
+  (with-open [c (jdbc)]
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE
+                                    x(id) AS (SELECT * FROM y UNION ALL
+                                              SELECT id+1 FROM x WHERE id < 5),
+                                    y(id) AS (VALUES (1))
+                                  SELECT * FROM x")))]
+      (is (= "0A000" (.getSQLState ^SQLException e)))
+      (is (re-find #"recursive CTE shape" (.getMessage ^SQLException e))))))
 
 (deftest postgres-recursive-outer-join-slice
   ;; PostgreSQL with.sql lines 977-992. The recursive relation may not occupy
