@@ -3495,6 +3495,46 @@
         [nil nil nil nil]
         [message nil nil sqlstate]))))
 
+(defn sql-array-fill
+  "PostgreSQL array_fill(value, dimensions [, lower_bounds])."
+  ([value dimensions]
+   (sql-array-fill value dimensions nil))
+  ([value dimensions lower-bounds]
+   (let [array-values (fn [v]
+                        (cond
+                          (pg-arr/array? v) (pg-arr/flat-elements v)
+                          (sequential? v) v
+                          :else nil))
+         dims (mapv long (or (array-values dimensions) []))
+         lbounds (when lower-bounds
+                   (mapv long (or (array-values lower-bounds) [])))
+         _ (when (or (empty? dims) (some neg? dims))
+             (throw (errors/pg-error
+                     :array-element-error
+                     {:detail "array dimensions must be non-negative"})))
+         _ (when (and lbounds (not= (count dims) (count lbounds)))
+             (throw (errors/pg-error
+                     :array-element-error
+                     {:detail "wrong number of array subscripts"})))
+         filled (reduce (fn [inner n]
+                          (vec (repeat n inner)))
+                        value
+                        (reverse dims))
+         elements (if (= 1 (count dims)) filled (vec filled))
+         elem-type (cond
+                     (instance? Integer value) :int4
+                     (integer? value) :int8
+                     (instance? Float value) :float4
+                     (instance? Double value) :float8
+                     (instance? java.math.BigDecimal value) :numeric
+                     (boolean? value) :bool
+                     (instance? java.time.LocalDate value) :date
+                     (instance? java.time.LocalTime value) :time
+                     (instance? java.time.LocalDateTime value) :timestamp
+                     (inst? value) :timestamptz
+                     :else :text)]
+     (pg-arr/array elem-type elements dims lbounds))))
+
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,
    and result-OID inference.
@@ -3514,6 +3554,7 @@
    "lcm"              {:unknown-args :homogeneous}
    ;; The first three arguments share a numeric overload; count is int4.
    "width_bucket"     {:unknown-args {:homogeneous-prefix 3}}
+   "array_fill"       {:impl sql-array-fill :arities #{2 3}}
    "booleq"           {:impl = :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "boolne"           {:impl not= :arities #{2}

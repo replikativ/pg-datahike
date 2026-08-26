@@ -376,6 +376,7 @@
                 ^PreparedStatement ps (.prepareStatement c "SELECT generate_series(1, ?)")]
       (.setInt ps 1 5)
       (with-open [^ResultSet rs (.executeQuery ps)]
+        (is (= Types/INTEGER (.getColumnType (.getMetaData rs) 1)))
         (is (= [1 2 3 4 5]
                (loop [values []]
                  (if (.next rs)

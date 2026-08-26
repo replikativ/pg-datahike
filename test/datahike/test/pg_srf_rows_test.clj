@@ -73,7 +73,11 @@
                 FROM ps_t ORDER BY id, generate_series(1,3) DESC")))
   (is (= [["2"] ["1"] ["0"]]
          (rows "SELECT generate_series(0,2) AS s
-                ORDER BY s DESC"))))
+                ORDER BY s DESC")))
+  (is (= 3
+         (count
+          (rows "SELECT unnest(array_fill('2020-01-02 03:04:05'::timestamp,
+                                          ARRAY[3]))")))))
 
 (deftest target-list-project-set-respects-empty-base-relation
   (run "CREATE TABLE ps_empty (id integer PRIMARY KEY)")
