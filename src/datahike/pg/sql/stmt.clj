@@ -922,6 +922,63 @@
        (contains? #{"generate_series" "unnest"}
                   (srf-base-name (.getName ^Function expr)))))
 
+(defn contains-target-list-srf?
+  "Whether an expression contains a ProjectSet-capable SRF in this query
+   level. `ast-function-names` deliberately does not descend into subqueries,
+   matching PostgreSQL's rule that an SRF inside a nested SELECT belongs to
+   that SELECT's placement context."
+  [expr]
+  (boolean
+   (some #(contains? #{"generate_series" "unnest"} (srf-base-name %))
+         (params/ast-function-names expr))))
+
+(defn- reject-prohibited-target-srf!
+  "Reject expression contexts in which PostgreSQL cannot conditionally or
+   repeatedly execute an SRF. Scalar expressions around SRFs remain legal;
+   these are the explicit parse_func/parse_agg placement boundaries."
+  [expr]
+  (when (contains-target-list-srf? expr)
+    (cond
+      (instance? CaseExpression expr)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "set-returning functions are not allowed in CASE"}))
+
+      (and (instance? Function expr)
+           (= "coalesce" (srf-base-name (.getName ^Function expr))))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "set-returning functions are not allowed in COALESCE"}))
+
+      (and (instance? Function expr)
+           (fns/aggregate-function?
+            (srf-base-name (.getName ^Function expr))))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "aggregate function calls cannot contain set-returning function calls"}))
+
+      (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "window function calls cannot contain set-returning function calls"})))))
+
+(defn validate-srf-row-count!
+  "Reject SRFs in LIMIT/FETCH/OFFSET before any table-free SELECT shortcut can
+   bypass the ordinary relational translator."
+  [^PlainSelect select]
+  (let [limit (some-> (.getLimit select) .getRowCount)
+        fetch (some-> (.getFetch select) .getExpression)
+        offset (some-> (.getOffset select) .getOffset)]
+    (when (or (contains-target-list-srf? limit)
+              (contains-target-list-srf? fetch))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "set-returning functions are not allowed in LIMIT"})))
+    (when (contains-target-list-srf? offset)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message "set-returning functions are not allowed in OFFSET"})))))
+
 (defn materialize-table-function
   "Produce rows for a `TableFunction` FROM item. Supports the common
    constant-arg set-returning functions:
@@ -950,6 +1007,11 @@
          ;; `pg_catalog.generate_series(1,3)` included.
          fname (srf-base-name (.getName f))
          params (vec (or (.getParameters f) []))
+         _ (when (and (not (target-list-srf? f))
+                      (contains-target-list-srf? f))
+             (throw (errors/pg-error
+                     :feature-not-supported
+                     {:message "set-returning functions must appear at top level of FROM"})))
          with-ord? (some-> (.getWithClause tf) str
                            (->> (= "ORDINALITY")))
          vtype-of (fn [v]
@@ -2836,7 +2898,8 @@
   "Translate a PlainSelect into a Datalog query map + metadata.
    Returns {:query map :find-aliases [...] :has-aggregates? bool}"
   [^PlainSelect select schema & [db]]
-  (let [name-anonymous-derived
+  (let [_ (validate-srf-row-count! select)
+        name-anonymous-derived
         (fn [item]
           (when (and (instance? ParenthesedSelect item)
                      (nil? (.getAlias ^ParenthesedSelect item)))
@@ -3796,7 +3859,8 @@
                   ;; 15. It is an expression over an aggregate like any
                   ;; other, and the hoisting path below handles it.
                   expr raw-expr
-                  alias-str (select-item-alias item)]
+                  alias-str (select-item-alias item)
+                  _ (reject-prohibited-target-srf! expr)]
               (cond
                 ;; SELECT t.* — table-qualified wildcard. JSqlParser
                 ;; surfaces this as AllTableColumns (which extends
@@ -4665,6 +4729,10 @@
         limit-expr (.getLimit select)
         limit-val (when limit-expr
                     (let [rc (.getRowCount ^Limit limit-expr)]
+                      (when (contains-target-list-srf? rc)
+                        (throw (errors/pg-error
+                                :feature-not-supported
+                                {:message "set-returning functions are not allowed in LIMIT"})))
                       (when (instance? LongValue rc)
                         (.getValue ^LongValue rc))))
         ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
@@ -4680,6 +4748,10 @@
         fetch-count-expr (when fetch-expr
                            (.getExpression
                             ^net.sf.jsqlparser.statement.select.Fetch fetch-expr))
+        _ (when (contains-target-list-srf? fetch-count-expr)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "set-returning functions are not allowed in LIMIT"})))
         fetch-count (when fetch-expr
                       (cond
                         ;; An omitted count defaults to one.
@@ -4715,6 +4787,10 @@
         offset-expr (.getOffset select)
         offset-val (when offset-expr
                      (let [ofs (.getOffset ^Offset offset-expr)]
+                       (when (contains-target-list-srf? ofs)
+                         (throw (errors/pg-error
+                                 :feature-not-supported
+                                 {:message "set-returning functions are not allowed in OFFSET"})))
                        (when (instance? LongValue ofs)
                          (.getValue ^LongValue ofs))))
 
@@ -6964,6 +7040,10 @@
   (when returning-clause
     (mapv (fn [^SelectItem item]
             (let [item-expr (.getExpression item)]
+              (when (contains-target-list-srf? item-expr)
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:message "set-returning functions are not allowed in RETURNING"})))
               (cond
                 (instance? AllColumns item-expr)
                 {:kind :star}
@@ -7272,6 +7352,31 @@
                        :target-count target-count
                        :value-count value-count}))))
   rows)
+
+(defn- expand-insert-values-srfs
+  "Expand top-level SRFs in one INSERT ... VALUES row.
+
+   PostgreSQL treats this context like an INSERT target list (unlike a
+   standalone VALUES relation): same-level SRFs advance in lockstep, shorter
+   results are NULL-padded, and an all-empty level produces no input row."
+  [row-exprs eval-fn]
+  (let [cells (mapv (fn [e]
+                      (if (target-list-srf? e)
+                        (let [tf (net.sf.jsqlparser.statement.select.TableFunction.
+                                  ^Function e)
+                              materialized (materialize-table-function tf eval-fn nil)]
+                          {:set-values (mapv first (:rows materialized))})
+                        {:scalar-value (eval-fn e)}))
+                    row-exprs)
+        set-cells (filter :set-values cells)]
+    (if (empty? set-cells)
+      [(mapv :scalar-value cells)]
+      (let [width (reduce max 0 (map (comp count :set-values) set-cells))]
+        (mapv (fn [i]
+                (mapv (fn [{:keys [set-values scalar-value]}]
+                        (if set-values (nth set-values i nil) scalar-value))
+                      cells))
+              (range width))))))
 
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
@@ -7613,34 +7718,32 @@
             ;;     e.g. INSERT INTO t(name) VALUES ('alice'), ('bob')
             all-pel? (every? #(instance? ParenthesedExpressionList %) expr-list)
             num-cols (count col-names)
-            rows (cond
-                   ;; All PELs have >1 element → genuine multi-row VALUES
-                   (and all-pel?
-                        (every? #(> (count %) 1) expr-list))
-                   (mapv (fn [^ParenthesedExpressionList pel]
-                           (mapv ev pel))
-                         expr-list)
+            row-exprs (cond
+                        ;; All PELs have >1 element → genuine multi-row VALUES
+                        (and all-pel?
+                             (every? #(> (count %) 1) expr-list))
+                        (mapv (fn [^ParenthesedExpressionList pel] (vec pel))
+                              expr-list)
 
-                   ;; All PELs have exactly 1 element AND count matches columns
-                   ;; → single row with parenthesized expressions
-                   (and all-pel?
-                        (every? #(= (count %) 1) expr-list)
-                        (= (count expr-list) num-cols))
-                   [(mapv (fn [^ParenthesedExpressionList pel]
-                            (ev (first pel)))
-                          expr-list)]
+                        ;; All PELs have exactly 1 element AND count matches columns
+                        ;; → single row with parenthesized expressions
+                        (and all-pel?
+                             (every? #(= (count %) 1) expr-list)
+                             (= (count expr-list) num-cols))
+                        [(mapv (fn [^ParenthesedExpressionList pel] (first pel))
+                               expr-list)]
 
-                   ;; All PELs have exactly 1 element but count != columns
-                   ;; → multi-row for single-column (or N-column) table
-                   (and all-pel?
-                        (every? #(= (count %) 1) expr-list))
-                   (mapv (fn [^ParenthesedExpressionList pel]
-                           (mapv ev pel))
-                         expr-list)
+                        ;; All PELs have exactly 1 element but count != columns
+                        ;; → multi-row for single-column (or N-column) table
+                        (and all-pel?
+                             (every? #(= (count %) 1) expr-list))
+                        (mapv (fn [^ParenthesedExpressionList pel] (vec pel))
+                              expr-list)
 
-                   ;; Direct list of values (single row without parens)
-                   :else
-                   [(mapv ev expr-list)])
+                        ;; Direct list of values (single row without parens)
+                        :else
+                        [(vec expr-list)])
+            rows (vec (mapcat #(expand-insert-values-srfs % ev) row-exprs))
             _ (if (seq columns)
                 (validate-insert-row-widths! col-names rows)
                 ;; Without an explicit target list PostgreSQL permits a
@@ -8246,6 +8349,12 @@
         ns table-name
         where-expr (.getWhere update)
         update-sets (.getUpdateSets update)
+        _ (doseq [^UpdateSet us update-sets
+                  value-expr (.getValues us)]
+            (when (contains-target-list-srf? value-expr)
+              (throw (errors/pg-error
+                      :feature-not-supported
+                      {:message "set-returning functions are not allowed in UPDATE"}))))
         ;; PostgreSQL does not permit qualification on the left-hand side
         ;; of SET, even when it names the target alias.  JSqlParser preserves
         ;; that qualifier separately on Column; dropping it silently accepted

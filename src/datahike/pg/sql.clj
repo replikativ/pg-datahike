@@ -42,7 +42,7 @@
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem Join OrderByElement
-            ParenthesedSelect SetOperationList TableStatement
+            ParenthesedSelect SetOperationList TableStatement Values
             UnionOp IntersectOp ExceptOp]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression.operators.relational
@@ -1382,6 +1382,7 @@
           ;; SELECT (may have CTEs — WITH ... AS)
                     (instance? PlainSelect stmt)
                     (let [;; Rewrite RIGHT JOIN → LEFT JOIN by swapping FROM and JOIN items
+                          _ (stmt/validate-srf-row-count! stmt)
                 ;; This ensures the proven LEFT JOIN path handles it correctly.
                           _ (when-let [joins (.getJoins ^PlainSelect stmt)]
                               (doseq [^Join j joins]
@@ -1945,6 +1946,19 @@
                           (cond-> (assoc result :type :select)
                             (not (identical? db orig-db)) (assoc :enriched-db db)))
                         {:type :error :message (str "Unsupported nested select: " (type inner))}))
+
+                    ;; A standalone VALUES relation cannot execute an SRF in
+                    ;; one of its cells. INSERT ... VALUES is intentionally a
+                    ;; different PostgreSQL context and remains legal.
+                    (instance? Values stmt)
+                    (if (some stmt/contains-target-list-srf?
+                              (.getExpressions ^Values stmt))
+                      (throw (errors/pg-error
+                              :feature-not-supported
+                              {:message "set-returning functions are not allowed in VALUES"}))
+                      {:type :error
+                       :message "standalone VALUES is not supported"
+                       :sqlstate "0A000"})
 
           ;; UNION / UNION ALL / INTERSECT / EXCEPT
                     (instance? SetOperationList stmt)
