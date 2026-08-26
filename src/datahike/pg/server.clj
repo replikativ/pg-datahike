@@ -1290,14 +1290,16 @@
   (resolve 'datahike.query/*result-cache-min-weight*))
 
 (defn- params-in-scoped-clauses?
-  "True when a translated :where contains a parameter var (?pN) inside an
-   or / or-join / not / not-join / and body. Under value-free parameter
-   binding those vars are branch-local to the promoted or-join and never
-   receive the outer binding — the branch silently matches nothing
-   (replikativ/datahike#938; same seam as #927). Such statements run
-   with stock const-folding instead; delete this guard when #938 lands."
+  "True when a translated :where contains a scalar input var inside an or /
+   or-join / not / not-join / and body. This includes wire parameters (?pN)
+   and generated wide-numeric inputs. Under value-free parameter binding
+   those vars are branch-local to the promoted or-join and never receive the
+   outer binding — the branch silently matches nothing
+   (replikativ/datahike#938; same seam as #927). Such statements run with
+   stock const-folding instead; delete this guard when #938 lands."
   [query]
-  (letfn [(param? [x] (and (symbol? x) (re-matches #"\?p\d+" (name x))))
+  (letfn [(param? [x] (and (symbol? x)
+                           (re-matches #"\?(?:p|wide-numeric)\d+" (name x))))
           (has-param? [form]
             (cond (param? form) true
                   (coll? form) (some has-param? form)
