@@ -18,7 +18,7 @@
    bind `*disable-planner* false` inside `materialize-recursive-cte!`
    itself (and `server.execute` also binds it at the handler entry),
    so the deftests don't have to set the env var."
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [java.sql Connection DriverManager SQLException]))
@@ -252,6 +252,27 @@
         (is (= "42P19" (.getSQLState ^SQLException e)))
         (is (re-find #"recursive reference to query \"x\" must not appear within an outer join"
                      (.getMessage ^SQLException e)))))))
+
+(deftest postgres-recursive-clause-restrictions-slice
+  ;; PostgreSQL with.sql lines 1000-1017. These clauses are rejected during
+  ;; recursive-query validation, before a potentially unbounded fixed point.
+  (with-open [c (jdbc)]
+    (doseq [[term state message]
+            [["SELECT count(*) FROM x" "42803" "aggregate functions"]
+             ["SELECT n+1 FROM x WHERE n < 3 ORDER BY 1" "0A000" "ORDER BY"]
+             ["SELECT n+1 FROM x WHERE n < 3 LIMIT 2 OFFSET 1" "0A000" "OFFSET"]
+             ["SELECT n+1 FROM x WHERE n < 3 FOR UPDATE" "0A000" "FOR UPDATE/SHARE"]]]
+      (testing term
+        (let [e (try
+                  (rows c (str "WITH RECURSIVE x(n) AS "
+                               "(SELECT 1 UNION ALL " term ") "
+                               "SELECT * FROM x"))
+                  nil
+                  (catch SQLException e e))]
+          (is (some? e))
+          (when e
+            (is (= state (.getSQLState ^SQLException e)))
+            (is (re-find (re-pattern message) (.getMessage ^SQLException e)))))))))
 
 (deftest with-recursive-update-from-cte
   ;; Lock-in for the UPDATE WITH RECURSIVE path with a 2-column CTE — the

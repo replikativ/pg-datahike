@@ -436,7 +436,11 @@
       {:id :recursive-outer-join
        :source-lines [977 992]
        :gate "test/datahike/test/pg_sql_cte_test.clj"
-       :test-var "postgres-recursive-outer-join-slice"}]}
+       :test-var "postgres-recursive-outer-join-slice"}
+      {:id :recursive-clause-restrictions
+       :source-lines [1000 1017]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-clause-restrictions-slice"}]}
     {:name "limit" :mode :discovery
      :boundaries #{:relational}
      :blockers #{:backward-cursors :set-returning-projections :planner-explain

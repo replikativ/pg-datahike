@@ -8277,7 +8277,38 @@
               table-name (fn [item]
                            (when (instance? Table item)
                              (str/lower-case
-                              (unquote-ident (.getName ^Table item)))))]
+                              (unquote-ident (.getName ^Table item)))))
+              recursive-functions
+              (into #{}
+                    (mapcat (fn [^SelectItem item]
+                              (params/ast-function-names (.getExpression item))))
+                    (.getSelectItems recursive))]
+          (when (some fns/aggregate-function? recursive-functions)
+            (throw
+             (ex-info
+              "aggregate functions are not allowed in a recursive query's recursive term"
+              {:error :grouping-error :sqlstate "42803" :query cte-name})))
+          (when (or (seq (.getOrderByElements recursive))
+                    (seq (.getOrderByElements sol)))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "ORDER BY in a recursive query is not implemented"})))
+          ;; PostgreSQL reports OFFSET ahead of LIMIT when both occur.
+          (when (or (some? (.getOffset recursive))
+                    (some? (.getOffset sol)))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "OFFSET in a recursive query is not implemented"})))
+          (when (or (some? (.getLimit recursive))
+                    (some? (.getLimit sol)))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "LIMIT in a recursive query is not implemented"})))
+          (when (re-find #"(?i)\bFOR\s+(?:NO\s+KEY\s+)?(?:UPDATE|SHARE)\b"
+                         (str recursive))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "FOR UPDATE/SHARE in a recursive query is not implemented"})))
           ;; PostgreSQL parse_agg.c/checkWellFormedRecursionWalker rejects a
           ;; recursive self-reference on the nullable side of every outer
           ;; join. Letting it reach fixed-point evaluation can keep producing
