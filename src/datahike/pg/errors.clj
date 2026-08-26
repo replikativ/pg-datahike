@@ -131,24 +131,33 @@
 
    :foreign-key-violation
    {:sqlstate "23503"
-    :format (fn [{:keys [table constraint detail]}]
+    :format (fn [{:keys [table parent-table constraint operation]}]
               (when (and table constraint)
-                (cond-> (str "insert or update on table \"" table
-                             "\" violates foreign key constraint \"" constraint "\"")
-                  detail (str ": " detail))))}
+                (if (contains? #{:delete :update-parent} operation)
+                  (str "update or delete on table \"" parent-table
+                       "\" violates foreign key constraint \"" constraint
+                       "\" on table \"" table "\"")
+                  (str "insert or update on table \"" table
+                       "\" violates foreign key constraint \"" constraint "\""))))}
 
    :check-violation
    {:sqlstate "23514"
-    :format (fn [{:keys [table constraint]}]
-              (when (and table constraint)
+    :format (fn [{:keys [table constraint domain]}]
+              (cond
+                (and domain constraint)
+                (str "value for domain " domain
+                     " violates check constraint \"" constraint "\"")
+                (and table constraint)
                 (str "new row for relation \"" table
                      "\" violates check constraint \"" constraint "\"")))}
 
    ;; --- input / data ---------------------------------------------------
    :invalid-text-representation
    {:sqlstate "22P02"
-    :format (fn [{:keys [type value detail]}]
+    :format (fn [{:keys [type value detail enum?]}]
               (cond
+                (and enum? type (some? value))
+                (str "invalid input value for enum " type ": " (pr-str value))
                 (and type value)
                 (str "invalid input syntax for type " type ": " (pr-str value))
                 detail detail

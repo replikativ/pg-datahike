@@ -171,6 +171,11 @@
    "current_date"  types/oid-date
    "current_time"  types/oid-time
    "localtime"     types/oid-time
+   "gen_random_uuid" types/oid-uuid
+   "uuidv4"        types/oid-uuid
+   "uuidv7"        types/oid-uuid
+   "uuid_extract_version" types/oid-int4
+   "uuid_extract_timestamp" types/oid-timestamptz
    ;; date_trunc has three overloads and each RETURNS its second
    ;; argument's type (pg_proc.dat): timestamptz, timestamp, interval.
    ;; Reporting timestamptz for all of them made `date_trunc('day', ts)`
@@ -184,6 +189,9 @@
    ;; pg_typeof returns regtype, not text — this is the OID the
    ;; reporter of #19 saw and mistook for the bit type's own.
    "pg_typeof"     types/oid-regtype
+   "enum_first"    :arg-type
+   "enum_last"     :arg-type
+   "enum_range"    types/oid-text-array
    "version"       types/oid-text
    "format_type"   types/oid-text
    "current_setting" types/oid-text
@@ -449,6 +457,8 @@
         l (if (instance? StringValue left) r0 l0)
         r (if (instance? StringValue right) l0 r0)
         date?    #(= % types/oid-date)
+        time?    #(= % types/oid-time)
+        timestamp? #(contains? #{types/oid-timestamp types/oid-timestamptz} %)
         money?   #(= % types/oid-money)
         money-factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
                                     types/oid-float4 types/oid-float8} %)
@@ -463,6 +473,11 @@
       ;; int8 for a value the renderer emits as `2020-01-02`, which a
       ;; binary-format client then failed to decode.
       (and minus? (date? l) (date? r))     types/oid-int4
+      ;; These operators produce an interval, not a promoted number. The
+      ;; result OID matters independently of the text rendering: binary
+      ;; clients choose their decoder from RowDescription.
+      (and minus? (time? l) (time? r)) types/oid-interval
+      (and minus? (timestamp? l) (timestamp? r)) types/oid-interval
       ;; Keyed off the date operand only — see date-arith-op in expr.clj
       ;; for why the other one is not inspected.
       (and (or plus? minus?) (date? l))    types/oid-date
@@ -599,7 +614,9 @@
       :else nil)))
 
 (defn- composite-name->oid
-  "Resolve a named composite type → its OID via the registry, or nil."
+  "Resolve a named composite type to its persisted OID. Enum values remain
+   text on the wire until pgjdbc's custom-type introspection query is fully
+   supported; their catalog OID is still available through pg_type/pg_enum."
   [type-str db]
   (when (and type-str db)
     (some (fn [{:keys [name oid]}] (when (= name type-str) oid))
@@ -650,6 +667,7 @@
                         (re-find #"with time zone|timestamptz" type-str)
                         types/oid-timestamptz
                         :else types/oid-timestamp)
+           :interval  types/oid-interval
            :uuid      types/oid-uuid
            :bytes     types/oid-bytea
            :bit       types/oid-bit

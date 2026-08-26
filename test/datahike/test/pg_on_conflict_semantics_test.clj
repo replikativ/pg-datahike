@@ -209,7 +209,7 @@
   (is (= [["1" "keep" "10"]] (rows "SELECT id, title, n FROM t"))))
 
 (deftest composite-conflict-target
-  (run "CREATE TABLE c (a int, b int, v text)")
+  (run "CREATE TABLE c (a int, b int, v text, UNIQUE (a,b))")
   (run "INSERT INTO c (a, b, v) VALUES (1, 2, 'orig')")
   (run (str "INSERT INTO c (a, b, v) VALUES (1, 2, 'new') "
             "ON CONFLICT (a, b) DO UPDATE SET v = EXCLUDED.v"))

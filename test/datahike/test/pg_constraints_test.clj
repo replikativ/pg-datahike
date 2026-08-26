@@ -62,6 +62,20 @@
   (testing "UPDATE SET col = NULL rejected"
     (is (err-contains? (run "UPDATE nn SET name = NULL WHERE id = 1") "not-null"))))
 
+(deftest primary-key-is-implicitly-not-null
+  (is (ok? (run "CREATE TABLE pkn (id INT PRIMARY KEY, name TEXT)")))
+  (let [r (run "INSERT INTO pkn (name) VALUES ('missing')")]
+    (is (err-contains? r "not-null"))
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult r))))
+  (is (= [] (rows (run "SELECT * FROM pkn")))))
+
+(deftest composite-primary-key-index-is-not-a-sql-column
+  (is (ok? (run "CREATE TABLE cpk (a INT, b TEXT, PRIMARY KEY (a,b))")))
+  (is (ok? (run "INSERT INTO cpk VALUES (1,'one')")))
+  (is (= [["1" "one"]] (rows (run "SELECT * FROM cpk"))))
+  (let [r (run "INSERT INTO cpk VALUES (NULL,'two')")]
+    (is (= "23502" (.sqlstate ^PgWireServer$QueryResult r)))))
+
 ;; ============================================================================
 ;; DEFAULT (literal and function)
 ;; ============================================================================
@@ -71,12 +85,26 @@
   (is (ok? (run "INSERT INTO dt (id) VALUES (1)")))
   (is (= [["1" "unset"]] (rows (run "SELECT id, tag FROM dt WHERE id = 1")))))
 
+(deftest explicit-null-suppresses-a-default
+  (is (ok? (run "CREATE TABLE dtn (id INT, tag TEXT DEFAULT 'unset')")))
+  (is (ok? (run "INSERT INTO dtn VALUES (1, NULL)")))
+  (is (ok? (run "INSERT INTO dtn (id) VALUES (2)")))
+  (is (= [["1" nil] ["2" "unset"]]
+         (rows (run "SELECT * FROM dtn ORDER BY id")))))
+
 (deftest default-function-now
   (is (ok? (run "CREATE TABLE dtf (id INT PRIMARY KEY, created TIMESTAMP DEFAULT NOW())")))
   (is (ok? (run "INSERT INTO dtf (id) VALUES (1)")))
   (let [r (run "SELECT created FROM dtf WHERE id = 1")]
     (is (ok? r))
     (is (some? (first (first (rows r)))))))
+
+(deftest temporal-default-is-assignment-coerced-to-text
+  (is (ok? (run "CREATE TABLE dtft (id INT PRIMARY KEY, created TEXT DEFAULT NOW())")))
+  (is (ok? (run "INSERT INTO dtft (id) VALUES (1)")))
+  (let [created (ffirst (rows (run "SELECT created FROM dtft WHERE id = 1")))]
+    (is (string? created))
+    (is (re-find #"^\d{4}-\d{2}-\d{2} " created))))
 
 ;; ============================================================================
 ;; CHECK constraints (23514)

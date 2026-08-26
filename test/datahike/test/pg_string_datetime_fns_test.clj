@@ -12,7 +12,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -145,6 +145,23 @@
     (is (= "NULL" (one c "SELECT quote_nullable(NULL)"))
         "quote_nullable is NOT strict -- rendering the NULL is its whole job")
     (is (= "ff" (one c "SELECT to_hex(255)")))))
+
+(deftest text-regression-boundaries
+  (with-open [c (jdbc)]
+    (is (= ["" "" "a" "ah" "aho" "" "a" "ah" "aho" "ahoj" "ahoj"]
+           (col c 2 (str "SELECT i, left('ahoj', i) "
+                         "FROM generate_series(-5, 5) t(i) ORDER BY i"))))
+    (is (= ["" "" "j" "oj" "hoj" "" "j" "oj" "hoj" "ahoj" "ahoj"]
+           (col c 2 (str "SELECT i, right('ahoj', i) "
+                         "FROM generate_series(-5, 5) t(i) ORDER BY i"))))
+    (is (= "1" (one c "SELECT length('é')")))
+    (is (= "2" (one c "SELECT octet_length('é')")))
+    (is (= "10,20,30" (one c "SELECT concat_ws(',', 10, 20, NULL, 30)")))
+    (is (= "one" (one c "SELECT concat_ws('#', 'one')")))
+    (is (nil? (one c "SELECT concat_ws(NULL, 10, 20)")))
+    (let [e (is (thrown? SQLException (one c "SELECT length(42)")))]
+      (is (= "42883" (.getSQLState ^SQLException e)))
+      (is (.contains (.getMessage ^SQLException e) "function length(")))))
 
 (deftest regex-functions
   (with-open [c (jdbc)]

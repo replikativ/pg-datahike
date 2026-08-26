@@ -311,6 +311,61 @@
   [ctx expr]
   (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
 
+(defn- enum-name-of-expr
+  "Recover the declared enum type from a cast or stored enum column. Enum
+   values themselves are strings, so runtime inspection cannot distinguish
+   two enum types (or an enum from text); the SQL expression must carry it."
+  [ctx expr]
+  (cond
+    (instance? CastExpression expr)
+    (let [type-name (some-> ^CastExpression expr .getColDataType str str/lower-case)]
+      (when (params/registered-enum-values (:db ctx) type-name)
+        (-> type-name (str/split #"\.") last params/unquote-ident)))
+
+    (instance? Column expr)
+    (when-let [resolved (try (ctx/resolve-column ^Column expr
+                                                 (:table-aliases ctx)
+                                                 (:default-table ctx)
+                                                 (:col-overrides ctx)
+                                                 (:derived-aliases ctx)
+                                                 (:ci-index ctx))
+                             (catch Throwable _ nil))]
+      (when-let [attr (ctx/attr-of ctx resolved)]
+        (ffirst
+         (d/q '{:find [?name]
+                :in [$ ?ident]
+                :where [[?e :db/ident ?ident]
+                        [?e :datahike.pg/enum-of ?name]]}
+              (:db ctx) attr))))
+
+    :else nil))
+
+(defn enum-spec-for-exprs [ctx exprs]
+  "Return the registry spec for the first enum-typed SQL expression. Public
+   for statement lowering, which must use the same type recovery for ORDER BY
+   and aggregates as predicate lowering does."
+  (when-let [enum-name (some #(enum-name-of-expr ctx %) exprs)]
+    (some #(when (= enum-name (:name %)) %)
+          (pgs/enum-types (:db ctx)))))
+
+(defn enum-rank-var!
+  "Bind the declaration-order rank of enum `value` and return its logic var.
+   SQL NULL remains the null sentinel so the normal server-side NULL ordering
+   path continues to apply."
+  [ctx spec value]
+  (let [rank-by-label (zipmap (:values spec) (range))
+        fn-param (symbol (str "?enum-rank-" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        rank-fn (fn [v]
+                  (if (fns/sql-null? v)
+                    :__null__
+                    (get rank-by-label (str v) Long/MAX_VALUE)))]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj rank-fn)
+    (swap! (:where-clauses ctx) conj [(list fn-param value) result-var])
+    (swap! (:nullable-vars ctx) conj result-var)
+    result-var))
+
 (def common-type-fns
   "The functions whose result type PostgreSQL resolves with
    `select_common_type` over their arguments rather than taking the
@@ -764,9 +819,18 @@
             evar (ctx/entity-var! ctx (:default-table ctx))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj (fn [_row & more] (apply impl (or more nil))))
-        (swap! (:where-clauses ctx) conj
-               [(apply list fn-param evar args) result-var])
-        result-var)
+        (if (:aggregate-projection? ctx)
+          ;; A volatile scalar beside an aggregate belongs above the
+          ;; grouping step: PostgreSQL evaluates it once per output group,
+          ;; not once per input row.  Returning the form directly lets
+          ;; split-aggregate-projection retain it in the deferred projection.
+          ;; The wrapper ignores its first argument, so nil is the appropriate
+          ;; synthetic row token when no input entity survives grouping.
+          (apply list fn-param nil args)
+          (do
+            (swap! (:where-clauses ctx) conj
+                   [(apply list fn-param evar args) result-var])
+            result-var)))
 
       (= fname "pg_typeof")
       (let [arg-expr (first params)
@@ -1116,6 +1180,26 @@
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
+      ;; CONCAT_WS(separator, value, ...) skips NULL values but a NULL
+      ;; separator makes the whole result NULL. It is variadic and non-strict
+      ;; in every argument after the separator.
+      (= fname "concat_ws")
+      (let [oids (mapv #(source-oid ctx %) params)
+            fn-param (symbol (str "?pg-concat-ws-fn" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj
+               (fn [sep & vs]
+                 (if (fns/sql-null? sep)
+                   :__null__
+                   (let [rendered (keep-indexed
+                                   (fn [i v]
+                                     (when-not (fns/sql-null? v)
+                                       (types/->pg-text v (nth oids (inc i) nil))))
+                                   vs)]
+                     (str/join (str sep) rendered)))))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       ;; SUBSTR/SUBSTRING(s, start [, len])
       ;; Through sql-substring rather than a raw `subs`: `subs` throws on
       ;; the `:__null__` sentinel ("class Keyword cannot be cast to
@@ -1207,9 +1291,18 @@
 
       ;; DATE_ADD(unit, amount, epoch-seconds) → add amount to timestamp
       (= fname "date_add")
-      (let [[_unit amount ts] args]
-        (swap! (:where-clauses ctx) conj [(list '+ ts amount) result-var])
-        result-var)
+      (if (contains? #{types/oid-date types/oid-time types/oid-timestamp
+                       types/oid-timestamptz}
+                     (source-oid ctx (first params)))
+        ;; PostgreSQL 18's date_add(timestamptz, interval [, zone]) is a
+        ;; different signature from the legacy three-number compatibility
+        ;; helper below. Until interval has a structural carrier, reject it
+        ;; at the SQL boundary instead of adding strings or nils.
+        (throw (errors/pg-error :feature-not-supported
+                                {:feature "date_add with an interval"}))
+        (let [[_unit amount ts] args]
+          (swap! (:where-clauses ctx) conj [(list '+ ts amount) result-var])
+          result-var))
 
       ;; DATE_DIFF(unit, end, start) → difference in days (epoch seconds / 86400)
       (= fname "date_diff")
@@ -1239,6 +1332,70 @@
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj diff-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param unit end-ts start-ts) result-var])
+        result-var)
+
+      ;; Temporal to_char has its own picture language in PostgreSQL. The
+      ;; mapped implementation is deliberately numeric-only.
+      (and (= fname "to_char")
+           (contains? #{types/oid-date types/oid-time types/oid-timestamp
+                        types/oid-timestamptz types/oid-interval}
+                      (source-oid ctx (first params))))
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature "to_char with a temporal value"}))
+
+      ;; User-defined enum input is database metadata, so the pure scalar
+      ;; helper cannot validate it without this translation-time closure.
+      (contains? #{"enum_first" "enum_last" "enum_range"} fname)
+      (let [argc (count args)
+            valid-arity? (if (= fname "enum_range") (contains? #{1 2} argc) (= 1 argc))
+            _ (when-not valid-arity?
+                (throw (errors/pg-error :undefined-function
+                                        {:function fname :arity argc})))
+            spec (enum-spec-for-exprs ctx arg-exprs)
+            _ (when-not spec
+                (throw (ex-info (str "function " fname " does not exist")
+                                {:error :undefined-function :sqlstate "42883"})))
+            values (:values spec)
+            safe-value (fn [value]
+                         (when (some? value)
+                           (params/assert-enum-label-safe!
+                            (:db ctx) (:name spec) value)))
+            impl (case fname
+                   "enum_first" (fn [_] (safe-value (first values)))
+                   "enum_last" (fn [_] (safe-value (last values)))
+                   "enum_range"
+                   (fn
+                     ([_]
+                      (doseq [value values] (safe-value value))
+                      (pg-arr/array :text values))
+                     ([lo hi]
+                      (let [lo (when-not (fns/sql-null? lo) (str lo))
+                            hi (when-not (fns/sql-null? hi) (str hi))
+                            start (if lo (.indexOf ^java.util.List values lo) 0)
+                            end (if hi (.indexOf ^java.util.List values hi) (dec (count values)))
+                            selected (if (and (<= 0 start) (<= start end))
+                                       (subvec values start (inc end))
+                                       [])]
+                        (doseq [value selected] (safe-value value))
+                        (pg-arr/array :text selected)))))
+            fn-param (symbol (str "?fn-" fname "-" (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
+      (= fname "pg_input_is_valid")
+      (let [_ (fns/check-arity! fname (count args))
+            db (:db ctx)
+            valid? (fn [value type-name]
+                     (if-let [values (params/registered-enum-values db type-name)]
+                       (contains? values (str value))
+                       (fns/pg-input-valid? value type-name)))
+            fn-param (symbol (str "?fn-pg-input-is-valid-"
+                                  (swap! (:var-counter ctx) inc)))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj (fns/null-safe valid?))
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
         result-var)
 
       ;; Known mapped functions. Emit via an in-param wrapping `null-safe`
@@ -1617,35 +1774,43 @@
    is a find element, not a binding. PostgreSQL draws the same line: the
    scan and the aggregate below, the projection above.
 
-   A clause is above the line when any of its inputs is (transitively) an
-   aggregate slot. Those are inlined -- their SSA-style out-variables
-   substituted back into one nested form -- and the rest are handed back
-   to the query untouched, which is what keeps an ordinary column
-   reference in the same expression (`sum(x) + id`) working.
+   Every SSA-style binding emitted while translating this SELECT item is
+   above that line once its output feeds the final projection. Those bindings
+   are inlined back into one nested form. Source-column bindings were emitted
+   before this item's clause slice and therefore remain query inputs; this is
+   what keeps an ordinary grouped column in the same expression
+   (`sum(x) + id * 2`) available without making the derived scalar a new
+   grouping key.
 
    Returns [query-clauses projection-form]."
   [v clauses agg-vars]
   (let [out-of (fn [c] (when (and (vector? c) (= 2 (count c)) (seq? (first c)))
                          (second c)))
-        deferred (volatile! (set agg-vars))
-        above? (fn [c]
-                 (boolean (some @deferred
-                                (filter symbol? (tree-seq coll? seq (first c))))))
-        keep-cs (vec (remove (fn [c]
-                               (if-let [o (out-of c)]
-                                 (when (above? c) (vswap! deferred conj o) true)
-                                 false))
-                             clauses))
+        ;; `get-else` is a source-column read, not projection work. Inlining
+        ;; it would hide the source variable from the 42803 grouping check
+        ;; and leave post-processing without a db/eid execution context.
+        source-binding? (fn [c]
+                          (and (vector? c) (seq? (first c))
+                               (= 'get-else (ffirst c))))
         by-out (into {} (keep (fn [c]
-                                (when-let [o (out-of c)]
-                                  (when (contains? @deferred o) [o (first c)])))
-                              clauses))
+                                (when (and (not (source-binding? c))
+                                           (out-of c))
+                                  [(out-of c) (first c)])))
+                     clauses)
+        expanded (volatile! (set agg-vars))
         inline (fn inline [x]
                  (cond
-                   (and (symbol? x) (contains? by-out x)) (inline (get by-out x))
+                   (and (symbol? x) (contains? by-out x))
+                   (do (vswap! expanded conj x)
+                       (inline (get by-out x)))
+
                    (seq? x) (apply list (map inline x))
-                   :else x))]
-    [keep-cs (inline v)]))
+                   :else x))
+        form (inline v)
+        keep-cs (vec (remove (fn [c]
+                               (contains? @expanded (out-of c)))
+                             clauses))]
+    [keep-cs form]))
 
 (defn translate-case-expr
   "Translate a CASE WHEN expression by compiling a Clojure function
@@ -2279,6 +2444,11 @@
    Returns the original string if all parsing attempts fail."
   [^String s]
   (let [trimmed (str/trim s)
+        ;; PostgreSQL accepts verbose timestamps with POSIX-style GMT zone
+        ;; names. In that notation GMT+05 means five hours WEST of UTC (the
+        ;; sign is intentionally opposite an ISO offset).
+        [_ verbose-local posix-sign zone-hour zone-minute]
+        (re-matches #"(?i)^[a-z]+,\s+(.+)\s+GMT([+-])(\d{2}):(\d{2})$" trimmed)
         ;; Strip trailing timezone offset from date-only strings:
         ;; "2000-09-07 -07" → "2000-09-07", "2000-09-07 +00" → "2000-09-07"
         date-only (second (re-find #"^(\d{4}-\d{2}-\d{2})\s+[+-]\d{2}$" trimmed))
@@ -2288,6 +2458,18 @@
                        (str/replace #"\+(\d{2})$" "+$1:00")
                        (str/replace #"(?<=\d)-(\d{2})$" "-$1:00"))]
     (or
+     (when verbose-local
+       (try
+         (let [local (java.time.LocalDateTime/parse
+                      verbose-local
+                      (java.time.format.DateTimeFormatter/ofPattern
+                       "MMMM d, uuuu h:mm:ss.SS a"
+                       java.util.Locale/ENGLISH))
+               iso-sign (if (= posix-sign "+") "-" "+")
+               offset (java.time.ZoneOffset/of
+                       (str iso-sign zone-hour ":" zone-minute))]
+           (java.util.Date/from (.toInstant local offset)))
+         (catch Exception _ nil)))
      ;; Date-only with timezone offset stripped
      (when date-only
        (try
@@ -2398,6 +2580,21 @@
         is-uuid? (= :uuid cast-cat)
         is-bit? (or (= :bit cast-cat) (= :varbit cast-cat))
         is-array? (= :array cast-cat)
+        enum-values (when (and (nil? cast-cat)
+                               (not (contains? types/pg-name->oid type-str)))
+                      (params/registered-enum-values (:db ctx) type-str))
+        is-enum? (some? enum-values)
+        domain-spec (params/registered-domain-spec (:db ctx) type-str)
+        enum-cast (fn [v]
+                    (if (or (nil? v) (= :__null__ v))
+                      :__null__
+                      (let [label (str v)]
+                        (if (contains? enum-values label)
+                          (params/assert-enum-label-safe! (:db ctx) type-str label)
+                          (throw (ex-info "invalid input value for enum"
+                                          {:error :invalid-text-representation
+                                           :enum? true :type type-str
+                                           :value label}))))))
         ;; `::json` / `::jsonb`. `cast-category` has no json branch, so
         ;; these fell through every arm and the value passed UNCHANGED —
         ;; the cast was a no-op that only set the wire OID, so
@@ -2411,7 +2608,29 @@
         ;; (integer 2) from text '10' (integer 10).
         src-oid (source-oid ctx inner)]
     (cond
+      is-enum?
+      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+        (enum-cast inner-raw)
+        (let [fn-param (symbol (str "?cast-enum" (swap! (:var-counter ctx) inc)))
+              result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
+              inner-val (if (seq? inner-raw) (ctx/materialize-arg! ctx inner-raw) inner-raw)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj enum-cast)
+          (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+          result-var))
+
       ;; Both types VALIDATE on input; only jsonb normalises after.
+      domain-spec
+      (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+        (params/cast-domain-value (:db ctx) domain-spec inner-raw)
+        (let [fn-param (symbol (str "?domain-cast-" (swap! (:var-counter ctx) inc)))
+              result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
+              inner-val (ctx/materialize-arg! ctx inner-raw)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj #(params/cast-domain-value (:db ctx) domain-spec %))
+          (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+          result-var))
+
       json-cast
       (if (string? inner-raw)
         (do (jb/validate-json! inner-raw)
@@ -2552,7 +2771,7 @@
                      (try (java.time.LocalTime/parse time-only)
                           (catch Exception _ s)))
           is-ts?   (parse-timestamp-string (str inner-raw))
-          is-uuid? (java.util.UUID/fromString (str inner-raw))
+          is-uuid? (coerce/parse-uuid inner-raw)
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
           (= type-str "regnamespace") 2200
@@ -2566,6 +2785,8 @@
             (or (when params/*parse-db* (pgs/table-oid params/*parse-db* n))
                 (when (seq n) (Math/abs (.hashCode ^String n)))
                 0))
+          (= type-str "regtype")
+          (or (params/registered-type-oid params/*parse-db* inner-raw) inner-raw)
           :else    inner-raw)
       ;; Variable/expression — add runtime cast binding
         (let [inner-val (ctx/materialize-arg! ctx inner-raw)
@@ -2646,7 +2867,7 @@
 
             is-uuid?
             (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))
-                  uuid-fn (fn [v] (java.util.UUID/fromString (str v)))]
+                  uuid-fn coerce/parse-uuid]
               (swap! (:in-params ctx) conj uuid-fn-param)
               (swap! (:in-args ctx) conj (null-preserving uuid-fn))
               (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
@@ -2668,6 +2889,17 @@
                                (or (when db (pgs/table-oid db n))
                                    (when (seq n) (Math/abs (.hashCode ^String n)))
                                    0))))]
+              (swap! (:in-params ctx) conj fn-param)
+              (swap! (:in-args ctx) conj lookup)
+              (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+              result-var)
+
+            (= type-str "regtype")
+            (let [fn-param (symbol (str "?regtype" (swap! (:var-counter ctx) inc)))
+                  db params/*parse-db*
+                  lookup (fn [v]
+                           (when (some? v)
+                             (or (params/registered-type-oid db v) v)))]
               (swap! (:in-params ctx) conj fn-param)
               (swap! (:in-args ctx) conj lookup)
               (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
@@ -2847,7 +3079,7 @@
       [sym w])))
 
 (defn- date-arith-op
-  "The date-arithmetic fn to emit for `expr`, or nil to use the numeric one.
+  "The temporal-arithmetic fn to emit for `expr`, or nil to use the numeric one.
 
    `date + integer`, `date - integer` and `date - date` are separate
    operators in PostgreSQL (date_pli / date_mii / date_mi). The choice
@@ -2866,18 +3098,38 @@
    right-hand operator to be confused with, and sql-date- dispatches
    days-vs-difference on the runtime value anyway."
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
-  (when (contains? #{'+ '-} op-sym)
-    (let [env (oid-env ctx)
-          oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
-          date? #(= (oid %) types/oid-date)
-          l (.getLeftExpression expr)
-          r (.getRightExpression expr)]
-      (cond
-        (date? l) (if (= op-sym '+) 'datahike.pg.sql/sql-date+ 'datahike.pg.sql/sql-date-)
+  (let [env (oid-env ctx)
+        oid (fn [e] (try (oid-infer/expr-oid e env) (catch Throwable _ nil)))
+        l (.getLeftExpression expr)
+        r (.getRightExpression expr)
+        loid (oid l)
+        roid (oid r)
+        date? #(= % types/oid-date)
+        integer? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8} %)
+        timestamp? #(contains? #{types/oid-timestamp types/oid-timestamptz} %)
+        temporal? #(contains? #{types/oid-date types/oid-time types/oid-timestamp
+                                types/oid-timestamptz types/oid-interval} %)]
+    (cond
+      (and (= op-sym '-) (date? loid) (date? roid))
+      'datahike.pg.sql/sql-date-
+        ;; An unknown right operand is normally a plan-cache parameter for
+        ;; an integer literal. Preserve that established date +/- path.
+      (and (contains? #{'+ '-} op-sym) (date? loid)
+           (or (nil? roid) (integer? roid)))
+      (if (= op-sym '+) 'datahike.pg.sql/sql-date+ 'datahike.pg.sql/sql-date-)
         ;; `integer + date` commutes. `integer - date` is not an operator
         ;; in PostgreSQL, so only `+` picks the right-hand date up.
-        (and (= op-sym '+) (date? r)) 'datahike.pg.sql/sql-date+
-        :else nil))))
+      (and (= op-sym '+) (date? roid) (or (nil? loid) (integer? loid)))
+      'datahike.pg.sql/sql-date+
+      (and (= op-sym '-) (timestamp? loid) (timestamp? roid))
+      'datahike.pg.sql/sql-timestamp-
+      (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
+      'datahike.pg.sql/sql-time-
+        ;; Any other typed temporal combination must not reach numeric +/-,
+        ;; whose Number casts leak a JVM implementation error.
+      (or (temporal? loid) (temporal? roid))
+      'datahike.pg.sql/sql-unsupported-temporal-arithmetic
+      :else nil)))
 
 (defn- agg-marker?
   "An aggregate placeholder produced by translate-expr, as distinct from
@@ -3641,6 +3893,7 @@
     (instance? SignedExpression expr)
     (let [^SignedExpression se expr
           sign (.getSign se)
+          source-type (source-oid ctx (.getExpression se))
           inner (translate-expr ctx (.getExpression se))
           inner (if (seq? inner) (ctx/materialize-arg! ctx inner) inner)]
       (case sign
@@ -3648,15 +3901,20 @@
         ;; negating INT_MIN is out of range in PostgreSQL, while Java's
         ;; `-` wraps it back to itself. `(* -1 x)` could not express that
         ;; because the multiplication carries no width.
-        \- (let [w (when-not (number? inner)
-                     (int-width-of ctx (.getExpression se)))]
-             (cond
-               (number? inner) (- inner)
-               w (list 'datahike.pg.sql/sql-int-neg w inner)
-               ;; Route through numeric-special-aware multiplication so
-               ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
-               ;; multiplication casts the carrier record to Number.
-               :else (list 'datahike.pg.sql/sql-* -1 inner)))
+        \- (if (= source-type types/oid-interval)
+             ;; Intervals are still text-backed. Until they have a
+             ;; structural value, never send that carrier through numeric
+             ;; multiplication and leak String->Number to a client.
+             (list 'datahike.pg.sql/sql-unsupported-temporal-arithmetic inner)
+             (let [w (when-not (number? inner)
+                       (int-width-of ctx (.getExpression se)))]
+               (cond
+                 (number? inner) (- inner)
+                 w (list 'datahike.pg.sql/sql-int-neg w inner)
+                 ;; Route through numeric-special-aware multiplication so
+                 ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
+                 ;; multiplication casts the carrier record to Number.
+                 :else (list 'datahike.pg.sql/sql-* -1 inner))))
         ;; `~` — bitwise NOT, over integers and bit strings alike.
         ;; Previously fell through to the identity branch below, so
         ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,
@@ -4252,16 +4510,13 @@
          (contains? #{"json" "jsonb"}
                     (some-> ^CastExpression expr .getColDataType .getDataType
                             str/lower-case)))
-    (when (instance? Column expr)
-      (let [resolved (ctx/resolve-column ^Column expr
-                                         (:table-aliases ctx)
-                                         (:default-table ctx)
-                                         (:col-overrides ctx)
-                                         (:derived-aliases ctx) (:ci-index ctx))
-            attr (ctx/attr-of ctx resolved)]
-        (and attr
-             (= "jsonb" (or (get-in (:schema ctx) [attr :pg/type])
-                            (params/pg-type-of-attr (:db ctx) attr)))))))))
+    ;; UPDATE ... FROM rows are runtime constant bindings rather than
+    ;; relations in ctx.  Type probing must therefore be tolerant of an
+    ;; otherwise-unresolvable qualified binding (`v.j`), just as
+    ;; column-pg-type is.  A failed probe means "type unknown", not a
+    ;; missing-FROM error; translate-expr resolves the bound value below.
+    (and (instance? Column expr)
+         (= "jsonb" (column-pg-type ctx ^Column expr))))))
 
 (defn- json-column?
   "Whether `expr` is a column of the text-faithful `json` type.
@@ -4273,16 +4528,8 @@
    silently, comparing the stored text."
   [ctx expr]
   (boolean
-   (when (instance? Column expr)
-     (let [resolved (ctx/resolve-column ^Column expr
-                                        (:table-aliases ctx)
-                                        (:default-table ctx)
-                                        (:col-overrides ctx)
-                                        (:derived-aliases ctx) (:ci-index ctx))
-           attr (ctx/attr-of ctx resolved)]
-       (and attr
-            (= "json" (or (get-in (:schema ctx) [attr :pg/type])
-                          (params/pg-type-of-attr (:db ctx) attr))))))))
+   (and (instance? Column expr)
+        (= "json" (column-pg-type ctx ^Column expr)))))
 
 (defn- reject-json-operator!
   "PostgreSQL has no such operator on `json`; raise as it does."
@@ -4367,8 +4614,23 @@
    typed Clojure value (Long/Double/Boolean/UUID/Date/...). The
    caller's translate-expr branch handles both."
   [ctx left right]
-  [(or (coerce-unknown-literal ctx right left) left)
-   (or (coerce-unknown-literal ctx left right) right)])
+  (let [coerce-for-expr
+        (fn [typed lit]
+          (when (instance? StringValue lit)
+            (when-let [vtype (some-> (source-oid ctx typed)
+                                     types/dh-type-for-oid)]
+              ;; Text expressions need no typinput coercion, and using the
+              ;; parser node's raw body here would undo E'' escape decoding.
+              (when-not (= :db.type/string vtype)
+                (coerce/coerce-unknown
+                 (.getNotExcapedValue ^StringValue lit)
+                 vtype parse-timestamp-string)))))]
+    [(or (coerce-unknown-literal ctx right left)
+         (coerce-for-expr right left)
+         left)
+     (or (coerce-unknown-literal ctx left right)
+         (coerce-for-expr left right)
+         right)]))
 
 (def ^:private op-sym->sql
   "The SQL spelling of a comparison operator, for PostgreSQL's
@@ -4574,7 +4836,9 @@
      ;; column-to-column comparison all fell through to here and
      ;; answered false. Decide it BEFORE coerce-comparison-operands,
      ;; which replaces the AST nodes this test needs.
-     (let [jsonb-cmp? (and (contains? #{'= 'not=} op)
+     (let [enum-spec (when (contains? #{'< '> '<= '>=} op)
+                       (enum-spec-for-exprs ctx [left right]))
+           jsonb-cmp? (and (contains? #{'= 'not=} op)
                            (or (jsonb-column? ctx left)
                                (jsonb-column? ctx right)))
            [left right] (coerce-comparison-operands ctx left right)
@@ -4586,9 +4850,22 @@
                (translate-expr ctx right) right)
            l (if (seq? l) (ctx/materialize-arg! ctx l) l)
            r (if (seq? r) (ctx/materialize-arg! ctx r) r)
-           guards (ctx/null-guard-clauses ctx [l r])]
+           guards (ctx/null-guard-clauses ctx [l r])
+           enum-cmp-param
+           (when enum-spec
+             (let [rank (zipmap (:values enum-spec) (range))
+                   cmp (case op < < > > <= <= >= >=)
+                   p (symbol (str "?enum-cmp-" (swap! (:var-counter ctx) inc)))]
+               (swap! (:in-params ctx) conj p)
+               (swap! (:in-args ctx) conj
+                      (fn [a b]
+                        (cmp (get rank (str a) Long/MAX_VALUE)
+                             (get rank (str b) Long/MAX_VALUE))))
+               p))]
        (conj guards
              (cond
+               enum-cmp-param
+               [(list enum-cmp-param l r)]
                (and jsonb-cmp? (= op '=))
                [(list 'datahike.pg.sql/jsonb-eq? l r)]
                jsonb-cmp?

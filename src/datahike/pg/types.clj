@@ -45,7 +45,9 @@
 (def oid-interval 1186)
 (def oid-numeric  1700)
 (def oid-uuid     2950)
+(def oid-regclass  2205)
 (def oid-regtype  2206)
+(def oid-regnamespace 4089)
 (def oid-bit      1560)
 (def oid-varbit   1562)
 (def oid-jsonb    3802)
@@ -139,7 +141,7 @@
    storage-type default. char(18) must stay char (not text) — asyncpg's typeinfo
    binary-decodes typtype to bytes b'c'; oid(26) must stay oid (not int8)."
   {18 "char", 26 "oid", oid-name "name", oid-money "money",
-   oid-bit "bit", oid-varbit "varbit"})
+   oid-interval "interval", oid-bit "bit", oid-varbit "varbit"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -331,11 +333,15 @@
     "time"        oid-time
     "timestamp"   oid-timestamp
     "timestamptz" oid-timestamptz
+    "interval"    oid-interval
     "uuid"        oid-uuid
     "json"        oid-json
     "jsonb"       oid-jsonb
     "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
+    "regclass"    oid-regclass
+    "regtype"     oid-regtype
+    "regnamespace" oid-regnamespace
     "tid"         oid-tid
     "char"        oid-char
     "bytea"       oid-bytea
@@ -414,7 +420,9 @@
    oid-float4     "real"
    oid-float8     "double precision"
    oid-numeric    "numeric"
+   oid-regclass   "regclass"
    oid-regtype    "regtype"
+   oid-regnamespace "regnamespace"
    oid-bit        "bit"
    oid-varbit     "bit varying"
    oid-text       "text"
@@ -516,7 +524,13 @@
   "SQL type names that cast to timestamp/instant."
   #{"timestamp" "timestamp without time zone" "timestamp with time zone"
     "timestamptz" "date" "time" "time without time zone"
-    "time with time zone" "interval"})
+    "time with time zone"})
+
+(def cast-interval-types
+  "SQL type names that denote an interval. Intervals currently retain their
+   text carrier, but they must remain a distinct SQL type for operator and
+   RowDescription inference."
+  #{"interval"})
 
 (def cast-date-types
   "SQL type names that cast to a DATE (no time component).
@@ -584,6 +598,9 @@
    [oid-varbit    "varbit"    -1  "b"]
    [oid-jsonb     "jsonb"     -1  "b"]
    [oid-pg-lsn    "pg_lsn"     8  "b"]
+   [oid-regclass  "regclass"    4  "b"]
+   [oid-regtype   "regtype"     4  "b"]
+   [oid-regnamespace "regnamespace" 4 "b"]
    ;; Array types — one per scalar with a paired T[] OID. typtype="b"
    ;; like scalars; the typelem linkage is exposed via element-oid
    ;; lookups at query time (see datahike.pg.sql.catalog).
@@ -1000,7 +1017,7 @@
 (defn cast-category
   "Classify a SQL type name for CAST handling.
    Returns :integer, :float, :text, :boolean, :date, :time,
-   :timestamp, :uuid, :bytes, :array, :json, :jsonb, or nil. :date and :time are
+   :timestamp, :interval, :uuid, :bytes, :array, :json, :jsonb, or nil. :date and :time are
    checked before :timestamp so callers can emit the
    display-appropriate Java type (LocalDate / LocalTime vs Instant).
    Any type-name ending in `[]` classifies as :array; the element
@@ -1027,6 +1044,7 @@
         (contains? cast-date-types base)      :date
         (contains? cast-time-types base)      :time
         (contains? cast-timestamp-types base) :timestamp
+        (contains? cast-interval-types base)  :interval
         (contains? cast-uuid-types base)      :uuid
         (contains? cast-bytes-types base)     :bytes
         (contains? cast-varbit-types base)    :varbit

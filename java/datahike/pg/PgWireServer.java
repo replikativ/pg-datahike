@@ -1112,6 +1112,10 @@ public final class PgWireServer {
             }
         } catch (IOException e) {
             // Client disconnected
+            if (System.getenv("DATAHIKE_WIRE_DEBUG") != null) {
+                System.err.println("PgWire connection I/O error: " + e.getMessage());
+                e.printStackTrace(System.err);
+            }
         } catch (Exception e) {
             System.err.println("PgWire connection error: " + e.getMessage());
             if (System.getenv("DATAHIKE_WIRE_DEBUG") != null) {
@@ -1198,6 +1202,9 @@ public final class PgWireServer {
                 // Parse key/value pairs and surface them to the caller so
                 // handlerFactory.create(params) can route on `database`.
                 startupParamsHolder[0] = parseStartupParams(params);
+                if (System.getenv("DATAHIKE_WIRE_DEBUG") != null) {
+                    System.err.println("PgWire startup parameters: " + startupParamsHolder[0]);
+                }
 
                 // AuthenticationOk
                 out.writeByte('R');

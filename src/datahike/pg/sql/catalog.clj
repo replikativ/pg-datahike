@@ -709,8 +709,15 @@
                               :pg_type/typelem 0 :pg_type/typdelim ","
                               :pg_type/typnamespace 2200
                               (pgs/row-marker-attr "pg_type") true})
-                           (pgs/composite-types cte-db))]
-      (into base composites))
+                           (pgs/composite-types cte-db))
+          enums (mapv (fn [{:keys [name oid]}]
+                        {:pg_type/oid oid :pg_type/typname name
+                         :pg_type/typlen 4 :pg_type/typtype "e"
+                         :pg_type/typelem 0 :pg_type/typdelim ","
+                         :pg_type/typnamespace 2200
+                         (pgs/row-marker-attr "pg_type") true})
+                      (pgs/enum-types cte-db))]
+      (into base (concat composites enums)))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
@@ -1257,7 +1264,18 @@
     "pg_inherits"
     []
     "pg_enum"
-    []
+    (vec
+     (for [{:keys [oid values]} (pgs/enum-types cte-db)
+           [idx label] (map-indexed vector values)]
+       {:pg_enum/oid
+        ;; pg_enum rows have their own OIDs. A stable hash is sufficient for
+        ;; catalog identity; enum ordering is represented separately below.
+        (long (bit-and 0x7fffffff
+                       (.hashCode ^String (str oid ":" idx ":" label))))
+        :pg_enum/enumtypid oid
+        :pg_enum/enumsortorder (double (inc idx))
+        :pg_enum/enumlabel label
+        (pgs/row-marker-attr "pg_enum") true}))
     "pg_policy"
     []
     "pg_statistic_ext"
@@ -1504,6 +1522,16 @@
     (collect-in-expr!
      acc
      (.getRightExpression ^net.sf.jsqlparser.expression.operators.relational.ExistsExpression expr))
+    ;; JSqlParser represents `NOT EXISTS (…)` as a unary NotExpression
+    ;; around ExistsExpression (despite ExistsExpression also having an
+    ;; `isNot` flag in some parser paths). Without crossing this wrapper,
+    ;; catalogs referenced only by the subquery were never materialised:
+    ;; the translated not-join was sound, but searched an enriched db that
+    ;; contained the outer catalog alone.
+    (instance? net.sf.jsqlparser.expression.NotExpression expr)
+    (collect-in-expr!
+     acc
+     (.getExpression ^net.sf.jsqlparser.expression.NotExpression expr))
     (instance? net.sf.jsqlparser.expression.BinaryExpression expr)
     (let [^net.sf.jsqlparser.expression.BinaryExpression be expr]
       (-> acc
@@ -1629,7 +1657,7 @@
   #{:set :show
     :prepare :execute-prepared :deallocate
     :declare-cursor :fetch-cursor :close-cursor :move-cursor
-    :begin :commit :savepoint :release-savepoint :rollback-to-savepoint
+    :begin :commit :rollback :savepoint :release-savepoint :rollback-to-savepoint
     :discard-all :discard-scoped
     ;; RESET ALL / RESET <var> (datahike.* + statement_timeout RESETs are
     ;; intercepted earlier in the simple-query path; everything else
@@ -1651,7 +1679,8 @@
     :create-database :drop-database
     ;; CREATE TYPE … AS ENUM and CREATE DOMAIN both bypass JSqlParser
     ;; (which can't / won't parse them) and run our own parsers.
-    :create-type-enum :create-type-composite :create-domain
+    :create-type-enum :create-type-composite :alter-type-enum
+    :rename-type-enum :drop-type-enum :create-domain :drop-domain
     ;; CREATE / ALTER SEQUENCE — JSqlParser's grammar covers only a
     ;; subset of PG's option list (INCREMENT BY but not INCREMENT,
     ;; no AS / IF NOT EXISTS / NO MINVALUE / signed values) and has no

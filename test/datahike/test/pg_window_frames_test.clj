@@ -21,7 +21,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -135,6 +135,30 @@
     (is (= ["1.8750000000000000" "1.8750000000000000" "2.8750000000000000"
             "2.8750000000000000" "2.8750000000000000"]
            (col c 2 "SELECT id, avg(n) OVER (ORDER BY k) FROM wp ORDER BY id")))))
+
+(deftest interval-window-aggregates-fail-explicitly
+  (with-open [c (jdbc)]
+    (doseq [agg ["sum" "avg"]]
+      (try
+        (exec! c (str "SELECT " agg "(v::interval) OVER (ORDER BY i) "
+                      "FROM (VALUES (1,'1 sec'),(2,'2 sec')) t(i,v)"))
+        (is false (str agg "(interval) should not reach numeric aggregation"))
+        (catch SQLException e
+          (is (= "0A000" (.getSQLState e)))
+          (is (.contains (.getMessage e) (str agg "(interval)"))))))
+    (try
+      ;; Here the cast belongs to VALUES, not the aggregate argument. The
+      ;; materialized column now preserves its interval OID, so either the
+      ;; static aggregate guard or the runtime window guard may reject it;
+      ;; neither may leak a host-language cast.
+      (exec! c (str "SELECT avg(x) OVER (ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING), "
+                    "sum(x) OVER (ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) "
+                    "FROM (VALUES (NULL::interval),('6 days'::interval)) v(x)"))
+      (is false "inferred interval columns should not reach numeric aggregation")
+      (catch SQLException e
+        (is (= "0A000" (.getSQLState e)))
+        (is (or (.contains (.getMessage e) "non-numeric window input")
+                (.contains (.getMessage e) "avg(interval)")))))))
 
 (deftest collection-aggregates-over-a-window
   (with-open [c (jdbc)]

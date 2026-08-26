@@ -117,6 +117,38 @@
     (is (= [["a" "32"] ["b" "32"]]
            (rows c "SELECT dept, sum(n)+count(*) FROM ae GROUP BY dept ORDER BY dept")))))
 
+(deftest grouped-projections-inline-sibling-scalars
+  (with-open [c (jdbc)]
+    (seed! c)
+    (is (= [["a" "32"] ["b" "32"]]
+           (rows c (str "SELECT dept, sum(n) + length(dept) * 2 "
+                        "FROM ae GROUP BY dept ORDER BY dept")))
+        "derived grouped-column expressions are evaluated above aggregation")
+    (is (= [["a" "30"] ["b" "30"]]
+           (rows c (str "SELECT dept, sum(n) + random() * 0 "
+                        "FROM ae GROUP BY dept ORDER BY dept")))
+        "a volatile sibling runs per output group without becoming a grouping key")
+    (is (= [["a" "30"] ["b" "30"]]
+           (rows c (str "SELECT dept, random() * 0 + sum(n) "
+                        "FROM ae GROUP BY dept ORDER BY dept")))
+        "aggregate/scalar order in the AST does not change volatility semantics")))
+
+(deftest corr-resolves-unknown-literals-as-float8
+  (with-open [c (jdbc)]
+    (seed! c)
+    (is (= ["NaN"] (col c 1 "SELECT corr(id, 'NaN') FROM ae")))
+    (is (= [nil] (col c 1 "SELECT corr(0.1, 'NaN') FROM ae")))
+    (is (= ["NaN"] (col c 1 "SELECT corr('NaN', 'NaN') FROM ae")))))
+
+(deftest derived-tables-materialize-logical-aggregate-projections
+  (with-open [c (jdbc)]
+    (seed! c)
+    (is (= [["61" "60"]]
+           (rows c (str "SELECT a.f1, b.f1 "
+                        "FROM (SELECT sum(n)+1 AS f1 FROM ae) a, "
+                        "     (SELECT sum(n) AS f1 FROM ae) b "
+                        "WHERE a.f1 = b.f1 + 1"))))))
+
 (deftest compound-projections-preserve-select-list-order
   (with-open [c (jdbc)]
     (seed! c)

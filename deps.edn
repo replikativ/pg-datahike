@@ -2,7 +2,7 @@
 
  :deps
  {org.clojure/clojure               {:mvn/version "1.12.4"}
-  org.replikativ/datahike           {:mvn/version "0.8.1800"}
+  org.replikativ/datahike           {:mvn/version "0.8.1805"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
   com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}
   ;; JSON codec for the json/jsonb types. Declared rather than inherited

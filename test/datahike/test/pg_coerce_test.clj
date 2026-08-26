@@ -114,3 +114,22 @@
     ;; blank are invalid — PG raises 22P02 for all of these.
     (doseq [s ["o" "2" "10" "01" "maybe" "" "  " "truex" "offf" "yesno"]]
       (is (nil? (c/parse-bool-token s)) s))))
+
+(deftest postgres-uuid-input-forms
+  (let [canonical "3f3e3c3b-3a30-3938-3736-353433a2313e"
+        expected (java.util.UUID/fromString canonical)]
+    (doseq [s [canonical
+               "{3f3e3c3b-3a30-3938-3736-353433a2313e}"
+               "3f3e3c3b3a3039383736353433a2313e"
+               "3f3e-3c3b-3a30-3938-3736-3534-33a2-313e"]]
+      (is (= expected (c/parse-uuid s)) s))
+    (doseq [s ["111-11111-1111-1111-1111-111111111111"
+               "11111111-1111-1111-G111-111111111111"
+               "{11111111-1111-1111-1111-11111111111}"
+               (str " " canonical)
+               (str canonical "-")]]
+      (try
+        (c/parse-uuid s)
+        (is false s)
+        (catch clojure.lang.ExceptionInfo e
+          (is (= "22P02" (:sqlstate (ex-data e))) s))))))

@@ -15,7 +15,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -49,6 +49,12 @@
   (with-open [st (.createStatement c)
               rs (.executeQuery st sql)]
     (when (.next rs) (.getString rs 1))))
+
+(defn- sqlstate [^Connection c sql]
+  (try
+    (one c sql)
+    nil
+    (catch SQLException e (.getSQLState e))))
 
 (defn- seed! [^Connection c]
   (exec! c "CREATE TABLE ev (id int, d date, ts timestamp)")
@@ -104,3 +110,34 @@
         "PostgreSQL has no `timestamp + integer` operator either; the point
          is that a timestamp column must NOT quietly acquire date
          semantics just because it is stored as a java.util.Date")))
+
+(deftest temporal-subtraction-produces-an-interval
+  (with-open [c (jdbc)]
+    (is (= "1 day 02:02:02"
+           (one c (str "SELECT timestamp '2020-01-02 03:04:05' "
+                       "- timestamp '2020-01-01 01:02:03'"))))
+    (is (= "-1 days -02:02:02"
+           (one c (str "SELECT timestamp '2020-01-01 01:02:03' "
+                       "- timestamp '2020-01-02 03:04:05'"))))
+    (is (= "02:02:02"
+           (one c "SELECT time '03:04:05' - time '01:02:03'")))
+    (is (= "interval"
+           (one c (str "SELECT pg_typeof(timestamp '2020-01-02 03:04:05' "
+                       "- timestamp '2020-01-01 01:02:03')"))))
+    (is (= "interval"
+           (one c "SELECT pg_typeof(time '03:04:05' - time '01:02:03')")))))
+
+(deftest unsupported-temporal-families-do-not-leak-host-casts
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE spans (span interval)")
+    (exec! c "INSERT INTO spans VALUES ('1 day')")
+    (is (= "interval" (one c "SELECT pg_typeof(span) FROM spans")))
+    (is (= "42883" (sqlstate c "SELECT time '03:04:05' + time '01:02:03'")))
+    (is (= "42883" (sqlstate c "SELECT -('1 day'::interval)")))
+    (is (= "42883" (sqlstate c "SELECT '1 day'::interval * 2")))
+    (is (= "42883" (sqlstate c "SELECT '1 day'::interval - '1 day'::interval")))
+    (is (= "42883" (sqlstate c "SELECT -span FROM spans")))
+    (is (= "42883" (sqlstate c "SELECT span - span FROM spans")))
+    (is (= "0A000"
+           (sqlstate c "SELECT to_char(timestamp '2020-01-01', 'YYYY-MM-DD')")))
+    (is (= "0A000" (sqlstate c "SELECT to_char('1 day'::interval, 'YYYY')")))))

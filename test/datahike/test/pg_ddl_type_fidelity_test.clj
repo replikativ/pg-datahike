@@ -45,7 +45,8 @@
     ORDER BY a.attnum")
 
 (deftest declared-types-survive-into-pg-attribute
-  (run "CREATE TABLE ag (id int, nm text, d date, ts timestamp, sm smallint, bg bigint, n numeric)")
+  (run (str "CREATE TABLE ag (id int, nm text, d date, ts timestamp, "
+            "sm smallint, bg bigint, n numeric, iv interval)"))
   (testing "each column reports the type it was DECLARED as, in CREATE TABLE order"
     (is (= [["id" "integer"]
             ["nm" "text"]
@@ -53,7 +54,8 @@
             ["ts" "timestamp without time zone"]
             ["sm" "smallint"]
             ["bg" "bigint"]
-            ["n"  "numeric"]]
+            ["n"  "numeric"]
+            ["iv" "interval"]]
            (rows (format cols-sql "ag"))))))
 
 (deftest bit-widths-survive-into-pg-attribute

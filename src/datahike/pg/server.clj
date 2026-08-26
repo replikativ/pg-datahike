@@ -33,6 +33,7 @@
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
+            [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
@@ -42,6 +43,7 @@
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
             PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException PgParamCodec]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
+           [net.sf.jsqlparser.schema Column]
            [net.sf.jsqlparser.statement.select PlainSelect Limit Offset]
            [net.sf.jsqlparser.expression LongValue]))
 
@@ -1477,48 +1479,64 @@
 ;; DML execution
 ;; ============================================================================
 
+(defn- returning-items
+  "Expand a parsed RETURNING projection to executable output descriptors."
+  [returning db table-name table-alias schema]
+  (let [columns (->> (pgs/column-info schema table-name db)
+                     (remove #(= "db_id" (:name %)))
+                     vec)
+        aliases (cond-> {table-name table-name} table-alias (assoc table-alias table-name))
+        env {:db db :schema schema :default-table table-name :table-aliases aliases}]
+    (vec
+     (mapcat
+      (fn [{:keys [kind table expr name] :as item}]
+        (if (= :star kind)
+          (do
+            (when (and table (not (contains? aliases table)))
+              (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
+                              {:error :undefined-table :sqlstate "42P01" :table table})))
+            (map (fn [{:keys [name oid]}]
+                   {:kind :column
+                    :name name
+                    :attr (#'sql/resolve-inherited-attr
+                           (keyword table-name name) schema db)
+                    :oid oid})
+                 columns))
+          [(assoc item :name name :oid (or (oid/expr-oid expr env)
+                                           PgWireServer/OID_TEXT))]))
+      returning))))
+
 (defn- build-returning-result
-  "Build a QueryResult for RETURNING clause from entity IDs.
-   returning: :* for all columns, or [col-name ...] for specific columns.
+  "Build a QueryResult for a RETURNING projection from affected entity IDs.
    db: database to read values from (db-after for INSERT/UPDATE, db-before for DELETE).
    eids: entity IDs to return.
    table-name: the table name (namespace prefix for attributes).
    schema: database schema."
-  [returning db eids table-name schema]
-  (let [col-names (if (= :* returning)
-                    (let [cols (pgs/column-info schema table-name db)]
-                      (mapv :name (rest cols)))  ;; skip db_id
-                    returning)
-        ;; Resolve inherited attrs: for INHERITS, some columns live in parent namespace
-        raw-attrs (mapv #(keyword table-name %) col-names)
-        attrs (mapv #(#'sql/resolve-inherited-attr % schema db) raw-attrs)
+  [returning db eids table-name table-alias schema command]
+  (let [items (returning-items returning db table-name table-alias schema)
+        col-names (mapv :name items)
         rows (for [eid eids]
                (let [datoms (d/datoms db :eavt eid)
                      entity-map (into {} (map (fn [^datahike.datom.Datom d]
                                                 [(.-a d) (.-v d)])
                                               datoms))]
-                 (mapv (fn [attr] (get entity-map attr)) attrs)))
+                 (binding [stmt/*eval-update-db* db]
+                   (mapv (fn [{:keys [kind attr expr]}]
+                           (if (= :column kind)
+                             (get entity-map attr)
+                             (stmt/eval-update-expr expr entity-map table-name schema)))
+                         items))))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [row rows]
                                  (into-array String (map value->string row))))
         col-name-array (into-array String col-names)
-        ;; Derive OIDs from column-info so the declared :pg/type wins
-        ;; (e.g. int4 columns report 23, not the storage type int8/20).
-        ;; This MUST match what the extended-protocol Describe advertises
-        ;; for the same RETURNING shape — otherwise a binary-format client
-        ;; (asyncpg) decodes the row against the wrong width. Fall back to
-        ;; the storage valueType, then text, for anything column-info
-        ;; doesn't surface (expressions, inherited renames).
-        by-name (into {} (map (juxt :name :oid)) (pgs/column-info schema table-name db))
-        oids (int-array (map (fn [cn attr]
-                               (int (or (get by-name cn)
-                                        (when-let [vtype (get-in schema [attr :db/valueType])]
-                                          (pgs/oid-for-valuetype vtype))
-                                        PgWireServer/OID_TEXT)))
-                             col-names attrs))]
+        oids (int-array (map #(int (or (:oid %) PgWireServer/OID_TEXT)) items))
+        tag (case command
+              :update (str "UPDATE " (count eids))
+              :delete (str "DELETE " (count eids))
+              (str "INSERT 0 " (count eids)))]
     (PgWireServer$QueryResult.
-     col-name-array oids row-arrays
-     (str "INSERT 0 " (count eids)))))
+     col-name-array oids row-arrays tag)))
 
 ;; ----------------------------------------------------------------------------
 ;; Per-schema memoisation for constraint metadata.
@@ -2033,9 +2051,9 @@
                                :detail (str "Key ("
                                             (str/join ", " child-cols)
                                             ")=("
-                                            (str/join ", " (map pr-str child-vals))
+                                            (str/join ", " (map str child-vals))
                                             ") is not present in table \""
-                                            parent-table "\"")})))))))))
+                                            parent-table "\".")})))))))))
 
 (defn- find-fk-children
   "Find child eids that reference any of the parent eids via the given FK.
@@ -2098,13 +2116,15 @@
             (throw (ex-info "foreign key still referenced"
                             {:error :foreign-key-violation
                              :table (:child-table fk)
+                             :parent-table t
+                             :operation :delete
                              :constraint name
                              :detail (str "Key ("
                                           (str/join ", " parent-cols)
                                           ")=("
-                                          (str/join ", " (map pr-str parent-vals))
+                                          (str/join ", " (map str parent-vals))
                                           ") is still referenced from table \""
-                                          (:child-table fk) "\"")})))
+                                          (:child-table fk) "\".")})))
           ;; CASCADE: collect new child eids, recurse on those.
           (let [cascades (get by-action :cascade)
                 new-by-table
@@ -2191,13 +2211,15 @@
           (throw (ex-info "foreign key still referenced"
                           {:error :foreign-key-violation
                            :table child-table
+                           :parent-table table-name
+                           :operation :update-parent
                            :constraint name
                            :detail (str "Key ("
                                         (str/join ", " parent-cols)
                                         ")=("
-                                        (str/join ", " (map pr-str parent-vals))
+                                        (str/join ", " (map str parent-vals))
                                         ") is still referenced from table \""
-                                        child-table "\"")})))))))
+                                        child-table "\".")})))))))
 
 (defn- read-column-constraints*
   [db table-name]
@@ -2274,8 +2296,12 @@
   (let [cols (read-column-constraints db table-name)
         has-checks? (seq (read-check-constraints db table-name))
         has-fks? (seq (read-fk-constraints db table-name))
-        has-domain-enum? (seq (read-domain-enum-checks db table-name))]
-    (if (and (empty? cols) (not has-checks?) (not has-fks?) (not has-domain-enum?))
+        has-domain-enum? (seq (read-domain-enum-checks db table-name))
+        explicit-nulls? (some (fn [entry]
+                                (and (map? entry) (some nil? (vals entry))))
+                              tx-data)]
+    (if (and (empty? cols) (not has-checks?) (not has-fks?)
+             (not has-domain-enum?) (not explicit-nulls?))
       tx-data
       [[:db.fn/call
         ;; fresh-insert-fn: conflict attribution treats this as writing no
@@ -2308,6 +2334,28 @@
                                    nxt (when eid (+ (or curr 0) incr))]
                                (when eid
                                  [nxt [:db/add eid :__seq__/value nxt]])))
+                 ;; Identity generation and constraint/default application
+                 ;; are both transaction functions.  When a SERIAL column
+                 ;; is omitted, auto-populate-identity wraps the row maps
+                 ;; first; treating that wrapper as an opaque non-map meant
+                 ;; DEFAULT values on OTHER columns were never applied.
+                 ;; Expand only our tagged fresh-insert wrapper inside this
+                 ;; outer tx-fn, preserving arbitrary user/Datahike tx-fns.
+                 input-tx-data
+                 (vec (mapcat (fn [entry]
+                                (if (and (vector? entry)
+                                         (= :db.fn/call (first entry))
+                                         ;; The identity/default wrapper takes
+                                         ;; only txdb.  The uniqueness guard is
+                                         ;; tagged fresh too, but carries its row
+                                         ;; payload as a third item and must be
+                                         ;; left for Datahike to invoke with both
+                                         ;; arguments.
+                                         (= 2 (count entry))
+                                         (-> entry second meta :datahike.pg/fresh-insert))
+                                  ((second entry) txdb)
+                                  [entry]))
+                              tx-data))
                  result
                  (reduce
                   (fn [acc entry]
@@ -2332,7 +2380,17 @@
 
                                    default
                                    (let [[kind value arg] default
-                                         v (eval-default kind value arg)]
+                                         raw-v (eval-default kind value arg)
+                                         ;; DEFAULT expressions undergo the
+                                         ;; target column's assignment cast in
+                                         ;; PostgreSQL. This happens here,
+                                         ;; after volatile defaults such as
+                                         ;; now() are materialized inside the
+                                         ;; transaction function; parse-time
+                                         ;; coercion only saw an opaque marker.
+                                         v (when (some? raw-v)
+                                             (#'sql/coerce-insert-value
+                                              raw-v ns-attr (dbi/-schema txdb) txdb))]
                                      (cond
                                        (and (vector? v) (= ::nextval (first v)))
                                        (let [[nxt seq-tx] (bump-seq! (second v))]
@@ -2369,7 +2427,7 @@
                              cols)]
                         (into (conj acc filled) seq-ops))))
                   []
-                  tx-data)
+                  input-tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
@@ -2382,7 +2440,14 @@
                (enforce-domain-enum-checks! txdb table-name ns filled-entities))
              (when has-fks?
                (enforce-fk-on-insert! txdb table-name ns filled-entities))
-             result)))]])))
+             ;; Datahike represents SQL NULL as an absent datom.  Nil map
+             ;; entries existed only long enough to distinguish explicit
+             ;; NULL from an omitted/defaulted column above.
+             (mapv (fn [entry]
+                     (if (map? entry)
+                       (into {} (remove (comp nil? val)) entry)
+                       entry))
+                   result))))]])))
 
 (defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
@@ -2421,7 +2486,7 @@
               data-eids (if (seq ordered-eids)
                           (filterv has-row? ordered-eids)
                           (filterv has-row? (vals tempids)))]
-          (build-returning-result returning db data-eids table-name schema))
+          (build-returning-result returning db data-eids table-name (:alias parsed) schema :insert))
         (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
@@ -2556,7 +2621,7 @@
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
-                             (build-returning-result returning db eids table schema))
+                             (build-returning-result returning db eids table (:alias parsed) schema :delete))
           ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
           ;; to retract atomically alongside the parent deletion.
           cascade-eids (collect-fk-cascade-retractions! db table eids)
@@ -2671,6 +2736,7 @@
         ;; consults for UPDATE…FROM(VALUES) bindings; we extend the
         ;; same map with the outer row keyed by alias-or-table.
         outer-key (or alias table)
+        column-constraints (read-column-constraints db table)
         tx-data (vec (keep identity
                            (mapcat
                             (fn [eid]
@@ -2691,16 +2757,32 @@
                                             ;; `SET bal = bal + $1` used to throw
                                             ;; ClassCastException on the ParamRef
                                             ;; (pgbench -M prepared).
-                                            raw-val (binding [params/*from-bindings* eff-from-bindings
-                                                              params/*from-source-aliases*
-                                                              (when from-bindings
-                                                                (set (keys from-bindings)))
-                                                              params/*bound-params*
-                                                              (or params/*bound-params*
-                                                                  (when-let [cb *cached-bound*]
-                                                                    (vec (rest cb))))
-                                                              stmt/*eval-update-db* db]
-                                                      (sql/eval-update-expr value-expr entity-map ns schema))
+                                            default? (and (instance? Column value-expr)
+                                                          (nil? (.getTable ^Column value-expr))
+                                                          (= "default"
+                                                             (str/lower-case
+                                                              (.getColumnName ^Column value-expr))))
+                                            raw-val (if default?
+                                                      (when-let [[kind value arg]
+                                                                 (:default (get column-constraints column))]
+                                                        (let [v (eval-default kind value arg)]
+                                                          (when (and (vector? v)
+                                                                     (= ::nextval (first v)))
+                                                            (throw (ex-info
+                                                                    "UPDATE SET DEFAULT for sequence-backed columns is not supported"
+                                                                    {:error :feature-not-supported
+                                                                     :sqlstate "0A000"})))
+                                                          v))
+                                                      (binding [params/*from-bindings* eff-from-bindings
+                                                                params/*from-source-aliases*
+                                                                (when from-bindings
+                                                                  (set (keys from-bindings)))
+                                                                params/*bound-params*
+                                                                (or params/*bound-params*
+                                                                    (when-let [cb *cached-bound*]
+                                                                      (vec (rest cb))))
+                                                                stmt/*eval-update-db* db]
+                                                        (sql/eval-update-expr value-expr entity-map ns schema)))
                                             resolved (resolve-param raw-val)
                                             ;; `db` so coerce-insert-value can
                                             ;; resolve :pg/type when the schema
@@ -2916,7 +2998,8 @@
       (if returning
         ;; RETURNING: read values from db-after
         (let [db-after (if tx-report (:db-after tx-report) db)]
-          (build-returning-result returning db-after eids table (:schema db-after)))
+          (build-returning-result returning db-after eids table (:alias parsed)
+                                  (:schema db-after) :update))
         (empty-result (str "UPDATE " (count eids)))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
@@ -4013,6 +4096,12 @@
                            :speculative-db (:db-after rep)
                            :begin-max-tx cur)))))))))))
 
+(defn- unsafe-enum-marker-op?
+  [op]
+  (and (vector? op)
+       (= :db/add (first op))
+       (= :datahike.pg.enum/unsafe-values (nth op 2 nil))))
+
 (defn- transact-tx-buffer!
   "Commit the accumulated transaction buffer to `conn`, with the same
    concurrent-write (40001 serialization_failure) detection as an
@@ -4026,7 +4115,10 @@
   ;; lose an update. Commits are already serialized by datahike's
   ;; single writer, so the monitor adds no real concurrency cost.
   (locking commit-check-lock
-    (let [buf (:tx-buffer @tx-state)
+    (let [;; Unsafe enum-label facts exist only in the speculative DB.  Once
+          ;; the surrounding transaction commits, every added label becomes
+          ;; safe, so never persist those marker operations.
+          buf (vec (remove unsafe-enum-marker-op? (:tx-buffer @tx-state)))
           begin-max-tx (:begin-max-tx @tx-state)
           real-db (d/db conn)
           current-max-tx (when begin-max-tx (:max-tx real-db))
@@ -4078,19 +4170,27 @@
    and commits separately."
   #{:insert :update :update-with-recursive :delete :truncate
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
-    :ddl-create-enum :ddl-create-domain
+    :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
+    :ddl-create-domain :ddl-drop-domain
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
   [{:keys [conn session-id tx-state]} _parsed]
   (if (:in-tx? @tx-state)
-    (try
-      (transact-tx-buffer! conn tx-state)
-      (end-tx! session-id tx-state)
-      (tag-tx-status (empty-result "COMMIT") tx-state)
-      (catch Exception e
+    (if (:aborted? @tx-state)
+      ;; PostgreSQL accepts COMMIT in a failed transaction, discards all
+      ;; buffered work, and reports ROLLBACK.  Rejecting COMMIT with 25P02
+      ;; leaves clients permanently stuck until they happen to issue an
+      ;; explicit ROLLBACK.
+      (do (end-tx! session-id tx-state)
+          (tag-tx-status (empty-result "ROLLBACK") tx-state))
+      (try
+        (transact-tx-buffer! conn tx-state)
         (end-tx! session-id tx-state)
-        (classified-error "COMMIT failed: " e)))
+        (tag-tx-status (empty-result "COMMIT") tx-state)
+        (catch Exception e
+          (end-tx! session-id tx-state)
+          (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
@@ -5643,7 +5743,8 @@
                   data-eids (if (seq ordered-eids)
                               (filterv has-row? ordered-eids)
                               (filterv has-row? (vals tempids-map)))]
-              (build-returning-result returning db-after data-eids table-name (:schema db-after)))
+              (build-returning-result returning db-after data-eids table-name (:alias parsed)
+                                      (:schema db-after) :insert))
             (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
@@ -5735,7 +5836,11 @@
                             (-> ts
                                 (update :tx-buffer into commit-tx-data)
                                 (assoc :speculative-db (:db-after spec-report)))))
-          (empty-result (str "UPDATE " (count eids))))
+          (if-let [returning (:returning parsed)]
+            (let [db-after (:db-after spec-report)]
+              (build-returning-result returning db-after eids (:table parsed)
+                                      (:alias parsed) (:schema db-after) :update))
+            (empty-result (str "UPDATE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
@@ -5766,6 +5871,10 @@
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
               _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
+              returning-result (when-let [returning (:returning parsed)]
+                                 (build-returning-result returning spec-db eids
+                                                         (:table parsed) (:alias parsed)
+                                                         (:schema spec-db) :delete))
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
               spec-report (dc/with spec-db spec-tx-data)
@@ -5775,7 +5884,7 @@
                             (-> ts
                                 (update :tx-buffer into commit-tx-data)
                                 (assoc :speculative-db (:db-after spec-report)))))
-          (empty-result (str "DELETE " (count eids))))
+          (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "DELETE error: " e)))
@@ -6008,7 +6117,7 @@
    - `:datahike.pg.enum/values` — vector of strings (declaration order)
    - `:datahike.pg.enum/value-set` — same values as a `:db.type/string`
      :cardinality/many for fast membership tests"
-  [type-name values]
+  [type-name oid values]
   [;; idempotent schema attrs (ok to re-transact across CREATEs).
    {:db/ident :datahike.pg.enum/name
     :db/valueType :db.type/string
@@ -6020,17 +6129,42 @@
    {:db/ident :datahike.pg.enum/values-ordered
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.enum/oid
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.enum/unsafe-values
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many}
    ;; the entity itself. We store values both as a many-cardinality
    ;; set (for fast contains?) AND as a single ordered string
    ;; (newline-separated) so dump can recover declaration order.
    {:datahike.pg.enum/name type-name
+    :datahike.pg.enum/oid oid
     :datahike.pg.enum/values (set values)
     :datahike.pg.enum/values-ordered (clojure.string/join "\n" values)}])
 
 (defn- exec-ddl-create-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
-        tx-data (enum-tx-data (:type-name parsed) (:values parsed))]
+        values (:values parsed)
+        duplicate (some (fn [[label n]] (when (> n 1) label))
+                        (frequencies values))
+        _ (when duplicate
+            (throw (ex-info (str "enum label " (pr-str duplicate)
+                                 " used more than once")
+                            {:error :duplicate-object :sqlstate "42710"})))
+        _ (doseq [label values]
+            (when (> (alength (.getBytes ^String label
+                                         java.nio.charset.StandardCharsets/UTF_8))
+                     63)
+              (throw (ex-info (str "invalid enum label " (pr-str label))
+                              {:error :name-too-long :sqlstate "42622"
+                               :detail "Labels must be 63 bytes or less."}))))
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))
+        oid (pgs/next-user-oid current-db)
+        tx-data (enum-tx-data (:type-name parsed) oid (:values parsed))]
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
       (try
@@ -6038,6 +6172,168 @@
         (empty-result "CREATE TYPE")
         (catch Exception e
           (classified-error "CREATE TYPE error: " e))))))
+
+(defn- validate-enum-label! [label]
+  (when (> (alength (.getBytes ^String label
+                               java.nio.charset.StandardCharsets/UTF_8))
+           63)
+    (throw (ex-info (str "invalid enum label " (pr-str label))
+                    {:error :name-too-long :sqlstate "42622"
+                     :detail "Labels must be 63 bytes or less."}))))
+
+(defn- exec-ddl-alter-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        type-name (:type-name parsed)
+        spec (some #(when (= type-name (:name %)) %) (pgs/enum-types db))]
+    (try
+      (when-not spec
+        (throw (ex-info (str "type " (pr-str type-name) " does not exist")
+                        {:error :undefined-object :sqlstate "42704"})))
+      (let [eid (ffirst (d/q '{:find [?e]
+                               :in [$ ?name]
+                               :where [[?e :datahike.pg.enum/name ?name]]}
+                             db type-name))
+            values (:values spec)
+            {:keys [op label if-not-exists? placement neighbor old-label new-label]} parsed
+            [new-values tx-data]
+            (case op
+              :add-value
+              (do
+                (validate-enum-label! label)
+                (if (some #{label} values)
+                  (if if-not-exists?
+                    [values []]
+                    (throw (ex-info (str "enum label " (pr-str label) " already exists")
+                                    {:error :duplicate-object :sqlstate "42710"})))
+                  (let [neighbor-idx (when neighbor (.indexOf ^java.util.List values neighbor))
+                        _ (when (and neighbor (neg? neighbor-idx))
+                            (throw (ex-info (str (pr-str neighbor)
+                                                 " is not an existing enum label")
+                                            {:error :invalid-parameter-value
+                                             :sqlstate "22023"})))
+                        idx (case placement
+                              :before neighbor-idx
+                              :after (inc neighbor-idx)
+                              (count values))
+                        updated (vec (concat (subvec values 0 idx) [label]
+                                             (subvec values idx)))]
+                    [updated [[:db/add eid :datahike.pg.enum/values label]]])))
+
+              :rename-value
+              (do
+                (validate-enum-label! new-label)
+                (when-not (some #{old-label} values)
+                  (throw (ex-info (str (pr-str old-label)
+                                       " is not an existing enum label")
+                                  {:error :invalid-parameter-value :sqlstate "22023"})))
+                (when (and (not= old-label new-label) (some #{new-label} values))
+                  (throw (ex-info (str "enum label " (pr-str new-label) " already exists")
+                                  {:error :duplicate-object :sqlstate "42710"})))
+                [(mapv #(if (= old-label %) new-label %) values)
+                 (if (= old-label new-label)
+                   []
+                   [[:db/retract eid :datahike.pg.enum/values old-label]
+                    [:db/add eid :datahike.pg.enum/values new-label]])]))
+            tx-data (cond-> (vec tx-data)
+                      (not= values new-values)
+                      (conj [:db/add eid :datahike.pg.enum/values-ordered
+                             (clojure.string/join "\n" new-values)]))
+            ;; PostgreSQL permits a newly-added label to be used in this
+            ;; transaction only when the enum type itself was also created
+            ;; here.  Mark additions to a pre-existing enum in the
+            ;; speculative DB; transact-tx-buffer! strips the marker before
+            ;; commit, while savepoint snapshots naturally retain/rollback it.
+            unsafe-add? (and (= :add-value op)
+                             (not= values new-values)
+                             (:in-tx? @tx-state)
+                             (some? (:datahike.pg.enum/name
+                                     (d/entity (d/db conn) eid))))
+            tx-data (if unsafe-add?
+                      (vec
+                       (concat
+                        [{:db/ident :datahike.pg.enum/unsafe-values
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/many}]
+                        tx-data
+                        [[:db/add eid :datahike.pg.enum/unsafe-values label]]))
+                      tx-data)]
+        (cond
+          (empty? tx-data) (empty-result "ALTER TYPE")
+          (:in-tx? @tx-state) (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")
+          :else (do (transact-recorded! conn tx-data) (empty-result "ALTER TYPE"))))
+      (catch Exception e
+        (classified-error "ALTER TYPE error: " e)))))
+
+(defn- enum-registry-eid [db type-name]
+  (ffirst (d/q '{:find [?e]
+                 :in [$ ?name]
+                 :where [[?e :datahike.pg.enum/name ?name]]}
+               db type-name)))
+
+(defn- exec-ddl-rename-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        {:keys [type-name new-name]} parsed]
+    (try
+      (let [eid (enum-registry-eid db type-name)]
+        (when-not eid
+          (throw (ex-info (str "type " (pr-str type-name) " does not exist")
+                          {:error :undefined-object :sqlstate "42704"})))
+        (when (pgs/sql-type-exists? db new-name)
+          (throw (ex-info (str "type " (pr-str new-name) " already exists")
+                          {:error :duplicate-object :sqlstate "42710"})))
+        (let [column-eids (map first
+                               (d/q '{:find [?col]
+                                      :in [$ ?name]
+                                      :where [[?col :datahike.pg/enum-of ?name]]}
+                                    db type-name))
+              tx-data (into [[:db/retract eid :datahike.pg.enum/name type-name]
+                             [:db/add eid :datahike.pg.enum/name new-name]]
+                            (mapcat (fn [col]
+                                      [[:db/retract col :datahike.pg/enum-of type-name]
+                                       [:db/add col :datahike.pg/enum-of new-name]])
+                                    column-eids))]
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state tx-data "ALTER TYPE")
+            (do (transact-recorded! conn tx-data) (empty-result "ALTER TYPE")))))
+      (catch Exception e
+        (classified-error "ALTER TYPE error: " e)))))
+
+(defn- exec-ddl-drop-enum
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        {:keys [type-name if-exists? cascade?]} parsed]
+    (try
+      (let [eid (enum-registry-eid db type-name)
+            dependents (when eid
+                         (map first
+                              (d/q '{:find [?col]
+                                     :in [$ ?name]
+                                     :where [[?col :datahike.pg/enum-of ?name]]}
+                                   db type-name)))]
+        (cond
+          (and (nil? eid) if-exists?) (empty-result "DROP TYPE")
+          (nil? eid)
+          (throw (ex-info (str "type " (pr-str type-name) " does not exist")
+                          {:error :undefined-object :sqlstate "42704"}))
+          (and (seq dependents) cascade?)
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "DROP TYPE CASCADE with dependent columns"}))
+          (seq dependents)
+          (throw (ex-info (str "cannot drop type " type-name
+                               " because other objects depend on it")
+                          {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+          :else
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP TYPE")
+            (do (transact-recorded! conn [[:db/retractEntity eid]])
+                (empty-result "DROP TYPE")))))
+      (catch Exception e
+        (classified-error "DROP TYPE error: " e)))))
 
 (defn- composite-tx-data
   "Build the registry tx-data for a `CREATE TYPE … AS (..)` composite,
@@ -6075,7 +6371,10 @@
 (defn- exec-ddl-create-composite
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
-        oid (pgs/next-composite-oid (d/db conn))
+        current-db (if (:in-tx? @tx-state)
+                     (:speculative-db @tx-state)
+                     (d/db conn))
+        oid (pgs/next-composite-oid current-db)
         tx-data (composite-tx-data (:type-name parsed) oid (:fields parsed))]
     (if (:in-tx? @tx-state)
       (execute-ddl-in-tx tx-state tx-data "CREATE TYPE")
@@ -6127,6 +6426,43 @@
         (empty-result "CREATE DOMAIN")
         (catch Exception e
           (classified-error "CREATE DOMAIN error: " e))))))
+
+(defn- exec-ddl-drop-domain
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+        {:keys [domain-name if-exists? cascade?]} parsed]
+    (try
+      (let [eid (ffirst
+                 (d/q '{:find [?e]
+                        :in [$ ?name]
+                        :where [[?e :datahike.pg.domain/name ?name]]}
+                      db domain-name))
+            dependents (when eid
+                         (map first
+                              (d/q '{:find [?col]
+                                     :in [$ ?name]
+                                     :where [[?col :datahike.pg/domain-of ?name]]}
+                                   db domain-name)))]
+        (cond
+          (and (nil? eid) if-exists?) (empty-result "DROP DOMAIN")
+          (nil? eid)
+          (throw (ex-info (str "type " (pr-str domain-name) " does not exist")
+                          {:error :undefined-object :sqlstate "42704"}))
+          (and (seq dependents) cascade?)
+          (throw (errors/pg-error :feature-not-supported
+                                  {:feature "DROP DOMAIN CASCADE with dependent columns"}))
+          (seq dependents)
+          (throw (ex-info (str "cannot drop type " domain-name
+                               " because other objects depend on it")
+                          {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+          :else
+          (if (:in-tx? @tx-state)
+            (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP DOMAIN")
+            (do (transact-recorded! conn [[:db/retractEntity eid]])
+                (empty-result "DROP DOMAIN")))))
+      (catch Exception e
+        (classified-error "DROP DOMAIN error: " e)))))
 
 (defn- exec-savepoint
   [ctx _parsed]
@@ -6271,7 +6607,8 @@
   [ctx parsed]
   (let [{:keys [conn temp-tables]} ctx]
     (try
-      (doseq [table (or (:tables parsed) [(:table parsed)])]
+      (doseq [raw-table (or (:tables parsed) [(:table parsed)])
+              :let [table (params/unquote-ident raw-table)]]
         (drop-table-tx! conn table)
         ;; A DROP TABLE on a tracked temp table means close() must not
         ;; try to drop it again.
@@ -6949,15 +7286,10 @@
                      (d/db conn))
                 schema (dbi/-schema db)
                 table-ns (or (:ns parsed) (:table parsed))
-                cols (pgs/column-info schema table-ns db)
-                by-name (into {} (map (juxt :name identity)) cols)
-                ret (:returning parsed)
-                names (vec (if (= ret ["*"])
-                             (remove #(= "db_id" %) (map :name cols))
-                             ret))
-                oids (int-array
-                      (for [c names]
-                        (int (or (:oid (get by-name c)) PgWireServer/OID_TEXT))))]
+                items (returning-items (:returning parsed) db table-ns
+                                       (:alias parsed) schema)
+                names (mapv :name items)
+                oids (int-array (map #(int (or (:oid %) PgWireServer/OID_TEXT)) items))]
             (PgWireServer$QueryResult.
              (into-array String names)
              oids
@@ -7198,13 +7530,12 @@
         ;; "current transaction is aborted, commands ignored until end of
         ;; transaction block" (in_failed_sql_transaction). Tag tx status
         ;; 'E' so the wire layer carries the right ReadyForQuery marker.
-        ;; Check aborted-tx state. Allowed while aborted: ROLLBACK,
-        ;; ROLLBACK TO, and RELEASE — these let a client escape the
-        ;; aborted state (either ending the tx or popping back to a
-        ;; valid savepoint). classify does the routing.
+        ;; Check aborted-tx state. Allowed while aborted: COMMIT (which
+        ;; rolls back), ROLLBACK, and ROLLBACK TO. RELEASE is *not* allowed:
+        ;; PostgreSQL returns 25P02 and preserves the savepoint so a later
+        ;; ROLLBACK TO can still recover.
             (if (and (:aborted? @tx-state)
-                     (not (contains? #{:rollback :rollback-to-savepoint
-                                       :release-savepoint}
+                     (not (contains? #{:commit :rollback :rollback-to-savepoint}
                                      (:kind (cls/classify sql)))))
               (tag-tx-status
                (error-result
@@ -7489,10 +7820,18 @@
                                                        (exec-ddl-alter-sequence ctx parsed))
                             :ddl-create-enum       (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-enum ctx parsed))
+                            :ddl-alter-enum        (do (invalidate-schema-cache!)
+                                                       (exec-ddl-alter-enum ctx parsed))
+                            :ddl-rename-enum       (do (invalidate-schema-cache!)
+                                                       (exec-ddl-rename-enum ctx parsed))
+                            :ddl-drop-enum         (do (invalidate-schema-cache!)
+                                                       (exec-ddl-drop-enum ctx parsed))
                             :ddl-create-composite  (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-composite ctx parsed))
                             :ddl-create-domain     (do (invalidate-schema-cache!)
                                                        (exec-ddl-create-domain ctx parsed))
+                            :ddl-drop-domain       (do (invalidate-schema-cache!)
+                                                       (exec-ddl-drop-domain ctx parsed))
                             :savepoint             (exec-savepoint ctx parsed)
                             :release-savepoint     (exec-release-savepoint ctx parsed)
                             :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)

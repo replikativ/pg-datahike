@@ -28,10 +28,12 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.cast :as sql-cast]
+            [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
-            CastExpression Function JdbcParameter Parenthesis NotExpression
+            AnalyticExpression CastExpression Function JdbcParameter Parenthesis NotExpression
             LongValue StringValue DoubleValue DateValue TimestampValue
             SignedExpression BinaryExpression]
            [net.sf.jsqlparser.expression.operators.relational
@@ -39,6 +41,7 @@
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression]
            [net.sf.jsqlparser.statement.insert Insert]
+           [net.sf.jsqlparser.statement.select Select]
            [net.sf.jsqlparser.statement.update Update UpdateSet]))
 
 (set! *warn-on-reflection* true)
@@ -156,6 +159,135 @@
    execute path."
   nil)
 
+(defn registered-enum-values
+  "Return the declared label set for a CREATE TYPE ... AS ENUM registry
+   entry, or nil when `type-name` is not a registered enum."
+  ([type-name] (registered-enum-values *parse-db* type-name))
+  ([db type-name]
+   (when (and db type-name)
+     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
+           values (d/q '{:find [?value]
+                         :in [$ ?name]
+                         :where [[?enum :datahike.pg.enum/name ?name]
+                                 [?enum :datahike.pg.enum/values ?value]]}
+                       db bare)]
+       (when (seq values)
+         (into #{} (map (comp str first)) values))))))
+
+(defn unsafe-enum-values
+  "Return labels added to an existing enum in the current speculative
+   transaction.  The pgwire transaction layer removes these marker facts at
+   commit, so a committed database normally returns the empty set."
+  [db type-name]
+  (if (and db type-name
+           ;; Databases created before transactional enum-label tracking do
+           ;; not have this schema attr until their first ALTER TYPE. Avoid
+           ;; querying an unknown attr; the ALTER transaction installs it
+           ;; immediately before adding its first marker.
+           (get (:schema db) :datahike.pg.enum/unsafe-values))
+    (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)]
+      (into #{}
+            (map (comp str first))
+            (d/q '{:find [?value]
+                   :in [$ ?name]
+                   :where [[?enum :datahike.pg.enum/name ?name]
+                           [?enum :datahike.pg.enum/unsafe-values ?value]]}
+                 db bare)))
+    #{}))
+
+(defn assert-enum-label-safe!
+  "Raise PostgreSQL's unsafe-new-enum-value error when `label` was added to
+   an already-committed enum in this transaction. Returns the string label."
+  [db type-name label]
+  (let [label (str label)]
+    (when (contains? (unsafe-enum-values db type-name) label)
+      (throw (ex-info (str "unsafe use of new value " (pr-str label)
+                           " of enum type " type-name)
+                      {:sqlstate "55P04"
+                       :hint "New enum values must be committed before they can be used."})))
+    label))
+
+(def ^:private regtype-aliases
+  {"boolean" "bool" "smallint" "int2" "integer" "int4" "int" "int4"
+   "bigint" "int8" "real" "float4" "double precision" "float8"
+   "decimal" "numeric" "character varying" "varchar" "character" "bpchar"})
+
+(defn registered-type-oid
+  "Resolve PostgreSQL's regtype input syntax for built-ins and the user type
+   registries. Returns nil for an unknown name; callers decide whether their
+   boundary should raise or retain the input."
+  ([type-name] (registered-type-oid *parse-db* type-name))
+  ([db type-name]
+   (when type-name
+     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
+           canonical (get regtype-aliases bare bare)]
+       (or (get types/pg-name->oid canonical)
+           (some (fn [{:keys [name oid]}] (when (= name bare) oid))
+                 (pgs/composite-types db))
+           (some (fn [{:keys [name oid]}] (when (= name bare) oid))
+                 (pgs/enum-types db)))))))
+
+(defn registered-domain-spec
+  "Return the persisted definition of a user domain, or nil. Optional fields
+   are normalized away from Datahike's null sentinel."
+  ([type-name] (registered-domain-spec *parse-db* type-name))
+  ([db type-name]
+   (when (and db type-name)
+     (let [bare (-> (str type-name) (str/split #"\.") last unquote-ident)
+           row (first
+                (d/q '{:find [?base ?check-name ?check-expr ?not-null]
+                       :in [$ ?name]
+                       :where [[?e :datahike.pg.domain/name ?name]
+                               [?e :datahike.pg.domain/base-type ?base]
+                               [(get-else $ ?e :datahike.pg.domain/check-name :__null__) ?check-name]
+                               [(get-else $ ?e :datahike.pg.domain/check-expr :__null__) ?check-expr]
+                               [(get-else $ ?e :datahike.pg.domain/not-null false) ?not-null]]}
+                     db bare))]
+       (when row
+         (let [[base check-name check-expr not-null] row
+               present #(when (not= :__null__ %) %)]
+           {:name bare :base-type base :check-name (present check-name)
+            :check-expr (present check-expr) :not-null? (boolean not-null)}))))))
+
+(defn cast-domain-value
+  "Coerce and validate one value against a persisted domain definition.
+   Reuses stmt/eval-check-predicate at runtime so casts and column writes do
+   not grow separate CHECK semantics."
+  [db spec value]
+  (cond
+    (or (nil? value) (= :__null__ value))
+    (if (:not-null? spec)
+      (throw (ex-info "domain not-null violation"
+                      {:error :not-null-violation :sqlstate "23502"
+                       :domain (:name spec)}))
+      :__null__)
+
+    :else
+    (let [base (:base-type spec)
+          enum-values (registered-enum-values db base)
+          coerced (if enum-values
+                    (let [label (str value)]
+                      (if (contains? enum-values label)
+                        (assert-enum-label-safe! db base label)
+                        (throw (ex-info "invalid input value for enum"
+                                        {:error :invalid-text-representation
+                                         :enum? true :type base :value label}))))
+                    (sql-cast/cast-scalar value base {:explicit? true}))]
+      (when-let [check-expr (:check-expr spec)]
+        (let [ast (try
+                    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression check-expr)
+                    (catch Exception _
+                      (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression check-expr)))
+              eval-check (requiring-resolve 'datahike.pg.sql.stmt/eval-check-predicate)
+              ok? (eval-check ast {(keyword "" "value") coerced} "" (:schema db))]
+          (when (false? ok?)
+            (throw (ex-info "domain check constraint violation"
+                            {:error :check-violation
+                             :constraint (or (:check-name spec)
+                                             (str (:name spec) "_check"))
+                             :domain (:name spec) :value coerced})))))
+      coerced)))
+
 (def ^:dynamic *parse-sql*
   "Bound by parse-sql to itself so top-level translate-* entries in
    datahike.pg.sql.stmt can seed `:parse-sql` into make-ctx without a
@@ -222,14 +354,11 @@
    The wire layer calls this at Execute time to resolve placeholders
    inside INSERT tx-data.
 
-   Maps with nil values after substitution have those keys dissoc'd.
-   An INSERT like `INSERT INTO t (a, b) VALUES (?, ?)` with
-   `setString(1, null)` ends up as `{:t/a nil :t/b \"x\"}` here —
-   `d/transact` rejects `[:db/add eid :t/a nil]` as `:transact/syntax`,
-   but the correct PG behaviour for a nullable column is to simply
-   not assert the attribute. The translate-time row-builder already
-   drops nil literals (NullValue), but those land as ParamRef sentinels
-   at parse time and only resolve to nil here.
+   Nil map values are preserved. At the INSERT boundary a present nil
+   means explicit SQL NULL, whereas a missing key means the column was
+   omitted and its DEFAULT must run. The constraint/default wrapper
+   validates that distinction and removes nil entries immediately before
+   returning Datahike tx-data.
 
    Identity preservation: deferred call-markers (`{:fn :nextval ...}`,
    `{:fn :now}`) pass through unchanged — same Clojure object in,
@@ -245,10 +374,7 @@
                 (param-ref? v)   (fetch (:idx v))
                 (call-marker? v) v
                 (map? v)         (reduce-kv (fn [m k x]
-                                              (let [v' (walk x)]
-                                                (if (nil? v')
-                                                  m
-                                                  (assoc m k v'))))
+                                              (assoc m k (walk x)))
                                             {} v)
                 (vector? v)      (mapv walk v)
                 (seq? v)         (map walk v)
@@ -271,7 +397,7 @@
   "Function markers translate-* may emit for SQL constructs that must
    be re-evaluated per execute (i.e. NOT cacheable as a parse-time
    value). Resolved by `resolve-nextvals!` against a per-fn resolver."
-  #{:nextval :now :eval})
+  #{:nextval :now :eval :random-uuid :uuid-v7})
 
 (defn call-marker?
   "True if v is a deferred function-call marker emitted by translate-*
@@ -322,6 +448,8 @@
                      (case (:fn v)
                        :nextval (nextval-fn (:seq-name v))
                        :now     (java.util.Date.)
+                       :random-uuid (java.util.UUID/randomUUID)
+                       :uuid-v7 (coerce/generate-uuid-v7)
                       ;; An arbitrary scalar expression in INSERT
                       ;; VALUES. Deferred rather than folded at parse
                       ;; time for the same reason `now()` is: the parse
@@ -462,6 +590,94 @@
                           #{} ms))
                        :else #{}))))]
     (into (sorted-set) (walk node))))
+
+(defn ast-columns
+  "Return every distinct top-level Column reachable from a JSqlParser AST.
+
+   This deliberately uses the same guarded reflective traversal as
+   `ast-param-indices`; statement-level name-resolution checks need to see
+   columns inside predicates and RETURNING expressions without maintaining a
+   second, inevitably incomplete list of AST node classes.  Nested SELECTs
+   form their own name-resolution scope and are deliberately opaque here."
+  [node]
+  (let [seen (java.util.IdentityHashMap.)
+        columns (transient [])]
+    (letfn [(walk [n]
+              (cond
+                (nil? n) nil
+                (.containsKey seen n) nil
+                (or (string? n) (number? n) (boolean? n) (keyword? n)) nil
+                :else
+                (do
+                  (.put seen n true)
+                  (cond
+                    (instance? Column n) (conj! columns n)
+                    (instance? Select n) nil
+                    (instance? java.lang.Iterable n) (doseq [v n] (walk v))
+                    (.isArray (class n)) (when-not (.isPrimitive (.getComponentType (class n)))
+                                           (doseq [v n] (walk v)))
+                    (.startsWith (.getName (class n)) "net.sf.jsqlparser.")
+                    (doseq [^java.lang.reflect.Method m (.getMethods (class n))
+                            :let [mn (.getName m)]
+                            :when (and (zero? (count (.getParameterTypes m)))
+                                       (or (.startsWith mn "get") (.startsWith mn "is"))
+                                       (not= "getClass" mn)
+                                       (not= "getDataType" mn))]
+                      (try (walk (.invoke m n (object-array 0)))
+                           (catch Throwable _)))))))]
+      (walk node)
+      (persistent! columns))))
+
+(defn ast-function-names
+  "Return the lower-case names of functions reachable in an expression AST.
+
+   Nested SELECTs are separate scopes and deliberately opaque. This is used
+   before lowering to decide whether volatile scalar calls belong above an
+   aggregate grouping step; relying on traversal order (`sum(x)+random()` vs
+   `random()+sum(x)`) would otherwise change semantics."
+  [node]
+  (let [seen (java.util.IdentityHashMap.)
+        names (transient #{})]
+    (letfn [(walk [n]
+              (cond
+                (nil? n) nil
+                (.containsKey seen n) nil
+                (or (string? n) (number? n) (boolean? n) (keyword? n)) nil
+                :else
+                (do
+                  (.put seen n true)
+                  (cond
+                    (instance? Function n)
+                    (do (conj! names (str/lower-case (.getName ^Function n)))
+                        (when-let [ps (.getParameters ^Function n)] (walk ps)))
+
+                    (instance? AnalyticExpression n)
+                    (do (conj! names (str/lower-case (.getName ^AnalyticExpression n)))
+                        (doseq [^java.lang.reflect.Method m (.getMethods (class n))
+                                :let [mn (.getName m)]
+                                :when (and (zero? (count (.getParameterTypes m)))
+                                           (.startsWith mn "get")
+                                           (not= "getClass" mn)
+                                           (not= "getDataType" mn)
+                                           (not= "getName" mn))]
+                          (try (walk (.invoke m n (object-array 0)))
+                               (catch Throwable _))))
+
+                    (instance? Select n) nil
+                    (instance? java.lang.Iterable n) (doseq [v n] (walk v))
+                    (.isArray (class n)) (when-not (.isPrimitive (.getComponentType (class n)))
+                                           (doseq [v n] (walk v)))
+                    (.startsWith (.getName (class n)) "net.sf.jsqlparser.")
+                    (doseq [^java.lang.reflect.Method m (.getMethods (class n))
+                            :let [mn (.getName m)]
+                            :when (and (zero? (count (.getParameterTypes m)))
+                                       (or (.startsWith mn "get") (.startsWith mn "is"))
+                                       (not= "getClass" mn)
+                                       (not= "getDataType" mn))]
+                      (try (walk (.invoke m n (object-array 0)))
+                           (catch Throwable _)))))))]
+      (walk node)
+      (persistent! names))))
 
 ;; ---------------------------------------------------------------------------
 ;; PG OID inference

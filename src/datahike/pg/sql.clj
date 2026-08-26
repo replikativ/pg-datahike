@@ -206,6 +206,8 @@
 (def sql-not-null?         fns/sql-not-null?)
 (def filter-min            fns/filter-min)
 (def filter-max            fns/filter-max)
+(def filter-enum-min       fns/filter-enum-min)
+(def filter-enum-max       fns/filter-enum-max)
 (def filter-count          fns/filter-count)
 (def filter-bool-and       fns/filter-bool-and)
 (def filter-count-distinct fns/filter-count-distinct)
@@ -274,6 +276,9 @@
 (def sql--   fns/sql--)
 (def sql-date+ fns/sql-date+)
 (def sql-date- fns/sql-date-)
+(def sql-timestamp- fns/sql-timestamp-)
+(def sql-time- fns/sql-time-)
+(def sql-unsupported-temporal-arithmetic fns/sql-unsupported-temporal-arithmetic)
 (def sql-*   fns/sql-*)
 (def sql-div fns/sql-div)
 (def sql-money+ fns/sql-money+)
@@ -800,17 +805,49 @@
                             (instance? SetOperationList body) body
                             (instance? ParenthesedSelect body)
                             (.getSelect ^ParenthesedSelect body)
-                            :else nil)]
+                            :else nil)
+               recursive-step
+               (when (instance? SetOperationList inner)
+                 (let [branches (.getSelects ^SetOperationList inner)]
+                   (when (and (= 2 (count branches))
+                              (instance? PlainSelect (second branches)))
+                     (second branches))))
+               demand-limited-recursion?
+               (and recursive?
+                    (instance? PlainSelect stmt)
+                    (some? (.getLimit ^PlainSelect stmt))
+                    recursive-step
+                    (nil? (.getWhere ^PlainSelect recursive-step)))]
            (cond
              ;; Recursive WITH on UPDATE — leave to translate-update.
              (and recursive? (instance? Update stmt))
              [curr-db curr-schema deferred ns-map]
 
              recursive?
-             (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
-                               (catch Throwable _ nil))
-                   iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
-                               (catch Throwable _ nil))
+             (do
+               ;; Capability fallbacks below deliberately catch translation
+               ;; failures while probing two evaluators. Structural SQL
+               ;; errors must be validated outside those catches, or an
+               ;; invalid INTERSECT/EXCEPT recursion degrades into an unknown
+               ;; CTE relation and may execute without a fixed point.
+               (stmt/validate-recursive-cte-shape! wi)
+               ;; PostgreSQL evaluates a recursive CTE on demand: an outer
+               ;; LIMIT can stop an otherwise infinite recursive term. Our
+               ;; CTE layer materializes the complete fixed point before the
+               ;; outer SELECT runs, so this shape otherwise grows without
+               ;; bound (the upstream `with.sql` corpus exhausted multiple
+               ;; gigabytes on `SELECT n+1 FROM t LIMIT 10`). Reject the
+               ;; structurally unbounded case before entering Datahike's
+               ;; recursive-rule executor. A recursive term with a WHERE
+               ;; predicate keeps the existing finite fixed-point path.
+               (when demand-limited-recursion?
+                 (throw (errors/pg-error
+                         :feature-not-supported
+                         {:feature "demand-driven recursive CTE evaluation with LIMIT"})))
+               (let [rule! #(try (stmt/materialize-recursive-cte! wi cte-name curr-db curr-schema)
+                                 (catch Throwable _ nil))
+                     iter! #(try (stmt/materialize-recursive-iterative! wi cte-name curr-db curr-schema)
+                                 (catch Throwable _ nil))
                    ;; Parameterised CTEs: prefer the iterative evaluator (it
                    ;; defers a table-full param anchor to Execute and handles
                    ;; complex bodies — asyncpg's typeinfo_tree); it bails (nil)
@@ -818,20 +855,20 @@
                    ;; ground-rule-params owns that. Non-parameterised: keep the
                    ;; proven single-rule path first, iteration as the fallback
                    ;; for bodies the rule can't represent (LEFT JOIN, etc.).
-                   paramy? (boolean (seq (try (params/ast-param-indices wi)
-                                              (catch Throwable _ nil))))
-                   m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
-               (if m
+                     paramy? (boolean (seq (try (params/ast-param-indices wi)
+                                                (catch Throwable _ nil))))
+                     m (if paramy? (or (iter!) (rule!)) (or (rule!) (iter!)))]
+                 (if m
                  ;; A parameterised recursive CTE enriches only the schema
                  ;; now and carries a `:deferred` spec for Execute-time data.
                  ;; Recursive CTEs keep their own name as the namespace
                  ;; for now — the rule/iterative evaluators thread
                  ;; :target-name end-to-end into Execute, so relocating
                  ;; them is a larger change. Tracked separately.
-                 [(:db m) (:schema m)
-                  (cond-> deferred (:deferred m) (conj (:deferred m)))
-                  ns-map]
-                 [curr-db curr-schema deferred ns-map]))
+                   [(:db m) (:schema m)
+                    (cond-> deferred (:deferred m) (conj (:deferred m)))
+                    ns-map]
+                   [curr-db curr-schema deferred ns-map])))
 
              (some? inner)
              ;; With the CTEs materialised SO FAR in scope. A WITH list is
@@ -1008,6 +1045,38 @@
                    :message (.getMessage e)
                    :sqlstate "42601"}))
 
+              :alter-type-enum
+              (try
+                (merge base {:type :ddl-alter-enum}
+                       (user-types/parse-alter-type-enum sql))
+                (catch clojure.lang.ExceptionInfo e
+                  {:type :error
+                   :message (.getMessage e)
+                   :sqlstate (or (:sqlstate (ex-data e)) "42601")})
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
+              :rename-type-enum
+              (try
+                (merge base {:type :ddl-rename-enum}
+                       (user-types/parse-rename-type sql))
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
+              :drop-type-enum
+              (try
+                (merge base {:type :ddl-drop-enum}
+                       (user-types/parse-drop-type sql))
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
+              :drop-domain
+              (try
+                (merge base {:type :ddl-drop-domain}
+                       (user-types/parse-drop-domain sql))
+                (catch Throwable e
+                  {:type :error :message (.getMessage e) :sqlstate "42601"}))
+
               ;; TRUNCATE — fully token-classified (base carries
               ;; :tables / :restart-identity? / :cascade? from
               ;; cls-info). CASCADE would have to chase FK references
@@ -1081,7 +1150,16 @@
         ;; Fall through to JSqlParser.
 
       ;; Parse with JSqlParser (AST-cached; see ast-parse).
-          (let [stmt (ast-parse (preprocess-sql (or (:parser-sql explain) sql)))
+          (let [^String parser-sql (preprocess-sql (or (:parser-sql explain) sql))
+                ;; Translation mutates some JSqlParser relation nodes while
+                ;; materialising derived schemas. Validate this rare invalid
+                ;; shape on an independent pristine AST, so neither the
+                ;; validator nor later passes share cursor-like AST objects.
+                _ (when (re-find #"(?is)\b(?:right|full)\s+(?:outer\s+)?join\s+lateral\b"
+                                 parser-sql)
+                    (stmt/validate-lateral-join-shapes!
+                     (CCJSqlParserUtil/parse parser-sql)))
+                stmt (ast-parse parser-sql)
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a
@@ -1589,6 +1667,11 @@
                                                                  ;; .getArrayData. (str cdt) carries the full "int[]".
                                                                    type-str (str/lower-case (str (.getDataType cdt)))
                                                                    full-str (str/lower-case (str cdt))
+                                                                   enum-values (when-not
+                                                                                (or (contains? types/pg-name->oid full-str)
+                                                                                    (contains? types/pg-name->oid type-str))
+                                                                                 (params/registered-enum-values cte-db full-str))
+                                                                   domain-spec (params/registered-domain-spec cte-db full-str)
                                                                    _ (when-not (pgs/sql-type-exists? cte-db full-str)
                                                                        (throw (errors/pg-error
                                                                                :undefined-object
@@ -1662,6 +1745,20 @@
                                                                    (pg-arr/from-pg-text (str raw) (types/cast-array-elem-kw full-str)))
                                                                  (or (nil? raw) (= :__null__ raw))
                                                                  :__null__
+                                                                 (= type-str "regtype")
+                                                                 (or (params/registered-type-oid cte-db raw) raw)
+                                                                 domain-spec
+                                                                 (params/cast-domain-value cte-db domain-spec raw)
+                                                                 enum-values
+                                                                 (let [label (str raw)]
+                                                                   (if (contains? enum-values label)
+                                                                     (params/assert-enum-label-safe!
+                                                                      cte-db full-str label)
+                                                                     (throw
+                                                                      (ex-info "invalid input value for enum"
+                                                                               {:error :invalid-text-representation
+                                                                                :enum? true :type full-str
+                                                                                :value label}))))
                                                                  :else
                                                                  (sql-cast/cast-scalar
                                                                   raw type-str

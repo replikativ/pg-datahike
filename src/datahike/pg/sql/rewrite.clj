@@ -180,22 +180,13 @@
 
 (defn inline-references-rule
   "Inline `col TYPE … REFERENCES name [(cols)] [ON (DELETE|UPDATE) action]`.
-   JSqlParser doesn't accept the inline form, so we rewrite it. Two paths:
+   JSqlParser doesn't accept the inline form, so lift it to the equivalent
+   table-level `FOREIGN KEY` before parsing.  This keeps every supported
+   action on the normal FK metadata/enforcement path, including the default
+   NO ACTION form; stripping that form used to silently disable both orphan
+   INSERT checks and parent-side DELETE checks.
 
-   1. **No action / RESTRICT / no action clause** — just strip the
-      `REFERENCES …` span. Our existing FK plumbing only enforces
-      table-level `FOREIGN KEY (col) REFERENCES …`, and NO ACTION /
-      RESTRICT have no operational consequence beyond blocking the
-      parent delete (which we then can't enforce, but Odoo's
-      _auto_init flow doesn't depend on it).
-
-   2. **CASCADE on DELETE** — lift to a table-level `FOREIGN KEY` so
-      our FK plumbing tracks it and enforces cascade at runtime.
-      We strip the inline span AND inject a synthetic
-      `, FOREIGN KEY (col) REFERENCES name(cols) ON DELETE CASCADE`
-      just before the closing `)` of the CREATE TABLE column list.
-
-   3. **SET NULL / SET DEFAULT / ON UPDATE non-trivial** — raise
+   **SET NULL / SET DEFAULT / ON UPDATE non-trivial** raise
       0A000; not yet implemented at the runtime side.
 
    Distinguishes inline from table-level by checking the previous
@@ -236,32 +227,38 @@
                                                    (str/upper-case (or verb "DELETE")) " "
                                                    (str/upper-case act))}))
 
-                    ;; ON DELETE CASCADE — lift to table-level FK so our
-                    ;; runtime cascade machinery (server.clj
-                    ;; collect-fk-cascade-retractions!) sees it.
-                    (and (= "delete" verb) (= "cascade" act))
+                    ;; Every supported inline form is lifted to a
+                    ;; table-level FK so runtime metadata and enforcement
+                    ;; cannot diverge by syntax spelling.
+                    :else
                     (let [col-name (find-inline-col-name toks i)
                           ;; `REFERENCES name [(col)]` — reconstruct from
                           ;; the tokens between `references` (inc i) and
                           ;; the action clause start (after-cols-idx).
                           ;; after-name-idx points one past the table name
                           ;; (at `(` of the col list), so we need (inc i).
-                          ref-target (token-range-text toks (inc i) after-cols-idx)
+                          ref-target (str (token-range-text toks (inc i) after-cols-idx)
+                                          ;; JSqlParser requires an explicit
+                                          ;; referenced-column list although
+                                          ;; PostgreSQL does not.  Carry an
+                                          ;; internal sentinel through the AST;
+                                          ;; DDL lowering replaces it with the
+                                          ;; parent's primary-key columns.
+                                          (when (= after-name-idx after-cols-idx)
+                                            " (__pg_default_pk__)"))
                           close-paren-pos (find-enclosing-close-paren toks (inc i))
                           inject (when col-name
                                    (str ", FOREIGN KEY (" col-name ") "
                                         "REFERENCES " ref-target
-                                        " ON DELETE CASCADE "))
+                                        (when (and verb act)
+                                          (str " ON " (str/upper-case verb) " "
+                                               (str/upper-case act)))
+                                        " "))
                           acc' (conj acc [start end-pos " "])
                           acc'' (if (and inject close-paren-pos)
                                   (conj acc' [close-paren-pos close-paren-pos inject])
                                   acc')]
-                      (recur end-idx acc''))
-
-                    ;; NO ACTION / RESTRICT / no action — strip silently.
-                    :else
-                    (recur end-idx
-                           (conj acc [start end-pos " "]))))))))))))
+                      (recur end-idx acc''))))))))))))
 
 (defonce ^:private anon-index-counter (atom 0))
 

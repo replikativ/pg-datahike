@@ -18,7 +18,7 @@
    bind `*disable-planner* false` inside `materialize-recursive-cte!`
    itself (and `server.execute` also binds it at the handler entry),
    so the deftests don't have to set the env var."
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [java.sql Connection DriverManager SQLException]))
@@ -213,6 +213,66 @@
     (is (= [["1"] ["2"] ["3"] ["4"] ["5"]]
            (rows c "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5)
                     SELECT n FROM t ORDER BY n")))))
+
+(deftest demand-limited-unbounded-recursion-fails-before-materialization
+  (with-open [c (jdbc)]
+    (let [e (is (thrown? SQLException
+                         (rows c "WITH RECURSIVE t(n) AS (
+                                    SELECT 1 UNION SELECT n+1 FROM t
+                                  ) SELECT n FROM t LIMIT 10")))]
+      (is (= "0A000" (.getSQLState ^SQLException e)))
+      (is (re-find #"demand-driven recursive CTE"
+                   (.getMessage ^SQLException e))))))
+
+(deftest postgres-recursive-set-operation-shape-slice
+  ;; PostgreSQL with.sql lines 916-924. A recursive reference is legal only
+  ;; under UNION [ALL]; INTERSECT/EXCEPT must fail before fixed-point lowering.
+  (with-open [c (jdbc)]
+    (doseq [op ["INTERSECT" "INTERSECT ALL" "EXCEPT"]]
+      (let [e (is (thrown? SQLException
+                           (rows c (str "WITH RECURSIVE x(n) AS "
+                                        "(SELECT 1 " op " SELECT n+1 FROM x) "
+                                        "SELECT * FROM x"))))]
+        (is (= "42601" (.getSQLState ^SQLException e)))
+        (is (re-find #"does not have the form non-recursive-term UNION"
+                     (.getMessage ^SQLException e)))))))
+
+(deftest postgres-recursive-outer-join-slice
+  ;; PostgreSQL with.sql lines 977-992. The recursive relation may not occupy
+  ;; the nullable side of an outer join during fixed-point evaluation.
+  (with-open [c (jdbc)]
+    (doseq [recursive-from ["y LEFT JOIN x ON x.n = y.id"
+                            "x RIGHT JOIN node y ON x.n = y.id"
+                            "x FULL JOIN node y ON x.n = y.id"]]
+      (let [e (is (thrown? SQLException
+                           (rows c (str "WITH RECURSIVE x(n) AS ("
+                                        "SELECT 1 UNION ALL "
+                                        "SELECT x.n+1 FROM " recursive-from
+                                        " WHERE x.n < 10) SELECT * FROM x"))))]
+        (is (= "42P19" (.getSQLState ^SQLException e)))
+        (is (re-find #"recursive reference to query \"x\" must not appear within an outer join"
+                     (.getMessage ^SQLException e)))))))
+
+(deftest postgres-recursive-clause-restrictions-slice
+  ;; PostgreSQL with.sql lines 1000-1017. These clauses are rejected during
+  ;; recursive-query validation, before a potentially unbounded fixed point.
+  (with-open [c (jdbc)]
+    (doseq [[term state message]
+            [["SELECT count(*) FROM x" "42803" "aggregate functions"]
+             ["SELECT n+1 FROM x WHERE n < 3 ORDER BY 1" "0A000" "ORDER BY"]
+             ["SELECT n+1 FROM x WHERE n < 3 LIMIT 2 OFFSET 1" "0A000" "OFFSET"]
+             ["SELECT n+1 FROM x WHERE n < 3 FOR UPDATE" "0A000" "FOR UPDATE/SHARE"]]]
+      (testing term
+        (let [e (try
+                  (rows c (str "WITH RECURSIVE x(n) AS "
+                               "(SELECT 1 UNION ALL " term ") "
+                               "SELECT * FROM x"))
+                  nil
+                  (catch SQLException e e))]
+          (is (some? e))
+          (when e
+            (is (= state (.getSQLState ^SQLException e)))
+            (is (re-find (re-pattern message) (.getMessage ^SQLException e)))))))))
 
 (deftest with-recursive-update-from-cte
   ;; Lock-in for the UPDATE WITH RECURSIVE path with a 2-column CTE — the

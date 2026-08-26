@@ -2,7 +2,7 @@
 # INSERT ON CONFLICT (UPSERT) tests
 
 statement ok
-CREATE TABLE kv (k INTEGER, v DOUBLE, label TEXT)
+CREATE TABLE kv (k INTEGER PRIMARY KEY, v DOUBLE, label TEXT)
 
 statement ok
 INSERT INTO kv VALUES (1, 10.0, 'one'), (2, 20.0, 'two'), (3, 30.0, 'three')

@@ -189,22 +189,52 @@
     {:name "arrays" :mode :discovery
      :boundaries #{:array-codec :array-expressions :polymorphism}
      :blockers #{:postgres-vector-types :create-function}}
-    {:name "uuid" :mode :unmeasured :boundaries #{:scalar-type :array-codec}}
-    {:name "enum" :mode :unmeasured :boundaries #{:user-type :casts :ordering}}
-    {:name "domain" :mode :unmeasured
+    {:name "uuid" :mode :discovery
+     :boundaries #{:scalar-type :input-codec :operators :volatile-functions
+                   :type-inference :temporal-extraction}
+     :blockers #{:create-index-catalog-and-enforcement
+                 :nullable-left-join-lowering :uuid-v7-interval-offset
+                 :complex-series-window-lowering :planner-explain
+                 :psql-source-location-presentation}}
+    {:name "enum" :mode :discovery
+     :boundaries #{:user-type :casts :ordering :catalog-introspection}
+     :blockers #{:enum-sortorder-oid-fidelity :enum-arrays :create-function
+                 :transactional-type-cascade}
+     :strict-slices
+     [{:id :enum-input-and-diagnostics
+       :source-lines [15 23]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "registered-enum-remains-a-valid-cast-target"}
+      {:id :enum-definition-validation
+       :source-lines [26 27]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-definition-rejects-duplicate-and-oversized-labels"}
+      {:id :enum-label-length
+       :source-lines [62 64]
+       :gate "test/datahike/test/pg_enum_domain_test.clj"
+       :test-var "enum-definition-rejects-duplicate-and-oversized-labels"}]}
+    {:name "domain" :mode :discovery
      :boundaries #{:user-type :casts :constraints}
-     :blockers #{:domain-constraint-coverage}}
-    {:name "create_type" :mode :unmeasured :boundaries #{:type-ddl :type-lookup}}
-    {:name "type_sanity" :mode :unmeasured
+     :blockers #{:alter-domain :domain-constraint-coverage
+                 :domain-arrays-and-composites :create-function
+                 :dump-domain-syntax}}
+    {:name "create_type" :mode :discovery
+     :boundaries #{:type-ddl :type-lookup}
+     :blockers #{:user-defined-base-types :range-and-multirange-types
+                 :shell-types :create-function}}
+    {:name "type_sanity" :mode :discovery
      :boundaries #{:catalogs :type-registry}
      :blockers #{:postgres-internal-catalog-completeness}}
-    {:name "opr_sanity" :mode :unmeasured
+    {:name "opr_sanity" :mode :discovery
      :boundaries #{:catalogs :operator-registry}
      :blockers #{:postgres-internal-catalog-completeness}}
-    {:name "misc_sanity" :mode :unmeasured
+    {:name "misc_sanity" :mode :discovery
      :boundaries #{:catalogs}
      :blockers #{:postgres-internal-catalog-completeness}}
-    {:name "namespace" :mode :unmeasured :boundaries #{:name-resolution :schemas}}
+    {:name "namespace" :mode :discovery
+     :boundaries #{:name-resolution :schemas}
+     :blockers #{:search-path-completeness :temporary-namespaces
+                 :catalog-roles :create-function}}
     {:name "rangefuncs" :mode :discovery
      :boundaries #{:set-returning-functions :lateral :parameter-inference}
      :blockers #{:create-function :fixture-dependencies}}
@@ -220,34 +250,206 @@
   {:id 2
    :name "application DDL, DML, and relational SQL"
    :tests
-   [{:name "boolean" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "char" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "name" :mode :unmeasured :boundaries #{:scalar-type :catalogs}}
-    {:name "varchar" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "text" :mode :unmeasured :boundaries #{:scalar-type}}
-    {:name "float4" :mode :unmeasured :boundaries #{:scalar-type :operators}}
-    {:name "float8" :mode :unmeasured :boundaries #{:scalar-type :operators}}
-    {:name "date" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "time" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "timestamp" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "timestamptz" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "interval" :mode :unmeasured :boundaries #{:temporal}}
-    {:name "create_table" :mode :unmeasured :boundaries #{:ddl}}
-    {:name "constraints" :mode :unmeasured :boundaries #{:ddl :constraints}}
-    {:name "insert" :mode :unmeasured :boundaries #{:dml}}
-    {:name "insert_conflict" :mode :unmeasured :boundaries #{:dml :constraints}}
-    {:name "update" :mode :unmeasured :boundaries #{:dml}}
-    {:name "delete" :mode :unmeasured :boundaries #{:dml}}
-    {:name "returning" :mode :unmeasured :boundaries #{:dml :result-metadata}}
-    {:name "transactions" :mode :unmeasured :boundaries #{:transactions}}
-    {:name "case" :mode :unmeasured :boundaries #{:expressions}}
-    {:name "subselect" :mode :unmeasured :boundaries #{:relational}}
-    {:name "union" :mode :unmeasured :boundaries #{:relational :common-types}}
-    {:name "join" :mode :unmeasured :boundaries #{:relational}}
-    {:name "aggregates" :mode :unmeasured :boundaries #{:aggregates}}
-    {:name "window" :mode :unmeasured :boundaries #{:windows}}
-    {:name "with" :mode :unmeasured :boundaries #{:ctes}}
-    {:name "limit" :mode :unmeasured :boundaries #{:relational}}]}
+   [{:name "boolean" :mode :strict
+     :boundaries #{:scalar-type :casts :errors}
+     :blockers #{}}
+    {:name "char" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :casts}
+     :blockers #{:internal-char-type :temporary-table-shadowing}}
+    {:name "name" :mode :discovery
+     :boundaries #{:scalar-type :catalogs}
+     :blockers #{:parse-ident :named-function-arguments :procedural-blocks}}
+    {:name "varchar" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :typmods}
+     :blockers #{:temporary-table-shadowing}}
+    {:name "text" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :functions :expressions}
+     :blockers #{:variadic-function-grammar :to-date :format-semantics}
+     :strict-slices
+     [{:id :negative-left-right-lengths
+       :source-lines [39 39]
+       :gate "test/datahike/test/pg_string_datetime_fns_test.clj"
+       :test-var "text-regression-boundaries"}]}
+    {:name "float4" :mode :discovery
+     :boundaries #{:scalar-type :operators :casts}
+     :blockers #{:user-defined-types :create-cast :binary-send-functions
+                 :floating-overflow-semantics}}
+    {:name "float8" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:scalar-type :operators :casts}
+     :blockers #{:user-defined-types :create-cast :gamma-functions
+                 :floating-overflow-semantics}}
+    {:name "date" :mode :discovery
+     :boundaries #{:temporal :casts :operators}
+     :blockers #{:temporal-input-validation :infinity-values
+                 :temporal-function-coverage :operator-resolution}}
+    {:name "time" :mode :discovery
+     :boundaries #{:temporal :casts :operators :typmods}
+     :blockers #{:interval-structural-type :time-zone-semantics
+                 :temporal-input-validation :temporal-typmods}}
+    {:name "timestamp" :mode :discovery
+     :boundaries #{:temporal :casts :operators :functions}
+     :blockers #{:interval-structural-type :temporal-format-pictures
+                 :temporal-constructors :infinity-values
+                 :outside-java-time-range :temporal-function-coverage
+                 :temporal-parser-grammar}}
+    {:name "timestamptz" :mode :discovery
+     :boundaries #{:temporal :casts :operators :functions :time-zones}
+     :blockers #{:interval-structural-type :temporal-format-pictures
+                 :temporal-constructors :infinity-values
+                 :outside-java-time-range :time-zone-semantics
+                 :temporal-function-coverage :temporal-parser-grammar}}
+    {:name "interval" :mode :discovery
+     :boundaries #{:temporal :casts :operators :functions}
+     :blockers #{:interval-structural-type :interval-literal-grammar
+                 :interval-arithmetic :interval-extract
+                 :temporal-format-pictures :temporal-function-coverage
+                 :copy-fixture-dependencies}}
+    {:name "create_table" :mode :discovery
+     :boundaries #{:ddl :type-metadata :defaults}
+     :blockers #{:typed-tables :partition-routing :inheritance
+                 :storage-options :system-columns :server-functions
+                 :prepared-create-table-as :without-oids-grammar
+                 :postgres-internal-catalog-completeness}}
+    {:name "constraints" :mode :discovery
+     :boundaries #{:ddl :constraints}
+     :blockers #{:deferrable-constraints :exclusion-constraints
+                 :partitioning :inheritance :not-enforced-constraints
+                 :server-side-copy :system-columns :alter-constraint-ddl}}
+    {:name "insert" :mode :discovery
+     :boundaries #{:dml :defaults :constraints :insert-select}
+     :blockers #{:composite-types :array-subscripting :rules :triggers
+                 :partitioning :system-columns}
+     :strict-slices
+     [{:id :defaults-and-row-width
+       :source-lines [4 29]
+       :gate "test/datahike/test/pg_insert_regress_test.clj"
+       :test-var "postgres-insert-default-and-row-width-slice"}]}
+    {:name "insert_conflict" :mode :discovery
+     :boundaries #{:dml :constraints :unique-index-inference}
+     :blockers #{:expression-indexes :partial-indexes :operator-classes
+                 :collations :exclusion-constraints :views :partitioning
+                 :system-columns :explain-dml}
+     :strict-slices
+     [{:id :self-conflict-command-cardinality
+       :source-lines [436 464]
+       :gate "test/datahike/test/pg_on_conflict_params_test.clj"
+       :test-var "self-conflicts-follow-postgres-command-cardinality"}]}
+    {:name "update" :mode :discovery
+     :boundaries #{:dml :update-from :row-assignment}
+     :blockers #{:row-subquery-assignment :partitioning :triggers :views
+                 :row-level-security :system-columns :create-function}
+     :strict-slices
+     [{:id :qualified-target-and-values-source
+       :source-lines [34 44]
+       :gate "test/datahike/test/pg_update_expressions_test.clj"
+       :test-var "postgres-update-from-values-and-qualified-target"}]}
+    {:name "delete" :mode :strict
+     :boundaries #{:dml :name-resolution}
+     :blockers #{}
+     :strict-slices
+     [{:id :target-alias-scope
+       :source-lines [11 18]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "target-alias-hides-original-relation-name"}]}
+    {:name "returning" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:dml :result-metadata :expressions :defaults}
+     :blockers #{:rules :views :create-function :inheritance :partitioning
+                 :update-from :delete-using}
+     :strict-slices
+     [{:id :simple-dml-projections
+       :source-lines [7 21]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "postgres-returning-simple-projection-slice"}]}
+    {:name "transactions" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:transactions :savepoints :error-recovery}
+     :blockers #{:transaction-characteristics :read-only-transactions
+                 :sql-functions :cursor-subtransactions :system-columns}
+     :strict-slices
+     [{:id :begin-end-abort
+       :source-lines [5 36]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "postgres-transaction-begin-end-abort-slice"}
+      {:id :failed-savepoint-recovery
+       :source-lines [259 273]
+       :gate "test/datahike/test/pg_returning_projection_test.clj"
+       :test-var "postgres-failed-transaction-savepoint-slice"}]}
+    {:name "case" :mode :discovery
+     :boundaries #{:expressions}
+     :blockers #{:create-function :enum-ddl :transaction-cascade}}
+    {:name "subselect" :mode :discovery
+     :boundaries #{:relational :name-resolution}
+     :blockers #{:subquery-datalog-shapes :correlated-subqueries
+                 :any-all-subqueries :set-returning-functions
+                 :parser-grammar :unsupported-ddl :lateral-outer-join}
+     :strict-slices
+     [{:id :redundant-derived-parentheses
+       :source-lines [13 16]
+       :gate "test/datahike/test/pg_derived_join_test.clj"
+       :test-var "redundant-parentheses-around-derived-relations"}]}
+    {:name "union" :mode :discovery
+     :boundaries #{:relational :common-types}
+     :blockers #{:values-cte :planner-explain :advanced-types :create-function}}
+    {:name "join" :mode :discovery
+     :boundaries #{:relational}
+     :blockers #{:planner-explain :correlated-planner-stress :advanced-join-plans
+                 :unsupported-ddl}
+     :strict-slices
+     [{:id :derived-aggregate-projection
+       :source-lines [431 442]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "derived-tables-materialize-logical-aggregate-projections"}
+      {:id :right-full-lateral-reference
+       :source-lines [3431 3432]
+       :gate "test/datahike/test/pg_lateral_srf_test.clj"
+       :test-var "postgres-right-full-lateral-reference-slice"}]}
+    {:name "aggregates" :mode :discovery
+     :boundaries #{:aggregates}
+     :blockers #{:regression-aggregate-functions :custom-aggregates
+                 :planner-explain :correlated-planner-stress}
+     :strict-slices
+     [{:id :corr-unknown-nan-input
+       :source-lines [155 159]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "corr-resolves-unknown-literals-as-float8"}]}
+    {:name "window" :mode :discovery
+     :boundaries #{:windows :aggregates :expressions}
+     :blockers #{:window-groups-frames :window-exclusion
+                 :custom-functions :custom-aggregates
+                 :nested-analytic-expressions :window-find-shapes
+                 :interval-structural-type}}
+    {:name "with" :mode :discovery
+     :boundaries #{:ctes :recursive-queries}
+     :blockers #{:cte-multiple-reference :recursive-cte-lowering
+                 :recursive-views :demand-driven-recursion
+                 :recursive-type-inference}
+     :strict-slices
+     [{:id :recursive-set-operation-shape
+       :source-lines [916 924]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-set-operation-shape-slice"}
+      {:id :recursive-outer-join
+       :source-lines [977 992]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-outer-join-slice"}
+      {:id :recursive-clause-restrictions
+       :source-lines [1000 1017]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-clause-restrictions-slice"}]}
+    {:name "limit" :mode :discovery
+     :boundaries #{:relational}
+     :blockers #{:backward-cursors :set-returning-projections :planner-explain
+                 :view-ddl :fetch-expression-grammar}
+     :strict-slices
+     [{:id :aggregate-sibling-scalar
+       :source-lines [147 153]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "grouped-projections-inline-sibling-scalars"}]}]}
 
   {:id 3
    :name "specialized application types"

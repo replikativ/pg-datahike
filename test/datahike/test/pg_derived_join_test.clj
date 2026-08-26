@@ -81,3 +81,10 @@
 
   (testing "a single relation is unchanged"
     (is (= [["1" "2"] ["2" "3"]] (rows "SELECT * FROM t ORDER BY 1")))))
+
+(deftest redundant-parentheses-around-derived-relations
+  (is (= [["1"]]
+         (rows "SELECT * FROM ((SELECT 1 AS x)) ss")))
+  (is (= [["1" "2"]]
+         (rows (str "SELECT * FROM ((SELECT 1 AS x)), "
+                    "((SELECT * FROM ((SELECT 2 AS y))))")))))

@@ -387,6 +387,23 @@
   [coll]
   (order-agg "max" pos? coll))
 
+(defn- filter-enum-extreme [pick coll]
+  (let [pairs (remove (fn [[_rank value]] (sql-null? value)) coll)]
+    (if (empty? pairs)
+      :__null__
+      (second (reduce (fn [a b] (if (pick (compare (first b) (first a))) b a))
+                      pairs)))))
+
+(defn filter-enum-min
+  "MIN over `[declaration-rank label]` pairs, returning the label."
+  [coll]
+  (filter-enum-extreme neg? coll))
+
+(defn filter-enum-max
+  "MAX over `[declaration-rank label]` pairs, returning the label."
+  [coll]
+  (filter-enum-extreme pos? coll))
+
 (defn filter-count
   "SQL COUNT(col) — counts non-NULL values. Unlike COUNT(*), which counts
    all rows, COUNT(col) skips rows where col IS NULL. Returns a long
@@ -835,21 +852,31 @@
                           (or (nil? a) (= :__null__ a)
                               (nil? b) (= :__null__ b))))
                       pairs)
-        n (count valid)]
+        n (count valid)
+        xs (map #(double (first %)) valid)
+        ys (map #(double (second %)) valid)
+        ;; PostgreSQL treats an all-NaN input column as *not* constant,
+        ;; while an ordinary all-equal column still makes correlation
+        ;; undefined. This ordering matters for corr(0.1, 'NaN'): the
+        ;; finite side decides NULL before NaN contaminates the sums.
+        finite-constant? (fn [values]
+                           (and (seq values)
+                                (not (Double/isNaN (double (first values))))
+                                (apply = values)))]
     (if (< n 2)
       :__null__
-      (let [xs  (map #(double (first %))  valid)
-            ys  (map #(double (second %)) valid)
-            sx  (reduce + 0.0 xs)
-            sy  (reduce + 0.0 ys)
-            sxx (reduce + 0.0 (map #(* % %) xs))
-            syy (reduce + 0.0 (map #(* % %) ys))
-            sxy (reduce + 0.0 (map * xs ys))
-            denom (* (Math/sqrt (- (* n sxx) (* sx sx)))
-                     (Math/sqrt (- (* n syy) (* sy sy))))]
-        (if (zero? denom)
-          :__null__
-          (/ (- (* n sxy) (* sx sy)) denom))))))
+      (if (or (finite-constant? xs) (finite-constant? ys))
+        :__null__
+        (let [sx  (reduce + 0.0 xs)
+              sy  (reduce + 0.0 ys)
+              sxx (reduce + 0.0 (map #(* % %) xs))
+              syy (reduce + 0.0 (map #(* % %) ys))
+              sxy (reduce + 0.0 (map * xs ys))
+              denom (* (Math/sqrt (- (* n sxx) (* sx sx)))
+                       (Math/sqrt (- (* n syy) (* sy sy))))]
+          (if (zero? denom)
+            :__null__
+            (/ (- (* n sxy) (* sx sy)) denom)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; null-safe wrapper + SQL null-safe arithmetic
@@ -1386,6 +1413,78 @@
        (.plusDays (->local-date a) (- (long b)))
        ;; date - date is a plain integer count of days, not an interval.
        (- (.toEpochDay (->local-date a)) (.toEpochDay (->local-date b)))))))
+
+(defn- duration->pg-interval
+  "Render a java.time.Duration in PostgreSQL's default interval style. This
+   is an interim value representation: interval columns are still stored as
+   text, but typed temporal subtraction must not fall through to numeric
+   arithmetic."
+  [^java.time.Duration duration]
+  (let [total-nanos (+ (*' (.getSeconds duration) 1000000000)
+                       (.getNano duration))
+        negative? (neg? total-nanos)
+        n (if negative? (- total-nanos) total-nanos)
+        day-nanos (*' 86400 1000000000)
+        days (quot n day-nanos)
+        rem-nanos (rem n day-nanos)
+        hours (quot rem-nanos (*' 3600 1000000000))
+        rem-nanos (rem rem-nanos (*' 3600 1000000000))
+        minutes (quot rem-nanos (*' 60 1000000000))
+        rem-nanos (rem rem-nanos (*' 60 1000000000))
+        seconds (quot rem-nanos 1000000000)
+        nanos (rem rem-nanos 1000000000)
+        fraction (when (pos? nanos)
+                   (str "." (str/replace (format "%09d" (long nanos)) #"0+$" "")))
+        clock (format "%s%02d:%02d:%02d%s"
+                      (if negative? "-" "")
+                      (long hours) (long minutes) (long seconds) (or fraction ""))
+        body (if (pos? days)
+               (let [signed-days (if negative? (- days) days)]
+                 ;; PostgreSQL pluralises -1 (the value is not +1), hence
+                 ;; "-1 days -02:00:00" rather than a global sign prefix.
+                 (str signed-days " day" (when (not= signed-days 1) "s") " " clock))
+               clock)]
+    body))
+
+(defn- ->instant
+  ^java.time.Instant [v]
+  (cond
+    (instance? java.time.Instant v) v
+    (instance? java.util.Date v) (.toInstant ^java.util.Date v)
+    (instance? java.time.LocalDateTime v)
+    (.toInstant ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
+    (instance? java.time.OffsetDateTime v) (.toInstant ^java.time.OffsetDateTime v)
+    (instance? java.time.ZonedDateTime v) (.toInstant ^java.time.ZonedDateTime v)
+    :else (throw (errors/pg-error
+                  :feature-not-supported
+                  {:feature "timestamp arithmetic outside the supported Java time range"}))))
+
+(def sql-timestamp-
+  (null-safe
+   (fn timestamp-minus [a b]
+     (duration->pg-interval
+      (java.time.Duration/between (->instant b) (->instant a))))))
+
+(defn- ->local-time
+  ^java.time.LocalTime [v]
+  (cond
+    (instance? java.time.LocalTime v) v
+    (string? v) (java.time.LocalTime/parse ^String v)
+    :else (throw (errors/pg-error :invalid-text-representation
+                                  {:type "time" :value (str v)}))))
+
+(def sql-time-
+  (null-safe
+   (fn time-minus [a b]
+     (duration->pg-interval
+      (java.time.Duration/between (->local-time b) (->local-time a))))))
+
+(def sql-unsupported-temporal-arithmetic
+  (null-safe
+   (fn [& _]
+     (throw (errors/pg-error
+             :undefined-function
+             {:function "operator for the supplied temporal argument types"})))))
 
 (defn- throw-division-by-zero []
   (throw (errors/pg-error :division-by-zero {})))
@@ -1925,12 +2024,36 @@
   "SQL LENGTH / CHAR_LENGTH. Bit strings measure in bits, not in the
    record's map entries."
   [v]
-  (if (pg-bits/pg-bit? v) (pg-bits/width v) (count v)))
+  (cond
+    (pg-bits/pg-bit? v) (pg-bits/width v)
+    (string? v) (count v)
+    (bytes? v) (alength ^bytes v)
+    :else
+    (throw (errors/pg-error
+            :undefined-function
+            {:function (str "length("
+                            (get types/oid->pg-name
+                                 (types/infer-oid-from-value v)
+                                 "unknown")
+                            ")")
+             :hint (str "No function matches the given name and argument types. "
+                        "You might need to add explicit type casts.")}))))
 
 (defn sql-octet-length
   "SQL OCTET_LENGTH. For a bit string PG reports ceil(bits / 8)."
   [v]
-  (if (pg-bits/pg-bit? v) (pg-bits/octet-length v) (count v)))
+  (cond
+    (pg-bits/pg-bit? v) (pg-bits/octet-length v)
+    (string? v) (alength (.getBytes ^String v java.nio.charset.StandardCharsets/UTF_8))
+    (bytes? v) (alength ^bytes v)
+    :else
+    (throw (errors/pg-error
+            :undefined-function
+            {:function (str "octet_length("
+                            (get types/oid->pg-name
+                                 (types/infer-oid-from-value v)
+                                 "unknown")
+                            ")")}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bitwise operators — `&` `|` `~` `<<` `>>`, over integers and bit strings.
@@ -2023,12 +2146,22 @@
   [s] (str/replace (str s) #"\b\w" str/upper-case))
 
 (defn sql-left
-  "Return first n characters of string."
-  [s n] (let [s (str s) n (long n)] (subs s 0 (min n (count s)))))
+  "Return first n characters of string. A negative n removes |n| trailing
+   characters, matching PostgreSQL's text_left."
+  [s n]
+  (let [s (str s)
+        n (long n)
+        end (if (neg? n) (+ (count s) n) n)]
+    (subs s 0 (max 0 (min end (count s))))))
 
 (defn sql-right
-  "Return last n characters of string."
-  [s n] (let [s (str s) n (long n)] (subs s (max 0 (- (count s) n)))))
+  "Return last n characters of string. A negative n removes |n| leading
+   characters, matching PostgreSQL's text_right."
+  [s n]
+  (let [s (str s)
+        n (long n)
+        start (if (neg? n) (- n) (- (count s) n))]
+    (subs s (max 0 (min start (count s))))))
 
 (defn- ->s ^String [v] (str v))
 
@@ -3307,7 +3440,7 @@
                    (<= 0 n 4294967295))
          ("float4" "real" "float8" "double precision") (float-value)
          ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
-         ("uuid") (do (java.util.UUID/fromString (str/trim s)) true)
+         ("uuid") (do (coerce/parse-uuid s) true)
          ("bit" "bit varying" "varbit")
          (do (sql-cast/cast-to-bit s (str type-name) false) true)
          ("char" "character" "varchar" "character varying" "text" "name")
@@ -3406,6 +3539,48 @@
    "jsonb_exists_all" {:impl jb/jsonb-exists-all? :arities #{2}
                        :strict? true :return-oid types/oid-bool}})
 
+(defn sql-uuid-v7
+  "Generate an RFC 9562 UUIDv7 using the current Unix millisecond and random
+   payload bits. The one-argument PostgreSQL form offsets the timestamp by an
+  interval; it stays explicit until intervals have a structural carrier."
+  ([]
+   (coerce/generate-uuid-v7))
+  ([_offset]
+   (throw (errors/pg-error :feature-not-supported
+                           {:feature "uuidv7 with an interval offset"}))))
+
+(defn sql-uuid-extract-version [value]
+  (let [uuid (if (instance? java.util.UUID value)
+               value
+               (coerce/parse-uuid value))
+        version (.version ^java.util.UUID uuid)]
+    ;; RFC 9562 UUIDs use the RFC variant. PostgreSQL returns NULL for a
+    ;; bit-pattern that spells a version nibble but has another variant.
+    (if (and (= 2 (.variant ^java.util.UUID uuid)) (<= 1 version 8))
+      version
+      :__null__)))
+
+(defn sql-uuid-extract-timestamp [value]
+  (let [uuid (if (instance? java.util.UUID value)
+               value
+               (coerce/parse-uuid value))
+        version (.version ^java.util.UUID uuid)]
+    (if-not (= 2 (.variant ^java.util.UUID uuid))
+      :__null__
+      (case version
+        ;; UUIDv1 stores 100ns ticks since the Gregorian UUID epoch,
+        ;; 1582-10-15. java.util.UUID reconstructs that 60-bit field.
+        1 (let [unix-100ns (- (.timestamp ^java.util.UUID uuid)
+                              122192928000000000)]
+            (java.util.Date. (Math/floorDiv unix-100ns 10000)))
+        ;; UUIDv7 stores unsigned Unix milliseconds in its top 48 bits.
+        7 (let [millis (bit-and
+                        (unsigned-bit-shift-right
+                         (.getMostSignificantBits ^java.util.UUID uuid) 16)
+                        0xFFFFFFFFFFFF)]
+            (java.util.Date. millis))
+        :__null__))))
+
 (def ^:private legacy-sql-fn->clj-fn
   {"upper"    str/upper-case
    "lower"    str/lower-case
@@ -3482,6 +3657,11 @@
    "erf"      sql-erf
    "erfc"     sql-erfc
    "random"   (fn [] (sql-random))
+   "gen_random_uuid" (fn [] (java.util.UUID/randomUUID))
+   "uuidv4"   (fn [] (java.util.UUID/randomUUID))
+   "uuidv7"   sql-uuid-v7
+   "uuid_extract_version" sql-uuid-extract-version
+   "uuid_extract_timestamp" sql-uuid-extract-timestamp
    "setseed"  sql-setseed
    "random_normal" (fn ([] (sql-random-normal))
                      ([m] (sql-random-normal m))
@@ -3669,6 +3849,8 @@
    "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
    "erf" #{1} "erfc" #{1}
    "random" #{0} "setseed" #{1} "random_normal" #{0 1 2}
+   "gen_random_uuid" #{0} "uuidv4" #{0} "uuidv7" #{0 1}
+   "uuid_extract_version" #{1} "uuid_extract_timestamp" #{1}
    "div" #{2} "factorial" #{1}
    "scale" #{1} "min_scale" #{1} "trim_scale" #{1} "numeric_inc" #{1}
    "width_bucket" #{4}

@@ -292,6 +292,22 @@
         result (transient {})]
     (doseq [partition partitions]
       (let [n (count partition)
+            _ (when (and (contains? #{:sum :avg} op)
+                         (some? col-idx)
+                         (some (fn [[_ row]]
+                                 (let [v (nth row col-idx nil)]
+                                   (and (not (fns/sql-null? v))
+                                        (not (number? v)))))
+                               partition))
+                ;; SUM/AVG accept numeric, money and interval in PostgreSQL.
+                ;; The first two are Numbers internally; interval is still
+                ;; represented as text. Never let that representation leak as
+                ;; a JVM ClassCastException while interval arithmetic remains
+                ;; unsupported.
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:feature (str (name op)
+                                       " over non-numeric window input (including interval)")})))
             [peer-lo peer-hi] (peer-bounds partition order-by)
             bounds (mapv #(frame-bounds partition order-by frame %
                                         (aget ^ints peer-lo %) (aget ^ints peer-hi %))

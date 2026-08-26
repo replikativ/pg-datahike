@@ -60,7 +60,59 @@
                                 [?e :datahike.pg.enum/values-ordered ?vs]]
                               (d/db *conn*)))]
       (is (= "sad\nok\nhappy" vs-ord)
-          "values stored in declaration order"))))
+          "values stored in declaration order")
+      (is (pos? (ffirst (d/q '[:find ?oid :where
+                               [?e :datahike.pg.enum/name "mood"]
+                               [?e :datahike.pg.enum/oid ?oid]]
+                             (d/db *conn*))))
+          "enum receives a persistent PostgreSQL type OID"))))
+
+(deftest enum-catalogs-share-a-stable-type-oid
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (let [rows (query-rows
+                c
+                (str "SELECT t.typname, t.typtype, e.enumlabel, e.enumsortorder "
+                     "FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+                     "WHERE t.typname = 'mood' ORDER BY e.enumsortorder"))]
+      (is (= [["mood" "e" "sad" 1.0]
+              ["mood" "e" "ok" 2.0]
+              ["mood" "e" "happy" 3.0]]
+             (mapv vec rows))))
+    (is (= [[3]]
+           (mapv vec
+                 (query-rows
+                  c "SELECT COUNT(*) FROM pg_enum WHERE enumtypid = 'mood'::regtype"))))))
+
+(deftest enum-catalog-has-no-orphaned-labels
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (testing "the catalog OIDs join directly"
+      (is (= [[3]]
+             (mapv vec
+                   (query-rows
+                    c (str "SELECT COUNT(*) FROM pg_enum e JOIN pg_type t "
+                           "ON t.oid = e.enumtypid WHERE t.typname = 'mood'"))))))
+    (testing "PostgreSQL's cleanup invariant works as a correlated anti-join"
+      (is (= []
+             (mapv vec
+                   (query-rows
+                    c (str "SELECT enumlabel FROM pg_enum e WHERE NOT EXISTS "
+                           "(SELECT 1 FROM pg_type t WHERE t.oid = e.enumtypid)"))))))
+    (testing "and with the outer column left unqualified, as upstream writes it"
+      (is (= []
+             (mapv vec
+                   (query-rows
+                    c (str "SELECT enumlabel FROM pg_enum WHERE NOT EXISTS "
+                           "(SELECT 1 FROM pg_type WHERE pg_type.oid = enumtypid)"))))))))
+
+(deftest enum-and-table-oids-do-not-collide
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (exec! c "CREATE TABLE enum_owner (id int)")
+    (let [[[enum-oid]] (query-rows c "SELECT oid FROM pg_type WHERE typname = 'mood'")
+          [[table-oid]] (query-rows c "SELECT oid FROM pg_class WHERE relname = 'enum_owner'")]
+      (is (not= enum-oid table-oid)))))
 
 (deftest create-enum-schema-qualified
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
@@ -89,7 +141,176 @@
 (deftest registered-enum-remains-a-valid-cast-target
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
-    (is (= [["happy"]] (mapv vec (query-rows c "SELECT 'happy'::mood"))))))
+    (is (= [["happy"]] (mapv vec (query-rows c "SELECT 'happy'::mood"))))
+    (let [raised (try
+                   (query-rows c "SELECT 'angry'::mood")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (= "22P02" (some-> raised .getSQLState)))
+      (is (re-find #"invalid input value for enum mood"
+                   (or (some-> raised .getMessage) ""))))
+    (exec! c "CREATE TABLE enum_cast_source (v text)")
+    (exec! c "INSERT INTO enum_cast_source VALUES ('happy'), ('angry')")
+    (let [raised (try
+                   (query-rows c "SELECT v::mood FROM enum_cast_source")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (= "22P02" (some-> raised .getSQLState))))))
+
+(deftest enum-input-validation-uses-the-registry
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (is (= [[true false]]
+           (mapv vec (query-rows
+                      c (str "SELECT pg_input_is_valid('happy', 'mood'), "
+                             "pg_input_is_valid('angry', 'mood')")))))
+    (is (= [["invalid input value for enum mood: \"angry\"" "22P02"]]
+           (mapv vec (query-rows
+                      c (str "SELECT message, sql_error_code FROM "
+                             "pg_input_error_info('angry', 'mood')")))))))
+
+(deftest enum-ordered-helper-functions
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    (is (= [["sad" "happy" "{sad,ok,happy}" "{ok,happy}"]]
+           (mapv vec
+                 (query-rows
+                  c (str "SELECT enum_first(NULL::mood), enum_last('ok'::mood), "
+                         "enum_range(NULL::mood)::text, "
+                         "enum_range('ok'::mood, NULL)::text")))))
+    (exec! c "CREATE TABLE enum_helper_source (m mood)")
+    (exec! c "INSERT INTO enum_helper_source VALUES ('ok')")
+    (is (= [["sad" "happy"]]
+           (mapv vec
+                 (query-rows c "SELECT enum_first(m), enum_last(m) FROM enum_helper_source"))))))
+
+(deftest alter-enum-add-and-rename-values
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE planets AS ENUM ('venus', 'earth', 'mars')")
+    (exec! c "ALTER TYPE planets ADD VALUE 'uranus'")
+    (exec! c "ALTER TYPE planets ADD VALUE 'mercury' BEFORE 'venus'")
+    (exec! c "ALTER TYPE planets ADD VALUE 'jupiter' AFTER 'mars'")
+    (exec! c "ALTER TYPE planets ADD VALUE IF NOT EXISTS 'earth'")
+    (exec! c "ALTER TYPE planets RENAME VALUE 'uranus' TO 'neptune'")
+    (is (= [["mercury"] ["venus"] ["earth"] ["mars"] ["jupiter"] ["neptune"]]
+           (mapv vec
+                 (query-rows c (str "SELECT enumlabel FROM pg_enum "
+                                    "WHERE enumtypid = 'planets'::regtype "
+                                    "ORDER BY enumsortorder")))))
+    (is (= [["mercury" "neptune"]]
+           (mapv vec
+                 (query-rows c "SELECT enum_first(NULL::planets), enum_last(NULL::planets)"))))))
+
+(deftest alter-enum-validates-and-is-transactional
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (doseq [[sql state]
+            [["ALTER TYPE mood ADD VALUE 'sad'" "42710"]
+             ["ALTER TYPE mood ADD VALUE 'ok' AFTER 'missing'" "22023"]
+             ["ALTER TYPE mood RENAME VALUE 'missing' TO 'ok'" "22023"]]]
+      (let [raised (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> raised .getSQLState)))))
+    (.setAutoCommit c false)
+    (exec! c "ALTER TYPE mood ADD VALUE 'ok' BEFORE 'happy'")
+    (.rollback c)
+    (.setAutoCommit c true)
+    (is (= [["sad"] ["happy"]]
+           (mapv vec
+                 (query-rows c (str "SELECT enumlabel FROM pg_enum "
+                                    "WHERE enumtypid = 'mood'::regtype "
+                                    "ORDER BY enumsortorder")))))))
+
+(deftest new-label-on-existing-enum-is-unsafe-until-commit
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (.setAutoCommit c false)
+    (exec! c "ALTER TYPE mood ADD VALUE 'ok'")
+    (doseq [sql ["SELECT 'ok'::mood" "SELECT enum_last(NULL::mood)"
+                 "SELECT enum_range(NULL::mood)"]]
+      (exec! c "SAVEPOINT before_unsafe")
+      (let [raised (try (query-rows c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "55P04" (some-> raised .getSQLState)))
+        (is (str/includes? (or (some-> raised .getMessage) "")
+                           "must be committed before they can be used")))
+      (exec! c "ROLLBACK TO SAVEPOINT before_unsafe"))
+    (.commit c)
+    (is (= [["ok"]] (mapv vec (query-rows c "SELECT 'ok'::mood"))))
+    (.setAutoCommit c false)
+    (exec! c "CREATE TYPE fresh_mood AS ENUM ('sad')")
+    (exec! c "ALTER TYPE fresh_mood ADD VALUE 'happy'")
+    (is (= [["happy"]]
+           (mapv vec (query-rows c "SELECT 'happy'::fresh_mood"))))
+    (.rollback c)))
+
+(deftest enum-comparisons-order-and-extrema-use-declaration-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'yellow', 'green', 'blue')")
+    (exec! c "CREATE TABLE enum_order (col rainbow)")
+    (exec! c "INSERT INTO enum_order VALUES ('green'), ('red'), ('blue'), ('yellow')")
+    (is (= [["red"] ["yellow"] ["green"] ["blue"]]
+           (mapv vec (query-rows c "SELECT col FROM enum_order ORDER BY col"))))
+    (is (= [["red"] ["yellow"] ["green"] ["blue"]]
+           (mapv vec (query-rows c "SELECT * FROM enum_order ORDER BY col"))))
+    (is (= [["green"] ["blue"]]
+           (mapv vec
+                 (query-rows c "SELECT col FROM enum_order WHERE col > 'yellow' ORDER BY col"))))
+    (is (= [["red" "blue"]]
+           (mapv vec (query-rows c "SELECT min(col), max(col) FROM enum_order"))))
+    (is (= [["red"] ["yellow"] ["green"] ["blue"]]
+           (mapv vec
+                 (query-rows
+                  c (str "SELECT enumlabel FROM pg_enum "
+                         "WHERE enumtypid = 'rainbow'::regtype "
+                         "ORDER BY enumlabel::rainbow")))))))
+
+(deftest enum-foreign-keys-use-nominal-types-and-default-primary-key
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'blue')")
+    (exec! c "CREATE TYPE bogus AS ENUM ('red', 'blue')")
+    (exec! c "CREATE TABLE enum_parent (id rainbow PRIMARY KEY)")
+    (exec! c "CREATE TABLE enum_child (parent rainbow REFERENCES enum_parent)")
+    (exec! c "INSERT INTO enum_parent VALUES ('red')")
+    (exec! c "INSERT INTO enum_child VALUES ('red')")
+    (doseq [sql ["INSERT INTO enum_child VALUES ('blue')"
+                 "DELETE FROM enum_parent"]]
+      (let [raised (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "23503" (some-> raised .getSQLState)))))
+    (let [raised (try
+                   (exec! c "CREATE TABLE enum_bogus (parent bogus REFERENCES enum_parent)")
+                   nil
+                   (catch java.sql.SQLException e e))]
+      (is (= "42804" (some-> raised .getSQLState)))
+      (is (str/includes? (some-> raised .getMessage)
+                         "cannot be implemented")))))
+
+(deftest enum-type-rename-and-drop-lifecycle
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    (exec! c "CREATE TABLE enum_lifecycle (m mood)")
+    (exec! c "ALTER TYPE mood RENAME TO feeling")
+    (exec! c "INSERT INTO enum_lifecycle VALUES ('happy')")
+    (is (= [["happy"]] (mapv vec (query-rows c "SELECT m FROM enum_lifecycle"))))
+    (is (= [[2]]
+           (mapv vec
+                 (query-rows
+                  c "SELECT count(*) FROM pg_enum WHERE enumtypid = 'feeling'::regtype"))))
+    (let [raised (try (exec! c "DROP TYPE feeling") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "2BP01" (some-> raised .getSQLState))))
+    (exec! c "DROP TABLE enum_lifecycle")
+    (exec! c "DROP TYPE feeling")
+    (is (= [[0]]
+           (mapv vec (query-rows c "SELECT count(*) FROM pg_type WHERE typname = 'feeling'"))))
+    (exec! c "DROP TYPE IF EXISTS feeling")))
+
+(deftest enum-definition-rejects-duplicate-and-oversized-labels
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [[sql state]
+            [["CREATE TYPE duplicate_mood AS ENUM ('sad', 'ok', 'sad')" "42710"]
+             [(str "CREATE TYPE long_mood AS ENUM ('" (apply str (repeat 64 "x")) "')")
+              "42622"]]]
+      (let [raised (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+        (is (= state (some-> raised .getSQLState)))))))
 
 ;; ============================================================================
 ;; DOMAIN
@@ -137,6 +358,31 @@
     ;; Only the in-range row landed.
     (let [rows (query-rows c "SELECT id, y FROM film ORDER BY id")]
       (is (= [[1 2020]] (mapv vec rows))))))
+
+(deftest domain-check-enforces-on-direct-cast
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE rainbow AS ENUM ('red', 'green', 'blue', 'purple')")
+    (exec! c "CREATE DOMAIN rgb AS rainbow CHECK (VALUE IN ('red', 'green', 'blue'))")
+    (is (= [["green"]] (mapv vec (query-rows c "SELECT 'green'::rgb"))))
+    (doseq [sql ["SELECT 'purple'::rgb" "SELECT 'purple'::rainbow::rgb"]]
+      (let [raised (try (query-rows c sql) nil (catch java.sql.SQLException e e))]
+        (is (= "23514" (some-> raised .getSQLState)))
+        (is (str/includes? (or (some-> raised .getMessage) "")
+                           "value for domain rgb violates check constraint \"rgb_check\""))))))
+
+(deftest drop-domain-lifecycle
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN rgb AS text")
+    (exec! c "DROP DOMAIN rgb")
+    (let [raised (try (exec! c "SELECT 'red'::rgb") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "42704" (some-> raised .getSQLState))))
+    (exec! c "DROP DOMAIN IF EXISTS rgb")
+    (exec! c "CREATE DOMAIN rgb AS text")
+    (exec! c "CREATE TABLE domain_dependent (value rgb)")
+    (let [raised (try (exec! c "DROP DOMAIN rgb") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "2BP01" (some-> raised .getSQLState))))))
 
 (deftest domain-check-between-enforces
   ;; `BETWEEN` had no clause in eval-check-predicate; the :else

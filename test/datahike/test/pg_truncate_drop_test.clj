@@ -211,3 +211,35 @@
         (is (nil? (.error (exec h "INSERT INTO pgbench_accounts(aid) VALUES (2)"))))
         (is (= [["2"]] (rows (exec h "SELECT aid FROM pgbench_accounts")))))
       (finally (release! h)))))
+
+(deftest drop-table-with-wide-composite-primary-key
+  (let [h (fresh-handler)]
+    (try
+      (doseq [[table columns values drop-sql]
+              [["cpk3" "a int, b int, c int, PRIMARY KEY (a, b, c)"
+                "1, 2, 3" "DROP TABLE cpk3"]
+               ["cpk4" "a int, b int, c int, d int, PRIMARY KEY (a, b, c, d)"
+                "1, 2, 3, 4" "DROP TABLE IF EXISTS cpk4"]]]
+        (is (nil? (.error (exec h (str "CREATE TABLE " table " (" columns ")")))))
+        (is (nil? (.error (exec h (str "INSERT INTO " table " VALUES (" values ")")))))
+        (is (nil? (.error (exec h drop-sql))))
+        ;; Re-creation proves both the SQL catalog and Datahike tuple-valued
+        ;; schema metadata were removed. Before Datahike 0.8.1805, exact search
+        ;; rejected tuple values wider than two while DROP traversed the schema.
+        (is (nil? (.error (exec h (str "CREATE TABLE " table " (" columns ")")))))
+        (is (nil? (.error (exec h (str "DROP TABLE " table))))))
+      (finally (release! h)))))
+
+(deftest unquoted-drop-table-folds-case-and-removes-rows
+  (let [h (fresh-handler)]
+    (try
+      (is (nil? (.error (exec h "CREATE TABLE drop_reuse(i int UNIQUE)"))))
+      (is (nil? (.error (exec h "INSERT INTO drop_reuse VALUES (1)"))))
+      ;; PostgreSQL folds an unquoted identifier regardless of how it was
+      ;; spelled.  Failing to fold here left both the old schema and rows
+      ;; alive, so a nominally fresh table inherited stale data.
+      (is (nil? (.error (exec h "DROP TABLE DROP_REUSE"))))
+      (is (nil? (.error (exec h "CREATE TABLE drop_reuse(i int UNIQUE)"))))
+      (is (nil? (.error (exec h "INSERT INTO drop_reuse VALUES (1)"))))
+      (is (= [["1"]] (rows (exec h "SELECT * FROM drop_reuse"))))
+      (finally (release! h)))))

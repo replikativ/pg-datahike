@@ -5,7 +5,8 @@
      (for the kinds that ship)
    - hostile cases: keyword inside a string / comment / dollar-quote"
   (:require [clojure.test :refer [deftest testing is]]
-            [datahike.pg.sql.classify :as c]))
+            [datahike.pg.sql.classify :as c]
+            [datahike.pg.sql.catalog :as catalog]))
 
 ;; ============================================================================
 ;; Tokenizer
@@ -116,7 +117,10 @@
   (is (= :commit   (kind "COMMIT WORK")))
   (is (= :commit   (kind "END")))
   (is (= :rollback (kind "ROLLBACK")))
-  (is (= :rollback (kind "ROLLBACK WORK"))))
+  (is (= :rollback (kind "ROLLBACK WORK")))
+  (is (= :rollback (kind "ABORT")))
+  (is (= :rollback (kind "ABORT WORK")))
+  (is (= :rollback (catalog/system-query? "ABORT"))))
 
 (deftest classify-savepoint
   (is (= {:kind :savepoint :name "sp1"}
