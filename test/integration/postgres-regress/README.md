@@ -43,9 +43,20 @@ to one mode), with:
 
 ```bash
 bb pg-regress-wave
+bb pg-regress-wave inventory
 bb pg-regress-wave 1
 bb pg-regress-wave 1 discovery
 ```
+
+The inventory accounts for every test in PostgreSQL's pinned
+`parallel_schedule`. Tests in `campaign.edn` are being measured or already
+gate focused behavior. The remaining scheduled files are grouped in
+`scope.edn` as either application-facing backlog or deliberately out of scope,
+with a reason for each group. Campaign validation fails when an upstream test
+is omitted, named twice, assigned to both files, or no longer exists in the
+pinned schedule. This makes the denominator explicit without pretending that
+PostgreSQL storage, planner, replication, or server-administration internals
+are pg-datahike release criteria.
 
 The campaign is pinned to the PostgreSQL tag recorded as `:postgres-ref` in
 `campaign.edn`. `POSTGRES_SOURCE` must point at a checkout whose `HEAD` is that

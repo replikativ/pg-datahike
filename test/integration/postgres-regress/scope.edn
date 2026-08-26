@@ -1,0 +1,78 @@
+{:backlog
+ {:scalar-and-structural-types
+  #{"box" "circle" "geometry" "inet" "line" "lseg"
+    "macaddr" "macaddr8" "multirangetypes" "oid" "path" "pg_lsn"
+    "point" "polygon" "rangetypes" "regproc" "rowtypes" "timetz"
+    "txid" "xid"}
+
+  :expressions-and-builtins
+  #{"conversion" "horology" "md5" "misc" "misc_functions"
+    "numerology" "polymorphism" "random" "regex" "strings" "unicode"}
+
+  :collation
+  #{"collate"}
+
+  :full-text
+  #{"tstypes"}
+
+  :ddl-and-dml
+  #{"alter_generic" "alter_operator" "alter_table" "comments" "copy"
+    "copy2" "copydml" "copyselect" "create_aggregate" "create_cast"
+    "create_function_sql" "create_index" "create_misc" "create_operator"
+    "create_procedure" "create_schema" "create_table_like" "create_view"
+    "drop_if_exists" "drop_operator" "fast_default" "foreign_key"
+    "generated" "identity" "inherit" "largeobject" "matview" "merge"
+    "rules" "sequence" "temp" "triggers" "truncate" "typed_table"
+    "updatable_views"}
+
+  :relational-queries
+  #{"groupingsets" "select" "select_distinct" "select_distinct_on"
+    "select_implicit" "select_into" "select_views" "tablesample"}
+
+  :transactions-and-concurrency
+  #{"advisory_lock" "async" "lock" "mvcc" "plancache"
+    "prepared_xacts"}
+
+  :json-and-xml
+  #{"json_encoding" "jsonb_jsonpath" "jsonpath_encoding"
+    "sqljson_jsontable" "sqljson_queryfuncs" "xml" "xmlmap"}
+
+  :catalog-and-client-api
+  #{"database" "dbsize" "portals" "portals_p2" "psql" "psql_crosstab"
+    "sysviews" "test_setup"}}
+
+ :out-of-scope
+ {:physical-access-methods
+  #{"brin" "brin_bloom" "brin_multi" "btree_index" "create_am"
+    "create_index_spgist" "gin" "gist" "hash_func" "hash_index"
+    "index_including" "index_including_gist" "indexing" "spgist"}
+
+  :planner-and-storage-internals
+  #{"bitmapops" "cluster" "combocid" "compression" "equivclass"
+    "functional_deps" "incremental_sort" "indirect_toast"
+    "infinite_recurse" "join_hash" "maintain_every" "memoize" "predicate"
+    "reloptions" "select_parallel" "stats" "stats_ext" "tid"
+    "tidrangescan" "tidscan" "tuplesort" "vacuum" "vacuum_parallel"
+    "write_parallel"}
+
+  :physical-partitioning
+  #{"hash_part" "partition_aggregate" "partition_info" "partition_join"
+    "partition_prune"}
+
+  :server-extension-hooks
+  #{"amutils" "create_function_c" "event_trigger" "event_trigger_login"
+    "foreign_data" "object_address" "plpgsql"}
+
+  :server-administration-and-security
+  #{"create_role" "dependency" "guc" "init_privs" "password" "privileges"
+    "roleattributes" "rowsecurity" "security_label" "tablespace"}
+
+  :replication
+  #{"publication" "replica_identity" "subscription"}
+
+  :postgres-internal-sanity
+  #{"oidjoins" "sanity_check"}
+
+  :platform-collation-matrix
+  #{"collate.icu.utf8" "collate.linux.utf8" "collate.utf8"
+    "collate.windows.win1252"}}}
