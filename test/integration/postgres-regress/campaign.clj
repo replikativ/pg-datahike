@@ -3,6 +3,7 @@
 (require '[babashka.fs :as fs]
          '[babashka.process :refer [shell]]
          '[clojure.edn :as edn]
+         '[clojure.java.shell :as sh]
          '[clojure.string :as str])
 
 (def here (fs/parent (fs/file *file*)))
@@ -17,7 +18,27 @@
     (println "campaign error:" message))
   (System/exit 2))
 
+(defn validate-postgres-ref! []
+  (let [expected (:postgres-ref campaign)
+        allow-unpinned? (= "1" (System/getenv "PG_REGRESS_ALLOW_UNPINNED"))
+        {:keys [exit out err]}
+        (sh/sh "git" "-C" (str postgres-source)
+               "describe" "--tags" "--exact-match" "HEAD")
+        actual (str/trim out)]
+    (cond
+      (and (zero? exit) (= expected actual)) nil
+      allow-unpinned?
+      (binding [*out* *err*]
+        (println (str "campaign warning: expected PostgreSQL " expected
+                      ", using " (if (seq actual) actual (str/trim err)))))
+      :else
+      (fail! (str "PostgreSQL source must be checked out at " expected
+                  "; got " (if (seq actual) actual (str/trim err))
+                  ". Set POSTGRES_SOURCE to a pinned checkout, or set "
+                  "PG_REGRESS_ALLOW_UNPINNED=1 for deliberate discovery.")))))
+
 (defn validate! []
+  (validate-postgres-ref!)
   (let [tests (mapcat :tests (:waves campaign))
         slices (for [test tests, slice (:strict-slices test)] [test slice])
         names (map :name tests)

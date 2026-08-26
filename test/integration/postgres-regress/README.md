@@ -47,6 +47,13 @@ bb pg-regress-wave 1
 bb pg-regress-wave 1 discovery
 ```
 
+The campaign is pinned to the PostgreSQL tag recorded as `:postgres-ref` in
+`campaign.edn`. `POSTGRES_SOURCE` must point at a checkout whose `HEAD` is that
+exact tag, so source-line admissions cannot silently drift when `../postgres`
+moves to another major release. For deliberate exploratory runs against a
+different revision, set `PG_REGRESS_ALLOW_UNPINNED=1`; do not use that override
+when admitting strict slices.
+
 `:unmeasured` means the upstream file has not yet been triaged on a clean
 fixture, `:discovery` means it is continuously useful but has classified
 prerequisites or differences, and `:strict` means its complete normalized API

@@ -273,12 +273,10 @@ plausible wrong answer rather than an error.
   `jsonb_*` name; we have none.
 - SQL/JSON path: `jsonb_path_query` and friends, `@@`.
 - ~~`jsonb_each`, `jsonb_array_elements` and friends are not
-  set-returning~~ — **FIXED on `feat/srf-catalog`** for FROM position:
-  they now materialise into rows, along with the `json_*` spellings,
-  `regexp_split_to_table`, `string_to_table` and the record-shaping
-  `json/jsonb_to_record(set)`. In the SELECT LIST they still serialise
-  the whole collection into one cell; that is PG's ProjectSet and needs
-  the same per-row expansion LATERAL does.
+  set-returning~~ — **FIXED**. They materialise in FROM position, along with
+  the `json_*` spellings, `regexp_split_to_table`, `string_to_table`, and the
+  record-shaping `json/jsonb_to_record(set)`; target-list SRFs now also flow
+  through ProjectSet row expansion.
 - ~~`jsonb_object_keys` returns a JSON array string rather than rows~~ —
   **FIXED on `feat/srf-catalog`** in FROM position, same caveat.
 - `chr()`.

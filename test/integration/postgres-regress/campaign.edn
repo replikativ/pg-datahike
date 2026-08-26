@@ -1,4 +1,5 @@
 {:postgres-major 17
+ :postgres-ref "REL_17_7"
  :modes #{:unmeasured :discovery :strict}
  :waves
  [{:id 1
@@ -123,7 +124,7 @@
        :gate "test/datahike/test/pg_numeric_transcendentals_test.clj"
        :test-var "logarithms-follow-postgresql-working-scales"}
       {:id :numeric-factorial-overflow
-       :source-lines [1570 1574]
+       :source-lines [1517 1521]
        :gate "test/datahike/test/pg_math_functions_test.clj"
        :test-var "factorial-and-scale-inspectors"}
       {:id :insert-values-numeric-arithmetic
@@ -131,7 +132,7 @@
        :gate "test/datahike/test/pg_insert_coercion_test.clj"
        :test-var "insert-values-evaluates-numeric-arithmetic"}
       {:id :derived-values-numeric-functions
-       :source-lines [1538 1563]
+       :source-lines [1484 1510]
        :gate "test/datahike/test/pg_math_functions_test.clj"
        :test-var "numeric-functions-scan-derived-values-relations"}
       {:id :numeric-inc-unary-matrix
@@ -163,7 +164,7 @@
        :gate "test/datahike/test/pg_lateral_srf_test.clj"
        :test-var "star-expands-every-correlated-srf"}
       {:id :numeric-to-pg-lsn
-       :source-lines [1577 1584]
+       :source-lines [1526 1531]
        :gate "test/datahike/test/pg_numeric_format_test.clj"
        :test-var "numeric-to-pg-lsn"}]}
     {:name "money" :mode :discovery
@@ -382,6 +383,9 @@
     {:name "case" :mode :discovery
      :boundaries #{:expressions}
      :blockers #{:create-function :enum-ddl :transaction-cascade}}
+    {:name "select_having" :mode :strict
+     :boundaries #{:aggregates :grouping :having :errors}
+     :blockers #{}}
     {:name "subselect" :mode :discovery
      :boundaries #{:relational :name-resolution}
      :blockers #{:subquery-datalog-shapes :correlated-subqueries
@@ -405,7 +409,7 @@
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
        :test-var "derived-tables-materialize-logical-aggregate-projections"}
       {:id :right-full-lateral-reference
-       :source-lines [3431 3432]
+       :source-lines [2649 2650]
        :gate "test/datahike/test/pg_lateral_srf_test.clj"
        :test-var "postgres-right-full-lateral-reference-slice"}]}
     {:name "aggregates" :mode :discovery
@@ -454,7 +458,7 @@
        :gate "test/datahike/test/pg_inherits_resolution_test.clj"
        :test-var "implicit-insert-column-order-includes-inherited-columns"}
       {:id :cte-dml-target-resolution
-       :source-lines [1759 1766]
+       :source-lines [1712 1719]
        :gate "test/datahike/test/pg_sql_cte_test.clj"
        :test-var "cte-names-are-not-writable-relations"}]}
     {:name "limit" :mode :discovery
