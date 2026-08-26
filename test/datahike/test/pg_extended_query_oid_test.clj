@@ -23,7 +23,8 @@
    Extended Query path end-to-end."
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.set-ops :as set-ops])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult]
            [java.sql Connection DriverManager PreparedStatement ResultSet
             ResultSetMetaData Types]))
@@ -314,6 +315,21 @@
     (assert-describe-and-execute-oids [oid-timestamp] sql)
     (is (= [["2020-01-01 00:00"] ["2020-01-02 03:04:05"]]
            (exec-rows sql)))))
+
+(deftest timestamptz-set-operation-carriers-are-canonical
+  (let [from-unknown (set-ops/coerce-value "2020-01-01 00:00:00+00"
+                                           oid-timestamptz)
+        from-compact-offset (set-ops/coerce-value "2020-01-01 05:30:00+0530"
+                                                  oid-timestamptz)
+        from-instant (set-ops/coerce-value
+                      (java.time.Instant/parse "2020-01-01T00:00:00Z")
+                      oid-timestamptz)]
+    (is (instance? java.util.Date from-unknown))
+    (is (= from-unknown from-compact-offset from-instant))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"invalid input syntax for type timestamp with time zone"
+                          (set-ops/coerce-value "not-a-timestamp"
+                                                oid-timestamptz)))))
 
 (deftest postgres-system-function-oids
   (assert-describe-and-execute-oids

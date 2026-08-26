@@ -100,6 +100,13 @@
            (col c 1 "SELECT id FROM ft UNION SELECT k FROM fu ORDER BY 1 DESC"))
         "DESC was ignored outright; NULL sorts first for DESC")))
 
+(deftest all-set-operations-never-fall-through-to-concatenation
+  ;; Bag multiplicity for INTERSECT/EXCEPT ALL remains a follow-up, but the
+  ;; historical set-semantics approximation must not degrade into UNION ALL.
+  (with-open [c (jdbc)]
+    (is (= [] (col c 1 "SELECT 1 INTERSECT ALL SELECT 2")))
+    (is (= ["1"] (col c 1 "SELECT 1 EXCEPT ALL SELECT 2")))))
+
 (deftest window-functions-see-the-whole-result-not-the-limited-one
   (with-open [c (jdbc)]
     (seed! c)

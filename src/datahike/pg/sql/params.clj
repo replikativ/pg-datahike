@@ -8,7 +8,7 @@
       time inside tx-data / query structures, replaced by real values
       at Execute time via `substitute-params`.
 
-   2. `*bound-params*` dynamic var: when bound to a 1-indexed vector
+   2. `*bound-params*` dynamic var: when bound to a 0-indexed vector
       of resolved values, translator branches (e.g. the JdbcParameter
       expression) resolve placeholders in-line instead of emitting
       ParamRef. This lets the same translator body serve both
@@ -127,7 +127,7 @@
   (instance? ParamRef x))
 
 (def ^:dynamic *bound-params*
-  "Dynamically bound at Execute time to a 1-indexed vector (or nil if
+  "Dynamically bound at Execute time to a 0-indexed vector (or nil if
    no params). When set, translate-expr's JdbcParameter branch resolves
    placeholders to concrete values in-line; otherwise (Parse time) it
    emits `?pN` in-param vars and records the index in ctx.
@@ -157,6 +157,14 @@
    that :schema doesn't surface (:pg/type and friends). Not meant to
    flow beyond the parse phase — clear it before dispatching to the
    execute path."
+  nil)
+
+(def ^:dynamic *runtime-db*
+  "The live statement snapshot while a translated query executes.
+
+   Runtime subquery functions must read through this binding rather than a
+   parse-time db captured in their closure; prepared statements otherwise
+   keep returning answers from the snapshot on which they were prepared."
   nil)
 
 (defn registered-enum-values
@@ -300,6 +308,16 @@
    a map {alias-name → {col-name → literal}} used by the Column branches
    of translate-expr and eval-update-expr to substitute row-level values
    for references like `src.col` to the current FROM row."
+  nil)
+
+(def ^:dynamic *from-binding-oids*
+  "Static PostgreSQL types for values supplied through `*from-bindings*`.
+
+   Correlated subqueries are analyzed before any outer row exists. During
+   that pass their outer references are represented by SQL NULL values, so
+   the values themselves cannot carry a useful type. This parallel
+   `{alias -> {column -> oid}}` map preserves each outer column's declared
+   type without inventing a representative runtime value."
   nil)
 
 (def ^:dynamic *from-source-aliases*

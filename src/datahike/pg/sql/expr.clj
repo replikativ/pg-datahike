@@ -42,6 +42,7 @@
    `:in-args`, `:param-placeholders`, `:entity-vars`, `:col->var`)."
   (:require [clojure.set :as set]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.sql.oid-infer :as oid-infer]
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
@@ -55,6 +56,7 @@
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
+            [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -76,7 +78,8 @@
             Addition Subtraction Multiplication Division Modulo Concat
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
-            PlainSelect SelectItem AllColumns ParenthesedSelect Join Values]))
+            PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
+            Select SetOperationList FromItem OrderByElement]))
 
 (set! *warn-on-reflection* true)
 
@@ -107,6 +110,12 @@
          check-comparison-types!
          translate-function-call
          translate-binary-arith
+         strict-subquery-values
+         analyze-in-subquery!
+         uncorrelated-in-values-var!
+         outer-alias-set
+         correlated-in-var!
+         operand-type-oid
          flatten-json-chain
          interpret-form
          parse-timestamp-string)
@@ -307,6 +316,7 @@
    :schema        (:schema ctx)
    :table-aliases (:table-aliases ctx)
    :default-table (:default-table ctx)
+   :from-binding-oids params/*from-binding-oids*
    :hints         (:hints ctx)})
 
 (defn- source-oid
@@ -2024,28 +2034,96 @@
                    nil)))
              find-elems)])))
 
-(defn correlated-subquery-refs
-  "Given a subquery `inner` (a JSqlParser Select) and the set of
-   `outer-aliases` (lowercased outer FROM aliases/table names), return the
-   set of [outer-alias col] correlation references the inner makes, or nil
-   when uncorrelated.
+(defn- nested-selects-in
+  "Immediate SELECT nodes reachable from `node`; SELECT bodies stay opaque so
+   every child can be analyzed under its own SQL name-resolution scope."
+  [node]
+  (let [seen (java.util.IdentityHashMap.)]
+    (letfn [(walk [n]
+              (cond
+                (nil? n) []
+                (.containsKey seen n) []
+                (instance? Select n) [n]
+                (or (string? n) (number? n) (boolean? n) (keyword? n)) []
+                :else
+                (do
+                  (.put seen n true)
+                  (cond
+                    (instance? java.lang.Iterable n) (mapcat walk n)
+                    (.isArray (class n))
+                    (when-not (.isPrimitive (.getComponentType (class n)))
+                      (mapcat walk n))
+                    (.startsWith (.getName (class n)) "net.sf.jsqlparser.")
+                    (mapcat (fn [^java.lang.reflect.Method m]
+                              (let [mn (.getName m)]
+                                (if (and (zero? (count (.getParameterTypes m)))
+                                         (or (.startsWith mn "get") (.startsWith mn "is"))
+                                         (not= mn "getClass")
+                                         (not= mn "getASTNode")
+                                         (not= mn "getParent")
+                                         (not= mn "getDataType"))
+                                  (try (walk (.invoke m n (object-array 0)))
+                                       (catch Throwable _ []))
+                                  [])))
+                            (.getMethods (class n)))
+                    :else []))))]
+      (vec (walk node)))))
 
-   Detection is lexical -- it finds `alias.col` occurrences of an OUTER alias
-   in the inner SQL (negative-lookbehind so `xt.` doesn't match alias `t`).
-   Robust enough for catalog / introspection shapes; AST-precise detection
-   (which would also respect inner shadowing) is a later refinement."
+(defn- local-item-alias [^FromItem item]
+  (or (try (some-> item .getAlias .getName unquote-ident str/lower-case)
+           (catch Throwable _ nil))
+      (when (instance? Table item)
+        (some-> ^Table item .getName unquote-ident str/lower-case))))
+
+(defn- plain-select-scope-nodes [^PlainSelect ps]
+  (let [joins (or (.getJoins ps) [])
+        group-exprs (try
+                      (some-> ps .getGroupBy .getGroupByExpressionList seq)
+                      (catch Throwable _ nil))]
+    (concat
+     (map #(.getExpression ^SelectItem %) (or (.getSelectItems ps) []))
+     [(.getWhere ps) (.getHaving ps)
+      (try (.getQualify ps) (catch Throwable _ nil))]
+     group-exprs
+     (map #(.getExpression ^OrderByElement %) (or (.getOrderByElements ps) []))
+     (mapcat #(or (.getOnExpressions ^Join %) []) joins))))
+
+(defn correlated-subquery-refs
+  "Return qualified outer-column references in `inner`, respecting every
+   SELECT's FROM/JOIN alias scope, including derived and set-op branches."
   [inner outer-aliases]
-  (when (seq outer-aliases)
-    (let [sql (str inner)
-          refs (for [a outer-aliases
-                     [_ col] (re-seq
-                              (re-pattern
-                               (str "(?i)(?<![\\w.])"
-                                    (java.util.regex.Pattern/quote a)
-                                    "\\.([A-Za-z_][A-Za-z0-9_]*)"))
-                              sql)]
-                 [a (str/lower-case col)])]
-      (not-empty (set refs)))))
+  (letfn [(refs [node visible-outers]
+            (cond
+              (instance? ParenthesedSelect node)
+              (refs (.getSelect ^ParenthesedSelect node) visible-outers)
+
+              (instance? SetOperationList node)
+              (into #{} (mapcat #(refs % visible-outers))
+                    (.getSelects ^SetOperationList node))
+
+              (instance? PlainSelect node)
+              (let [^PlainSelect ps node
+                    joins (or (.getJoins ps) [])
+                    local-items (cons (.getFromItem ps)
+                                      (map #(.getRightItem ^Join %) joins))
+                    locals (into #{} (keep local-item-alias) local-items)
+                    visible (set/difference visible-outers locals)
+                    scope-nodes (plain-select-scope-nodes ps)
+                    own-refs (into #{}
+                                   (keep (fn [^Column col]
+                                           (let [alias (some-> col .getTable .getName
+                                                               unquote-ident str/lower-case)]
+                                             (when (contains? visible alias)
+                                               [alias (-> col .getColumnName
+                                                          unquote-ident str/lower-case)]))))
+                                   (mapcat params/ast-columns scope-nodes))
+                    children (concat (mapcat nested-selects-in scope-nodes)
+                                     (mapcat nested-selects-in local-items))]
+                (into own-refs (mapcat #(refs % visible)) children))
+
+              :else #{}))]
+    (when (seq outer-aliases)
+      (not-empty (refs inner (set outer-aliases))))))
 
 (defn eval-correlated-scalar
   "Evaluate one SQL fragment for a correlated subquery against `query-db`
@@ -2276,6 +2354,14 @@
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           right (.getRightExpression e)
+          inner (when (instance? ParenthesedSelect right)
+                  (.getSelect ^ParenthesedSelect right))
+          corr-refs (when inner
+                      (correlated-subquery-refs inner (outer-alias-set ctx)))
+          _ (when inner
+              (analyze-in-subquery! ctx left-ast inner corr-refs))
+          subquery-values-var (when (and inner (not (seq corr-refs)))
+                                (uncorrelated-in-values-var! ctx inner))
           vals (cond
                  (instance? ParenthesedExpressionList right)
                  (mapv (fn [v]
@@ -2287,45 +2373,29 @@
                          (check-comparison-types! ctx '= left-ast v)
                          (translate-expr ctx v))
                        ^ExpressionList right)
-                 ;; IN (SELECT …) — evaluate the subquery once at
-                 ;; translate-time and lift its result column to a
-                 ;; value list. Same conservative pattern as the
-                 ;; scalar-subquery branch below (translate-expr's
-                 ;; ParenthesedSelect handler): non-correlated only;
-                 ;; correlated subqueries that throw inside the inner
-                 ;; translator fall back to an empty list, which makes
-                 ;; the outer `IN` evaluate to false (or, if wrapped
-                 ;; in `IS NOT TRUE`, to true). Surfaced by Odoo's
-                 ;; view-loading probes that wrap an IN-subquery in
-                 ;; IS NOT TRUE.
+                 ;; Uncorrelated subqueries are safe to execute once while
+                 ;; translating. Correlated ones become a per-row binding;
+                 ;; a failed translation must never masquerade as an empty RHS.
                  (instance? ParenthesedSelect right)
-                 (if-let [parse-fn (:parse-sql ctx)]
-                   (try
-                     (let [inner-sql (str (.getSelect ^ParenthesedSelect right))
-                           parsed   (parse-fn inner-sql (:schema ctx) (:db ctx))
-                           q        (:query parsed)
-                           in-args  (:in-args parsed)
-                           query-db (or (:enriched-db parsed) (:db ctx))
-                           q-fn     d/q
-                           rows     (if (seq in-args)
-                                      (apply q-fn q query-db in-args)
-                                      (q-fn q query-db))]
-                       (mapv (fn [r] (if (sequential? r) (first r) r)) rows))
-                     (catch Throwable _ []))
-                   [])
+                 nil
                  :else
                  (throw (ex-info "IN form unsupported in predicate-expr context"
                                  {:error :feature-not-supported
                                   :feature (str "IN expression form: " (.getName ^Class (type right)))
                                   :expr (str right)})))
           non-null-vals (filterv some? vals)
+          static-null? (not= (count vals) (count non-null-vals))
           has-param? (some symbol? non-null-vals)
-          set-form (if has-param?
+          set-form (cond
+                     subquery-values-var subquery-values-var
+                     has-param?
                      ;; Parameter-laden lists — runtime set construction
                      ;; via in-param fn so each Bind sees the current
                      ;; values. (Same trick we use for IN in WHERE.)
                      (let [fn-param (symbol (str "?in-set" (swap! (:var-counter ctx) inc)))
-                           build (fn [& xs] (set xs))]
+                           build (fn [& xs]
+                                   (cond-> (set xs)
+                                     static-null? (conj :__null__)))]
                        (swap! (:in-params ctx) conj fn-param)
                        (swap! (:in-args ctx) conj build)
                        (let [out-var (ctx/fresh-var! ctx)]
@@ -2336,11 +2406,15 @@
                      ;; is UNKNOWN rather than FALSE when x is not 1 --
                      ;; x might have equalled the unknown element -- so
                      ;; sql-in3? has to be able to see that one was there.
+                     :else
                      (cond-> (set non-null-vals)
-                       (not= (count vals) (count non-null-vals))
-                       (conj :__null__)))
+                       static-null? (conj :__null__)))
           base (list 'datahike.pg.sql/sql-in3? set-form col)]
-      (if not-in? (list 'datahike.pg.sql/sql-not3 base) base))
+      (if (seq corr-refs)
+        (correlated-in-var! ctx col inner corr-refs not-in?)
+        (if not-in?
+          (list 'datahike.pg.sql/sql-not3 (ctx/materialize-arg! ctx base))
+          base)))
 
     ;; col [NOT] LIKE 'pat' inside CASE WHEN. Reuse the LIKE→regex
     ;; compile from translate-predicate (precomputed Pattern literal).
@@ -3418,6 +3492,275 @@
                   (remove nil?))
         (concat (keys (or (:table-aliases ctx) {}))
                 [(:default-table ctx)])))
+
+(defn- throw-subquery-error! [p]
+  (when (= :error (:type p))
+    (throw (ex-info (:message p)
+                    {:error :subquery-error
+                     :sqlstate (or (:sqlstate p) "XX000")}))))
+
+(defn- leaf-output-oids
+  "Visible output OIDs for a translated SELECT leaf. Resolution OIDs retain
+   PostgreSQL UNKNOWN where relevant; declared output OIDs fill the remaining
+   analyzer gaps. Both vectors are already expanded for SELECT *."
+  [p]
+  (throw-subquery-error! p)
+  (let [declared (vec (:select-item-oids p))
+        resolution (vec (:select-item-resolution-oids p))]
+    (mapv #(or (nth resolution % nil) (nth declared % nil))
+          (range (count declared)))))
+
+(defn- parsed-output-oids
+  "Return a parsed SELECT/set-operation's visible output OIDs, validating
+   equal branch widths while resolving set operations left-associatively."
+  [p]
+  (throw-subquery-error! p)
+  (if (= :set-operation (:type p))
+    (let [branches (mapv leaf-output-oids (:sub-results p))
+          width (count (first branches))]
+      (when-not (and (seq branches) (every? #(= width (count %)) branches))
+        (throw (errors/pg-error
+                :syntax-error
+                {:message "each UNION query must have the same number of columns"})))
+      (reduce (fn [left right]
+                (mapv #(types/select-common-type [%1 %2] "UNION" true)
+                      left right))
+              (first branches)
+              (rest branches)))
+    (leaf-output-oids p)))
+
+(defn- reject-unapplied-subquery-stages! [p]
+  ;; This evaluator sits below the wire SELECT executor. Until these stages
+  ;; share one execution pipeline, an explicit 0A000 is safer than consuming
+  ;; plausible-looking raw Datalog rows with SQL semantics omitted.
+  (when (or (seq (:project-set p))
+            (seq (:window-specs p))
+            (seq (:compound-exprs p))
+            (seq (:correlated-subqueries p))
+            (:distinct-on-n p)
+            (:having p)
+            (:fetch-with-ties? p)
+            (:for-update p)
+            (seq (:deferred-recursive-ctes p))
+            (:sql-limit p)
+            (:sql-offset p))
+    (throw (errors/pg-error
+            :feature-not-supported
+            {:message "this IN subquery requires SELECT post-processing that is not implemented"}))))
+
+(defn- raw-in-subquery-having?
+  "True when a SELECT AST contains a HAVING clause in any set-op branch.
+
+   JSqlParser 5 omits GROUP BY and HAVING from `PlainSelect.toString` when
+   the SELECT has no FROM item.  IN-subquery execution reparses that string,
+   so inspecting only the reparsed plan would silently lose the clause (and
+   can expose a Datahike unknown-var error for aggregate-only SELECTs).  Keep
+   the unsupported-stage boundary on the original AST as well."
+  [select]
+  (cond
+    (instance? ParenthesedSelect select)
+    (raw-in-subquery-having? (.getSelect ^ParenthesedSelect select))
+
+    (instance? SetOperationList select)
+    (boolean (some raw-in-subquery-having?
+                   (.getSelects ^SetOperationList select)))
+
+    (instance? PlainSelect select)
+    (some? (.getHaving ^PlainSelect select))
+
+    :else false))
+
+(defn- run-subquery-leaf
+  [p db]
+  (throw-subquery-error! p)
+  (reject-unapplied-subquery-stages! p)
+  (let [q (cond-> (:query p)
+            (:limit p) (assoc :limit (:limit p))
+            (:offset p) (assoc :offset (:offset p)))
+        in-args (:in-args p)
+        query-db (or (:enriched-db p) db)
+        raw (cond
+              (:literal-rows p) (:literal-rows p)
+              (:literal-row p) [(:literal-row p)]
+              (nil? q)
+              (throw (ex-info "subquery produced no executable query"
+                              {:error :internal-error :sqlstate "XX000"}))
+              (seq in-args) (apply d/q q query-db in-args)
+              :else (d/q q query-db))
+        raw (or (when (and q (empty? (seq raw))) (empty-aggregate-row q)) raw)
+        hidden (long (or (:hidden-count p) 0))]
+    (if (pos? hidden)
+      (mapv (fn [row]
+              (let [v (if (sequential? row) (vec row) [row])]
+                (subvec v 0 (- (count v) hidden))))
+            raw)
+      (mapv #(if (sequential? %) (vec %) [%]) raw))))
+
+(defn- validate-parsed-in-plan! [p]
+  (if (= :set-operation (:type p))
+    (let [ops (:set-ops p)]
+      (when (or (not (apply = ops))
+                (some #{:intersect-all :except-all :unknown} ops))
+        (throw (errors/pg-error
+                :feature-not-supported
+                {:message "mixed or ALL INTERSECT/EXCEPT operations in an IN subquery are not implemented"})))
+      (doseq [branch (:sub-results p)]
+        (throw-subquery-error! branch)
+        (reject-unapplied-subquery-stages! branch)))
+    (reject-unapplied-subquery-stages! p))
+  p)
+
+(defn- run-parsed-subquery
+  [p db]
+  (validate-parsed-in-plan! p)
+  (if (= :set-operation (:type p))
+    (let [output-oids (parsed-output-oids p)
+          rows (mapv (fn [branch]
+                       (mapv #(set-ops/coerce-row % output-oids)
+                             (run-subquery-leaf branch (or (:enriched-db p) db))))
+                     (:sub-results p))]
+      (case (:op p)
+        :union-all (vec (mapcat identity rows))
+        :union (vec (distinct (mapcat identity rows)))
+        :intersect (vec (apply set/intersection (map set rows)))
+        :except (let [[head & tail] rows]
+                  (vec (reduce set/difference (set head) (map set tail))))
+        (vec (mapcat identity rows))))
+    (run-subquery-leaf p db)))
+
+(defn- check-in-output-type! [left-oid right-oid]
+  (when-not (types/comparison-compatible? '= left-oid right-oid)
+    (throw (errors/pg-error
+            :undefined-function
+            {:detail (str "operator does not exist: "
+                          (get types/oid->pg-name left-oid "?") " = "
+                          (get types/oid->pg-name right-oid "?"))
+             :hint "No operator matches the given name and argument types. You might need to add explicit type casts."}))))
+
+(defn- strict-subquery-values
+  "Execute a scalar IN subquery and return every value in its output column.
+
+   Translation errors are SQL answers and must reach the client; multiple
+   rows are expected, but multiple visible columns are not."
+  ([parse-fn inner schema db]
+   (strict-subquery-values parse-fn inner schema db nil {}))
+  ([parse-fn inner schema db left-oid]
+   (strict-subquery-values parse-fn inner schema db left-oid {}))
+  ([parse-fn inner schema db left-oid relation-namespaces]
+   (let [runtime-db params/*runtime-db*
+         ;; Ordinary prepared subqueries must read the current execution
+         ;; snapshot.  Query-local relations (CTEs / derived tables), however,
+         ;; live only in the parse-time enriched DB; replacing that DB with the
+         ;; raw connection snapshot makes their rows disappear.  Extra schema
+         ;; attributes are the stable signal that `db` carries such a virtual
+         ;; relation.  (Catalogs have their own execute-time refresh path.)
+         runtime-schema (when runtime-db
+                          (try (dbi/-schema runtime-db)
+                               (catch Throwable _ nil)))
+         fallback-schema (when db
+                           (try (dbi/-schema db)
+                                (catch Throwable _ nil)))
+         enriched? (and db runtime-schema
+                        (some #(not (contains? runtime-schema %))
+                              (keys fallback-schema)))
+         db (cond
+              (seq relation-namespaces) db
+              enriched? db
+              runtime-db runtime-db
+              :else db)
+         p (binding [ctx/*relation-namespaces* relation-namespaces]
+             (parse-fn (str inner) schema db))
+         oids (parsed-output-oids p)]
+     (when (not= 1 (count oids))
+       (throw (errors/pg-error :syntax-error
+                               {:message "subquery has too many columns"})))
+     (when left-oid (check-in-output-type! left-oid (first oids)))
+     (mapv first (run-parsed-subquery p db)))))
+
+(defn- correlation-oids [ctx corr-refs]
+  (reduce (fn [m [alias col]]
+            (assoc-in m [alias col]
+                      (source-oid ctx (Column. (Table. ^String alias) ^String col))))
+          {} corr-refs))
+
+(defn- analyze-in-subquery!
+  "Analyze an IN subquery once, before scanning the outer relation.
+
+   Outer references are SQL NULL placeholders accompanied by their declared
+   OIDs. This catches missing inner columns, star-expanded arity and operator
+   type errors even when the outer relation contains no rows."
+  [ctx left-ast inner corr-refs]
+  (when (raw-in-subquery-having? inner)
+    (throw (errors/pg-error
+            :feature-not-supported
+            {:message "this IN subquery requires SELECT post-processing that is not implemented"})))
+  (let [parse-fn (:parse-sql ctx)
+        corr-oids (correlation-oids ctx corr-refs)
+        null-bindings (reduce (fn [m [alias col]]
+                                (assoc-in m [alias col] :__null__))
+                              {} corr-refs)
+        parsed (binding [params/*from-bindings* null-bindings
+                         params/*from-binding-oids* corr-oids
+                         params/*lateral-outer-aliases* (set (map first corr-refs))]
+                 (parse-fn (str inner) (:schema ctx) (:db ctx)))
+        _ (validate-parsed-in-plan! parsed)
+        output-oids (parsed-output-oids parsed)]
+    (when (not= 1 (count output-oids))
+      (throw (errors/pg-error :syntax-error
+                              {:message "subquery has too many columns"})))
+    (check-in-output-type! (operand-type-oid ctx left-ast) (first output-oids))
+    parsed))
+
+(defn- uncorrelated-in-values-var!
+  "Bind an uncorrelated IN subquery's values at query execution time."
+  [ctx inner]
+  (let [parse-fn (:parse-sql ctx)
+        schema (:schema ctx)
+        fallback-db (:db ctx)
+        relation-namespaces ctx/*relation-namespaces*
+        fn-param (symbol (str "?in-subquery" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        evaluate (fn []
+                   (strict-subquery-values parse-fn inner schema fallback-db nil
+                                           relation-namespaces))]
+    (reset! (:runtime-subqueries? ctx) true)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj evaluate)
+    (ctx/add-clause! ctx [(list fn-param) result-var])
+    result-var))
+
+(defn- correlated-in-var!
+  "Bind scalar IN/NOT IN as one three-valued result per outer row."
+  [ctx col inner corr-refs not-in?]
+  (let [parse-fn (:parse-sql ctx)
+        schema (:schema ctx)
+        db (:db ctx)
+        relation-namespaces ctx/*relation-namespaces*
+        corr-refs (vec corr-refs)
+        corr-oids (correlation-oids ctx corr-refs)
+        arg-vars (mapv (fn [[a c]]
+                         (translate-expr ctx (Column. (Table. ^String a) ^String c)))
+                       corr-refs)
+        col (if (seq? col) (ctx/materialize-arg! ctx col) col)
+        fn-param (symbol (str "?corr-in" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        eval-in (fn [lhs & outer-vals]
+                  (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
+                                   {} (map vector corr-refs outer-vals))
+                        values (binding [params/*from-bindings* fb
+                                         params/*from-binding-oids* corr-oids
+                                         params/*lateral-outer-aliases*
+                                         (set (map first corr-refs))]
+                                 (strict-subquery-values parse-fn inner schema db nil
+                                                         relation-namespaces))
+                        result (fns/sql-in3? values lhs)]
+                    (if not-in? (fns/sql-not3 result) result)))]
+    (reset! (:runtime-subqueries? ctx) true)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj eval-in)
+    (ctx/add-clause! ctx [(apply list fn-param col arg-vars) result-var])
+    (swap! (:nullable-vars ctx) conj result-var)
+    result-var))
 
 (defn- correlated-scalar-var!
   "Bind a variable to a CORRELATED scalar subquery's value, evaluated once
@@ -5723,6 +6066,14 @@
           left-ast (.getLeftExpression e)
           col (translate-expr ctx left-ast)
           right (.getRightExpression e)
+          inner (when (instance? ParenthesedSelect right)
+                  (.getSelect ^ParenthesedSelect right))
+          corr-refs (when inner
+                      (correlated-subquery-refs inner (outer-alias-set ctx)))
+          _ (when inner
+              (analyze-in-subquery! ctx left-ast inner corr-refs))
+          subquery-values-var (when (and inner (not (seq corr-refs)))
+                                (uncorrelated-in-values-var! ctx inner))
           ;; PG-style typinput: when the LHS is a typed Column, route
           ;; each unknown StringValue in the IN-list through the
           ;; column's typinput. Mirrors `c.oid IN ('16384','16385')`
@@ -5741,26 +6092,7 @@
 
                  ;; Subquery: execute it and extract single-column values
                  (instance? ParenthesedSelect right)
-                 (if-let [db (:db ctx)]
-                   (let [inner-sql (str right)
-                         inner-parsed ((:parse-sql ctx) inner-sql (:schema ctx) db)
-                         inner-query (:query inner-parsed)
-                         inner-in-args (:in-args inner-parsed)
-                         ;; Use enriched-db when subquery has derived tables/CTEs
-                         query-db (or (:enriched-db inner-parsed) db)
-                         inner-results (if (seq inner-in-args)
-                                         (apply d/q
-                                                inner-query query-db inner-in-args)
-                                         (d/q
-                                          inner-query query-db))]
-                     ;; Extract single-column values from results
-                     (mapv (fn [row]
-                             (if (sequential? row) (first row) row))
-                           inner-results))
-                   (throw (ex-info "subquery requires database context"
-                                   {:error :internal-error
-                                    :detail "subquery requires database context (use parse-sql with db parameter)"
-                                    :expr (str right)})))
+                 nil
 
                  :else
                  (throw (ex-info "unsupported IN expression form"
@@ -5786,55 +6118,68 @@
           ;; using the O(1) hash-set predicate.
           has-param? (some symbol? non-null-vals)
           guards (ctx/null-guard-clauses ctx [col])]
-      (cond
+      (if inner
+        (let [result-var (if (seq corr-refs)
+                           (correlated-in-var! ctx col inner corr-refs not-in?)
+                           (let [base (list 'datahike.pg.sql/sql-in3?
+                                            subquery-values-var col)
+                                 form (if not-in?
+                                        (list 'datahike.pg.sql/sql-not3
+                                              (ctx/materialize-arg! ctx base))
+                                        base)]
+                             (ctx/materialize-arg! ctx form)))]
+          ;; WHERE admits only TRUE. SQL UNKNOWN is a truthy sentinel in
+          ;; Clojure, so an identity predicate would incorrectly keep it.
+          [[(list 'true? result-var)]])
+        (cond
         ;; NOT IN with NULL in the list → always empty (SQL standard):
         ;; `x NOT IN (…, NULL)` is UNKNOWN for every x that matches
         ;; nothing else, and FALSE for one that does.
-        (and not-in? has-null-val?)
-        [[(list 'not= col col)]]
+          (and not-in? has-null-val?)
+          [[(list 'not= col col)]]
 
         ;; NOT IN with empty list → all rows match (everything is NOT IN {})
-        (and not-in? (empty? non-null-vals))
-        []
+          (and not-in? (empty? non-null-vals))
+          []
 
         ;; NOT IN with parameterised values — emit per-value not= guards
         ;; (one parameter per row of the list). Datahike conjoins them:
         ;; col matches NOT IN iff every (not= col p_i) holds.
-        (and not-in? has-param?)
-        (into guards
-              (mapv (fn [v] [(list 'datahike.pg.sql/sql-ne? col v)]) non-null-vals))
+          (and not-in? has-param?)
+          (into guards
+                (mapv (fn [v] [(list 'datahike.pg.sql/sql-ne? col v)]) non-null-vals))
 
         ;; NOT IN literal list — set-based predicate wrapped in `not`.
         ;; Using `(or-join ...)` with many branches explodes Datahike's
         ;; planner (OOM on large lists). A single `(contains? #{...} ?col)`
         ;; predicate is O(1) per row. NULL col must be filtered via
         ;; null-guard (SQL: NULL NOT IN (…) → UNKNOWN → FALSE).
-        not-in?
-        (let [val-set (set non-null-vals)]
-          (conj guards (list 'not [(list 'contains? val-set col)])))
+          not-in?
+          (let [val-set (set non-null-vals)]
+            (conj guards (list 'not [(list 'contains? val-set col)])))
 
         ;; IN with empty or NULL-only list → nothing matches
-        (empty? non-null-vals)
-        [[(list 'not= col col)]]
+          (empty? non-null-vals)
+          [[(list 'not= col col)]]
 
         ;; IN with parameterised values — or-join across per-value
         ;; equality. Each branch binds the param var to col via `=`.
         ;; `[(= ?col ?p1)]` works because Datahike resolves both vars
         ;; from :in / :where bindings; `(contains? #{?p1} ?col)` does
         ;; NOT (the set member is the var symbol, not its value).
-        has-param?
-        (let [shared-vars (vec (distinct (concat (ctx/collect-vars col)
-                                                 (filter symbol? non-null-vals))))
-              branches (mapv (fn [v]
-                               (list 'and [(list 'datahike.pg.sql/sql-eq? col v)]))
-                             non-null-vals)]
-          (conj guards (apply list 'or-join shared-vars branches)))
+          has-param?
+          (let [shared-vars (vec (distinct (concat (ctx/collect-vars col)
+                                                   (filter symbol? non-null-vals))))
+                branches (mapv (fn [v]
+                                 (list 'and [(list 'datahike.pg.sql/sql-eq? col v)]))
+                               non-null-vals)]
+            (conj guards (apply list 'or-join shared-vars branches)))
 
         ;; IN — set-based predicate (O(1) per row)
         ;; `(contains? #{...} :__null__)` returns false, so positive IN is already null-safe.
-        :else
-        (let [val-set (set non-null-vals)]
-          [[(list 'datahike.pg.sql/sql-in? val-set col)]])))
+          :else
+          (let [val-set (set non-null-vals)]
+            [[(list 'datahike.pg.sql/sql-in? val-set col)]]))))
 
     ;; EXISTS / NOT EXISTS subquery
     (instance? ExistsExpression expr)
