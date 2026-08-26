@@ -226,7 +226,7 @@
    "array_position" types/oid-int4
    "array_remove"  :arg-type
    "array_replace" :arg-type
-   "array_fill"    :arg-type})
+   "array_fill"    :arg-array})
 
 (def sql-aggregate->return-oid
   "Aggregate function → return-OID rule. Three rule shapes:
@@ -569,6 +569,23 @@
       ;; A ::type cast wrapping it overrides via cast-oid.
       (= fname "row") 2249
 
+      ;; Set-returning functions still have an ordinary scalar element type
+      ;; in PostgreSQL's target list. Describe must report that element OID
+      ;; before Execute expands the rows; falling back to TEXT makes binary
+      ;; clients decode int4/int8 bytes as UTF-8.
+      (= fname "generate_series")
+      (let [o (types/select-common-type
+               (mapv #(resolution-oid % env) (take 2 args))
+               "generate_series" false)]
+        (when (contains? #{types/oid-int4 types/oid-int8 types/oid-numeric
+                           types/oid-timestamp types/oid-timestamptz}
+                         o)
+          o))
+
+      (= fname "unnest")
+      (when-let [array-oid (some-> first-arg (expr-oid env))]
+        (get types/array-oid->element-oid array-oid))
+
       ;; Aggregate rule (registered in sql-aggregate->return-oid) —
       ;; delegate to the shared resolver so runtime variant selection
       ;; (in stmt.clj) doesn't have to recompute the same logic.
@@ -579,6 +596,9 @@
         (resolve-aggregate-result-oid fname input-oid))
       (integer? rule) rule
       (= rule :arg-type) (when first-arg (expr-oid first-arg env))
+      (= rule :arg-array)
+      (when-let [element-oid (some-> first-arg (expr-oid env))]
+        (get types/element-oid->array-oid element-oid types/oid-text-array))
       ;; The SECOND argument's type -- `date_trunc(unit, ts)` returns
       ;; whatever ts is.
       (= rule :arg2-type)

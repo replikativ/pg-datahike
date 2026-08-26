@@ -460,7 +460,7 @@
     {:name "limit" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:relational}
-     :blockers #{:backward-cursors :set-returning-projections :planner-explain
+     :blockers #{:backward-cursors :planner-explain
                  :view-ddl :fetch-expression-grammar}
      :strict-slices
      [{:id :aggregate-sibling-scalar
@@ -474,7 +474,35 @@
       {:id :fetch-first-structural-errors
        :source-lines [176 184]
        :gate "test/datahike/test/pg_topk_test.clj"
-       :test-var "test-fetch-first-with-ties-errors"}]}]}
+       :test-var "test-fetch-first-with-ties-errors"}
+      {:id :project-set-order-limit
+       :source-lines [120 145]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "target-list-project-set-order-and-limit"}]}
+    {:name "tsrf" :mode :discovery
+     :boundaries #{:set-returning-projections :expressions :relational}
+     :blockers #{:unprojected-project-set-sort :project-set-in-group-by
+                 :conditional-srf-errors
+                 :aggregate-window-srf-errors :srf-dml-boundaries
+                 :window-project-set-ordering :project-set-distinct-on-ordering
+                 :planner-explain}
+     :strict-slices
+     [{:id :parallel-and-nested-project-set
+       :source-lines [6 26]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "target-list-project-set-parallel-and-nested"}
+      {:id :project-set-empty-base
+       :source-lines [31 34]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "target-list-project-set-respects-empty-base-relation"}
+      {:id :project-set-ordering
+       :source-lines [43 48]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "target-list-project-set-order-and-limit"}
+      {:id :project-set-ctas
+       :source-lines [109 109]
+       :gate "test/datahike/test/pg_srf_rows_test.clj"
+       :test-var "project-set-is-consumed-by-data-producing-statements"}]}]}
 
   {:id 3
    :name "specialized application types"

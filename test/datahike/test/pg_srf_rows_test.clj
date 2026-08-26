@@ -27,6 +27,9 @@
 
 (defn- run [sql] (.execute *handler* sql))
 (defn- rows [sql] (mapv vec (.-rows ^PgWireServer$QueryResult (run sql))))
+(defn- state [sql]
+  (try (.-sqlstate ^PgWireServer$QueryResult (run sql))
+       (catch Exception e (:sqlstate (ex-data e)))))
 
 (deftest virtual-tables-carry-a-row-marker
   (testing "without a row-existence marker `count(*)` and `SELECT *` had
@@ -38,6 +41,78 @@
     (is (= [["10"]] (rows "SELECT count(g) FROM generate_series(1,10) g")))
     (is (= [["3"]] (rows "SELECT count(*) FROM unnest(ARRAY[1,2,3]) u")))
     (is (= [["1"] ["2"] ["3"]] (rows "SELECT * FROM generate_series(1,3) g")))))
+
+(deftest target-list-project-set-parallel-and-nested
+  ;; PostgreSQL 17 tsrf.sql:6-26. SRFs at one expression depth advance in
+  ;; parallel; a shorter result is NULL-padded. Nested SRFs form another
+  ;; ProjectSet level, so the outer function runs once for every inner row.
+  (is (= [["1" "1"] ["2" "2"] [nil "3"] [nil "4"]]
+         (rows "SELECT generate_series(1,2), generate_series(1,4)")))
+  (is (= [["1"] ["1"] ["2"] ["1"] ["2"] ["3"]]
+         (rows "SELECT generate_series(1, generate_series(1,3))")))
+  (is (= [["1" "2"] ["1" "3"] ["2" "3"]
+          ["1" "4"] ["2" "4"] ["3" "4"]]
+         (rows "SELECT generate_series(1, generate_series(1,3)),
+                       generate_series(2,4)"))))
+
+(deftest target-list-project-set-order-and-limit
+  ;; PostgreSQL limit.sql:120-145. Base ORDER BY runs below ProjectSet and
+  ;; LIMIT above it; an ORDER BY that references the SRF output moves above
+  ;; ProjectSet. The argument may depend on each base row.
+  (run "CREATE TABLE ps_t (id integer PRIMARY KEY, n integer)")
+  (run "INSERT INTO ps_t VALUES (1,2), (2,3)")
+  (is (= [["2" "1"] ["2" "2"] ["2" "3"] ["1" "1"]]
+         (rows "SELECT id, generate_series(1,3) AS g
+                FROM ps_t ORDER BY id DESC LIMIT 4")))
+  (is (= [["1" "2"] ["1" "1"] ["2" "3"] ["2" "2"] ["2" "1"]]
+         (rows "SELECT id, generate_series(1,n) AS g
+                FROM ps_t ORDER BY id, g DESC")))
+  (is (= [["1" "3"] ["1" "2"] ["1" "1"]
+          ["2" "3"] ["2" "2"] ["2" "1"]]
+         (rows "SELECT id, generate_series(1,3) AS g
+                FROM ps_t ORDER BY id, generate_series(1,3) DESC")))
+  (is (= [["2"] ["1"] ["0"]]
+         (rows "SELECT generate_series(0,2) AS s
+                ORDER BY s DESC")))
+  (is (= 3
+         (count
+          (rows "SELECT unnest(array_fill('2020-01-02 03:04:05'::timestamp,
+                                          ARRAY[3]))")))))
+
+(deftest target-list-project-set-respects-empty-base-relation
+  (run "CREATE TABLE ps_empty (id integer PRIMARY KEY)")
+  (run "INSERT INTO ps_empty VALUES (1)")
+  (is (= [] (rows "SELECT generate_series(1,3) FROM ps_empty WHERE false"))))
+
+(deftest project-set-rejects-unsupported-stage-orderings
+  (testing "window functions must see base rows before ProjectSet expansion"
+    (is (= "0A000"
+           (state "SELECT row_number() OVER (), generate_series(1,2)"))))
+  (testing "DISTINCT ON can sit on either side of ProjectSet depending on its keys"
+    (is (= "0A000"
+           (state "SELECT DISTINCT ON (generate_series(1,2))
+                          generate_series(1,2)")))))
+
+(deftest project-set-is-consumed-by-data-producing-statements
+  ;; ProjectSet is a logical executor stage. Statements which execute a
+  ;; translated SELECT directly must materialise it before trimming the
+  ;; hidden SRF argument columns or persisting the rows.
+  (run "CREATE TABLE ps_insert (id integer PRIMARY KEY)")
+  (is (= "INSERT 0 3"
+         (.-commandTag ^PgWireServer$QueryResult
+          (run "INSERT INTO ps_insert SELECT generate_series(1,3)"))))
+  (is (= [["1"] ["2"] ["3"]]
+         (rows "SELECT id FROM ps_insert ORDER BY id")))
+
+  (run "CREATE TABLE ps_ctas AS SELECT generate_series(1,3) AS id")
+  (is (= [["1"] ["2"] ["3"]]
+         (rows "SELECT id FROM ps_ctas ORDER BY id")))
+
+  (is (= [["1"] ["2"] ["3"] ["4"]]
+         (rows "SELECT generate_series(1,2) AS id
+                UNION ALL
+                SELECT generate_series(3,4) AS id
+                ORDER BY id"))))
 
 (deftest insert-select-from-a-set-returning-function
   (testing "the source query ran against the PLAIN db, where the virtual

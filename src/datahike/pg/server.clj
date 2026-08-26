@@ -5208,6 +5208,7 @@
              (nil? (:correlated-subqueries parsed))
              (nil? (:compound-exprs parsed))
              (nil? (:window-specs parsed))
+             (nil? (:project-set parsed))
              (nil? (:for-update parsed))
              (not (:has-aggregates? parsed))
              (not (:has-distinct? parsed))
@@ -5313,6 +5314,7 @@
                 having has-aggregates? has-distinct?
                 in-args hidden-count compound-exprs window-specs
                 sql-order-by sql-limit sql-offset fetch-with-ties?
+                project-set project-order-by project-limit project-offset
                 enriched-db literal-row literal-rows for-update]} parsed]
     (if (or literal-row literal-rows)
       ;; Table-free SELECT: return literal row(s) directly.
@@ -5481,6 +5483,30 @@
                                   (take-with-ties sql-limit null-safe-cmp offset-results)
                                   (cond->> offset-results
                                     sql-limit (take sql-limit))))))))
+                      results)
+            ;; PostgreSQL's ProjectSet sits above the base scan/sort and below
+            ;; the final LIMIT. SRF arguments ride as hidden query columns;
+            ;; expand each base row now, zip multiple SRFs to the longest with
+            ;; NULL padding, and only then apply an SRF-output ORDER BY and the
+            ;; statement's OFFSET/LIMIT.
+            results (if (seq project-set)
+                      (stmt/apply-project-set results project-set)
+                      results)
+            results (if (seq project-order-by)
+                      (sort (null-safe-order-cmp project-order-by) results)
+                      results)
+            results (if (seq project-set)
+                      (let [offset-results (cond->> results
+                                             project-offset (drop project-offset))]
+                        (if (and fetch-with-ties?
+                                 (or (seq project-order-by)
+                                     (seq sql-order-by)))
+                          (take-with-ties project-limit
+                                          (null-safe-order-cmp
+                                           (or project-order-by sql-order-by))
+                                          offset-results)
+                          (cond->> offset-results
+                            project-limit (take project-limit))))
                       results)
             ;; DISTINCT ON (exprs): keep the FIRST row of each run sharing
             ;; those expressions. They are the leading ORDER BY keys, so the
@@ -6668,11 +6694,27 @@
         ;; (or similar) to :find for server-side sort, which must
         ;; not leak into UNION/INTERSECT/EXCEPT row comparison or
         ;; the returned result shape.
-        exec-sub (fn [{:keys [query in-args find-aliases hidden-count]}]
+        exec-sub (fn [{:keys [query in-args find-aliases hidden-count
+                              project-set project-order-by project-limit
+                              project-offset fetch-with-ties?]}]
                    (let [q-input (assoc query :cancel (current-cancel))
                          raw (if (seq in-args)
                                (apply d/q q-input query-db in-args)
                                (run-param-query q-input #(d/q q-input query-db)))
+                         raw (if (seq project-set)
+                               (stmt/apply-project-set raw project-set)
+                               raw)
+                         project-cmp (when (seq project-order-by)
+                                       (null-safe-order-cmp project-order-by))
+                         raw (if project-cmp (sort project-cmp raw) raw)
+                         raw (if (seq project-set)
+                               (let [offset-rows (cond->> raw
+                                                   project-offset (drop project-offset))]
+                                 (if (and fetch-with-ties? project-cmp)
+                                   (take-with-ties project-limit project-cmp offset-rows)
+                                   (cond->> offset-rows
+                                     project-limit (take project-limit))))
+                               raw)
                          hc (or hidden-count 0)
                          visible (- (count (:find query)) hc)
                          results (if (pos? hc)
