@@ -4,7 +4,9 @@
 -- Run only against a fresh regression database after `bb pg-regress
 -- test_setup`. bootstrap-api.sh streams the data after creating these missing
 -- CTAS targets. Client-side \copy uses COPY FROM STDIN, which is both
--- supported by pg-datahike and safe for the server process.
+-- supported by pg-datahike and safe for the server process. It also loads the
+-- supported columns of test_setup's inheritance fixtures; path-backed road
+-- fixtures remain unavailable until that type is implemented.
 
 \set ON_ERROR_STOP on
 

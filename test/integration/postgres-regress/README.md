@@ -77,7 +77,9 @@ fails if either provenance or gate goes stale.
 Tests that consume relations created by another upstream file declare it with
 `:requires`. The wave runner schedules each prerequisite once, before its first
 consumer. For example, selecting the integer suites also runs PostgreSQL's
-unmodified `test_setup.sql`, which creates and populates their shared tables.
+unmodified `test_setup.sql`, then safely populates its shared tables through
+the client protocol. The complete setup and selected tests share one
+automatically removed database.
 
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
 result output, unified diff, and summary. A normal mismatch (`pg_regress`
@@ -92,19 +94,32 @@ omitting only PostgreSQL's rendered `LINE`/caret excerpts.
 
 PostgreSQL's `test_setup.sql` loads `onek` and `tenk` with server-side
 `COPY FROM '/path'` and clones them with CTAS. Enabling arbitrary server-side
-file reads merely for the suite would be unsafe. For relational tests, use a
-fresh database and load the API fixtures through psql's client-side COPY:
+file reads merely for the suite would be unsafe. For relational tests, use the
+fixture runner, which creates a fresh database, runs `test_setup`, loads through
+psql's client-side COPY, runs the selected tests, and removes the database even
+when a test fails:
 
 ```bash
-PG_REGRESS_DB=regress_api bb pg-regress test_setup
-PG_REGRESS_DB=regress_api bb pg-regress-bootstrap
-PG_REGRESS_DB=regress_api bb pg-regress case subselect union join aggregates
+PG_REGRESS_DB=datahike bb pg-regress-with-fixtures case subselect union join aggregates
 ```
 
-The bootstrap creates `onek2`/`tenk2` when `test_setup` could not and streams
-the unmodified upstream data into all four tables. It is intentionally a
-one-shot operation: rerunning it appends the fixture rows again, so use a fresh
-regression database for each independent baseline.
+`PG_REGRESS_DB` names the administrative database and is never removed. Only
+the generated `pgdh_regress_fixture_*` database is dropped. The server must be
+configured with SQL database provisioning, just as for
+`PG_REGRESS_ISOLATE=1`. Campaign waves choose this runner automatically when a
+selected test declares `test_setup` as a prerequisite. The bootstrap verifies
+the exact row counts instead of accepting partial writes, and its output is
+retained as `bootstrap.log` beside the setup and target artifacts.
+
+The fixture restores `onek`, `tenk`, and `person` through client-side COPY. For
+PostgreSQL's inherited `emp`, `student`, and `stud_emp` tables it loads the
+declared scalar columns from the original rows, which makes independent
+aggregate and DML behavior measurable without claiming inheritance support.
+The `road` family remains unavailable because PostgreSQL `path` and inherited
+column layouts are not implemented; campaign diffs that touch those surfaces
+remain classified compatibility gaps. The lower-level `pg-regress-bootstrap`
+task remains available for diagnosing fixture loading in a caller-managed
+fresh database.
 
 ## Reading the baseline
 

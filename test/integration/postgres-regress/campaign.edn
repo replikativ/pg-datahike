@@ -188,6 +188,7 @@
        :gate "test/datahike/test/pg_type_resolution_test.clj"
        :test-var "postgres-money-arithmetic-slice"}]}
     {:name "arrays" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:array-codec :array-expressions :polymorphism}
      :blockers #{:postgres-vector-types :create-function}}
     {:name "uuid" :mode :discovery
@@ -237,9 +238,11 @@
      :blockers #{:search-path-completeness :temporary-namespaces
                  :catalog-roles :create-function}}
     {:name "rangefuncs" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:set-returning-functions :lateral :parameter-inference}
      :blockers #{:create-function :fixture-dependencies}}
     {:name "explain" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:utility-grammar :errors}
      :blockers #{:postgres-planner-output :helper-functions}
      :strict-slices
@@ -387,19 +390,23 @@
      :boundaries #{:aggregates :grouping :having :errors}
      :blockers #{}}
     {:name "subselect" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:relational :name-resolution}
      :blockers #{:subquery-datalog-shapes :correlated-subqueries
                  :any-all-subqueries :set-returning-functions
-                 :parser-grammar :unsupported-ddl :lateral-outer-join}
+                 :parser-grammar :unsupported-ddl :lateral-outer-join
+                 :path-inheritance-fixtures}
      :strict-slices
      [{:id :redundant-derived-parentheses
        :source-lines [13 16]
        :gate "test/datahike/test/pg_derived_join_test.clj"
        :test-var "redundant-parentheses-around-derived-relations"}]}
     {:name "union" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:relational :common-types}
      :blockers #{:values-cte :planner-explain :advanced-types :create-function}}
     {:name "join" :mode :discovery
+     :requires ["test_setup" "create_misc"]
      :boundaries #{:relational}
      :blockers #{:planner-explain :correlated-planner-stress :advanced-join-plans
                  :unsupported-ddl}
@@ -413,6 +420,7 @@
        :gate "test/datahike/test/pg_lateral_srf_test.clj"
        :test-var "postgres-right-full-lateral-reference-slice"}]}
     {:name "aggregates" :mode :discovery
+     :requires ["test_setup" "create_aggregate"]
      :boundaries #{:aggregates}
      :blockers #{:regression-aggregate-functions :custom-aggregates
                  :planner-explain :correlated-planner-stress}
@@ -422,12 +430,14 @@
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
        :test-var "corr-resolves-unknown-literals-as-float8"}]}
     {:name "window" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:windows :aggregates :expressions}
      :blockers #{:window-groups-frames :window-exclusion
                  :custom-functions :custom-aggregates
                  :nested-analytic-expressions :window-find-shapes
                  :interval-structural-type}}
     {:name "with" :mode :discovery
+     :requires ["test_setup" "create_misc"]
      :boundaries #{:ctes :recursive-queries}
      :blockers #{:cte-multiple-reference :recursive-cte-lowering
                  :recursive-views :demand-driven-recursion
@@ -484,6 +494,7 @@
        :gate "test/datahike/test/pg_srf_rows_test.clj"
        :test-var "target-list-project-set-order-and-limit"}]}
     {:name "tsrf" :mode :discovery
+     :requires ["test_setup"]
      :boundaries #{:set-returning-projections :expressions :relational}
      :blockers #{:unprojected-project-set-sort :project-set-in-group-by
                  :conditional-srf-errors

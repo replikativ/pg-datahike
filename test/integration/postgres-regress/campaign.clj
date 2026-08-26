@@ -205,15 +205,20 @@
       (when (and mode (not ((:modes campaign) mode)))
         (fail! (str "unknown mode: " mode-arg)))
       (let [tests (cond->> (:tests wave) mode (filter #(= mode (:mode %))))
-            names (->> tests
-                       (mapcat #(concat (:requires %) [(:name %)]))
+            prerequisites (->> tests (mapcat :requires) distinct vec)
+            api-fixtures? (some #{"test_setup"} prerequisites)
+            names (->> (concat (remove #{"test_setup"} prerequisites)
+                               (map :name tests))
                        distinct
                        vec)]
         (when (empty? names) (fail! "selection contains no tests"))
         (println (str "running wave " wave-id
                       (when mode (str " mode " (clojure.core/name mode)))
                       ": " (str/join " " names)))
-        (let [runner ["bash" (str (fs/file here "run.sh"))]
+        (let [runner ["bash" (str (fs/file here
+                                           (if api-fixtures?
+                                             "run-with-api-fixtures.sh"
+                                             "run.sh")))]
               command (if (= mode :strict)
                         (into ["env" "PG_REGRESS_API_STRICT=1"] runner)
                         runner)]
