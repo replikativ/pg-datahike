@@ -429,10 +429,18 @@
                  :recursive-views :demand-driven-recursion
                  :recursive-type-inference}
      :strict-slices
-     [{:id :recursive-set-operation-shape
+     [{:id :recursive-scalar-values-anchor
+       :source-lines [27 32]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "postgres-recursive-scalar-values-anchor"}
+      {:id :recursive-set-operation-shape
        :source-lines [916 924]
        :gate "test/datahike/test/pg_sql_cte_test.clj"
        :test-var "postgres-recursive-set-operation-shape-slice"}
+      {:id :malformed-recursive-self-references
+       :source-lines [930 935]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "malformed-recursive-self-references-fail-before-lowering"}
       {:id :recursive-outer-join
        :source-lines [977 992]
        :gate "test/datahike/test/pg_sql_cte_test.clj"
@@ -440,7 +448,15 @@
       {:id :recursive-clause-restrictions
        :source-lines [1000 1017]
        :gate "test/datahike/test/pg_sql_cte_test.clj"
-       :test-var "postgres-recursive-clause-restrictions-slice"}]}
+       :test-var "postgres-recursive-clause-restrictions-slice"}
+      {:id :inherited-implicit-insert
+       :source-lines [1661 1667]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "implicit-insert-column-order-includes-inherited-columns"}
+      {:id :cte-dml-target-resolution
+       :source-lines [1759 1766]
+       :gate "test/datahike/test/pg_sql_cte_test.clj"
+       :test-var "cte-names-are-not-writable-relations"}]}
     {:name "limit" :mode :discovery
      :boundaries #{:relational}
      :blockers #{:backward-cursors :set-returning-projections :planner-explain

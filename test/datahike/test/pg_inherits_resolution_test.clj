@@ -106,6 +106,14 @@
   (is (= "c" (v "SELECT cname FROM chi WHERE id = 1")))
   (is (= "c" (v "SELECT c.cname FROM chi c WHERE c.id = 1"))))
 
+(deftest implicit-insert-column-order-includes-inherited-columns
+  ;; PostgreSQL orders inherited columns before the child's own columns when
+  ;; INSERT omits its target list. The child's persisted column-order contains
+  ;; only `cname`, so translation must prepend the parent's order explicitly.
+  (.execute *handler* "INSERT INTO chi VALUES (3, 'r', 30, 'e')")
+  (is (= [["3" "r" "30" "e"]]
+         (rows "SELECT id, pname, pnum, cname FROM chi WHERE id = 3"))))
+
 (deftest the-parent-table-is-unaffected
   (.execute *handler* "INSERT INTO par (id, pname, pnum) VALUES (9, 'z', 90)")
   (is (= "z" (v "SELECT p.pname FROM par p WHERE p.id = 9")))
