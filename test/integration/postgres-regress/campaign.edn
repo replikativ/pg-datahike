@@ -400,7 +400,11 @@
      [{:id :redundant-derived-parentheses
        :source-lines [13 16]
        :gate "test/datahike/test/pg_derived_join_test.clj"
-       :test-var "redundant-parentheses-around-derived-relations"}]}
+       :test-var "redundant-parentheses-around-derived-relations"}
+      {:id :correlated-exists-disjunction
+       :source-lines [579 590]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "correlated-exists-is-safe-in-boolean-composition"}]}
     {:name "union" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:relational :common-types}

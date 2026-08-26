@@ -17,6 +17,7 @@
   (:import [java.sql Connection DriverManager]))
 
 (def ^:dynamic *port* nil)
+(def ^:dynamic *conn* nil)
 
 (defn cs-fixture [f]
   (pg/reset-lock-registry!)
@@ -26,7 +27,7 @@
     (d/create-database cfg)
     (let [conn (d/connect cfg)
           {:keys [server]} (pg/start-server {"cs" conn} {:port 0})]
-      (try (binding [*port* (.getPort server)] (f))
+      (try (binding [*port* (.getPort server) *conn* conn] (f))
            (finally (.stop server) (d/release conn) (d/delete-database cfg))))))
 
 (use-fixtures :each cs-fixture)
@@ -158,6 +159,78 @@
       (is (= "42883"
              (sqlstate c (str "SELECT k FROM empty_outer o WHERE k IN "
                               "(SELECT v FROM text_inner i WHERE i.owner = o.k)")))))))
+
+(deftest correlated-exists-is-safe-in-boolean-composition
+  (with-open [c (jdbc)]
+    (seed! c)
+    (testing "EXISTS inside OR does not leak its inner scan into the outer query"
+      (is (= "2"
+             (one c (str "SELECT count(*) FROM p o WHERE "
+                         "(EXISTS (SELECT 1 FROM ch i WHERE i.pid = o.id) OR o.id < 0)")))))
+    (testing "NOT EXISTS remains two-valued"
+      (is (= ["3"]
+             (col c 1 (str "SELECT id FROM p o WHERE NOT EXISTS "
+                           "(SELECT 1 FROM ch i WHERE i.pid = o.id) ORDER BY id")))))
+    (testing "nested correlated shapes fail explicitly instead of running an N+1 plan"
+      (is (= "0A000"
+             (sqlstate c (str "SELECT id FROM p o WHERE EXISTS "
+                              "(SELECT 1 FROM ch i WHERE o.id IN "
+                              "(SELECT pid FROM ch j WHERE j.id = i.id)) ORDER BY id")))))
+    (testing "an empty outer relation cannot hide inner analyzer errors"
+      (exec! c "CREATE TABLE no_parents (id int)")
+      (is (= "42703"
+             (sqlstate c (str "SELECT id FROM no_parents o WHERE EXISTS "
+                              "(SELECT 1 FROM ch i WHERE i.missing = o.id)")))))
+    (testing "correlation preserves PostgreSQL cross-storage numeric equality"
+      (exec! c "CREATE TABLE numeric_outer (id numeric)")
+      (exec! c "CREATE TABLE float_inner (id double precision)")
+      (exec! c "INSERT INTO numeric_outer VALUES (1.5)")
+      (exec! c "INSERT INTO float_inner VALUES (1.5)")
+      (is (= "1"
+             (one c (str "SELECT count(*) FROM numeric_outer o WHERE EXISTS "
+                         "(SELECT 1 FROM float_inner i WHERE i.id = o.id)"))))
+      (is (= [["1.5"]]
+             (rows c (str "SELECT o.id FROM numeric_outer o WHERE EXISTS "
+                          "(SELECT 1 FROM float_inner i WHERE i.id = o.id)")))
+          "a projected outer column is already bound before EXISTS lowering"))
+    (testing "floating NaN correlation retains PostgreSQL equality semantics"
+      (exec! c "CREATE TABLE nan_outer (id double precision)")
+      (exec! c "CREATE TABLE nan_inner (id double precision)")
+      (exec! c "INSERT INTO nan_outer VALUES ('NaN')")
+      (exec! c "INSERT INTO nan_inner VALUES ('NaN')")
+      (is (= "1"
+             (one c (str "SELECT count(*) FROM nan_outer o WHERE EXISTS "
+                         "(SELECT 1 FROM nan_inner i WHERE i.id = o.id)")))))))
+
+(deftest prepared-correlated-exists-reuses-a-parameter-across-scopes
+  (with-open [c (jdbc)]
+    (seed! c)
+    (let [handler (pg/make-query-handler *conn*)
+          prepared (.parse handler
+                           (str "SELECT id FROM p o WHERE o.id > $1 AND EXISTS "
+                                "(SELECT 1 FROM ch i WHERE i.pid = o.id AND i.pid > $1) "
+                                "ORDER BY id")
+                           (int-array [23]))
+          result (.executePrepared handler prepared (object-array [nil (long 0)]))]
+      (is (nil? (.error result)) (.error result))
+      (is (= [["1"] ["2"]]
+             (vec (map vec (.rows result))))))))
+
+(deftest prepared-correlated-exists-reads-the-execution-snapshot
+  (with-open [c (jdbc)]
+    (seed! c)
+    (with-open [statement (.prepareStatement
+                           c (str "SELECT id FROM p o WHERE EXISTS "
+                                  "(SELECT 1 FROM ch i WHERE i.pid = o.id) ORDER BY id"))]
+      (letfn [(answers []
+                (with-open [rs (.executeQuery statement)]
+                  (loop [out []]
+                    (if (.next rs)
+                      (recur (conj out (.getString rs 1)))
+                      out))))]
+        (is (= ["1" "2"] (answers)))
+        (exec! c "INSERT INTO ch VALUES (4,3)")
+        (is (= ["1" "2" "3"] (answers)))))))
 
 (deftest in-subquery-result-semantics
   (with-open [c (jdbc)]
