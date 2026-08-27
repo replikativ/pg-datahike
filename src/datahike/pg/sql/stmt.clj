@@ -83,7 +83,7 @@
             PlainSelect SelectItem AllColumns AllTableColumns OrderByElement
             GroupByElement Limit Offset Join
             ParenthesedSelect ParenthesedFromItem SetOperationList
-            Values]
+            Values FromItem]
            [net.sf.jsqlparser.statement.insert Insert]
            [net.sf.jsqlparser.statement.update Update UpdateSet]
            [net.sf.jsqlparser.statement.delete Delete]))
@@ -1978,7 +1978,15 @@
    treats nil as SQL NULL, and the shared one has to be strict about it
    (a Datalog binding that yields nil FILTERS THE ROW)."
   [parse-fn sql subquery? inner-schema query-db]
-  (expr/eval-correlated-scalar parse-fn sql subquery? inner-schema query-db))
+  ;; WHEN and plain THEN/ELSE fragments are reparsed as a no-FROM SELECT.
+  ;; Make their row bindings visible for unqualified references. A full
+  ;; subquery keeps lexical SQL scoping instead: its inner columns must shadow
+  ;; same-named outer columns.
+  (binding [params/*from-source-aliases*
+            (if subquery?
+              params/*from-source-aliases*
+              (set (keys params/*from-bindings*)))]
+    (expr/eval-correlated-scalar parse-fn sql subquery? inner-schema query-db)))
 
 (defn- eval-corr-then
   "Evaluate a CASE branch THEN/ELSE spec with *from-bindings* bound."
@@ -1994,18 +2002,23 @@
   [parse-fn spec fb inner-schema query-db]
   ;; See the server-side twin: without *lateral-outer-aliases* the inner
   ;; translator turns the correlation predicate into an implicit JOIN.
-  (binding [params/*from-bindings* fb
-            *eval-update-db* query-db]
-    (case (:kind spec)
-      :case
-      (let [hit (some (fn [{:keys [when-sql then]}]
-                        (when (true? (eval-corr-scalar parse-fn when-sql false inner-schema query-db))
-                          [(eval-corr-then parse-fn then inner-schema query-db)]))
-                      (:branches spec))]
-        (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
-      ;; Scalar only -- see the server-side twin for why the :case path is
-      ;; deliberately left alone.
-      (binding [params/*lateral-outer-aliases* (set (keys fb))]
+  (let [aliases (set (keys fb))]
+    (binding [params/*from-bindings* fb
+              ;; Outer values are row constants, not inner Datalog
+              ;; relations. Keep the LATERAL scope for the entire CASE
+              ;; because a selected branch may contain its own WITH RECURSIVE
+              ;; query. The empty source set also lets an inner column shadow
+              ;; an outer column with the same name, as PostgreSQL requires.
+              params/*from-source-aliases* #{}
+              params/*lateral-outer-aliases* aliases
+              *eval-update-db* query-db]
+      (case (:kind spec)
+        :case
+        (let [hit (some (fn [{:keys [when-sql then]}]
+                          (when (true? (eval-corr-scalar parse-fn when-sql false inner-schema query-db))
+                            [(eval-corr-then parse-fn then inner-schema query-db)]))
+                        (:branches spec))]
+          (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
         (eval-corr-scalar parse-fn (:inner-sql spec) true inner-schema query-db)))))
 
 (defn resolve-correlated-rows
@@ -2575,26 +2588,11 @@
   "Given a scalar-subquery `inner` (a JSqlParser Select) and the set of
    `outer-aliases` (lowercased outer FROM aliases/table names), return the
    set of [outer-alias col] correlation references the inner makes, or nil
-   when uncorrelated.
-
-   Detection is lexical — it finds `alias.col` occurrences of an OUTER alias
-   in the inner SQL (negative-lookbehind so `xt.` doesn't match alias `t`).
-   Robust enough for catalog / introspection shapes; AST-precise detection
-   (which would also respect inner shadowing) is a later refinement. This is
-   the first slice of the correlated-subquery / LATERAL executor — see
-   doc/design-alignment.md."
+   when uncorrelated. Delegating to the scope-aware AST walker is essential:
+   an inner `FROM other AS t` shadows an outer `t` and must never be replaced
+   by the outer row binding."
   [inner outer-aliases]
-  (when (seq outer-aliases)
-    (let [sql (str inner)
-          refs (for [a outer-aliases
-                     [_ col] (re-seq
-                              (re-pattern
-                               (str "(?i)(?<![\\w.])"
-                                    (java.util.regex.Pattern/quote a)
-                                    "\\.([A-Za-z_][A-Za-z0-9_]*)"))
-                              sql)]
-                 [a (str/lower-case col)])]
-      (not-empty (set refs)))))
+  (expr/correlated-subquery-refs inner outer-aliases))
 
 (defn- unwrap-parens
   "Peel redundant Parenthesis / single-element ParenthesedExpressionList
@@ -2633,7 +2631,7 @@
 
    `:corr-refs` is the set of [outer-alias col] references threaded into
    :find as hidden columns so exec-select can bind *from-bindings* per row."
-  [^net.sf.jsqlparser.expression.Expression e0 outer-aliases]
+  [^net.sf.jsqlparser.expression.Expression e0 outer-aliases single-outer-alias]
   (let [e (unwrap-parens e0)]
     (cond
       (subquery-expr? e)
@@ -2663,7 +2661,25 @@
                                 (let [inner (subquery-inner s)]
                                   (and (instance? PlainSelect inner)
                                        (seq (correlated-subquery-refs inner outer-aliases)))))
-                              subqs)]
+                              subqs)
+            qualified-refs (or (correlated-subquery-refs ce outer-aliases) #{})
+            ;; params/ast-columns treats SELECT nodes as scope boundaries, so
+            ;; these are only the CASE's own WHEN/plain-branch columns. When
+            ;; the outer SELECT has exactly one source, bare CASE columns
+            ;; belong to that row and must ride as hidden correlation inputs
+            ;; too. Multi-source ownership needs schema-aware resolution and
+            ;; is deliberately not guessed here.
+            unqualified-cols (when single-outer-alias
+                               (into #{}
+                                     (keep (fn [^Column col]
+                                             (when (str/blank?
+                                                    (some-> col .getTable .getName))
+                                               (unquote-ident (.getColumnName col)))))
+                                     (params/ast-columns ce)))
+            unqualified-refs (when single-outer-alias
+                               (set (map #(vector single-outer-alias %)
+                                         unqualified-cols)))
+            corr-refs (into qualified-refs (or unqualified-refs #{}))]
         (when correlated?
           {:kind :case
            :branches (mapv (fn [^net.sf.jsqlparser.expression.WhenClause wc]
@@ -2672,7 +2688,7 @@
                            when-clauses)
            :else (then->spec else-expr)
          ;; All outer refs across the whole CASE (WHEN conditions + subqueries).
-           :corr-refs (vec (or (correlated-subquery-refs ce outer-aliases) []))}))
+           :corr-refs (vec corr-refs)}))
 
       :else nil)))
 
@@ -2686,8 +2702,19 @@
     (when parse-fn
       (let [sql (case (:kind spec)
                   :scalar (:inner-sql spec)
-                  :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))]
-        (when sql (first (:select-item-oids (parse-fn sql schema db))))))
+                  :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))
+            fb (reduce (fn [m [alias col]]
+                         (assoc-in m [alias col] :__null__))
+                       {} (:corr-refs spec))
+            aliases (set (keys fb))]
+        ;; OID analysis runs before an outer row exists, but nested WITH
+        ;; queries must still resolve their correlated relation. SQL-NULL
+        ;; placeholders are sufficient to determine the scalar output type.
+        (when sql
+          (binding [params/*from-bindings* fb
+                    params/*from-source-aliases* #{}
+                    params/*lateral-outer-aliases* aliases]
+            (first (:select-item-oids (parse-fn sql schema db)))))))
     (catch Throwable _ nil)))
 
 (def ^:private two-arg-aggs
@@ -3833,12 +3860,21 @@
         outer-aliases (into #{}
                             (comp cat (remove nil?) (map str/lower-case))
                             [(keys table-aliases) (vals table-aliases) [default-table]])
+        single-outer-alias
+        (when (and from-item (empty? joins))
+          (some-> (or (try (some-> ^Alias (.getAlias ^FromItem from-item)
+                                   .getName)
+                           (catch Throwable _ nil))
+                      (when (instance? Table from-item)
+                        (.getName ^Table from-item)))
+                  unquote-ident str/lower-case))
         correlated-subqs
         (when db
           (into []
                 (keep-indexed
                  (fn [i ^SelectItem item]
-                   (when-let [spec (correlated-select-item-spec (.getExpression item) outer-aliases)]
+                   (when-let [spec (correlated-select-item-spec
+                                    (.getExpression item) outer-aliases single-outer-alias)]
                      (assoc spec
                             :out-pos i
                             :alias (or (select-item-alias item) "?column?")
@@ -7488,7 +7524,13 @@
         aliases #{target-name "excluded"}]
     (binding [params/*from-bindings* bindings
               params/*from-binding-oids* binding-oids
-              params/*from-source-aliases* #{target-name}
+              ;; Neither row is an UPDATE ... FROM source.  In particular,
+              ;; counting the materialised target row as one makes a legal
+              ;; `SET v = v + excluded.v` look ambiguous between the target
+              ;; schema and its own binding.  Qualified target references
+              ;; still resolve through *from-bindings*, while unqualified
+              ;; ones resolve through the target schema as PostgreSQL does.
+              params/*from-source-aliases* #{}
               params/*lateral-outer-aliases* aliases]
       (f))))
 

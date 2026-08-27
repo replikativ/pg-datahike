@@ -79,7 +79,7 @@
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
-            Select SetOperationList FromItem OrderByElement]))
+            Select SetOperationList FromItem OrderByElement WithItem]))
 
 (set! *warn-on-reflection* true)
 
@@ -2153,6 +2153,9 @@
               (instance? PlainSelect node)
               (let [^PlainSelect ps node
                     joins (or (.getJoins ps) [])
+                    with-items (or (try (.getWithItemsList ps)
+                                        (catch Throwable _ nil))
+                                   [])
                     local-items (cons (.getFromItem ps)
                                       (map #(.getRightItem ^Join %) joins))
                     locals (into #{} (keep local-item-alias) local-items)
@@ -2167,10 +2170,37 @@
                                                           unquote-ident str/lower-case)]))))
                                    (mapcat params/ast-columns scope-nodes))
                     children (concat (mapcat nested-selects-in scope-nodes)
-                                     (mapcat nested-selects-in local-items))]
-                (into own-refs (mapcat #(refs % visible)) children))
+                                     (mapcat nested-selects-in local-items))
+                    ;; WITH definitions are attached to the SELECT but are
+                    ;; outside the ordinary projection/FROM scope nodes.
+                    ;; They can themselves correlate to an outer query (the
+                    ;; asyncpg domain-type probe does so from a recursive CTE).
+                    with-refs
+                    (mapcat (fn [^WithItem wi]
+                              (when-let [body (try (.getParenthesedStatement wi)
+                                                   (catch Throwable _ nil))]
+                                (refs body visible-outers)))
+                            with-items)]
+                (into own-refs (concat with-refs
+                                       (mapcat #(refs % visible) children))))
 
-              :else #{}))]
+              ;; Expression roots (notably CASE) are not SELECT scopes, but
+              ;; can both refer directly to an outer column and contain scalar
+              ;; SELECTs. `ast-columns` leaves SELECT bodies opaque, so direct
+              ;; CASE references are collected here without leaking through an
+              ;; inner alias scope; each immediate SELECT child is then handled
+              ;; by `refs` under its own FROM shadowing rules.
+              :else
+              (let [own-refs (into #{}
+                                   (keep (fn [^Column col]
+                                           (let [alias (some-> col .getTable .getName
+                                                               unquote-ident str/lower-case)]
+                                             (when (contains? visible-outers alias)
+                                               [alias (-> col .getColumnName
+                                                          unquote-ident str/lower-case)]))))
+                                   (params/ast-columns node))]
+                (into own-refs (mapcat #(refs % visible-outers))
+                      (nested-selects-in node)))))]
     (when (seq outer-aliases)
       (not-empty (refs inner (set outer-aliases))))))
 
@@ -3620,9 +3650,7 @@
             (:having p)
             (:fetch-with-ties? p)
             (:for-update p)
-            (seq (:deferred-recursive-ctes p))
-            (:sql-limit p)
-            (:sql-offset p))
+            (seq (:deferred-recursive-ctes p)))
     (throw (errors/pg-error
             :feature-not-supported
             {:message "this subquery requires SELECT post-processing that is not implemented"}))))
@@ -3649,13 +3677,33 @@
 
     :else false))
 
+(defn- apply-subquery-order-limit
+  "Apply the server-side SELECT tail used when nullable ORDER BY keys keep
+   sorting out of Datalog. Rows still include any hidden sort projections."
+  [rows {:keys [sql-order-by sql-offset sql-limit has-aggregates? limit offset]}]
+  (let [tail-offset (or sql-offset (when has-aggregates? offset))
+        tail-limit (or sql-limit (when has-aggregates? limit))
+        ordered (if sql-order-by
+                  (sort (fn [a b]
+                          (loop [parts (partition 3 sql-order-by)]
+                            (if-let [[idx dir nulls] (first parts)]
+                              (let [c (fns/order-key-cmp (nth a idx nil)
+                                                         (nth b idx nil)
+                                                         dir nulls)]
+                                (if (zero? c) (recur (rest parts)) c))
+                              0)))
+                        rows)
+                  rows)
+        offset-rows (cond->> ordered tail-offset (drop tail-offset))]
+    (vec (cond->> offset-rows tail-limit (take tail-limit)))))
+
 (defn- run-subquery-leaf
   [p db]
   (throw-subquery-error! p)
   (reject-unapplied-subquery-stages! p)
   (let [q (cond-> (:query p)
-            (:limit p) (assoc :limit (:limit p))
-            (:offset p) (assoc :offset (:offset p)))
+            (and (:limit p) (not (:has-aggregates? p))) (assoc :limit (:limit p))
+            (and (:offset p) (not (:has-aggregates? p))) (assoc :offset (:offset p)))
         in-args (:in-args p)
         query-db (or (:enriched-db p) db)
         raw (cond
@@ -3667,6 +3715,7 @@
               (seq in-args) (apply d/q q query-db in-args)
               :else (d/q q query-db))
         raw (or (when (and q (empty? (seq raw))) (empty-aggregate-row q)) raw)
+        raw (apply-subquery-order-limit raw p)
         hidden (long (or (:hidden-count p) 0))]
     (if (pos? hidden)
       (mapv (fn [row]
@@ -3705,19 +3754,8 @@
                        :except (let [[head & tail] rows]
                                  (vec (reduce set/difference (set head) (map set tail))))
                        (vec (mapcat identity rows)))
-            ordered (if-let [spec (:sql-order-by p)]
-                      (sort (fn [a b]
-                              (loop [parts (partition 3 spec)]
-                                (if-let [[idx dir nulls] (first parts)]
-                                  (let [c (fns/order-key-cmp (nth a idx nil)
-                                                             (nth b idx nil)
-                                                             dir nulls)]
-                                    (if (zero? c) (recur (rest parts)) c))
-                                  0)))
-                            combined)
-                      combined)
-            offset-rows (cond->> ordered (:sql-offset p) (drop (:sql-offset p)))]
-        (vec (cond->> offset-rows (:sql-limit p) (take (:sql-limit p))))))
+            result (apply-subquery-order-limit combined p)]
+        result))
     (run-subquery-leaf p db)))
 
 (def ^:private row-op->sym
