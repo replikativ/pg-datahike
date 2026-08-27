@@ -10,7 +10,16 @@
   ;; letting transitive resolution pick the version means a datahike bump
   ;; can silently change bytes already on disk. (jackson-core is contested
   ;; in this tree — transit-java asks for 2.8.7 and loses to jsonista's.)
-  metosin/jsonista                  {:mvn/version "0.3.14"}}
+  metosin/jsonista                  {:mvn/version "0.3.14"}
+  ;; PostgreSQL's built-in english_stem dictionary is generated from the
+  ;; Snowball English algorithm.  Lucene packages that same generated
+  ;; stemmer; query parsing and matching deliberately remain ours so Lucene
+  ;; syntax/ranking cannot leak into PostgreSQL-visible semantics.
+  ;; Stay on Lucene 9 here: its Snowball classes run on pg-datahike's
+  ;; documented JDK 17 baseline. Scriptum/Lucene 10 is a future optional
+  ;; retrieval adapter with a JDK 21 runtime, not a reason to raise the SQL
+  ;; semantic layer's minimum Java version.
+  org.apache.lucene/lucene-analysis-common {:mvn/version "9.12.3"}}
 
  :aliases
  {;; Prep task: compile Java sources before Clojure can load them.

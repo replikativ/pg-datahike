@@ -596,6 +596,13 @@
                                             (str b args))
                                           :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
+                               _ (when (types/unsupported-input-type? base-type)
+                                   (throw (ex-info
+                                           (str "type \"" base-type
+                                                "\" is not supported until its PostgreSQL input parser is implemented")
+                                           {:error :feature-not-supported
+                                            :sqlstate "0A000"
+                                            :type base-type})))
                                ;; Detect array column. JSqlParser exposes
                                ;; the array dimensions via getArrayData()
                                ;; — a list whose size = ndim (entries are

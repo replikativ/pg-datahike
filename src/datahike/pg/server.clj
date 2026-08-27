@@ -6713,6 +6713,13 @@
                               :add-column
                               (for [{:keys [name type]} columns
                                     :let [base-type (str/replace type #"\s*\([^)]*\)" "")
+                                          _ (when (types/unsupported-input-type? base-type)
+                                              (throw (ex-info
+                                                      (str "type \"" base-type
+                                                           "\" is not supported until its PostgreSQL input parser is implemented")
+                                                      {:error :feature-not-supported
+                                                       :sqlstate "0A000"
+                                                       :type base-type})))
                                           dh-type (or (get types/sql-name->dh-type type)
                                                       (get types/sql-name->dh-type base-type)
                                                       :db.type/string)]]

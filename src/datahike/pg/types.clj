@@ -52,6 +52,8 @@
 (def oid-bit      1560)
 (def oid-varbit   1562)
 (def oid-jsonb    3802)
+(def oid-tsvector 3614)
+(def oid-tsquery  3615)
 (def oid-pg-lsn   3220)
 
 ;; Array OIDs — every scalar type has a paired `T[]` OID. PG catalog
@@ -79,6 +81,8 @@
 (def oid-json-array        199)
 (def oid-money-array       791)
 (def oid-jsonb-array       3807)
+(def oid-tsvector-array     3643)
+(def oid-tsquery-array      3645)
 
 (def element-oid->array-oid
   "Scalar element OID → corresponding T[] OID."
@@ -103,7 +107,9 @@
    oid-uuid        oid-uuid-array
    oid-json        oid-json-array
    oid-money       oid-money-array
-   oid-jsonb       oid-jsonb-array})
+   oid-jsonb       oid-jsonb-array
+   oid-tsvector    oid-tsvector-array
+   oid-tsquery     oid-tsquery-array})
 
 (def array-oid->element-oid
   "Inverse of element-oid->array-oid: T[] OID → T OID."
@@ -156,6 +162,44 @@
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
 ;; ============================================================================
+
+(def unsupported-input-types
+  "Catalog types whose OIDs/results are visible, but whose PostgreSQL input
+   parser and canonical storage representation are not implemented yet.
+
+   DDL must reject these explicitly. The generic unknown-type fallback stores
+   arbitrary extension types as strings; letting a built-in type take that
+   path would silently turn malformed values into `text`."
+  #{"tsvector" "tsquery"})
+
+(defn- normalize-type-ident [ident]
+  (let [ident (str/trim ident)]
+    (if (and (str/starts-with? ident "\"")
+             (str/ends-with? ident "\"")
+             (<= 2 (count ident)))
+      ;; Quoted identifiers preserve case. Therefore "tsquery" names the
+      ;; built-in while "TSQUERY" remains a distinct, potentially user-defined
+      ;; type and must not be intercepted by this guard.
+      (-> (subs ident 1 (dec (count ident)))
+          (str/replace "\"\"" "\""))
+      (str/lower-case ident))))
+
+(defn unsupported-input-type? [type-name]
+  (when type-name
+    (let [without-modifiers (-> (str type-name)
+                                str/trim
+                                (str/replace #"\s*\([^)]*\)" "")
+                                (str/replace #"(?:\s*\[\s*\d*\s*\])+$" "")
+                                (str/replace #"(?i)\s+array$" "")
+                                str/trim)
+          parts (str/split without-modifiers #"\.")
+          [schema type-name] (case (count parts)
+                               1 [nil (normalize-type-ident (first parts))]
+                               2 [(normalize-type-ident (first parts))
+                                  (normalize-type-ident (second parts))]
+                               [::unsupported-qualification nil])]
+      (and (or (nil? schema) (= "pg_catalog" schema))
+           (contains? unsupported-input-types type-name)))))
 
 (def sql-name->dh-type
   "Map SQL type names (lowercased) to Datahike :db/valueType keywords.
@@ -452,6 +496,8 @@
    oid-uuid       "uuid"
    oid-json       "json"
    oid-jsonb      "jsonb"
+   oid-tsvector   "tsvector"
+   oid-tsquery    "tsquery"
    oid-pg-lsn     "pg_lsn"
    oid-oid        "oid"
    oid-tid        "tid"}
@@ -611,6 +657,8 @@
    [oid-bit       "bit"       -1  "b"]
    [oid-varbit    "varbit"    -1  "b"]
    [oid-jsonb     "jsonb"     -1  "b"]
+   [oid-tsvector  "tsvector"   -1  "b"]
+   [oid-tsquery   "tsquery"    -1  "b"]
    [oid-pg-lsn    "pg_lsn"     8  "b"]
    [oid-regclass  "regclass"    4  "b"]
    [oid-regtype   "regtype"     4  "b"]
@@ -639,7 +687,9 @@
    [oid-uuid-array        "_uuid"        -1 "b"]
    [oid-json-array        "_json"        -1 "b"]
    [oid-money-array       "_money"       -1 "b"]
-   [oid-jsonb-array       "_jsonb"       -1 "b"]])
+   [oid-jsonb-array       "_jsonb"       -1 "b"]
+   [oid-tsvector-array    "_tsvector"    -1 "b"]
+   [oid-tsquery-array     "_tsquery"     -1 "b"]])
 
 ;; ============================================================================
 ;; Type size for wire protocol RowDescription
@@ -671,6 +721,8 @@
    oid-uuid      16
    oid-json      -1
    oid-jsonb     -1
+   oid-tsvector  -1
+   oid-tsquery   -1
    oid-pg-lsn     8
    oid-oid        4
    ;; Array types are always variable-length on the wire.
@@ -695,7 +747,9 @@
    oid-uuid-array        -1
    oid-json-array        -1
    oid-money-array       -1
-   oid-jsonb-array       -1})
+   oid-jsonb-array       -1
+   oid-tsvector-array    -1
+   oid-tsquery-array     -1})
 
 ;; ============================================================================
 ;; Type resolution — PostgreSQL's category / preferred / implicit-cast
@@ -722,7 +776,7 @@
    oid-interval    :T
    oid-bit         :V  oid-varbit  :V
    oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U
-   oid-pg-lsn      :U})
+   oid-pg-lsn      :U  oid-tsvector :U  oid-tsquery :U})
 
 (def preferred-oids
   "`typispreferred`. One per category among the types we carry: a
