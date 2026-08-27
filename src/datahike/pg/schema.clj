@@ -32,7 +32,11 @@
    unknown name as text, which made `NULL::does_not_exist` appear valid.
    ENUM, DOMAIN, and composite registries remain valid extension points."
   [db type-name]
-  (let [raw (-> (str type-name) str/trim str/lower-case
+  (let [normalized (types/normalize-sql-type-name type-name)
+        invalid-vector-spelling?
+        (and (types/vector-type-spelling? type-name)
+             (not= :vector (types/cast-category normalized)))
+        raw (-> (str normalized) str/trim str/lower-case
                 (str/replace #"\s*\([^)]*\)" ""))
         raw (if (str/ends-with? raw "[]")
               (subs raw 0 (- (count raw) 2))
@@ -50,10 +54,11 @@
                                          :where [['?e attr '?name]]}
                                         db base)))
                           (catch Throwable _ false))))]
-    (boolean (or built-in?
-                 (registered? :datahike.pg.enum/name)
-                 (registered? :datahike.pg.domain/name)
-                 (registered? :datahike.pg.composite/name)))))
+    (boolean (and (not invalid-vector-spelling?)
+                  (or built-in?
+                      (registered? :datahike.pg.enum/name)
+                      (registered? :datahike.pg.domain/name)
+                      (registered? :datahike.pg.composite/name))))))
 
 ;; ============================================================================
 ;; Internal namespace filter

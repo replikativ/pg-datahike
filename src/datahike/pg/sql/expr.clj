@@ -57,7 +57,8 @@
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.set-ops :as set-ops]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.pg.vector :as pg-vector])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
             Alias ArrayExpression Function LongValue DoubleValue StringValue NullValue
@@ -71,7 +72,7 @@
             IsDistinctExpression IsUnknownExpression
             IsNullExpression JsonOperator LikeExpression MinorThan
             MinorThanEquals NotEqualsTo ParenthesedExpressionList
-            RegExpMatchOperator Between]
+            RegExpMatchOperator Between GeometryDistance CosineSimilarity]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.arithmetic
@@ -171,6 +172,31 @@
                 (range) arg-exprs)
           arg-exprs))
       arg-exprs)))
+
+(defn- validate-function-argument-types!
+  "Validate extension-function signatures during analysis. Untyped string and
+   NULL literals remain eligible for PostgreSQL's unknown coercion; a known,
+   incompatible type means function lookup failed and must be 42883, not a
+   later typinput error."
+  [ctx fname arg-exprs]
+  (when-let [expected (get-in fns/sql-function-specs [fname :arg-oids])]
+    (let [actual (mapv (fn [arg]
+                         (when-not (oid-infer/untyped-literal? arg)
+                           (try (source-oid ctx arg)
+                                (catch Throwable _ nil))))
+                       arg-exprs)]
+      (when (some false?
+                  (map (fn [want got] (or (nil? got) (= want got)))
+                       expected actual))
+        (throw (errors/pg-error
+                :undefined-function
+                {:detail (str "function " fname "("
+                              (str/join ", "
+                                        (map #(get types/oid->pg-name % "unknown")
+                                             actual))
+                              ") does not exist")
+                 :hint (str "No function matches the given name and argument "
+                            "types. You might need to add explicit type casts.")}))))))
 
 (def ^:dynamic *conjunctive-where*
   "True while translating top-level AND-ed conjuncts of a WHERE (or an
@@ -487,9 +513,28 @@
   (let [raw-name (str/lower-case (.getName f))
         ;; Strip a leading `pg_catalog.` schema qualifier — pgjdbc &
         ;; friends explicitly qualify their catalog-function calls.
-        fname (if (str/starts-with? raw-name "pg_catalog.")
-                (subs raw-name (count "pg_catalog."))
-                raw-name)
+        unqualified (cond
+                      (str/starts-with? raw-name "pg_catalog.")
+                      (subs raw-name (count "pg_catalog."))
+
+                      (str/starts-with? raw-name "public.")
+                      (subs raw-name (count "public."))
+
+                      :else raw-name)
+        vector-function-names
+        #{"vector_dims" "vector_norm" "l2_distance"
+          "vector_l2_squared_distance" "l1_distance" "inner_product"
+          "cosine_distance"}
+        fname (cond
+                ;; pgvector installs these in its extension schema (public in
+                ;; our compatibility profile), not in pg_catalog.
+                (and (str/starts-with? raw-name "pg_catalog.")
+                     (contains? vector-function-names unqualified)) raw-name
+
+                (and (str/starts-with? raw-name "public.")
+                     (not (contains? vector-function-names unqualified))) raw-name
+
+                :else unqualified)
         ;; The SQL keyword call forms -- `substring(s FROM 1 FOR 2)`,
         ;; `position('a' IN s)`, `trim(BOTH ' ' FROM s)` -- put their
         ;; operands in a NamedExpressionList and leave .getParameters
@@ -497,6 +542,7 @@
         params (or (.getParameters f)
                    (some-> (.getNamedParameters f) .getExpressions))
         arg-exprs (when params (vec params))
+        _ (validate-function-argument-types! ctx fname arg-exprs)
         arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
         lazy-args? (= fname "coalesce")
         raw-args (when arg-exprs
@@ -2279,6 +2325,45 @@
     (row-comparison-expression? expr)
     (translate-row-comparison ctx expr)
 
+    (and (or (instance? EqualsTo expr)
+             (instance? NotEqualsTo expr)
+             (instance? GreaterThan expr)
+             (instance? GreaterThanEquals expr)
+             (instance? MinorThan expr)
+             (instance? MinorThanEquals expr))
+         (let [^net.sf.jsqlparser.expression.BinaryExpression e expr]
+           (or (= types/oid-vector (source-oid ctx (.getLeftExpression e)))
+               (= types/oid-vector (source-oid ctx (.getRightExpression e))))))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
+          op (cond
+               (instance? EqualsTo e) '=
+               (instance? NotEqualsTo e) 'not=
+               (instance? GreaterThan e) '>
+               (instance? GreaterThanEquals e) '>=
+               (instance? MinorThan e) '<
+               :else '<=)
+          _ (check-comparison-types! ctx op
+                                     (.getLeftExpression e)
+                                     (.getRightExpression e))
+          [l r] (translate-value-comparison-operands
+                 ctx (.getLeftExpression e) (.getRightExpression e))
+          cmp (cond
+                (instance? EqualsTo e) zero?
+                (instance? NotEqualsTo e) (complement zero?)
+                (instance? GreaterThan e) pos?
+                (instance? GreaterThanEquals e) #(not (neg? %))
+                (instance? MinorThan e) neg?
+                :else #(not (pos? %)))
+          p (symbol (str "?vector-value-cmp-" (swap! (:var-counter ctx) inc)))]
+      (swap! (:in-params ctx) conj p)
+      (swap! (:in-args ctx) conj
+             (fn [a b]
+               (if (or (nil? a) (nil? b)
+                       (= :__null__ a) (= :__null__ b))
+                 :__null__
+                 (cmp (pg-vector/compare-values a b)))))
+      (list p l r))
+
     ;; The NaN-aware comparisons, as in translate-comparison: PostgreSQL
     ;; sorts NaN above everything, and IEEE-754 answers false for every
     ;; comparison involving one.
@@ -2718,7 +2803,14 @@
         ;; survive — getDataType returns just the base `"int"` and
         ;; exposes the `[]` via getArrayData.
         type-str (when col-data-type
-                   (str/lower-case (str col-data-type)))
+                   (types/normalize-sql-type-name (str col-data-type)))
+        _ (when (and (str/ends-with? type-str "[]")
+                     (= :vector
+                        (types/cast-category
+                         (subs type-str 0 (- (count type-str) 2)))))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "vector arrays are not supported"})))
         _ (when-not (pgs/sql-type-exists? (:db ctx) type-str)
             (throw (errors/pg-error :undefined-object
                                     {:kind "type" :name type-str})))
@@ -2742,6 +2834,7 @@
         is-uuid? (= :uuid cast-cat)
         is-bit? (or (= :bit cast-cat) (= :varbit cast-cat))
         is-array? (= :array cast-cat)
+        is-vector? (= :vector cast-cat)
         enum-values (when (and (nil? cast-cat)
                                (not (contains? types/pg-name->oid type-str)))
                       (params/registered-enum-values (:db ctx) type-str))
@@ -2770,6 +2863,20 @@
         ;; (integer 2) from text '10' (integer 10).
         src-oid (source-oid ctx inner)]
     (cond
+      is-vector?
+      (let [cast1 #(sql-cast/cast-scalar % type-str {:explicit? true})]
+        (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
+          (cast1 inner-raw)
+          (let [fn-param (symbol (str "?cast-vector" (swap! (:var-counter ctx) inc)))
+                result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner-raw)
+                inner-val (if (seq? inner-raw)
+                            (ctx/materialize-arg! ctx inner-raw)
+                            inner-raw)]
+            (swap! (:in-params ctx) conj fn-param)
+            (swap! (:in-args ctx) conj (null-preserving cast1))
+            (swap! (:where-clauses ctx) conj [(list fn-param inner-val) result-var])
+            result-var)))
+
       is-enum?
       (if (and (not (symbol? inner-raw)) (not (seq? inner-raw)))
         (enum-cast inner-raw)
@@ -3447,6 +3554,51 @@
       (list fn-sym
             (if (seq? l) (ctx/materialize-arg! ctx l) l)
             (if (seq? r) (ctx/materialize-arg! ctx r) r)))))
+
+(defn- translate-vector-distance
+  "Lower pgvector's distance operators without involving an ANN index. The
+   exact scalar function is retained as the eventual Proximum recheck path."
+  [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr f]
+  (let [left-expr (.getLeftExpression expr)
+        right-expr (.getRightExpression expr)
+        l-oid (source-oid ctx left-expr)
+        r-oid (source-oid ctx right-expr)
+        op-text (if (instance? GeometryDistance expr)
+                  (.getStringExpression ^GeometryDistance expr)
+                  "<=>")
+        unknown? #(or (instance? StringValue %)
+                      (instance? NullValue %)
+                      (instance? JdbcParameter %)
+                      (instance? JdbcNamedParameter %))
+        _ (when (or (and (not (unknown? left-expr))
+                         (not= types/oid-vector l-oid))
+                    (and (not (unknown? right-expr))
+                         (not= types/oid-vector r-oid))
+                    (and (not= types/oid-vector l-oid)
+                         (not= types/oid-vector r-oid)))
+            (throw (errors/pg-error
+                    :undefined-function
+                    {:detail (str "operator does not exist: "
+                                  (get types/oid->pg-name l-oid "unknown") " "
+                                  op-text " "
+                                  (get types/oid->pg-name r-oid "unknown"))
+                     :hint (str "No operator matches the given name and argument "
+                                "types. You might need to add explicit type casts.")})))
+        l (translate-expr ctx left-expr)
+        r (translate-expr ctx right-expr)
+        l (if (seq? l) (ctx/materialize-arg! ctx l) l)
+        r (if (seq? r) (ctx/materialize-arg! ctx r) r)
+        strict-f (fn [a b]
+                   (if (or (nil? a) (nil? b)
+                           (= :__null__ a) (= :__null__ b))
+                     :__null__
+                     (f (pg-vector/coerce a) (pg-vector/coerce b))))
+        fn-param (symbol (str "?vector-distance" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj strict-f)
+    (swap! (:where-clauses ctx) conj [(list fn-param l r) result-var])
+    result-var))
 
 (defn- generic-bitwise-node?
   [expr]
@@ -4960,6 +5112,16 @@
     ;;
     ;; A leading `~` is re-associated inside translate-binary-arith —
     ;; PG's prefix `~` binds looser than these operators. See there.
+    (instance? GeometryDistance expr)
+    (case (.getStringExpression ^GeometryDistance expr)
+      "<->" (translate-vector-distance ctx expr pg-vector/l2-distance)
+      "<#>" (translate-vector-distance ctx expr pg-vector/negative-inner-product)
+      (throw (errors/pg-error :undefined-function
+                              {:detail (str "operator does not exist: "
+                                            (.getStringExpression ^GeometryDistance expr))})))
+    (instance? CosineSimilarity expr)
+    (translate-vector-distance ctx expr pg-vector/cosine-distance)
+
     (instance? Addition expr) (translate-binary-arith ctx expr '+)
     ;; `jsonb - key` / `jsonb - idx` deletes; only `-` on numbers is
     ;; arithmetic. Routing everything to translate-binary-arith made
@@ -5651,14 +5813,16 @@
   (let [coerce-for-expr
         (fn [typed lit]
           (when (instance? StringValue lit)
-            (when-let [vtype (some-> (source-oid ctx typed)
-                                     types/dh-type-for-oid)]
+            (let [oid (source-oid ctx typed)]
+              (if (= oid types/oid-vector)
+                (pg-vector/coerce (.getNotExcapedValue ^StringValue lit))
+                (when-let [vtype (some-> oid types/dh-type-for-oid)]
               ;; Text expressions need no typinput coercion, and using the
               ;; parser node's raw body here would undo E'' escape decoding.
-              (when-not (= :db.type/string vtype)
-                (coerce/coerce-unknown
-                 (.getNotExcapedValue ^StringValue lit)
-                 vtype parse-timestamp-string)))))]
+                  (when-not (= :db.type/string vtype)
+                    (coerce/coerce-unknown
+                     (.getNotExcapedValue ^StringValue lit)
+                     vtype parse-timestamp-string)))))))]
     [(or (coerce-unknown-literal ctx right left)
          (coerce-for-expr right left)
          left)
@@ -5787,6 +5951,8 @@
                 (nil? (.getArrayConstructor ^Column right))
                 (not (jsonb-column? ctx left))
                 (not (jsonb-column? ctx right))
+                (not= types/oid-vector (source-oid ctx left))
+                (not= types/oid-vector (source-oid ctx right))
                 ;; UPDATE FROM values are constants for this invocation,
                 ;; not a second Datalog relation. This gate is deliberately
                 ;; UPDATE-specific; using *from-bindings* alone also catches
@@ -5876,6 +6042,8 @@
            jsonb-cmp? (and (contains? #{'= 'not=} op)
                            (or (jsonb-column? ctx left)
                                (jsonb-column? ctx right)))
+           vector-cmp? (or (= types/oid-vector (source-oid ctx left))
+                           (= types/oid-vector (source-oid ctx right)))
            [left right] (coerce-comparison-operands ctx left right)
            ;; Each side is either an AST node (translate-expr-bound) or
            ;; a pre-resolved typed Clojure value from coerce-unknown.
@@ -5896,11 +6064,22 @@
                       (fn [a b]
                         (cmp (get rank (str a) Long/MAX_VALUE)
                              (get rank (str b) Long/MAX_VALUE))))
+               p))
+           vector-cmp-param
+           (when vector-cmp?
+             (let [cmp (case op = zero? not= (complement zero?)
+                             < neg? > pos? <= #(not (pos? %)) >= #(not (neg? %)))
+                   p (symbol (str "?vector-cmp-" (swap! (:var-counter ctx) inc)))]
+               (swap! (:in-params ctx) conj p)
+               (swap! (:in-args ctx) conj
+                      (fn [a b] (cmp (pg-vector/compare-values a b))))
                p))]
        (conj guards
              (cond
                enum-cmp-param
                [(list enum-cmp-param l r)]
+               vector-cmp-param
+               [(list vector-cmp-param l r)]
                (and jsonb-cmp? (= op '=))
                [(list 'datahike.pg.sql/jsonb-eq? l r)]
                jsonb-cmp?
@@ -6274,6 +6453,7 @@
         ;; through resolve-column / col-var!.
         (if (and *conjunctive-where*
                  (instance? Column left)
+                 (not= types/oid-vector (source-oid ctx left))
                  (nil? (.getArrayConstructor ^Column left))
                  (instance? JdbcParameter right))
           ;; col = $N in a top-level conjunct: index-seekable data
@@ -6299,6 +6479,7 @@
                     guards (ctx/null-guard-clauses ctx [v])]
                 (conj guards [(list 'datahike.pg.sql/sql-eq? v pv)]))))
           (if (and (instance? Column left)
+                   (not= types/oid-vector (source-oid ctx left))
                    (nil? (.getArrayConstructor ^Column left))
                    (or (instance? LongValue right)
                        (instance? DoubleValue right)

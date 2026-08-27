@@ -590,6 +590,7 @@ public final class PgParamCodec {
             case PgWireServer.OID_JSONB,
                  PgWireServer.OID_JSON ->
                 s;
+            case PgWireServer.OID_VECTOR -> parseVectorText(s);
             // bytea in text form uses `\x…` hex or legacy octal escapes. The
             // existing parse-bytea-hex in sql.clj handles both; leave as string.
             case PgWireServer.OID_BYTEA ->
@@ -666,7 +667,8 @@ public final class PgParamCodec {
             || oid == PgWireServer.OID_NAME
             || oid == PgWireServer.OID_JSON
             || oid == PgWireServer.OID_BYTEA
-            || oid == PgWireServer.OID_JSONB;
+            || oid == PgWireServer.OID_JSONB
+            || oid == PgWireServer.OID_VECTOR;
     }
 
     // ========================================================================
@@ -945,6 +947,29 @@ public final class PgParamCodec {
                     yield out;
                 }
 
+                // vector_send: int16 dimensions, int16 unused, then float4
+                // elements in network byte order (pgvector vector.c).
+                case PgWireServer.OID_VECTOR -> {
+                    float[] values = value instanceof float[] fs
+                        ? fs : parseVectorText(value.toString());
+                    if (values.length < 1 || values.length > 16000) {
+                        throw new PgWireServer.PgProtocolException("22000",
+                            "invalid vector dimensions: " + values.length);
+                    }
+                    for (float v : values) {
+                        if (!Float.isFinite(v)) {
+                            throw new PgWireServer.PgProtocolException("22000",
+                                Float.isNaN(v) ? "NaN not allowed in vector"
+                                               : "infinite value not allowed in vector");
+                        }
+                    }
+                    ByteBuffer out = ByteBuffer.allocate(4 + values.length * 4)
+                                               .order(ByteOrder.BIG_ENDIAN);
+                    out.putShort((short) values.length).putShort((short) 0);
+                    for (float v : values) out.putFloat(v);
+                    yield out.array();
+                }
+
                 default -> {
                     // Array OIDs: route through the array codec which
                     // parses the canonical text form and encodes each
@@ -964,6 +989,12 @@ public final class PgParamCodec {
                     yield null;   // caller falls back to text encoding
                 }
             };
+        } catch (PgWireServer.PgProtocolException e) {
+            // Invalid values of a supported type are errors, not a reason to
+            // silently switch result formats. In particular, text fallback
+            // would let malformed native float[] values bypass vector_send's
+            // invariants and surface as JVM identity strings.
+            throw e;
         } catch (Exception e) {
             return null;  // fall back to text encoding
         }
@@ -1093,6 +1124,37 @@ public final class PgParamCodec {
             case PgWireServer.OID_JSON ->
                 new String(bytes, StandardCharsets.UTF_8);
 
+            // vector_recv: reject malformed lengths, the reserved header
+            // field, invalid dimensions, and non-finite elements before the
+            // value can reach Datahike storage.
+            case PgWireServer.OID_VECTOR -> {
+                if (bytes.length < 4) {
+                    throw new PgWireServer.PgProtocolException("22P03",
+                        "invalid binary representation for type vector");
+                }
+                int dim = Short.toUnsignedInt(buf.getShort());
+                int unused = Short.toUnsignedInt(buf.getShort());
+                if (dim < 1 || dim > 16000) {
+                    throw new PgWireServer.PgProtocolException("22000",
+                        "invalid binary representation for type vector");
+                }
+                if (unused != 0 || bytes.length != 4 + dim * 4) {
+                    throw new PgWireServer.PgProtocolException("22P03",
+                        "invalid binary representation for type vector");
+                }
+                float[] values = new float[dim];
+                for (int i = 0; i < dim; i++) {
+                    float v = buf.getFloat();
+                    if (!Float.isFinite(v)) {
+                        throw new PgWireServer.PgProtocolException("22000",
+                            Float.isNaN(v) ? "NaN not allowed in vector"
+                                           : "infinite value not allowed in vector");
+                    }
+                    values[i] = v;
+                }
+                yield values;
+            }
+
             // Array OIDs: decode through the array codec, returning the
             // canonical text form so downstream coerce-pg-array hits the
             // existing from-pg-text path. NULL elements re-emit as the
@@ -1114,5 +1176,59 @@ public final class PgParamCodec {
                     + " (use text parameter format)");
             }
         };
+    }
+
+    private static float[] parseVectorText(String input) {
+        String s = input.trim();
+        if (s.length() < 3 || s.charAt(0) != '[' || s.charAt(s.length() - 1) != ']') {
+            throw new PgWireServer.PgProtocolException("22P02",
+                "invalid input syntax for type vector: \"" + input + "\"");
+        }
+        String body = s.substring(1, s.length() - 1).trim();
+        if (body.isEmpty()) {
+            throw new PgWireServer.PgProtocolException("22000",
+                "vector must have at least 1 dimension");
+        }
+        String[] parts = body.split(",", -1);
+        if (parts.length > 16000) {
+            throw new PgWireServer.PgProtocolException("54000",
+                "vector cannot have more than 16000 dimensions");
+        }
+        float[] result = new float[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            String token = parts[i].trim();
+            if (!token.matches(
+                    "[+-]?(?:(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?|(?i:NaN|Inf(?:inity)?))")) {
+                throw new PgWireServer.PgProtocolException("22P02",
+                    "invalid input syntax for type vector: \"" + input + "\"");
+            }
+            final float v;
+            String lower = token.toLowerCase(java.util.Locale.ROOT);
+            boolean explicitSpecial = lower.equals("nan") || lower.equals("+nan")
+                || lower.equals("-nan") || lower.equals("inf") || lower.equals("+inf")
+                || lower.equals("-inf") || lower.equals("infinity")
+                || lower.equals("+infinity") || lower.equals("-infinity");
+            try {
+                if (lower.endsWith("nan")) v = Float.NaN;
+                else if (lower.endsWith("inf") || lower.endsWith("infinity"))
+                    v = lower.startsWith("-") ? Float.NEGATIVE_INFINITY
+                                               : Float.POSITIVE_INFINITY;
+                else v = Float.parseFloat(token);
+            } catch (NumberFormatException e) {
+                throw new PgWireServer.PgProtocolException("22P02",
+                    "invalid input syntax for type vector: \"" + input + "\"");
+            }
+            if (!Float.isFinite(v)) {
+                if (!explicitSpecial) {
+                    throw new PgWireServer.PgProtocolException("22003",
+                        "\"" + token + "\" is out of range for type vector");
+                }
+                throw new PgWireServer.PgProtocolException("22000",
+                    Float.isNaN(v) ? "NaN not allowed in vector"
+                                   : "infinite value not allowed in vector");
+            }
+            result[i] = v;
+        }
+        return result;
     }
 }

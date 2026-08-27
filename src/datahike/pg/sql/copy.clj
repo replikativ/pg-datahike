@@ -65,6 +65,7 @@
      binary: rejected at this layer (returns :feature-not-supported)"
   (:require [clojure.string :as str]
             [datahike.pg.sql.coerce :as coerce]
+            [datahike.pg.vector :as pg-vector]
             [datahike.pg.sql.database :as database]))
 
 ;; ----------------------------------------------------------------------------
@@ -496,6 +497,7 @@
           :db.type/bigdec    (BigDecimal. raw)
           :db.type/double    (Double/parseDouble raw)
           :db.type/float     (Float/parseFloat raw)
+          :db.type/float-array (pg-vector/parse raw (get-in schema [attr :pg/typmod]))
           :db.type/boolean   (case (str/lower-case raw)
                                ("t" "true" "yes" "on" "1") true
                                ("f" "false" "no" "off" "0") false

@@ -378,12 +378,12 @@
         (is (= expected-tag (:tag r)))))))
 
 ;; ============================================================================
-;; pg_extension exists and is empty
+;; pg_extension exposes built-in compatibility extensions
 ;; ============================================================================
 
-(deftest pg-extension-empty-but-queryable
+(deftest pg-extension-queryable
   (let [r (run "SELECT count(*) FROM pg_extension")]
-    (is (= [["0"]] (rows r))))
+    (is (= [["1"]] (rows r))))
   (let [r (run "SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")]
     (is (= [] (rows r)))))
 

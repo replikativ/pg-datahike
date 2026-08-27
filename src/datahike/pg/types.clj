@@ -55,6 +55,11 @@
 (def oid-tsvector 3614)
 (def oid-tsquery  3615)
 (def oid-pg-lsn   3220)
+;; Extension OIDs are assigned at CREATE EXTENSION time in PostgreSQL and are
+;; not portable. pg-datahike reserves the last pre-user OID so clients can
+;; discover one stable vector type without colliding with the allocator for
+;; user relations and types, which starts at 16384.
+(def oid-vector  16383)
 
 ;; Array OIDs — every scalar type has a paired `T[]` OID. PG catalog
 ;; rows: `SELECT typname, oid, typelem FROM pg_type WHERE typelem <> 0`.
@@ -157,7 +162,7 @@
    oid-interval "interval", oid-bit "bit", oid-varbit "varbit",
    oid-json "json", oid-jsonb "jsonb", oid-bytea "bytea",
    oid-pg-lsn "pg_lsn", oid-regclass "regclass", oid-regtype "regtype",
-   oid-regnamespace "regnamespace", oid-tid "tid"})
+   oid-regnamespace "regnamespace", oid-tid "tid", oid-vector "vector"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -266,6 +271,9 @@
    ;; value rather than the generic unknown-extension fallback.  A future
    ;; Scriptum index may derive postings from it without changing storage.
    "tsvector"          :db.type/string
+   ;; pgvector uses float32 elements; Datahike has a native, portable
+   ;; float-array value type with content-based equality and ordering.
+   "vector"            :db.type/float-array
    ;; OID / system (mapped to long)
    "oid"               :db.type/long
    "regclass"          :db.type/long
@@ -400,6 +408,7 @@
     "jsonb"       oid-jsonb
     "tsvector"    oid-tsvector
     "tsquery"     oid-tsquery
+    "vector"      oid-vector
     "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
     "regclass"    oid-regclass
@@ -446,7 +455,8 @@
    :db.type/ref     oid-int8
    :db.type/bytes   oid-text
    :db.type/number  oid-float8
-   :db.type/tuple   oid-text})
+   :db.type/tuple   oid-text
+   :db.type/float-array oid-vector})
 
 ;; ============================================================================
 ;; Datahike value type → PostgreSQL type name (for information_schema)
@@ -468,7 +478,8 @@
    :db.type/ref     "bigint"
    :db.type/bytes   "bytea"
    :db.type/number  "double precision"
-   :db.type/tuple   "text"})
+   :db.type/tuple   "text"
+   :db.type/float-array "vector"})
 
 ;; ============================================================================
 ;; PostgreSQL OID → type name (for format_type() catalog function)
@@ -507,7 +518,8 @@
    oid-tsquery    "tsquery"
    oid-pg-lsn     "pg_lsn"
    oid-oid        "oid"
-   oid-tid        "tid"}
+   oid-tid        "tid"
+   oid-vector     "vector"}
 
   ;; Array OIDs, derived rather than listed so the two maps cannot drift.
   ;; Without them `format_type(1007, -1)` fell through to "text", so an
@@ -631,6 +643,34 @@
    right, `bit varying(n)` truncates but never pads."
   #{"varbit" "bit varying"})
 
+(def cast-vector-types #{"vector"})
+
+(defn vector-type-spelling?
+  "True when a type name is visibly trying to name vector, including an
+   invalid schema or quoted-case spelling. Callers use this to reject the
+   spelling instead of silently lowering it to text."
+  [sql-type-name]
+  (boolean
+   (and sql-type-name
+        (re-find #"(?i)(?:^|\.)\s*\"?vector\"?\s*(?:\(|\[|$)"
+                 (str/trim (str sql-type-name))))))
+
+(defn normalize-sql-type-name
+  "Normalize the built-in compatibility spelling of pgvector's type.
+   JSqlParser preserves schema qualification and identifier quotes in
+   different fields depending on CAST versus DDL. PostgreSQL installs the
+   extension in public by default, so these all resolve to the same type."
+  [sql-type-name]
+  (when sql-type-name
+    (let [s (clojure.string/trim (str sql-type-name))
+          valid-prefix
+          #"^(?:(?:(?i:public)|\"public\")\s*\.\s*)?(?:(?i:vector)|\"vector\")(?=\s*(?:\(|\[|$))"]
+      (if (re-find valid-prefix s)
+        (clojure.string/replace-first s valid-prefix "vector")
+        (if (vector-type-spelling? s)
+          s
+          (clojure.string/lower-case s))))))
+
 ;; ============================================================================
 ;; Catalog data: pg_type rows for virtual table materialization
 ;; ============================================================================
@@ -670,6 +710,7 @@
    [oid-regclass  "regclass"    4  "b"]
    [oid-regtype   "regtype"     4  "b"]
    [oid-regnamespace "regnamespace" 4 "b"]
+   [oid-vector    "vector"      -1  "b"]
    ;; Array types — one per scalar with a paired T[] OID. typtype="b"
    ;; like scalars; the typelem linkage is exposed via element-oid
    ;; lookups at query time (see datahike.pg.sql.catalog).
@@ -732,6 +773,7 @@
    oid-tsquery   -1
    oid-pg-lsn     8
    oid-oid        4
+   oid-vector    -1
    ;; Array types are always variable-length on the wire.
    oid-bool-array        -1
    oid-bytea-array       -1
@@ -783,7 +825,7 @@
    oid-interval    :T
    oid-bit         :V  oid-varbit  :V
    oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U
-   oid-pg-lsn      :U  oid-tsvector :U  oid-tsquery :U})
+   oid-pg-lsn      :U  oid-tsvector :U  oid-tsquery :U  oid-vector :U})
 
 (def preferred-oids
   "`typispreferred`. One per category among the types we carry: a
@@ -1087,6 +1129,7 @@
         (= oid oid-timetz)  (format "time(%d) with time zone" tm)
         (= oid oid-timestamp)   (format "timestamp(%d) without time zone" tm)
         (= oid oid-timestamptz) (format "timestamp(%d) with time zone" tm)
+        (= oid oid-vector) (format "vector(%d)" tm)
         :else base))))
 
 (defn wire-size
@@ -1104,7 +1147,8 @@
    category can be resolved by recursing on the prefix."
   [sql-type-name]
   (when sql-type-name
-    (let [;; Strip type arguments: "timestamp(6)" → "timestamp"
+    (let [sql-type-name (normalize-sql-type-name sql-type-name)
+          ;; Strip type arguments: "timestamp(6)" → "timestamp"
           base (clojure.string/replace sql-type-name #"\s*\([^)]*\)" "")]
       (cond
         (clojure.string/ends-with? base "[]") :array
@@ -1115,6 +1159,7 @@
         ;; canonicalised.
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
+        (contains? cast-vector-types base)     :vector
         (contains? cast-integer-types base)   :integer
         (contains? cast-numeric-types base)   :numeric
         (contains? cast-money-types base)     :money
@@ -1273,6 +1318,7 @@
     (and (some? v)
          (= "datahike.pg.bits.PgBit" (.getName (class v))))
     (if (:varying? v) oid-varbit oid-bit)
+    (instance? (Class/forName "[F") v) oid-vector
     (instance? clojure.lang.Ratio v) oid-float8
     (instance? Long v)    oid-int8
     (instance? Integer v) oid-int4

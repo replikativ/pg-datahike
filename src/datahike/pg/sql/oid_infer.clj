@@ -40,7 +40,7 @@
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression JsonOperator LikeExpression
             MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
-            RegExpMatchOperator]))
+            RegExpMatchOperator GeometryDistance CosineSimilarity]))
 
 ;; ---------------------------------------------------------------------------
 ;; Function return-type registry — keyed by lowercased SQL name.
@@ -769,6 +769,7 @@
            :bytes     types/oid-bytea
            :bit       types/oid-bit
            :varbit    types/oid-varbit
+           :vector    types/oid-vector
            nil)
          ;; Fallback for types cast-category doesn't width-classify (jsonb,
          ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
@@ -917,6 +918,8 @@
 
       ;; --- Arithmetic (numeric promotion) -------------------------------
       (instance? Addition expr)       (binary-arith-oid expr env)
+      (or (instance? GeometryDistance expr)
+          (instance? CosineSimilarity expr)) types/oid-float8
       (instance? Subtraction expr)    (binary-arith-oid expr env)
       (instance? Multiplication expr) (binary-arith-oid expr env)
       ;; Division consults its operands like every other arithmetic
