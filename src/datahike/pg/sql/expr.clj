@@ -3587,6 +3587,30 @@
                                 "types. You might need to add explicit type casts.")})))
         l (translate-expr ctx left-expr)
         r (translate-expr ctx right-expr)
+        ;; Candidate eligibility is deliberately recorded here, where the
+        ;; resolved storage attribute and the exact result variable meet.  It
+        ;; is only a hint: translate-select checks ORDER BY/LIMIT shape, and
+        ;; execution falls back to this exact expression unless a compatible,
+        ;; ready secondary index is present.
+        unwrap (fn unwrap [x]
+                 (cond
+                   (instance? Parenthesis x)
+                   (unwrap (.getExpression ^Parenthesis x))
+
+                   (instance? CastExpression x)
+                   (unwrap (.getLeftExpression ^CastExpression x))
+
+                   :else x))
+        left-base (unwrap left-expr)
+        right-base (unwrap right-expr)
+        [column query-expr query-translated]
+        (cond
+          (instance? Column left-base) [left-base right-base r]
+          (instance? Column right-base) [right-base left-base l]
+          :else [nil nil nil])
+        query-value (if (instance? JdbcParameter query-expr)
+                      (params/->ParamRef (.getIndex ^JdbcParameter query-expr))
+                      query-translated)
         l (if (seq? l) (ctx/materialize-arg! ctx l) l)
         r (if (seq? r) (ctx/materialize-arg! ctx r) r)
         strict-f (fn [a b]
@@ -3599,6 +3623,28 @@
     (swap! (:in-params ctx) conj fn-param)
     (swap! (:in-args ctx) conj strict-f)
     (swap! (:where-clauses ctx) conj [(list fn-param l r) result-var])
+    (when column
+      (let [resolved (ctx/resolve-column
+                      column (:table-aliases ctx) (:default-table ctx)
+                      (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+            attr (ctx/attr-of ctx resolved)
+            alias (cond
+                    (and (vector? resolved) (= :aliased (first resolved)))
+                    (second resolved)
+
+                    (keyword? resolved) (namespace resolved)
+                    :else nil)]
+        (when (and attr alias)
+          (swap! (:vector-distance-candidates ctx) conj
+                 {:result-var result-var
+                  :entity-var (ctx/entity-var! ctx alias)
+                  :attribute attr
+                  :operator op-text
+                  :metric (case op-text
+                            "<->" :euclidean
+                            "<#>" :inner-product
+                            "<=>" :cosine)
+                  :query-vector query-value}))))
     result-var))
 
 (defn- generic-bitwise-node?

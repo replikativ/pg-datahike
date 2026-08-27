@@ -1,10 +1,12 @@
 (ns datahike.test.pg-vector-test
   "A focused, source-pinned foundation from pgvector 0.8.6's
-   test/sql/vector_type.sql. Index access methods are intentionally outside
-   this slice; these assertions define the exact scalar recheck contract."
+   test/sql/vector_type.sql. Scalar semantics define the authoritative
+   recheck contract; HNSW is exercised only as an optional candidate source."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.server :as pg]
+            [datahike.pg.sql :as sql]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as vector])
   (:import [datahike.pg PgParamCodec PgWireServer$PgProtocolException
@@ -12,6 +14,7 @@
            [java.nio ByteBuffer ByteOrder]))
 
 (def ^:dynamic *handler* nil)
+(def ^:dynamic *conn* nil)
 
 (defn- fixture [f]
   (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
@@ -19,7 +22,9 @@
              :max-string-length 0 :max-float-array-length 0}]
     (d/create-database cfg)
     (let [conn (d/connect cfg)]
-      (try (binding [*handler* (pg/make-query-handler conn)] (f))
+      (try (binding [*conn* conn
+                     *handler* (pg/make-query-handler conn)]
+             (f))
            (finally (d/release conn) (d/delete-database cfg))))))
 
 (use-fixtures :each fixture)
@@ -110,6 +115,147 @@
     (is (= [types/oid-int4] (describe "SELECT vector_dims('[1,2]'::vector)")))
     (is (= [types/oid-float8] (describe "SELECT '[1,2]'::vector <-> '[3,4]'")))
     (is (= [types/oid-float8] (describe "SELECT cosine_distance('[1,2]'::vector, '[2,4]')")))))
+
+(deftest vector-hnsw-ddl-and-candidate-shape-are-preserved
+  (run "CREATE TABLE vector_ann (id int PRIMARY KEY, embedding vector(3))")
+  (let [ddl (sql/parse-sql
+             (str "CREATE INDEX vector_ann_embedding_hnsw ON vector_ann "
+                  "USING hnsw (embedding vector_l2_ops) "
+                  "WITH (m=16, ef_construction=64)")
+             {})]
+    (is (= {:type :ddl-create-index
+            :name "vector_ann_embedding_hnsw"
+            :table "vector_ann"
+            :method "hnsw"
+            :columns ["embedding"]
+            :column-specs [{:name "embedding" :params ["vector_l2_ops"]}]
+            :options {:m 16 :ef_construction 64}}
+           (dissoc ddl :param-count))))
+  (let [db (d/db *conn*)
+        parse #(sql/parse-sql % (dbi/-schema db) db)
+        eligible (parse (str "SELECT id FROM vector_ann "
+                             "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))
+        prepared (parse (str "SELECT id FROM vector_ann "
+                             "ORDER BY embedding <-> $1::vector LIMIT 5"))
+        unbounded (parse (str "SELECT id FROM vector_ann "
+                              "ORDER BY embedding <-> '[1,2,3]'::vector"))
+        descending (parse (str "SELECT id FROM vector_ann "
+                               "ORDER BY embedding <-> '[1,2,3]'::vector DESC LIMIT 5"))
+        nulls-first (parse (str "SELECT id FROM vector_ann "
+                                "ORDER BY embedding <-> '[1,2,3]'::vector "
+                                "NULLS FIRST LIMIT 5"))
+        with-ties (parse (str "SELECT id FROM vector_ann "
+                              "ORDER BY embedding <-> '[1,2,3]'::vector "
+                              "FETCH FIRST 5 ROWS WITH TIES"))
+        windowed (parse (str "SELECT id, row_number() OVER () FROM vector_ann "
+                             "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))
+        project-set (parse (str "SELECT id, generate_series(1, 2) FROM vector_ann "
+                                "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))
+        offset (parse (str "SELECT id FROM vector_ann "
+                           "ORDER BY embedding <-> '[1,2,3]'::vector "
+                           "LIMIT 5 OFFSET 7"))]
+    (is (= {:attribute :vector_ann/embedding
+            :operator "<->"
+            :metric :euclidean
+            :limit 5}
+           (select-keys (:secondary-candidate eligible)
+                        [:attribute :operator :metric :limit])))
+    (is (= "[1,2,3]"
+           (vector/to-pg-text
+            (:query-vector (:secondary-candidate eligible)))))
+    (is (sql/param-ref?
+         (:query-vector (:secondary-candidate prepared))))
+    (is (= 12 (get-in offset [:secondary-candidate :candidate-limit])))
+    (is (nil? (:secondary-candidate unbounded)))
+    (is (nil? (:secondary-candidate descending)))
+    (is (nil? (:secondary-candidate nulls-first)))
+    (is (nil? (:secondary-candidate with-ties)))
+    (is (nil? (:secondary-candidate windowed)))
+    (is (nil? (:secondary-candidate project-set)))))
+
+(deftest vector-candidates-are-only-a-rechecked-restriction
+  (run "CREATE TABLE vector_recheck (id int PRIMARY KEY, embedding vector(2))")
+  (run (str "INSERT INTO vector_recheck VALUES "
+            "(1, '[0,0]'), (2, '[1,0]'), (3, '[4,0]')"))
+  (let [query-sql (str "SELECT id FROM vector_recheck "
+                       "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
+        _ (is (= [["2"] ["1"]] (rows query-sql))
+              "the released core, without candidate scans, stays exact")
+        db (d/db *conn*)
+        parsed (sql/parse-sql query-sql
+                              (dbi/-schema db) db)
+        eid-by-id (into {}
+                        (d/q '[:find ?id ?e
+                               :where [?e :vector_recheck/id ?id]]
+                             db))
+        indexed-db (-> db
+                       (assoc-in [:schema :idx/vector_recheck]
+                                 {:db.secondary/type :proximum
+                                  :db.secondary/attrs [:vector_recheck/embedding]
+                                  :db.secondary/config {:distance :euclidean :dim 2}
+                                  :db.secondary/status :ready})
+                       (assoc :secondary-indices
+                              {:idx/vector_recheck ::fake-index}))
+        restrict (ns-resolve 'datahike.pg.server
+                             'restrict-to-vector-candidates)
+        entrypoint (ns-resolve 'datahike.pg.server
+                               'candidate-page-entrypoint)
+        seen (atom [])
+        page-fn (fn [_db idx-ident index query-spec _filter request]
+                  (swap! seen conj {:idx-ident idx-ident
+                                    :index index
+                                    :query-spec query-spec
+                                    :request request})
+                  ;; Deliberately page and reverse/widen candidate order. The
+                  ;; SQL distance expression must still establish the result.
+                  (if (:continuation request)
+                    {:candidates [{:entity-id (eid-by-id 1)
+                                   :attribute :vector_recheck/embedding}
+                                  {:entity-id (eid-by-id 2)
+                                   :attribute :vector_recheck/embedding}]
+                     :precision :recheck :recall :approximate
+                     :ordering :approximate :exhausted? true
+                     :continuation nil}
+                    {:candidates [{:entity-id (eid-by-id 3)
+                                   :attribute :vector_recheck/embedding}]
+                     :precision :recheck :recall :approximate
+                     :ordering :approximate :exhausted? false
+                     :continuation :page-2}))
+        [query args]
+        (with-redefs-fn {entrypoint (fn [] page-fn)}
+          #(restrict indexed-db (:query parsed) (:in-args parsed)
+                     (:secondary-candidate parsed)))
+        result (apply d/q (assoc query :limit (:limit parsed)) indexed-db args)]
+    (is (= 2 (count @seen)))
+    (is (= :idx/vector_recheck (:idx-ident (first @seen))))
+    (is (= ::fake-index (:index (first @seen))))
+    (is (= 40 (get-in (first @seen) [:query-spec :candidate-limit])))
+    (is (= :page-2 (get-in (second @seen) [:request :continuation])))
+    (is (= [2 1] (mapv first result))
+        "the exact scalar distance, not candidate order, determines top-k")
+    (is (= [(get-in parsed [:secondary-candidate :entity-var]) '...]
+           (last (:in query))))
+
+    (testing "one prepared plan supplies each bind's decoded query vector"
+      (reset! *conn* indexed-db)
+      (reset! seen [])
+      (let [prepared (.parse *handler*
+                             (str "SELECT id FROM vector_recheck "
+                                  "ORDER BY embedding <-> $1::vector LIMIT 2")
+                             (int-array [types/oid-vector]))
+            execute #(with-redefs-fn {entrypoint (fn [] page-fn)}
+                       (fn []
+                         (.executePrepared
+                          *handler* prepared
+                          (object-array [nil (vector/parse %)]))))
+            r1 (execute "[0.9,0]")
+            r2 (execute "[3.9,0]")
+            first-query (get-in (first @seen) [:query-spec :vector])
+            second-query (get-in (nth @seen 2) [:query-spec :vector])]
+        (is (= [["2"] ["1"]] (mapv vec (.-rows r1))))
+        (is (= [["3"] ["2"]] (mapv vec (.-rows r2))))
+        (is (= "[0.9,0]" (vector/to-pg-text first-query)))
+        (is (= "[3.9,0]" (vector/to-pg-text second-query)))))))
 
 (deftest vector-extension-discovery-and-binary-codec
   (is (= "CREATE EXTENSION"
