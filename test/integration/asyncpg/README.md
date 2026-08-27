@@ -41,13 +41,17 @@ asyncpg/
 ./run.sh       # run focused modules, ~1-3 min
 ```
 
-`run.sh` exits 0 when every non-skipped test passes. Summary line:
+`run.sh` exits 0 when every live failure is present in the checked-in
+`expected-failures.txt` manifest. Summary line:
 
 ```
-SUMMARY: 187 passed, 0 failed, 3 skipped   (pytest rc=0)
+SUMMARY: 99 passed, 70 failed, 32 skipped
 ```
 
-`last-run.log` has the full pytest output.
+The raw failure count therefore does not determine the exit status. A failure
+outside the manifest is a regression and fails the job; a manifest entry that
+now passes is reported as resolved and should be removed. `last-run.log` has
+the full pytest output.
 
 ## What is covered
 
@@ -74,11 +78,12 @@ trying to spawn `initdb`.
 
 ## Interpreting output
 
-- `N passed, 0 failed, M skipped`: clean.
-- `N passed, K failed, M skipped`, `K > 0`:
-  - Cross-check each failure against the "Expected failures" section of
-    `expected-skips.md`. Known gaps there are not regressions.
-  - Otherwise treat as a regression; `last-run.log` has the full stack.
+- no `REGRESSION` section: the live failures exactly match the manifest.
+- `REGRESSION: ... failing that are NOT in expected-failures.txt`: a new
+  compatibility failure; `last-run.log` has the full stack.
+- `expected-failure(s) now PASS`: coverage improved; prune the manifest.
+- `expected-failure(s) DID NOT RUN`: the test was renamed, deselected, or its
+  module stopped early; this is a coverage hole, not a fix.
 - pytest rc != 0 with zero failures reported: likely a collection/import
   error in asyncpg itself. Look for `ERROR` lines early in the log.
 

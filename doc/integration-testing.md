@@ -1,25 +1,32 @@
 # Integration testing model
 
-pg-datahike is tested at three layers, with CI wired into two
-different cadences.
+pg-datahike is tested at four complementary boundaries. The jobs in layers
+1–3 run for every pull request; suites with known upstream gaps use explicit
+manifests so only a new regression fails the build. Layer 4 is a local
+discovery and admission workflow.
 
 ## Layer 1 — unit (per-commit)
 
 ```
-bb test             234 tests / 952 assertions — ~30 s
-bb sqllogictest     59 files — ~60 s
+bb test
+bb sqllogictest
 ```
+
+A current full run reports 1,526 tests / 6,273 assertions and the SQLLogic
+runner reports 61 assertions. Treat the runner output, rather than these
+snapshot counts, as authoritative as coverage grows.
 
 Run on every PR + commit. Covered by the `unittest` and `sqllogictest`
 jobs in the main workflow.
 
-Exercises the translator, handler dispatch, classifier, rewriter,
-shape matcher, and SQL-conformance surface. Does **not** involve a
-real wire connection.
+Exercises the translator, handler dispatch, classifier, rewriter, shape
+matcher, embedded pgwire/JDBC behavior, catalog goldens, and SQL-conformance
+surface. The unit job also has a real PostgreSQL 16 sidecar for cross-engine
+round-trip tests.
 
 ## Layer 2 — wire + ORM conformance (per-commit)
 
-Three jobs run against a live pgwire server on :15432:
+Three application-level jobs run against a live pgwire server on :15432:
 
 ```
 pgjdbc-conformance       80 ResultSetTest cases — ~6 min warm daemon
@@ -43,24 +50,22 @@ including ROLLBACK, raw SQL, and schema introspection.
 
 All three gate `deploy`.
 
-## Layer 3 — low-level wire regression targets (nightly, non-blocking)
+## Layer 3 — client and dump regression gates (per-commit)
 
-| Harness          | Base image        | Client binding    | Status against HEAD (0.1)                    |
-|------------------|-------------------|-------------------|----------------------------------------------|
-| asyncpg          | cimg/python:3.11  | C-extension async | ~32 / ~67 — prepared-statement + cursor gaps |
-| node-postgres    | cimg/node:20.11   | pure-JS `pg`      | ~4 / many — `COLLATE` parse + protocol gaps  |
+| Harness | Boundary | Gate contract |
+|---|---|---|
+| asyncpg | Independent async wire implementation, codecs, prepared statements, transactions, and introspection | Every included test runs; a failure not in `expected-failures.txt` fails CI |
+| node-postgres | Independent JavaScript wire implementation and common `pg` API behavior | Must-pass files gate CI; documented known-gap files run as XFAIL and report XPASS |
+| pg_dump round-trip | PostgreSQL 16 default-format dump of Pagila restored through pgwire | Restore and data checks must complete without an unexpected failure |
 
-Runs on a schedule (`nightly-integration` workflow, 04:00 UTC daily,
-main only). The harness and setup scripts are verified to install +
-invoke cleanly (see `test/integration/<name>/README.md` +
-`expected-skips.md`); what's not ready is the translator's coverage
-of what these clients probe. Both stay in nightly so a future fix
-will immediately light them up, without blocking per-commit PRs on
-known gaps.
+The distinction between a green job and complete upstream compatibility is
+important. asyncpg and node-postgres intentionally continue to execute known
+unsupported cases. Their checked-in manifests keep those gaps visible while
+making any new failure a per-commit regression. When an expected failure starts
+passing, the harness reports it so the manifest can be tightened.
 
-For 0.1 release, we don't block on them being green. Hibernate +
-SQLAlchemy (full ORM round-trips via pgjdbc and psycopg2) moved
-up to Layer 2 once they hit 100% on their curated suites.
+The asyncpg and node-postgres jobs gate deployment; the pg_dump round-trip runs
+per commit but is not currently in the `deploy` job's dependency list.
 
 Each harness follows the same shape:
 
@@ -113,7 +118,7 @@ Not wired into CI — needs a running Postgres. Use locally during
 feature development; copy surprising diffs into `sqllogictest/` as
 new test cases once fixed.
 
-## PostgreSQL's upstream regression suite
+## Layer 4 — PostgreSQL's upstream regression suite
 
 `bb pg-regress` runs PostgreSQL's own `pg_regress` driver, SQL, and expected
 output against an existing pg-datahike server. It uses `../postgres` and the
@@ -124,39 +129,34 @@ bb pg-regress jsonb
 bb pg-regress jsonb expressions
 ```
 
-This is initially a baseline rather than a CI gate. A completed upstream test
-that produces differences exits successfully and retains its full output under
-`.internal/pg-regress/`; a harness failure still fails. The summary highlights
-frequent target errors and internal-looking failures so unsupported surface
-does not hide class casts, unknown Datalog variables, or lost connections.
+The complete upstream corpus is a local discovery baseline rather than one
+all-or-nothing CI gate. The pinned campaign accounts for PostgreSQL's full
+`parallel_schedule`: application-facing files are assigned to compatibility
+waves, and server-internal files are explicitly out of scope. Exact admitted
+line slices are linked to focused tests and act as strict per-commit gates.
+
+A discovery run that produces differences exits successfully and retains its
+full output under `.internal/pg-regress/`; a harness failure still fails. The
+summary highlights frequent target errors and internal-looking failures so
+unsupported surface does not hide class casts, unknown Datalog variables, or
+lost connections.
 
 Use `PG_REGRESS_STRICT=1` only for an admitted test that is expected to match
 completely. Endpoint, PostgreSQL checkout, and binary overrides are documented
 in `test/integration/postgres-regress/README.md`.
 
-## Golden-file catalog tests (planned)
+## Golden-file catalog tests
 
-pgjdbc / Hibernate / Rails / Django all call a small fixed set of
-`DatabaseMetaData` methods at connection time. Each method issues a
-specific SQL statement against `pg_catalog` tables. Recording the
-expected row shapes once and diffing on every PR catches silent
-regressions in `pg_class` / `pg_attribute` / `pg_index` projection —
-a class of bug that unit tests miss because no unit test knows which
-exact 47 columns Hibernate wants.
+The unit suite records the catalog results used by pgjdbc, Hibernate, and
+other clients in `test/goldens/`. The probes in
+`datahike.test.catalog-goldens-test` compare those exact row sets on every PR,
+catching silent regressions in `pg_class`, `pg_attribute`, `pg_index`, and
+`pg_type` projection.
 
-Sketch:
-
-```
-  test/goldens/pgjdbc-getTables.edn       # per-driver, per-call
-  test/goldens/pgjdbc-getColumns-person.edn
-  test/goldens/hibernate-boot-probe.edn
-  ...
-```
-
-Runner reads the golden, executes the SQL, compares. A diff prints the
-row-set diff + prompts the dev to intentionally regenerate the golden
-(`bb goldens :update`). Planned for the same session that adds the
-cross-engine runner — they share harness code.
+To regenerate an intentionally changed probe, call `check-probe!` with
+`:regenerate? true` from a REPL, inspect the diff, and commit the changed EDN.
+Missing goldens are reported explicitly instead of silently weakening the
+baseline.
 
 ## Toolchain versions pinned in CI
 

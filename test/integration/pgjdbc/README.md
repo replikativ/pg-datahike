@@ -26,8 +26,7 @@ pgjdbc/
 - A running Datahike pgwire server on `localhost:15432`, started from the
   repo root:
   ```
-  cd $DATAHIKE_ROOT
-  DATAHIKE_QUERY_PLANNER=true clojure -A:test -M test/integration/start_pgwire.clj
+  clojure -M:server
   ```
 
 `setup.sh` and `run.sh` do not start or stop the server.
