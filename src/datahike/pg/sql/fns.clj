@@ -43,6 +43,7 @@
             [datahike.pg.numeric-format :as numfmt]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
+            [datahike.pg.tsearch :as tsearch]
             [datahike.pg.types :as types]
             [datahike.pg.prng]))
 
@@ -3668,6 +3669,12 @@
                        :strict? true :return-oid types/oid-int8}
    "pg_lsn"           {:impl sql-pg-lsn :arities #{1}
                        :strict? true :return-oid types/oid-pg-lsn}
+   "ts_lexize"        {:impl tsearch/ts-lexize :arities #{2}
+                       :strict? true :return-oid types/oid-text-array}
+   "plainto_tsquery"  {:impl tsearch/plainto-tsquery :arities #{2}
+                       :strict? true :return-oid types/oid-tsquery}
+   "phraseto_tsquery" {:impl tsearch/phraseto-tsquery :arities #{2}
+                       :strict? true :return-oid types/oid-tsquery}
    "jsonb_contains"   {:impl jb/jsonb-contains?   :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "jsonb_contained"  {:impl jb/jsonb-contained?  :arities #{2}

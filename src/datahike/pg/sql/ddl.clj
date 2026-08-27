@@ -413,7 +413,7 @@
 
       array? nil
 
-      (#{"jsonb" "json" "money" "interval"} bt) bt
+      (#{"jsonb" "json" "money" "interval" "tsvector"} bt) bt
 
       (#{"date" "time" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"
@@ -596,6 +596,13 @@
                                             (str b args))
                                           :else raw-type-orig)
                                base-type (str/replace raw-type #"\s*\([^)]*\)" "")
+                               _ (when (types/unsupported-input-type? base-type)
+                                   (throw (ex-info
+                                           (str "type \"" base-type
+                                                "\" is not supported until its PostgreSQL input parser is implemented")
+                                           {:error :feature-not-supported
+                                            :sqlstate "0A000"
+                                            :type base-type})))
                                ;; Detect array column. JSqlParser exposes
                                ;; the array dimensions via getArrayData()
                                ;; — a list whose size = ndim (entries are
@@ -737,7 +744,7 @@
                        ;; setDate binds with "Can't change resolved
                        ;; type for param …".
                        (and (not array-spec)
-                            (#{"jsonb" "json" "money" "interval"
+                            (#{"jsonb" "json" "money" "interval" "tsvector"
                                "date" "time" "timestamp"
                                "timestamptz" "timestamp without time zone"
                                "timestamp with time zone"

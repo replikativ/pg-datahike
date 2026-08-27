@@ -624,5 +624,22 @@
        :test-var "postgres-json-input-regression-slices"}]}
     {:name "jsonpath" :mode :unmeasured :boundaries #{:jsonpath}}
     {:name "sqljson" :mode :unmeasured :boundaries #{:sql-json}}
-    {:name "tsearch" :mode :unmeasured :boundaries #{:full-text}}
+    {:name "tsearch" :mode :discovery
+     :boundaries #{:full-text :normalization :wire-result-type}
+     :blockers #{:postgres-token-parser :explicit-tsquery-parser :matching
+                 :tsvector-input-parser :input-canonicalization :type-ddl
+                 :ranking :headline :catalog-configurations :scriptum-index}
+     :strict-slices
+     [{:id :english-stem-dictionary
+       :source-lines [274 275]
+       :gate "test/datahike/test/pg_tsearch_test.clj"
+       :test-var "postgres-tsearch-dictionary-slice"}
+      {:id :plain-query-normalization
+       :source-lines [315 315]
+       :gate "test/datahike/test/pg_tsearch_test.clj"
+       :test-var "postgres-plain-query-slice"}
+      {:id :phrase-stop-word-distance
+       :source-lines [367 367]
+       :gate "test/datahike/test/pg_tsearch_test.clj"
+       :test-var "postgres-phrase-query-slice"}]}
     {:name "tsdicts" :mode :unmeasured :boundaries #{:full-text}}]}]}
