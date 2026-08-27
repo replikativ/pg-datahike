@@ -7,6 +7,7 @@
    (PG's record binary format is [nfields][per-field oid,len,data]); the
    values render to PG's canonical `record_out` text for text-format
    clients. Mirrors the role `datahike.pg.arrays/PgArray` plays for arrays."
+  (:refer-clojure :exclude [record?])
   (:require [clojure.string :as str]
             [datahike.pg.arrays :as arr]))
 

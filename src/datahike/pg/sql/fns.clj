@@ -284,7 +284,7 @@
    NaN, `x / Inf` is 0 -- so routing through double loses nothing, and
    PostgreSQL's numeric special rules are IEEE's."
   [f a b]
-  (let [r (f (->num-double a) (->num-double b))]
+  (let [r (double (f (->num-double a) (->num-double b)))]
     (or (types/double->numeric-special r)
         (java.math.BigDecimal/valueOf r))))
 
@@ -674,12 +674,14 @@
       (some types/numeric-special? vs) Double/NaN
       :else
       (let [bds   (mapv ->bigdec vs)
-            sum-x (reduce (fn [^java.math.BigDecimal a ^java.math.BigDecimal b] (.add a b))
-                          java.math.BigDecimal/ZERO bds)
-            sum-x2 (reduce (fn [^java.math.BigDecimal a ^java.math.BigDecimal b]
-                             (.add a (.multiply b b)))
-                           java.math.BigDecimal/ZERO bds)
-            n-bd  (java.math.BigDecimal/valueOf (long n))
+            ^java.math.BigDecimal sum-x
+            (reduce (fn [^java.math.BigDecimal a ^java.math.BigDecimal b] (.add a b))
+                    java.math.BigDecimal/ZERO bds)
+            ^java.math.BigDecimal sum-x2
+            (reduce (fn [^java.math.BigDecimal a ^java.math.BigDecimal b]
+                      (.add a (.multiply b b)))
+                    java.math.BigDecimal/ZERO bds)
+            ^java.math.BigDecimal n-bd (java.math.BigDecimal/valueOf (long n))
             ;; rscale for the two products, from sumX's scale BEFORE
             ;; squaring -- both products are exact at it.
             rs0   (int (* 2 (.scale sum-x)))
@@ -2437,8 +2439,8 @@
   ([s pattern repl flags]
    (if (or (sql-null? s) (sql-null? pattern) (sql-null? repl))
      :__null__
-     (let [m (.matcher (re-compile pattern flags) (str s))
-           r (pg-replacement->java (str repl))]
+     (let [^java.util.regex.Matcher m (.matcher (re-compile pattern flags) (str s))
+           ^String r (pg-replacement->java (str repl))]
        (if (str/includes? (str (when-not (sql-null? flags) flags)) "g")
          (.replaceAll m r)
          (.replaceFirst m r))))))
@@ -2467,7 +2469,7 @@
            (.region m from (.length t))
            (loop [c 0] (if (.find m) (recur (inc c)) c))))))))
 
-(defn- nth-match
+(defn- ^java.util.regex.Matcher nth-match
   "The java Matcher positioned on the Nth match at or after `start`, or nil."
   [s pattern start n flags]
   (let [^String t (str s)
@@ -2489,7 +2491,9 @@
   ([s pattern start n flags]
    (if (or (sql-null? s) (sql-null? pattern))
      :__null__
-     (if-let [m (nth-match s pattern start n flags)] (.group m) :__null__))))
+     (if-let [^java.util.regex.Matcher m (nth-match s pattern start n flags)]
+       (.group m)
+       :__null__))))
 
 (defn sql-regexp-instr
   "`regexp_instr(string, pattern [, start [, N [, endoption [, flags]]]])`
@@ -2502,7 +2506,7 @@
   ([s pattern start n endoption flags]
    (if (or (sql-null? s) (sql-null? pattern))
      :__null__
-     (if-let [m (nth-match s pattern start n flags)]
+     (if-let [^java.util.regex.Matcher m (nth-match s pattern start n flags)]
        (if (and (not (sql-null? endoption)) (= 1 (long endoption)))
          (inc (.end m))
          (inc (.start m)))
@@ -2844,7 +2848,7 @@
 (defn- ln-rscale ^long [^java.math.BigDecimal a]
   (clamp-rscale (- numeric-min-sig-digits (estimate-ln-dweight a)) (.scale a)))
 
-(def ^:private ln10-str
+(def ^String ^:private ln10-str
   ;; Kept beyond NUMERIC_MIN_SIG_DIGITS because a high-scale input can ask
   ;; log() for many more displayed digits. bd-ln's decimal range reduction
   ;; multiplies this constant by the input exponent; a short constant made
@@ -2875,7 +2879,7 @@
                           (.multiply pow y2 mc)
                           (.add acc (.divide pow (java.math.BigDecimal/valueOf (inc (* 2 n))) mc) mc))))]
     (.add (.multiply (java.math.BigDecimal/valueOf 2) series mc)
-          (.multiply (java.math.BigDecimal/valueOf k) (java.math.BigDecimal. ln10-str) mc)
+          (.multiply (java.math.BigDecimal/valueOf k) (java.math.BigDecimal. ^String ln10-str) mc)
           mc)))
 
 (defn- bd-exp
@@ -2892,7 +2896,8 @@
               acc
               (let [t (.divide (.multiply term xr mc) (java.math.BigDecimal/valueOf n) mc)]
                 (recur (inc n) t (.add acc t mc)))))]
-    (loop [i 0 v s] (if (>= i halvings) v (recur (inc i) (.multiply v v mc))))))
+    (loop [i 0 ^java.math.BigDecimal v s]
+      (if (>= i halvings) v (recur (inc i) (.multiply v v mc))))))
 
 ;; The numeric overloads. Dispatch is on the ARGUMENT's runtime class,
 ;; which mirrors PostgreSQL's function resolution: a numeric argument
@@ -3066,15 +3071,17 @@
 (defn- numeric-exp ^java.math.BigDecimal [^java.math.BigDecimal a]
   (let [rs (exp-rscale a)
         result-weight (* (.doubleValue a) 0.434294481903252)
-        p (result-working-precision rs result-weight 20)]
-    (.setScale (bd-exp a p) (int rs) java.math.RoundingMode/HALF_UP)))
+        p (result-working-precision rs result-weight 20)
+        ^java.math.BigDecimal result (bd-exp a p)]
+    (.setScale result (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- numeric-ln ^java.math.BigDecimal [^java.math.BigDecimal a]
   (cond
     (zero? (.signum a)) (throw-logarithm-error "cannot take logarithm of zero")
     (neg? (.signum a)) (throw-logarithm-error "cannot take logarithm of a negative number"))
-  (let [rs (ln-rscale a)]
-    (.setScale (bd-ln a (+ rs 20)) (int rs) java.math.RoundingMode/HALF_UP)))
+  (let [rs (ln-rscale a)
+        ^java.math.BigDecimal result (bd-ln a (+ rs 20))]
+    (.setScale result (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- numeric-log
   "log(base, x) — numeric_log. Computed as ln(x)/ln(base) at a guard
@@ -3104,9 +3111,10 @@
         num-precision (precision-for-rscale num-rscale num-weight)
         result-precision (+ (precision-for-rscale rs result-weight) 8)
         mc (java.math.MathContext. (int result-precision))
-        lb (bd-ln base base-precision)]
+        ^java.math.BigDecimal lb (bd-ln base base-precision)
+        ^java.math.BigDecimal lx (bd-ln x num-precision)]
     (when (zero? (.signum lb)) (throw-division-by-zero))
-    (.setScale (.divide (bd-ln x num-precision) lb mc)
+    (.setScale (.divide lx lb mc)
                (int rs) java.math.RoundingMode/HALF_UP)))
 
 (defn- power-rscale
@@ -3180,13 +3188,16 @@
       (and (zero? (.scale (.stripTrailingZeros e)))
            (< (Math/abs (.doubleValue e)) 1.0e9))
       (let [n (.intValueExact (.toBigIntegerExact (.stripTrailingZeros e)))
-            v (if (neg? n)
-                (.divide java.math.BigDecimal/ONE (.pow base (- n) mc) mc)
-                (.pow base n mc))]
+            ^java.math.BigDecimal v
+            (if (neg? n)
+              (.divide java.math.BigDecimal/ONE (.pow base (- n) mc) mc)
+              (.pow base n mc))]
         (.setScale v (int rs) java.math.RoundingMode/HALF_UP))
       :else
-      (.setScale (bd-exp (.multiply e (bd-ln base p) mc) p)
-                 (int rs) java.math.RoundingMode/HALF_UP))))
+      (let [^java.math.BigDecimal ln-base (bd-ln base p)
+            ^java.math.BigDecimal exponent (.multiply e ln-base mc)
+            ^java.math.BigDecimal result (bd-exp exponent p)]
+        (.setScale result (int rs) java.math.RoundingMode/HALF_UP)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Degree trigonometry — ported from PostgreSQL's float.c, NOT derived

@@ -29,7 +29,7 @@
          :exec-args {:src-dirs ["java"]
                      :class-dir "target/classes"
                      :basis-args {:aliases [:build]}
-                     :javac-opts ["-source" "17" "-target" "17"]}
+                     :javac-opts ["--release" "17"]}
          :extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}}}
 
   ;; Unit tests — ns-based, run against :local/root datahike.

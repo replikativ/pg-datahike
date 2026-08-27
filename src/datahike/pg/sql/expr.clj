@@ -134,14 +134,15 @@
          parse-timestamp-string)
 
 (defn- numeric-target-for-oid [oid]
-  (case oid
-    21 :long
-    23 :long
-    20 :long
-    700 :float
-    701 :double
-    1700 :bigdec
-    nil))
+  (when oid
+    (case (long oid)
+      21 :long
+      23 :long
+      20 :long
+      700 :float
+      701 :double
+      1700 :bigdec
+      nil)))
 
 (defn- coerce-function-unknowns
   "Apply a function spec's argument-resolution rule to raw AST operands.

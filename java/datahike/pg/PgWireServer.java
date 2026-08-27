@@ -721,14 +721,51 @@ public final class PgWireServer {
     public static final ThreadLocal<AtomicBoolean> CANCEL_FLAG = new ThreadLocal<>();
 
     /**
+     * Java 21's virtual-thread entry point, discovered reflectively so the
+     * standalone server remains loadable on the documented Java 17 baseline.
+     * A Java 21+ runtime still uses virtual threads for the accept loop and
+     * when DATAHIKE_CONN_THREADS=virtual is requested; Java 17 falls back to
+     * ordinary daemon threads.
+     */
+    private static final java.lang.reflect.Method START_VIRTUAL_THREAD =
+        findVirtualThreadStarter();
+
+    private static java.lang.reflect.Method findVirtualThreadStarter() {
+        try {
+            return Thread.class.getMethod("startVirtualThread", Runnable.class);
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        }
+    }
+
+    private static Thread startNamedThread(String name, boolean preferVirtual,
+                                           Runnable task) {
+        Runnable namedTask = () -> {
+            Thread.currentThread().setName(name);
+            task.run();
+        };
+        if (preferVirtual && START_VIRTUAL_THREAD != null) {
+            try {
+                return (Thread) START_VIRTUAL_THREAD.invoke(null, namedTask);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("Could not start virtual thread", e);
+            }
+        }
+        Thread thread = new Thread(namedTask, name);
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    /**
      * Shared scheduler for statement_timeout tasks. Virtual-thread per
      * task keeps contention negligible; used by the Clojure layer to
      * flip the current session's cancel flag after statement_timeout ms.
      */
     public static final java.util.concurrent.ScheduledExecutorService TIMEOUT_SCHED =
         java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = Thread.ofVirtual().unstarted(r);
-            t.setName("pgwire-stmt-timeout");
+            Thread t = new Thread(r, "pgwire-stmt-timeout");
+            t.setDaemon(true);
             return t;
         });
 
@@ -767,7 +804,7 @@ public final class PgWireServer {
         serverSocket.bind(new InetSocketAddress(InetAddress.getByName(host), port), 50);
         running.set(true);
 
-        acceptThread = Thread.ofVirtual().name("pgwire-accept").start(() -> {
+        acceptThread = startNamedThread("pgwire-accept", true, () -> {
             while (running.get()) {
                 try {
                     Socket client = serverSocket.accept();
@@ -796,13 +833,9 @@ public final class PgWireServer {
                     // counts via DATAHIKE_CONN_THREADS=virtual.
                     String connThreads = System.getenv("DATAHIKE_CONN_THREADS");
                     String connName = "pgwire-conn-" + client.getRemoteSocketAddress();
-                    if ("virtual".equalsIgnoreCase(connThreads)) {
-                        Thread.ofVirtual().name(connName)
-                            .start(() -> handleConnection(client));
-                    } else {
-                        Thread.ofPlatform().name(connName).daemon(true)
-                            .start(() -> handleConnection(client));
-                    }
+                    startNamedThread(connName,
+                        "virtual".equalsIgnoreCase(connThreads),
+                        () -> handleConnection(client));
                 } catch (IOException e) {
                     if (running.get()) {
                         System.err.println("PgWire accept error: " + e.getMessage());

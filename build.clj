@@ -33,7 +33,7 @@
   (b/javac {:src-dirs ["java"]
             :class-dir class-dir
             :basis (basis)
-            :javac-opts ["-source" "17" "-target" "17"]}))
+            :javac-opts ["--release" "17"]}))
 
 (defn- write-version-resource!
   "Embed the version string at `pg-datahike.version` on the classpath
