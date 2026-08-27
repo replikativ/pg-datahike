@@ -2403,6 +2403,9 @@
                               (not (and (= :op (:type next))
                                         (not (contains? #{"+" "-" "~"}
                                                         (:text next))))))))
+          unclosed-dollar (first (filter #(and (:dollar-quoted? %)
+                                               (false? (:closed? %)))
+                                         tokens))
           bad (first
                (keep-indexed
                 (fn [idx {:keys [type text] :as token}]
@@ -2417,10 +2420,12 @@
                                  (not (contains? #{"#>" "#>>"} text))))
                     token))
                 tokens))]
-      (when bad
+      (when (or unclosed-dollar bad)
         {:type :error
          :sqlstate "42601"
-         :message (str "syntax error at or near \"" (:text bad) "\"")}))))
+         :message (if unclosed-dollar
+                    "unterminated dollar-quoted string"
+                    (str "syntax error at or near \"" (:text bad) "\""))}))))
 
 (defn simple-query-param-error
   "An `{:type :error}` map when `sql` uses a `$N` placeholder in the

@@ -922,6 +922,26 @@
             [end end "e0"]))
         toks))
 
+(defn dollar-quoted-string-rule
+  "Translate PostgreSQL dollar-quoted string literals to ordinary SQL string
+   literals before JSqlParser sees them.
+
+   JSqlParser 5.2 represents `$$body$$` as an unqualified Column instead of a
+   StringValue. That is especially dangerous for casts: `$$''$$::json` was
+   resolved as a missing column and returned zero rows instead of invoking the
+   json input function. Our tokenizer already recognizes complete untagged and
+   tagged dollar quotes as one :string token and exposes their decoded body, so
+   this rewrite is lexical and cannot affect placeholders, quoted identifiers,
+   comments, or dollar signs inside another string. Doubling single quotes
+   preserves the body under standard-conforming string semantics."
+  [toks]
+  (keep (fn [{:keys [type value pos end dollar-quoted? closed?]}]
+          (when (and (= :string type)
+                     dollar-quoted?
+                     closed?)
+            [pos end (str "'" (str/replace value "'" "''") "'")]))
+        toks))
+
 ;; ============================================================================
 ;; Canonical rule set for preprocess-sql
 ;; ============================================================================
@@ -948,6 +968,7 @@
    default-fn-call-paren-rule
    negative-numeric-scale-rule
    wide-integer-literal-rule
+   dollar-quoted-string-rule
    hash-xor-rule
    json-path-operator-spacing-rule
    partition-by-rule])

@@ -594,8 +594,34 @@
   {:id 3
    :name "specialized application types"
    :tests
-   [{:name "json" :mode :unmeasured :boundaries #{:json}}
-    {:name "jsonb" :mode :discovery :boundaries #{:jsonb}}
+   [{:name "json" :mode :discovery :boundaries #{:json}
+     :blockers #{:json-number-token-resource-ceiling
+                 :json-constructors :json-aggregates :record-population
+                 :catalog-statistics :temporal-infinity :json-full-text
+                 :planner-explain}
+     :strict-slices
+     [{:id :input-strings-numbers-arrays-objects
+       :source-lines [1 48]
+       :gate "test/datahike/test/pg_json_input_validation_test.clj"
+       :test-var "postgres-json-input-regression-slices"}
+      {:id :input-scalars-multiline-and-inspection
+       :source-lines [55 87]
+       :gate "test/datahike/test/pg_json_input_validation_test.clj"
+       :test-var "postgres-json-input-regression-slices"}]}
+    {:name "jsonb" :mode :discovery :boundaries #{:jsonb}
+     :blockers #{:copy-from-file :json-constructors :json-aggregates
+                 :record-population :catalog-statistics :temporal-infinity
+                 :jsonpath :json-full-text :operator-parser-coverage
+                 :planner-explain}
+     :strict-slices
+     [{:id :input-strings-numbers-arrays-objects
+       :source-lines [11 52]
+       :gate "test/datahike/test/pg_json_input_validation_test.clj"
+       :test-var "postgres-json-input-regression-slices"}
+      {:id :input-scalars-multiline-and-inspection
+       :source-lines [60 93]
+       :gate "test/datahike/test/pg_json_input_validation_test.clj"
+       :test-var "postgres-json-input-regression-slices"}]}
     {:name "jsonpath" :mode :unmeasured :boundaries #{:jsonpath}}
     {:name "sqljson" :mode :unmeasured :boundaries #{:sql-json}}
     {:name "tsearch" :mode :unmeasured :boundaries #{:full-text}}

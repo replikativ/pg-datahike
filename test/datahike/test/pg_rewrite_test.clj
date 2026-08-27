@@ -218,6 +218,20 @@
     (is (= "SELECT '9999999999999999999999', 1.0e30"
            (rewrite "SELECT '9999999999999999999999', 1.0e30")))))
 
+(deftest dollar-quoted-strings-become-parser-safe-literals
+  (let [rewrite #(rw/rewrite % [rw/dollar-quoted-string-rule])]
+    (testing "untagged and tagged literals preserve their bodies"
+      (is (= "SELECT 'abc', 'it''s json'"
+             (rewrite "SELECT $$abc$$, $json$it's json$json$")))
+      (is (= "SELECT '', 'a\n\\b'"
+             (rewrite "SELECT $$$$, $body$a\n\\b$body$"))))
+    (testing "parameters and opaque source regions remain untouched"
+      (is (= "SELECT $1, '$$inside$$', \"$identifier\" -- $$comment$$\n"
+             (rewrite "SELECT $1, '$$inside$$', \"$identifier\" -- $$comment$$\n"))))
+    (testing "an opener without its exact closer is never repaired into valid SQL"
+      (doseq [sql ["SELECT $$abc" "SELECT $tag$abc$wrong$"]]
+        (is (= sql (rewrite sql)))))))
+
 ;; ============================================================================
 ;; quote-reserved-alias-rule
 ;;

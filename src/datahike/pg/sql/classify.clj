@@ -165,9 +165,12 @@
           [{:type :string
             :text (subs sql pos (+ close-idx (count tag)))
             :pos pos
+            :dollar-quoted? true
+            :closed? true
             :value (subs sql body-start close-idx)}
            (+ close-idx (count tag))]
           [{:type :string :text (subs sql pos len) :pos pos
+            :dollar-quoted? true :closed? false
             :value (subs sql body-start len)}
            len])))))
 
