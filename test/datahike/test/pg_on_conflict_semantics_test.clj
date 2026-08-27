@@ -84,6 +84,15 @@
             "ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n"))
   (is (= [["15"]] (rows "SELECT n FROM t WHERE id = 1"))))
 
+(deftest do-update-unqualified-columns-belong-to-the-target-row
+  (seed!)
+  (testing "VALUES and INSERT SELECT both accept PostgreSQL's usual form"
+    (run (str "INSERT INTO t (id, n) VALUES (1, 5) "
+              "ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n"))
+    (run (str "INSERT INTO t (id, n) SELECT 1, 7 "
+              "ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n"))
+    (is (= [["22"]] (rows "SELECT n FROM t WHERE id = 1")))))
+
 (deftest insert-select-without-conflict-still-inserts
   (is (= "INSERT 0 1"
          (tag "INSERT INTO t (id, title) SELECT 2, 'fresh' ON CONFLICT (id) DO NOTHING")))

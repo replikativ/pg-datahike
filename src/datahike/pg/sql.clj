@@ -43,7 +43,7 @@
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem Join OrderByElement
             ParenthesedSelect SetOperationList TableStatement Values
-            UnionOp IntersectOp ExceptOp]
+            UnionOp IntersectOp ExceptOp Limit Offset]
            [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression.operators.relational
             ParenthesedExpressionList]
@@ -1651,6 +1651,15 @@
 
                                    (and table-free?
                                         (zero? param-count)
+                                        ;; Scalar subqueries need runtime
+                                        ;; Datalog bindings for cardinality,
+                                        ;; errors and execution snapshots;
+                                        ;; the literal-row fast path would
+                                        ;; freeze their result (or the result
+                                        ;; variable's printed name).
+                                        (not-any? #(expr/contains-subquery?
+                                                    (.getExpression ^SelectItem %))
+                                                  (.getSelectItems ^PlainSelect stmt))
                                         (identical? db pre-cte-db))
                          ;; Evaluate each SELECT expression as a Clojure expression
                                    (let [select-items (.getSelectItems ^PlainSelect stmt)
@@ -1964,20 +1973,49 @@
                     (instance? SetOperationList stmt)
                     (let [^SetOperationList sol stmt
                           selects (.getSelects sol)
+                          ;; JSqlParser attaches an unparenthesized trailing
+                          ;; LIMIT/OFFSET to the final PlainSelect when the set
+                          ;; operation has no ORDER BY. PostgreSQL applies that
+                          ;; tail to the combined set. Parenthesized members
+                          ;; retain their own local clauses.
+                          ^PlainSelect tail-select
+                          (when (instance? PlainSelect (last selects))
+                            (last selects))
+                          tail-limit (some-> tail-select .getLimit .getRowCount)
+                          tail-offset (some-> tail-select .getOffset .getOffset)
+                          lift-tail-limit? (and (nil? (.getLimit sol)) tail-limit)
+                          lift-tail-offset? (and (nil? (.getOffset sol)) tail-offset)
+                          limit-expr (or (some-> sol .getLimit .getRowCount)
+                                         tail-limit)
+                          offset-expr (or (some-> sol .getOffset .getOffset)
+                                          tail-offset)
                           operations (.getOperations sol)
                 ;; Parse each sub-select
-                          sub-results (mapv (fn [s]
-                                              (let [s (loop [s s]
-                                                        (if (instance? ParenthesedSelect s)
-                                                          (recur (.getSelect ^ParenthesedSelect s))
-                                                          s))]
-                                                (if (instance? PlainSelect s)
-                                                  (translate-select ^PlainSelect s schema db)
-                                                  {:type :error
-                                                   :sqlstate "0A000"
-                                                   :message (str "Unsupported set operation member: "
-                                                                 (type s))})))
-                                            selects)
+                          sub-results-raw
+                          (mapv (fn [s]
+                                  (let [s (loop [s s]
+                                            (if (instance? ParenthesedSelect s)
+                                              (recur (.getSelect ^ParenthesedSelect s))
+                                              s))]
+                                    (if (instance? PlainSelect s)
+                                      (translate-select ^PlainSelect s schema db)
+                                      {:type :error
+                                       :sqlstate "0A000"
+                                       :message (str "Unsupported set operation member: "
+                                                     (type s))})))
+                                selects)
+                          ;; Do not mutate the AST: it is shared by the AST
+                          ;; cache, and removing its tail made a later prepared
+                          ;; execution silently lose LIMIT/OFFSET. Translate
+                          ;; first, then lift only the unparenthesized final
+                          ;; member's post-processing into the combined plan.
+                          sub-results
+                          (if (or lift-tail-limit? lift-tail-offset?)
+                            (update sub-results-raw (dec (count sub-results-raw))
+                                    #(cond-> %
+                                       lift-tail-limit? (dissoc :limit :sql-limit :project-limit)
+                                       lift-tail-offset? (dissoc :offset :sql-offset :project-offset)))
+                            sub-results-raw)
                           op-kind (fn [op]
                                     (cond
                                       (instance? UnionOp op)
@@ -1988,6 +2026,32 @@
                                       (if (.isAll ^ExceptOp op) :except-all :except)
                                       :else :unknown))
                           operation-kinds (mapv op-kind operations)
+                          set-limit (when limit-expr
+                                      (let [value (stmt/extract-value limit-expr schema db)]
+                                        (when-not (params/param-ref? value)
+                                          (when (and (some? value) (not (integer? value)))
+                                            (throw (errors/pg-error
+                                                    :feature-not-supported
+                                                    {:detail (str "LIMIT expression is not supported: "
+                                                                  limit-expr)})))
+                                          (when (and (integer? value) (neg? value))
+                                            (throw (errors/pg-error
+                                                    :invalid-row-count-in-limit-clause
+                                                    {:message "LIMIT must not be negative"})))
+                                          value)))
+                          set-offset (when offset-expr
+                                       (let [value (stmt/extract-value offset-expr schema db)]
+                                         (when-not (params/param-ref? value)
+                                           (when (and (some? value) (not (integer? value)))
+                                             (throw (errors/pg-error
+                                                     :feature-not-supported
+                                                     {:detail (str "OFFSET expression is not supported: "
+                                                                   offset-expr)})))
+                                           (when (and (integer? value) (neg? value))
+                                             (throw (errors/pg-error
+                                                     :invalid-row-count-in-result-offset-clause
+                                                     {:message "OFFSET must not be negative"})))
+                                           value)))
                           ;; The top-level executor retains its historical
                           ;; first-op field; nested consumers inspect the full
                           ;; vector and reject shapes they cannot preserve.
@@ -2034,6 +2098,8 @@
                                :runtime-subqueries?
                                (boolean (some :runtime-subqueries? sub-results))}
                         (seq set-order-by) (assoc :sql-order-by set-order-by)
+                        (some? set-limit) (assoc :sql-limit set-limit)
+                        (some? set-offset) (assoc :sql-offset set-offset)
                        ;; Top-level catalog materialisation propagates
                        ;; to the server's set-operation executor via
                        ;; :enriched-db — each sub-query runs against it.

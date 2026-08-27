@@ -79,7 +79,7 @@
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
-            Select SetOperationList FromItem OrderByElement]))
+            Select SetOperationList FromItem OrderByElement WithItem]))
 
 (set! *warn-on-reflection* true)
 
@@ -113,6 +113,8 @@
          strict-subquery-values
          strict-subquery-rows
          strict-subquery-row
+         strict-scalar-subquery
+         scalar-subquery-output-oid
          in-left-asts
          row-expression?
          row-comparison-expression?
@@ -327,6 +329,7 @@
    :table-aliases (:table-aliases ctx)
    :default-table (:default-table ctx)
    :from-binding-oids params/*from-binding-oids*
+   :scalar-subquery-oid #(scalar-subquery-output-oid ctx %)
    :hints         (:hints ctx)})
 
 (defn- source-oid
@@ -475,6 +478,8 @@
 
      :else nil)))
 
+(declare translate-deferred-form)
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -493,9 +498,13 @@
                    (some-> (.getNamedParameters f) .getExpressions))
         arg-exprs (when params (vec params))
         arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
+        lazy-args? (= fname "coalesce")
         raw-args (when arg-exprs
                    (mapv #(if (instance? net.sf.jsqlparser.expression.Expression %)
-                            (translate-expr ctx %)
+                            (if lazy-args?
+                              (translate-deferred-form
+                               ctx (fn [] (translate-expr ctx %)))
+                              (translate-expr ctx %))
                             %)
                          arg-exprs))
         ;; `position(sub IN str)` names its operands the other way round
@@ -507,8 +516,9 @@
                    [(second raw-args) (first raw-args)]
                    raw-args)
         ;; Materialize complex sub-expressions into intermediate vars
-        args (when raw-args
-               (mapv #(ctx/materialize-arg! ctx %) raw-args))
+        args (binding [ctx/*defer-expression-materialization* lazy-args?]
+               (when raw-args
+                 (mapv #(ctx/materialize-arg! ctx %) raw-args)))
         ;; Strict-function nullability: `upper(s)` is NULL wherever s is,
         ;; and the result var is the operand a null-guard has to name.
         result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) args)]
@@ -860,11 +870,7 @@
 
       (= fname "pg_typeof")
       (let [arg-expr (first params)
-            oid-env {:db            (:db ctx)
-                     :schema        (:schema ctx)
-                     :table-aliases (:table-aliases ctx)
-                     :default-table (:default-table ctx)
-                     :hints         (:hints ctx)}
+            oid-env (oid-env ctx)
             arg-oid (try
                       (oid-infer/expr-oid arg-expr oid-env)
                       (catch Throwable _ nil))
@@ -1165,17 +1171,22 @@
 
       ;; COALESCE(a, b, ...) → first non-null/non-sentinel arg
       (= fname "coalesce")
-      (let [_ (ctx/make-columns-optional! ctx args)
+      (let [param-vars (vec (ctx/collect-vars args))
+            _ (ctx/make-columns-optional! ctx param-vars)
             fn-param (symbol (str "?coalesce-fn" (swap! (:var-counter ctx) inc)))
-            coalesce-fn (fn [& vals]
-                          ;; Can't use `or` here — `false` is a valid value but
-                          ;; falsy. Find first non-null explicitly.
-                          (let [non-null (remove #(or (nil? %) (= :__null__ %)) vals)]
-                            (if (seq non-null) (first non-null) :__null__)))]
+            coalesce-fn (let [forms args pv param-vars]
+                          (fn [& vals]
+                            (let [bindings (zipmap pv vals)]
+                              (reduce (fn [_ form]
+                                        (let [value (interpret-form form bindings)]
+                                          (if (or (nil? value) (= :__null__ value))
+                                            :__null__
+                                            (reduced value))))
+                                      :__null__ forms))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj coalesce-fn)
         (swap! (:where-clauses ctx) conj
-               [(apply list fn-param args) result-var])
+               [(apply list fn-param param-vars) result-var])
         result-var)
 
       ;; NULLIF(a, b) → [(when (not= ?a ?b) ?a) ?result]
@@ -1838,6 +1849,23 @@
                              clauses))]
     [keep-cs form]))
 
+(defn translate-deferred-form
+  "Translate one lazy SQL operand into an interpreted form.
+
+   Translation normally emits SSA-style Datalog bindings eagerly. CASE and
+   COALESCE must instead evaluate only the selected operand, so capture the
+   bindings emitted by this operand, inline the dependency chain feeding its
+   result, and retain only source-column reads needed to supply runtime vars."
+  [ctx translate]
+  (let [before (vec @(:where-clauses ctx))
+        start (count before)
+        value (translate)
+        after (vec @(:where-clauses ctx))
+        emitted (subvec after start)
+        [retained form] (split-aggregate-projection value emitted #{})]
+    (reset! (:where-clauses ctx) (into before retained))
+    form))
+
 (defn translate-case-expr
   "Translate a CASE WHEN expression by compiling a Clojure function
    and passing it as an :in parameter. Returns the result variable.
@@ -1860,10 +1888,14 @@
                                then-val (.getThenExpression wc)
                                _ (when switch-expr
                                    (check-comparison-types! ctx '= switch-expr when-val))
-                               test (if switch-val
-                                      (list 'datahike.pg.sql/sql-eq? switch-val (translate-expr ctx when-val))
-                                      (translate-predicate-expr ctx when-val))
-                               then (translate-expr ctx then-val)]
+                               test (translate-deferred-form
+                                     ctx
+                                     #(if switch-val
+                                        (list 'datahike.pg.sql/sql-eq? switch-val
+                                              (translate-expr ctx when-val))
+                                        (translate-predicate-expr ctx when-val)))
+                               then (translate-deferred-form
+                                     ctx #(translate-expr ctx then-val))]
                            ;; Detect unsupported: aggregate refs in CASE branches
                            (when (or (map? test) (map? then))
                              (throw (ex-info "aggregate in CASE not supported"
@@ -1873,7 +1905,9 @@
                                               :expr (str case-expr)})))
                            {:test test :then then}))
                        when-clauses)
-        else-val (when else-expr (translate-expr ctx else-expr))
+        else-val (when else-expr
+                   (translate-deferred-form
+                    ctx #(translate-expr ctx else-expr)))
         ;; Collect all symbols (variables) from the branches
         all-forms (concat (mapcat (fn [{:keys [test then]}] [test then]) branches)
                           (when else-val [else-val]))
@@ -2079,6 +2113,11 @@
                     :else []))))]
       (vec (walk node)))))
 
+(defn contains-subquery?
+  "True when an expression contains a SELECT node at any nesting depth."
+  [node]
+  (boolean (seq (nested-selects-in node))))
+
 (defn- local-item-alias [^FromItem item]
   (or (try (some-> item .getAlias .getName unquote-ident str/lower-case)
            (catch Throwable _ nil))
@@ -2114,6 +2153,9 @@
               (instance? PlainSelect node)
               (let [^PlainSelect ps node
                     joins (or (.getJoins ps) [])
+                    with-items (or (try (.getWithItemsList ps)
+                                        (catch Throwable _ nil))
+                                   [])
                     local-items (cons (.getFromItem ps)
                                       (map #(.getRightItem ^Join %) joins))
                     locals (into #{} (keep local-item-alias) local-items)
@@ -2128,10 +2170,42 @@
                                                           unquote-ident str/lower-case)]))))
                                    (mapcat params/ast-columns scope-nodes))
                     children (concat (mapcat nested-selects-in scope-nodes)
-                                     (mapcat nested-selects-in local-items))]
-                (into own-refs (mapcat #(refs % visible)) children))
+                                     (mapcat nested-selects-in local-items))
+                    ;; WITH definitions are attached to the SELECT but are
+                    ;; outside the ordinary projection/FROM scope nodes.
+                    ;; They can themselves correlate to an outer query (the
+                    ;; asyncpg domain-type probe does so from a recursive CTE).
+                    with-refs
+                    (mapcat (fn [^WithItem wi]
+                              (when-let [body (try (.getParenthesedStatement wi)
+                                                   (catch Throwable _ nil))]
+                                (refs body visible-outers)))
+                            with-items)]
+                (into own-refs (concat with-refs
+                                       (mapcat #(refs % visible) children))))
 
-              :else #{}))]
+              ;; Expression roots (notably CASE) are not SELECT scopes, but
+              ;; can both refer directly to an outer column and contain scalar
+              ;; SELECTs. `ast-columns` leaves SELECT bodies opaque, so direct
+              ;; CASE references are collected here without leaking through an
+              ;; inner alias scope; each immediate SELECT child is then handled
+              ;; by `refs` under its own FROM shadowing rules.
+              :else
+              (let [own-refs (into #{}
+                                   (keep (fn [^Column col]
+                                           (let [alias (some-> col .getTable .getName
+                                                               unquote-ident str/lower-case)]
+                                             (when (contains? visible-outers alias)
+                                               [alias (-> col .getColumnName
+                                                          unquote-ident str/lower-case)]))))
+                                   (params/ast-columns node))]
+                (into own-refs (mapcat #(refs % visible-outers))
+                      ;; Values is itself a Select in JSqlParser. Its columns
+                      ;; are handled above; recursing into the node returned by
+                      ;; nested-selects-in would revisit the identical object
+                      ;; forever. Other expression roots only retain proper
+                      ;; child SELECTs here.
+                      (remove #(identical? node %) (nested-selects-in node))))))]
     (when (seq outer-aliases)
       (not-empty (refs inner (set outer-aliases))))))
 
@@ -2166,45 +2240,8 @@
    One implementation for both callers: the deferred SELECT-list evaluator
    and the per-row WHERE-position binding below."
   [parse-fn sql subquery? inner-schema query-db]
-  (let [v (try
-            (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))
-                  p   (parse-fn run-sql inner-schema query-db)
-                  ;; `parse-sql` REPORTS a translation failure as an error
-                  ;; map rather than throwing, so the type errors below
-                  ;; would be swallowed here just as silently as a throw:
-                  ;; the inner would produce no query and the item would
-                  ;; read as NULL.
-                  _   (when (and (= :error (:type p))
-                                 (contains? #{"42883" "42804"} (:sqlstate p)))
-                        (throw (ex-info (:message p)
-                                        {:error (if (= "42804" (:sqlstate p))
-                                                  :datatype-mismatch
-                                                  :undefined-function)
-                                         :sqlstate (:sqlstate p)
-                                         :detail (:message p)})))
-                  q   (:query p) ia (:in-args p) qdb (or (:enriched-db p) query-db)]
-              (if (nil? q)
-                (let [lr (:literal-row p)] (if (sequential? lr) (first lr) lr))
-                (let [res (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))
-                      ;; An aggregate over an empty relation is still ONE
-                      ;; row -- `(SELECT count(*) FROM t WHERE …)` with no
-                      ;; match is 0, not NULL.
-                      res (or (when (empty? (seq res)) (empty-aggregate-row q)) res)
-                      fr  (first res)]
-                  (if (sequential? fr) (first fr) fr))))
-            ;; A TYPE-RESOLUTION error is PostgreSQL's own answer to this
-            ;; query and has to reach the client: `(SELECT count(*) …
-            ;; WHERE t2.flag = t.n)` is `operator does not exist: boolean
-            ;; = integer` there, not a column of NULLs here. Everything
-            ;; else stays tolerant -- the catalog probes this path was
-            ;; written for fail to translate for reasons PostgreSQL does
-            ;; not share, and NULL is the right answer for those.
-            (catch Throwable t
-              (let [{:keys [error]} (ex-data t)]
-                (if (contains? #{:undefined-function :datatype-mismatch} error)
-                  (throw t)
-                  nil))))]
-    (if (some? v) v :__null__)))
+  (let [run-sql (if subquery? sql (str "SELECT (" sql ")"))]
+    (strict-scalar-subquery parse-fn run-sql inner-schema query-db {})))
 
 (defn- translate-value-comparison-operands
   "Translate comparison operands in value position after applying the
@@ -3285,6 +3322,29 @@
       (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.sql/sql-money-div
       :else nil)))
 
+(defn- check-scalar-subquery-arithmetic-types!
+  "Do not let a scalar subquery's resolved output type fall back to JVM
+   arithmetic. Unlike a quoted literal, `(SELECT '1')` has already crossed
+   a query boundary and is TEXT, so PostgreSQL cannot coerce it to integer."
+  [ctx op left right]
+  (when (or (instance? ParenthesedSelect left)
+            (instance? PlainSelect left)
+            (instance? ParenthesedSelect right)
+            (instance? PlainSelect right))
+    (let [left-oid (source-oid ctx left)
+          right-oid (source-oid ctx right)
+          arithmetic-category? #(contains? #{:N :D :T} (get types/oid->category %))]
+      (when (and left-oid right-oid
+                 (not (and (arithmetic-category? left-oid)
+                           (arithmetic-category? right-oid))))
+        (throw (errors/pg-error
+                :undefined-function
+                {:detail (str "operator does not exist: "
+                              (get types/oid->pg-name left-oid "?") " " op " "
+                              (get types/oid->pg-name right-oid "?"))
+                 :hint (str "No operator matches the given name and argument "
+                            "types. You might need to add explicit type casts.")}))))))
+
 (defn translate-binary-arith
   "Translate a binary arithmetic expression. Materializes sub-expression
    operands. When operands are aggregate markers, returns a compound-agg
@@ -3297,6 +3357,7 @@
   [ctx ^net.sf.jsqlparser.expression.BinaryExpression expr op-sym]
   (let [left-expr (.getLeftExpression expr)
         right-expr (.getRightExpression expr)
+        _ (check-scalar-subquery-arithmetic-types! ctx op-sym left-expr right-expr)
         ;; PG puts prefix `~` at the generic-operator precedence level,
         ;; BELOW `+ - * / %` and `^`, so `~1 + 1` means `~(1 + 1)` = -3
         ;; and `~2 * 3` means `~(2 * 3)` = -7. JSqlParser binds the `~`
@@ -3594,9 +3655,7 @@
             (:having p)
             (:fetch-with-ties? p)
             (:for-update p)
-            (seq (:deferred-recursive-ctes p))
-            (:sql-limit p)
-            (:sql-offset p))
+            (seq (:deferred-recursive-ctes p)))
     (throw (errors/pg-error
             :feature-not-supported
             {:message "this subquery requires SELECT post-processing that is not implemented"}))))
@@ -3623,13 +3682,33 @@
 
     :else false))
 
+(defn- apply-subquery-order-limit
+  "Apply the server-side SELECT tail used when nullable ORDER BY keys keep
+   sorting out of Datalog. Rows still include any hidden sort projections."
+  [rows {:keys [sql-order-by sql-offset sql-limit has-aggregates? limit offset]}]
+  (let [tail-offset (or sql-offset (when has-aggregates? offset))
+        tail-limit (or sql-limit (when has-aggregates? limit))
+        ordered (if sql-order-by
+                  (sort (fn [a b]
+                          (loop [parts (partition 3 sql-order-by)]
+                            (if-let [[idx dir nulls] (first parts)]
+                              (let [c (fns/order-key-cmp (nth a idx nil)
+                                                         (nth b idx nil)
+                                                         dir nulls)]
+                                (if (zero? c) (recur (rest parts)) c))
+                              0)))
+                        rows)
+                  rows)
+        offset-rows (cond->> ordered tail-offset (drop tail-offset))]
+    (vec (cond->> offset-rows tail-limit (take tail-limit)))))
+
 (defn- run-subquery-leaf
   [p db]
   (throw-subquery-error! p)
   (reject-unapplied-subquery-stages! p)
   (let [q (cond-> (:query p)
-            (:limit p) (assoc :limit (:limit p))
-            (:offset p) (assoc :offset (:offset p)))
+            (and (:limit p) (not (:has-aggregates? p))) (assoc :limit (:limit p))
+            (and (:offset p) (not (:has-aggregates? p))) (assoc :offset (:offset p)))
         in-args (:in-args p)
         query-db (or (:enriched-db p) db)
         raw (cond
@@ -3641,6 +3720,7 @@
               (seq in-args) (apply d/q q query-db in-args)
               :else (d/q q query-db))
         raw (or (when (and q (empty? (seq raw))) (empty-aggregate-row q)) raw)
+        raw (apply-subquery-order-limit raw p)
         hidden (long (or (:hidden-count p) 0))]
     (if (pos? hidden)
       (mapv (fn [row]
@@ -3672,13 +3752,15 @@
                        (mapv #(set-ops/coerce-row % output-oids)
                              (run-subquery-leaf branch (or (:enriched-db p) db))))
                      (:sub-results p))]
-      (case (:op p)
-        :union-all (vec (mapcat identity rows))
-        :union (vec (distinct (mapcat identity rows)))
-        :intersect (vec (apply set/intersection (map set rows)))
-        :except (let [[head & tail] rows]
-                  (vec (reduce set/difference (set head) (map set tail))))
-        (vec (mapcat identity rows))))
+      (let [combined (case (:op p)
+                       :union-all (vec (mapcat identity rows))
+                       :union (vec (distinct (mapcat identity rows)))
+                       :intersect (vec (apply set/intersection (map set rows)))
+                       :except (let [[head & tail] rows]
+                                 (vec (reduce set/difference (set head) (map set tail))))
+                       (vec (mapcat identity rows)))
+            result (apply-subquery-order-limit combined p)]
+        result))
     (run-subquery-leaf p db)))
 
 (def ^:private row-op->sym
@@ -3806,7 +3888,7 @@
    (strict-subquery-rows parse-fn inner schema db left-oids relation-namespaces
                          {:op := :unknown-from-left? true}))
   ([parse-fn inner schema db left-oids relation-namespaces
-    {:keys [op unknown-from-left?]
+    {:keys [op unknown-from-left? expected-width]
      :or {op := unknown-from-left? true}}]
    (let [runtime-db params/*runtime-db*
         ;; Query-local relations live only in the enriched parse-time DB.
@@ -3833,6 +3915,10 @@
                            output-oids
                            (leaf-resolution-oids p))
          comparison-oids (if unknown-from-left? resolution-oids output-oids)
+         _ (when (and expected-width (not= expected-width (count output-oids)))
+             (throw (errors/pg-error
+                     :syntax-error
+                     {:message "subquery must return only one column"})))
          _ (when left-oids
              (check-row-output-types! op left-oids output-oids comparison-oids))
          target-oids (mapv (fn [left-oid output-oid resolution-oid]
@@ -3870,6 +3956,24 @@
       1 (first rows)
       (throw (ex-info "more than one row returned by a subquery used as an expression"
                       {:error :cardinality-violation :sqlstate "21000"})))))
+
+(defn strict-scalar-subquery
+  "Execute a scalar subquery with PostgreSQL width and cardinality rules.
+
+   Translation and execution errors remain SQL errors. Empty results become
+   the SQL NULL sentinel because nil would filter a Datalog function binding."
+  ([parse-fn inner schema db]
+   (strict-scalar-subquery parse-fn inner schema db {}))
+  ([parse-fn inner schema db relation-namespaces]
+   (let [rows (strict-subquery-rows parse-fn inner schema db nil
+                                    relation-namespaces
+                                    {:expected-width 1
+                                     :unknown-from-left? false})]
+     (case (count rows)
+       0 :__null__
+       1 (let [v (ffirst rows)] (if (some? v) v :__null__))
+       (throw (ex-info "more than one row returned by a subquery used as an expression"
+                       {:error :cardinality-violation :sqlstate "21000"}))))))
 
 (defn- correlation-oids [ctx corr-refs]
   (reduce (fn [m [alias col]]
@@ -4234,6 +4338,90 @@
     (throw-subquery-error! parsed)
     (validate-parsed-in-plan! parsed)))
 
+(defn- analyze-scalar-subquery!
+  "Validate scalar width and executable stages before scanning an outer row."
+  [ctx inner corr-refs]
+  (let [corr-oids (correlation-oids ctx corr-refs)
+        unqualified-outer-scope? (and (instance? PlainSelect inner)
+                                      (nil? (.getFromItem ^PlainSelect inner)))
+        null-bindings (reduce (fn [m [alias col]]
+                                (assoc-in m [alias col] :__null__))
+                              {} corr-refs)
+        parsed (binding [params/*from-bindings* null-bindings
+                         params/*from-binding-oids* corr-oids
+                         params/*from-source-aliases*
+                         (when unqualified-outer-scope?
+                           (set (map first corr-refs)))
+                         params/*lateral-outer-aliases* (set (map first corr-refs))]
+                 ((:parse-sql ctx) (str inner) (:schema ctx) (:db ctx)))]
+    (throw-subquery-error! parsed)
+    (validate-parsed-in-plan! parsed)
+    (when (not= 1 (count (parsed-output-oids parsed)))
+      (throw (errors/pg-error
+              :syntax-error
+              {:message "subquery must return only one column"})))
+    parsed))
+
+(defn scalar-subquery-output-oid
+  "Analyze a scalar subquery and return its sole PostgreSQL output OID.
+
+   This is the callback seam used by oid-infer: the generic AST walker does
+   not know SQL scopes, while this namespace can validate correlated names,
+   scalar width and set-operation common types against the active context."
+  [ctx expr]
+  (let [inner (loop [node expr]
+                (if (instance? ParenthesedSelect node)
+                  (recur (.getSelect ^ParenthesedSelect node))
+                  node))
+        values-rows (when (instance? Values inner)
+                      (let [raw (vec (.getExpressions ^Values inner))]
+                        (if (and (seq raw)
+                                 (instance? ParenthesedExpressionList (first raw)))
+                          (mapv #(vec ^ParenthesedExpressionList %) raw)
+                          [raw])))]
+    (if values-rows
+      (let [row (first values-rows)]
+        (when (not= 1 (count row))
+          (throw (errors/pg-error
+                  :syntax-error
+                  {:message "subquery must return only one column"})))
+        (oid-infer/expr-oid (first row) (oid-env ctx)))
+      (let [corr-refs (when (and (:db ctx) (:parse-sql ctx))
+                        (seq (row-subquery-correlation-refs ctx inner)))
+            parsed (analyze-scalar-subquery! ctx inner corr-refs)]
+        (first (parsed-output-oids parsed))))))
+
+(defn- uncorrelated-scalar-var!
+  "Bind an uncorrelated scalar subquery at query execution time."
+  [ctx inner]
+  (let [parse-fn (:parse-sql ctx)
+        schema (:schema ctx)
+        fallback-db (:db ctx)
+        relation-namespaces ctx/*relation-namespaces*
+        fn-param (symbol (str "?scalar-subquery" (swap! (:var-counter ctx) inc)))
+        result-var (ctx/fresh-var! ctx)
+        cache-key (Object.)
+        evaluate (fn []
+                   (if-let [cache params/*scalar-subquery-cache*]
+                     (if (contains? @cache cache-key)
+                       (get @cache cache-key)
+                       (let [value (strict-scalar-subquery
+                                    parse-fn inner schema fallback-db relation-namespaces)]
+                         (swap! cache assoc cache-key value)
+                         value))
+                     (strict-scalar-subquery
+                      parse-fn inner schema fallback-db relation-namespaces)))
+        form (list fn-param)]
+    (reset! (:runtime-subqueries? ctx) true)
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj evaluate)
+    (if ctx/*defer-expression-materialization*
+      form
+      (do
+        (ctx/add-clause! ctx [form result-var])
+        (swap! (:nullable-vars ctx) conj result-var)
+        result-var))))
+
 (defn- correlated-scalar-var!
   "Bind a variable to a CORRELATED scalar subquery's value, evaluated once
    per outer row, and return the variable.
@@ -4257,6 +4445,9 @@
         db       (:db ctx)
         inner-sql (str inner)
         corr-refs (vec corr-refs)
+        corr-oids (correlation-oids ctx corr-refs)
+        unqualified-outer-scope? (and (instance? PlainSelect inner)
+                                      (nil? (.getFromItem ^PlainSelect inner)))
         ;; Through translate-expr, so the outer column resolves exactly as
         ;; it would anywhere else in the statement -- aliases, ref columns
         ;; and the nullable-var bookkeeping included.
@@ -4267,12 +4458,24 @@
                            (net.sf.jsqlparser.schema.Table. ^String a)
                            ^String c)))
                        corr-refs)
+        ;; Datahike may memoize a function binding by its argument tuple.
+        ;; PostgreSQL rescans a correlated volatile subplan for every
+        ;; physical outer row, even when two rows carry equal correlation
+        ;; values. Thread the outer entity id as an ignored identity token.
+        row-token (when-let [alias (:default-table ctx)]
+                    (ctx/entity-var! ctx alias))
+        call-args (cond-> arg-vars row-token (conj row-token))
         out-var  (ctx/fresh-var! ctx)
         fn-param (symbol (str "?corr-scalar" (swap! (:var-counter ctx) inc)))
-        f (fn [& outer-vals]
-            (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
+        f (fn [& all-vals]
+            (let [outer-vals (take (count corr-refs) all-vals)
+                  fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
                              {} (map vector corr-refs outer-vals))]
               (binding [params/*from-bindings* fb
+                        params/*from-binding-oids* corr-oids
+                        params/*from-source-aliases*
+                        (when unqualified-outer-scope?
+                          (set (map first corr-refs)))
                         ;; Without it the inner translator reads `t2.id =
                         ;; ft.id` as an implicit JOIN against the relation
                         ;; `ft` and adds ft to the inner FROM -- the
@@ -4280,13 +4483,18 @@
                         ;; row gets the same uncorrelated answer.
                         params/*lateral-outer-aliases* (set (map first corr-refs))]
                 (eval-correlated-scalar parse-fn inner-sql true schema db))))]
+    (reset! (:runtime-subqueries? ctx) true)
     (swap! (:in-params ctx) conj fn-param)
     (swap! (:in-args ctx) conj f)
-    (ctx/add-clause! ctx [(apply list fn-param arg-vars) out-var])
-    ;; It can be NULL, so comparisons against it need the three-valued
-    ;; guard every other nullable value gets.
-    (swap! (:nullable-vars ctx) conj out-var)
-    out-var))
+    (let [form (apply list fn-param call-args)]
+      (if ctx/*defer-expression-materialization*
+        form
+        (do
+          (ctx/add-clause! ctx [form out-var])
+          ;; It can be NULL, so comparisons against it need the three-valued
+          ;; guard every other nullable value gets.
+          (swap! (:nullable-vars ctx) conj out-var)
+          out-var)))))
 
 (defn column-value!
   "Return a column's SQL value variable. Most Datahike scalar values are
@@ -5173,16 +5381,15 @@
     ;; catalog (we don't track column defaults or collations as rows),
     ;; so the inner produces no rows for any outer row → NULL.
     ;;
-    ;; Strategy: a CORRELATED inner becomes a per-row function binding
-    ;; (`correlated-scalar-var!`); an uncorrelated one is evaluated once
-    ;; at translate time against the (catalog-enriched) db, which is both
-    ;; correct and cheaper -- its value cannot vary by row.
-    ;;   1. Uncorrelated, returns rows → use first row's first col.
-    ;;   2. Uncorrelated, returns 0 rows → :__null__.
+    ;; Strategy: a CORRELATED inner becomes a per-row function binding;
+    ;; an uncorrelated one becomes a zero-argument runtime binding so a
+    ;; prepared statement reads its execution snapshot. Both share strict
+    ;; scalar width, cardinality and error propagation.
     (or (instance? ParenthesedSelect expr) (instance? PlainSelect expr))
-    (let [inner (if (instance? ParenthesedSelect expr)
-                  (.getSelect ^ParenthesedSelect expr)
-                  expr)]
+    (let [inner (loop [node expr]
+                  (if (instance? ParenthesedSelect node)
+                    (recur (.getSelect ^ParenthesedSelect node))
+                    node))]
       ;; `SELECT (VALUES (1))` is PostgreSQL's scalar-subquery spelling for
       ;; a one-row, one-column VALUES relation. JSqlParser puts Values behind
       ;; ParenthesedSelect, but the ordinary scalar-subquery executor below
@@ -5204,34 +5411,15 @@
                               {:error :syntax-error :sqlstate "42601"})))
             (translate-expr ctx (first row))))
         (let [db    (:db ctx)
-              corr-refs (when (and db (instance? PlainSelect inner) (:parse-sql ctx))
-                          (seq (correlated-subquery-refs inner (outer-alias-set ctx))))]
-          (if corr-refs
-            (correlated-scalar-var! ctx inner corr-refs)
-            (if (and db (instance? PlainSelect inner) (:parse-sql ctx))
-              (try
-                (let [parse-fn   (:parse-sql ctx)
-                      inner-sql  (str inner)
-                      parsed     (parse-fn inner-sql (:schema ctx) db)
-                      q          (:query parsed)
-                      in-args    (:in-args parsed)
-                      query-db   (or (:enriched-db parsed) db)
-                      q-fn       d/q
-                      results    (if (seq in-args)
-                                   (apply q-fn q query-db in-args)
-                                   (q-fn q query-db))
-                ;; An aggregate over an empty relation is still ONE row --
-                ;; `(SELECT count(*) FROM t WHERE false)` is 0, not NULL.
-                ;; The rule lives with the other consumers; see
-                ;; stmt/empty-aggregate-row.
-                      results    (or (when (empty? (seq results))
-                                       (empty-aggregate-row q))
-                                     results)
-                      first-row  (first results)
-                      v          (if (sequential? first-row) (first first-row) first-row)]
-                  (if (some? v) v :__null__))
-                (catch Throwable _ :__null__))
-              :__null__)))))
+              corr-refs (when (and db (:parse-sql ctx))
+                          (seq (row-subquery-correlation-refs ctx inner)))]
+          (if (and db (:parse-sql ctx))
+            (do
+              (analyze-scalar-subquery! ctx inner corr-refs)
+              (if corr-refs
+                (correlated-scalar-var! ctx inner corr-refs)
+                (uncorrelated-scalar-var! ctx inner)))
+            :__null__))))
 
     :else
     (throw (ex-info "unsupported SQL expression"

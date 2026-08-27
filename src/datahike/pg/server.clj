@@ -1112,6 +1112,11 @@
                               :when (and (keyword? k) (not= :db/id k))]
                           [(long e) k]))
                   acc))))
+
+          (instance? datahike.datom.Datom item)
+          (conj acc [(.-e ^datahike.datom.Datom item)
+                     (.-a ^datahike.datom.Datom item)])
+
           (vector? item)
           (case (first item)
             (:db/add :db/retract)
@@ -1342,6 +1347,41 @@
                            (if (= ::opaque eas) ::opaque eas))
     report))
 
+(defn- transact-speculative-report!
+  "Commit exactly the datoms produced by one prior `dc/with` evaluation.
+
+   RETURNING must be validated before commit, but replaying the original SQL
+   tx-data would execute transaction functions (notably ON CONFLICT) twice and
+   could store a different volatile value from the one returned. Expanded
+   datoms preserve the one speculative evaluation. The transactor guard makes
+   that replay conditional on the connection still being at the snapshot it
+   expanded from; a concurrent advance returns 40001 instead of applying EIDs
+   or uniqueness decisions derived from a stale database."
+  [conn db-before spec-report]
+  (let [expected-max-tx (:max-tx db-before)
+        ;; A history-enabled `dc/with` includes its speculative transaction's
+        ;; txInstant datom. The real transact creates its own metadata; replaying
+        ;; the speculative one would retract/replace that timestamp and add
+        ;; duplicate history churn on the tx entity.
+        expanded (into []
+                       (remove #(and (instance? datahike.datom.Datom %)
+                                     (= :db/txInstant
+                                        (.-a ^datahike.datom.Datom %))))
+                       (:tx-data spec-report))
+        guarded-expand
+        (fn [txdb expected datoms]
+          (if (= expected (:max-tx txdb))
+            datoms
+            (throw (ex-info "could not serialize speculative RETURNING write"
+                            {:error :serialization-failure
+                             :detail "database advanced while RETURNING was evaluated"}))))]
+    (let [report (d/transact
+                  conn [[:db.fn/call guarded-expand expected-max-tx expanded]])
+          db-after (:db-after report)
+          eas (tx-buffer-eas expanded db-before)]
+      (record-commit-writes! (db-ring-key db-after) (:max-tx db-after) eas)
+      report)))
+
 (defn- eas-overlap?
   "Row-level overlap incl. [e ::all] entity-retraction wildcards on
    either side."
@@ -1525,8 +1565,17 @@
   (let [columns (->> (pgs/column-info schema table-name db)
                      (remove #(= "db_id" (:name %)))
                      vec)
-        aliases (cond-> {table-name table-name} table-alias (assoc table-alias table-name))
-        env {:db db :schema schema :default-table table-name :table-aliases aliases}]
+        visible-name (or table-alias table-name)
+        aliases {visible-name table-name}
+        return-ctx (sql-ctx/make-ctx
+                    schema aliases visible-name
+                    {:db db :parse-sql sql/parse-sql :hints (pgs/schema-hints db)})
+        env {:db db
+             :schema schema
+             :default-table visible-name
+             :table-aliases aliases
+             :scalar-subquery-oid #(expr/scalar-subquery-output-oid return-ctx %)
+             :hints (pgs/schema-hints db)}]
     (vec
      (mapcat
       (fn [{:keys [kind table expr name] :as item}]
@@ -1548,24 +1597,31 @@
 
 (defn- build-returning-result
   "Build a QueryResult for a RETURNING projection from affected entity IDs.
-   db: database to read values from (db-after for INSERT/UPDATE, db-before for DELETE).
+   row-db: database containing the row image exposed by RETURNING (db-after
+   for INSERT/UPDATE, db-before for DELETE).
+   subquery-db: the command snapshot used by scalar subqueries in RETURNING.
+   PostgreSQL exposes the new row directly, but scans performed by a RETURNING
+   subquery do not see writes made by the current command.
    eids: entity IDs to return.
    table-name: the table name (namespace prefix for attributes).
    schema: database schema."
-  [returning db eids table-name table-alias schema command]
-  (let [items (returning-items returning db table-name table-alias schema)
+  [returning row-db subquery-db eids table-name table-alias schema command]
+  (let [items (returning-items returning row-db table-name table-alias schema)
         col-names (mapv :name items)
         rows (for [eid eids]
-               (let [datoms (d/datoms db :eavt eid)
+               (let [datoms (d/datoms row-db :eavt eid)
                      entity-map (into {} (map (fn [^datahike.datom.Datom d]
                                                 [(.-a d) (.-v d)])
                                               datoms))]
-                 (binding [stmt/*eval-update-db* db]
-                   (mapv (fn [{:keys [kind attr expr]}]
-                           (if (= :column kind)
-                             (get entity-map attr)
-                             (stmt/eval-update-expr expr entity-map table-name schema)))
-                         items))))
+                 (stmt/with-dml-row-context
+                   #(binding [stmt/*eval-update-db* subquery-db
+                              stmt/*eval-update-parse-fn* sql/parse-sql]
+                      (mapv (fn [{:keys [kind attr expr]}]
+                              (if (= :column kind)
+                                (get entity-map attr)
+                                (stmt/eval-update-expr expr entity-map table-name schema)))
+                            items))
+                   subquery-db schema table-name table-alias entity-map)))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
                                (for [row rows]
                                  (into-array String (map value->string row))))
@@ -2497,13 +2553,17 @@
                       (auto-populate-identity table-name db)
                       (apply-column-constraints table-name (:ns parsed) db)
                       tx-wrap)
-          tx-report (transact-recorded! conn tx-data)]
+          returning (:returning parsed)
+          ;; RETURNING can itself fail (for example, a scalar subquery can
+          ;; produce two rows). Evaluate it against a speculative post-write
+          ;; db before committing so the statement remains atomic.
+          tx-report (if returning (dc/with db tx-data) (transact-recorded! conn tx-data))]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
         (let [tempids (:tempids tx-report)
-              db (:db-after tx-report)
-              schema (dbi/-schema db)
+              row-db (:db-after tx-report)
+              schema (dbi/-schema row-db)
               ns-prefix (str table-name "/")
               has-row? (fn [eid]
                          (some (fn [^datahike.datom.Datom d]
@@ -2511,7 +2571,7 @@
                                    (and (keyword? a)
                                         (.startsWith (str (namespace a) "/") ns-prefix)
                                         (not= (name a) "db-row-exists"))))
-                               (d/datoms db :eavt eid)))
+                               (d/datoms row-db :eavt eid)))
               ordered-refs (if-let [refs (:row-refs parsed)]
                              @refs
                              (keep #(when (and (map? %) (string? (:db/id %)))
@@ -2525,8 +2585,11 @@
                                       ordered-refs))
               data-eids (if (seq ordered-eids)
                           (filterv has-row? ordered-eids)
-                          (filterv has-row? (vals tempids)))]
-          (build-returning-result returning db data-eids table-name (:alias parsed) schema :insert))
+                          (filterv has-row? (vals tempids)))
+              result (build-returning-result returning row-db db data-eids table-name
+                                             (:alias parsed) schema :insert)]
+          (transact-speculative-report! conn db tx-report)
+          result)
         (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
@@ -2661,7 +2724,8 @@
           ;; For RETURNING, snapshot values BEFORE delete
           returning (:returning parsed)
           returning-result (when returning
-                             (build-returning-result returning db eids table (:alias parsed) schema :delete))
+                             (build-returning-result returning db db eids table
+                                                     (:alias parsed) schema :delete))
           ;; FK enforcement — RESTRICT raises, CASCADE returns extra eids
           ;; to retract atomically alongside the parent deletion.
           cascade-eids (collect-fk-cascade-retractions! db table eids)
@@ -2821,7 +2885,8 @@
                                                                 (or params/*bound-params*
                                                                     (when-let [cb *cached-bound*]
                                                                       (vec (rest cb))))
-                                                                stmt/*eval-update-db* db]
+                                                                stmt/*eval-update-db* db
+                                                                stmt/*eval-update-parse-fn* sql/parse-sql]
                                                         (sql/eval-update-expr value-expr entity-map ns schema)))
                                             resolved (resolve-param raw-val)
                                             ;; `db` so coerce-insert-value can
@@ -3033,13 +3098,18 @@
              db table (or (:ns parsed) table) tx-data)
           _ (enforce-fk-restrict-on-update! db table tx-data)
           tx-data (tx-wrap tx-data)
-          tx-report (when (seq tx-data) (transact-recorded! conn tx-data))
-          returning (:returning parsed)]
+          returning (:returning parsed)
+          tx-report (when (seq tx-data)
+                      (if returning
+                        (dc/with db tx-data)
+                        (transact-recorded! conn tx-data)))]
       (if returning
         ;; RETURNING: read values from db-after
-        (let [db-after (if tx-report (:db-after tx-report) db)]
-          (build-returning-result returning db-after eids table (:alias parsed)
-                                  (:schema db-after) :update))
+        (let [db-after (if tx-report (:db-after tx-report) db)
+              result (build-returning-result returning db-after db eids table (:alias parsed)
+                                             (:schema db-after) :update)]
+          (when (seq tx-data) (transact-speculative-report! conn db tx-report))
+          result)
         (empty-result (str "UPDATE " (count eids)))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
@@ -5829,50 +5899,53 @@
               spec-report (dc/with spec-db tx-data)
               new-tempids (into {} (keep (fn [[tid eid]] (when (string? tid) [eid tid])))
                                 (:tempids spec-report))
-              db-after (:db-after spec-report)]
-          (swap! tx-state (fn [ts]
-                            (-> ts
-                                (update :tx-buffer into tx-data)
-                                (assoc :speculative-db db-after)
-                                (update :eid->tempid merge new-tempids))))
-          (if-let [returning (:returning parsed)]
+              db-after (:db-after spec-report)
+              returning-result
+              (when-let [returning (:returning parsed)]
             ;; RETURNING: read values from speculative db-after.
             ;; Order matters — Odoo matches RETURNING rows positionally
             ;; to VALUES. Extract tempids from the parsed tx-data
             ;; (preserves VALUES order) and resolve each to an eid.
             ;; Falls back to hash-order if tempids can't be recovered
             ;; (e.g. ON CONFLICT path where tx-data is :db.fn/call).
-            (let [ns-prefix (str table-name "/")
-                  tempids-map (:tempids spec-report)
-                  has-row? (fn [eid]
-                             (some (fn [^datahike.datom.Datom d]
-                                     (let [a (.-a d)]
-                                       (and (keyword? a)
-                                            (.startsWith (str (namespace a) "/") ns-prefix)
-                                            (not= (name a) "db-row-exists"))))
-                                   (d/datoms db-after :eavt eid)))
+                (let [ns-prefix (str table-name "/")
+                      tempids-map (:tempids spec-report)
+                      has-row? (fn [eid]
+                                 (some (fn [^datahike.datom.Datom d]
+                                         (let [a (.-a d)]
+                                           (and (keyword? a)
+                                                (.startsWith (str (namespace a) "/") ns-prefix)
+                                                (not= (name a) "db-row-exists"))))
+                                       (d/datoms db-after :eavt eid)))
                   ;; ON CONFLICT path records row-positional eids/tempids
                   ;; via :row-refs atom set in translate-insert.
                   ;; Non-ON-CONFLICT path uses :db/id tempids on entity maps.
-                  ordered-refs (if-let [refs (:row-refs parsed)]
-                                 @refs
-                                 (keep #(when (and (map? %) (string? (:db/id %)))
-                                          (:db/id %))
-                                       (:tx-data parsed)))
-                  ordered-eids (vec (keep (fn [ref]
-                                            (cond
+                      ordered-refs (if-let [refs (:row-refs parsed)]
+                                     @refs
+                                     (keep #(when (and (map? %) (string? (:db/id %)))
+                                              (:db/id %))
+                                           (:tx-data parsed)))
+                      ordered-eids (vec (keep (fn [ref]
+                                                (cond
                                               ;; already an eid (DO UPDATE case)
-                                              (integer? ref) ref
+                                                  (integer? ref) ref
                                               ;; tempid string — resolve via tempids map
-                                              (string? ref) (get tempids-map ref)
-                                              :else nil))
-                                          ordered-refs))
-                  data-eids (if (seq ordered-eids)
-                              (filterv has-row? ordered-eids)
-                              (filterv has-row? (vals tempids-map)))]
-              (build-returning-result returning db-after data-eids table-name (:alias parsed)
-                                      (:schema db-after) :insert))
-            (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
+                                                  (string? ref) (get tempids-map ref)
+                                                  :else nil))
+                                              ordered-refs))
+                      data-eids (if (seq ordered-eids)
+                                  (filterv has-row? ordered-eids)
+                                  (filterv has-row? (vals tempids-map)))]
+                  (build-returning-result returning db-after spec-db data-eids table-name
+                                          (:alias parsed) (:schema db-after) :insert)))]
+          ;; Publish the speculative write only after RETURNING succeeds.
+          (swap! tx-state (fn [ts]
+                            (-> ts
+                                (update :tx-buffer into tx-data)
+                                (assoc :speculative-db db-after)
+                                (update :eid->tempid merge new-tempids))))
+          (or returning-result
+              (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "INSERT error: " e)))
@@ -5958,16 +6031,19 @@
                                             (when-not (and (= op :db/retract)
                                                            (not= mapped eid))
                                               [op mapped attr val])))
-                                        tx-data))]
+                                        tx-data))
+              db-after (:db-after spec-report)
+              returning-result
+              (when-let [returning (:returning parsed)]
+                (build-returning-result returning db-after spec-db eids (:table parsed)
+                                        (:alias parsed) (:schema db-after) :update))]
+          ;; A failing RETURNING projection aborts the statement without
+          ;; changing the transaction's speculative image or commit buffer.
           (swap! tx-state (fn [ts]
                             (-> ts
                                 (update :tx-buffer into commit-tx-data)
-                                (assoc :speculative-db (:db-after spec-report)))))
-          (if-let [returning (:returning parsed)]
-            (let [db-after (:db-after spec-report)]
-              (build-returning-result returning db-after eids (:table parsed)
-                                      (:alias parsed) (:schema db-after) :update))
-            (empty-result (str "UPDATE " (count eids)))))
+                                (assoc :speculative-db db-after))))
+          (or returning-result (empty-result (str "UPDATE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
@@ -5999,7 +6075,7 @@
               eid->tempid (:eid->tempid @tx-state)
               _ (enforce-fk-restrict-on-delete! spec-db (:table parsed) eids)
               returning-result (when-let [returning (:returning parsed)]
-                                 (build-returning-result returning spec-db eids
+                                 (build-returning-result returning spec-db spec-db eids
                                                          (:table parsed) (:alias parsed)
                                                          (:schema spec-db) :delete))
               ;; Apply to speculative-db with ORIGINAL entity IDs
@@ -6828,8 +6904,12 @@
         ;; explicit `ORDER BY … DESC` was ignored entirely.
         ordered (if-let [ob (:sql-order-by parsed)]
                   (sort (null-safe-order-cmp ob) combined)
-                  combined)]
-    (format-query-result ordered find-aliases wire-oids)))
+                  combined)
+        offset-rows (cond->> ordered
+                      (:sql-offset parsed) (drop (:sql-offset parsed)))
+        limited (cond->> offset-rows
+                  (:sql-limit parsed) (take (:sql-limit parsed)))]
+    (format-query-result limited find-aliases wire-oids)))
 
 (defn- exec-full-join
   [ctx parsed]
@@ -7629,7 +7709,8 @@
                                   :sql (:sql parsed)
                                   :declared-param-oids (:declared-param-oids parsed))))
                        parsed)]
-          (binding [params/*statement-time* (java.util.Date.)]
+          (binding [params/*statement-time* (java.util.Date.)
+                    params/*scalar-subquery-cache* (atom {})]
             (or
              ;; Tier-1 compiled lane: plain autocommit SELECT with no
              ;; session modifiers runs its compiled executor directly.
@@ -7657,6 +7738,7 @@
         ;; hits pg_database.
         (binding [catalog/*registered-databases* registered-databases
                   params/*statement-time* (java.util.Date.)
+                  params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)

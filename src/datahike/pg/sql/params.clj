@@ -144,6 +144,15 @@
    Nil during parsing and non-server use."
   nil)
 
+(def ^:dynamic *scalar-subquery-cache*
+  "Execution-local memo table for uncorrelated scalar subqueries.
+
+   Parsed plans are shared by the global SQL cache, so mutable memo state must
+   never be captured by a translated plan. The server binds a fresh atom for
+   each statement execution; direct translator users may leave this nil, in
+   which case scalar subqueries are evaluated without memoization."
+  nil)
+
 (def ^:dynamic *session-state*
   "The current pgwire connection's session-state atom while SQL is being
    translated. Session-valued expressions capture the atom (rather than a

@@ -255,6 +255,34 @@
                       WHERE seed.id = 1 AND t.n < 3
                     ) SELECT n FROM t ORDER BY n")))))
 
+(deftest correlated-case-keeps-outer-scope-inside-recursive-scalar
+  ;; asyncpg's type introspection has this shape for domain basetypes.  It is
+  ;; only exercised after a domain exists, which made the conformance failure
+  ;; order-dependent: isolated array introspection stayed green.
+  (with-open [c (jdbc)]
+    (update-count c "CREATE TABLE type_outer (oid int, kind text)")
+    (update-count c "INSERT INTO type_outer VALUES (7, 'd'), (8, 'b')")
+    (is (= [["7"] [nil]]
+           (rows c (str "SELECT CASE WHEN kind = 'd' THEN ("
+                        "WITH RECURSIVE bases(oid, depth) AS ("
+                        "SELECT t2.oid, 0 FROM type_outer t2 WHERE t2.oid = t.oid "
+                        "UNION ALL "
+                        "SELECT t2.oid, b.depth + 1 FROM type_outer t2, bases b "
+                        "WHERE b.oid = t2.oid AND false) "
+                        "SELECT oid FROM bases ORDER BY depth DESC LIMIT 1) "
+                        "ELSE NULL END FROM type_outer t ORDER BY oid"))))
+    (is (= [["7"]]
+           (rows c (str "SELECT CASE WHEN t.kind = 'd' THEN "
+                        "(SELECT t.oid) ELSE NULL END "
+                        "FROM type_outer AS t WHERE t.oid = 7")))
+        "qualified columns in the CASE condition share its deferred outer row")
+    (is (= [["8"]]
+           (rows c (str "SELECT CASE WHEN t.kind = 'd' THEN "
+                        "(SELECT t.oid FROM type_outer AS t "
+                        " WHERE t.oid = 8 LIMIT 1) ELSE NULL END "
+                        "FROM type_outer AS t WHERE t.oid = 7")))
+        "an inner alias shadows a same-named outer alias")))
+
 (deftest postgres-recursive-scalar-values-anchor
   ;; PostgreSQL 17 src/test/regress/sql/with.sql:26-33. VALUES is a SELECT
   ;; body in JSqlParser, including when it is used as a scalar subquery in a

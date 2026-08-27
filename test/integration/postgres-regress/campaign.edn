@@ -400,7 +400,8 @@
      :blockers #{}}
     {:name "subselect" :mode :discovery
      :requires ["test_setup"]
-     :boundaries #{:relational :name-resolution}
+     :boundaries #{:relational :name-resolution :scalar-subqueries
+                   :write-expressions}
      :blockers #{:subquery-datalog-shapes :correlated-subqueries
                  :any-all-subqueries :set-returning-functions
                  :parser-grammar :unsupported-ddl :lateral-outer-join
@@ -410,6 +411,18 @@
        :source-lines [13 16]
        :gate "test/datahike/test/pg_derived_join_test.clj"
        :test-var "redundant-parentheses-around-derived-relations"}
+      {:id :scalar-set-operation-subqueries
+       :source-lines [21 22]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "scalar-subqueries-enforce-postgresql-width-cardinality-and-errors"}
+      {:id :scalar-array-subquery-subscripting
+       :source-lines [24 26]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "scalar-subqueries-enforce-postgresql-width-cardinality-and-errors"}
+      {:id :scalar-subquery-in-upsert-update
+       :source-lines [466 470]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "scalar-subqueries-in-writes-use-the-statement-and-transaction-snapshot"}
       {:id :correlated-exists-disjunction
        :source-lines [579 590]
        :gate "test/datahike/test/pg_correlated_subquery_test.clj"

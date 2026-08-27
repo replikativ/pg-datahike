@@ -83,7 +83,7 @@
             PlainSelect SelectItem AllColumns AllTableColumns OrderByElement
             GroupByElement Limit Offset Join
             ParenthesedSelect ParenthesedFromItem SetOperationList
-            Values]
+            Values FromItem]
            [net.sf.jsqlparser.statement.insert Insert]
            [net.sf.jsqlparser.statement.update Update UpdateSet]
            [net.sf.jsqlparser.statement.delete Delete]))
@@ -131,6 +131,7 @@
          translate-cte-branch
          translate-recursive-cte
          extract-value
+         strict-scalar-value
          coerce-insert-value
          eval-check-predicate
          eval-update-expr
@@ -1977,7 +1978,15 @@
    treats nil as SQL NULL, and the shared one has to be strict about it
    (a Datalog binding that yields nil FILTERS THE ROW)."
   [parse-fn sql subquery? inner-schema query-db]
-  (expr/eval-correlated-scalar parse-fn sql subquery? inner-schema query-db))
+  ;; WHEN and plain THEN/ELSE fragments are reparsed as a no-FROM SELECT.
+  ;; Make their row bindings visible for unqualified references. A full
+  ;; subquery keeps lexical SQL scoping instead: its inner columns must shadow
+  ;; same-named outer columns.
+  (binding [params/*from-source-aliases*
+            (if subquery?
+              params/*from-source-aliases*
+              (set (keys params/*from-bindings*)))]
+    (expr/eval-correlated-scalar parse-fn sql subquery? inner-schema query-db)))
 
 (defn- eval-corr-then
   "Evaluate a CASE branch THEN/ELSE spec with *from-bindings* bound."
@@ -1993,18 +2002,23 @@
   [parse-fn spec fb inner-schema query-db]
   ;; See the server-side twin: without *lateral-outer-aliases* the inner
   ;; translator turns the correlation predicate into an implicit JOIN.
-  (binding [params/*from-bindings* fb
-            *eval-update-db* query-db]
-    (case (:kind spec)
-      :case
-      (let [hit (some (fn [{:keys [when-sql then]}]
-                        (when (true? (eval-corr-scalar parse-fn when-sql false inner-schema query-db))
-                          [(eval-corr-then parse-fn then inner-schema query-db)]))
-                      (:branches spec))]
-        (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
-      ;; Scalar only -- see the server-side twin for why the :case path is
-      ;; deliberately left alone.
-      (binding [params/*lateral-outer-aliases* (set (keys fb))]
+  (let [aliases (set (keys fb))]
+    (binding [params/*from-bindings* fb
+              ;; Outer values are row constants, not inner Datalog
+              ;; relations. Keep the LATERAL scope for the entire CASE
+              ;; because a selected branch may contain its own WITH RECURSIVE
+              ;; query. The empty source set also lets an inner column shadow
+              ;; an outer column with the same name, as PostgreSQL requires.
+              params/*from-source-aliases* #{}
+              params/*lateral-outer-aliases* aliases
+              *eval-update-db* query-db]
+      (case (:kind spec)
+        :case
+        (let [hit (some (fn [{:keys [when-sql then]}]
+                          (when (true? (eval-corr-scalar parse-fn when-sql false inner-schema query-db))
+                            [(eval-corr-then parse-fn then inner-schema query-db)]))
+                        (:branches spec))]
+          (if hit (first hit) (eval-corr-then parse-fn (:else spec) inner-schema query-db)))
         (eval-corr-scalar parse-fn (:inner-sql spec) true inner-schema query-db)))))
 
 (defn resolve-correlated-rows
@@ -2574,26 +2588,11 @@
   "Given a scalar-subquery `inner` (a JSqlParser Select) and the set of
    `outer-aliases` (lowercased outer FROM aliases/table names), return the
    set of [outer-alias col] correlation references the inner makes, or nil
-   when uncorrelated.
-
-   Detection is lexical — it finds `alias.col` occurrences of an OUTER alias
-   in the inner SQL (negative-lookbehind so `xt.` doesn't match alias `t`).
-   Robust enough for catalog / introspection shapes; AST-precise detection
-   (which would also respect inner shadowing) is a later refinement. This is
-   the first slice of the correlated-subquery / LATERAL executor — see
-   doc/design-alignment.md."
+   when uncorrelated. Delegating to the scope-aware AST walker is essential:
+   an inner `FROM other AS t` shadows an outer `t` and must never be replaced
+   by the outer row binding."
   [inner outer-aliases]
-  (when (seq outer-aliases)
-    (let [sql (str inner)
-          refs (for [a outer-aliases
-                     [_ col] (re-seq
-                              (re-pattern
-                               (str "(?i)(?<![\\w.])"
-                                    (java.util.regex.Pattern/quote a)
-                                    "\\.([A-Za-z_][A-Za-z0-9_]*)"))
-                              sql)]
-                 [a (str/lower-case col)])]
-      (not-empty (set refs)))))
+  (expr/correlated-subquery-refs inner outer-aliases))
 
 (defn- unwrap-parens
   "Peel redundant Parenthesis / single-element ParenthesedExpressionList
@@ -2632,7 +2631,7 @@
 
    `:corr-refs` is the set of [outer-alias col] references threaded into
    :find as hidden columns so exec-select can bind *from-bindings* per row."
-  [^net.sf.jsqlparser.expression.Expression e0 outer-aliases]
+  [^net.sf.jsqlparser.expression.Expression e0 outer-aliases single-outer-alias]
   (let [e (unwrap-parens e0)]
     (cond
       (subquery-expr? e)
@@ -2662,7 +2661,25 @@
                                 (let [inner (subquery-inner s)]
                                   (and (instance? PlainSelect inner)
                                        (seq (correlated-subquery-refs inner outer-aliases)))))
-                              subqs)]
+                              subqs)
+            qualified-refs (or (correlated-subquery-refs ce outer-aliases) #{})
+            ;; params/ast-columns treats SELECT nodes as scope boundaries, so
+            ;; these are only the CASE's own WHEN/plain-branch columns. When
+            ;; the outer SELECT has exactly one source, bare CASE columns
+            ;; belong to that row and must ride as hidden correlation inputs
+            ;; too. Multi-source ownership needs schema-aware resolution and
+            ;; is deliberately not guessed here.
+            unqualified-cols (when single-outer-alias
+                               (into #{}
+                                     (keep (fn [^Column col]
+                                             (when (str/blank?
+                                                    (some-> col .getTable .getName))
+                                               (unquote-ident (.getColumnName col)))))
+                                     (params/ast-columns ce)))
+            unqualified-refs (when single-outer-alias
+                               (set (map #(vector single-outer-alias %)
+                                         unqualified-cols)))
+            corr-refs (into qualified-refs (or unqualified-refs #{}))]
         (when correlated?
           {:kind :case
            :branches (mapv (fn [^net.sf.jsqlparser.expression.WhenClause wc]
@@ -2671,7 +2688,7 @@
                            when-clauses)
            :else (then->spec else-expr)
          ;; All outer refs across the whole CASE (WHEN conditions + subqueries).
-           :corr-refs (vec (or (correlated-subquery-refs ce outer-aliases) []))}))
+           :corr-refs (vec corr-refs)}))
 
       :else nil)))
 
@@ -2685,8 +2702,19 @@
     (when parse-fn
       (let [sql (case (:kind spec)
                   :scalar (:inner-sql spec)
-                  :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))]
-        (when sql (first (:select-item-oids (parse-fn sql schema db))))))
+                  :case   (some #(get-in % [:then :subquery-sql]) (:branches spec)))
+            fb (reduce (fn [m [alias col]]
+                         (assoc-in m [alias col] :__null__))
+                       {} (:corr-refs spec))
+            aliases (set (keys fb))]
+        ;; OID analysis runs before an outer row exists, but nested WITH
+        ;; queries must still resolve their correlated relation. SQL-NULL
+        ;; placeholders are sufficient to determine the scalar output type.
+        (when sql
+          (binding [params/*from-bindings* fb
+                    params/*from-source-aliases* #{}
+                    params/*lateral-outer-aliases* aliases]
+            (first (:select-item-oids (parse-fn sql schema db)))))))
     (catch Throwable _ nil)))
 
 (def ^:private two-arg-aggs
@@ -3539,6 +3567,7 @@
         agg-oid-env {:db db :schema schema
                      :table-aliases table-aliases
                      :default-table default-table
+                     :scalar-subquery-oid #(expr/scalar-subquery-output-oid ctx %)
                      :hints (pgs/schema-hints db)}
         ;; Per-input-type runtime variant for precision-sensitive
         ;; aggregates. Single source of truth: oid-infer's
@@ -3831,12 +3860,21 @@
         outer-aliases (into #{}
                             (comp cat (remove nil?) (map str/lower-case))
                             [(keys table-aliases) (vals table-aliases) [default-table]])
+        single-outer-alias
+        (when (and from-item (empty? joins))
+          (some-> (or (try (some-> ^Alias (.getAlias ^FromItem from-item)
+                                   .getName)
+                           (catch Throwable _ nil))
+                      (when (instance? Table from-item)
+                        (.getName ^Table from-item)))
+                  unquote-ident str/lower-case))
         correlated-subqs
         (when db
           (into []
                 (keep-indexed
                  (fn [i ^SelectItem item]
-                   (when-let [spec (correlated-select-item-spec (.getExpression item) outer-aliases)]
+                   (when-let [spec (correlated-select-item-spec
+                                    (.getExpression item) outer-aliases single-outer-alias)]
                      (assoc spec
                             :out-pos i
                             :alias (or (select-item-alias item) "?column?")
@@ -4406,6 +4444,7 @@
                  :table-aliases table-aliases
                  :default-table default-table
                  :from-binding-oids params/*from-binding-oids*
+                 :scalar-subquery-oid #(expr/scalar-subquery-output-oid ctx %)
                  :hints (pgs/schema-hints db)}
         ;; OID inference per select-item. The expr-oid walker handles
         ;; AnalyticExpression (windows, WITHIN GROUP) and arithmetic
@@ -4754,8 +4793,17 @@
                         (throw (errors/pg-error
                                 :feature-not-supported
                                 {:message "set-returning functions are not allowed in LIMIT"})))
-                      (when (instance? LongValue rc)
-                        (.getValue ^LongValue rc))))
+                      (let [value (extract-value rc schema db)]
+                        (when-not (params/param-ref? value)
+                          (when (and (some? value) (not (integer? value)))
+                            (throw (errors/pg-error
+                                    :feature-not-supported
+                                    {:detail (str "LIMIT expression is not supported: " rc)})))
+                          (when (and (integer? value) (neg? value))
+                            (throw (errors/pg-error
+                                    :invalid-row-count-in-limit-clause
+                                    {:message "LIMIT must not be negative"})))
+                          value))))
         ;; Fetch.getRowCount returns primitive `long` and unboxes a nullable
         ;; field.  It crashes for the SQL-standard default count and for
         ;; expression counts, so always inspect getExpression instead.
@@ -4812,8 +4860,17 @@
                          (throw (errors/pg-error
                                  :feature-not-supported
                                  {:message "set-returning functions are not allowed in OFFSET"})))
-                       (when (instance? LongValue ofs)
-                         (.getValue ^LongValue ofs))))
+                       (let [value (extract-value ofs schema db)]
+                         (when-not (params/param-ref? value)
+                           (when (and (some? value) (not (integer? value)))
+                             (throw (errors/pg-error
+                                     :feature-not-supported
+                                     {:detail (str "OFFSET expression is not supported: " ofs)})))
+                           (when (and (integer? value) (neg? value))
+                             (throw (errors/pg-error
+                                     :invalid-row-count-in-result-offset-clause
+                                     {:message "OFFSET must not be negative"})))
+                           value))))
 
         ;; FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE
         ;; + optional NOWAIT / SKIP LOCKED / (default: block)
@@ -5899,27 +5956,8 @@
          (str e)))
     ;; Scalar subquery: (SELECT id FROM table WHERE ...)
      (instance? ParenthesedSelect e)
-     (if db
-       (let [inner (.getSelect ^ParenthesedSelect e)]
-         (if (instance? PlainSelect inner)
-           (let [parsed (if params/*parse-sql*
-                          (params/*parse-sql* (str inner) schema db)
-                          (translate-select ^PlainSelect inner schema db))
-                 _ (when (= :error (:type parsed))
-                     (throw (ex-info (:message parsed)
-                                     {:sqlstate (or (:sqlstate parsed) "XX000")})))
-                 q (:query parsed)
-                 in-args (:in-args parsed)
-                 query-db (or (:enriched-db parsed) db)
-                 results (cond
-                           (:literal-rows parsed) (:literal-rows parsed)
-                           (:literal-row parsed) [(:literal-row parsed)]
-                           (seq in-args) (apply d/q q query-db in-args)
-                           :else (d/q q query-db))
-                 first-row (first results)]
-             (if (sequential? first-row) (first first-row) first-row))
-           nil))
-       nil)
+     (strict-scalar-value (.getSelect ^ParenthesedSelect e)
+                          schema db params/*parse-sql*)
      (instance? net.sf.jsqlparser.expression.Function e)
      (let [^net.sf.jsqlparser.expression.Function f e
            fname (str/lower-case (.getName f))]
@@ -6334,6 +6372,104 @@
    translate-select for inner subqueries. nil when an UPDATE has no
    subquery / function-call assignments, which is the common case."
   nil)
+
+(def ^:dynamic *eval-update-parse-fn*
+  "Captured parse hook used by scalar subqueries evaluated inside tx fns."
+  nil)
+
+(defonce ^:private ^ThreadLocal dml-scalar-cache
+  (ThreadLocal.))
+
+(defn- no-from-select-columns
+  "Columns in a no-FROM SELECT's projection.
+
+   params/ast-columns intentionally treats SELECT nodes as scope boundaries,
+   so asking it for columns on the PlainSelect itself returns none. DML scalar
+   correlation needs to inspect each select-item expression explicitly."
+  [inner]
+  (when (and (instance? PlainSelect inner)
+             (nil? (.getFromItem ^PlainSelect inner)))
+    (mapcat (fn [^SelectItem item]
+              (params/ast-columns (.getExpression item)))
+            (.getSelectItems ^PlainSelect inner))))
+
+(defn- dml-scalar-correlated?
+  [inner]
+  (let [aliases (set (keys params/*from-bindings*))
+        qualified (expr/correlated-subquery-refs inner aliases)
+        directly-qualified
+        (some (fn [^Column col]
+                (when-let [qualifier (some-> col .getTable .getName unquote-ident)]
+                  (contains? aliases qualifier)))
+              (params/ast-columns inner))
+        unqualified (when (instance? PlainSelect inner)
+                      (some (fn [^Column col]
+                              (and (str/blank? (some-> col .getTable .getName))
+                                   (seq (params/binding-column-owners
+                                         params/*from-bindings*
+                                         (unquote-ident (.getColumnName col))))))
+                            (no-from-select-columns inner)))]
+    (boolean (or (seq qualified) directly-qualified unqualified))))
+
+(defn with-dml-row-context
+  "Run `f` with one DML target row exposed as an outer SQL relation.
+
+   Every declared column is present (SQL NULL uses the sentinel), so scalar
+   subqueries in RETURNING and ON CONFLICT can resolve nullable columns and
+   retain their declared OIDs. An explicit alias hides the storage name."
+  [f db schema table-name target-alias entity-map]
+  (let [target-name (or target-alias table-name)
+        columns (remove #(= "db_id" (:name %))
+                        (pgs/column-info schema table-name db))
+        target-row (into {}
+                         (map (fn [{:keys [name attr]}]
+                                [name (get entity-map attr :__null__)]))
+                         columns)
+        target-oids (into {} (map (juxt :name :oid)) columns)]
+    (binding [params/*from-bindings* {target-name target-row}
+              params/*from-binding-oids* {target-name target-oids}
+              params/*lateral-outer-aliases* #{target-name}
+              params/*runtime-db* db]
+      (f))))
+
+(defn- strict-scalar-value
+  [inner schema db parse-fn]
+  (when (and db parse-fn)
+    (let [no-from-unqualified?
+          (and (instance? PlainSelect inner)
+               (some (fn [^Column col]
+                       (and (str/blank? (some-> col .getTable .getName))
+                            (seq (params/binding-column-owners
+                                  params/*from-bindings*
+                                  (unquote-ident (.getColumnName col))))))
+                     (no-from-select-columns inner)))
+          evaluate #(binding [params/*lateral-outer-aliases*
+                              (set (keys params/*from-bindings*))
+                              params/*from-source-aliases*
+                              (if no-from-unqualified?
+                                (set (keys params/*from-bindings*))
+                                params/*from-source-aliases*)]
+                      (expr/strict-scalar-subquery parse-fn inner schema db))
+          v (if (dml-scalar-correlated? inner)
+              (evaluate)
+              (if-let [token params/*statement-time*]
+                (let [state (.get dml-scalar-cache)
+                      cache (if (and state (identical? token (:token state)))
+                              (:values state)
+                              {})
+                      ;; One InitPlan per scalar-subquery OCCURRENCE. Two
+                      ;; syntactically identical `(SELECT random())` nodes in
+                      ;; the same UPDATE are independent in PostgreSQL, while
+                      ;; this AST object is stable across all target rows.
+                      key inner]
+                  (if (contains? cache key)
+                    (get cache key)
+                    (let [value (evaluate)
+                          values (assoc cache key value)]
+                      (.set dml-scalar-cache {:token token :values values})
+                      value)))
+                (evaluate)))]
+      (when-not (= :__null__ v) v))))
 
 (defn eval-check-predicate
   "Evaluate a CHECK-style JSqlParser Expression against an entity map
@@ -6922,15 +7058,9 @@
     ;; SELECT's WHERE references like `node.parent_id` resolve via
     ;; expr.clj's existing from-bindings Column branch.
     (instance? ParenthesedSelect value-expr)
-    (when-let [db *eval-update-db*]
-      (let [inner (.getSelect ^ParenthesedSelect value-expr)]
-        (when (instance? PlainSelect inner)
-          (let [parsed (translate-select ^PlainSelect inner schema db)
-                q (:query parsed)
-                in-args (:in-args parsed)
-                results (if (seq in-args) (apply d/q q db in-args) (d/q q db))
-                first-row (first results)]
-            (if (sequential? first-row) (first first-row) first-row)))))
+    (strict-scalar-value (.getSelect ^ParenthesedSelect value-expr)
+                         schema *eval-update-db*
+                         (or *eval-update-parse-fn* params/*parse-sql*))
 
     ;; Cast expression: evaluate inner and cast
     (instance? CastExpression value-expr)
@@ -7360,6 +7490,50 @@
                  (if (and a (not (pgs/ambiguous? a))) (name a) c)))
              col-names)]))
 
+(defn- with-conflict-expression-context
+  "Evaluate `f` with PostgreSQL's ON CONFLICT row namespaces installed.
+
+   The ordinary update evaluator receives keyword-keyed target and EXCLUDED
+   values directly. A scalar subquery is parsed by the SELECT translator,
+   however, and needs the same rows represented as FROM bindings. EXCLUDED
+   stays out of `*from-source-aliases*`: it is visible only when qualified,
+   while an unqualified column belongs to the target row."
+  [f txdb schema table-name target-alias old-map attrs]
+  (let [target-name (or target-alias table-name)
+        target-row (into {}
+                         (keep (fn [[attr value]]
+                                 (when (= table-name (namespace attr))
+                                   [(name attr) value])))
+                         old-map)
+        excluded-row (into {}
+                           (keep (fn [[attr value]]
+                                   (when (= table-name (namespace attr))
+                                     [(name attr) value])))
+                           attrs)
+        bindings {target-name target-row
+                  "excluded" excluded-row}
+        row-oids (fn [row]
+                   (into {}
+                         (keep (fn [[col _]]
+                                 (when-let [oid (params/infer-param-oid-for-column
+                                                 schema table-name col txdb)]
+                                   [col oid])))
+                         row))
+        binding-oids {target-name (row-oids target-row)
+                      "excluded" (row-oids excluded-row)}
+        aliases #{target-name "excluded"}]
+    (binding [params/*from-bindings* bindings
+              params/*from-binding-oids* binding-oids
+              ;; Neither row is an UPDATE ... FROM source.  In particular,
+              ;; counting the materialised target row as one makes a legal
+              ;; `SET v = v + excluded.v` look ambiguous between the target
+              ;; schema and its own binding.  Qualified target references
+              ;; still resolve through *from-bindings*, while unqualified
+              ;; ones resolve through the target schema as PostgreSQL does.
+              params/*from-source-aliases* #{}
+              params/*lateral-outer-aliases* aliases]
+      (f))))
+
 (defn- validate-insert-row-widths!
   "Require every VALUES/SELECT row to match the INSERT target list.
 
@@ -7411,6 +7585,7 @@
    Handles ON CONFLICT (UPSERT) via :db.fn/call for atomic execution."
   [^Insert insert schema db]
   (let [schema (enrich-schema-with-pg-array-meta schema db)
+        parse-fn params/*parse-sql*
         table (.getTable insert)
         raw-table (unquote-ident (.getName ^Table table))
         _ (when-not (stored-relation-known? schema raw-table)
@@ -7693,20 +7868,34 @@
                                      (swap! row-refs conj existing)
                                      (if (or do-nothing?
                                              (and update-where
-                                                  (not (true? (eval-check-predicate
-                                                               update-where combined ns schema)))))
+                                                  (with-conflict-expression-context
+                                                    #(binding [*eval-update-db* txdb
+                                                               *eval-update-parse-fn* parse-fn]
+                                                       (not (true? (eval-check-predicate
+                                                                    update-where combined ns schema))))
+                                                    txdb schema table-name target-alias
+                                                    old-map attrs)))
                                        []
                                        (do
                                          (swap! affected inc)
                                          (vec (keep
                                                (fn [{:keys [attr value-expr]}]
-                                                 (let [new-val
+                                                 (let [old-val (get old-map attr)
+                                                       new-val
                                                        (if (and (instance? Column value-expr)
                                                                 (when-let [t (.getTable ^Column value-expr)]
                                                                   (= "EXCLUDED" (.toUpperCase (.getName ^Table t)))))
                                                          (get attrs attr)
-                                                         (eval-update-expr value-expr combined ns schema))]
-                                                   (when (some? new-val)
+                                                         (with-conflict-expression-context
+                                                           #(binding [*eval-update-db* txdb
+                                                                      *eval-update-parse-fn* parse-fn]
+                                                              (eval-update-expr
+                                                               value-expr combined ns schema))
+                                                           txdb schema table-name target-alias
+                                                           old-map attrs))]
+                                                   (if (nil? new-val)
+                                                     (when (some? old-val)
+                                                       [:db/retract existing attr old-val])
                                                      [:db/add existing attr
                                                       (or (coerce-insert-value new-val attr schema) new-val)])))
                                                update-assignments)))))
@@ -8019,12 +8208,17 @@
                                                         excluded-map (into {} (map (fn [[k v]]
                                                                                      [(keyword "excluded" (name k)) v]))
                                                                            attrs)]
-                                                    (binding [params/*bound-params*
-                                                              (or set-params params/*bound-params*)]
-                                                      (not (true? (eval-check-predicate
-                                                                   update-where
-                                                                   (merge old-map excluded-map)
-                                                                   ns schema)))))))
+                                                    (with-conflict-expression-context
+                                                      #(binding [params/*bound-params*
+                                                                 (or set-params params/*bound-params*)
+                                                                 *eval-update-db* txdb
+                                                                 *eval-update-parse-fn* parse-fn]
+                                                         (not (true? (eval-check-predicate
+                                                                      update-where
+                                                                      (merge old-map excluded-map)
+                                                                      ns schema))))
+                                                      txdb schema table-name target-alias
+                                                      old-map attrs))))
                                        [] ;; DO NOTHING / condition not met
                                  ;; DO UPDATE SET
                                        (do
@@ -8067,10 +8261,15 @@
                                                   ;; substituted by the wire layer) lets
                                                   ;; eval-update-expr resolve `$N` operands
                                                   ;; inline — same idiom the UPDATE path uses.
-                                                           (binding [params/*bound-params*
-                                                                     (or set-params params/*bound-params*)]
-                                                             (eval-update-expr
-                                                              value-expr combined ns schema))))]
+                                                           (with-conflict-expression-context
+                                                             #(binding [params/*bound-params*
+                                                                        (or set-params params/*bound-params*)
+                                                                        *eval-update-db* txdb
+                                                                        *eval-update-parse-fn* parse-fn]
+                                                                (eval-update-expr
+                                                                 value-expr combined ns schema))
+                                                             txdb schema table-name target-alias
+                                                             old-map attrs)))]
                                                    (if (nil? new-val)
                                                      (when (some? old-val)
                                                        [:db/retract existing attr old-val])
@@ -8235,7 +8434,7 @@
                :table table-name :ns ns})
         ;; Add RETURNING clause if present
             returning (extract-returning (.getReturningClause insert))]
-        (cond-> result
+        (cond-> (assoc result :alias target-alias)
           returning (assoc :returning returning))))))
 
 (defn translate-delete

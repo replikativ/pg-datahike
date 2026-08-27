@@ -13,7 +13,8 @@
    Expectations are a PostgreSQL 17 oracle's."
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.fns :as fns])
   (:import [java.sql Connection DriverManager]))
 
 (def ^:dynamic *port* nil)
@@ -567,6 +568,201 @@
         result (.execute handler "SELECT ROW(1,2) = (SELECT 1,2)")]
     (is (nil? (.error result)) (.error result))
     (is (= [["t"]] (mapv vec (.rows result))))))
+
+(deftest scalar-subqueries-enforce-postgresql-width-cardinality-and-errors
+  (with-open [c (jdbc)]
+    (is (= "2" (one c "SELECT (SELECT 2)")))
+    (is (= "2" (one c "SELECT ((SELECT 2) UNION SELECT 2)")))
+    (is (= "1" (one c "SELECT (SELECT 1 UNION ALL SELECT 2 LIMIT 1)")))
+    (is (= "2" (one c "SELECT (SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 1)")))
+    (is (= "1" (one c "SELECT (SELECT 2 UNION ALL SELECT 1 ORDER BY 1 LIMIT 1)")))
+    (is (nil? (one c "SELECT (SELECT count(*) FROM (SELECT 1 WHERE false) q LIMIT 0)"))
+        "LIMIT applies after an aggregate synthesizes its one output row")
+    (is (nil? (one c "SELECT (SELECT count(*) FROM (SELECT 1 WHERE false) q OFFSET 1)"))
+        "OFFSET can remove an aggregate's one output row")
+    (is (= "1" (one c "SELECT (SELECT ARRAY[1,2,3])[1]")))
+    (is (= "2" (one c "SELECT ((SELECT ARRAY[1,2,3]))[2]")))
+    (is (= "3" (one c "SELECT (((SELECT ARRAY[1,2,3])))[3]")))
+    (is (= "2201W"
+           (sqlstate c "SELECT (SELECT 1 UNION ALL SELECT 2 LIMIT -1)")))
+    (is (= "2201X"
+           (sqlstate c "SELECT (SELECT 1 UNION ALL SELECT 2 OFFSET -1)")))
+    (is (nil? (one c "SELECT (SELECT 1 WHERE false)")))
+    (is (= "21000"
+           (sqlstate c "SELECT (SELECT x FROM (VALUES (1),(2)) v(x))")))
+    (is (= "42601" (sqlstate c "SELECT (SELECT 1,2)")))
+    (is (= "22012" (sqlstate c "SELECT (SELECT 1/0)")))))
+
+(deftest correlated-scalar-set-operations-use-each-outer-row
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE scalar_outer (k int)")
+    (exec! c "INSERT INTO scalar_outer VALUES (1),(2)")
+    (is (= [["1" "1"] ["2" "2"]]
+           (rows c (str "SELECT k, (SELECT o.k UNION SELECT o.k) "
+                        "FROM scalar_outer o ORDER BY k"))))
+    (is (= [["1" "1"] ["2" "2"]]
+           (rows c "SELECT k, (SELECT k) FROM scalar_outer ORDER BY k"))
+        "a unique unqualified column resolves outward when the inner has no FROM")
+    (exec! c "INSERT INTO scalar_outer VALUES (1)")
+    (let [calls (atom 0)]
+      (with-redefs [fns/sql-random (fn [] (double (swap! calls inc)))]
+        (is (= ["1" "2" "3"]
+               (col c 1 (str "SELECT (SELECT random() WHERE o.k=o.k) "
+                             "FROM scalar_outer o ORDER BY db_id")))
+            "equal correlation values still execute once per physical row")))))
+
+(deftest scalar-subquery-types-participate-in-expression-analysis
+  (with-open [c (jdbc)]
+    (is (= "integer" (one c "SELECT pg_typeof((SELECT 1))")))
+    (is (= "text" (one c "SELECT pg_typeof((SELECT NULL))")))
+    (is (= "real"
+           (one c "SELECT pg_typeof((SELECT 1::real) * (SELECT 2::real))")))
+    (is (= "date"
+           (one c "SELECT pg_typeof((SELECT DATE '2020-01-01') + 1)")))
+    (is (= "2020-01-02" (one c "SELECT (SELECT DATE '2020-01-01') + 1")))
+    (is (= "42883" (sqlstate c "SELECT (SELECT true) = 1")))
+    (is (= "42883" (sqlstate c "SELECT (SELECT NULL) = 1")))
+    (is (= "42883" (sqlstate c "SELECT (SELECT '1') + 1")))
+    (is (= "22003" (sqlstate c "SELECT (SELECT 2147483647) + 1")))
+    (exec! c "CREATE TABLE scalar_typed_outer (i int, b boolean)")
+    (exec! c "INSERT INTO scalar_typed_outer VALUES (1,true)")
+    (is (= "integer"
+           (one c "SELECT pg_typeof((SELECT o.i)) FROM scalar_typed_outer o")))
+    (is (= "42883"
+           (sqlstate c "SELECT (SELECT o.b) = o.i FROM scalar_typed_outer o")))))
+
+(deftest case-and-coalesce-evaluate-only-the-selected-scalar-subquery
+  (with-open [c (jdbc)]
+    (testing "runtime cardinality and arithmetic faults in dead arms are skipped"
+      (is (= "1"
+             (one c (str "SELECT CASE WHEN true THEN 1 ELSE "
+                         "(SELECT x FROM (VALUES (1),(2)) v(x)) END"))))
+      (is (= "1"
+             (one c (str "SELECT COALESCE(1, "
+                         "(SELECT x FROM (VALUES (1),(2)) v(x)))"))))
+      (is (= "1" (one c "SELECT CASE WHEN true THEN 1 ELSE (SELECT 1/0) END")))
+      (is (= "1" (one c "SELECT COALESCE(1, (SELECT 1/0))")))
+      (is (= "1" (one c "SELECT CASE WHEN true THEN 1 ELSE abs((SELECT 1/0)) END")))
+      (is (= "1" (one c "SELECT COALESCE(1, abs((SELECT 1/0)))")))
+      (is (= "1"
+             (one c (str "SELECT CASE WHEN true THEN 1 ELSE "
+                         "CASE WHEN true THEN (SELECT 1/0) ELSE 2 END END"))))
+      (is (= "1"
+             (one c "SELECT CASE WHEN true THEN 1 ELSE ((SELECT 1/0) + 1) END"))))
+    (testing "the same faults are retained when the value is selected"
+      (is (= "21000"
+             (sqlstate c (str "SELECT CASE WHEN false THEN 1 ELSE "
+                              "(SELECT x FROM (VALUES (1),(2)) v(x)) END"))))
+      (is (= "21000"
+             (sqlstate c (str "SELECT COALESCE(NULL::int, "
+                              "(SELECT x FROM (VALUES (1),(2)) v(x)))"))))
+      (is (= "22012" (sqlstate c "SELECT CASE WHEN false THEN 1 ELSE (SELECT 1/0) END")))
+      (is (= "22012" (sqlstate c "SELECT COALESCE(NULL::int, (SELECT 1/0))"))))
+    (testing "analysis still visits dead subqueries"
+      (is (= "42601"
+             (sqlstate c "SELECT CASE WHEN true THEN 1 ELSE (SELECT 1,2) END")))
+      (exec! c "CREATE TABLE scalar_analysis_source (x int)")
+      (is (= "42703"
+             (sqlstate c (str "SELECT COALESCE(1, "
+                              "(SELECT missing FROM scalar_analysis_source))")))))))
+
+(deftest prepared-scalar-subquery-reads-the-execution-snapshot
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE scalar_snapshot (v int)")
+    (exec! c "INSERT INTO scalar_snapshot VALUES (1)")
+    (with-open [statement (.prepareStatement c "SELECT (SELECT v FROM scalar_snapshot)")]
+      (letfn [(answer []
+                (with-open [rs (.executeQuery statement)]
+                  (.next rs)
+                  (.getString rs 1)))]
+        (is (= "1" (answer)))
+        (exec! c "UPDATE scalar_snapshot SET v=2")
+        (is (= "2" (answer)))
+        (exec! c "INSERT INTO scalar_snapshot VALUES (3)")
+        (is (= "21000"
+               (try (answer) nil
+                    (catch java.sql.SQLException e (.getSQLState e)))))))))
+
+(deftest prepared-set-operation-scalar-applies-limit-and-offset-at-execute
+  (with-open [c (jdbc)
+              statement (.prepareStatement
+                         c "SELECT (SELECT 1 UNION ALL SELECT 2 LIMIT ? OFFSET ?)")]
+    (letfn [(answer [limit offset]
+              (.setInt statement 1 limit)
+              (.setInt statement 2 offset)
+              (try
+                (with-open [rs (.executeQuery statement)]
+                  (.next rs)
+                  (.getString rs 1))
+                (catch java.sql.SQLException e (.getSQLState e))))]
+      (is (= "1" (answer 1 0)))
+      (is (= "2" (answer 1 1)))
+      (is (= "21000" (answer 2 0)))
+      (is (= "2201W" (answer -1 0)))
+      (is (= "2201X" (answer 1 -1))))))
+
+(deftest scalar-subqueries-in-writes-use-the-statement-and-transaction-snapshot
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE scalar_source (v int)")
+    (exec! c "INSERT INTO scalar_source VALUES (0),(123456)")
+    (exec! c "CREATE TABLE scalar_target (key int PRIMARY KEY, val text)")
+    (exec! c (str "INSERT INTO scalar_target VALUES "
+                  "(1,(SELECT v FROM scalar_source WHERE v=0)::text)"))
+    (exec! c (str "UPDATE scalar_target SET val="
+                  "(SELECT v FROM scalar_source WHERE v=123456)::text WHERE key=1"))
+    (is (= "123456" (one c "SELECT val FROM scalar_target WHERE key=1")))
+    (exec! c (str "INSERT INTO scalar_target VALUES (1,'discard') "
+                  "ON CONFLICT (key) DO UPDATE SET val='seen with subselect ' || "
+                  "(SELECT v FROM scalar_source WHERE v != 0 LIMIT 1)::text"))
+    (is (= "seen with subselect 123456"
+           (one c "SELECT val FROM scalar_target WHERE key=1")))
+    (exec! c "INSERT INTO scalar_source VALUES (1),(2)")
+    (exec! c (str "INSERT INTO scalar_target AS t VALUES (1,'discard') "
+                  "ON CONFLICT (key) DO UPDATE SET val="
+                  "(SELECT v FROM scalar_source WHERE v=t.key)::text"))
+    (is (= "1" (one c "SELECT val FROM scalar_target WHERE key=1"))
+        "a scalar subquery sees the aliased conflict target row")
+    (exec! c (str "INSERT INTO scalar_target VALUES (1,'discard') "
+                  "ON CONFLICT (key) DO UPDATE SET val=(SELECT excluded.key)::text"))
+    (is (= "1" (one c "SELECT val FROM scalar_target WHERE key=1"))
+        "a scalar subquery sees the qualified EXCLUDED row")
+    (exec! c (str "INSERT INTO scalar_target SELECT 1,'discard' "
+                  "ON CONFLICT (key) DO UPDATE SET val="
+                  "(SELECT v FROM scalar_source WHERE false)"))
+    (is (nil? (one c "SELECT val FROM scalar_target WHERE key=1"))
+        "INSERT SELECT assigns scalar NULL instead of keeping the old value")
+    (is (= "21000"
+           (sqlstate c (str "UPDATE scalar_target SET val="
+                            "(SELECT v FROM scalar_source)::text WHERE key=1"))))
+    (is (nil? (one c "SELECT val FROM scalar_target WHERE key=1"))
+        "a cardinality error leaves the existing row unchanged")))
+
+(deftest update-uncorrelated-scalar-subquery-is-initialized-once
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE scalar_dml_rows (k int, v double precision)")
+    (exec! c "INSERT INTO scalar_dml_rows VALUES (1,0),(1,0),(1,0)")
+    (let [calls (atom 0)]
+      (with-redefs [fns/sql-random (fn [] (double (swap! calls inc)))]
+        (exec! c "UPDATE scalar_dml_rows SET v=(SELECT random())")
+        (is (= ["1" "1" "1"]
+               (col c 2 "SELECT k,v FROM scalar_dml_rows ORDER BY db_id")))
+        (is (= 1 @calls) "an uncorrelated scalar is initialized once per statement")
+        (exec! c "UPDATE scalar_dml_rows SET v=(SELECT random())")
+        (is (= ["2" "2" "2"]
+               (col c 2 "SELECT k,v FROM scalar_dml_rows ORDER BY db_id")))
+        (is (= 2 @calls) "a later statement gets a fresh initialization")))))
+
+(deftest distinct-dml-scalar-occurrences-have-distinct-initplans
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE scalar_dml_occurrences (a double precision, b double precision)")
+    (exec! c "INSERT INTO scalar_dml_occurrences VALUES (0,0),(0,0)")
+    (let [calls (atom 0)]
+      (with-redefs [fns/sql-random (fn [] (double (swap! calls inc)))]
+        (exec! c (str "UPDATE scalar_dml_occurrences "
+                      "SET a=(SELECT random()), b=(SELECT random())"))
+        (is (= [["1" "2"] ["1" "2"]]
+               (rows c "SELECT a,b FROM scalar_dml_occurrences ORDER BY db_id")))
+        (is (= 2 @calls) "each syntactic scalar occurrence owns one InitPlan")))))
 
 (deftest postgres-17-correlated-in-regression-slice
   (with-open [c (jdbc)]

@@ -3,7 +3,8 @@
    returning.sql simple-cases slice (lines 7-21)."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.fns :as fns])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
 (def ^:dynamic *handler* nil)
@@ -50,6 +51,93 @@
       (is (= [["42" "b" "2" "2"]] (mapv vec (.-rows r))))
       (is (= "DELETE 1" (.-commandTag r))))
     (is (= [["1" "a" "42"]] (rows "SELECT * FROM rt")))))
+
+(deftest returning-subqueries-use-the-command-snapshot
+  (run "CREATE TABLE returning_snapshot (id int, v int)")
+  (run "INSERT INTO returning_snapshot VALUES (1,10),(2,20)")
+  (testing "UPDATE exposes new row columns while its subquery scans old rows"
+    (is (= [["1" "11" "30"] ["2" "21" "30"]]
+           (mapv vec
+                 (.-rows ^PgWireServer$QueryResult
+                  (run (str "UPDATE returning_snapshot SET v=v+1 "
+                            "RETURNING id,v,(SELECT sum(v) "
+                            "FROM returning_snapshot)")))))))
+  (testing "INSERT's subquery cannot see the row inserted by its command"
+    (is (= [["3" "30" "2"]]
+           (mapv vec
+                 (.-rows ^PgWireServer$QueryResult
+                  (run (str "INSERT INTO returning_snapshot VALUES (3,30) "
+                            "RETURNING id,v,(SELECT count(*) "
+                            "FROM returning_snapshot)")))))))
+  (testing "DELETE uses the same pre-command database for its row and scans"
+    (is (= [["1" "11" "3"]]
+           (mapv vec
+                 (.-rows ^PgWireServer$QueryResult
+                  (run (str "DELETE FROM returning_snapshot WHERE id=1 "
+                            "RETURNING id,v,(SELECT count(*) "
+                            "FROM returning_snapshot)"))))))))
+
+(deftest returning-scalar-subqueries-correlate-to-the-target-row
+  (run "CREATE TABLE returning_row (id int, v int)")
+  (testing "INSERT and UPDATE expose each post-command target row"
+    (is (= [["1" "10" "10"] ["2" "20" "20"]]
+           (rows (str "INSERT INTO returning_row AS r VALUES (1,10),(2,20) "
+                      "RETURNING id,(SELECT r.v),(SELECT v)"))))
+    (is (= [["1" "11" "11"] ["2" "21" "21"]]
+           (rows (str "UPDATE returning_row SET v=v+1 "
+                      "RETURNING id,(SELECT returning_row.v),(SELECT v)")))))
+  (testing "DELETE exposes each pre-command target row"
+    (is (= [["1" "11" "11"] ["2" "21" "21"]]
+           (rows (str "DELETE FROM returning_row "
+                      "RETURNING id,(SELECT returning_row.v),(SELECT v)")))))
+  (testing "scalar RETURNING metadata retains the analyzed PostgreSQL type"
+    (run "INSERT INTO returning_row VALUES (3,30)")
+    (is (= [23 20]
+           (vec (.-columnOids
+                 ^PgWireServer$QueryResult
+                 (run (str "UPDATE returning_row SET v=v "
+                           "RETURNING (SELECT returning_row.v),(SELECT 1::bigint)"))))))))
+
+(deftest failing-returning-does-not-commit-a-direct-write
+  (run "CREATE TABLE returning_atomic (id int, v int)")
+  (run "CREATE TABLE returning_many (v int)")
+  (run "INSERT INTO returning_many VALUES (1),(2)")
+  (let [insert-result
+        (run (str "INSERT INTO returning_atomic VALUES (1,10) "
+                  "RETURNING (SELECT v FROM returning_many)"))]
+    (is (= "21000" (.-sqlstate insert-result)))
+    (is (= [] (rows "SELECT id FROM returning_atomic"))))
+  (run "INSERT INTO returning_atomic VALUES (1,10)")
+  (let [update-result
+        (run (str "UPDATE returning_atomic SET v=20 "
+                  "RETURNING (SELECT v FROM returning_many)"))]
+    (is (= "21000" (.-sqlstate update-result)))
+    (is (= [["10"]] (rows "SELECT v FROM returning_atomic")))))
+
+(deftest returning-commits-the-same-volatile-upsert-value-it-reports
+  (run "CREATE TABLE returning_upsert (id int PRIMARY KEY, v double precision)")
+  (run "INSERT INTO returning_upsert VALUES (1,0)")
+  (let [calls (atom 0)]
+    (with-redefs [fns/sql-random (fn [] (double (swap! calls inc)))]
+      (is (= [["1"]]
+             (rows (str "INSERT INTO returning_upsert VALUES (1,0) "
+                        "ON CONFLICT(id) DO UPDATE SET v=random() RETURNING v"))))
+      (is (= [["1"]] (rows "SELECT v FROM returning_upsert")))
+      (is (= 1 @calls) "the ON CONFLICT transaction function executes once"))))
+
+(deftest returning-subquery-snapshot-in-an-explicit-transaction
+  (run "CREATE TABLE returning_tx_snapshot (id int, v int)")
+  (run "INSERT INTO returning_tx_snapshot VALUES (1,10)")
+  (run "BEGIN")
+  (run "INSERT INTO returning_tx_snapshot VALUES (2,20)")
+  (testing "prior commands are visible, but the current command is not"
+    (is (= [["3" "30" "2"]]
+           (mapv vec
+                 (.-rows ^PgWireServer$QueryResult
+                  (run (str "INSERT INTO returning_tx_snapshot VALUES (3,30) "
+                            "RETURNING id,v,(SELECT count(*) "
+                            "FROM returning_tx_snapshot)")))))))
+  (run "ROLLBACK"))
 
 (deftest target-alias-hides-original-relation-name
   (run "CREATE TABLE dt (id int, n int)")
