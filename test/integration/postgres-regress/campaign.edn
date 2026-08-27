@@ -394,7 +394,21 @@
        :test-var "postgres-failed-transaction-savepoint-slice"}]}
     {:name "case" :mode :discovery
      :boundaries #{:expressions}
-     :blockers #{:create-function :enum-ddl :transaction-cascade}}
+     :blockers #{:planner-constant-folding :planner-explain
+                 :create-function :custom-operators :plpgsql :enum-range}
+     :strict-slices
+     [{:id :scalar-and-lazy-case
+       :source-lines [32 68]
+       :gate "test/datahike/test/pg_case_regression_test.clj"
+       :test-var "postgres-case-scalar-lazy-slice"}
+      {:id :table-case-coalesce-nullif
+       :source-lines [74 138]
+       :gate "test/datahike/test/pg_case_regression_test.clj"
+       :test-var "postgres-case-table-null-functions-slice"}
+      {:id :case-update-from
+       :source-lines [155 173]
+       :gate "test/datahike/test/pg_case_regression_test.clj"
+       :test-var "postgres-case-update-from-slice"}]}
     {:name "select_having" :mode :strict
      :boundaries #{:aggregates :grouping :having :errors}
      :blockers #{}}
