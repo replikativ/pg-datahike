@@ -68,6 +68,10 @@
 (deftest trailing-dollar-is-a-syntax-error
   (is (= "42601" (first (parse-err "SELECT 42$")))))
 
+(deftest unterminated-dollar-quote-is-a-syntax-error
+  (doseq [sql ["SELECT $$abc" "SELECT $tag$abc$wrong$"]]
+    (is (= "42601" (first (parse-err sql))) sql)))
+
 (deftest hash-in-an-operator-position-is-xor-not-an-identifier
   (testing "adjacent operands are still tokenized as PostgreSQL XOR"
     (is (nil? (parse-err "SELECT a#b")))

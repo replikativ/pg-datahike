@@ -3488,6 +3488,16 @@
       (sql-cast/apply-numeric-typmod parsed precision scale)
       parsed)))
 
+(defn- validate-json-input! [value type-name]
+  (let [s (str value)
+        jsonb? (= "jsonb" (str/lower-case (str/trim (str type-name))))]
+    (jb/validate-json! s)
+    ;; json stores the validated source text. jsonb additionally converts
+    ;; every number to PostgreSQL numeric, whose finite range is narrower
+    ;; than Jackson's BigDecimal parser (jsonb.sql:93).
+    (when jsonb? (jb/serialize-jsonb s))
+    true))
+
 (defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
@@ -3521,6 +3531,7 @@
                    (<= 0 n 4294967295))
          ("float4" "real" "float8" "double precision") (float-value)
          ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
+         ("json" "jsonb") (validate-json-input! s base)
          ("uuid") (do (coerce/parse-uuid s) true)
          ("bit" "bit varying" "varbit")
          (do (sql-cast/cast-to-bit s (str type-name) false) true)
@@ -3554,14 +3565,21 @@
                   (str "value too long for type " display-type)
                   (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
         sqlstate (if too-long? "22001" "22P02")]
-    (if (contains? #{"bit" "bit varying" "varbit" "numeric" "decimal"} base)
+    (if (contains? #{"bit" "bit varying" "varbit" "numeric" "decimal"
+                     "json" "jsonb"} base)
       ;; Preserve the typinput function's own diagnostic. In particular,
       ;; fixed-width mismatches are 22026, while bad binary/hex digits are
       ;; 22P02 with the offending digit named. A boolean-only validation
       ;; pass loses both distinctions.
       (try
-        (if (contains? #{"numeric" "decimal"} base)
+        (cond
+          (contains? #{"numeric" "decimal"} base)
           (validate-numeric-input! value type-name)
+
+          (contains? #{"json" "jsonb"} base)
+          (validate-json-input! value base)
+
+          :else
           (sql-cast/cast-to-bit (str value) (str type-name) false))
         [nil nil nil nil]
         (catch Throwable e

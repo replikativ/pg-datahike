@@ -14,6 +14,20 @@
 
 (set! *warn-on-reflection* true)
 
+(def ^:private json-number-token-max-length
+  "Jackson defaults to 1,000 characters, far below PostgreSQL jsonb's
+   NUMERIC_WEIGHT_MAX/NUMERIC_DSCALE_MAX envelope. Keep a deliberate bounded
+   parser ceiling above every representable PostgreSQL numeric rather than
+   inheriting a dependency default that rejects valid 1,001-digit input."
+  1048576)
+
+(defn- configure-read-constraints! [^com.fasterxml.jackson.databind.ObjectMapper m]
+  (let [constraints (-> (com.fasterxml.jackson.core.StreamReadConstraints/builder)
+                        (.maxNumberLength (int json-number-token-max-length))
+                        (.build))]
+    (.setStreamReadConstraints (.getFactory m) constraints)
+    m))
+
 ;; ============================================================================
 ;; JSON parsing / serialization
 ;; ============================================================================
@@ -25,7 +39,7 @@
    9007199254740993 exactly. Once a value has been through a double the
    information is gone and no renderer can recover it."
   (doto ^com.fasterxml.jackson.databind.ObjectMapper
-   (json/object-mapper {:decode-key-fn str})
+   (configure-read-constraints! (json/object-mapper {:decode-key-fn str}))
     (.configure com.fasterxml.jackson.databind.DeserializationFeature/USE_BIG_DECIMAL_FOR_FLOATS
                 true)))
 
@@ -54,7 +68,11 @@
   (when (> (.scale d) numeric-max-dscale)
     (throw (ex-info "value overflows numeric format"
                     {:error :numeric-value-out-of-range :sqlstate "22003"})))
-  (when (> (- (.precision d) (.scale d)) numeric-max-int-digits)
+  ;; Numeric zero has no significant integer weight. PostgreSQL normalizes
+  ;; `0e1000000` to zero rather than treating its exponent as a million-digit
+  ;; integer, while a non-zero number with the same exponent overflows.
+  (when (and (not (zero? (.signum d)))
+             (> (- (.precision d) (.scale d)) numeric-max-int-digits))
     (throw (ex-info "value overflows numeric format"
                     {:error :numeric-value-out-of-range :sqlstate "22003"})))
   d)
@@ -66,7 +84,7 @@
    Jackson stops at the first value — so `SELECT '1 2'::jsonb` and
    `'{} {}'` were accepted, returning `1` and `{}`."
   (doto ^com.fasterxml.jackson.databind.ObjectMapper
-   (json/object-mapper {:decode-key-fn str})
+   (configure-read-constraints! (json/object-mapper {:decode-key-fn str}))
     (.configure com.fasterxml.jackson.databind.DeserializationFeature/USE_BIG_DECIMAL_FOR_FLOATS
                 true)
     (.configure com.fasterxml.jackson.databind.DeserializationFeature/FAIL_ON_TRAILING_TOKENS
@@ -150,7 +168,7 @@
     (vector? v)  (mapv normalize-tree v)
     (sequential? v) (mapv normalize-tree v)
     (instance? java.math.BigDecimal v) (check-numeric-range! v)
-    (integer? v) (java.math.BigDecimal. (str v))
+    (integer? v) (check-numeric-range! (java.math.BigDecimal. (str v)))
     (float? v)   (check-numeric-range! (java.math.BigDecimal. (str v)))
     :else        v))
 
@@ -283,7 +301,12 @@
   [v]
   (when (some? v)
     (let [data (if (string? v)
-                 (try (json/read-value v mapper)
+                 ;; Parsing and normalization are one input boundary. Besides
+                 ;; the uniform number/null model used by operators, this
+                 ;; enforces PostgreSQL numeric's finite jsonb range before a
+                 ;; huge exponent can expand into a multi-megabyte string.
+                 (try (normalize-tree (json/read-value v mapper))
+                      (catch clojure.lang.ExceptionInfo e (throw e))
                       (catch Exception _ v))
                  ;; A value that did NOT come from JSON text still has to
                  ;; go through the value model: PgRecord and PgArray are
@@ -304,8 +327,18 @@
    as PostgreSQL renders a json value it constructed
    (`json_strip_nulls('{\"a\":1,\"z\":null}')` -> `{\"a\":1}`)."
   [v]
-  (binding [*json-style* {:pair ":" :sep ","}]
-    (serialize-jsonb v)))
+  (when (some? v)
+    (let [data (if (string? v)
+                 ;; JSON is not backed by PostgreSQL numeric. Parse only to
+                 ;; render transformed JSON values; do not run jsonb's numeric
+                 ;; normalization/range checks over this text-faithful family.
+                 (try (json/read-value v mapper)
+                      (catch Exception _ v))
+                 (normalize-tree v))
+          sb (StringBuilder.)]
+      (binding [*json-style* {:pair ":" :sep ","}]
+        (emit! sb data))
+      (.toString sb))))
 
 (def canonicalize-jsonb
   "Deprecated alias for `serialize-jsonb`; they were always the same fn."
