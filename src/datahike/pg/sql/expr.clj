@@ -2200,7 +2200,12 @@
                                                           unquote-ident str/lower-case)]))))
                                    (params/ast-columns node))]
                 (into own-refs (mapcat #(refs % visible-outers))
-                      (nested-selects-in node)))))]
+                      ;; Values is itself a Select in JSqlParser. Its columns
+                      ;; are handled above; recursing into the node returned by
+                      ;; nested-selects-in would revisit the identical object
+                      ;; forever. Other expression roots only retain proper
+                      ;; child SELECTs here.
+                      (remove #(identical? node %) (nested-selects-in node))))))]
     (when (seq outer-aliases)
       (not-empty (refs inner (set outer-aliases))))))
 
