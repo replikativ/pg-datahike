@@ -34,9 +34,10 @@ Each pg-datahike release ships a runnable uberjar on
 JDK 17+ is the only prerequisite:
 
 ```bash
-java -jar pg-datahike-VERSION-standalone.jar
+curl -fLO https://github.com/replikativ/pg-datahike/releases/latest/download/pg-datahike-standalone.jar
+java -jar pg-datahike-standalone.jar --port 5432 --memory
 # pg-datahike VERSION ready on 127.0.0.1:5432
-#   backend:  file (~/.local/share/pg-datahike)
+#   backend:  memory
 #   CREATE DATABASE:  enabled
 #   databases: ["datahike"]
 
@@ -46,9 +47,9 @@ psql postgresql://datahike@localhost:5432/datahike
 Useful flags (`--help` for the full list):
 
 ```bash
-java -jar pg-datahike.jar --memory                      # ephemeral
-java -jar pg-datahike.jar --port 15432 --data-dir /var/lib/dh
-java -jar pg-datahike.jar --db prod --db staging        # pre-create dbs
+java -jar pg-datahike-standalone.jar --memory                      # ephemeral
+java -jar pg-datahike-standalone.jar --port 15432 --data-dir /var/lib/dh
+java -jar pg-datahike-standalone.jar --db prod --db staging        # pre-create dbs
 ```
 
 The `dump` subcommand exports a database to portable PostgreSQL SQL —
@@ -56,8 +57,8 @@ replay-ready in either pg-datahike or real PG via `psql`. See
 [Migration & pg_dump interop](#migration--pg_dump-interop):
 
 ```bash
-java -jar pg-datahike.jar dump --data-dir /var/lib/dh --db prod \
-                              --out prod.sql
+java -jar pg-datahike-standalone.jar dump --data-dir /var/lib/dh --db prod \
+                                         --out prod.sql
 ```
 
 ### Embedded library
