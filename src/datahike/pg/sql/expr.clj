@@ -58,6 +58,7 @@
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.types :as types]
+            [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -72,7 +73,7 @@
             IsDistinctExpression IsUnknownExpression
             IsNullExpression JsonOperator LikeExpression MinorThan
             MinorThanEquals NotEqualsTo ParenthesedExpressionList
-            RegExpMatchOperator Between GeometryDistance CosineSimilarity]
+            RegExpMatchOperator Matches Between GeometryDistance CosineSimilarity]
            [net.sf.jsqlparser.expression.operators.conditional
             AndExpression OrExpression XorExpression]
            [net.sf.jsqlparser.expression.operators.arithmetic
@@ -2325,6 +2326,12 @@
 
     (row-comparison-expression? expr)
     (translate-row-comparison ctx expr)
+
+    (instance? Matches expr)
+    (let [^Matches e expr
+          l (translate-expr ctx (.getLeftExpression e))
+          r (translate-expr ctx (.getRightExpression e))]
+      (list 'datahike.pg.tsearch/ts-match3 l r))
 
     (and (or (instance? EqualsTo expr)
              (instance? NotEqualsTo expr)
@@ -5567,6 +5574,7 @@
         (instance? AndExpression expr)
         (instance? OrExpression expr)
         (instance? LikeExpression expr)
+        (instance? Matches expr)
         (instance? Between expr)
         (instance? IsBooleanExpression expr)
         (instance? IsUnknownExpression expr)
@@ -6420,6 +6428,12 @@
     (row-comparison-expression? expr)
     (let [result (translate-row-comparison ctx expr)]
       [[(list 'true? result)]])
+
+    (instance? Matches expr)
+    (let [^Matches e expr
+          l (translate-expr ctx (.getLeftExpression e))
+          r (translate-expr ctx (.getRightExpression e))]
+      [[(list 'datahike.pg.tsearch/ts-match? l r)]])
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr

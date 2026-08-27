@@ -3717,6 +3717,8 @@
                        :strict? true :return-oid types/oid-pg-lsn}
    "ts_lexize"        {:impl tsearch/ts-lexize :arities #{2}
                        :strict? true :return-oid types/oid-text-array}
+   "to_tsvector"      {:impl tsearch/to-tsvector :arities #{1 2}
+                       :strict? true :return-oid types/oid-tsvector}
    "plainto_tsquery"  {:impl tsearch/plainto-tsquery :arities #{2}
                        :strict? true :return-oid types/oid-tsquery}
    "phraseto_tsquery" {:impl tsearch/phraseto-tsquery :arities #{2}

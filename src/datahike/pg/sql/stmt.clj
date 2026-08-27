@@ -57,6 +57,7 @@
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
+            [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.arrays :as pg-arr])
@@ -6238,6 +6239,10 @@
         ;; behaving like PG `json`). Canonicalize every jsonb write here — string
         ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
           jsonb? (jb/serialize-jsonb val)
+
+          (= "tsvector" pg-type) (tsearch/canonical-tsvector val)
+
+          (= "tsquery" pg-type) (tsearch/canonical-tsquery val)
 
         ;; pgvector's vector type is Datahike's native float array. Parse
         ;; every write through the same input function, even if it is already
