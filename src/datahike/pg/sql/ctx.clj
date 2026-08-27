@@ -937,6 +937,12 @@
         (swap! (:nullable-vars ctx) conj result-var))))
   result-var)
 
+(def ^:dynamic *defer-expression-materialization*
+  "Keep compound forms nested so a short-circuiting parent (CASE/COALESCE)
+   can decide whether to evaluate them. Analysis and input registration still
+   happen eagerly; only runtime function-binding clauses are deferred."
+  false)
+
 (defn materialize-arg!
   "If arg is a compound form (seq), bind it to a fresh var via a
    function-binding clause and return the var. Otherwise return arg.
@@ -953,7 +959,7 @@
    other reader of `:nullable-vars` is ORDER BY, where the flag just
    selects the null-aware comparator."
   [ctx arg]
-  (if (seq? arg)
+  (if (and (seq? arg) (not *defer-expression-materialization*))
     (let [v (fresh-var! ctx)]
       (propagate-nullability! ctx v arg)
       (add-clause! ctx [arg v])

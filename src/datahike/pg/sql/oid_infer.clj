@@ -24,6 +24,7 @@
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column]
+           [net.sf.jsqlparser.statement.select ParenthesedSelect PlainSelect]
            [net.sf.jsqlparser.expression
             ArrayConstructor ArrayExpression BinaryExpression BooleanValue
             CaseExpression CastExpression DoubleValue Expression ExtractExpression
@@ -842,6 +843,14 @@
       (instance? DateValue expr)      types/oid-date
       (instance? TimeValue expr)      types/oid-time
       (instance? TimestampValue expr) types/oid-timestamp
+
+      ;; Scalar-subquery typing depends on SQL analysis (including outer
+      ;; bindings and set-operation common types), so keep this generic OID
+      ;; walker decoupled from the parser through an environment callback.
+      (or (instance? ParenthesedSelect expr)
+          (instance? PlainSelect expr))
+      (when-let [infer (:scalar-subquery-oid env)]
+        (infer expr))
 
       ;; TRUE/FALSE parsed as Column on older JSqlParser
       (and (instance? Column expr)

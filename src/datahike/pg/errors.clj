@@ -222,6 +222,10 @@
    {:sqlstate "2201W"
     :format (fn [{:keys [message detail]}] (or message detail))}
 
+   :invalid-row-count-in-result-offset-clause
+   {:sqlstate "2201X"
+    :format (fn [{:keys [message detail]}] (or message detail))}
+
    ;; nextval past MAXVALUE / MINVALUE on a non-CYCLE sequence
    ;; (sequence.c:736). PG names the sequence and the bound it hit.
    :sequence-generator-limit-exceeded
