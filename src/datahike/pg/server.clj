@@ -3630,6 +3630,8 @@
       (update :in-args sql/substitute-params fetch)
       (contains? parsed :tx-data)
       (update :tx-data sql/substitute-params fetch)
+      (contains? parsed :secondary-candidate)
+      (update :secondary-candidate sql/substitute-params fetch)
       ;; A compound aggregate over a constant — `sum(x) / 2` — carries the
       ;; constant in the spec rather than in a column, and a rewritten
       ;; literal arrives here as a ParamRef like any other.
@@ -5445,6 +5447,113 @@
    generations age out."
   (pg-cache/bounded-cache 512))
 
+(defn- candidate-page-entrypoint
+  "Resolve the candidate protocol only when the running Datahike provides it.
+   pg-datahike remains usable on the released core and on JDK 17 without
+   loading Proximum; absence means an exact primary-index scan."
+  []
+  (try
+    (requiring-resolve 'datahike.index.secondary/candidate-page)
+    (catch Exception _ nil)))
+
+(defn- zero-vector?
+  [^floats v]
+  (loop [i 0]
+    (cond
+      (= i (alength v)) true
+      (zero? (aget v i)) (recur (inc i))
+      :else false)))
+
+(defn- matching-vector-secondary
+  [db {:keys [attribute metric query-vector]}]
+  (let [^floats query-vector query-vector
+        schema (dbi/-schema db)
+        attr-schema (get schema attribute)]
+    (when (and (= :db.type/float-array (:db/valueType attr-schema))
+               (= :db.cardinality/one (:db/cardinality attr-schema)))
+      (some (fn [[ident entry]]
+              (let [config (:db.secondary/config entry)]
+                (when (and (= :proximum (:db.secondary/type entry))
+                           (contains? (set (:db.secondary/attrs entry)) attribute)
+                           (= metric (:distance config))
+                           (= (long (:dim config -1)) (alength query-vector))
+                           (contains? #{nil :ready} (:db.secondary/status entry)))
+                  (when-let [index (get (:secondary-indices db) ident)]
+                    [ident index]))))
+            schema))))
+
+(defn- restrict-to-vector-candidates
+  "Use a ready Proximum index as a bounded candidate source.
+
+   The returned query still evaluates the exact pgvector distance expression,
+   sorts it, and applies LIMIT. Any missing protocol/backend, stale lifecycle
+   state, malformed query vector, or adapter failure declines the optimization
+   and returns the original query unchanged. This makes secondary-index
+   availability an optional access path. Selecting an approximate-recall ANN
+   index can intentionally change membership, as it can in pgvector; exact
+   recheck guarantees distances and predicates only within its candidates."
+  [db query in-args
+   {:keys [entity-var metric query-vector limit candidate-limit] :as spec}]
+  (if-let [candidate-page (and spec (candidate-page-entrypoint))]
+    (try
+      (let [query-vector (pg-vector/coerce query-vector)]
+        ;; Cosine has no ordering for a zero query vector. pgvector's HNSW
+        ;; index does not index zero vectors for cosine distance; exact scan is
+        ;; therefore the only semantics-preserving path for this shape.
+        (if (and (= :cosine metric) (zero-vector? query-vector))
+          [query in-args]
+          (if-let [[idx-ident index]
+                   (matching-vector-secondary db (assoc spec :query-vector query-vector))]
+            (let [candidate-limit (max 40 (long (or candidate-limit limit)))
+                  query-spec {:vector query-vector
+                              :candidate-limit candidate-limit}
+                  ;; The core contract permits arbitrarily sized pages. Walk
+                  ;; continuations until the bounded ANN candidate budget is
+                  ;; filled or the adapter reports exhaustion; never equate a
+                  ;; short page with end-of-scan.
+                  candidates
+                  (loop [continuation nil
+                         remaining candidate-limit
+                         seen-continuations #{}
+                         acc []]
+                    (let [request (cond-> {:limit (min 256 remaining)}
+                                    continuation (assoc :continuation continuation))
+                          page (candidate-page db idx-ident index query-spec nil request)
+                          page-candidates (vec (take remaining (:candidates page)))
+                          acc (into acc page-candidates)
+                          remaining (- remaining (count page-candidates))
+                          next-continuation (:continuation page)]
+                      (cond
+                        (or (zero? remaining) (:exhausted? page)) acc
+                        (empty? page-candidates)
+                        (throw (ex-info "Non-exhausted secondary candidate page was empty"
+                                        {:index-ident idx-ident
+                                         :continuation next-continuation}))
+                        (contains? seen-continuations next-continuation)
+                        (throw (ex-info "Secondary candidate continuation repeated"
+                                        {:index-ident idx-ident
+                                         :continuation next-continuation}))
+                        :else
+                        (recur next-continuation remaining
+                               (conj seen-continuations next-continuation) acc))))
+                  eids (->> candidates
+                            (keep (fn [candidate]
+                                    (when (= (:attribute candidate) (:attribute spec))
+                                      (:entity-id candidate))))
+                            distinct
+                            vec)
+                  query (update query :in
+                                (fn [inputs]
+                                  (conj (vec (or inputs ['$]))
+                                        [entity-var '...])))]
+              [query (conj (vec in-args) eids)])
+            [query in-args])))
+      ;; Candidate scans are optional accelerators. The exact scan is both the
+      ;; compatibility path and the fail-safe for an adapter generation that
+      ;; cannot serve this snapshot.
+      (catch Exception _ [query in-args]))
+    [query in-args]))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -5495,6 +5604,9 @@
                                query-db specs)
                        query-db)
             hidden-count (or hidden-count 0)
+            [query in-args]
+            (restrict-to-vector-candidates
+             query-db query in-args (:secondary-candidate parsed))
             q-input (cond-> query
                       limit  (assoc :limit limit)
                       offset (assoc :offset offset)

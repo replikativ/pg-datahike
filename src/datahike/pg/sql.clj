@@ -51,7 +51,7 @@
             BooleanValue Function LongValue DoubleValue StringValue NullValue
             SignedExpression
             CaseExpression CastExpression ArrayConstructor JdbcParameter]
-           [net.sf.jsqlparser.statement.create.table CreateTable ColumnDefinition]
+           [net.sf.jsqlparser.statement.create.table CreateTable ColumnDefinition Index$ColumnParams]
            [net.sf.jsqlparser.statement.create.view CreateView]
            [net.sf.jsqlparser.statement.create.sequence CreateSequence]
            [net.sf.jsqlparser.statement.insert Insert]
@@ -83,6 +83,25 @@
 (def ^:private view-name-attr :datahike.pg/view-name)
 (def ^:private view-definition-attr :datahike.pg/view-definition)
 (def ^:private view-columns-attr :datahike.pg/view-columns)
+
+(defn- create-index-options
+  "Normalize JSqlParser's `WITH (...)` tail into a keyword map.  PostgreSQL's
+   HNSW knobs are integer-valued today; retaining non-integers as strings
+   keeps this parser forward-compatible without guessing their types."
+  [^CreateIndex ci]
+  (let [tail (mapv str (or (.getTailParameters ci) []))
+        body (when (= "WITH" (some-> (first tail) str/upper-case))
+               (second tail))]
+    (if-let [[_ content] (and body (re-matches #"\s*\((.*)\)\s*" body))]
+      (into {}
+            (map (fn [part]
+                   (let [[k v] (map str/trim (str/split part #"=" 2))]
+                     [(keyword (str/lower-case k))
+                      (if (re-matches #"[+-]?\d+" v)
+                        (Long/parseLong v)
+                        v)])))
+            (remove str/blank? (str/split content #",")))
+      {})))
 
 (defn- cast-expression-typmod [^CastExpression cast]
   (let [type-str (str (.getColDataType cast))
@@ -2206,14 +2225,28 @@
                       {:type :rollback-to-savepoint :name (.getSavepointName ^RollbackStatement stmt)}
                       {:type :system :system-type :rollback})
 
-          ;; CREATE INDEX — accepted as no-op
+          ;; CREATE INDEX. Ordinary B-tree declarations remain compatibility
+          ;; no-ops, but retain the native AST detail required to materialize
+          ;; pgvector HNSW secondary indices at execution time.
                     (instance? CreateIndex stmt)
                     (let [^CreateIndex ci stmt
-                          idx (.getIndex ci)]
+                          idx (.getIndex ci)
+                          column-specs
+                          (mapv (fn [^Index$ColumnParams column]
+                                  {:name (unquote-ident (.getColumnName column))
+                                   :params (mapv (comp str/lower-case str)
+                                                 (or (.getParams column) []))})
+                                (or (.getColumnWithParams idx) []))]
                       {:type :ddl-create-index
+                       :name (some-> (.getName idx) unquote-ident)
                        :table (some-> (.getTable ci) .getName unquote-ident)
-                       :columns (mapv (comp unquote-ident str)
-                                      (or (some-> idx .getColumnsNames) []))})
+                       :method (some-> (.getUsing idx) str/lower-case)
+                       :columns (if (seq column-specs)
+                                  (mapv :name column-specs)
+                                  (mapv (comp unquote-ident str)
+                                        (or (.getColumnsNames idx) [])))
+                       :column-specs column-specs
+                       :options (create-index-options ci)})
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
                     (instance? Alter stmt)

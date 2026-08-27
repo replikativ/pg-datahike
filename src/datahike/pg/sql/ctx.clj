@@ -361,6 +361,11 @@
    :with-vars     (atom #{})
    :in-params     (atom [])       ;; extra :in parameter symbols for CASE fns etc.
    :in-args       (atom [])
+   ;; Exact vector-distance expressions that could use an ANN secondary
+   ;; index as a candidate source.  stmt/translate-select only exposes one
+   ;; when it is the leading ascending ORDER BY key of a bounded query; the
+   ;; scalar expression remains in :where as the authoritative recheck.
+   :vector-distance-candidates (atom [])
    :runtime-subqueries? (atom false)
    :left-join-evars (atom #{})    ;; entity vars from LEFT JOIN right side (don't get-else on these)
    ;; Vars emitted by col-var! that are bound via get-else and thus may
@@ -384,7 +389,8 @@
 
 (def ^:private snapshot-keys
   [:var-counter :col->var :entity-vars :where-clauses :find-elements
-   :with-vars :in-params :in-args :runtime-subqueries? :left-join-evars :nullable-vars
+   :with-vars :in-params :in-args :vector-distance-candidates
+   :runtime-subqueries? :left-join-evars :nullable-vars
    :required-join-patterns :param-placeholders])
 
 (defn snapshot

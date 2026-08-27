@@ -5637,6 +5637,33 @@
 
         in-params @(:in-params ctx)
         in-args @(:in-args ctx)
+        ;; ANN is an access path, never the semantic implementation.  Expose
+        ;; a candidate request only for pgvector's indexable shape: one
+        ;; ascending distance key plus a positive LIMIT.  exec-select may use
+        ;; it to restrict entity ids, after which the ordinary Datalog
+        ;; distance expression above performs exact recheck/order/limit.
+        secondary-candidate
+        (when (and (pos-int? limit-val)
+                   (= 1 (count order-by-spec))
+                   (= :asc (second (first order-by-spec)))
+                   (not= :first (nth (first order-by-spec) 2 nil))
+                   (not fetch-with-ties?)
+                   default-table
+                   (not @has-aggregates?)
+                   (not has-distinct?)
+                   (empty? joins)
+                   (empty? group-by)
+                   (nil? having-expr)
+                   (empty? @window-specs)
+                   (empty? project-set-specs)
+                   (empty? correlated-subqs))
+          (let [order-var (ffirst order-by-spec)]
+            (some (fn [candidate]
+                    (when (= order-var (:result-var candidate))
+                      (assoc candidate
+                             :limit limit-val
+                             :candidate-limit (+ limit-val (or offset-val 0)))))
+                  @(:vector-distance-candidates ctx))))
         ;; A constant implicit HAVING group deliberately detached from its
         ;; source relation above must not keep that relation's entity id in
         ;; :with: it is now unbound and would suppress the singleton row.
@@ -5803,6 +5830,8 @@
              ;; decoded values to :in-args in index order; an empty map
              ;; means no parameters were used.
              :param-placeholders @(:param-placeholders ctx)}
+      secondary-candidate
+      (assoc :secondary-candidate secondary-candidate)
       ;; Include join metadata for outer join handling
       (some #(#{:left :right :full} (:join-type %)) join-infos)
       (assoc :join-infos join-infos
