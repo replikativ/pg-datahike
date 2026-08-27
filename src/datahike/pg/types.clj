@@ -170,7 +170,7 @@
    DDL must reject these explicitly. The generic unknown-type fallback stores
    arbitrary extension types as strings; letting a built-in type take that
    path would silently turn malformed values into `text`."
-  #{"tsvector" "tsquery"})
+  #{"tsquery"})
 
 (defn- normalize-type-ident [ident]
   (let [ident (str/trim ident)]
@@ -261,6 +261,11 @@
    ;; JSON (stored as string in Datahike)
    "json"              :db.type/string
    "jsonb"             :db.type/string
+   ;; Keep the PostgreSQL canonical text as the Datahike carrier.  The
+   ;; explicit mapping (together with :pg/type metadata) makes this a typed
+   ;; value rather than the generic unknown-extension fallback.  A future
+   ;; Scriptum index may derive postings from it without changing storage.
+   "tsvector"          :db.type/string
    ;; OID / system (mapped to long)
    "oid"               :db.type/long
    "regclass"          :db.type/long
@@ -393,6 +398,8 @@
     "uuid"        oid-uuid
     "json"        oid-json
     "jsonb"       oid-jsonb
+    "tsvector"    oid-tsvector
+    "tsquery"     oid-tsquery
     "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
     "regclass"    oid-regclass

@@ -73,13 +73,21 @@
       (is (= [[expected]] (mapv vec (.-rows ^PgWireServer$QueryResult r))))
       (is (= [types/oid-tsquery] (vec (.-columnOids ^PgWireServer$QueryResult r)))))))
 
-(deftest typed-storage-waits-for-postgres-input-parsers
+(deftest typed-storage-boundary
   (testing "CREATE cannot silently degrade a catalog tsearch type to text"
     (is (= "0A000" (state "CREATE TABLE bad_search_type (q tsquery)")))
-    (is (= "0A000" (state "CREATE TABLE bad_search_vector (v tsvector)")))
     (is (= "0A000" (state "CREATE TABLE bad_search_array (q tsquery[])")))
     (is (= "0A000" (state "CREATE TABLE bad_search_qualified (q pg_catalog.tsquery)")))
     (is (= "0A000" (state "CREATE TABLE bad_search_quoted (q \"tsquery\")"))))
+  (testing "tsvector has an explicit typed text carrier for dump round-trips"
+    (result "CREATE TABLE search_vector (id int, document tsvector NOT NULL)")
+    (result (str "INSERT INTO search_vector VALUES "
+                 "(1, '''academi'':1A ''dinosaur'':2,7')"))
+    (let [r (result "SELECT document FROM search_vector")]
+      (is (= [["'academi':1A 'dinosaur':2,7"]]
+             (mapv vec (.-rows ^PgWireServer$QueryResult r))))
+      (is (= [types/oid-tsvector]
+             (vec (.-columnOids ^PgWireServer$QueryResult r))))))
   (testing "ALTER uses the same explicit boundary"
     (result "CREATE TABLE search_type_alter (id int)")
     (is (= "0A000"
