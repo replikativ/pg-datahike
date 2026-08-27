@@ -519,21 +519,30 @@ jobs:
             if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${GITHUB_TOKEN}" ]; then
               JAR_FILE=$(ls target/pg-datahike-*.jar | grep -v standalone | head -1)
               UBER_FILE=$(ls target/pg-datahike-*-standalone.jar | head -1)
+              STABLE_UBER_FILE=target/pg-datahike-standalone.jar
+              cp "$UBER_FILE" "$STABLE_UBER_FILE"
               VERSION=$(basename "$JAR_FILE" | sed 's/pg-datahike-//' | sed 's/.jar//')
-              echo "Creating release for version ${VERSION}"
+              echo "Publishing release for version ${VERSION}"
               cat > /tmp/release-notes.md \<<EOF
             pg-datahike ${VERSION} — library jar + standalone server uberjar.
 
-            Run with:
+            Download and run the latest release with:
 
-                java -jar pg-datahike-${VERSION}-standalone.jar [--port N --host ADDR --data-dir DIR --memory --db NAME ...]
+                curl -fLO https://github.com/replikativ/pg-datahike/releases/latest/download/pg-datahike-standalone.jar
+                java -jar pg-datahike-standalone.jar --port 5432 --memory
 
             See \`--help\` for the full CLI surface.
             EOF
-              gh release create "v${VERSION}" \
-                --title "Release ${VERSION}" \
-                --notes-file /tmp/release-notes.md \
-                "$JAR_FILE" "$UBER_FILE" || echo "Release may already exist"
+              if gh release view "v${VERSION}" > /dev/null 2>&1; then
+                gh release upload "v${VERSION}" \
+                  "$JAR_FILE" "$UBER_FILE" "$STABLE_UBER_FILE" \
+                  --clobber
+              else
+                gh release create "v${VERSION}" \
+                  --title "Release ${VERSION}" \
+                  --notes-file /tmp/release-notes.md \
+                  "$JAR_FILE" "$UBER_FILE" "$STABLE_UBER_FILE"
+              fi
             else
               echo "Skipping release - not on main branch or no GITHUB_TOKEN"
             fi
