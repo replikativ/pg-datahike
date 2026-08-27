@@ -232,6 +232,8 @@
      ;; typtype is PG's "char" (OID 18): clients (asyncpg's is_scalar_type)
      ;; binary-decode it to a single byte, so advertise OID 18 not text.
      {:db/ident :pg_type/typtype :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_type/typcategory :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_type/typispreferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      ;; typelem: element type OID for array types (0 for scalars). Clients
      ;; (asyncpg's TYPE_BY_OID, libpq) read it to detect/decode arrays.
      {:db/ident :pg_type/typelem :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
@@ -671,6 +673,7 @@
 (defn- attribute-storage [oid]
   (cond
     (= oid types/oid-numeric) "m"
+    (= oid types/oid-vector) "e"
     (or (contains? types/array-oid->element-oid oid)
         (contains? #{types/oid-bytea types/oid-text types/oid-varchar
                      types/oid-bpchar types/oid-json types/oid-jsonb}
@@ -696,6 +699,9 @@
                                     (name->oid (subs tname 1)))]
                          {:pg_type/oid (long oid) :pg_type/typname tname
                           :pg_type/typlen (long tlen) :pg_type/typtype ttype
+                          :pg_type/typcategory
+                          (name (or (when elem :A) (get types/oid->category oid :U)))
+                          :pg_type/typispreferred (contains? types/preferred-oids oid)
                           :pg_type/typelem (long (or elem 0))
                           :pg_type/typdelim ","
                           :pg_type/typnamespace 2200
@@ -706,6 +712,7 @@
           composites (mapv (fn [{:keys [name oid]}]
                              {:pg_type/oid oid :pg_type/typname name
                               :pg_type/typlen -1 :pg_type/typtype "c"
+                              :pg_type/typcategory "C" :pg_type/typispreferred false
                               :pg_type/typelem 0 :pg_type/typdelim ","
                               :pg_type/typnamespace 2200
                               (pgs/row-marker-attr "pg_type") true})
@@ -713,6 +720,7 @@
           enums (mapv (fn [{:keys [name oid]}]
                         {:pg_type/oid oid :pg_type/typname name
                          :pg_type/typlen 4 :pg_type/typtype "e"
+                         :pg_type/typcategory "E" :pg_type/typispreferred false
                          :pg_type/typelem 0 :pg_type/typdelim ","
                          :pg_type/typnamespace 2200
                          (pgs/row-marker-attr "pg_type") true})
@@ -841,10 +849,10 @@
                     (pgs/row-marker-attr "pg_database") true}))
             real))
     "pg_proc"
-    (mapv (fn [[pname vol nargs ret args]]
+    (mapv (fn [[pname vol nargs ret args & [namespace-oid]]]
             {:pg_proc/proname pname
              :pg_proc/provolatile vol
-             :pg_proc/pronamespace 11
+             :pg_proc/pronamespace (long (or namespace-oid 11))
              :pg_proc/pronargs (long nargs)
              :pg_proc/prorettype (long ret)
              :pg_proc/proargtypes (or args "")
@@ -890,6 +898,13 @@
            ["exp" "i" 1 701 "701"] ["ln" "i" 1 701 "701"]
            ["log" "i" 2 701 "701 701"]
            ["greatest" "i" 2 701 "701 701"]
+           ["vector_dims" "i" 1 23 "16383" 2200]
+           ["vector_norm" "i" 1 701 "16383" 2200]
+           ["l2_distance" "i" 2 701 "16383 16383" 2200]
+           ["vector_l2_squared_distance" "i" 2 701 "16383 16383" 2200]
+           ["l1_distance" "i" 2 701 "16383 16383" 2200]
+           ["inner_product" "i" 2 701 "16383 16383" 2200]
+           ["cosine_distance" "i" 2 701 "16383 16383" 2200]
            ["least" "i" 2 701 "701 701"]
            ["count" "i" 1 20 "2276"] ["sum" "i" 1 701 "701"]
            ["avg" "i" 1 701 "701"] ["min" "i" 1 701 "701"]
@@ -1248,9 +1263,17 @@
           :pg_attrdef/adnum (long (inc idx))
           :pg_attrdef/adbin (render default col)
           (pgs/row-marker-attr "pg_attrdef") true})))
-    ;; pg_extension — always empty; we never install extensions.
+    ;; `vector` is built into this compatibility surface, but expose it as an
+    ;; installed extension because migration tools discover pgvector through
+    ;; pg_extension before using its type and functions.
     "pg_extension"
-    []
+    [{:pg_extension/oid 16382
+      :pg_extension/extname "vector"
+      :pg_extension/extowner pg-role-oid
+      :pg_extension/extnamespace 2200
+      :pg_extension/extrelocatable true
+      :pg_extension/extversion "0.8.6"
+      (pgs/row-marker-attr "pg_extension") true}]
     ;; Always-empty tables. Modelling them as real (empty) catalog
     ;; tables so LEFT JOINs against them produce NULL fills rather
     ;; than dropping the entire row set (the empty-catalog short-

@@ -45,6 +45,7 @@
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.types :as types]
+            [datahike.pg.vector :as pg-vector]
             [datahike.pg.prng]))
 
 (set! *warn-on-reflection* true)
@@ -328,6 +329,8 @@
   (cond
     (and (bytes? a) (bytes? b))
     (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
+    (and (pg-vector/vector-value? a) (pg-vector/vector-value? b))
+    (pg-vector/compare-values a b)
     (or (types/numeric-special? a) (types/numeric-special? b))
     (numeric-special-cmp a b)
     (nan-num? a) (if (nan-num? b) 0 1)
@@ -3655,6 +3658,38 @@
    ;; The first three arguments share a numeric overload; count is int4.
    "width_bucket"     {:unknown-args {:homogeneous-prefix 3}}
    "array_fill"       {:impl sql-array-fill :arities #{2 3}}
+   "vector_dims"      {:impl (comp pg-vector/vector-dims pg-vector/coerce)
+                       :arities #{1} :arg-oids [types/oid-vector]
+                       :strict? true :return-oid types/oid-int4}
+   "vector_norm"      {:impl (comp pg-vector/vector-norm pg-vector/coerce)
+                       :arities #{1} :arg-oids [types/oid-vector]
+                       :strict? true :return-oid types/oid-float8}
+   "l2_distance"      {:impl (fn [a b]
+                               (pg-vector/l2-distance (pg-vector/coerce a)
+                                                      (pg-vector/coerce b)))
+                       :arities #{2} :arg-oids [types/oid-vector types/oid-vector]
+                       :strict? true :return-oid types/oid-float8}
+   "vector_l2_squared_distance"
+   {:impl (fn [a b]
+            (pg-vector/l2-squared-distance (pg-vector/coerce a)
+                                           (pg-vector/coerce b)))
+    :arities #{2} :arg-oids [types/oid-vector types/oid-vector]
+    :strict? true :return-oid types/oid-float8}
+   "l1_distance"      {:impl (fn [a b]
+                               (pg-vector/l1-distance (pg-vector/coerce a)
+                                                      (pg-vector/coerce b)))
+                       :arities #{2} :arg-oids [types/oid-vector types/oid-vector]
+                       :strict? true :return-oid types/oid-float8}
+   "inner_product"    {:impl (fn [a b]
+                               (pg-vector/inner-product (pg-vector/coerce a)
+                                                        (pg-vector/coerce b)))
+                       :arities #{2} :arg-oids [types/oid-vector types/oid-vector]
+                       :strict? true :return-oid types/oid-float8}
+   "cosine_distance" {:impl (fn [a b]
+                              (pg-vector/cosine-distance (pg-vector/coerce a)
+                                                         (pg-vector/coerce b)))
+                      :arities #{2} :arg-oids [types/oid-vector types/oid-vector]
+                      :strict? true :return-oid types/oid-float8}
    "booleq"           {:impl = :arities #{2}
                        :strict? true :return-oid types/oid-bool}
    "boolne"           {:impl not= :arities #{2}

@@ -57,6 +57,7 @@
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
+            [datahike.pg.vector :as pg-vector]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.arrays :as pg-arr])
   (:import [datahike.datom Datom]
@@ -2137,6 +2138,14 @@
 
            :else
            {:op nil :branches [(translate-select ^PlainSelect inner schema db)]})
+         _ (when (and (some? (:op branch-parsed))
+                      (not= :union-all (:op branch-parsed))
+                      (some #{types/oid-vector}
+                            (mapcat :select-item-oids (:branches branch-parsed))))
+             (throw (errors/pg-error
+                     :feature-not-supported
+                     {:message (str "set operations that deduplicate vector "
+                                    "values are not supported")})))
          sub-parsed (first (:branches branch-parsed))
         ;; Per-column expected OID from the inner translate-select's
         ;; oid-infer pass. Used as a default when the materialised
@@ -2311,6 +2320,7 @@
                             (boolean? v)                              :boolean
                             (instance? java.util.Date v)              :datetime
                             (instance? java.util.UUID v)              :uuid
+                            (pg-vector/vector-value? v)                :vector
                             (or (number? v) (types/numeric-special? v)) :numeric
                             (or (string? v) (keyword? v) (symbol? v)) :string
                             :else                                     :unknown))
@@ -2335,6 +2345,7 @@
                              (= cats #{:boolean})  :db.type/boolean
                              (= cats #{:datetime}) :db.type/instant
                              (= cats #{:uuid})     :db.type/uuid
+                             (= cats #{:vector})   :db.type/float-array
                              (= cats #{:string})   :db.type/string
 
                              (= cats #{:numeric})
@@ -3569,6 +3580,15 @@
                      :default-table default-table
                      :scalar-subquery-oid #(expr/scalar-subquery-output-oid ctx %)
                      :hints (pgs/schema-hints db)}
+        reject-vector-distinct-aggregate!
+        (fn [distinct? inner-expr]
+          (when (and distinct? inner-expr
+                     (= types/oid-vector
+                        (try (oid/expr-oid inner-expr agg-oid-env)
+                             (catch Throwable _ nil))))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "DISTINCT aggregates over vector values are not supported"}))))
         ;; Per-input-type runtime variant for precision-sensitive
         ;; aggregates. Single source of truth: oid-infer's
         ;; `sql-aggregate->return-oid` says e.g. AVG(int8) → numeric;
@@ -3611,6 +3631,7 @@
                 inner-expr (.getExpression ae)
                 filter-expr (.getFilterExpression ae)
                 idx (count @find-elements)]
+            (reject-vector-distinct-aggregate! (.isDistinct ae) inner-expr)
             (reset! has-aggregates? true)
             (if (and filter-expr agg-sym)
               (let [is-count? (= fname "count")
@@ -3664,6 +3685,8 @@
                   agg-sym (get fns/sql-aggregate->datalog fname)
                   params (.getParameters f)
                   is-distinct? (.isDistinct f)]
+              (reject-vector-distinct-aggregate!
+               is-distinct? (when (seq params) (first params)))
               (reset! has-aggregates? true)
               (let [is-count-star? (or (nil? params)
                                        (= 0 (count params))
@@ -4510,6 +4533,41 @@
         select-item-oids select-item-oids*
         select-item-resolution-oids select-item-resolution-oids*
         select-item-param-idx select-item-param-idx*
+        _ (when (and has-distinct? (empty? distinct-on-items)
+                     (some #{types/oid-vector} select-item-oids))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "DISTINCT over vector values is not supported"})))
+        distinct-on-oids
+        (when (seq distinct-on-items)
+          (mapv (fn [^SelectItem item]
+                  (try (oid/expr-oid (.getExpression item) oid-env)
+                       (catch Throwable _ nil)))
+                distinct-on-items))
+        _ (when (some #{types/oid-vector} distinct-on-oids)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "DISTINCT ON over vector keys is not supported"})))
+        group-by-oids
+        (when (seq group-by)
+          (mapv (fn [g]
+                  (cond
+                    (instance? LongValue g)
+                    (nth select-item-oids (dec (.getValue ^LongValue g)) nil)
+
+                    (group-by-alias-only? g)
+                    (let [alias (unquote-ident (.getColumnName ^Column g))
+                          idx (.indexOf ^java.util.List @find-aliases alias)]
+                      (nth select-item-oids idx nil))
+
+                    :else
+                    (try (oid/expr-oid g oid-env)
+                         (catch Throwable _ nil))))
+                group-by))
+        _ (when (some #{types/oid-vector} group-by-oids)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "GROUP BY over vector values is not supported"})))
 
         ;; For JOINs: add entity vars to :with to prevent dedup of rows
         ;; from different entity combinations that produce identical values.
@@ -5773,7 +5831,7 @@
     nil
     (let [col-data-type (.getColDataType ce)
           type-str (when col-data-type
-                     (str/lower-case (str (.getDataType col-data-type))))
+                     (types/normalize-sql-type-name (str col-data-type)))
           cast-cat (types/cast-category type-str)
           ;; CAST(<x> AS T[]): JSqlParser exposes the array dim via
           ;; getArrayData (a list, size = ndim) rather than embedding
@@ -5782,6 +5840,12 @@
           ;; non-array inputs through `pg-arr/array` for consistency.
           array-data (try (.getArrayData col-data-type) (catch Throwable _ nil))
           array-target? (and (some? type-str) (seq array-data))]
+      (when (and array-target?
+                 (= :vector (types/cast-category
+                             (str/replace type-str #"\[\]$" ""))))
+        (throw (errors/pg-error
+                :feature-not-supported
+                {:message "vector arrays are not supported"})))
       (if array-target?
         (let [elem-kw (or (get types/sql-name->elem-kw type-str) :text)]
           (cond
@@ -6145,6 +6209,11 @@
         ;; behaving like PG `json`). Canonicalize every jsonb write here — string
         ;; literal or Clojure map/vector alike — keyed on the :pg/type tag.
           jsonb? (jb/serialize-jsonb val)
+
+        ;; pgvector's vector type is Datahike's native float array. Parse
+        ;; every write through the same input function, even if it is already
+        ;; a float[], so vector(n) is enforced on INSERT and UPDATE alike.
+          (= "vector" pg-type) (pg-vector/coerce val typmod)
 
         ;; money shares Datahike's BigDecimal carrier with numeric, but its
         ;; SQL input function accepts currency/grouping syntax and enforces

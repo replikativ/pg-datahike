@@ -461,8 +461,11 @@ callers get distinct values), `DEFAULT nextval('s'::regclass)`,
 raise 22P02), `CREATE DOMAIN … [NOT NULL] [CHECK (…)]` (CHECK predicate
 evaluated on INSERT — violations raise 23514, NOT NULL raises 23502;
 `VALUE` keyword resolves to the column value), `text[]` arrays,
-`tsvector` (opaque round-trip),
-`bytea`, `timestamp with time zone`, `CHARACTER(N)`, `SERIAL`,
+`tsvector` (opaque round-trip), pgvector-compatible `vector` / `vector(n)`
+values, scalar distance functions and `<->` / `<#>` / `<=>` operators (exact
+scan evaluation; ANN indexes, vector arrays, vector uniqueness, and
+DISTINCT/GROUP BY vector keys are not exposed yet), `bytea`,
+`timestamp with time zone`, `CHARACTER(N)`, `SERIAL`,
 `COPY … FROM stdin` (text + CSV), `ALTER TABLE … ADD CONSTRAINT
 FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
 

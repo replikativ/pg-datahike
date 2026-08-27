@@ -652,7 +652,10 @@
       ;; Views are real database objects now; route through JSqlParser and
       ;; the transactional DDL path instead of acknowledging a no-op.
       (kw=? t1 "view")      {:kind :generic-sql}
-      (kw=? t1 "index")     {:kind :create-index}
+      ;; Route through JSqlParser so the executor can inspect indexed columns.
+      ;; Ordinary indexes remain compatibility no-ops; extension-backed types
+      ;; such as vector must reject until their index semantics are real.
+      (kw=? t1 "index")     {:kind :generic-sql}
       (kw=? t1 "table")     {:kind :generic-sql}
       (kw=? t1 "sequence")  (classify-create-sequence (rest toks))
 

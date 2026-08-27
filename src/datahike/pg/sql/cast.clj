@@ -31,7 +31,8 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.coerce :as coerce]
-            [datahike.pg.types :as types]))
+            [datahike.pg.types :as types]
+            [datahike.pg.vector :as pg-vector]))
 
 (set! *warn-on-reflection* true)
 
@@ -317,6 +318,11 @@
     v
     (let [cat (types/cast-category type-str)]
       (case cat
+        :vector
+        (let [typmod (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str))
+                             second Long/parseLong)]
+          (pg-vector/coerce v typmod))
+
         ;; Both json types VALIDATE on input — `json_in` does a full
         ;; RFC-8259 parse and only then keeps the original bytes — and
         ;; only jsonb normalises afterwards. Handled here rather than at

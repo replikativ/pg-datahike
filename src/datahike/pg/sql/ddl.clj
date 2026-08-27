@@ -18,13 +18,15 @@
    Helpers:
      - extract-ddl-constraints — CHECK / NOT NULL / UNIQUE / FK clauses
      - extract-inherits        — PostgreSQL INHERITS"
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params]
-            [datahike.pg.types :as types])
+            [datahike.pg.types :as types]
+            [datahike.pg.vector :as pg-vector])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression StringValue]
            [net.sf.jsqlparser.statement.create.table
@@ -413,7 +415,7 @@
 
       array? nil
 
-      (#{"jsonb" "json" "money" "interval" "tsvector"} bt) bt
+      (#{"jsonb" "json" "money" "interval" "tsvector" "vector"} bt) bt
 
       (#{"date" "time" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"
@@ -465,6 +467,33 @@
                                     :in [$ ?c]}
                                   db table-name)))
         parent-table (or parent-from-sql parent-from-db)
+        vector-columns
+        (into #{}
+              (keep (fn [^ColumnDefinition col]
+                      (let [^ColDataType cdt (.getColDataType col)
+                            base (types/normalize-sql-type-name
+                                  (str (.getDataType cdt)))]
+                        (when (= :vector (types/cast-category base))
+                          (params/unquote-ident (.getColumnName col))))))
+              columns)
+        _vector-arrays
+        (doseq [^ColumnDefinition col columns
+                :let [^ColDataType cdt (.getColDataType col)
+                      raw-type (str (.getDataType cdt))
+                      base (types/normalize-sql-type-name
+                            raw-type)
+                      array-data (try (.getArrayData cdt)
+                                      (catch Throwable _ nil))]]
+          (when (and (types/vector-type-spelling? raw-type)
+                     (not= :vector (types/cast-category base)))
+            (throw (errors/pg-error
+                    :undefined-object
+                    {:kind "type" :name raw-type})))
+          (when (and (seq array-data)
+                     (= :vector (types/cast-category base)))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "vector arrays are not supported"}))))
         ;; For INHERITS children, skip `id` — it's shared with parent. Adding
         ;; a child-namespaced id attr would cause auto-increment to assign
         ;; DIFFERENT values for child vs parent, breaking SELECT FROM parent
@@ -497,6 +526,14 @@
         ;;     uniqueness as the single-col case.
         constraints (extract-ddl-constraints ct)
         pk-cols (:pk-cols constraints)
+        constrained-vector-cols
+        (set (concat pk-cols (mapcat :cols (:uniques constraints))))
+        _vector-uniqueness
+        (when (seq (set/intersection vector-columns constrained-vector-cols))
+          (throw (errors/pg-error
+                  :feature-not-supported
+                  {:message (str "UNIQUE and PRIMARY KEY constraints on vector "
+                                 "columns are not supported")})))
         single-pk? (= 1 (count pk-cols))
         single-pk-col (when single-pk? (first pk-cols))
         pk-cols-set (set pk-cols)
@@ -554,7 +591,8 @@
                    (for [^ColumnDefinition col columns
                          :let [col-name (params/unquote-ident (.getColumnName col))
                                ^ColDataType cdt (.getColDataType col)
-                               raw-type-orig (str/lower-case (str (.getDataType cdt)))
+                               raw-type-orig (types/normalize-sql-type-name
+                                              (str (.getDataType cdt)))
                                ;; Strip schema prefix from type names. pg_dump
                                ;; emits `public.year`, `public.mpaa_rating` —
                                ;; we have a flat type namespace.
@@ -661,6 +699,10 @@
                                  ;; plus a separate argument list. `str` on
                                  ;; ColDataType faithfully includes both.
                                  (some-> (types/parse-bit-length (str cdt)) long))
+                               vector-typmod
+                               (when (= dh-type :db.type/float-array)
+                                 (pg-vector/parse-typmod
+                                  (types/normalize-sql-type-name (str cdt))))
                                char-pg-type
                                (when-not array-spec
                                  (let [b (types/base-type-name-of raw-type)]
@@ -723,6 +765,8 @@
                        numeric-typmod (assoc :pg/typmod numeric-typmod)
                        char-typmod (assoc :pg/typmod char-typmod)
                        bit-typmod (assoc :pg/typmod bit-typmod)
+                       vector-typmod (assoc :pg/typmod vector-typmod)
+                       (= dh-type :db.type/float-array) (assoc :pg/type "vector")
                        char-pg-type (assoc :pg/type char-pg-type)
                        not-null-here? (assoc :pg/not-null true)
                        (and default-spec

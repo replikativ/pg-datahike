@@ -1583,7 +1583,8 @@
                                              (instance? CastExpression unnest-val)
                                              (let [c-expr ^CastExpression unnest-val
                                                    inner (.getLeftExpression c-expr)
-                                                   type-str (str/lower-case (str (.getDataType (.getColDataType c-expr))))
+                                                   type-str (types/normalize-sql-type-name
+                                                             (str (.getColDataType c-expr)))
                                                    raw (cond
                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
                                                          (instance? DoubleValue inner) (types/decimal-literal inner (.getValue ^DoubleValue inner))
@@ -1718,8 +1719,9 @@
                                                                            inner)
                                                                  ;; .getDataType is the BASE name ("int"); the `[]` is in
                                                                  ;; .getArrayData. (str cdt) carries the full "int[]".
-                                                                   type-str (str/lower-case (str (.getDataType cdt)))
-                                                                   full-str (str/lower-case (str cdt))
+                                                                   type-str (types/normalize-sql-type-name
+                                                                             (str (.getDataType cdt)))
+                                                                   full-str (types/normalize-sql-type-name (str cdt))
                                                                    enum-values (when-not
                                                                                 (or (contains? types/pg-name->oid full-str)
                                                                                     (contains? types/pg-name->oid type-str))
@@ -1732,6 +1734,11 @@
                                                                                 :name full-str})))
                                                                    ad (.getArrayData cdt)
                                                                    array? (and ad (pos? (.size ^java.util.List ad)))
+                                                                   _ (when (and array?
+                                                                                (= :vector (types/cast-category type-str)))
+                                                                       (throw (errors/pg-error
+                                                                               :feature-not-supported
+                                                                               {:message "vector arrays are not supported"})))
                                                                    raw (cond
                                                                          (instance? LongValue inner) (.getValue ^LongValue inner)
                                                                          (instance? DoubleValue inner) (types/decimal-literal inner (.getValue ^DoubleValue inner))
@@ -1814,7 +1821,7 @@
                                                                                 :value label}))))
                                                                  :else
                                                                  (sql-cast/cast-scalar
-                                                                  raw type-str
+                                                                  raw full-str
                                                                   {:explicit? true
                                                                    :prefer-local-datetime? true
                                                                    :parse-timestamp expr/parse-timestamp-string})))
@@ -2026,6 +2033,14 @@
                                       (if (.isAll ^ExceptOp op) :except-all :except)
                                       :else :unknown))
                           operation-kinds (mapv op-kind operations)
+                          _ (when (and (some #(not= :union-all %) operation-kinds)
+                                       (some #{types/oid-vector}
+                                             (mapcat :select-item-oids
+                                                     sub-results)))
+                              (throw (errors/pg-error
+                                      :feature-not-supported
+                                      {:message (str "set operations that deduplicate "
+                                                     "vector values are not supported")})))
                           set-limit (when limit-expr
                                       (let [value (stmt/extract-value limit-expr schema db)]
                                         (when-not (params/param-ref? value)
@@ -2193,7 +2208,12 @@
 
           ;; CREATE INDEX — accepted as no-op
                     (instance? CreateIndex stmt)
-                    {:type :ddl-create-index}
+                    (let [^CreateIndex ci stmt
+                          idx (.getIndex ci)]
+                      {:type :ddl-create-index
+                       :table (some-> (.getTable ci) .getName unquote-ident)
+                       :columns (mapv (comp unquote-ident str)
+                                      (or (some-> idx .getColumnsNames) []))})
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
                     (instance? Alter stmt)
@@ -2209,7 +2229,14 @@
                                             {:op :add-column
                                              :columns (mapv (fn [^ColumnDefinition cdt]
                                                               {:name (unquote-ident (.getColumnName cdt))
-                                                               :type (str/lower-case (str (.getDataType (.getColDataType cdt))))})
+                                                               ;; Preserve identifier quotes/case here. The executor
+                                                               ;; normalizes valid built-ins; lowercasing now would turn
+                                                               ;; distinct `"Vector"` into pgvector's `vector` silently.
+                                                               :type (str (.getColDataType cdt))
+                                                               :primary-key? (boolean
+                                                                              (ddl/column-is-primary-key? cdt))
+                                                               :unique? (boolean
+                                                                         (ddl/column-is-unique? cdt))})
                                                             cdts)})
                                 ;; ADD [CONSTRAINT name] PRIMARY KEY / UNIQUE —
                                 ;; carry the columns so the executor can upgrade
@@ -2416,7 +2443,7 @@
                                  (or (some unsupported-op-chars text)
                                      (and (= "#" text) (not (xor-infix? idx)))
                                      (and (str/includes? text "#")
-                                          (not (contains? #{"#" "#>" "#>>"} text))))
+                                          (not (contains? #{"#" "#>" "#>>" "<#>"} text))))
                                  (not (contains? #{"#>" "#>>"} text))))
                     token))
                 tokens))]

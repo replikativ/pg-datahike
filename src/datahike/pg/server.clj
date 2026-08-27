@@ -39,6 +39,7 @@
             [datahike.pg.sql.stmt :as stmt]
             [datahike.pg.sql.temporal :as sql-temporal]
             [datahike.pg.types :as types]
+            [datahike.pg.vector :as pg-vector]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
@@ -337,6 +338,7 @@
      (pg-rec/record? v) (do (pg-rec/register-layouts!
                              (fn [t oids] (PgParamCodec/registerRecordLayout t oids)) v)
                             (pg-rec/to-pg-text v))
+     (pg-vector/vector-value? v) (pg-vector/to-pg-text v)
      (string? v)  v
      (keyword? v) (if-let [ns (namespace v)]
                     (str ns "/" (name v))
@@ -6698,31 +6700,86 @@
     (empty-result "ROLLBACK")))
 
 (defn- exec-ddl-create-index
-  [_ctx _parsed]
-  (empty-result "CREATE INDEX"))
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx
+        db (or (:speculative-db @tx-state) (d/db conn))
+        schema (dbi/-schema db)
+        vector-column?
+        (some (fn [col]
+                (= :db.type/float-array
+                   (get-in schema [(keyword (:table parsed) col) :db/valueType])))
+              (:columns parsed))]
+    (if vector-column?
+      (classified-error
+       "CREATE INDEX error: "
+       (errors/pg-error
+        :feature-not-supported
+        {:message "indexes on vector columns are not supported"}))
+      (empty-result "CREATE INDEX"))))
 
 (defn- exec-ddl-alter
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx]
     (try
       (let [{:keys [table operations]} parsed
-            schema (dbi/-schema (d/db conn))
+            db (or (:speculative-db @tx-state) (d/db conn))
+            schema (dbi/-schema db)
+            _ (doseq [{:keys [op columns]} operations]
+                (case op
+                  :add-column
+                  (doseq [{:keys [type primary-key? unique?]} columns
+                          :let [raw-type type
+                                type (types/normalize-sql-type-name raw-type)
+                                base (str/replace type #"\[\]$" "")]]
+                    (when (and (types/vector-type-spelling? raw-type)
+                               (not= :vector (types/cast-category base)))
+                      (throw (errors/pg-error
+                              :undefined-object
+                              {:kind "type" :name raw-type})))
+                    (when (= :vector (types/cast-category base))
+                      (cond
+                        (str/ends-with? type "[]")
+                        (throw (errors/pg-error
+                                :feature-not-supported
+                                {:message "vector arrays are not supported"}))
+
+                        (or primary-key? unique?)
+                        (throw (errors/pg-error
+                                :feature-not-supported
+                                {:message (str "UNIQUE and PRIMARY KEY constraints on "
+                                               "vector columns are not supported")})))))
+
+                  (:add-primary-key :add-unique)
+                  (when (some (fn [col]
+                                (= :db.type/float-array
+                                   (get-in schema [(keyword table col) :db/valueType])))
+                              columns)
+                    (throw (errors/pg-error
+                            :feature-not-supported
+                            {:message (str "UNIQUE and PRIMARY KEY constraints on "
+                                           "vector columns are not supported")})))
+                  nil))
             tx-data (vec (mapcat
                           (fn [{:keys [op columns]}]
                             (case op
                               :add-column
                               (for [{:keys [name type]} columns
-                                    :let [base-type (str/replace type #"\s*\([^)]*\)" "")
-                                          _ (when (types/unsupported-input-type? base-type)
+                                    :let [raw-type type
+                                          unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")
+                                          _ (when (types/unsupported-input-type? unsupported-base)
                                               (throw (ex-info
-                                                      (str "type \"" base-type
+                                                      (str "type \"" unsupported-base
                                                            "\" is not supported until its PostgreSQL input parser is implemented")
                                                       {:error :feature-not-supported
                                                        :sqlstate "0A000"
-                                                       :type base-type})))
+                                                       :type unsupported-base})))
+                                          type (types/normalize-sql-type-name raw-type)
+                                          base-type (str/replace type #"\s*\([^)]*\)" "")
                                           dh-type (or (get types/sql-name->dh-type type)
                                                       (get types/sql-name->dh-type base-type)
-                                                      :db.type/string)]]
+                                                      :db.type/string)
+                                          vector-typmod (when (= "vector" base-type)
+                                                          (pg-vector/parse-typmod type))]]
                                 (cond-> {:db/ident (keyword table name)
                                          :db/valueType dh-type
                                          :db/cardinality :db.cardinality/one}
@@ -6733,7 +6790,8 @@
                                   ;; type (timestamp / int8) forever.
                                   (ddl/pg-type-hint base-type false)
                                   (assoc :pg/type
-                                         (ddl/pg-type-hint base-type false))))
+                                         (ddl/pg-type-hint base-type false))
+                                  vector-typmod (assoc :pg/typmod vector-typmod)))
                               ;; PK/UNIQUE on an existing column: upgrade the
                               ;; attribute — datahike's index-backfill migration
                               ;; populates AVET for pre-existing datoms and
@@ -6965,8 +7023,19 @@
   [ctx parsed]
   (let [{:keys [silently-accept tx-state]} ctx
         msg (:message parsed)
-        kind (:reject-kind parsed)]
-    (if (and kind (contains? silently-accept kind))
+        kind (:reject-kind parsed)
+        ;; `vector` is a built-in compatibility surface here even though it
+        ;; is an extension in PostgreSQL. Migration tools conventionally run
+        ;; CREATE EXTENSION IF NOT EXISTS vector before using the type; make
+        ;; that exact declaration idempotent in strict mode. Other extensions
+        ;; retain the configured strict/permissive policy.
+        vector-extension-if-not-exists?
+        (and (= :create-extension kind)
+             (boolean (re-matches
+                       #"(?is)\s*create\s+extension\s+if\s+not\s+exists\s+(?:\"vector\"|vector)\s*;?\s*"
+                       (:sql ctx))))]
+    (if (or vector-extension-if-not-exists?
+            (and kind (contains? silently-accept kind)))
       (empty-result (or (:reject-tag parsed) "OK"))
       (let [code (or (:sqlstate parsed)
                      (errors/classify-message msg)
@@ -7091,7 +7160,8 @@
    via `copy/row->entity-map`, append to pending, and flush whenever
    we cross batch-size."
   [ctx rows]
-  (let [{:keys [copy-state schema]} ctx
+  (let [{:keys [conn copy-state schema]} ctx
+        schema (stmt/enrich-schema-with-pg-array-meta schema (d/db conn))
         {:keys [columns ns row-marker batch-size]} @copy-state]
     (doseq [row rows]
       (let [next-idx (-> @copy-state :rows-committed (+ (count (:pending-rows @copy-state))))

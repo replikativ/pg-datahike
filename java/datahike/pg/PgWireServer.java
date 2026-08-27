@@ -82,6 +82,8 @@ public final class PgWireServer {
     public static final int OID_TIMETZ      = 1266; // time with time zone
     public static final int OID_UUID        = 2950;
     public static final int OID_JSONB       = 3802;
+    /** pg-datahike's reserved, discoverable OID for pgvector's extension type. */
+    public static final int OID_VECTOR      = 16383;
 
     // Array OIDs — exposed so PgParamCodec can dispatch binary
     // encode/decode through the scalar element codec without
