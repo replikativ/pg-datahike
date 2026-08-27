@@ -694,7 +694,7 @@
                     (.add params v)
                     (.add param-oids oid)
                     (.append sb (str "$" (.size params)))
-                    (recur (inc i) (long end) false fn-depth' paren-stack'
+                    (recur (inc i) (long end) false (long fn-depth') paren-stack'
                            false in-sort-list?))
                   :else
                   (let [low (when (= :ident type) (str/lower-case text))
@@ -711,7 +711,7 @@
                     (recur (inc i) (long last-end)
                            (and (= :ident type)
                                 (contains? no-param-after low))
-                           fn-depth' paren-stack'
+                           (long fn-depth') paren-stack'
                            (or by?
                                (and in-sort-list?'
                                     (= :punct type) (= "," text)))
