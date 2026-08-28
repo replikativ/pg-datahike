@@ -1,0 +1,249 @@
+(ns datahike.test.pg-secondary-validation-test
+  "End-to-end PostgreSQL access-path validation against the local secondary
+   stack. The released runtime remains JDK 17 compatible; these tests activate
+   only under the opt-in :local-secondary-stack alias (JDK 22+)."
+  (:require [clojure.test :refer [deftest is use-fixtures]]
+            [datahike.api :as d]
+            [datahike.pg.server :as pg])
+  (:import [datahike.pg PgWireServer$QueryResult]))
+
+(def ^:dynamic *conn* nil)
+(def ^:dynamic *handler* nil)
+
+(def ^:private secondary-stack-available?
+  (try
+    (require 'datahike.index.secondary.scriptum)
+    (require 'datahike.index.secondary.proximum)
+    (requiring-resolve 'datahike.index.secondary/candidate-page)
+    true
+    (catch Throwable _ false)))
+
+(defn- fixture [f]
+  (if-not secondary-stack-available?
+    (f)
+    (let [cfg {:store {:backend :memory :id (random-uuid)}
+               :writer {:backend :self :writer-ownership :exclusive}
+               :schema-flexibility :write
+               :max-string-length 0}
+          vector-store-id (random-uuid)]
+      (d/create-database cfg)
+      (let [conn (d/connect cfg)
+            handler
+            (pg/make-query-handler
+             conn
+             {:secondary-index-config
+              {:proximum {:store-config {:backend :memory
+                                         :id vector-store-id}}
+               :stratum {}}})]
+        (try
+          (binding [*conn* conn *handler* handler] (f))
+          (finally
+            (.close handler)
+            (d/release conn)
+            (d/delete-database cfg)))))))
+
+(use-fixtures :each fixture)
+
+(defn- result [sql]
+  (.execute *handler* sql))
+
+(defn- rows [sql]
+  (mapv vec (.-rows ^PgWireServer$QueryResult (result sql))))
+
+(defn- sqlstate [sql]
+  (.-sqlstate ^PgWireServer$QueryResult (result sql)))
+
+(deftest postgres-secondary-index-vertical
+  (if-not secondary-stack-available?
+    (is true ":local-secondary-stack is not active")
+    (do
+      (result (str "CREATE TABLE secondary_docs ("
+                   "id int PRIMARY KEY, priority int NOT NULL, "
+                   "body tsvector, embedding vector(3))"))
+      ;; Build over existing data to exercise Datahike's non-blocking writer +
+      ;; buffered-delta backfill path, not only the empty-index fast path.
+      (result (str "INSERT INTO secondary_docs VALUES "
+                   "(1, 30, '''alpha'':1', '[1,0,0]'), "
+                   "(2, 10, '''beta'':1', '[0,1,0]'), "
+                   "(3, 20, '''alpha'':1 ''beta'':2', '[0.9,0.1,0]')"))
+      (let [^PgWireServer$QueryResult index-result
+            (result "CREATE INDEX secondary_docs_priority_idx ON secondary_docs (priority)")]
+        (is (nil? (.-sqlstate index-result)) (.-error index-result)))
+      (is (nil? (sqlstate
+                 "CREATE INDEX secondary_docs_body_gin ON secondary_docs USING gin (body)")))
+      (is (nil? (sqlstate
+                 "CREATE INDEX secondary_docs_body_gist ON secondary_docs USING gist (body)")))
+      (is (nil? (sqlstate
+                 (str "CREATE INDEX secondary_docs_embedding_hnsw ON secondary_docs "
+                      "USING hnsw (embedding vector_cosine_ops) "
+                      "WITH (m=8, ef_construction=32)"))))
+
+      (let [schema (:schema (d/db *conn*))]
+        (is (= :ready
+               (get-in schema
+                       [:datahike.pg.index/secondary_docs_body_gin
+                        :db.secondary/status])))
+        (is (= :ready
+               (get-in schema
+                       [:datahike.pg.index/secondary_docs_body_gist
+                        :db.secondary/status])))
+        (is (= :ready
+               (get-in schema
+                       [:datahike.pg.index/secondary_docs_priority_idx
+                        :db.secondary/status])))
+        (is (= {:dim 3 :distance :cosine :m 8 :ef-construction 32}
+               (select-keys
+                (get-in schema
+                        [:datahike.pg.index/secondary_docs_embedding_hnsw
+                         :db.secondary/config])
+                [:dim :distance :m :ef-construction]))))
+
+      ;; PostgreSQL @@ is still authoritative after Scriptum candidate
+      ;; selection, including phrase, prefix, and negation semantics.
+      (let [search-var (requiring-resolve
+                        'datahike.index.secondary/search-with-vt)
+            original @search-var
+            calls (atom 0)]
+        (with-redefs-fn
+          {search-var (fn [& args]
+                        (swap! calls inc)
+                        (apply original args))}
+          #(do
+             (is (= [["1"] ["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "WHERE body @@ 'alpha' ORDER BY id"))))
+             (is (= [["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "WHERE body @@ 'alpha <-> beta' ORDER BY id"))))
+             (is (= [["1"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "WHERE body @@ 'alpha & !beta' ORDER BY id"))))
+             (is (= [["1"] ["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "WHERE body @@ 'alp:*' ORDER BY id"))))
+             (is (= [["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "WHERE body @@ plainto_tsquery('english', "
+                               "'alpha beta') ORDER BY id"))))
+             (is (= [["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "WHERE body @@ phraseto_tsquery('english', "
+                               "'alpha beta') ORDER BY id"))))))
+        (is (pos? @calls) "SQL @@ invoked Scriptum rather than only the exact scan"))
+
+      (let [candidate-var (requiring-resolve
+                           'datahike.index.secondary/candidate-page)
+            original @candidate-var
+            calls (atom 0)]
+        (with-redefs-fn
+          {candidate-var (fn [& args]
+                           (swap! calls inc)
+                           (apply original args))}
+          #(do
+             (is (= [["2"] ["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "ORDER BY priority ASC LIMIT 2"))))
+             (is (= [["1"] ["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "ORDER BY priority DESC LIMIT 2"))))
+             (is (= [["3"] ["1"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "ORDER BY priority ASC LIMIT 2 OFFSET 1"))))
+             ;; Until range predicates are explicitly pushed into Stratum,
+             ;; filtered ordering must decline the top-N candidate path and
+             ;; retain the complete exact scan.
+             (is (= [["3"] ["1"]]
+                    (rows (str "SELECT id FROM secondary_docs WHERE priority > 15 "
+                               "ORDER BY priority ASC LIMIT 2"))))
+             (let [before @calls]
+               (is (= [["1"]]
+                      (rows (str "SELECT id FROM secondary_docs WHERE id = 1 "
+                                 "ORDER BY priority ASC LIMIT 1"))))
+               (is (= before @calls)
+                   "an unpushed filter declines Stratum rather than under-filling"))))
+        (is (pos? @calls) "SQL scalar ordering invoked Stratum candidate paging"))
+
+      (let [search-var (requiring-resolve 'proximum.core/search)
+            original @search-var
+            filtered-var (requiring-resolve 'proximum.core/search-filtered)
+            filtered-original @filtered-var
+            calls (atom 0)
+            filtered-calls (atom 0)]
+        (with-redefs-fn
+          {search-var (fn [& args]
+                        (swap! calls inc)
+                        (apply original args))
+           filtered-var (fn [& args]
+                          (swap! filtered-calls inc)
+                          (apply filtered-original args))}
+          #(do
+             (is (= [["1"] ["3"]]
+                    (rows (str "SELECT id FROM secondary_docs "
+                               "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 2"))))
+             (is (= [["3"]]
+                    (rows (str "SELECT id FROM secondary_docs WHERE priority = 20 "
+                               "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 1"))))))
+        (is (pos? (+ @calls @filtered-calls))
+            "SQL vector ordering invoked Proximum through the external engine")
+        (is (pos? @filtered-calls)
+            "a selective primary predicate reached Proximum as an entity filter"))
+
+      (doseq [index-name ["secondary_docs_priority_idx"
+                          "secondary_docs_body_gin"
+                          "secondary_docs_body_gist"
+                          "secondary_docs_embedding_hnsw"]]
+        (is (nil? (sqlstate (str "DROP INDEX " index-name)))))
+      (is (every? nil?
+                  (map #(get-in (d/db *conn*) [:schema %])
+                       [:datahike.pg.index/secondary_docs_priority_idx
+                        :datahike.pg.index/secondary_docs_body_gin
+                        :datahike.pg.index/secondary_docs_body_gist
+                        :datahike.pg.index/secondary_docs_embedding_hnsw])))
+      (is (nil? (sqlstate "DROP INDEX IF EXISTS secondary_docs_priority_idx")))
+      (is (= "42704" (sqlstate "DROP INDEX secondary_docs_priority_idx")))
+
+      ;; DROP TABLE removes its materialized index declaration in the same
+      ;; Datahike root transaction. Use an empty table here: the secondary
+      ;; cascade is independent of the separate relational-schema identity
+      ;; problem for dropping and recreating populated attributes while
+      ;; Datahike retains their history.
+      (result "CREATE TABLE secondary_empty (priority int NOT NULL)")
+      (result "CREATE INDEX secondary_docs_priority_idx ON secondary_empty (priority)")
+      (is (nil? (sqlstate "DROP TABLE secondary_empty")))
+      (is (nil? (get-in (d/db *conn*)
+                        [:schema :datahike.pg.index/secondary_docs_priority_idx]))))))
+
+(deftest secondary-index-ddl-rejections-are-explicit
+  (if-not secondary-stack-available?
+    (is true ":local-secondary-stack is not active")
+    (do
+      (result (str "CREATE TABLE secondary_bad (body tsvector, embedding vector, "
+                   "embedding3 vector(3), embedding2001 vector(2001))"))
+      (is (= "0A000"
+             (sqlstate (str "CREATE INDEX secondary_bad_vector_hnsw ON secondary_bad "
+                            "USING hnsw (embedding vector_l2_ops)"))))
+      (is (= "0A000"
+             (sqlstate (str "CREATE INDEX secondary_bad_vector_ivf ON secondary_bad "
+                            "USING ivfflat (embedding vector_l2_ops)"))))
+      (is (= "0A000"
+             (sqlstate (str "CREATE UNIQUE INDEX secondary_bad_vector_unique "
+                            "ON secondary_bad USING hnsw "
+                            "(embedding3 vector_l2_ops)"))))
+      (is (= "0A000"
+             (sqlstate (str "CREATE INDEX secondary_bad_vector_wide ON secondary_bad "
+                            "USING hnsw (embedding2001 vector_l2_ops)"))))
+      (is (= "0A000"
+             (sqlstate (str "CREATE UNIQUE INDEX secondary_bad_body_unique "
+                            "ON secondary_bad USING gin (body)"))))
+      (doseq [[name options]
+              [["m_low" "m=1"]
+               ["m_high" "m=101"]
+               ["ef_low" "ef_construction=3"]
+               ["ef_high" "ef_construction=1001"]
+               ["ef_below_m" "m=16, ef_construction=31"]
+               ["unknown" "unknown_option=1"]
+               ["non_integer" "m=wide"]]]
+        (is (= "22023"
+               (sqlstate
+                (str "CREATE INDEX secondary_bad_" name " ON secondary_bad "
+                     "USING hnsw (embedding3 vector_l2_ops) WITH (" options ")"))))))))

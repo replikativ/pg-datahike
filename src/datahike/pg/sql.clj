@@ -2206,6 +2206,9 @@
                           obj-name (-> d .getName .getName)]
                       (case drop-type
                         "sequence" {:type :ddl-drop-sequence :seq-name obj-name}
+                        "index" {:type :ddl-drop-index
+                                 :name (unquote-ident obj-name)
+                                 :if-exists? (.isIfExists d)}
                         "view" {:type :ddl-drop-view
                                 :view-name (unquote-ident obj-name)
                                 :if-exists? (.isIfExists d)}
@@ -2241,6 +2244,8 @@
                        :name (some-> (.getName idx) unquote-ident)
                        :table (some-> (.getTable ci) .getName unquote-ident)
                        :method (some-> (.getUsing idx) str/lower-case)
+                       :unique? (= "UNIQUE" (some-> (.getType idx) str/upper-case))
+                       :if-not-exists? (.isUsingIfNotExists ci)
                        :columns (if (seq column-specs)
                                   (mapv :name column-specs)
                                   (mapv (comp unquote-ident str)

@@ -5792,6 +5792,50 @@
                      :hint (str "No operator matches the given name and argument "
                                 "types. You might need to add explicit type casts.")}))))
 
+(defn- unwrap-parentheses-and-casts
+  "Return the expression underneath syntax-only parentheses and casts.
+
+   Access-path planning uses this only to recognize a conservative constant
+   shape. The ordinary expression translator remains authoritative for type
+   checking and evaluation."
+  [expr]
+  (cond
+    (instance? Parenthesis expr)
+    (recur (.getExpression ^Parenthesis expr))
+
+    (instance? CastExpression expr)
+    (recur (.getLeftExpression ^CastExpression expr))
+
+    :else expr))
+
+(defn- constant-tsquery
+  "Return the canonical text of a compile-time constant tsquery expression.
+
+   Scriptum is a candidate accelerator, so this deliberately recognizes only
+   forms whose value can be derived without rows, parameters, session state,
+   or SQL evaluation. Unknown forms return nil and retain the exact primary
+   scan."
+  [expr]
+  (let [expr (unwrap-parentheses-and-casts expr)]
+    (cond
+      (instance? StringValue expr)
+      (string-value-text expr)
+
+      (instance? Function expr)
+      (let [^Function f expr
+            name (some-> (.getName f) str/lower-case
+                         (str/replace-first #"^(pg_catalog|public)\\." ""))
+            params (some-> (.getParameters f) vec)]
+        (when (and (= 2 (count params))
+                   (every? #(instance? StringValue %) params))
+          (let [[config text] (mapv string-value-text params)]
+            (case name
+              "plainto_tsquery" (tsearch/plainto-tsquery config text)
+              "phraseto_tsquery" (tsearch/phraseto-tsquery config text)
+              nil))))
+
+      :else nil)))
+
 (defn- jsonb-canonical-operand
   "Canonicalize a literal being compared against a `jsonb` column.
 
@@ -6431,8 +6475,31 @@
 
     (instance? Matches expr)
     (let [^Matches e expr
-          l (translate-expr ctx (.getLeftExpression e))
-          r (translate-expr ctx (.getRightExpression e))]
+          left-expr (.getLeftExpression e)
+          right-expr (.getRightExpression e)
+          l (translate-expr ctx left-expr)
+          r (translate-expr ctx right-expr)
+          candidate-query (constant-tsquery right-expr)
+          column (unwrap-parentheses-and-casts left-expr)]
+      ;; Record only a resolved tsvector-column / constant-tsquery shape. A
+      ;; parameter or row-dependent query remains an exact primary scan until
+      ;; execution-time candidate planning has a stable value to bind.
+      (when (and *conjunctive-where* (instance? Column column) candidate-query)
+        (let [resolved (ctx/resolve-column
+                        column (:table-aliases ctx) (:default-table ctx)
+                        (:col-overrides ctx) (:derived-aliases ctx) (:ci-index ctx))
+              attr (ctx/attr-of ctx resolved)
+              alias (cond
+                      (and (vector? resolved) (= :aliased (first resolved)))
+                      (second resolved)
+
+                      (keyword? resolved) (namespace resolved)
+                      :else nil)]
+          (when (and attr alias)
+            (swap! (:text-search-candidates ctx) conj
+                   {:entity-var (ctx/entity-var! ctx alias)
+                    :attribute attr
+                    :query candidate-query}))))
       [[(list 'datahike.pg.tsearch/ts-match? l r)]])
 
     (instance? EqualsTo expr)

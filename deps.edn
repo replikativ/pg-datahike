@@ -66,6 +66,24 @@
   ;; fixing planner bugs. Compose: `clojure -M:server:local-dh`.
   :local-dh {:override-deps {org.replikativ/datahike {:local/root "../datahike"}}}
 
+  ;; Cross-repository secondary-index validation. This is deliberately an
+  ;; opt-in development profile: Scriptum uses Lucene 10 (JDK 21+) and
+  ;; Proximum uses the incubating Vector API (JDK 22+), while pg-datahike's
+  ;; ordinary SQL/runtime baseline remains JDK 17.
+  :local-secondary-stack
+  {:extra-paths ["../datahike/src-secondary"]
+   :jvm-opts ["-XX:-UsePerfData"
+              "-XX:-UseJVMCICompiler"
+              "--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"]
+   :override-deps
+   {org.replikativ/datahike {:local/root "../datahike"}
+    org.apache.lucene/lucene-analysis-common {:mvn/version "10.3.2"}}
+   :extra-deps
+   {org.replikativ/scriptum {:local/root "../scriptum"}
+    org.replikativ/proximum {:local/root "../proximum"}
+    org.replikativ/stratum {:mvn/version "0.3.83"}}}
+
   ;; tools.build-based jar / install / deploy.
   :build {:extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
                        slipset/deps-deploy          {:mvn/version "0.2.2"}}
