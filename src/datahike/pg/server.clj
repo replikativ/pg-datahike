@@ -3638,6 +3638,8 @@
       (update :tx-data sql/substitute-params fetch)
       (contains? parsed :secondary-candidate)
       (update :secondary-candidate sql/substitute-params fetch)
+      (contains? parsed :secondary-order-candidate)
+      (update :secondary-order-candidate sql/substitute-params fetch)
       ;; A compound aggregate over a constant — `sum(x) / 2` — carries the
       ;; constant in the spec rather than in a column, and a rewritten
       ;; literal arrives here as a ParamRef like any other.

@@ -2,7 +2,8 @@
   "End-to-end PostgreSQL access-path validation against the local secondary
    stack. The released runtime remains JDK 17 compatible; these tests activate
    only under the opt-in :local-secondary-stack alias (JDK 22+)."
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
@@ -153,10 +154,12 @@
       (let [candidate-var (requiring-resolve
                            'datahike.index.secondary/candidate-page)
             original @candidate-var
-            calls (atom 0)]
+            calls (atom 0)
+            query-specs (atom [])]
         (with-redefs-fn
           {candidate-var (fn [& args]
                            (swap! calls inc)
+                           (swap! query-specs conj (nth args 3))
                            (apply original args))}
           #(do
              (is (= [["2"] ["3"]]
@@ -168,11 +171,11 @@
              (is (= [["3"] ["1"]]
                     (rows (str "SELECT id FROM secondary_docs "
                                "ORDER BY priority ASC LIMIT 2 OFFSET 1"))))
-             ;; Until range predicates are explicitly pushed into Stratum,
-             ;; filtered ordering must decline the top-N candidate path and
-             ;; retain the complete exact scan.
              (is (= [["3"] ["1"]]
                     (rows (str "SELECT id FROM secondary_docs WHERE priority > 15 "
+                               "ORDER BY priority ASC LIMIT 2"))))
+             (is (= [["1"]]
+                    (rows (str "SELECT id FROM secondary_docs WHERE priority > 25 "
                                "ORDER BY priority ASC LIMIT 2"))))
              (let [before @calls]
                (is (= [["1"]]
@@ -180,7 +183,11 @@
                                  "ORDER BY priority ASC LIMIT 1"))))
                (is (= before @calls)
                    "an unpushed filter declines Stratum rather than under-filling"))))
-        (is (pos? @calls) "SQL scalar ordering invoked Stratum candidate paging"))
+        (is (pos? @calls) "SQL scalar ordering invoked Stratum candidate paging")
+        (is (some #(= [[:> :priority 15]] (:where %)) @query-specs)
+            "a same-key range is evaluated inside Stratum before top-N")
+        (is (some #(= [[:> :priority 25]] (:where %)) @query-specs)
+            "numeric plan reuse substitutes the current range boundary"))
 
       (let [search-var (requiring-resolve 'proximum.core/search)
             original @search-var
@@ -231,6 +238,49 @@
       (is (nil? (sqlstate "DROP TABLE secondary_empty")))
       (is (nil? (get-in (d/db *conn*)
                         [:schema :datahike.pg.index/secondary_docs_priority_idx]))))))
+
+(deftest full-text-posting-pages-and-mutations-match-the-exact-path
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (let [query-sql (str "SELECT id FROM secondary_text_page "
+                         "WHERE body @@ 'common' ORDER BY id")
+          values-sql (->> (range 1 1106)
+                          (map #(format "(%d, '''common'':1')" %))
+                          (str/join ", "))]
+      (result "CREATE TABLE secondary_text_page (id int PRIMARY KEY, body tsvector)")
+      (result (str "INSERT INTO secondary_text_page VALUES " values-sql))
+      (let [exact-before (rows query-sql)]
+        (is (= 1105 (count exact-before)))
+        (is (nil? (sqlstate
+                   (str "CREATE INDEX secondary_text_page_body_gin "
+                        "ON secondary_text_page USING gin (body)"))))
+        (let [search-var (requiring-resolve
+                          'datahike.index.secondary/search-with-vt)
+              original @search-var
+              calls (atom 0)]
+          (with-redefs-fn
+            {search-var (fn [& args]
+                          (swap! calls inc)
+                          (apply original args))}
+            #(do
+               ;; The comparison with the pre-index result is the SQL-level
+               ;; completeness oracle. It crosses Scriptum's historical
+               ;; 1,000-hit convenience boundary and therefore also exercises
+               ;; continuation paging in Datahike's external-engine executor.
+               (is (= exact-before (rows query-sql)))
+
+               ;; A ready generation must track all three delta shapes. The
+               ;; final no-index query below is authoritative, so this does not
+               ;; bake adapter implementation details into the assertion.
+               (result "UPDATE secondary_text_page SET body = '''rare'':1' WHERE id = 1105")
+               (result "DELETE FROM secondary_text_page WHERE id = 1104")
+               (result "INSERT INTO secondary_text_page VALUES (1106, '''common'':1')")
+               (let [indexed-after (rows query-sql)]
+                 (is (= 1104 (count indexed-after)))
+                 (is (nil? (sqlstate "DROP INDEX secondary_text_page_body_gin")))
+                 (is (= indexed-after (rows query-sql))))))
+          (is (<= 2 @calls)
+              "both indexed snapshots were served through Scriptum"))))))
 
 (deftest secondary-index-ddl-rejections-are-explicit
   (if-not secondary-stack-available?

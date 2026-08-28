@@ -831,18 +831,28 @@
             (when (or (instance? LongValue candidate)
                       (instance? DoubleValue candidate)
                       (instance? StringValue candidate)
+                      (instance? JdbcParameter candidate)
                       (and (instance? SignedExpression candidate)
                            (or (instance? LongValue
                                           (.getExpression ^SignedExpression candidate))
                                (instance? DoubleValue
                                           (.getExpression ^SignedExpression candidate)))))
-              (let [value (extract-value candidate schema db)
+              (let [value (if (instance? JdbcParameter candidate)
+                            (->ParamRef (.getIndex ^JdbcParameter candidate))
+                            (extract-value candidate schema db))
                     value-type (:db/valueType attr-schema)]
-                (when (case value-type
-                        :db.type/long (integer? value)
-                        (:db.type/double :db.type/float) (number? value)
-                        :db.type/string (string? value)
-                        false)
+                ;; Parameter OID inference has already tied a JdbcParameter to
+                ;; this column's PostgreSQL type. Preserve its ParamRef in the
+                ;; cached candidate descriptor; executePrepared and the simple
+                ;; numeric-template path substitute the decoded value before
+                ;; Stratum sees it. Baking the first literal into this plan
+                ;; would make the parse cache return wrong ranges later.
+                (when (or (params/param-ref? value)
+                          (case value-type
+                            :db.type/long (integer? value)
+                            (:db.type/double :db.type/float) (number? value)
+                            :db.type/string (string? value)
+                            false))
                   value))))
           (comparison-op [candidate]
             (cond
