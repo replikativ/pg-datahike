@@ -9,7 +9,7 @@ Primary references:
 - PostgreSQL `IndexAmRoutine`: `../postgres/src/include/access/amapi.h`
 - [PostgreSQL index access methods](https://www.postgresql.org/docs/current/indexam.html)
 - [PostgreSQL index method functions](https://www.postgresql.org/docs/current/index-functions.html)
-- [PostgreSQL index types](https://www.postgresql.org/docs/current/indexes-types.html)
+- [PostgreSQL index types](https://www.postgresql.org/docs/current/indextypes.html)
 - [pgvector](https://github.com/pgvector/pgvector)
 
 ## Core contract under test
