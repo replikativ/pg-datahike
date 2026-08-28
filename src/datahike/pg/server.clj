@@ -4325,10 +4325,10 @@
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
     :ddl-create-domain :ddl-drop-domain
-    ;; Secondary CREATE INDEX uses Datahike's asynchronous backfill and cannot
-    ;; be represented by db-with. Its executor rejects explicit transactions
-    ;; and publishes directly in autocommit mode.
-    :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
+    ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
+    ;; compatibility declaration. Materialized secondary methods reject a
+    ;; buffered/explicit transaction at their narrower execution boundary.
+    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
   [{:keys [conn session-id tx-state cursors]} _parsed]
@@ -7114,8 +7114,22 @@
 
 (defn- materialize-secondary-index!
   [ctx parsed index-type attr config]
-  (let [{:keys [conn secondary-index-build-timeout-ms]} ctx
+  (let [{:keys [conn tx-state secondary-index-build-timeout-ms]} ctx
+        tx @tx-state
         index-ident (secondary-index-ident (:name parsed))]
+    ;; The declaration and its initial generation are published through the
+    ;; connection writer, not speculative db-with state. A standalone CREATE
+    ;; INDEX may have opened an empty implicit wire transaction; that is safe.
+    ;; A client transaction, or an implicit multi-statement group with buffered
+    ;; writes, is not: the index would otherwise be built against the wrong
+    ;; primary snapshot and could escape a later rollback.
+    (when (and (:in-tx? tx)
+               (or (not (:implicit? tx)) (seq (:tx-buffer tx))))
+      (throw
+       (errors/pg-error
+        :feature-not-supported
+        {:message (str "materialized secondary CREATE INDEX requires autocommit; "
+                       "commit the current transaction first")})))
     (load-secondary-adapter! index-type)
     (transact-recorded!
      conn
@@ -7138,7 +7152,7 @@
   [ctx parsed]
   (try
     (let [{:keys [conn tx-state secondary-index-config]} ctx
-          db (d/db conn)
+          db (or (:speculative-db @tx-state) (d/db conn))
           schema (dbi/-schema db)
           index-ident (secondary-index-ident (:name parsed))
           method (or (:method parsed) "btree")
@@ -7148,12 +7162,6 @@
           pg-hints (pgs/schema-hints db)
           pg-type (get-in pg-hints [attr :pg-type])]
       (cond
-        (and (:in-tx? @tx-state) (not (:implicit? @tx-state)))
-        (throw
-         (errors/pg-error
-          :feature-not-supported
-          {:message "secondary CREATE INDEX inside a transaction is not yet supported"}))
-
         (get schema index-ident)
         (if (:if-not-exists? parsed)
           (empty-result "CREATE INDEX")

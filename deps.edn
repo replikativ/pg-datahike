@@ -69,7 +69,9 @@
   ;; Cross-repository secondary-index validation. This is deliberately an
   ;; opt-in development profile: Scriptum uses Lucene 10 (JDK 21+) and
   ;; Proximum uses the incubating Vector API (JDK 22+), while pg-datahike's
-  ;; ordinary SQL/runtime baseline remains JDK 17.
+  ;; ordinary SQL/runtime baseline remains JDK 17. The tests fail (rather than
+  ;; silently skip) when these roots resolve legacy adapters; check out the
+  ;; branches from Datahike #1012, Scriptum #8, and Proximum #21 first.
   :local-secondary-stack
   {:extra-paths ["../datahike/src-secondary"]
    :jvm-opts ["-XX:-UsePerfData"
