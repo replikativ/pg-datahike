@@ -10,13 +10,32 @@
 (def ^:dynamic *conn* nil)
 (def ^:dynamic *handler* nil)
 
-(def ^:private secondary-stack-available?
+(def ^:private secondary-stack-probe
   (try
     (require 'datahike.index.secondary.scriptum)
     (require 'datahike.index.secondary.proximum)
-    (requiring-resolve 'datahike.index.secondary/candidate-page)
-    true
-    (catch Throwable _ false)))
+    (try
+      ;; Loading a legacy adapter is not enough: local-root profiles can point
+      ;; at an unrelated sibling branch and otherwise produce a plausible but
+      ;; meaningless green run. Pin one API introduced by each PR in this
+      ;; validation vertical so stale worktrees fail loudly.
+      (requiring-resolve 'datahike.index.secondary/candidate-page)
+      (requiring-resolve 'proximum.generations/open-generation)
+      (requiring-resolve 'scriptum.core/begin-generation)
+      {:available? true}
+      (catch Throwable failure
+        {:available? false
+         :stale? true
+         :error (ex-message failure)}))
+    (catch Throwable _ {:available? false :stale? false})))
+
+(def ^:private secondary-stack-available?
+  (:available? secondary-stack-probe))
+
+(defn- secondary-stack-unavailable-assertion []
+  (is (not (:stale? secondary-stack-probe))
+      (str ":local-secondary-stack resolved legacy or unrelated sibling branches: "
+           (:error secondary-stack-probe))))
 
 (defn- fixture [f]
   (if-not secondary-stack-available?
@@ -55,7 +74,7 @@
 
 (deftest postgres-secondary-index-vertical
   (if-not secondary-stack-available?
-    (is true ":local-secondary-stack is not active")
+    (secondary-stack-unavailable-assertion)
     (do
       (result (str "CREATE TABLE secondary_docs ("
                    "id int PRIMARY KEY, priority int NOT NULL, "
@@ -215,10 +234,25 @@
 
 (deftest secondary-index-ddl-rejections-are-explicit
   (if-not secondary-stack-available?
-    (is true ":local-secondary-stack is not active")
+    (secondary-stack-unavailable-assertion)
     (do
       (result (str "CREATE TABLE secondary_bad (body tsvector, embedding vector, "
                    "embedding3 vector(3), embedding2001 vector(2001))"))
+      ;; This handler is configured to materialize B-trees with Stratum. A
+      ;; materialized generation (Stratum or Proximum) cannot escape rollback
+      ;; or build against a speculative primary snapshot, so both fail closed.
+      ;; The ordinary, unconfigured B-tree compatibility path remains
+      ;; transaction-safe and is covered by the Chinook multi-statement test.
+      (result "BEGIN")
+      (is (= "0A000"
+             (sqlstate
+              "CREATE INDEX secondary_bad_body_btree ON secondary_bad (body)")))
+      (is (= "0A000"
+             (sqlstate
+              (str "CREATE INDEX secondary_bad_vector_tx ON secondary_bad "
+                   "USING hnsw (embedding3 vector_l2_ops)"))))
+      (result "ROLLBACK")
+
       (is (= "0A000"
              (sqlstate (str "CREATE INDEX secondary_bad_vector_hnsw ON secondary_bad "
                             "USING hnsw (embedding vector_l2_ops)"))))
