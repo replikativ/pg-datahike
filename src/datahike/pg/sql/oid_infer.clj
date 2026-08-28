@@ -40,7 +40,7 @@
             Between EqualsTo ExistsExpression GreaterThan GreaterThanEquals
             InExpression IsBooleanExpression IsNullExpression JsonOperator LikeExpression
             MinorThan MinorThanEquals NotEqualsTo ParenthesedExpressionList
-            RegExpMatchOperator GeometryDistance CosineSimilarity]))
+            RegExpMatchOperator Matches GeometryDistance CosineSimilarity]))
 
 ;; ---------------------------------------------------------------------------
 ;; Function return-type registry — keyed by lowercased SQL name.
@@ -906,6 +906,7 @@
       (instance? InExpression expr)      types/oid-bool
       (instance? Between expr)           types/oid-bool
       (instance? LikeExpression expr)    types/oid-bool
+      (instance? Matches expr)           types/oid-bool
       (instance? ExistsExpression expr)  types/oid-bool
       (instance? RegExpMatchOperator expr) types/oid-bool
       (instance? JsonOperator expr)      types/oid-bool

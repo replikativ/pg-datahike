@@ -641,5 +641,17 @@
       {:id :phrase-stop-word-distance
        :source-lines [367 367]
        :gate "test/datahike/test/pg_tsearch_test.clj"
-       :test-var "postgres-phrase-query-slice"}]}
+       :test-var "postgres-phrase-query-slice"}
+      {:id :canonical-tsvector-and-tsquery-input
+       :source-lines [8 20]
+       :gate "test/datahike/test/pg_tsearch_test.clj"
+       :test-var "canonical-tsvector-and-tsquery-input"}
+      {:id :exact-match-recheck-semantics
+       :source-lines [58 81]
+       :gate "test/datahike/test/pg_tsearch_test.clj"
+       :test-var "exact-match-recheck-semantics"}
+      {:id :sql-match-operator
+       :source-lines [58 81]
+       :gate "test/datahike/test/pg_tsearch_test.clj"
+       :test-var "sql-match-operator-slice"}]}
     {:name "tsdicts" :mode :unmeasured :boundaries #{:full-text}}]}]}

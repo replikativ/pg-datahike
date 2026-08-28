@@ -74,24 +74,77 @@
       (is (= [types/oid-tsquery] (vec (.-columnOids ^PgWireServer$QueryResult r)))))))
 
 (deftest typed-storage-boundary
-  (testing "CREATE cannot silently degrade a catalog tsearch type to text"
-    (is (= "0A000" (state "CREATE TABLE bad_search_type (q tsquery)")))
-    (is (= "0A000" (state "CREATE TABLE bad_search_array (q tsquery[])")))
-    (is (= "0A000" (state "CREATE TABLE bad_search_qualified (q pg_catalog.tsquery)")))
-    (is (= "0A000" (state "CREATE TABLE bad_search_quoted (q \"tsquery\")"))))
-  (testing "tsvector has an explicit typed text carrier for dump round-trips"
-    (result "CREATE TABLE search_vector (id int, document tsvector NOT NULL)")
+  (testing "tsearch types have validated canonical text carriers"
+    (result "CREATE TABLE search_vector (id int, document tsvector NOT NULL, q tsquery)")
     (result (str "INSERT INTO search_vector VALUES "
-                 "(1, '''academi'':1A ''dinosaur'':2,7')"))
-    (let [r (result "SELECT document FROM search_vector")]
-      (is (= [["'academi':1A 'dinosaur':2,7"]]
+                 "(1, '''dinosaur'':7,2 ''academi'':1A', 'academi & dinosaur')"))
+    (let [r (result "SELECT document, q FROM search_vector")]
+      (is (= [["'academi':1A 'dinosaur':2,7"
+               "'academi' & 'dinosaur'"]]
              (mapv vec (.-rows ^PgWireServer$QueryResult r))))
-      (is (= [types/oid-tsvector]
+      (is (= [types/oid-tsvector types/oid-tsquery]
              (vec (.-columnOids ^PgWireServer$QueryResult r))))))
-  (testing "ALTER uses the same explicit boundary"
-    (result "CREATE TABLE search_type_alter (id int)")
-    (is (= "0A000"
-           (state "ALTER TABLE search_type_alter ADD COLUMN q tsquery"))))
   (testing "quoted case and non-catalog schemas remain distinct identifiers"
     (is (false? (types/unsupported-input-type? "\"TSQUERY\"")))
     (is (false? (types/unsupported-input-type? "application.tsquery")))))
+
+(deftest canonical-tsvector-and-tsquery-input
+  (is (= "'bar' 'foo':1A,2B"
+         (tsearch/canonical-tsvector "foo:2B,1A foo:2C bar")))
+  (is (= "'foo' & !'bar' | 'baz':*AB"
+         (tsearch/canonical-tsquery "foo&!bar|baz:BA*")))
+  (is (= "42601" (:sqlstate (ex-data
+                             (try (tsearch/canonical-tsvector "foo:0")
+                                  (catch Exception e e))))))
+  (is (= "42601" (:sqlstate (ex-data
+                             (try (tsearch/canonical-tsquery "foo &")
+                                  (catch Exception e e)))))))
+
+(deftest exact-match-recheck-semantics
+  (let [v "'bar':2 'bazaar':5C 'foo':1A 'weighted':7B"]
+    (is (tsearch/ts-match? v "foo & bar"))
+    (is (tsearch/ts-match? v "foo <-> bar"))
+    (is (not (tsearch/ts-match? v "bar <-> foo")))
+    (is (tsearch/ts-match? v "foo <4> baz:*"))
+    (is (tsearch/ts-match? v "weighted:B"))
+    (is (not (tsearch/ts-match? v "weighted:A")))
+    (is (tsearch/ts-match? v "foo & !missing"))
+    (is (tsearch/ts-match? v "!missing"))
+    (is (false? (tsearch/ts-match? v ""))))
+  (testing "stripped lexemes retain boolean membership but cannot satisfy a phrase"
+    (is (tsearch/ts-match? "'foo' 'bar':2" "foo"))
+    (is (not (tsearch/ts-match? "'foo' 'bar':2" "foo <-> bar"))))
+  (testing "unsupported complex phrase semantics fail instead of approximating"
+    (is (= "0A000" (:sqlstate
+                    (ex-data
+                     (try (tsearch/ts-match? "'foo':1 'bar':2"
+                                             "(foo | baz) <-> bar")
+                          (catch Exception e e))))))))
+
+(deftest secondary-candidate-plans-have-no-false-negative-shortcuts
+  (is (= {:op :term :lexeme "foo"}
+         (:query (tsearch/tsquery-candidate-plan "foo & !bar"))))
+  (is (= :all (:query (tsearch/tsquery-candidate-plan "foo | !bar"))))
+  (is (= :all (:query (tsearch/tsquery-candidate-plan "!foo"))))
+  (is (= {:op :and
+          :args [{:op :term :lexeme "foo"}
+                 {:op :prefix :lexeme "bar"}]}
+         (:query (tsearch/tsquery-candidate-plan "foo <-> bar:*"))))
+  (is (= :none (:query (tsearch/tsquery-candidate-plan ""))))
+  (is (= {:precision :recheck :recall :complete :ordering :none}
+         (select-keys (tsearch/tsquery-candidate-plan "foo")
+                      [:precision :recall :ordering]))))
+
+(deftest sql-match-operator-slice
+  (result "CREATE TABLE search_match (id int, document tsvector, q tsquery)")
+  (result (str "INSERT INTO search_match VALUES "
+               "(1, '''foo'':1A ''bar'':2', 'foo <-> bar'), "
+               "(2, '''foo'':1 ''bar'':4', 'foo <-> bar'), "
+               "(3, NULL, 'foo')"))
+  (is (= [["1" "t"] ["2" "f"] ["3" nil]]
+         (rows "SELECT id, document @@ q FROM search_match ORDER BY id")))
+  (is (= [["1"]]
+         (rows "SELECT id FROM search_match WHERE document @@ q ORDER BY id")))
+  (let [r (result "SELECT to_tsvector('english', 'Fat cats ate rats')")]
+    (is (= [["'ate':3 'cat':2 'fat':1 'rat':4"]] (mapv vec (.-rows r))))
+    (is (= [types/oid-tsvector] (vec (.-columnOids r))))))

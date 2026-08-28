@@ -415,7 +415,7 @@
 
       array? nil
 
-      (#{"jsonb" "json" "money" "interval" "tsvector" "vector"} bt) bt
+      (#{"jsonb" "json" "money" "interval" "tsvector" "tsquery" "vector"} bt) bt
 
       (#{"date" "time" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"
@@ -788,7 +788,7 @@
                        ;; setDate binds with "Can't change resolved
                        ;; type for param …".
                        (and (not array-spec)
-                            (#{"jsonb" "json" "money" "interval" "tsvector"
+                            (#{"jsonb" "json" "money" "interval" "tsvector" "tsquery"
                                "date" "time" "timestamp"
                                "timestamptz" "timestamp without time zone"
                                "timestamp with time zone"

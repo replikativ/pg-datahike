@@ -162,7 +162,8 @@
    oid-interval "interval", oid-bit "bit", oid-varbit "varbit",
    oid-json "json", oid-jsonb "jsonb", oid-bytea "bytea",
    oid-pg-lsn "pg_lsn", oid-regclass "regclass", oid-regtype "regtype",
-   oid-regnamespace "regnamespace", oid-tid "tid", oid-vector "vector"})
+   oid-regnamespace "regnamespace", oid-tid "tid", oid-vector "vector",
+   oid-tsvector "tsvector", oid-tsquery "tsquery"})
 
 ;; ============================================================================
 ;; SQL name → Datahike value type (for CREATE TABLE DDL)
@@ -175,7 +176,7 @@
    DDL must reject these explicitly. The generic unknown-type fallback stores
    arbitrary extension types as strings; letting a built-in type take that
    path would silently turn malformed values into `text`."
-  #{"tsquery"})
+  #{})
 
 (defn- normalize-type-ident [ident]
   (let [ident (str/trim ident)]
@@ -271,6 +272,7 @@
    ;; value rather than the generic unknown-extension fallback.  A future
    ;; Scriptum index may derive postings from it without changing storage.
    "tsvector"          :db.type/string
+   "tsquery"           :db.type/string
    ;; pgvector uses float32 elements; Datahike has a native, portable
    ;; float-array value type with content-based equality and ordering.
    "vector"            :db.type/float-array
@@ -1159,6 +1161,8 @@
         ;; canonicalised.
         (= base "json")                       :json
         (= base "jsonb")                      :jsonb
+        (= base "tsvector")                   :tsvector
+        (= base "tsquery")                    :tsquery
         (contains? cast-vector-types base)     :vector
         (contains? cast-integer-types base)   :integer
         (contains? cast-numeric-types base)   :numeric

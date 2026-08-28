@@ -31,6 +31,7 @@
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.coerce :as coerce]
+            [datahike.pg.tsearch :as tsearch]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]))
 
@@ -318,6 +319,9 @@
     v
     (let [cat (types/cast-category type-str)]
       (case cat
+        :tsvector (tsearch/canonical-tsvector v)
+        :tsquery (tsearch/canonical-tsquery v)
+
         :vector
         (let [typmod (some-> (re-find #"\(\s*(\d+)\s*\)" (str type-str))
                              second Long/parseLong)]
