@@ -85,6 +85,62 @@ Datahike roots. A common Konserve guard closes the write-before-root race, but
 does not by itself tell an external collector which historical roots the owner
 still retains.
 
+## Next interface falsification: summarizing scan domains
+
+The current candidate protocol is a good fit for access methods that eventually
+name tuples: B-tree, GIN/GiST/SP-GiST bitmap scans, and HNSW can all yield entity
+IDs with independent match, recall, and ordering guarantees. It should not be
+stretched to pretend that every index works that way.
+
+PostgreSQL BRIN stores one summary for a range of heap pages. A matching summary
+adds the *whole page range* to a lossy bitmap; the heap scan then visits and
+rechecks its tuples. Unsummarized ranges must also be scanned. Expanding those
+ranges into tuple IDs inside the secondary would preserve answers but destroy
+the representation and I/O advantage that the experiment is meant to test.
+
+A useful Datahike analogue is a second result domain alongside entity candidate
+pages:
+
+```clojure
+{:domain :entity-intervals
+ :intervals [[first-eid last-eid] ...]
+ :precision :recheck
+ :recall :complete
+ :ordering :none
+ :continuation ...}
+```
+
+Fixed logical entity-ID intervals are preferable to persistent-tree node
+addresses for the first experiment: they survive node rebalancing, can be
+searched as bounded EAVT ranges, and tend to retain insertion correlation for
+SQL table rows. They are not an imitation of PostgreSQL heap blocks; they are
+the stable primary-scan partition available in Datahike's model. Each interval
+would store min/max (then bloom or multi-minmax) summaries for configured
+attributes. Inserts widen a summary, deletion may leave it conservatively
+loose, and compaction can tighten it. Missing or unsummarized intervals are
+always returned, so failure costs performance rather than recall.
+
+This needs one query-engine addition: intersect a scan-domain result with the
+primary relation without first materializing every entity ID. It does *not*
+need a different publication protocol—the immutable summary generation is
+still prepared before, and named by, the same Datahike database root. A
+synthetic min/max adapter plus exact no-index differential and range-selectivity
+benchmark is the next high-value design test.
+
+The other PostgreSQL families divide cleanly after that experiment:
+
+- Hash equality already maps to Datahike AVET point lookup; another physical
+  adapter would add little semantic coverage.
+- GIN arrays and JSONB reuse complete/recheck inverted candidates, but require
+  typed extraction and an operator-class registry rather than Lucene text
+  analysis.
+- General GiST/SP-GiST and multicolumn B-tree need declarative operator-family,
+  key projection, partial-predicate, and ordering capabilities. The immutable
+  generation and candidate contracts do not need to change.
+- `INCLUDE` and index-only scans need candidate payload columns plus a planner
+  rule that proves the payload belongs to the current immutable generation;
+  they are a performance extension, not a matching-semantics extension.
+
 ## Required semantic waves
 
 1. Lifecycle: empty/populated build, concurrent writes during backfill,
