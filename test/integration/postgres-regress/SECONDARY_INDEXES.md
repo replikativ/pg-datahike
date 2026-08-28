@@ -33,6 +33,14 @@ Collapsing these into one `exact?` flag is incorrect. Full-text is commonly
 `:recheck/:approximate/:exact` for its frozen discovered set; scalar Stratum
 order is `:exact/:complete/:exact`.
 
+These properties are validated by the adapter protocol, but are not yet a
+general Datahike physical-plan node. Planner-native entity-filter pushdown
+currently goes through `ISecondaryIndex/-search` and `-slice-ordered`.
+pg-datahike calls the paged protocol directly for the scalar Stratum top-N
+path; Scriptum and Proximum SQL clauses use the planner-integrated search
+protocol. A future paged plan node must preserve Proximum's native filtered
+search rather than filtering an already frozen ANN page.
+
 ## PostgreSQL mapping
 
 | PostgreSQL shape | Validation adapter | Current boundary |
@@ -65,11 +73,11 @@ Datahike exposes the following boundaries:
 |---|---|---|
 | snapshot visibility | immutable generation key-map in the database root | strong; one root publishes primary and secondary state |
 | insert/build/abort | transient builder, prepare, release outcome | covered; concurrent backfill remains lifecycle-tested |
-| exact vs lossy match | candidate `:precision` plus primary recheck | covered; analogous to `xs_recheck` |
-| complete vs approximate membership | candidate `:recall` | covered; intentionally separate from recheck |
-| value or operator order | candidate `:ordering`, `-slice-ordered` | covered for one key; ordered retrieval can consume an upstream entity filter |
+| exact vs lossy match | candidate `:precision` plus primary recheck | represented and validated; planner-native candidate-page recheck is still required |
+| complete vs approximate membership | candidate `:recall` | represented and intentionally separate from recheck; not yet planner-costed |
+| value or operator order | candidate `:ordering`, `-slice-ordered` | `-slice-ordered` is planner-integrated for one key; paged ordering metadata is not yet planner-consumed |
 | bitmap/filter composition | `EntityBitSet`, optional or required upstream filter | covered for entity sets; the required dependency fails closed |
-| scan/rescan | opaque page continuation | stable paging covered; no adaptive planner feedback yet |
+| scan/rescan | opaque page continuation | stable adapter paging covered; no general physical plan node or adaptive planner feedback yet |
 | operator classes/strategies | opaque query spec, SQL-side hard-coded mapping | works for current adapters; needs a declarative capability registry |
 | multicolumn/expression/partial/INCLUDE | attrs/config can carry metadata | not planner-normalized or executable end to end |
 | uniqueness | primary transactor constraint | correctly outside the read adapter; materialized unique secondaries are rejected |
@@ -120,12 +128,22 @@ attributes. Inserts widen a summary, deletion may leave it conservatively
 loose, and compaction can tighten it. Missing or unsummarized intervals are
 always returned, so failure costs performance rather than recall.
 
-This needs one query-engine addition: intersect a scan-domain result with the
-primary relation without first materializing every entity ID. It does *not*
+This needs one query-engine addition: an `:external-domain` plan node that
+constrains an entity variable without binding it, then intersects that domain
+with the primary relation without first materializing every entity ID. It does *not*
 need a different publication protocol—the immutable summary generation is
 still prepared before, and named by, the same Datahike database root. A
 synthetic min/max adapter plus exact no-index differential and range-selectivity
 benchmark is the next high-value design test.
+
+Intervals should be sorted, disjoint, half-open, and normalized by merging
+adjacent ranges. EAVT can then issue one bounded slice per interval while the
+ordinary predicate remains the authoritative recheck. Stratum can prototype
+this from its aligned entity-id column and existing chunk zone maps. That first
+version will still inspect every chunk header: persistent-sorted-set exposes
+aggregate measures but not yet a measure-aware subtree visitor returning key
+ranges. A later `walk-measured-ranges` operation would let Stratum prune whole
+subtrees from merged statistics before loading descendant chunks.
 
 The other PostgreSQL families divide cleanly after that experiment:
 
