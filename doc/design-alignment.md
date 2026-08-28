@@ -32,6 +32,60 @@ A few capabilities live *outside* the single-query model (structural gaps
 below); most remaining differences are incremental type/catalog coverage, or
 boundaries intrinsic to Datahike.
 
+## Secondary access paths
+
+Secondary indexes are immutable generations named from the same Datahike root
+as the primary indexes. Preparing a transaction may write content-addressed
+secondary objects, but the Datahike root is the sole publication point. A
+branch or historical database value consequently resolves the corresponding
+secondary generation rather than a mutable external `latest` pointer.
+
+The query boundary describes candidate precision, recall, and ordering
+independently. This covers three materially different PostgreSQL shapes:
+
+- GIN/GiST-style full-text candidates can be complete but require an exact
+  PostgreSQL `@@` recheck;
+- pgvector HNSW candidates have approximate recall even though returned
+  distances are rechecked and sorted exactly;
+- B-tree-shaped Stratum pages have complete recall and exact value ordering.
+
+External scans can declare that they accept an upstream entity bitmap or that
+one is required. The latter is a planner dependency, not merely an adapter
+hint: primary predicates run first, their current relation is projected to an
+`EntityBitSet`, and filtered or ordered retrieval receives it. Missing required
+input fails closed. This supports pre-filtered ANN and cross-index bitmap
+composition without materializing entity IDs in the PostgreSQL adapter.
+
+Unavailable, stale, or incompatible secondary generations are optional access
+paths and fall back to the primary query. PostgreSQL predicates and distance
+functions remain authoritative. The SQL vertical is experimental while its
+Datahike, Scriptum, Proximum, and Stratum changes are reviewed together. The
+maintainer test matrix and performance gates live in the
+[secondary-index validation guide](../test/integration/postgres-regress/SECONDARY_INDEXES.md).
+
+Dropping a secondary declaration removes its generation address from the new
+Datahike root without mutating retained roots. Cascading that operation from an
+empty SQL table is covered. Dropping and recreating populated relations under
+history retention still needs generation-scoped schema identities; weakening
+Datahike's schema-transition guard would make historical datoms adopt the new
+relation's schema and is not an acceptable shortcut.
+
+The current protocol is broad enough for tuple-producing B-tree, inverted
+full-text, and KNN/ANN implementations. It is not yet a complete analogue of
+PostgreSQL's access-method registry: operator classes are mapped by the SQL
+adapter, and expression/partial/multicolumn/INCLUDE definitions lack a
+normalized planner descriptor. BRIN also exposes a performance-level gap:
+candidate pages enumerate entity IDs, while a summarizing index needs to hand
+the primary engine compact ranges or partitions to scan. Those are explicit
+next interfaces rather than reasons to weaken the immutable-generation model.
+
+All current adapters use Konserve and therefore share its values-before-root
+GC fence. Storage ownership still matters. Datahike directly marks Scriptum
+and Stratum objects in its store; Proximum's separate store needs a complete
+export of generation IDs retained by Datahike history before its own collector
+can safely sweep. A shared fencing mechanism solves the publication race, not
+cross-store root discovery.
+
 ## Covered
 
 Capabilities implemented and exercised by the conformance suites:

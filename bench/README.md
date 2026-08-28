@@ -79,3 +79,34 @@ PGPORT=15432 bench/append-results.sh pg-datahike-main
 
 Ballpark expectations (scale 1, 1 client, tpcb, simple protocol):
 pg-datahike ~70 tps, real PG ~7400 tps.
+# Secondary-index validation
+
+The cross-repository PostgreSQL secondary vertical has a bounded correctness
+and growth probe (JDK 22+):
+
+```bash
+clojure -J-Xmx3g -M:dev:local-secondary-stack bench/secondary_validation.clj
+SECONDARY_BENCH_ROWS=100000 \
+  clojure -J-Xmx6g -M:dev:local-secondary-stack bench/secondary_validation.clj
+SECONDARY_BENCH_ROWS=50000 SECONDARY_BENCH_DIMENSION=384 \
+  clojure -J-Xmx6g -M:dev:local-secondary-stack bench/secondary_validation.clj
+```
+
+It compares exact and indexed PostgreSQL full-text results/latency at 10%, 1%,
+and 0.1% selectivity, and exact vector neighbors against Proximum HNSW recall
+and latency at unfiltered, 10%, and 1% selectivity. ANN quality includes both a
+beam sweep and a deterministic 12-query recall sample. The 10k ×
+16-dimensional default is a development smoke test; realistic embedding widths
+and larger runs are intentionally outside CI.
+
+For a same-host PostgreSQL 17 full-text reference after starting `realpg.sh`:
+
+```bash
+SECONDARY_BENCH_ROWS=20000 \
+  clojure -M:dev bench/postgres_secondary_reference.clj
+```
+
+The reference forces a sequential plan for the exact baseline and a GIN plan
+for the indexed baseline, reports the selected plan, and includes result
+materialization in both timings. A pgvector reference remains a separate
+optional environment because PostgreSQL itself does not ship that extension.

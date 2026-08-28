@@ -25,6 +25,7 @@
             [datahike.pg.records :as pg-rec]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.secondary :as pg-secondary]
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
@@ -1486,6 +1487,10 @@
       (= setting-name "statement_timeout")
       (show-setting "statement_timeout"
                     (str (or (:statement-timeout @session-state) 0)))
+
+      (= setting-name "hnsw.ef_search")
+      (show-setting "hnsw.ef_search"
+                    (str (or (:hnsw-ef-search @session-state) 40)))
 
       (= setting-name "search_path")
       (show-setting "search_path"
@@ -4320,7 +4325,10 @@
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
     :ddl-create-domain :ddl-drop-domain
-    :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
+    ;; Secondary CREATE INDEX uses Datahike's asynchronous backfill and cannot
+    ;; be represented by db-with. Its executor rejects explicit transactions
+    ;; and publishes directly in autocommit mode.
+    :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
   [{:keys [conn session-id tx-state cursors]} _parsed]
@@ -4411,7 +4419,7 @@
 (def ^:private session-guc-keys
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
-  [:as-of :since :history :branch :commit-id :search-path
+  [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search
    :valid-at :valid-from :valid-to :statement-timeout :isolation])
 
 (defn- handle-reset
@@ -4429,7 +4437,10 @@
       (swap! session-state #(apply dissoc % session-guc-keys))
 
       (= "search_path" setting)
-      (swap! session-state dissoc :search-path)))
+      (swap! session-state dissoc :search-path)
+
+      (= "hnsw.ef_search" setting)
+      (swap! session-state dissoc :hnsw-ef-search)))
   (empty-result "RESET"))
 
 ;; --- Advisory-lock handlers -------------------------------------------------
@@ -5024,8 +5035,19 @@
     (case (:system-type parsed)
       :set
       (do
-        (when (= "search_path" (some-> (:var parsed) str/lower-case))
-          (set-search-path! session-state (:values parsed)))
+        (let [setting (some-> (:var parsed) str/lower-case)]
+          (when (= "search_path" setting)
+            (set-search-path! session-state (:values parsed)))
+          (when (= "hnsw.ef_search" setting)
+            (let [value (try
+                          (parse-long (or (:value parsed) ""))
+                          (catch Exception _ nil))]
+              (when-not (and value (<= 1 value 1000))
+                (throw
+                 (errors/pg-error
+                  :invalid-parameter-value
+                  {:message "hnsw.ef_search must be between 1 and 1000"})))
+              (swap! session-state assoc :hnsw-ef-search value))))
         (empty-result "SET"))
       :prepare          (handle-prepare ctx parsed)
       :execute-prepared (handle-execute-prepared ctx parsed)
@@ -5490,6 +5512,129 @@
     (requiring-resolve 'datahike.index.secondary/candidate-page)
     (catch Exception _ nil)))
 
+(defn- matching-text-secondary [db attribute]
+  (some (fn [[ident entry]]
+          (when (and (= :scriptum (:db.secondary/type entry))
+                     (contains? (set (:db.secondary/attrs entry)) attribute)
+                     (contains? #{nil :ready} (:db.secondary/status entry))
+                     (get (:secondary-indices db) ident))
+            ident))
+        (dbi/-schema db)))
+
+(defn- not-null-attribute?
+  "Whether PostgreSQL metadata guarantees that every table row has `attr`.
+
+   A columnar secondary contains attribute values, not Datahike row-marker
+   entities. Using it to order a nullable SQL column would therefore omit the
+   NULL rows entirely rather than merely place them first or last."
+  [db attr]
+  (boolean
+   (d/q '{:find [?entity .]
+          :in [$ ?attr]
+          :where [[?entity :db/ident ?attr]
+                  [?entity :pg/not-null true]]}
+        db attr)))
+
+(defn- restrict-to-text-candidates
+  "Precede conjunctive PostgreSQL @@ predicates with complete Scriptum
+   candidate sets. Datahike's external-engine planner keeps candidates as an
+   EntityBitSet; the existing ts-match? clause remains the authoritative
+   PostgreSQL recheck for phrases, positions, weights, prefixes, and NOT."
+  [db query in-args candidates]
+  (reduce
+   (fn [[datalog in-args] {:keys [entity-var attribute] :as candidate}]
+     (try
+       (if-let [idx-ident (matching-text-secondary db attribute)]
+         (if-let [query-spec (pg-secondary/scriptum-query-spec (:query candidate))]
+           (let [spec-var (gensym "?scriptum-query-spec")]
+             [(-> datalog
+                  (update :in (fn [inputs]
+                                (conj (vec (or inputs ['$])) spec-var)))
+                  (update :where conj
+                          [(list 'datahike.pg.secondary/candidates
+                                 idx-ident spec-var)
+                           [entity-var '...]]))
+              (conj (vec in-args) query-spec)])
+           [datalog in-args])
+         [datalog in-args])
+       ;; A secondary is an optional access path. Missing adapters, an old
+       ;; Datahike planner, or a generation that cannot serve this snapshot all
+       ;; leave the exact primary scan unchanged.
+       (catch Throwable _ [datalog in-args])))
+   [query in-args]
+   candidates))
+
+(defn- matching-stratum-secondary [db attribute]
+  (when (not-null-attribute? db attribute)
+    (some (fn [[ident entry]]
+            (when (and (= :stratum (:db.secondary/type entry))
+                       (contains? (set (:db.secondary/attrs entry)) attribute)
+                       (contains? #{nil :ready} (:db.secondary/status entry)))
+              (when-let [index (get (:secondary-indices db) ident)]
+                [ident index])))
+          (dbi/-schema db))))
+
+(defn- restrict-to-scalar-order-candidates
+  "Use an immutable Stratum generation for exact B-tree-shaped top-N order.
+
+   The primary Datalog query still evaluates all WHERE predicates and performs
+   final PostgreSQL ordering. If those predicates under-fill the candidate
+   page, exec-select retries the untouched exact query."
+  [db query in-args
+   {:keys [entity-var attribute direction nulls where candidate-limit] :as spec}]
+  (if-let [candidate-page (and spec (candidate-page-entrypoint))]
+    (try
+      ;; Stratum currently indexes values rather than absent/NULL rows. Even a
+      ;; NOT NULL column can use either PostgreSQL default NULL placement; an
+      ;; explicit non-default clause is harmless because no NULL is possible.
+      (if-let [[idx-ident index] (matching-stratum-secondary db attribute)]
+        (let [query-spec {:attribute attribute
+                          :direction direction
+                          :nulls nulls
+                          :where where}
+              candidates
+              (loop [continuation nil
+                     remaining (long candidate-limit)
+                     seen-continuations #{}
+                     acc []]
+                (let [request (cond-> {:limit (min 256 remaining)}
+                                continuation (assoc :continuation continuation))
+                      page (candidate-page db idx-ident index query-spec nil request)
+                      page-candidates (vec (take remaining (:candidates page)))
+                      acc (into acc page-candidates)
+                      remaining (- remaining (count page-candidates))
+                      next-continuation (:continuation page)]
+                  (cond
+                    (or (zero? remaining) (:exhausted? page)) acc
+                    (empty? page-candidates)
+                    (throw (ex-info "Non-exhausted scalar candidate page was empty"
+                                    {:index-ident idx-ident
+                                     :continuation next-continuation}))
+                    (contains? seen-continuations next-continuation)
+                    (throw (ex-info "Scalar candidate continuation repeated"
+                                    {:index-ident idx-ident
+                                     :continuation next-continuation}))
+                    :else
+                    (recur next-continuation remaining
+                           (conj seen-continuations next-continuation) acc))))
+              eids (->> candidates
+                        (keep (fn [candidate]
+                                (when (= attribute (:attribute candidate))
+                                  (:entity-id candidate))))
+                        distinct
+                        vec)
+              query (update query :in
+                            (fn [inputs]
+                              (conj (vec (or inputs ['$]))
+                                    [entity-var '...])))]
+          [query (conj (vec in-args) eids)
+           {:kind :stratum-order
+            :candidate-count (count eids)
+            :candidate-limit candidate-limit}])
+        [query in-args nil])
+      (catch Exception _ [query in-args nil]))
+    [query in-args nil]))
+
 (defn- zero-vector?
   [^floats v]
   (loop [i 0]
@@ -5517,7 +5662,7 @@
             schema))))
 
 (defn- restrict-to-vector-candidates
-  "Use a ready Proximum index as a bounded candidate source.
+  "Use a ready Proximum index as a filter-aware candidate source.
 
    The returned query still evaluates the exact pgvector distance expression,
    sorts it, and applies LIMIT. Any missing protocol/backend, stale lifecycle
@@ -5525,68 +5670,50 @@
    and returns the original query unchanged. This makes secondary-index
    availability an optional access path. Selecting an approximate-recall ANN
    index can intentionally change membership, as it can in pgvector; exact
-   recheck guarantees distances and predicates only within its candidates."
+   recheck guarantees distances and predicates only within its candidates.
+
+   The generic external-engine clause is deliberate: Datahike can run ordinary
+   selective predicates first and pass their EntityBitSet to Proximum's native
+   filtered HNSW search. Materializing an unfiltered eid vector here would lose
+   that cross-index composition and reproduce pgvector's post-filter underfill
+   cliff unnecessarily."
   [db query in-args
-   {:keys [entity-var metric query-vector limit candidate-limit] :as spec}]
-  (if-let [candidate-page (and spec (candidate-page-entrypoint))]
+   {:keys [entity-var metric query-vector limit candidate-limit ef
+           prefer-entity-filter?] :as spec}]
+  (if spec
     (try
       (let [query-vector (pg-vector/coerce query-vector)]
         ;; Cosine has no ordering for a zero query vector. pgvector's HNSW
         ;; index does not index zero vectors for cosine distance; exact scan is
         ;; therefore the only semantics-preserving path for this shape.
         (if (and (= :cosine metric) (zero-vector? query-vector))
-          [query in-args]
-          (if-let [[idx-ident index]
+          [query in-args nil]
+          (if-let [[idx-ident _index]
                    (matching-vector-secondary db (assoc spec :query-vector query-vector))]
-            (let [candidate-limit (max 40 (long (or candidate-limit limit)))
+            (let [candidate-limit (max 1 (long (or candidate-limit limit)))
                   query-spec {:vector query-vector
-                              :candidate-limit candidate-limit}
-                  ;; The core contract permits arbitrarily sized pages. Walk
-                  ;; continuations until the bounded ANN candidate budget is
-                  ;; filled or the adapter reports exhaustion; never equate a
-                  ;; short page with end-of-scan.
-                  candidates
-                  (loop [continuation nil
-                         remaining candidate-limit
-                         seen-continuations #{}
-                         acc []]
-                    (let [request (cond-> {:limit (min 256 remaining)}
-                                    continuation (assoc :continuation continuation))
-                          page (candidate-page db idx-ident index query-spec nil request)
-                          page-candidates (vec (take remaining (:candidates page)))
-                          acc (into acc page-candidates)
-                          remaining (- remaining (count page-candidates))
-                          next-continuation (:continuation page)]
-                      (cond
-                        (or (zero? remaining) (:exhausted? page)) acc
-                        (empty? page-candidates)
-                        (throw (ex-info "Non-exhausted secondary candidate page was empty"
-                                        {:index-ident idx-ident
-                                         :continuation next-continuation}))
-                        (contains? seen-continuations next-continuation)
-                        (throw (ex-info "Secondary candidate continuation repeated"
-                                        {:index-ident idx-ident
-                                         :continuation next-continuation}))
-                        :else
-                        (recur next-continuation remaining
-                               (conj seen-continuations next-continuation) acc))))
-                  eids (->> candidates
-                            (keep (fn [candidate]
-                                    (when (= (:attribute candidate) (:attribute spec))
-                                      (:entity-id candidate))))
-                            distinct
-                            vec)
-                  query (update query :in
-                                (fn [inputs]
-                                  (conj (vec (or inputs ['$]))
-                                        [entity-var '...])))]
-              [query (conj (vec in-args) eids)])
-            [query in-args])))
+                              :k candidate-limit
+                              :ef (or ef 40)}
+                  spec-var (gensym "?proximum-query-spec")
+                  candidate-fn (if prefer-entity-filter?
+                                 'datahike.pg.secondary/filtered-candidates
+                                 'datahike.pg.secondary/candidates)
+                  query (-> query
+                            (update :in (fn [inputs]
+                                          (conj (vec (or inputs ['$])) spec-var)))
+                            (update :where conj
+                                    [(list candidate-fn idx-ident spec-var)
+                                     [entity-var '...]]))]
+              [query (conj (vec in-args) query-spec)
+               {:kind :proximum-filter-aware
+                :candidate-limit candidate-limit
+                :ef (:ef query-spec)}])
+            [query in-args nil])))
       ;; Candidate scans are optional accelerators. The exact scan is both the
       ;; compatibility path and the fail-safe for an adapter generation that
       ;; cannot serve this snapshot.
-      (catch Exception _ [query in-args]))
-    [query in-args]))
+      (catch Exception _ [query in-args nil]))
+    [query in-args nil]))
 
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
@@ -5596,7 +5723,7 @@
    expressions, DISTINCT-on-aggregates, and schema-derived OID
    computation for the result-set metadata."
   [ctx parsed]
-  (let [{:keys [db tx-state]} ctx
+  (let [{:keys [db tx-state session-state]} ctx
         {:keys [query find-aliases limit offset
                 having has-aggregates? has-distinct?
                 in-args hidden-count compound-exprs window-specs
@@ -5638,20 +5765,46 @@
                                query-db specs)
                        query-db)
             hidden-count (or hidden-count 0)
-            [query in-args]
+            [exact-query exact-in-args]
+            (restrict-to-text-candidates
+             query-db query in-args (:secondary-text-candidates parsed))
+            [scalar-query scalar-in-args scalar-access]
+            (restrict-to-scalar-order-candidates
+             query-db exact-query exact-in-args
+             (:secondary-order-candidate parsed))
+            [query in-args vector-access]
             (restrict-to-vector-candidates
-             query-db query in-args (:secondary-candidate parsed))
-            q-input (cond-> query
-                      limit  (assoc :limit limit)
-                      offset (assoc :offset offset)
-                      :always (assoc :cancel (current-cancel)))
-            ;; Runtime subquery closures execute inside d/q. Bind the
-            ;; statement's effective query DB, not merely the connection's raw
-            ;; snapshot: CTEs and derived relations live in `query-db`.
-            results (binding [params/*runtime-db* query-db]
-                      (if (seq in-args)
-                        (run-param-query q-input #(apply d/q q-input query-db in-args))
-                        (run-param-query q-input #(d/q q-input query-db))))
+             query-db scalar-query scalar-in-args
+             (cond-> (:secondary-candidate parsed)
+               (:secondary-candidate parsed)
+               (assoc :ef (or (:hnsw-ef-search @session-state) 40))))
+            run-query
+            (fn [datalog args]
+              (let [q-input (cond-> datalog
+                              limit  (assoc :limit limit)
+                              offset (assoc :offset offset)
+                              :always (assoc :cancel (current-cancel)))]
+                ;; Runtime subquery closures execute inside d/q. Bind the
+                ;; statement's effective query DB, not merely the connection's
+                ;; raw snapshot: CTEs and derived relations live in `query-db`.
+                (binding [params/*runtime-db* query-db]
+                  (if (seq args)
+                    (run-param-query q-input #(apply d/q q-input query-db args))
+                    (run-param-query q-input #(d/q q-input query-db))))))
+            candidate-results (run-query query in-args)
+            ;; WHERE-bearing ANN plans now feed their upstream entity relation
+            ;; into Proximum before search; the exact SQL predicate still
+            ;; rechecks every returned row. Approximate search (or a bounded
+            ;; scalar top-N followed by an unpushed predicate) can nevertheless
+            ;; under-fill LIMIT. Until the candidate API supports adaptive
+            ;; feedback, fail over to the exact primary scan for that shape.
+            ;; It costs one bounded attempt but never returns a silently short
+            ;; page; full ANN pages retain pgvector's approximate membership.
+            results (if (and (or vector-access scalar-access)
+                             (pos-int? limit)
+                             (< (count candidate-results) limit))
+                      (run-query exact-query exact-in-args)
+                      candidate-results)
             ;; FOR UPDATE / FOR NO KEY UPDATE / SKIP LOCKED / NOWAIT.
             ;; Extract the `id` column from each result row, check the
             ;; server-wide lock registry, and either:
@@ -6857,23 +7010,309 @@
                :savepoints (pop sp-stack))))
     (empty-result "ROLLBACK")))
 
-(defn- exec-ddl-create-index
-  [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx
-        db (or (:speculative-db @tx-state) (d/db conn))
-        schema (dbi/-schema db)
-        vector-column?
-        (some (fn [col]
-                (= :db.type/float-array
-                   (get-in schema [(keyword (:table parsed) col) :db/valueType])))
-              (:columns parsed))]
-    (if vector-column?
-      (classified-error
-       "CREATE INDEX error: "
+(def ^:private pgvector-opclasses
+  {"vector_l2_ops" :euclidean
+   "vector_ip_ops" :inner-product
+   "vector_cosine_ops" :cosine})
+
+(defn- validate-hnsw-options! [parsed]
+  (let [options (:options parsed)
+        unknown (seq (remove #{:m :ef_construction} (keys options)))
+        m-value (or (:m options) 16)
+        ef-value (or (:ef_construction options) 64)]
+    (when unknown
+      (throw
+       (errors/pg-error
+        :invalid-parameter-value
+        {:message (str "unrecognized hnsw index option " (pr-str (first unknown)))})))
+    (when-not (and (integer? m-value) (integer? ef-value))
+      (throw
+       (errors/pg-error
+        :invalid-parameter-value
+        {:message "hnsw options m and ef_construction must be integers"})))
+    (let [m (long m-value)
+          ef-construction (long ef-value)]
+      (when-not (<= 2 m 100)
+        (throw
+         (errors/pg-error
+          :invalid-parameter-value
+          {:message "hnsw option m must be between 2 and 100"})))
+      (when-not (<= 4 ef-construction 1000)
+        (throw
+         (errors/pg-error
+          :invalid-parameter-value
+          {:message "hnsw option ef_construction must be between 4 and 1000"})))
+      (when (< ef-construction (* 2 m))
+        (throw
+         (errors/pg-error
+          :invalid-parameter-value
+          {:message "hnsw option ef_construction must be at least 2 * m"}))))))
+
+(defn- secondary-index-ident [index-name]
+  (keyword "datahike.pg.index" index-name))
+
+(defn- attribute-typmod [db attr]
+  (d/q '{:find [?typmod .]
+         :in [$ ?attr]
+         :where [[?entity :db/ident ?attr]
+                 [?entity :pg/typmod ?typmod]]}
+       db attr))
+
+(defn- load-secondary-adapter! [index-type]
+  (try
+    (require (case index-type
+               :proximum 'datahike.index.secondary.proximum
+               :scriptum 'datahike.index.secondary.scriptum
+               :stratum 'datahike.index.secondary.stratum))
+    (catch Throwable failure
+      (throw
        (errors/pg-error
         :feature-not-supported
-        {:message "indexes on vector columns are not supported"}))
-      (empty-result "CREATE INDEX"))))
+        {:message (str "secondary index method " (name index-type)
+                       " is not available in this runtime: "
+                       (ex-message failure))})))))
+
+(defn- configured-secondary-options
+  "Resolve the operator-owned portion of a secondary configuration.
+
+   `:secondary-index-config` may be a map keyed by secondary type, a function
+   of the parsed PostgreSQL index specification, or contain a function at a
+   type key. This lets a deployment allocate a distinct durable Proximum store
+   per SQL index without putting paths or credentials into SQL text."
+  [configured index-type spec]
+  (let [entry (if (fn? configured)
+                (configured (assoc spec :secondary-type index-type))
+                (get configured index-type))]
+    (cond
+      (fn? entry) (or (entry spec) {})
+      (map? entry) entry
+      (nil? entry) {}
+      :else
+      (throw
+       (errors/pg-error
+        :invalid-parameter-value
+        {:message (str "invalid :secondary-index-config for " (name index-type))})))))
+
+(defn- await-secondary-ready!
+  [conn index-ident timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [status (get-in (d/db conn) [:schema index-ident :db.secondary/status])]
+        (cond
+          (= :ready status) true
+          (= :disabled status)
+          (throw
+           (errors/pg-error
+            :object-not-in-prerequisite-state
+            {:message (str "index \"" (name index-ident) "\" is disabled")}))
+          (>= (System/currentTimeMillis) deadline)
+          (throw
+           (errors/pg-error
+            :query-canceled
+            {:message (str "timed out building index \"" (name index-ident) "\"")}))
+          :else (do (Thread/sleep 20) (recur)))))))
+
+(defn- materialize-secondary-index!
+  [ctx parsed index-type attr config]
+  (let [{:keys [conn secondary-index-build-timeout-ms]} ctx
+        index-ident (secondary-index-ident (:name parsed))]
+    (load-secondary-adapter! index-type)
+    (transact-recorded!
+     conn
+     [{:db/ident index-ident
+       :db.secondary/type index-type
+       :db.secondary/attrs [attr]
+       :db.secondary/config
+       (merge config
+              {:pg/index-name (:name parsed)
+               :pg/table (:table parsed)
+               :pg/method (:method parsed)})}])
+    ;; PostgreSQL's non-CONCURRENT CREATE INDEX does not return while the
+    ;; index is still being built. Datahike's writer remains available during
+    ;; the asynchronous backfill; only this SQL request waits for publication.
+    (await-secondary-ready! conn index-ident
+                            (long (or secondary-index-build-timeout-ms 60000)))
+    (empty-result "CREATE INDEX")))
+
+(defn- exec-ddl-create-index
+  [ctx parsed]
+  (try
+    (let [{:keys [conn tx-state secondary-index-config]} ctx
+          db (d/db conn)
+          schema (dbi/-schema db)
+          index-ident (secondary-index-ident (:name parsed))
+          method (or (:method parsed) "btree")
+          column (first (:columns parsed))
+          attr (when column (keyword (:table parsed) column))
+          attr-schema (get schema attr)
+          pg-hints (pgs/schema-hints db)
+          pg-type (get-in pg-hints [attr :pg-type])]
+      (cond
+        (and (:in-tx? @tx-state) (not (:implicit? @tx-state)))
+        (throw
+         (errors/pg-error
+          :feature-not-supported
+          {:message "secondary CREATE INDEX inside a transaction is not yet supported"}))
+
+        (get schema index-ident)
+        (if (:if-not-exists? parsed)
+          (empty-result "CREATE INDEX")
+          (throw (ex-info (str "relation \"" (:name parsed) "\" already exists")
+                          {:sqlstate "42P07" :index (:name parsed)})))
+
+        (not= 1 (count (:columns parsed)))
+        (if (contains? #{"hnsw" "ivfflat" "gin" "gist"} method)
+          (throw
+           (errors/pg-error
+            :feature-not-supported
+            {:message (str method " secondary indexes currently require exactly one column")}))
+          (empty-result "CREATE INDEX"))
+
+        (nil? attr-schema)
+        (throw (errors/pg-error :undefined-column
+                                {:column column :table (:table parsed)}))
+
+        (= "ivfflat" method)
+        (throw
+         (errors/pg-error
+          :feature-not-supported
+          {:message "ivfflat indexes are not yet supported; use hnsw"}))
+
+        (= "hnsw" method)
+        (let [opclass (first (get-in parsed [:column-specs 0 :params]))
+              metric (get pgvector-opclasses opclass)
+              dim (attribute-typmod db attr)]
+          (when (:unique? parsed)
+            (throw
+             (errors/pg-error
+              :feature-not-supported
+              {:message "hnsw does not support unique indexes"})))
+          (validate-hnsw-options! parsed)
+          (when-not (= :db.type/float-array (:db/valueType attr-schema))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "hnsw currently supports only vector columns"})))
+          (when-not metric
+            (throw
+             (errors/pg-error
+              :undefined-object
+              {:kind "operator class" :name (or opclass "<missing>")})))
+          (when-not (and (integer? dim) (pos? dim))
+            (throw
+             (errors/pg-error
+              :feature-not-supported
+              {:message "hnsw requires a vector column with a declared dimension"})))
+          (when (> dim 2000)
+            (throw
+             (errors/pg-error
+              :feature-not-supported
+              {:message "hnsw indexes support vectors with at most 2000 dimensions"})))
+          (let [base (configured-secondary-options secondary-index-config :proximum parsed)]
+            (when-not (get-in base [:store-config :id])
+              (throw
+               (errors/pg-error
+                :feature-not-supported
+                {:message (str "hnsw requires operator configuration at "
+                               ":secondary-index-config :proximum with a durable "
+                               ":store-config :id")})))
+            (materialize-secondary-index!
+             ctx parsed :proximum attr
+             (cond-> (merge base {:dim dim :distance metric})
+               (get-in parsed [:options :m])
+               (assoc :m (get-in parsed [:options :m]))
+               (get-in parsed [:options :ef_construction])
+               (assoc :ef-construction
+                      (get-in parsed [:options :ef_construction]))))))
+
+        (and (contains? #{"gin" "gist"} method) (= "tsvector" pg-type))
+        (if (:unique? parsed)
+          (throw
+           (errors/pg-error
+            :feature-not-supported
+            {:message (str method " does not support unique indexes")}))
+          (materialize-secondary-index!
+           ctx parsed :scriptum attr
+           (configured-secondary-options secondary-index-config :scriptum parsed)))
+
+        ;; Datahike's native AVET/AEVT indices already serve ordinary scalar
+        ;; equality and range predicates. Keep accepting their PostgreSQL
+        ;; declarations as compatibility metadata until SQL index catalog and
+        ;; explicit access-path selection are represented end to end.
+        (= "btree" method)
+        (if (= :db.type/float-array (:db/valueType attr-schema))
+          (throw
+           (errors/pg-error
+            :feature-not-supported
+            {:message "btree indexes on vector columns are not supported"}))
+          (if (and (map? secondary-index-config)
+                   (contains? secondary-index-config :stratum))
+            (if (:unique? parsed)
+              (throw
+               (errors/pg-error
+                :feature-not-supported
+                {:message (str "materialized Stratum btree indexes do not yet "
+                               "enforce uniqueness")}))
+              (materialize-secondary-index!
+               ctx parsed :stratum attr
+               (configured-secondary-options
+                secondary-index-config :stratum parsed)))
+            (empty-result "CREATE INDEX")))
+
+        :else
+        (throw
+         (errors/pg-error
+          :feature-not-supported
+          {:message (str "index method " method " is not supported for this column")}))))
+    (catch Exception failure
+      (if (some #(= :secondary-index-backfill-unsupported-writer
+                    (:type (ex-data %)))
+                (take-while some? (iterate ex-cause failure)))
+        (classified-error
+         ""
+         (errors/pg-error
+          :object-not-in-prerequisite-state
+          {:message (str "online secondary-index backfill requires Datahike "
+                         ":writer-ownership :exclusive; empty-table index "
+                         "creation remains available with a shared writer")}))
+        (classified-error "CREATE INDEX error: " failure)))))
+
+(defn- exec-ddl-drop-index
+  "Remove a materialized secondary declaration from the Datahike root.
+
+   Once the root transaction commits, the generation is no longer visible to
+   new database values. Its content-addressed objects remain available to
+   retained historical roots and become ordinary Konserve GC candidates only
+   after those roots disappear."
+  [ctx parsed]
+  (let [{:keys [conn tx-state]} ctx]
+    (try
+      (when (and (:in-tx? @tx-state) (not (:implicit? @tx-state)))
+        (throw
+         (errors/pg-error
+          :feature-not-supported
+          {:message "secondary DROP INDEX inside a transaction is not yet supported"})))
+      (let [index-ident (secondary-index-ident (:name parsed))
+            db (d/db conn)
+            entity-id (d/q '{:find [?entity .]
+                             :in [$ ?ident]
+                             :where [[?entity :db/ident ?ident]]}
+                           db index-ident)]
+        (cond
+          entity-id
+          (do
+            (transact-recorded! conn [[:db/retractEntity entity-id]])
+            (empty-result "DROP INDEX"))
+
+          (:if-exists? parsed)
+          (empty-result "DROP INDEX")
+
+          :else
+          (throw
+           (errors/pg-error
+            :undefined-object
+            {:kind "index" :name (:name parsed)}))))
+      (catch Exception failure
+        (classified-error "DROP INDEX error: " failure)))))
 
 (defn- exec-ddl-alter
   [ctx parsed]
@@ -7021,7 +7460,24 @@
                                                            db))]
                                  (when attr-eid [:db/retractEntity attr-eid])))
                              table-attrs)
-        all-tx-data (into data-tx-data (filter some? schema-tx-data))]
+        ;; Physical PostgreSQL indexes are schema dependents of their table.
+        ;; Retract declarations in the SAME root transaction so no committed
+        ;; database value can retain an index whose covered attributes have
+        ;; already disappeared.
+        secondary-tx-data
+        (into []
+              (keep (fn [[ident entry]]
+                      (when (= table (get-in entry [:db.secondary/config :pg/table]))
+                        (when-let [entity-id
+                                   (d/q '{:find [?entity .]
+                                          :in [$ ?ident]
+                                          :where [[?entity :db/ident ?ident]]}
+                                        db ident)]
+                          [:db/retractEntity entity-id]))))
+              db-schema)
+        all-tx-data (into data-tx-data
+                          (concat (filter some? schema-tx-data)
+                                  secondary-tx-data))]
     (when (seq all-tx-data)
       (transact-recorded! conn all-tx-data))))
 
@@ -7370,6 +7826,8 @@
                                               dispatch-stats
                                               on-create-database on-delete-database
                                               registry-atom
+                                              secondary-index-config
+                                              secondary-index-build-timeout-ms
                                               tx-wrap]
                                        :as opts}]]
   (ensure-pg-schema! conn)
@@ -8237,6 +8695,9 @@
                                    :on-create-database on-create-database
                                    :on-delete-database on-delete-database
                                    :registry-atom registry-atom
+                                   :secondary-index-config secondary-index-config
+                                   :secondary-index-build-timeout-ms
+                                   secondary-index-build-timeout-ms
                                    ;; Optional `(fn [tx-data] -> tx-data)`
                                    ;; called BEFORE every INSERT/UPDATE/
                                    ;; DELETE's d/transact. Lets framework
@@ -8321,6 +8782,8 @@
                               :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
                               :ddl-create-index      (do (invalidate-schema-cache!)
                                                          (exec-ddl-create-index ctx parsed))
+                              :ddl-drop-index        (do (invalidate-schema-cache!)
+                                                         (exec-ddl-drop-index ctx parsed))
                               :ddl-alter             (do (invalidate-schema-cache!)
                                                          (exec-ddl-alter ctx parsed))
                               :ddl-drop              (do (invalidate-schema-cache!)
@@ -8656,7 +9119,9 @@
                         ((resolve 'datahike.pg.sql.database/db-delete-from-template)
                          database-template)))
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
-                                            :dispatch-stats :tx-wrap])
+                                            :dispatch-stats :tx-wrap
+                                            :secondary-index-config
+                                            :secondary-index-build-timeout-ms])
                          (cond-> on-create (assoc :on-create-database on-create)
                                  on-delete (assoc :on-delete-database on-delete)))
         factory  (make-query-handler-factory registry-atom factory-opts)

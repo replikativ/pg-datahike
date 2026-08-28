@@ -366,6 +366,10 @@
    ;; when it is the leading ascending ORDER BY key of a bounded query; the
    ;; scalar expression remains in :where as the authoritative recheck.
    :vector-distance-candidates (atom [])
+   ;; Exact tsvector @@ tsquery predicates that may be preceded by a complete
+   ;; Scriptum posting-list candidate set. The predicate itself remains in
+   ;; :where and therefore rechecks positions, weights, phrases, and NOT.
+   :text-search-candidates (atom [])
    :runtime-subqueries? (atom false)
    :left-join-evars (atom #{})    ;; entity vars from LEFT JOIN right side (don't get-else on these)
    ;; Vars emitted by col-var! that are bound via get-else and thus may
@@ -390,6 +394,7 @@
 (def ^:private snapshot-keys
   [:var-counter :col->var :entity-vars :where-clauses :find-elements
    :with-vars :in-params :in-args :vector-distance-candidates
+   :text-search-candidates
    :runtime-subqueries? :left-join-evars :nullable-vars
    :required-join-patterns :param-placeholders])
 
