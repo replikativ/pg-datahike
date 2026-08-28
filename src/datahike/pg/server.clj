@@ -324,6 +324,23 @@
      ;; from SQL NULL above. It must be tested BEFORE the generic
      ;; keyword branch, which would otherwise print the sentinel's name.
      (= jb/json-null v) "null"
+     ;; Keep the scalar cases before the structured wrapper predicates below.
+     ;; Result sets are dominated by strings, booleans and integer identifiers;
+     ;; asking every such value whether it is a PgArray, PgRecord, bit string or
+     ;; vector made wide result formatting several times more expensive than the
+     ;; underlying Datahike query. The structured representations cannot satisfy
+     ;; any of these scalar predicates, so this is only a dispatch fast path.
+     (string? v)  v
+     (keyword? v) (if-let [ns (namespace v)]
+                    (str ns "/" (name v))
+                    (name v))
+     (boolean? v) (if v "t" "f")
+     (integer? v) (str v)
+     (instance? clojure.lang.Ratio v) (str (double v))
+    ;; PG float text format emits the shortest round-trip representation,
+    ;; including PostgreSQL's normalization of negative zero.
+     (or (instance? Float v) (instance? Double v))
+     (types/float->pg-text v (instance? Float v))
     ;; PgArray → PG canonical array text format `{…}` (see
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
@@ -339,29 +356,6 @@
                              (fn [t oids] (PgParamCodec/registerRecordLayout t oids)) v)
                             (pg-rec/to-pg-text v))
      (pg-vector/vector-value? v) (pg-vector/to-pg-text v)
-     (string? v)  v
-     (keyword? v) (if-let [ns (namespace v)]
-                    (str ns "/" (name v))
-                    (name v))
-     (boolean? v) (if v "t" "f")
-     (instance? clojure.lang.Ratio v) (str (double v))
-    ;; PG float text format emits the shortest round-trip representation,
-    ;; so 1.0/-2.0/0.0 come across as "1"/"-2"/"0" (no ".0" suffix).
-    ;; Java's Double/Float toString always appends ".0" for whole-valued
-    ;; floats, so strip it to match. This also handles the -0.0 → 0
-    ;; normalization. pgjdbc's getBoolean on a float column routes
-    ;; through string parsing in text protocol and only accepts
-    ;; "0"/"1"/"true"/... — never "0.0"/"1.0".
-     ;; PostgreSQL's float text form -- see types/float->pg-text. This
-     ;; used to strip a trailing ".0" from whole-valued floats below
-     ;; 1e15 and otherwise fall through to Java's `str`, so every float
-     ;; above ~1e7 or below 1e-4 went out as `1.0E7` / `1.0E-5`, a syntax
-     ;; PostgreSQL never emits.
-     ;;
-     ;; Zero still renders as "0" for -0.0 as well: pgjdbc's boolean and
-     ;; number parsers accept "0" but not "-0".
-     (or (instance? Float v) (instance? Double v))
-     (types/float->pg-text v (instance? Float v))
     ;; CAST results carry a Java type that encodes the source SQL type,
     ;; so we can emit the PG-correct text form without dragging the
     ;; timestamp through a lossy date-only conversion.
