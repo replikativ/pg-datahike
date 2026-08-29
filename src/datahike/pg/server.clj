@@ -5655,8 +5655,33 @@
    [query in-args]
    candidates))
 
+(def ^:private stratum-text-order-types
+  #{"text" "varchar" "character varying" "char" "character" "bpchar"
+    "name" "citext" "time" "timetz" "time without time zone"
+    "time with time zone"})
+
+(defn- stratum-orderable-attribute?
+  "Whether Stratum preserves this PostgreSQL column's scalar order exactly.
+
+   The adapter stores longs and floating values primitively. It dictionary-
+   encodes genuine textual values and stringifies other Datahike types; that
+   representation is not an order-preserving encoding for NUMERIC, temporal,
+   JSON, or binary values and must never source a truncated top-N page."
+  [db attribute]
+  (let [attr-type (get-in (dbi/-schema db) [attribute :db/valueType])
+        pg-type (get-in (pgs/schema-hints db) [attribute :pg-type])]
+    (or (contains? #{:db.type/long :db.type/ref
+                     :db.type/double :db.type/float}
+                   attr-type)
+        (and (= :db.type/string attr-type)
+             (contains? stratum-text-order-types pg-type))
+        (and (= :db.type/boolean attr-type)
+             (contains? #{"boolean" "bool"} pg-type))
+        (and (= :db.type/uuid attr-type) (= "uuid" pg-type)))))
+
 (defn- matching-stratum-secondary [db attribute]
-  (when (not-null-attribute? db attribute)
+  (when (and (not-null-attribute? db attribute)
+             (stratum-orderable-attribute? db attribute))
     (some (fn [[ident entry]]
             (when (and (= :stratum (:db.secondary/type entry))
                        (contains? (set (:db.secondary/attrs entry)) attribute)
@@ -5665,66 +5690,138 @@
                 [ident index])))
           (dbi/-schema db))))
 
+(defn- native-avet-order-candidates
+  "Read an exact top-N directly from Datahike's value-ordered AVET index.
+
+   This is the PostgreSQL-B-tree-shaped path: O(log N + k), exact full-width
+   values, and forward/backward iteration from the same immutable database
+   root used by the authoritative SQL recheck. Keep the initial admission
+   deliberately narrow. Same-key range bounds will follow once their inclusive
+   cursor contract is explicit; nullable columns need physical NULL placement."
+  [db attribute direction where candidate-limit]
+  (let [attr-schema (get (dbi/-schema db) attribute)]
+    (when (and (empty? where)
+               (not-null-attribute? db attribute)
+               (or (:db/index attr-schema) (:db/unique attr-schema)))
+      (let [datoms (if (= :desc direction)
+                     (d/rseek-datoms db :avet attribute)
+                     (d/datoms db :avet attribute))]
+        (into []
+              (comp (take-while #(= attribute (:a %)))
+                    (take candidate-limit)
+                    (map (fn [datom]
+                           {:entity-id (long (:e datom))
+                            :attribute attribute
+                            :value (:v datom)})))
+              datoms)))))
+
+(declare restrict-query-to-entities)
+
 (defn- restrict-to-scalar-order-candidates
   "Use an immutable Stratum generation for exact B-tree-shaped top-N order.
 
    The primary Datalog query still evaluates all WHERE predicates and performs
-   final PostgreSQL ordering. If those predicates under-fill the candidate
-   page, exec-select retries the untouched exact query."
+   final PostgreSQL ordering. Candidate truncation is admitted only for exact,
+   complete, exactly ordered pages; every live continuation is closed even
+   though Stratum's current offset token itself owns no resources."
   [db query in-args
    {:keys [entity-var attribute direction nulls where candidate-limit] :as spec}]
-  (if-let [candidate-page (and spec (candidate-page-entrypoint))]
-    (try
+  (if-let [native-candidates
+           (and spec
+                (native-avet-order-candidates
+                 db attribute direction where candidate-limit))]
+    (let [eids (mapv :entity-id native-candidates)
+          [query in-args]
+          (restrict-query-to-entities query in-args entity-var eids)]
+      [query in-args
+       {:kind :avet-order
+        :candidate-count (count eids)
+        :candidate-limit candidate-limit
+        :precision :exact
+        :recall :complete
+        :ordering :exact}])
+    (if-let [candidate-page (and spec (candidate-page-entrypoint))]
+      (try
       ;; Stratum currently indexes values rather than absent/NULL rows. Even a
       ;; NOT NULL column can use either PostgreSQL default NULL placement; an
       ;; explicit non-default clause is harmless because no NULL is possible.
-      (if-let [[idx-ident index] (matching-stratum-secondary db attribute)]
-        (let [query-spec {:attribute attribute
-                          :direction direction
-                          :nulls nulls
-                          :where where}
-              candidates
-              (loop [continuation nil
-                     remaining (long candidate-limit)
-                     seen-continuations #{}
-                     acc []]
-                (let [request (cond-> {:limit (min 256 remaining)}
-                                continuation (assoc :continuation continuation))
-                      page (candidate-page db idx-ident index query-spec nil request)
-                      page-candidates (vec (take remaining (:candidates page)))
-                      acc (into acc page-candidates)
-                      remaining (- remaining (count page-candidates))
-                      next-continuation (:continuation page)]
-                  (cond
-                    (or (zero? remaining) (:exhausted? page)) acc
-                    (empty? page-candidates)
-                    (throw (ex-info "Non-exhausted scalar candidate page was empty"
-                                    {:index-ident idx-ident
-                                     :continuation next-continuation}))
-                    (contains? seen-continuations next-continuation)
-                    (throw (ex-info "Scalar candidate continuation repeated"
-                                    {:index-ident idx-ident
-                                     :continuation next-continuation}))
-                    :else
-                    (recur next-continuation remaining
-                           (conj seen-continuations next-continuation) acc))))
-              eids (->> candidates
-                        (keep (fn [candidate]
-                                (when (= attribute (:attribute candidate))
-                                  (:entity-id candidate))))
-                        distinct
-                        vec)
-              query (update query :in
-                            (fn [inputs]
-                              (conj (vec (or inputs ['$]))
-                                    [entity-var '...])))]
-          [query (conj (vec in-args) eids)
-           {:kind :stratum-order
-            :candidate-count (count eids)
-            :candidate-limit candidate-limit}])
-        [query in-args nil])
-      (catch Exception _ [query in-args nil]))
-    [query in-args nil]))
+        (if-let [[idx-ident index] (matching-stratum-secondary db attribute)]
+          (let [query-spec {:attribute attribute
+                            :direction direction
+                            :nulls nulls
+                            :where where}
+                close-candidate-scan (close-candidate-scan-entrypoint)
+                continuation* (atom nil)
+                candidates
+                (try
+                  (loop [continuation nil
+                         remaining (long candidate-limit)
+                         seen-continuations #{}
+                         seen-candidates #{}
+                         acc []]
+                    (reset! continuation* continuation)
+                    (let [request (cond-> {:limit (min 256 remaining)}
+                                    (some? continuation)
+                                    (assoc :continuation continuation))
+                          page (candidate-page
+                                db idx-ident index query-spec nil request)
+                          next-continuation (:continuation page)
+                          _ (reset! continuation* next-continuation)
+                          page-candidates (vec (take remaining (:candidates page)))
+                          identities (mapv (juxt :entity-id :attribute)
+                                           page-candidates)
+                          protocol-error?
+                          (or (not= :exact (:precision page))
+                              (not= :complete (:recall page))
+                              (not= :exact (:ordering page))
+                              (some #(not= attribute (second %)) identities)
+                              (some seen-candidates identities)
+                              (not= (count identities) (count (distinct identities)))
+                              (and (some? next-continuation)
+                                   (contains? seen-continuations
+                                              next-continuation)))
+                          acc (into acc page-candidates)
+                          remaining (- remaining (count page-candidates))]
+                      (when protocol-error?
+                        (throw (ex-info "Invalid exact scalar candidate scan"
+                                        {:index-ident idx-ident
+                                         :page (select-keys
+                                                page
+                                                [:precision :recall :ordering
+                                                 :exhausted? :stop-reason])})))
+                      (cond
+                        (or (zero? remaining) (:exhausted? page)) acc
+                        :else
+                        (recur next-continuation remaining
+                               (conj seen-continuations next-continuation)
+                               (into seen-candidates identities)
+                               acc))))
+                  (finally
+                    (when-some [continuation @continuation*]
+                      (when close-candidate-scan
+                        (try
+                          (close-candidate-scan index continuation)
+                          (catch Exception _ nil))))))
+                eids (->> candidates
+                          (keep (fn [candidate]
+                                  (when (= attribute (:attribute candidate))
+                                    (:entity-id candidate))))
+                          distinct
+                          vec)
+                query (update query :in
+                              (fn [inputs]
+                                (conj (vec (or inputs ['$]))
+                                      [entity-var '...])))]
+            [query (conj (vec in-args) eids)
+             {:kind :stratum-order
+              :candidate-count (count eids)
+              :candidate-limit candidate-limit
+              :precision :exact
+              :recall :complete
+              :ordering :exact}])
+          [query in-args nil])
+        (catch Exception _ [query in-args nil]))
+      [query in-args nil])))
 
 (defn- zero-vector?
   [^floats v]
@@ -6118,7 +6215,7 @@
             [exact-query exact-in-args]
             (restrict-to-text-candidates
              query-db query in-args (:secondary-text-candidates parsed))
-            [scalar-query scalar-in-args scalar-access]
+            [scalar-query scalar-in-args _scalar-access]
             (restrict-to-scalar-order-candidates
              query-db exact-query exact-in-args
              (:secondary-order-candidate parsed))
@@ -6160,13 +6257,14 @@
                query-db exact-query exact-in-args run-query limit vector-access)
 
               (run-query query in-args))
-            ;; Iterative Proximum plans handle under-fill inside their demand
-            ;; loop. The remaining bounded access paths get one attempt, then
-            ;; fall back to the exact primary query rather than returning a
-            ;; silently short page.
-            results (if (and (or (= :proximum-materialized
-                                    (:kind vector-access))
-                                 scalar-access)
+            ;; Scalar pages are accepted only when their range predicate,
+            ;; precision, recall, and ordering are exact, so an exhausted
+            ;; relation shorter than LIMIT is a final result rather than a
+            ;; reason to evaluate the SQL target list twice. Materialized ANN
+            ;; remains approximate membership and retains exact under-fill
+            ;; fallback.
+            results (if (and (= :proximum-materialized
+                                (:kind vector-access))
                              (pos-int? limit)
                              (< (count candidate-results) limit))
                       (run-query exact-query exact-in-args)
@@ -7615,10 +7713,16 @@
                 :feature-not-supported
                 {:message (str "materialized Stratum btree indexes do not yet "
                                "enforce uniqueness")}))
-              (materialize-secondary-index!
-               ctx parsed :stratum attr
-               (configured-secondary-options
-                secondary-index-config :stratum parsed)))
+              (if (stratum-orderable-attribute? db attr)
+                (materialize-secondary-index!
+                 ctx parsed :stratum attr
+                 (configured-secondary-options
+                  secondary-index-config :stratum parsed))
+                (throw
+                 (errors/pg-error
+                  :feature-not-supported
+                  {:message (str "Stratum does not preserve PostgreSQL btree "
+                                 "ordering for column type " pg-type)}))))
             (empty-result "CREATE INDEX")))
 
         :else

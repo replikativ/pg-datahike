@@ -92,6 +92,92 @@
           #(worthwhile ::db ::index :docs/body ::query))
         "an older adapter without estimates preserves the compatibility path")))
 
+(deftest scalar-candidate-pages-enforce-contract-and-close
+  (let [restrict (ns-resolve 'datahike.pg.server
+                             'restrict-to-scalar-order-candidates)
+        candidate-entrypoint (ns-resolve 'datahike.pg.server
+                                         'candidate-page-entrypoint)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)
+        native-order (ns-resolve 'datahike.pg.server
+                                 'native-avet-order-candidates)
+        matching (ns-resolve 'datahike.pg.server
+                             'matching-stratum-secondary)
+        query {:find ['?e] :in ['$] :where []}
+        spec {:entity-var '?e
+              :attribute :docs/rank
+              :direction :asc
+              :candidate-limit 1}
+        closes (atom [])
+        redefine-base
+        {native-order (constantly nil)
+         matching (fn [_ _] [:idx/rank ::index])
+         close-entrypoint (constantly
+                           (fn [index continuation]
+                             (swap! closes conj [index continuation])))}]
+    (let [page {:candidates [{:entity-id 7 :attribute :docs/rank :value 10}]
+                :precision :exact
+                :recall :complete
+                :ordering :exact
+                :exhausted? false
+                :continuation false}
+          [restricted args access]
+          (with-redefs-fn
+            (assoc redefine-base candidate-entrypoint (constantly
+                                                       (fn [& _] page)))
+            #(restrict ::db query [] spec))]
+      (is (= [[7]] args))
+      (is (= :stratum-order (:kind access)))
+      (is (= [['?e '...]] (take-last 1 (:in restricted))))
+      (is (= [[::index false]] @closes)
+          "false is a valid opaque continuation and is still closed"))
+    (reset! closes [])
+    (let [page {:candidates [{:entity-id 7 :attribute :docs/rank :value 10}]
+                :precision :approximate
+                :recall :bounded
+                :ordering :approximate
+                :exhausted? false
+                :continuation :opaque}
+          [restricted args access]
+          (with-redefs-fn
+            (assoc redefine-base candidate-entrypoint (constantly
+                                                       (fn [& _] page)))
+            #(restrict ::db query [] spec))]
+      (is (= query restricted))
+      (is (= [] args))
+      (is (nil? access))
+      (is (= [[::index :opaque]] @closes)
+          "a rejected declaration closes the adapter-owned scan"))))
+
+(deftest stratum-btree-declines-non-order-preserving-carriers
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (do
+      (result "CREATE TABLE secondary_numeric_order (amount numeric NOT NULL)")
+      (is (= "0A000"
+             (sqlstate
+              "CREATE INDEX secondary_numeric_order_idx ON secondary_numeric_order (amount)")))
+      (is (nil? (get-in (d/db *conn*)
+                        [:schema :datahike.pg.index/secondary_numeric_order_idx]))))))
+
+(deftest stratum-btree-preserves-full-width-bigint-order
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (do
+      (result (str "CREATE TABLE secondary_bigint_order "
+                   "(id int PRIMARY KEY, rank bigint NOT NULL)"))
+      (result (str "INSERT INTO secondary_bigint_order VALUES "
+                   "(1, 9007199254740993), (2, 9007199254740992)"))
+      (let [query (str "SELECT id FROM secondary_bigint_order "
+                       "ORDER BY rank ASC LIMIT 1")
+            exact (rows query)]
+        (is (= [["2"]] exact))
+        (is (nil? (sqlstate
+                   (str "CREATE INDEX secondary_bigint_order_idx "
+                        "ON secondary_bigint_order (rank)"))))
+        (is (= exact (rows query))
+            "Stratum must not collapse distinct int64 keys through double")))))
+
 (deftest postgres-secondary-index-vertical
   (if-not secondary-stack-available?
     (secondary-stack-unavailable-assertion)
@@ -105,6 +191,18 @@
                    "(1, 30, '''alpha'':1', '[1,0,0]'), "
                    "(2, 10, '''beta'':1', '[0,1,0]'), "
                    "(3, 20, '''alpha'':1 ''beta'':2', '[0.9,0.1,0]')"))
+      (let [native-var (ns-resolve 'datahike.pg.server
+                                   'native-avet-order-candidates)
+            original @native-var
+            calls (atom 0)]
+        (with-redefs-fn
+          {native-var (fn [& args]
+                        (swap! calls inc)
+                        (apply original args))}
+          #(is (= [["3"] ["2"]]
+                  (rows "SELECT id FROM secondary_docs ORDER BY id DESC LIMIT 2"))))
+        (is (pos? @calls)
+            "an already indexed primary key uses the O(log N + k) AVET path"))
       (let [^PgWireServer$QueryResult index-result
             (result "CREATE INDEX secondary_docs_priority_idx ON secondary_docs (priority)")]
         (is (nil? (.-sqlstate index-result)) (.-error index-result)))
