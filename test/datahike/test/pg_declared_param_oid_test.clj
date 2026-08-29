@@ -514,7 +514,8 @@
   (let [token (atom 0)
         width (atom 1)
         handler (reify PgWireServer$QueryHandler
-                  (execute [_ _] (PgWireServer$QueryResult/empty "SELECT 0"))
+                  (execute [_ _] (-> (PgWireServer$QueryResult/empty "BEGIN")
+                                     (.withTxStatus \T)))
                   (parse [_ _ _] @width)
                   (describeParams [_ _] (int-array 0))
                   (describeResult [_ parsed]
@@ -540,6 +541,8 @@
       (binding [*port* (.getPort server)]
         (with-conn
           (fn [in out]
+            (send-msg! out \Q (cstr "BEGIN"))
+            (read-until-ready in)
             (send-msg! out \P (ba (cstr "s") (cstr "SELECT ignored") [:i16 0]))
             (send-msg! out \B (ba (cstr "p") (cstr "s")
                                   [:i16 0] [:i16 0] [:i16 0]))
