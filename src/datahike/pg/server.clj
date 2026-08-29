@@ -5544,11 +5544,9 @@
    NULL rows entirely rather than merely place them first or last."
   [db attr]
   (boolean
-   (d/q '{:find [?entity .]
-          :in [$ ?attr]
-          :where [[?entity :db/ident ?attr]
-                  [?entity :pg/not-null true]]}
-        db attr)))
+   (when-let [table-name (namespace attr)]
+     (get-in (read-column-constraints db table-name)
+             [(name attr) :not-null?]))))
 
 (defn- restrict-to-text-candidates
   "Precede conjunctive PostgreSQL @@ predicates with complete Scriptum
