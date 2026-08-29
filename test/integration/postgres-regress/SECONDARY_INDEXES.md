@@ -244,11 +244,20 @@ accounted for about 2.0 ms of a 5.6 ms Datahike query and 6.5 ms SQL query at
 
 These are inclusive stage timings, not additive components, but the direction
 is stable: the native engines are useful and no longer hidden behind repeated
-query dispatch. The next large gain is a physical candidate/recheck/projection
-pipeline that does not materialize a general Datalog relation and then perform
-SQL sorting/rendering for access paths that already identify a small ordered
-row set. Stratum's own top-N query and Proximum build/filtered-search curves
-remain adapter-level targets; replacing the generation protocol would not
+query dispatch. A first bounded physical split now materializes an unfiltered
+Proximum candidate page outside the general external-engine planner, then
+passes only those entity IDs to the existing authoritative Datalog distance,
+ordering, and projection query. On the same live 10k-row REPL fixture at
+`ef_search=1000`, this reduced top-10 p50 from 8.65 ms through the generic
+external-engine route to 4.19 ms. Filtered ANN deliberately stays in the
+planner so an upstream `EntityBitSet` reaches Proximum.
+
+The next gains are narrower: avoid general relation construction only where a
+candidate contract and a recognized simple SQL shape prove that canonical
+recheck/projection remain bounded. Stratum's own top-N query and Proximum
+build/filtered-search curves remain adapter-level targets. Full text still
+requires PostgreSQL's exact `@@` recheck, and high-cardinality matches still
+need the general relation path. Replacing the generation protocol would not
 address the dominant read-side cost shown here.
 
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,

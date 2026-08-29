@@ -193,19 +193,28 @@
             original @search-var
             filtered-var (requiring-resolve 'proximum.core/search-filtered)
             filtered-original @filtered-var
+            candidate-var (requiring-resolve
+                           'datahike.index.secondary/candidate-page)
+            candidate-original @candidate-var
             calls (atom 0)
-            filtered-calls (atom 0)]
+            filtered-calls (atom 0)
+            candidate-calls (atom 0)]
         (with-redefs-fn
           {search-var (fn [& args]
                         (swap! calls inc)
                         (apply original args))
            filtered-var (fn [& args]
                           (swap! filtered-calls inc)
-                          (apply filtered-original args))}
+                          (apply filtered-original args))
+           candidate-var (fn [& args]
+                           (swap! candidate-calls inc)
+                           (apply candidate-original args))}
           #(do
              (is (= [["1"] ["3"]]
                     (rows (str "SELECT id FROM secondary_docs "
                                "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 2"))))
+             (is (pos? @candidate-calls)
+                 "unfiltered top-k materialized a bounded Proximum page")
              (is (= [["3"]]
                     (rows (str "SELECT id FROM secondary_docs WHERE priority = 20 "
                                "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 1"))))))
