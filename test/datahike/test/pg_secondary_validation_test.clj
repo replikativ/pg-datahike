@@ -172,7 +172,17 @@
       (is (= [{:limit 267}] @requests)
           "bounded OFFSET prefixes stay in one streaming top-N page")
       (is (= 267 (count (first args))))
-      (is (= :stratum-order (:kind access))))))
+      (is (= :stratum-order (:kind access)))
+      (reset! requests [])
+      (with-redefs-fn
+        (assoc redefine-base candidate-entrypoint
+               (constantly
+                (fn [_ _ _ _ _ request]
+                  (swap! requests conj request)
+                  page)))
+        #(restrict ::db query [] (assoc spec :candidate-limit 1024)))
+      (is (= [{:limit 1023}] @requests)
+          "Stratum's lookahead stays within its 1024-row Top-N ceiling"))))
 
 (deftest stratum-btree-declines-non-order-preserving-carriers
   (if-not secondary-stack-available?
@@ -202,6 +212,27 @@
                         "ON secondary_bigint_order (rank)"))))
         (is (= exact (rows query))
             "Stratum must not collapse distinct int64 keys through double")))))
+
+(deftest native-avet-order-declines-postgres-divergent-comparators
+  (result (str "CREATE TABLE avet_comparator_guard ("
+               "id int PRIMARY KEY, u uuid NOT NULL, "
+               "f double precision NOT NULL)"))
+  ;; Install ordinary AVET entries before data exists, without introducing a
+  ;; Stratum generation; this isolates native primary-index admission.
+  (d/transact *conn* [{:db/ident :avet_comparator_guard/u :db/index true}
+                      {:db/ident :avet_comparator_guard/f :db/index true}])
+  (result (str "INSERT INTO avet_comparator_guard VALUES "
+               "(1, '00000000-0000-0000-0000-000000000000', 'Infinity'), "
+               "(2, '80000000-0000-0000-0000-000000000000', 'NaN')"))
+  (is (= [["2"]]
+         (rows (str "SELECT id FROM avet_comparator_guard "
+                    "WHERE u > '00000000-0000-0000-0000-000000000000'::uuid "
+                    "ORDER BY u LIMIT 1")))
+      "PostgreSQL UUID order is unsigned, unlike java.util.UUID.compareTo")
+  (is (= [["2"]]
+         (rows (str "SELECT id FROM avet_comparator_guard "
+                    "WHERE f > 'Infinity'::float8 ORDER BY f LIMIT 1")))
+      "PostgreSQL orders NaN after positive infinity"))
 
 (deftest postgres-secondary-index-vertical
   (if-not secondary-stack-available?

@@ -5546,7 +5546,7 @@
                            :v (symbol "?v")}
                           (get schema marker))))))
 
-(defn- vector-exact-filter-binding-kind
+(defn- vector-exact-filter-binding
   "Classify a WHERE equality by whether AVET can start the lookup.
 
    SQL's nullable parameter lowering represents `column = value` as a data
@@ -5557,17 +5557,20 @@
    rather than paying for a second O(N) prefilter pass."
   [db query in-args entity-var]
   (let [schema (dbi/-schema db)
-        bound-inputs (set (keys (zipmap (rest (:in query)) in-args)))
+        input-values (zipmap (rest (:in query)) in-args)
         seek-values
-        (into #{}
+        (into {}
               (keep (fn [clause]
                       (when (and (vector? clause)
                                  (= 2 (count clause))
                                  (seq? (first clause))
                                  (= 'datahike.pg.sql/seek-key (ffirst clause))
-                                 (contains? bound-inputs
+                                 (contains? input-values
                                             (second (first clause))))
-                        (second clause))))
+                        [(second clause)
+                         (sql/seek-key
+                          (get input-values (second (first clause)))
+                          (nth (first clause) 2))])))
               (:where query))]
     (some (fn [clause]
             (when (and (vector? clause)
@@ -5578,16 +5581,47 @@
                        (let [value (nth clause 2)]
                          (or (not (symbol? value))
                              (contains? seek-values value))))
-              (let [attr-schema (get schema (second clause))]
-                (if (or (:db/index attr-schema) (:db/unique attr-schema))
-                  :indexed
-                  :unindexed))))
+              (let [attribute (second clause)
+                    attr-schema (get schema attribute)
+                    raw-value (nth clause 2)]
+                {:kind (if (or (:db/index attr-schema)
+                               (:db/unique attr-schema))
+                         :indexed
+                         :unindexed)
+                 :attribute attribute
+                 :value (if (symbol? raw-value)
+                          (get seek-values raw-value)
+                          raw-value)})))
           (:where query))))
 
 (defn- vector-indexed-exact-filter-binding?
   [db query in-args entity-var]
   (= :indexed
-     (vector-exact-filter-binding-kind db query in-args entity-var)))
+     (:kind (vector-exact-filter-binding db query in-args entity-var))))
+
+(defn- exact-pattern-cardinality?
+  "True when planner cardinalities come from subtree counts, not legacy
+   heuristics. Cost choices described as hard bounds must fail closed here."
+  [db]
+  (try
+    (if-let [has-counts?
+             (requiring-resolve 'datahike.index.interface/-has-subtree-counts?)]
+      (boolean (has-counts? (:eavt db)))
+      false)
+    (catch Throwable _ false)))
+
+(defn- small-indexed-vector-equality?
+  [db {:keys [kind attribute value]} candidate-limit]
+  (try
+    (and (= :indexed kind)
+         (exact-pattern-cardinality? db)
+         (when-let [estimate-pattern (pattern-estimate-entrypoint)]
+           (<= (long (estimate-pattern
+                      db
+                      {:e (symbol "?e") :a attribute :v value}
+                      (get (dbi/-schema db) attribute)))
+               (max 256 (* 8 (long candidate-limit))))))
+    (catch Throwable _ false)))
 
 (defn- bounded-unindexed-vector-equality?
   "Prefer one exact query when the entire input relation has a hard small bound.
@@ -5599,42 +5633,43 @@
    Larger relations retain the bounded ANN probe and exact underfill fallback."
   [db query in-args entity-var vector-dimension]
   (try
-    (let [schema (dbi/-schema db)
-          bound-inputs (set (keys (zipmap (rest (:in query)) in-args)))
-          seek-values
-          (into #{}
-                (keep (fn [clause]
-                        (when (and (vector? clause)
-                                   (= 2 (count clause))
-                                   (seq? (first clause))
-                                   (= 'datahike.pg.sql/seek-key (ffirst clause))
-                                   (contains? bound-inputs
-                                              (second (first clause))))
-                          (second clause))))
-                (:where query))
-          attribute
-          (some (fn [clause]
-                  (when (and (vector? clause)
-                             (= 3 (count clause))
-                             (= entity-var (first clause))
-                             (keyword? (second clause))
-                             (not= "db-row-exists" (name (second clause)))
-                             (let [value (nth clause 2)]
-                               (or (not (symbol? value))
-                                   (contains? seek-values value)))
-                             (let [attr-schema (get schema (second clause))]
-                               (not (or (:db/index attr-schema)
-                                        (:db/unique attr-schema)))))
-                    (second clause)))
-                (:where query))
+    (when (exact-pattern-cardinality? db)
+      (let [schema (dbi/-schema db)
+            bound-inputs (set (keys (zipmap (rest (:in query)) in-args)))
+            seek-values
+            (into #{}
+                  (keep (fn [clause]
+                          (when (and (vector? clause)
+                                     (= 2 (count clause))
+                                     (seq? (first clause))
+                                     (= 'datahike.pg.sql/seek-key (ffirst clause))
+                                     (contains? bound-inputs
+                                                (second (first clause))))
+                            (second clause))))
+                  (:where query))
+            attribute
+            (some (fn [clause]
+                    (when (and (vector? clause)
+                               (= 3 (count clause))
+                               (= entity-var (first clause))
+                               (keyword? (second clause))
+                               (not= "db-row-exists" (name (second clause)))
+                               (let [value (nth clause 2)]
+                                 (or (not (symbol? value))
+                                     (contains? seek-values value)))
+                               (let [attr-schema (get schema (second clause))]
+                                 (not (or (:db/index attr-schema)
+                                          (:db/unique attr-schema)))))
+                      (second clause)))
+                  (:where query))
           ;; Bound worst-case distance work as well as the Datalog scan. This
           ;; deliberately uses total rows, not a skew-sensitive value sample.
-          threshold (min 16384
-                         (max 64 (quot 65536
-                                       (max 1 (long vector-dimension)))))]
-      (when-let [row-count (and attribute
-                                (table-row-estimate db attribute))]
-        (<= (long row-count) threshold)))
+            threshold (min 16384
+                           (max 64 (quot 65536
+                                         (max 1 (long vector-dimension)))))]
+        (when-let [row-count (and attribute
+                                  (table-row-estimate db attribute))]
+          (<= (long row-count) threshold))))
     (catch Exception _ false)))
 
 (defn- text-secondary-worthwhile?
@@ -5762,6 +5797,11 @@
                   where)]
     (when (and (some? clauses)
                (not-null-attribute? db attribute)
+               ;; Datahike's total order is not PostgreSQL's for every AVET
+               ;; carrier (notably UUID and floating NaN). Only truncate a
+               ;; page when the physical and SQL comparators are proven equal.
+               (contains? #{:db.type/long :db.type/boolean}
+                          (:db/valueType attr-schema))
                (or (:db/index attr-schema) (:db/unique attr-schema)))
       (try
         (letfn [(satisfies? [value [op _ bound]]
@@ -5855,7 +5895,7 @@
                          seen-candidates #{}
                          acc []]
                     (reset! continuation* continuation)
-                    (let [request (cond-> {:limit (min 1024 remaining)}
+                    (let [request (cond-> {:limit (min 1023 remaining)}
                                     (some? continuation)
                                     (assoc :continuation continuation))
                           page (candidate-page
@@ -5984,15 +6024,14 @@
                               :k candidate-limit
                               :candidate-limit candidate-limit
                               :ef (or ef 40)}
+                  equality-binding
+                  (when prefer-entity-filter?
+                    (vector-exact-filter-binding db query in-args entity-var))
                   prefilter-first?
-                  (when prefer-entity-filter?
-                    (vector-indexed-exact-filter-binding?
-                     db query in-args entity-var))
+                  (small-indexed-vector-equality?
+                   db equality-binding candidate-limit)
                   unindexed-equality?
-                  (when prefer-entity-filter?
-                    (= :unindexed
-                       (vector-exact-filter-binding-kind
-                        db query in-args entity-var)))
+                  (= :unindexed (:kind equality-binding))
                   bounded-unindexed-equality?
                   (and unindexed-equality?
                        (bounded-unindexed-vector-equality?
@@ -6028,7 +6067,7 @@
                       :attribute attribute
                       :query-spec query-spec
                       :probe-limit 128
-                      :underfill-fallback (if unindexed-equality?
+                      :underfill-fallback (if equality-binding
                                             :exact
                                             :prefilter)}]
                     (if-let [candidate-page (and (close-candidate-scan-entrypoint)

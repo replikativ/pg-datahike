@@ -260,6 +260,25 @@
         (is (= :proximum-prefiltered (:kind filtered-access))
             "the measured entity set chooses exact distance or filtered ANN")))
 
+    (testing "a common indexed equality probes before materializing its set"
+      (let [filtered (sql/parse-sql
+                      (str "SELECT id FROM vector_recheck WHERE category = 20 "
+                           "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
+                      (dbi/-schema db) db)
+            estimate-var (requiring-resolve
+                          'datahike.query.estimate/estimate-pattern)
+            common-db (assoc-in indexed-db
+                                [:schema :vector_recheck/category :db/index]
+                                true)
+            [_ _ filtered-access]
+            (with-redefs-fn
+              {estimate-var (constantly 10000)}
+              #(restrict common-db (:query filtered) (:in-args filtered)
+                         (:secondary-candidate filtered)))]
+        (is (= :proximum-hybrid (:kind filtered-access)))
+        (is (= :exact (:underfill-fallback filtered-access))
+            "underfill executes one authoritative query, not a full set copy")))
+
     (testing "a selective unindexed equality keeps one authoritative pass"
       (let [filtered (sql/parse-sql
                       (str "SELECT id FROM vector_recheck WHERE category = 20 "
