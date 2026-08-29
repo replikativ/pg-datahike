@@ -99,14 +99,20 @@ beam sweep and a deterministic 12-query recall sample. The 10k ×
 16-dimensional default is a development smoke test; realistic embedding widths
 and larger runs are intentionally outside CI.
 
-For a same-host PostgreSQL 17 full-text reference after starting `realpg.sh`:
+For a same-host PostgreSQL 17 full-text and pgvector HNSW reference after
+starting `realpg.sh`, install the PostgreSQL 17 pgvector extension and use the
+same corpus parameters as the pg-datahike run:
 
 ```bash
-SECONDARY_BENCH_ROWS=20000 \
+SECONDARY_BENCH_ROWS=20000 SECONDARY_BENCH_DIMENSION=384 \
+  SECONDARY_BENCH_EF_CONSTRUCTION=200 \
   clojure -M:dev bench/postgres_secondary_reference.clj
 ```
 
 The reference forces a sequential plan for the exact baseline and a GIN plan
-for the indexed baseline, reports the selected plan, and includes result
-materialization in both timings. A pgvector reference remains a separate
-optional environment because PostgreSQL itself does not ship that extension.
+for the indexed full-text baseline, reports the selected plans, and includes
+result materialization in all timings. Its vector corpus and deterministic
+query sample use the same RNG seeds, cosine operator class, `m`,
+`ef_construction`, and `ef_search` sweep as `secondary_validation.clj`, so
+pgvector and Proximum results are directly comparable. pgvector remains an
+optional prerequisite because PostgreSQL itself does not ship the extension.

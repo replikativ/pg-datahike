@@ -219,7 +219,7 @@ One same-host 20k-row development run (not a release claim) measured:
 | full-text, 10% / 2k matches p50 | 51.3 ms | 34.2 ms | 1.35 ms |
 | full-text, 1% / 200 matches p50 | 38.0 ms | 5.7 ms | 0.71 ms |
 | full-text, 0.1% / 20 matches p50 | 35.0 ms | 3.3 ms | 0.12 ms |
-| vector(384) top-10 p50 | 93.0 ms | 5.2 ms at `ef_search=1000` | not measured locally |
+| vector(384) top-10 p50 | 93.0 ms | 5.2 ms at `ef_search=1000` | see matched pgvector run below |
 
 At `ef_search=1000`, a 12-query deterministic vector sample measured mean
 recall@10 0.992, minimum 0.9. The fixed `[1,0,...]` probe was the minimum; the
@@ -269,6 +269,38 @@ build/filtered-search curves remain adapter-level targets. Full text still
 requires PostgreSQL's exact `@@` recheck, and high-cardinality matches still
 need the general relation path. Replacing the generation protocol would not
 address the dominant read-side cost shown here.
+
+### Matched pgvector HNSW reference
+
+With pgvector 0.8.0 installed into the same PostgreSQL 17.10 instance, a
+matched 20k-row, 384-dimensional run used the identical generated vectors and
+query sample, cosine distance, `m=16`, `ef_construction=200`, and
+`ef_search=1000`:
+
+| Operation | pg-datahike / Proximum | PostgreSQL / pgvector |
+|---|---:|---:|
+| HNSW build | 55.7 s | 20.4 s |
+| Exact top-10 p50 | 282.5 ms | 16.1 ms |
+| HNSW top-10 p50 | 8.4 ms | 39.3 ms |
+| 12-query mean/min recall@10 | 0.975 / 0.9 | 0.983 / 0.9 |
+| 10%-filtered exact / HNSW p50 | 91.8 / 153.2 ms | 11.0 / 39.1 ms |
+| 1%-filtered exact / HNSW p50 | 6.2 / 35.9 ms | 10.2 / 37.2 ms |
+
+This is a bounded development run, not a general engine ranking. It does show
+three different costs that must not be collapsed into “vector performance”:
+Proximum's query graph is competitive, its full-copy immutable generation build
+is not yet, and pg-datahike's exact/recheck path has a much larger cliff than
+PostgreSQL's. At the two filtered probes Proximum returned all ten exact
+neighbors, while pgvector returned ten with recall 0.9.
+
+pgvector 0.8.0 also demonstrates why filtered ANN needs an explicit
+continuation contract. With `ef_search=40` and a 1% post-filter, its default
+`hnsw.iterative_scan=off` visited forty candidates and returned zero rows in a
+22 ms `EXPLAIN ANALYZE` probe. `strict_order` continued until it found ten rows,
+touching 726 rejected candidates and taking 60 ms. Proximum's candidate cursor
+and Datahike's `ISecondaryCandidateScan` have the right semantic shape for this;
+the remaining work is a planner-controlled breadth/continuation policy and a
+bounded authoritative recheck, not a different generation model.
 
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,
 useful indexed growth curves, bounded memory/write amplification, and no
