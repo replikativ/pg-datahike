@@ -208,39 +208,43 @@
         (is (some #(= [[:> :priority 25]] (:where %)) @query-specs)
             "numeric plan reuse substitutes the current range boundary"))
 
-      (let [search-var (requiring-resolve 'proximum.core/search)
-            original @search-var
-            filtered-var (requiring-resolve 'proximum.core/search-filtered)
+      (let [filtered-var (requiring-resolve 'proximum.core/search-filtered)
             filtered-original @filtered-var
             candidate-var (requiring-resolve
                            'datahike.index.secondary/candidate-page)
             candidate-original @candidate-var
-            calls (atom 0)
+            search-var (requiring-resolve 'datahike.index.secondary/search-with-vt)
+            search-original @search-var
             filtered-calls (atom 0)
-            candidate-calls (atom 0)]
+            candidate-calls (atom 0)
+            probe-calls (atom 0)]
         (with-redefs-fn
-          {search-var (fn [& args]
-                        (swap! calls inc)
-                        (apply original args))
-           filtered-var (fn [& args]
+          {filtered-var (fn [& args]
                           (swap! filtered-calls inc)
                           (apply filtered-original args))
            candidate-var (fn [& args]
                            (swap! candidate-calls inc)
-                           (apply candidate-original args))}
+                           (apply candidate-original args))
+           search-var (fn [& args]
+                        (when (nil? (nth args 3))
+                          (swap! probe-calls inc))
+                        (apply search-original args))}
           #(do
              (is (= [["1"] ["3"]]
                     (rows (str "SELECT id FROM secondary_docs "
                                "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 2"))))
              (is (pos? @candidate-calls)
                  "unfiltered top-k materialized a bounded Proximum page")
-             (is (= [["3"]]
-                    (rows (str "SELECT id FROM secondary_docs WHERE priority = 20 "
-                               "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 1"))))))
-        (is (pos? (+ @calls @filtered-calls))
-            "SQL vector ordering invoked Proximum through the external engine")
-        (is (pos? @filtered-calls)
-            "a selective primary predicate reached Proximum as an entity filter"))
+             (let [before @candidate-calls]
+               (is (= [["3"]]
+                      (rows (str "SELECT id FROM secondary_docs WHERE priority = 20 "
+                                 "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 1"))))
+               (is (= before @candidate-calls)
+                   "the one-shot filtered probe does not open a cursor")
+               (is (pos? @probe-calls)
+                   "a filtered top-k starts with a bounded Proximum probe"))))
+        (is (zero? @filtered-calls)
+            "the one-row filter fills the probe and avoids a second native search"))
 
       (doseq [index-name ["secondary_docs_priority_idx"
                           "secondary_docs_body_gin"
@@ -312,6 +316,49 @@
                  (is (= indexed-after (rows query-sql))))))
           (is (<= 2 @calls)
               "both indexed snapshots were served through Scriptum"))))))
+
+(deftest filtered-vector-native-fallback-matches-the-exact-path
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (let [near-rejected (for [id (range 1 161)]
+                          (format "(%d, 0, '[%d,0,0]')" id id))
+          far-accepted (for [id (range 161 461)]
+                         (format "(%d, 1, '[%d,0,0]')"
+                                 id (+ 1000 (- id 161))))
+          null-accepted (for [id (range 461 481)]
+                          (format "(%d, 1, NULL)" id))
+          values-sql (str/join ", "
+                               (concat near-rejected far-accepted null-accepted))
+          query-sql (str "SELECT id, bucket, bucket FROM secondary_vector_filter "
+                         "WHERE bucket = 1 "
+                         "ORDER BY embedding <-> '[0,0,0]'::vector "
+                         "LIMIT 10 OFFSET 5")]
+      (result (str "CREATE TABLE secondary_vector_filter ("
+                   "id int PRIMARY KEY, bucket int NOT NULL, embedding vector(3))"))
+      (result (str "INSERT INTO secondary_vector_filter VALUES " values-sql))
+      (let [exact-rows (rows query-sql)]
+        (is (= 10 (count exact-rows)))
+        (is (every? (fn [[_ bucket-a bucket-b]]
+                      (= "1" bucket-a bucket-b))
+                    exact-rows)
+            "duplicate projected columns survive SQL bag semantics")
+        (is (nil? (sqlstate
+                   (str "CREATE INDEX secondary_vector_filter_hnsw "
+                        "ON secondary_vector_filter USING hnsw "
+                        "(embedding vector_l2_ops) "
+                        "WITH (m=16, ef_construction=128)"))))
+        (is (nil? (sqlstate "SET hnsw.ef_search = 1000")))
+        (let [filtered-var (requiring-resolve 'proximum.core/search-filtered)
+              original @filtered-var
+              filtered-calls (atom 0)]
+          (with-redefs-fn
+            {filtered-var (fn [& args]
+                            (swap! filtered-calls inc)
+                            (apply original args))}
+            #(is (= exact-rows (rows query-sql))
+                 "native filtered HNSW preserves exact recheck/OFFSET output"))
+          (is (pos? @filtered-calls)
+              "the 320-row filter exceeds the exact lane after probe underfill"))))))
 
 (deftest secondary-index-ddl-rejections-are-explicit
   (if-not secondary-stack-available?

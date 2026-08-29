@@ -116,6 +116,13 @@
     (is (= [types/oid-float8] (describe "SELECT '[1,2]'::vector <-> '[3,4]'")))
     (is (= [types/oid-float8] (describe "SELECT cosine_distance('[1,2]'::vector, '[2,4]')")))))
 
+(deftest nullable-vector-distance-ordering-keeps-non-null-rows
+  (run "CREATE TABLE vector_nullable (id int PRIMARY KEY, embedding vector(1))")
+  (run "INSERT INTO vector_nullable VALUES (1, '[2]'), (2, NULL), (3, '[1]')")
+  (is (= [["3"] ["1"]]
+         (rows (str "SELECT id FROM vector_nullable "
+                    "ORDER BY embedding <-> '[0]'::vector LIMIT 2")))))
+
 (deftest vector-hnsw-ddl-and-candidate-shape-are-preserved
   (run "CREATE TABLE vector_ann (id int PRIMARY KEY, embedding vector(3))")
   (let [ddl (sql/parse-sql
@@ -155,7 +162,16 @@
                                 "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))
         offset (parse (str "SELECT id FROM vector_ann "
                            "ORDER BY embedding <-> '[1,2,3]'::vector "
-                           "LIMIT 5 OFFSET 7"))]
+                           "LIMIT 5 OFFSET 7"))
+        volatile-filter (parse (str "SELECT id FROM vector_ann "
+                                    "WHERE random() < 0.5 "
+                                    "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))
+        volatile-projection (parse (str "SELECT random(), id FROM vector_ann "
+                                        "WHERE id > 0 "
+                                        "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))
+        subquery-filter (parse (str "SELECT id FROM vector_ann "
+                                    "WHERE id < (SELECT 10) "
+                                    "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))]
     (is (= {:attribute :vector_ann/embedding
             :operator "<->"
             :metric :euclidean
@@ -173,7 +189,13 @@
     (is (nil? (:secondary-candidate nulls-first)))
     (is (nil? (:secondary-candidate with-ties)))
     (is (nil? (:secondary-candidate windowed)))
-    (is (nil? (:secondary-candidate project-set)))))
+    (is (nil? (:secondary-candidate project-set)))
+    (is (nil? (:secondary-candidate volatile-filter))
+        "hybrid ANN must not evaluate volatile WHERE predicates repeatedly")
+    (is (nil? (:secondary-candidate volatile-projection))
+        "hybrid ANN must not evaluate volatile projections repeatedly")
+    (is (nil? (:secondary-candidate subquery-filter))
+        "nested SELECT bodies are opaque to the volatility walker")))
 
 (deftest vector-candidates-are-only-a-rechecked-restriction
   (run "CREATE TABLE vector_recheck (id int PRIMARY KEY, embedding vector(2))")
@@ -209,7 +231,7 @@
     (is (= [(get-in parsed [:secondary-candidate :entity-var]) '...]
            (second (peek (:where candidate-query)))))
 
-    (testing "a WHERE-bearing candidate stays exact until full-WHERE is explicit"
+    (testing "a WHERE-bearing candidate is deferred until the full-WHERE boundary"
       (let [filtered (sql/parse-sql
                       (str "SELECT id FROM vector_recheck WHERE id > 1 "
                            "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
@@ -219,7 +241,10 @@
                       (:secondary-candidate filtered))]
         (is (= (:query filtered) filtered-query))
         (is (= (:in-args filtered) filtered-args))
-        (is (nil? filtered-access))))
+        (is (= :proximum-hybrid (:kind filtered-access)))
+        (is (= 2 (get-in filtered-access [:query-spec :candidate-limit])))
+        (is (= 128 (:probe-limit filtered-access)))
+        (is (some? (:filtered-entrypoints filtered-access)))))
 
     (testing "an explicit beam does not change SQL k"
       (let [[_ args _]
@@ -227,6 +252,355 @@
                       (assoc (:secondary-candidate parsed) :ef 1))]
         (is (= 1 (:ef (peek args))))
         (is (= 2 (:k (peek args))))))))
+
+(deftest iterative-vector-candidates-observe-full-query-demand-and-close
+  (let [run-iterative (ns-resolve 'datahike.pg.server
+                                  'run-iterative-vector-query)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)
+        page-calls (atom [])
+        query-eids (atom [])
+        closed (atom [])
+        candidate-page
+        (fn [_db _ident _index _spec _filter request]
+          (swap! page-calls conj request)
+          (if (:continuation request)
+            {:candidates [{:entity-id 3 :attribute :doc/embedding}
+                          {:entity-id 4 :attribute :doc/embedding}]
+             :precision :recheck
+             :recall :approximate
+             :ordering :exact
+             :exhausted? false
+             :continuation :page-2}
+            {:candidates [{:entity-id 1 :attribute :doc/embedding}
+                          {:entity-id 2 :attribute :doc/embedding}]
+             :precision :recheck
+             :recall :approximate
+             :ordering :exact
+             :exhausted? false
+             :continuation :page-1}))
+        run-query (fn [_query args]
+                    (let [eids (peek args)]
+                      (swap! query-eids conj eids)
+                      (if (some #{4} eids) [[:enough]] [])))
+        access {:candidate-page candidate-page
+                :index-ident :idx/doc-embedding
+                :index ::index
+                :entity-var '?doc
+                :attribute :doc/embedding
+                :query-spec {:scan-mode :iterative}
+                :page-limit 2}]
+    (with-redefs-fn
+      {close-entrypoint
+       (constantly (fn [index continuation]
+                     (swap! closed conj [index continuation])))}
+      #(is (= [[:enough]]
+              (run-iterative ::db {:find ['?doc]} [] run-query 1 access))))
+    (is (= [{:limit 2} {:limit 2 :continuation :page-1}] @page-calls))
+    (is (= [[1 2] [1 2 3 4]] @query-eids)
+        "the authoritative query sees cumulative candidates after every page")
+    (is (= [[::index :page-2]] @closed)
+        "early LIMIT closes the still-resumable generation")))
+
+(deftest iterative-vector-candidate-failure-falls-back-and-closes
+  (let [run-iterative (ns-resolve 'datahike.pg.server
+                                  'run-iterative-vector-query)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)
+        page-number (atom 0)
+        query-args (atom [])
+        closed (atom [])
+        candidate-page
+        (fn [& _]
+          (if (= 1 (swap! page-number inc))
+            {:candidates [{:entity-id 1 :attribute :doc/embedding}]
+             :precision :recheck
+             :recall :approximate
+             :ordering :exact
+             :exhausted? false
+             :continuation :page-1}
+            (throw (ex-info "secondary unavailable" {:type :test/failure}))))
+        run-query (fn [_query args]
+                    (swap! query-args conj args)
+                    (if (empty? args) [[:exact]] []))
+        access {:candidate-page candidate-page
+                :index-ident :idx/doc-embedding
+                :index ::index
+                :entity-var '?doc
+                :attribute :doc/embedding
+                :query-spec {:scan-mode :iterative}
+                :page-limit 1}]
+    (with-redefs-fn
+      {close-entrypoint
+       (constantly (fn [index continuation]
+                     (swap! closed conj [index continuation])))}
+      #(is (= [[:exact]]
+              (run-iterative ::db {:find ['?doc]} [] run-query 1 access))))
+    (is (= [[[1]] []] @query-args))
+    (is (= [[::index :page-1]] @closed)
+        "fallback releases the last live continuation")))
+
+(deftest materialized-vector-probe-falls-back-after-full-query-underfill
+  (let [run-probe (ns-resolve 'datahike.pg.server
+                              'run-materialized-vector-probe)
+        search-call (atom nil)
+        query-call (atom nil)
+        fallback-calls (atom 0)
+        access {:index ::index
+                :entity-var '?doc
+                :query-spec {:vector [0.0 0.0]
+                             :k 3
+                             :candidate-limit 3}
+                :probe-limit 128
+                :filtered-entrypoints
+                {:entity-seq identity
+                 :search (fn [db index query-spec entity-filter]
+                           (reset! search-call
+                                   [db index query-spec entity-filter])
+                           [1 2 3])}}
+        run-query (fn [query args]
+                    (reset! query-call [query args])
+                    [])]
+    (is (= [[:fallback]]
+           (run-probe
+            ::db {:find ['?doc]} [] run-query 1 access
+            #(do (swap! fallback-calls inc) [[:fallback]]))))
+    (is (= [::db ::index
+            {:vector [0.0 0.0] :k 128 :candidate-limit 128}
+            nil]
+           @search-call))
+    (is (= [[1 2 3]] (second @query-call)))
+    (is (= 1 @fallback-calls))))
+
+(deftest iterative-vector-demand-applies-offset-to-the-cumulative-recheck
+  (let [run-iterative (ns-resolve 'datahike.pg.server
+                                  'run-iterative-vector-query)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)
+        page-number (atom 0)
+        rechecked (atom [])
+        closed (atom [])
+        candidate-page
+        (fn [& _]
+          (let [n (swap! page-number inc)]
+            {:candidates (mapv (fn [eid]
+                                 {:entity-id eid :attribute :doc/embedding})
+                               (if (= n 1) [1 2] [3 4]))
+             :precision :recheck
+             :recall :approximate
+             :ordering :exact
+             :exhausted? false
+             :continuation (keyword (str "page-" n))}))
+        run-query (fn [_query args]
+                    (let [eids (peek args)]
+                      (swap! rechecked conj eids)
+                      (->> eids (drop 2) (take 2) (mapv vector))))
+        access {:candidate-page candidate-page
+                :index-ident :idx/doc-embedding
+                :index ::index
+                :entity-var '?doc
+                :attribute :doc/embedding
+                :query-spec {:scan-mode :iterative}
+                :page-limit 2}]
+    (with-redefs-fn
+      {close-entrypoint
+       (constantly (fn [index continuation]
+                     (swap! closed conj [index continuation])))}
+      #(is (= [[3] [4]]
+              (run-iterative ::db {:find ['?doc]} [] run-query 2 access))))
+    (is (= [[1 2] [1 2 3 4]] @rechecked))
+    (is (= [[::index :page-2]] @closed))))
+
+(deftest iterative-vector-stream-violations-fall-back-and-close
+  (let [run-iterative (ns-resolve 'datahike.pg.server
+                                  'run-iterative-vector-query)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)]
+    (doseq [[label page]
+            [["wrong attribute"
+              {:candidates [{:entity-id 1 :attribute :doc/wrong}]}]
+             ["duplicate candidate"
+              {:candidates [{:entity-id 1 :attribute :doc/embedding}
+                            {:entity-id 1 :attribute :doc/embedding}]}]
+             ["empty non-exhausted page" {:candidates []}]
+             ["non-exact ordering"
+              {:candidates [{:entity-id 1 :attribute :doc/embedding}]
+               :ordering :approximate}]]]
+      (testing label
+        (let [query-calls (atom [])
+              closed (atom [])
+              page (merge {:precision :recheck
+                           :recall :approximate
+                           :ordering :exact
+                           :exhausted? false
+                           :continuation :live}
+                          page)
+              access {:candidate-page (fn [& _] page)
+                      :index-ident :idx/doc-embedding
+                      :index ::index
+                      :entity-var '?doc
+                      :attribute :doc/embedding
+                      :query-spec {:scan-mode :iterative}
+                      :page-limit 2}
+              run-query (fn [_query args]
+                          (swap! query-calls conj args)
+                          (if (empty? args) [[:exact]] []))]
+          (with-redefs-fn
+            {close-entrypoint
+             (constantly (fn [index continuation]
+                           (swap! closed conj [index continuation])))}
+            #(is (= [[:exact]]
+                    (run-iterative
+                     ::db {:find ['?doc]} [] run-query 1 access))))
+          (is (= [[]] @query-calls)
+              "the malformed stream is never exposed to SQL recheck")
+          (is (= [[::index :live]] @closed)))))))
+
+(deftest iterative-vector-rejects-non-adjacent-continuation-cycles
+  (let [run-iterative (ns-resolve 'datahike.pg.server
+                                  'run-iterative-vector-query)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)
+        rechecked (atom [])
+        closed (atom [])
+        candidate-page
+        (fn [_db _ident _index _spec _filter request]
+          (case (:continuation request)
+            nil {:candidates [{:entity-id 1 :attribute :doc/embedding}]
+                 :precision :recheck :recall :approximate :ordering :exact
+                 :exhausted? false :continuation :a}
+            :a {:candidates [{:entity-id 2 :attribute :doc/embedding}]
+                :precision :recheck :recall :approximate :ordering :exact
+                :exhausted? false :continuation :b}
+            :b {:candidates [{:entity-id 3 :attribute :doc/embedding}]
+                :precision :recheck :recall :approximate :ordering :exact
+                :exhausted? false :continuation :a}))
+        run-query (fn [_query args]
+                    (swap! rechecked conj args)
+                    (if (empty? args) [[:exact]] []))
+        access {:candidate-page candidate-page
+                :index-ident :idx/doc-embedding
+                :index ::index
+                :entity-var '?doc
+                :attribute :doc/embedding
+                :query-spec {:scan-mode :iterative}
+                :page-limit 1}]
+    (with-redefs-fn
+      {close-entrypoint
+       (constantly (fn [index continuation]
+                     (swap! closed conj [index continuation])))}
+      #(is (= [[:exact]]
+              (run-iterative ::db {:find ['?doc]} [] run-query 1 access))))
+    (is (= [[[1]] [[1 2]] []] @rechecked)
+        "the cyclic page is rejected before SQL recheck")
+    (is (= [[::index :a]] @closed))))
+
+(deftest iterative-vector-treats-false-as-an-opaque-continuation
+  (let [run-iterative (ns-resolve 'datahike.pg.server
+                                  'run-iterative-vector-query)
+        close-entrypoint (ns-resolve 'datahike.pg.server
+                                     'close-candidate-scan-entrypoint)
+        requests (atom [])
+        closed (atom [])
+        candidate-page
+        (fn [_db _ident _index _spec _filter request]
+          (swap! requests conj request)
+          (if (contains? request :continuation)
+            {:candidates [{:entity-id 2 :attribute :doc/embedding}]
+             :precision :recheck :recall :approximate :ordering :exact
+             :exhausted? false :continuation :live}
+            {:candidates [{:entity-id 1 :attribute :doc/embedding}]
+             :precision :recheck :recall :approximate :ordering :exact
+             :exhausted? false :continuation false}))
+        access {:candidate-page candidate-page
+                :index-ident :idx/doc-embedding
+                :index ::index
+                :entity-var '?doc
+                :attribute :doc/embedding
+                :query-spec {:scan-mode :iterative}
+                :page-limit 1}]
+    (with-redefs-fn
+      {close-entrypoint
+       (constantly (fn [index continuation]
+                     (swap! closed conj [index continuation])))}
+      #(do
+         (is (= [[:enough]]
+                (run-iterative
+                 ::db {:find ['?doc]} []
+                 (fn [_query args]
+                   (when (= [1 2] (peek args)) [[:enough]]))
+                 1 access)))
+         (is (= [[:first-page]]
+                (run-iterative
+                 ::db {:find ['?doc]} []
+                 (fn [_query _args] [[:first-page]])
+                 1 access)))))
+    (is (= [{:limit 1}
+            {:limit 1 :continuation false}
+            {:limit 1}]
+           @requests)
+        "false resumes the first scan instead of restarting it")
+    (is (= [[::index :live] [::index false]] @closed)
+        "both ordinary and false live tokens are released on early LIMIT")))
+
+(deftest large-vector-prefilter-uses-the-native-entity-filter
+  (let [run-prefiltered (ns-resolve 'datahike.pg.server
+                                    'run-prefiltered-vector-query)
+        prefilter-query* (atom nil)
+        native-call* (atom nil)
+        exact-call* (atom nil)
+        distance-var '?distance
+        entity-var '?doc
+        exact-query {:find ['?id distance-var]
+                     :with [entity-var]
+                     :where [[entity-var :doc/id '?id]
+                             [entity-var :doc/category '?category]
+                             [(list 'vector-distance '?embedding '[0.0 0.0])
+                              distance-var]]
+                     :order-by [1 :asc]
+                     :limit 10}
+        filter-eids (vec (range 1 301))
+        ann-eids (vec (range 1001 1011))
+        run-query
+        (fn
+          ([query args]
+           (reset! exact-call* [query args])
+           [[:native-result]])
+          ([query args apply-bounds?]
+           (reset! prefilter-query* [query args apply-bounds?])
+           (mapv vector filter-eids)))
+        access
+        {:index ::index
+         :entity-var entity-var
+         :result-var distance-var
+         :query-spec {:vector [0.0 0.0]
+                      :candidate-limit 10}
+         :filtered-entrypoints
+         {:entity-set #(do (is (= filter-eids %)) ::entity-filter)
+          :entity-seq (fn [_] (throw (AssertionError. "not needed")))
+          :search (fn [db index query-spec entity-filter]
+                    (reset! native-call*
+                            [db index query-spec entity-filter])
+                    ann-eids)}}]
+    (is (= [[:native-result]]
+           (run-prefiltered ::db exact-query [] run-query access)))
+    (let [[prefilter-query prefilter-args apply-bounds?] @prefilter-query*]
+      (is (= [entity-var] (:find prefilter-query)))
+      (is (= [[entity-var :doc/id '?id]
+              [entity-var :doc/category '?category]]
+             (:where prefilter-query)))
+      (is (nil? (:with prefilter-query)))
+      (is (nil? (:order-by prefilter-query)))
+      (is (= [] prefilter-args))
+      (is (false? apply-bounds?)))
+    (is (= [::db ::index (:query-spec access) ::entity-filter]
+           @native-call*))
+    (let [[query args] @exact-call*]
+      (is (= exact-query
+             (-> query
+                 (update :in pop)
+                 (dissoc :in))))
+      (is (= [ann-eids] args)))))
 
 (deftest vector-extension-discovery-and-binary-codec
   (is (= "CREATE EXTENSION"

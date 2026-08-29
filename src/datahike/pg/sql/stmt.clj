@@ -1020,6 +1020,20 @@
    (some #(contains? #{"generate_series" "unnest"} (srf-base-name %))
          (params/ast-function-names expr))))
 
+(def ^:private volatile-rescan-functions
+  "Functions whose row result or side effect may change if an access path
+   evaluates WHERE more than once. Hybrid ANN probing must stay exact-only for
+   these shapes. Stable statement/transaction time functions are deliberately
+   absent."
+  #{"random" "random_normal" "gen_random_uuid" "uuidv4" "uuidv7"
+    "clock_timestamp" "timeofday" "nextval" "setseed"})
+
+(defn- contains-volatile-rescan-function?
+  [expr]
+  (boolean
+   (some #(contains? volatile-rescan-functions (srf-base-name %))
+         (params/ast-function-names expr))))
+
 (defn- reject-prohibited-target-srf!
   "Reject expression contexts in which PostgreSQL cannot conditionally or
    repeatedly execute an SRF. Scalar expressions around SRFs remain legal;
@@ -5723,6 +5737,20 @@
 
         in-params @(:in-params ctx)
         in-args @(:in-args ctx)
+        secondary-rescan-exprs
+        ;; Hybrid ANN may evaluate the authoritative SQL query once for its
+        ;; probe and again after prefiltering. Keep any expression whose value
+        ;; or side effect is not stable across those evaluations on the exact
+        ;; path. Subqueries are excluded conservatively: the query-level AST
+        ;; walkers deliberately treat their SELECT bodies as scope boundaries,
+        ;; so looking only for top-level function names cannot prove them safe.
+        (into [where-expr]
+              (map #(.getExpression ^SelectItem %))
+              select-items)
+        secondary-rescan-safe?
+        (not-any? #(or (and % (expr/contains-subquery? %))
+                       (contains-volatile-rescan-function? %))
+                  secondary-rescan-exprs)
         ;; ANN is an access path, never the semantic implementation.  Expose
         ;; a candidate request only for pgvector's indexable shape: one
         ;; ascending distance key plus a positive LIMIT.  exec-select may use
@@ -5742,7 +5770,8 @@
                    (nil? having-expr)
                    (empty? @window-specs)
                    (empty? project-set-specs)
-                   (empty? correlated-subqs))
+                   (empty? correlated-subqs)
+                   secondary-rescan-safe?)
           (let [order-var (ffirst order-by-spec)]
             (some (fn [candidate]
                     (when (= order-var (:result-var candidate))

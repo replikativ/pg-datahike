@@ -3626,7 +3626,8 @@
                      :__null__
                      (f (pg-vector/coerce a) (pg-vector/coerce b))))
         fn-param (symbol (str "?vector-distance" (swap! (:var-counter ctx) inc)))
-        result-var (ctx/fresh-var! ctx)]
+        result-var (ctx/propagate-nullability!
+                    ctx (ctx/fresh-var! ctx) [l r])]
     (swap! (:in-params ctx) conj fn-param)
     (swap! (:in-args ctx) conj strict-f)
     (swap! (:where-clauses ctx) conj [(list fn-param l r) result-var])

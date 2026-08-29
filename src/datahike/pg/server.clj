@@ -5500,6 +5500,24 @@
     (requiring-resolve 'datahike.index.secondary/candidate-page)
     (catch Exception _ nil)))
 
+(defn- close-candidate-scan-entrypoint
+  "Resolve optional candidate lifecycle support alongside candidate paging."
+  []
+  (try
+    (requiring-resolve 'datahike.index.secondary/close-candidate-scan!)
+    (catch Exception _ nil)))
+
+(defn- filtered-vector-entrypoints
+  "Resolve the generic entity-filter path only when Datahike provides it."
+  []
+  (try
+    {:search (requiring-resolve 'datahike.index.secondary/search-with-vt)
+     :entity-set (requiring-resolve
+                  'datahike.index.entity-set/entity-bitset-from-longs)
+     :entity-seq (requiring-resolve
+                  'datahike.index.entity-set/entity-bitset-seq)}
+    (catch Exception _ nil)))
+
 (defn- secondary-estimate-entrypoint []
   (try
     (requiring-resolve 'datahike.index.secondary/-estimate)
@@ -5705,19 +5723,20 @@
    index can intentionally change membership, as it can in pgvector; exact
    recheck guarantees distances and predicates only within its candidates.
 
-   A WHERE-bearing plan currently stays exact. Merely requiring an entity
-   binding does not prove that every SQL predicate has run, so inserting a
-   filtered ANN marker into the freely reordered Datalog plan can search a
-   partial filter and lose valid top-k rows. A later first-class filtered-access
-   operator can restore this path with an explicit full-WHERE dependency.
+   A WHERE-bearing plan must not insert an ANN marker into the freely reordered
+   Datalog plan: an entity binding does not prove that every SQL predicate has
+   run. Instead exec-select first evaluates the complete WHERE as an entity-only
+   query. Tiny sets use exact distance directly; larger sets are pushed into
+   Proximum's native filtered HNSW search, followed by the authoritative SQL
+   recheck. A resumable post-filter scan remains the compatibility fallback.
 
    An unfiltered top-k has no upstream relation to compose, so materialize its
    bounded candidate page once and pass the entity IDs to the authoritative
    Datalog distance/recheck query. This keeps projection, exact distance,
    ordering, and LIMIT in one SQL implementation."
   [db query in-args
-   {:keys [entity-var attribute metric query-vector limit candidate-limit ef
-           prefer-entity-filter?] :as spec}]
+   {:keys [entity-var result-var attribute metric query-vector limit
+           candidate-limit ef prefer-entity-filter?] :as spec}]
   (if spec
     (try
       (let [query-vector (pg-vector/coerce query-vector)]
@@ -5748,7 +5767,31 @@
                         :candidate-limit candidate-limit
                         :ef (:ef query-spec)}]))]
               (if prefer-entity-filter?
-                [query in-args nil]
+                (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
+                  [query in-args
+                   {:kind :proximum-hybrid
+                    :filtered-entrypoints filtered-entrypoints
+                    :index-ident idx-ident
+                    :index index
+                    :entity-var entity-var
+                    :result-var result-var
+                    :attribute attribute
+                    :query-spec query-spec
+                    :probe-limit 128}]
+                  (if-let [candidate-page (and (close-candidate-scan-entrypoint)
+                                               (candidate-page-entrypoint))]
+                    [query in-args
+                     {:kind :proximum-iterative
+                      :candidate-page candidate-page
+                      :index-ident idx-ident
+                      :index index
+                      :entity-var entity-var
+                      :attribute attribute
+                      :query-spec (assoc query-spec
+                                         :scan-mode :iterative
+                                         :strict-order? true)
+                      :page-limit 512}]
+                    [query in-args nil]))
                 ;; Candidate paging is optional so a released/third-party
                 ;; adapter that only implements ISecondaryIndex keeps using
                 ;; the external-engine path.  Current Proximum generations
@@ -5786,6 +5829,190 @@
       ;; cannot serve this snapshot.
       (catch Exception _ [query in-args nil]))
     [query in-args nil]))
+
+(defn- restrict-query-to-entities
+  [query in-args entity-var eids]
+  [(update query :in
+           (fn [inputs]
+             (conj (vec (or inputs ['$])) [entity-var '...])))
+   (conj (vec in-args) eids)])
+
+(defn- vector-prefilter-query
+  "Project only entity ids after removing the exact distance binding/order.
+
+   The remaining clauses are the complete translated SQL WHERE plus the base
+   table bindings. Returning nil is a fail-closed signal if the expected fresh
+   distance binding is not structurally present exactly once."
+  [query entity-var result-var]
+  (let [where (:where query)
+        retained (filterv (fn [clause]
+                            (not (and (vector? clause)
+                                      (= 2 (count clause))
+                                      (= result-var (second clause)))))
+                          where)]
+    (when (= 1 (- (count where) (count retained)))
+      (-> query
+          (assoc :find [entity-var]
+                 :where retained)
+          (dissoc :with :order-by :limit :offset)))))
+
+(defn- secondary-result-eids
+  [result entity-seq]
+  (if (sequential? result)
+    (mapv (fn [value]
+            (long (if (map? value)
+                    (:entity-id value)
+                    value)))
+          result)
+    (mapv long (entity-seq result))))
+
+(defn- run-prefiltered-vector-query
+  "Choose exact top-k or native filtered HNSW after one full-WHERE pass.
+
+   This avoids the quadratic repeated-recheck cliff of post-filter paging. The
+   threshold is intentionally absolute: exact distance cost grows with the
+   number of surviving entities, regardless of their fraction of the table."
+  [db exact-query exact-in-args run-query
+   {:keys [filtered-entrypoints index entity-var result-var query-spec]}]
+  (if-let [prefilter-query (vector-prefilter-query
+                            exact-query entity-var result-var)]
+    (let [prefilter-rows (run-query prefilter-query exact-in-args false)
+          filter-eids (mapv (fn [row]
+                              (long (if (sequential? row) (first row) row)))
+                            prefilter-rows)
+          [filtered-query filtered-args]
+          (restrict-query-to-entities
+           exact-query exact-in-args entity-var filter-eids)
+          exact-filtered #(run-query filtered-query filtered-args)
+          exact-threshold (max 256 (* 8 (:candidate-limit query-spec)))]
+      (if (<= (count filter-eids) exact-threshold)
+        (exact-filtered)
+        (let [{:keys [search entity-set entity-seq]} filtered-entrypoints
+              ann-eids
+              (try
+                (secondary-result-eids
+                 (search db index query-spec (entity-set filter-eids))
+                 entity-seq)
+                (catch Exception _ nil))]
+          (if (and ann-eids
+                   (>= (count ann-eids) (:candidate-limit query-spec)))
+            (let [[ann-query ann-args]
+                  (restrict-query-to-entities
+                   exact-query exact-in-args entity-var ann-eids)]
+              (run-query ann-query ann-args))
+            (exact-filtered)))))
+    (run-query exact-query exact-in-args)))
+
+(defn- run-materialized-vector-probe
+  "Try one bounded unfiltered ANN probe before the full prefilter path.
+
+   This intentionally uses ordinary materialized search rather than opening an
+   iterative cursor: the hybrid lane never consumes a second probe page, while
+   a cursor owns corpus-sized resumable traversal state. SQL predicates,
+   distance, order, OFFSET, and LIMIT remain authoritative in run-query."
+  [db exact-query exact-in-args run-query limit
+   {:keys [filtered-entrypoints index entity-var query-spec probe-limit]}
+   fallback]
+  (let [{:keys [search entity-seq]} filtered-entrypoints
+        demand (or limit (:candidate-limit query-spec))
+        probe-limit (max (:candidate-limit query-spec) probe-limit)
+        probe-spec (assoc query-spec
+                          :k probe-limit
+                          :candidate-limit probe-limit)
+        probe-eids (try
+                     (secondary-result-eids
+                      (search db index probe-spec nil) entity-seq)
+                     (catch Exception _ nil))]
+    (if probe-eids
+      (let [[probe-query probe-args]
+            (restrict-query-to-entities
+             exact-query exact-in-args entity-var probe-eids)
+            results (run-query probe-query probe-args)]
+        (if (>= (count results) demand) results (fallback)))
+      (fallback))))
+
+(defn- run-iterative-vector-query
+  "Demand candidates only after the complete SQL query rejects a page.
+
+   The continuation always belongs to one immutable Proximum generation. It is
+   explicitly closed on early LIMIT, query failure, adapter failure, and client
+   cancellation. An exhausted or failed scan that cannot fill LIMIT falls back
+   to the exact query, preserving the existing no-silently-short-page rule."
+  ([db exact-query exact-in-args run-query limit access]
+   (run-iterative-vector-query
+    db exact-query exact-in-args run-query limit access nil))
+  ([db exact-query exact-in-args run-query limit
+    {:keys [candidate-page index-ident index entity-var attribute query-spec
+            page-limit max-pages]}
+    fallback]
+   (let [continuation* (atom nil)
+         close-candidate-scan (close-candidate-scan-entrypoint)
+         demand (or limit (:candidate-limit query-spec))
+         exact #(run-query exact-query exact-in-args)
+         fallback (or fallback exact)
+         close-owned!
+         (fn []
+           (let [continuation @continuation*]
+             (when (some? continuation)
+               (reset! continuation* nil)
+               (when close-candidate-scan
+                 (try
+                   (close-candidate-scan index continuation)
+                   (catch Exception _ nil))))))
+         fallback! (fn [] (close-owned!) (fallback))]
+     (try
+       (loop [continuation nil
+              seen-continuations #{}
+              eids []
+              seen #{}
+              declaration nil
+              page-number 0]
+         (reset! continuation* continuation)
+         (let [request (cond-> {:limit page-limit}
+                         (some? continuation)
+                         (assoc :continuation continuation))
+               page (try
+                      (candidate-page
+                       db index-ident index query-spec nil request)
+                      (catch Exception _ ::candidate-scan-failed))]
+           (if (= ::candidate-scan-failed page)
+             (fallback!)
+             (let [next-continuation (:continuation page)
+                   _ (reset! continuation* next-continuation)
+                   page-declaration (select-keys
+                                     page [:precision :recall :ordering])
+                   identities (mapv (juxt :entity-id :attribute)
+                                    (:candidates page))
+                   protocol-error?
+                   (or (not= :exact (:ordering page))
+                       (and declaration (not= declaration page-declaration))
+                       (some #(not= attribute (second %)) identities)
+                       (some seen identities)
+                       (not= (count identities) (count (distinct identities)))
+                       (and (not (:exhausted? page)) (empty? identities))
+                       (and (some? next-continuation)
+                            (contains? seen-continuations next-continuation)))
+                   [eids seen]
+                   (reduce (fn [[ids known] [eid :as identity]]
+                             [(conj ids eid) (conj known identity)])
+                           [eids seen]
+                           identities)
+                   [candidate-query candidate-args]
+                   (restrict-query-to-entities
+                    exact-query exact-in-args entity-var eids)
+                   results (when-not protocol-error?
+                             (run-query candidate-query candidate-args))
+                   pages-read (inc page-number)]
+               (cond
+                 protocol-error? (fallback!)
+                 (>= (count results) demand) results
+                 (:exhausted? page) (fallback!)
+                 (and max-pages (>= pages-read max-pages)) (fallback!)
+                 :else
+                 (recur next-continuation
+                        (conj seen-continuations next-continuation) eids seen
+                        (or declaration page-declaration) pages-read))))))
+       (finally (close-owned!))))))
 
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
@@ -5851,28 +6078,44 @@
                (:secondary-candidate parsed)
                (assoc :ef (or (:hnsw-ef-search @session-state) 40))))
             run-query
-            (fn [datalog args]
-              (let [q-input (cond-> datalog
-                              limit  (assoc :limit limit)
-                              offset (assoc :offset offset)
-                              :always (assoc :cancel (current-cancel)))]
-                ;; Runtime subquery closures execute inside d/q. Bind the
-                ;; statement's effective query DB, not merely the connection's
-                ;; raw snapshot: CTEs and derived relations live in `query-db`.
-                (binding [params/*runtime-db* query-db]
-                  (if (seq args)
-                    (run-param-query q-input #(apply d/q q-input query-db args))
-                    (run-param-query q-input #(d/q q-input query-db))))))
-            candidate-results (run-query query in-args)
-            ;; WHERE-bearing ANN plans now feed their upstream entity relation
-            ;; into Proximum before search; the exact SQL predicate still
-            ;; rechecks every returned row. Approximate search (or a bounded
-            ;; scalar top-N followed by an unpushed predicate) can nevertheless
-            ;; under-fill LIMIT. Until the candidate API supports adaptive
-            ;; feedback, fail over to the exact primary scan for that shape.
-            ;; It costs one bounded attempt but never returns a silently short
-            ;; page; full ANN pages retain pgvector's approximate membership.
-            results (if (and (or vector-access scalar-access)
+            (fn run-query
+              ([datalog args] (run-query datalog args true))
+              ([datalog args apply-bounds?]
+               (let [q-input (cond-> datalog
+                               (and apply-bounds? limit) (assoc :limit limit)
+                               (and apply-bounds? offset) (assoc :offset offset)
+                               :always (assoc :cancel (current-cancel)))]
+                 ;; Runtime subquery closures execute inside d/q. Bind the
+                 ;; statement's effective query DB, not merely the connection's
+                 ;; raw snapshot: CTEs and derived relations live in `query-db`.
+                 (binding [params/*runtime-db* query-db]
+                   (if (seq args)
+                     (run-param-query q-input #(apply d/q q-input query-db args))
+                     (run-param-query q-input #(d/q q-input query-db)))))))
+            candidate-results
+            (case (:kind vector-access)
+              :proximum-hybrid
+              (run-materialized-vector-probe
+               query-db exact-query exact-in-args run-query limit vector-access
+               #(run-prefiltered-vector-query
+                 query-db exact-query exact-in-args run-query vector-access))
+
+              :proximum-prefiltered
+              (run-prefiltered-vector-query
+               query-db exact-query exact-in-args run-query vector-access)
+
+              :proximum-iterative
+              (run-iterative-vector-query
+               query-db exact-query exact-in-args run-query limit vector-access)
+
+              (run-query query in-args))
+            ;; Iterative Proximum plans handle under-fill inside their demand
+            ;; loop. The remaining bounded access paths get one attempt, then
+            ;; fall back to the exact primary query rather than returning a
+            ;; silently short page.
+            results (if (and (or (= :proximum-materialized
+                                    (:kind vector-access))
+                                 scalar-access)
                              (pos-int? limit)
                              (< (count candidate-results) limit))
                       (run-query exact-query exact-in-args)

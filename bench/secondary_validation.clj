@@ -143,6 +143,12 @@
 (defn- profiling-stages []
   {:vector-candidate-restriction
    (requiring-resolve 'datahike.pg.server/restrict-to-vector-candidates)
+   :vector-iterative-query
+   (requiring-resolve 'datahike.pg.server/run-iterative-vector-query)
+   :vector-prefiltered-query
+   (requiring-resolve 'datahike.pg.server/run-prefiltered-vector-query)
+   :vector-materialized-probe
+   (requiring-resolve 'datahike.pg.server/run-materialized-vector-probe)
    :text-candidate-restriction
    (requiring-resolve 'datahike.pg.server/restrict-to-text-candidates)
    :scalar-candidate-restriction
@@ -230,6 +236,9 @@
                "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
           filtered-1-sql
           (str "SELECT id FROM secondary_bench WHERE category = 0 "
+               "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
+          filtered-01-sql
+          (str "SELECT id FROM secondary_bench WHERE id < 10 "
                "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")]
       (try
         (checked handler
@@ -272,6 +281,7 @@
                       quality-query-vectors)
                 exact-filtered-10 (ids (rows handler filtered-10-sql))
                 exact-filtered-1 (ids (rows handler filtered-1-sql))
+                exact-filtered-01 (ids (rows handler filtered-01-sql))
                 exact-fulltext-timing (timings 3 10 #(rows handler fulltext-sql))
                 exact-fulltext-1-timing
                 (timings 3 10 #(rows handler fulltext-1-sql))
@@ -287,6 +297,8 @@
                                   #(rows handler vector-sql))
                 exact-filtered-10-timing (timings 3 10 #(rows handler filtered-10-sql))
                 exact-filtered-1-timing (timings 3 10 #(rows handler filtered-1-sql))
+                exact-filtered-01-timing
+                (timings 3 10 #(rows handler filtered-01-sql))
                 scalar-build-start (now-nanos)
                 _ (checked handler
                            (str "CREATE INDEX secondary_bench_rank_btree "
@@ -370,6 +382,7 @@
                 (mapv recall exact-quality-sample indexed-quality-sample)
                 indexed-filtered-10 (ids (rows handler filtered-10-sql))
                 indexed-filtered-1 (ids (rows handler filtered-1-sql))
+                indexed-filtered-01 (ids (rows handler filtered-01-sql))
                 indexed-vector-timing
                 (profiled-timings
                  5 20
@@ -386,6 +399,10 @@
                  3 10
                  (select-keys stages
                               [:vector-candidate-restriction
+                               :vector-materialized-probe
+                               :vector-prefiltered-query
+                               :vector-iterative-query
+                               :candidate-page
                                :secondary-search
                                :proximum-filtered-search
                                :proximum-api-filtered-search
@@ -397,12 +414,31 @@
                  3 10
                  (select-keys stages
                               [:vector-candidate-restriction
+                               :vector-materialized-probe
+                               :vector-prefiltered-query
+                               :vector-iterative-query
+                               :candidate-page
                                :secondary-search
                                :proximum-filtered-search
                                :proximum-api-filtered-search
                                :datahike-query
                                :exact-cosine-distance])
-                 #(rows handler filtered-1-sql))]
+                 #(rows handler filtered-1-sql))
+                indexed-filtered-01-timing
+                (profiled-timings
+                 3 10
+                 (select-keys stages
+                              [:vector-candidate-restriction
+                               :vector-materialized-probe
+                               :vector-prefiltered-query
+                               :vector-iterative-query
+                               :candidate-page
+                               :secondary-search
+                               :proximum-filtered-search
+                               :proximum-api-filtered-search
+                               :datahike-query
+                               :exact-cosine-distance])
+                 #(rows handler filtered-01-sql))]
             {:rows n
              :dimension dimension
              :hnsw {:m 16 :ef-construction hnsw-ef-construction}
@@ -454,6 +490,11 @@
                :recall-at-k (recall exact-filtered-1 indexed-filtered-1)
                :exact exact-filtered-1-timing
                :indexed indexed-filtered-1-timing}
+              :filter-0.1-percent
+              {:returned (count indexed-filtered-01)
+               :recall-at-k (recall exact-filtered-01 indexed-filtered-01)
+               :exact exact-filtered-01-timing
+               :indexed indexed-filtered-01-timing}
               :exact exact-vector-timing}}))
         (finally
           (.close handler)
