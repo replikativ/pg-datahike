@@ -5514,6 +5514,8 @@
     {:search (requiring-resolve 'datahike.index.secondary/search-with-vt)
      :entity-set (requiring-resolve
                   'datahike.index.entity-set/entity-bitset-from-longs)
+     :entity-count (requiring-resolve
+                    'datahike.index.entity-set/entity-bitset-cardinality)
      :entity-seq (requiring-resolve
                   'datahike.index.entity-set/entity-bitset-seq)}
     (catch Exception _ nil)))
@@ -5856,15 +5858,18 @@
                  :where retained)
           (dissoc :with :order-by :limit :offset)))))
 
-(defn- secondary-result-eids
-  [result entity-seq]
+(defn- secondary-result-entities
+  "Normalize row-like adapter results, but retain a native EntityBitSet so
+   Datahike can push it into primary scans instead of rebuilding boxed ids."
+  [result entity-count]
   (if (sequential? result)
-    (mapv (fn [value]
-            (long (if (map? value)
-                    (:entity-id value)
-                    value)))
-          result)
-    (mapv long (entity-seq result))))
+    (let [entities (mapv (fn [value]
+                           (long (if (map? value)
+                                   (:entity-id value)
+                                   value)))
+                         result)]
+      [entities (count entities)])
+    [result (long (entity-count result))]))
 
 (defn- run-prefiltered-vector-query
   "Choose exact top-k or native filtered HNSW after one full-WHERE pass.
@@ -5876,29 +5881,30 @@
    {:keys [filtered-entrypoints index entity-var result-var query-spec]}]
   (if-let [prefilter-query (vector-prefilter-query
                             exact-query entity-var result-var)]
-    (let [prefilter-rows (run-query prefilter-query exact-in-args false)
+    (let [{:keys [search entity-set entity-count]} filtered-entrypoints
+          prefilter-rows (run-query prefilter-query exact-in-args false)
           filter-eids (mapv (fn [row]
                               (long (if (sequential? row) (first row) row)))
                             prefilter-rows)
+          filter-entities (entity-set filter-eids)
           [filtered-query filtered-args]
           (restrict-query-to-entities
-           exact-query exact-in-args entity-var filter-eids)
+           exact-query exact-in-args entity-var filter-entities)
           exact-filtered #(run-query filtered-query filtered-args)
           exact-threshold (max 256 (* 8 (:candidate-limit query-spec)))]
       (if (<= (count filter-eids) exact-threshold)
         (exact-filtered)
-        (let [{:keys [search entity-set entity-seq]} filtered-entrypoints
-              ann-eids
+        (let [[ann-entities ann-count]
               (try
-                (secondary-result-eids
-                 (search db index query-spec (entity-set filter-eids))
-                 entity-seq)
-                (catch Exception _ nil))]
-          (if (and ann-eids
-                   (>= (count ann-eids) (:candidate-limit query-spec)))
+                (secondary-result-entities
+                 (search db index query-spec filter-entities)
+                 entity-count)
+                (catch Exception _ [nil 0]))]
+          (if (and ann-entities
+                   (>= ann-count (:candidate-limit query-spec)))
             (let [[ann-query ann-args]
                   (restrict-query-to-entities
-                   exact-query exact-in-args entity-var ann-eids)]
+                   exact-query exact-in-args entity-var ann-entities)]
               (run-query ann-query ann-args))
             (exact-filtered)))))
     (run-query exact-query exact-in-args)))
@@ -5913,20 +5919,21 @@
   [db exact-query exact-in-args run-query limit
    {:keys [filtered-entrypoints index entity-var query-spec probe-limit]}
    fallback]
-  (let [{:keys [search entity-seq]} filtered-entrypoints
+  (let [{:keys [search entity-count]} filtered-entrypoints
         demand (or limit (:candidate-limit query-spec))
         probe-limit (max (:candidate-limit query-spec) probe-limit)
         probe-spec (assoc query-spec
                           :k probe-limit
                           :candidate-limit probe-limit)
-        probe-eids (try
-                     (secondary-result-eids
-                      (search db index probe-spec nil) entity-seq)
-                     (catch Exception _ nil))]
-    (if probe-eids
+        [probe-entities _probe-count]
+        (try
+          (secondary-result-entities
+           (search db index probe-spec nil) entity-count)
+          (catch Exception _ [nil 0]))]
+    (if probe-entities
       (let [[probe-query probe-args]
             (restrict-query-to-entities
-             exact-query exact-in-args entity-var probe-eids)
+             exact-query exact-in-args entity-var probe-entities)
             results (run-query probe-query probe-args)]
         (if (>= (count results) demand) results (fallback)))
       (fallback))))
