@@ -288,10 +288,12 @@ query sample, cosine distance, `m=16`, `ef_construction=200`, and
 
 This is a bounded development run, not a general engine ranking. It does show
 three different costs that must not be collapsed into “vector performance”:
-Proximum's query graph is competitive, its full-copy immutable generation build
-is not yet, and pg-datahike's exact/recheck path has a much larger cliff than
-PostgreSQL's. At the two filtered probes Proximum returned all ten exact
-neighbors, while pgvector returned ten with recall 0.9.
+Proximum's query graph is competitive, its current build path is not yet, and
+pg-datahike's exact/recheck path has a much larger cliff than PostgreSQL's. At
+the two filtered probes Proximum returned all ten exact neighbors, while
+pgvector returned ten with recall 0.9. The isolation below shows that initial
+construction, unlike descendant updates, is not dominated by a generation
+mmap copy.
 
 pgvector 0.8.0 also demonstrates why filtered ANN needs an explicit
 continuation contract. With `ef_search=40` and a 1% post-filter, its default
@@ -301,6 +303,81 @@ touching 726 rejected candidates and taking 60 ms. Proximum's candidate cursor
 and Datahike's `ISecondaryCandidateScan` have the right semantic shape for this;
 the remaining work is a planner-controlled breadth/continuation policy and a
 bounded authoritative recheck, not a different generation model.
+
+### Proximum layer isolation
+
+A warm in-process REPL probe on 10k deterministic 384-dimensional vectors,
+using cosine distance, `m=16`, and `ef_construction=200`, separated the same
+stack into native, Datahike, and SQL work. These figures are diagnostic rather
+than a cross-process benchmark:
+
+| Query stage, `ef_search=1000` | p50 |
+|---|---:|
+| Proximum native top-10 search | 4.68 ms |
+| Proximum candidate cursor | 3.90 ms |
+| Datahike validated candidate page | 4.16 ms |
+| pg-datahike indexed SQL, including exact distance recheck | 8.36 ms |
+| pg-datahike exact scan without HNSW | 136.65 ms |
+
+The secondary protocol and `EntityBitSet` boundary add little to an unfiltered
+search. About 2.6 ms of an instrumented SQL query was the authoritative
+Datahike recheck over ten candidates; parsing, lowering, and result production
+accounted for the remaining small fixed cost. The useful optimization target
+is therefore not a pg-datahike-native vector representation on this path.
+
+Initial index construction took 21.96 s end to end. Reading the 10k vectors
+from Datahike took 39.9 ms, creating the rootless builder 12.6 ms, inserting
+them one at a time into HNSW 20.43 s, and sealing 85.6 ms. More than 90 percent
+of the build is graph construction. The mmap was 2 GiB logical but only about
+15 MiB allocated, and a descendant-generation fork took about 20 ms on this
+sparse-copy-capable filesystem. The fixed logical capacity and shelling out to
+`cp` remain portability and bounded-space concerns, but they do not explain
+the initial-build gap measured here.
+
+Proximum already contains a transient `insert-batch` path which the Datahike
+adapter does not use. The same 10k fixture measured:
+
+| Construction path | Time |
+|---|---:|
+| current per-datom generation `put!` | 20.43 s |
+| one deterministic, single-thread batch | 16.64 s |
+| one eight-way batch | 8.15 s |
+| streaming 1,000-vector eight-way batches | 6.95–8.06 s |
+
+The streaming result means Datahike need not accumulate an unbounded backfill
+to benefit. At `ef_search=400` the per-row, one-batch, and streaming graphs all
+had recall@10 0.8 for the fixed hard query; at `ef_search=1000` all reached
+1.0. That one query is not enough to approve parallel construction, however:
+Proximum documents the parallel neighbor-selection races as nondeterministic.
+A production bulk protocol must either make the parallel graph reproducible or
+declare and test that secondary generation bytes may vary while query semantics
+and the published immutable root remain sound.
+
+Warm single-row SQL vector updates measured 195, 136, and 113 ms. The median
+call spent about 19 ms forking the source generation, 3 ms deleting the old
+node, 5 ms inserting the new node, 5 ms sealing, and 69 ms reopening the just
+sealed generation. A sealed generation is already immutable and queryable.
+An explicit ownership transfer from `SealedGeneration` to a ref-counted
+`GenerationView` can remove that cold reopen without changing publication:
+the GC guard is still released only after Datahike commits the generation ID in
+its root, and abort still closes the unpublished handle.
+
+Filter translation has a separate density cliff. Turning external Datahike
+entity IDs into Proximum internal IDs by one persistent-sorted-set lookup per
+ID cost 0.21, 2.55, 9.43, and 15.19 ms for 100, 1k, 5k, and 10k IDs. Scanning
+the numeric external-ID range once and building `ArrayBitSet` directly stayed
+between 3.25 and 3.93 ms. Proximum should choose point lookup for sparse sets,
+a sorted merge/range scan for dense sets, and ordinary unfiltered HNSW when the
+filter covers the corpus. The API should accept a primitive iterator/bitmap so
+this optimization is not coupled to Datahike's concrete bitmap type.
+
+Finally, Datahike's raw AVET range scan produced 100, 1k, 5k, and 10k entity
+IDs in 0.09, 0.18, 0.55, and 0.67 ms. The corresponding SQL range predicate
+still went through a generic relation and erased that advantage. SQL should
+lower recognized scalar ranges to an AVET-backed entity-set producer, preserve
+its cardinality, and cost exact filtered distance against ANN. On this fixture
+exact search already won at one percent selectivity; forcing ANN for every
+filter would make a correct index predictably slower.
 
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,
 useful indexed growth curves, bounded memory/write amplification, and no
