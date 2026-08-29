@@ -252,6 +252,16 @@ ordering, and projection query. On the same live 10k-row REPL fixture at
 external-engine route to 4.19 ms. Filtered ANN deliberately stays in the
 planner so an upstream `EntityBitSet` reaches Proximum.
 
+Full-text planning now asks Scriptum for an exact hit count against the same
+immutable snapshot before making the access-path decision. A same-JVM 10k-row
+probe measured the 10%-selective candidate path at 58.7 ms versus 19.9 ms for
+the primary scan, while the maintained benchmark continued to show clear
+secondary wins at 1% and 0.1%. The initial conservative gate therefore retains
+Scriptum for at most five percent of a table (or 64 absolute hits) and otherwise
+keeps the exact primary path. The benchmark records the count call separately;
+the >1,000-hit continuation test explicitly forces Scriptum because it tests
+adapter completeness rather than planner choice.
+
 The next gains are narrower: avoid general relation construction only where a
 candidate contract and a recognized simple SQL shape prove that canonical
 recheck/projection remain bounded. Stratum's own top-N query and Proximum

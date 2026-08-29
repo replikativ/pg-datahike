@@ -145,6 +145,7 @@
    :candidate-page (requiring-resolve 'datahike.index.secondary/candidate-page)
    :secondary-search (requiring-resolve 'datahike.index.secondary/search-with-vt)
    :stratum-query (requiring-resolve 'stratum.api/q)
+   :scriptum-count (requiring-resolve 'scriptum.core/count-store-snapshot)
    :scriptum-candidate-page (requiring-resolve 'scriptum.core/candidate-page)
    :scriptum-generation-search (requiring-resolve 'scriptum.core/search)
    :scriptum-snapshot-search (requiring-resolve 'scriptum.core/search-store-snapshot)
@@ -295,6 +296,7 @@
                 indexed-fulltext-timing
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
                                            :scriptum-snapshot-search])
@@ -302,6 +304,7 @@
                 indexed-fulltext-1-timing
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
                                            :scriptum-snapshot-search])
@@ -309,6 +312,7 @@
                 indexed-fulltext-01-timing
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
                                            :scriptum-snapshot-search])

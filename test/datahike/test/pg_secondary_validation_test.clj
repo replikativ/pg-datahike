@@ -73,6 +73,25 @@
 (defn- sqlstate [sql]
   (.-sqlstate ^PgWireServer$QueryResult (result sql)))
 
+(deftest scriptum-selectivity-cost-gate
+  (let [worthwhile (ns-resolve 'datahike.pg.server
+                               'text-secondary-worthwhile?)
+        estimate-entrypoint (ns-resolve 'datahike.pg.server
+                                        'secondary-estimate-entrypoint)
+        row-estimate (ns-resolve 'datahike.pg.server 'table-row-estimate)
+        use? (fn [hits rows]
+               (with-redefs-fn
+                 {estimate-entrypoint (constantly (fn [_ _] hits))
+                  row-estimate (fn [_ _] rows)}
+                 #(worthwhile ::db ::index :docs/body ::query)))]
+    (is (use? 500 10000) "the measured five-percent boundary uses Scriptum")
+    (is (not (use? 501 10000)) "a larger candidate relation stays primary")
+    (is (use? 64 100) "small absolute result sets retain the secondary path")
+    (is (not (use? 65 100)))
+    (is (with-redefs-fn {estimate-entrypoint (constantly nil)}
+          #(worthwhile ::db ::index :docs/body ::query))
+        "an older adapter without estimates preserves the compatibility path")))
+
 (deftest postgres-secondary-index-vertical
   (if-not secondary-stack-available?
     (secondary-stack-unavailable-assertion)
@@ -265,12 +284,15 @@
                         "ON secondary_text_page USING gin (body)"))))
         (let [search-var (requiring-resolve
                           'datahike.index.secondary/search-with-vt)
+              worthwhile-var (ns-resolve 'datahike.pg.server
+                                         'text-secondary-worthwhile?)
               original @search-var
               calls (atom 0)]
           (with-redefs-fn
             {search-var (fn [& args]
                           (swap! calls inc)
-                          (apply original args))}
+                          (apply original args))
+             worthwhile-var (constantly true)}
             #(do
                ;; The comparison with the pre-index result is the SQL-level
                ;; completeness oracle. It crosses Scriptum's historical
