@@ -372,8 +372,8 @@
                                  "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 1"))))
                (is (= before @candidate-calls)
                    "the one-shot filtered probe does not open a cursor")
-               (is (pos? @probe-calls)
-                   "an unindexed equality starts with a bounded ANN probe"))))
+               (is (zero? @probe-calls)
+                   "a hard-small relation avoids a wasted ANN probe"))))
         (is (zero? @filtered-calls)
             "the one-row filter fills the probe and avoids a second native search"))
 
@@ -488,8 +488,8 @@
                             (apply original args))}
             #(is (= exact-rows (rows query-sql))
                  "native filtered HNSW preserves exact recheck/OFFSET output"))
-          (is (pos? @filtered-calls)
-              "the 320-row filter exceeds the exact lane after probe underfill"))))))
+          (is (zero? @filtered-calls)
+              "the hard-small relation stays on one authoritative query"))))))
 
 (deftest secondary-index-ddl-rejections-are-explicit
   (if-not secondary-stack-available?

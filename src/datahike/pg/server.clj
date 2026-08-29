@@ -5546,14 +5546,15 @@
                            :v (symbol "?v")}
                           (get schema marker))))))
 
-(defn- vector-indexed-exact-filter-binding?
-  "Recognize a WHERE equality that can start with a cheap primary lookup.
+(defn- vector-exact-filter-binding-kind
+  "Classify a WHERE equality by whether AVET can start the lookup.
 
    SQL's nullable parameter lowering represents `column = value` as a data
    pattern plus `(seek-key ?parameter type)`. Literal equality may instead be
-   a ground data pattern. Only AVET/unique attributes qualify: an unindexed
-   equality can require an O(N) AEVT scan, in which case the bounded ANN probe
-   remains the safer first step for common or skewed prepared values."
+   a ground data pattern. AVET/unique bindings can prefilter first. An
+   unindexed equality still starts with a bounded ANN probe for common values,
+   but an under-filled probe returns to the single authoritative Datalog pass
+   rather than paying for a second O(N) prefilter pass."
   [db query in-args entity-var]
   (let [schema (dbi/-schema db)
         bound-inputs (set (keys (zipmap (rest (:in query)) in-args)))
@@ -5568,21 +5569,73 @@
                                             (second (first clause))))
                         (second clause))))
               (:where query))]
-    (boolean
-     (some (fn [clause]
-             (and (vector? clause)
-                  (= 3 (count clause))
-                  (= entity-var (first clause))
-                  (keyword? (second clause))
-                  (not= "db-row-exists" (name (second clause)))
-                  (let [attribute (second clause)
-                        attr-schema (get schema attribute)
-                        value (nth clause 2)]
-                    (and (or (:db/index attr-schema)
-                             (:db/unique attr-schema))
+    (some (fn [clause]
+            (when (and (vector? clause)
+                       (= 3 (count clause))
+                       (= entity-var (first clause))
+                       (keyword? (second clause))
+                       (not= "db-row-exists" (name (second clause)))
+                       (let [value (nth clause 2)]
                          (or (not (symbol? value))
-                             (contains? seek-values value))))))
-           (:where query)))))
+                             (contains? seek-values value))))
+              (let [attr-schema (get schema (second clause))]
+                (if (or (:db/index attr-schema) (:db/unique attr-schema))
+                  :indexed
+                  :unindexed))))
+          (:where query))))
+
+(defn- vector-indexed-exact-filter-binding?
+  [db query in-args entity-var]
+  (= :indexed
+     (vector-exact-filter-binding-kind db query in-args entity-var)))
+
+(defn- bounded-unindexed-vector-equality?
+  "Prefer one exact query when the entire input relation has a hard small bound.
+
+   Datahike's value-frequency estimate for an unindexed attribute samples AEVT
+   and can be biased by entity order. It is useful for join planning, but it is
+   not a safe reason to choose an O(N) vector path under skew. The SQL row marker
+   count is exact and cheap, so combine that upper bound with vector dimension.
+   Larger relations retain the bounded ANN probe and exact underfill fallback."
+  [db query in-args entity-var vector-dimension]
+  (try
+    (let [schema (dbi/-schema db)
+          bound-inputs (set (keys (zipmap (rest (:in query)) in-args)))
+          seek-values
+          (into #{}
+                (keep (fn [clause]
+                        (when (and (vector? clause)
+                                   (= 2 (count clause))
+                                   (seq? (first clause))
+                                   (= 'datahike.pg.sql/seek-key (ffirst clause))
+                                   (contains? bound-inputs
+                                              (second (first clause))))
+                          (second clause))))
+                (:where query))
+          attribute
+          (some (fn [clause]
+                  (when (and (vector? clause)
+                             (= 3 (count clause))
+                             (= entity-var (first clause))
+                             (keyword? (second clause))
+                             (not= "db-row-exists" (name (second clause)))
+                             (let [value (nth clause 2)]
+                               (or (not (symbol? value))
+                                   (contains? seek-values value)))
+                             (let [attr-schema (get schema (second clause))]
+                               (not (or (:db/index attr-schema)
+                                        (:db/unique attr-schema)))))
+                    (second clause)))
+                (:where query))
+          ;; Bound worst-case distance work as well as the Datalog scan. This
+          ;; deliberately uses total rows, not a skew-sensitive value sample.
+          threshold (min 16384
+                         (max 64 (quot 65536
+                                       (max 1 (long vector-dimension)))))]
+      (when-let [row-count (and attribute
+                                (table-row-estimate db attribute))]
+        (<= (long row-count) threshold)))
+    (catch Exception _ false)))
 
 (defn- text-secondary-worthwhile?
   "Use Scriptum only when its exact hit estimate is selective enough.
@@ -5935,6 +5988,16 @@
                   (when prefer-entity-filter?
                     (vector-indexed-exact-filter-binding?
                      db query in-args entity-var))
+                  unindexed-equality?
+                  (when prefer-entity-filter?
+                    (= :unindexed
+                       (vector-exact-filter-binding-kind
+                        db query in-args entity-var)))
+                  bounded-unindexed-equality?
+                  (and unindexed-equality?
+                       (bounded-unindexed-vector-equality?
+                        db query in-args entity-var
+                        (alength ^floats query-vector)))
                   external-plan
                   (fn []
                     (let [spec-var (gensym "?proximum-query-spec")
@@ -5949,65 +6012,70 @@
                        {:kind :proximum-filter-aware
                         :candidate-limit candidate-limit
                         :ef (:ef query-spec)}]))]
-              (if prefer-entity-filter?
-                (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
-                  [query in-args
-                   {:kind (if prefilter-first?
-                            :proximum-prefiltered
-                            :proximum-hybrid)
-                    :filtered-entrypoints filtered-entrypoints
-                    :index-ident idx-ident
-                    :index index
-                    :entity-var entity-var
-                    :result-var result-var
-                    :attribute attribute
-                    :query-spec query-spec
-                    :probe-limit 128}]
-                  (if-let [candidate-page (and (close-candidate-scan-entrypoint)
-                                               (candidate-page-entrypoint))]
+              (if bounded-unindexed-equality?
+                [query in-args nil]
+                (if prefer-entity-filter?
+                  (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
                     [query in-args
-                     {:kind :proximum-iterative
-                      :candidate-page candidate-page
+                     {:kind (if prefilter-first?
+                              :proximum-prefiltered
+                              :proximum-hybrid)
+                      :filtered-entrypoints filtered-entrypoints
                       :index-ident idx-ident
                       :index index
                       :entity-var entity-var
+                      :result-var result-var
                       :attribute attribute
-                      :query-spec (assoc query-spec
-                                         :scan-mode :iterative
-                                         :strict-order? true)
-                      :page-limit 512}]
-                    [query in-args nil]))
+                      :query-spec query-spec
+                      :probe-limit 128
+                      :underfill-fallback (if unindexed-equality?
+                                            :exact
+                                            :prefilter)}]
+                    (if-let [candidate-page (and (close-candidate-scan-entrypoint)
+                                                 (candidate-page-entrypoint))]
+                      [query in-args
+                       {:kind :proximum-iterative
+                        :candidate-page candidate-page
+                        :index-ident idx-ident
+                        :index index
+                        :entity-var entity-var
+                        :attribute attribute
+                        :query-spec (assoc query-spec
+                                           :scan-mode :iterative
+                                           :strict-order? true)
+                        :page-limit 512}]
+                      [query in-args nil]))
                 ;; Candidate paging is optional so a released/third-party
                 ;; adapter that only implements ISecondaryIndex keeps using
                 ;; the external-engine path.  Current Proximum generations
                 ;; take this bounded lane.
-                (if-let [candidate-page (candidate-page-entrypoint)]
-                  (try
-                    (let [page (candidate-page
-                                db idx-ident index query-spec nil
-                                {:limit candidate-limit})
-                          eids (->> (:candidates page)
-                                    (keep (fn [candidate]
-                                            (when (= attribute
-                                                     (:attribute candidate))
-                                              (:entity-id candidate))))
-                                    distinct
-                                    vec)
-                          query (update query :in
-                                        (fn [inputs]
-                                          (conj (vec (or inputs ['$]))
-                                                [entity-var '...])))]
-                      [query (conj (vec in-args) eids)
-                       {:kind :proximum-materialized
-                        :candidate-count (count eids)
-                        :candidate-limit candidate-limit
-                        :precision (:precision page)
-                        :recall (:recall page)
-                        :ordering (:ordering page)
-                        :ef (:ef query-spec)}])
-                    (catch Exception _
-                      (external-plan)))
-                  (external-plan))))
+                  (if-let [candidate-page (candidate-page-entrypoint)]
+                    (try
+                      (let [page (candidate-page
+                                  db idx-ident index query-spec nil
+                                  {:limit candidate-limit})
+                            eids (->> (:candidates page)
+                                      (keep (fn [candidate]
+                                              (when (= attribute
+                                                       (:attribute candidate))
+                                                (:entity-id candidate))))
+                                      distinct
+                                      vec)
+                            query (update query :in
+                                          (fn [inputs]
+                                            (conj (vec (or inputs ['$]))
+                                                  [entity-var '...])))]
+                        [query (conj (vec in-args) eids)
+                         {:kind :proximum-materialized
+                          :candidate-count (count eids)
+                          :candidate-limit candidate-limit
+                          :precision (:precision page)
+                          :recall (:recall page)
+                          :ordering (:ordering page)
+                          :ef (:ef query-spec)}])
+                      (catch Exception _
+                        (external-plan)))
+                    (external-plan)))))
             [query in-args nil])))
       ;; Candidate scans are optional accelerators. The exact scan is both the
       ;; compatibility path and the fail-safe for an adapter generation that
@@ -6287,8 +6355,10 @@
               :proximum-hybrid
               (run-materialized-vector-probe
                query-db exact-query exact-in-args run-query limit vector-access
-               #(run-prefiltered-vector-query
-                 query-db exact-query exact-in-args run-query vector-access))
+               (if (= :exact (:underfill-fallback vector-access))
+                 #(run-query exact-query exact-in-args)
+                 #(run-prefiltered-vector-query
+                   query-db exact-query exact-in-args run-query vector-access)))
 
               :proximum-prefiltered
               (run-prefiltered-vector-query

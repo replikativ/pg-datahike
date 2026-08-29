@@ -260,7 +260,7 @@
         (is (= :proximum-prefiltered (:kind filtered-access))
             "the measured entity set chooses exact distance or filtered ANN")))
 
-    (testing "an unindexed equality keeps the bounded probe first"
+    (testing "a selective unindexed equality keeps one authoritative pass"
       (let [filtered (sql/parse-sql
                       (str "SELECT id FROM vector_recheck WHERE category = 20 "
                            "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
@@ -268,8 +268,13 @@
             [_ _ filtered-access]
             (restrict indexed-db (:query filtered) (:in-args filtered)
                       (:secondary-candidate filtered))]
-        (is (= :proximum-hybrid (:kind filtered-access))
-            "common/skewed values must not force an O(N) prefilter")))
+        (is (nil? filtered-access)
+            "the primary sample avoids a probe plus a second O(N) pass")
+        (is (= filtered-access
+               (nth (restrict indexed-db (:query filtered) (:in-args filtered)
+                              (:secondary-candidate filtered))
+                    2))
+            "the row bound is stable across repeated planning")))
 
     (testing "an explicit beam does not change SQL k"
       (let [[_ args _]
