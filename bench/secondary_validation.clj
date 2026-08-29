@@ -141,7 +141,14 @@
                  @samples))))
 
 (defn- profiling-stages []
-  {:datahike-query (requiring-resolve 'datahike.api/q)
+  {:vector-candidate-restriction
+   (requiring-resolve 'datahike.pg.server/restrict-to-vector-candidates)
+   :text-candidate-restriction
+   (requiring-resolve 'datahike.pg.server/restrict-to-text-candidates)
+   :scalar-candidate-restriction
+   (requiring-resolve 'datahike.pg.server/restrict-to-scalar-order-candidates)
+   :datahike-query (requiring-resolve 'datahike.api/q)
+   :exact-cosine-distance (requiring-resolve 'datahike.pg.vector/cosine-distance)
    :candidate-page (requiring-resolve 'datahike.index.secondary/candidate-page)
    :secondary-search (requiring-resolve 'datahike.index.secondary/search-with-vt)
    :stratum-query (requiring-resolve 'stratum.api/q)
@@ -150,7 +157,10 @@
    :scriptum-generation-search (requiring-resolve 'scriptum.core/search)
    :scriptum-snapshot-search (requiring-resolve 'scriptum.core/search-store-snapshot)
    :proximum-search (requiring-resolve 'proximum.core/search)
-   :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)})
+   :proximum-api-search (requiring-resolve 'proximum.api-impl/search)
+   :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)
+   :proximum-api-filtered-search
+   (requiring-resolve 'proximum.api-impl/search-filtered)})
 
 (defn- random-vector [^java.util.Random random dimension]
   (float-array
@@ -270,7 +280,10 @@
                 exact-scalar-order-timing
                 (timings 5 20 #(rows handler scalar-order-sql))
                 exact-vector-timing
-                (profiled-timings 5 20 (select-keys stages [:datahike-query])
+                (profiled-timings 5 20
+                                  (select-keys stages
+                                               [:datahike-query
+                                                :exact-cosine-distance])
                                   #(rows handler vector-sql))
                 exact-filtered-10-timing (timings 3 10 #(rows handler filtered-10-sql))
                 exact-filtered-1-timing (timings 3 10 #(rows handler filtered-1-sql))
@@ -283,7 +296,8 @@
                 indexed-scalar-order-timing
                 (profiled-timings
                  5 20 (select-keys stages [:datahike-query :candidate-page
-                                           :stratum-query])
+                                           :stratum-query
+                                           :scalar-candidate-restriction])
                  #(rows handler scalar-order-sql))
                 text-build-start (now-nanos)
                 _ (checked handler
@@ -296,6 +310,7 @@
                 indexed-fulltext-timing
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :text-candidate-restriction
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
@@ -304,6 +319,7 @@
                 indexed-fulltext-1-timing
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :text-candidate-restriction
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
@@ -312,6 +328,7 @@
                 indexed-fulltext-01-timing
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :text-candidate-restriction
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
@@ -333,10 +350,15 @@
                                [ef {:returned (count actual)
                                     :recall-at-k (recall exact-vector actual)
                                     :timing
-                                    (profiled-timings
+                                     (profiled-timings
                                      5 20
                                      (select-keys stages
-                                                  [:datahike-query :proximum-search])
+                                                  [:vector-candidate-restriction
+                                                   :candidate-page
+                                                   :proximum-search
+                                                   :proximum-api-search
+                                                   :datahike-query
+                                                   :exact-cosine-distance])
                                      #(rows handler vector-sql))}]))
                            [40 100 200 400 800 1000]))
                 _ (checked handler "SET hnsw.ef_search = 1000")
@@ -350,17 +372,36 @@
                 indexed-filtered-1 (ids (rows handler filtered-1-sql))
                 indexed-vector-timing
                 (profiled-timings
-                 5 20 (select-keys stages [:datahike-query :proximum-search])
+                 5 20
+                 (select-keys stages
+                              [:vector-candidate-restriction
+                               :candidate-page
+                               :proximum-search
+                               :proximum-api-search
+                               :datahike-query
+                               :exact-cosine-distance])
                  #(rows handler vector-sql))
                 indexed-filtered-10-timing
                 (profiled-timings
                  3 10
-                 (select-keys stages [:datahike-query :proximum-filtered-search])
+                 (select-keys stages
+                              [:vector-candidate-restriction
+                               :secondary-search
+                               :proximum-filtered-search
+                               :proximum-api-filtered-search
+                               :datahike-query
+                               :exact-cosine-distance])
                  #(rows handler filtered-10-sql))
                 indexed-filtered-1-timing
                 (profiled-timings
                  3 10
-                 (select-keys stages [:datahike-query :proximum-filtered-search])
+                 (select-keys stages
+                              [:vector-candidate-restriction
+                               :secondary-search
+                               :proximum-filtered-search
+                               :proximum-api-filtered-search
+                               :datahike-query
+                               :exact-cosine-distance])
                  #(rows handler filtered-1-sql))]
             {:rows n
              :dimension dimension

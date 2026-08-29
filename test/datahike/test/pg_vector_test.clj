@@ -209,16 +209,17 @@
     (is (= [(get-in parsed [:secondary-candidate :entity-var]) '...]
            (second (peek (:where candidate-query)))))
 
-    (testing "a WHERE-bearing candidate declares the upstream filter dependency"
+    (testing "a WHERE-bearing candidate stays exact until full-WHERE is explicit"
       (let [filtered (sql/parse-sql
                       (str "SELECT id FROM vector_recheck WHERE id > 1 "
                            "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
                       (dbi/-schema db) db)
-            [filtered-query _ _]
+            [filtered-query filtered-args filtered-access]
             (restrict indexed-db (:query filtered) (:in-args filtered)
                       (:secondary-candidate filtered))]
-        (is (= 'datahike.pg.secondary/filtered-candidates
-               (ffirst (peek (:where filtered-query)))))))
+        (is (= (:query filtered) filtered-query))
+        (is (= (:in-args filtered) filtered-args))
+        (is (nil? filtered-access))))
 
     (testing "an explicit beam does not change SQL k"
       (let [[_ args _]

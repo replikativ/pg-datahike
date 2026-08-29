@@ -5705,14 +5705,16 @@
    index can intentionally change membership, as it can in pgvector; exact
    recheck guarantees distances and predicates only within its candidates.
 
-   WHERE-bearing plans use the generic external-engine clause so Datahike can
-   run selective predicates first and pass their EntityBitSet to Proximum's
-   native filtered HNSW search.  An unfiltered top-k has no upstream relation
-   to compose, so materialize its bounded candidate page once and pass the
-   entity IDs to the authoritative Datalog distance/recheck query.  This avoids
-   routing a ten-row access path through the general external-engine planner
-   while keeping projection, exact distance, ordering, and LIMIT in one SQL
-   implementation."
+   A WHERE-bearing plan currently stays exact. Merely requiring an entity
+   binding does not prove that every SQL predicate has run, so inserting a
+   filtered ANN marker into the freely reordered Datalog plan can search a
+   partial filter and lose valid top-k rows. A later first-class filtered-access
+   operator can restore this path with an explicit full-WHERE dependency.
+
+   An unfiltered top-k has no upstream relation to compose, so materialize its
+   bounded candidate page once and pass the entity IDs to the authoritative
+   Datalog distance/recheck query. This keeps projection, exact distance,
+   ordering, and LIMIT in one SQL implementation."
   [db query in-args
    {:keys [entity-var attribute metric query-vector limit candidate-limit ef
            prefer-entity-filter?] :as spec}]
@@ -5734,9 +5736,7 @@
                   external-plan
                   (fn []
                     (let [spec-var (gensym "?proximum-query-spec")
-                          candidate-fn (if prefer-entity-filter?
-                                         'datahike.pg.secondary/filtered-candidates
-                                         'datahike.pg.secondary/candidates)]
+                          candidate-fn 'datahike.pg.secondary/candidates]
                       [(-> query
                            (update :in (fn [inputs]
                                          (conj (vec (or inputs ['$])) spec-var)))
@@ -5748,7 +5748,7 @@
                         :candidate-limit candidate-limit
                         :ef (:ef query-spec)}]))]
               (if prefer-entity-filter?
-                (external-plan)
+                [query in-args nil]
                 ;; Candidate paging is optional so a released/third-party
                 ;; adapter that only implements ISecondaryIndex keeps using
                 ;; the external-engine path.  Current Proximum generations
