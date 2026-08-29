@@ -37,6 +37,13 @@
        (min (dec (count sorted-values))
             (long (Math/floor (* p (count sorted-values)))))))
 
+(defn- timing-summary [values]
+  (let [values (vec (sort values))]
+    {:p50-ms (percentile values 0.50)
+     :p95-ms (percentile values 0.95)
+     :min-ms (first values)
+     :max-ms (peek values)}))
+
 (defn- timings [warmups iterations f]
   (dotimes [_ warmups] (f))
   (let [values (->> (repeatedly iterations
@@ -45,10 +52,78 @@
                                     (f)
                                     (elapsed-ms start))))
                     sort vec)]
-    {:p50-ms (percentile values 0.50)
-     :p95-ms (percentile values 0.95)
-     :min-ms (first values)
-     :max-ms (peek values)}))
+    (timing-summary values)))
+
+(def ^:dynamic *stage-recorder*
+  "Per-query stage accumulator used only by the maintainer benchmark."
+  nil)
+
+(defn- stage-wrapper [stage f]
+  (fn [& args]
+    (let [start (now-nanos)]
+      (try
+        (apply f args)
+        (finally
+          (when *stage-recorder*
+            (swap! *stage-recorder*
+                   (fn [stages]
+                     (-> stages
+                         (update-in [stage :nanos] (fnil + 0)
+                                    (- (now-nanos) start))
+                         (update-in [stage :calls] (fnil inc 0)))))))))))
+
+(defn- profiled-timings
+  "End-to-end latency plus inclusive time in selected nested calls.
+
+   Stage times are diagnostic rather than a subtraction identity: the
+   Datahike query stage contains the Scriptum/Proximum stage when an external
+   engine runs inside d/q. Recording starts after warmup so setup calls cannot
+   pollute the per-statement distributions."
+  [warmups iterations stages f]
+  (dotimes [_ warmups] (f))
+  (let [samples (atom {})
+        replacements
+        (into {}
+              (map (fn [[stage v]] [v (stage-wrapper stage @v)]))
+              stages)
+        totals
+        (with-redefs-fn
+          replacements
+          (fn []
+            (vec
+             (repeatedly
+              iterations
+              (fn []
+                (let [per-query (atom {})
+                      start (now-nanos)]
+                  (binding [*stage-recorder* per-query]
+                    (f))
+                  (swap! samples
+                         (fn [acc]
+                           (reduce-kv
+                            (fn [acc stage {:keys [nanos calls]}]
+                              (-> acc
+                                  (update-in [stage :elapsed-ms] (fnil conj [])
+                                             (/ (double nanos) 1e6))
+                                  (update-in [stage :calls] (fnil conj []) calls)))
+                            acc @per-query)))
+                  (elapsed-ms start)))))))]
+    (assoc (timing-summary totals)
+           :stages
+           (into {}
+                 (map (fn [[stage {:keys [elapsed-ms calls]}]]
+                        [stage (assoc (timing-summary elapsed-ms)
+                                      :calls-per-query
+                                      {:min (apply min calls)
+                                       :max (apply max calls)})]))
+                 @samples))))
+
+(defn- profiling-stages []
+  {:datahike-query (requiring-resolve 'datahike.api/q)
+   :candidate-page (requiring-resolve 'datahike.index.secondary/candidate-page)
+   :secondary-search (requiring-resolve 'datahike.index.secondary/search-with-vt)
+   :proximum-search (requiring-resolve 'proximum.core/search)
+   :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)})
 
 (defn- random-vector [^java.util.Random random dimension]
   (float-array
@@ -149,6 +224,7 @@
                       (random-vector random dimension)})
                    (range start (min n (+ start 1000))))))
           (let [load-ms (elapsed-ms load-start)
+                stages (profiling-stages)
                 exact-fulltext (ids (rows handler fulltext-sql))
                 exact-fulltext-1 (ids (rows handler fulltext-1-sql))
                 exact-fulltext-01 (ids (rows handler fulltext-01-sql))
@@ -166,7 +242,9 @@
                 (timings 3 10 #(rows handler fulltext-01-sql))
                 exact-scalar-order-timing
                 (timings 5 20 #(rows handler scalar-order-sql))
-                exact-vector-timing (timings 5 20 #(rows handler vector-sql))
+                exact-vector-timing
+                (profiled-timings 5 20 (select-keys stages [:datahike-query])
+                                  #(rows handler vector-sql))
                 exact-filtered-10-timing (timings 3 10 #(rows handler filtered-10-sql))
                 exact-filtered-1-timing (timings 3 10 #(rows handler filtered-1-sql))
                 scalar-build-start (now-nanos)
@@ -176,7 +254,9 @@
                 scalar-build-ms (elapsed-ms scalar-build-start)
                 indexed-scalar-order (ids (rows handler scalar-order-sql))
                 indexed-scalar-order-timing
-                (timings 5 20 #(rows handler scalar-order-sql))
+                (profiled-timings
+                 5 20 (select-keys stages [:datahike-query :candidate-page])
+                 #(rows handler scalar-order-sql))
                 text-build-start (now-nanos)
                 _ (checked handler
                            (str "CREATE INDEX secondary_bench_body_gin "
@@ -185,11 +265,18 @@
                 indexed-fulltext (ids (rows handler fulltext-sql))
                 indexed-fulltext-1 (ids (rows handler fulltext-1-sql))
                 indexed-fulltext-01 (ids (rows handler fulltext-01-sql))
-                indexed-fulltext-timing (timings 3 10 #(rows handler fulltext-sql))
+                indexed-fulltext-timing
+                (profiled-timings
+                 3 10 (select-keys stages [:datahike-query :secondary-search])
+                 #(rows handler fulltext-sql))
                 indexed-fulltext-1-timing
-                (timings 3 10 #(rows handler fulltext-1-sql))
+                (profiled-timings
+                 3 10 (select-keys stages [:datahike-query :secondary-search])
+                 #(rows handler fulltext-1-sql))
                 indexed-fulltext-01-timing
-                (timings 3 10 #(rows handler fulltext-01-sql))
+                (profiled-timings
+                 3 10 (select-keys stages [:datahike-query :secondary-search])
+                 #(rows handler fulltext-01-sql))
                 vector-build-start (now-nanos)
                 _ (checked handler
                            (str "CREATE INDEX secondary_bench_embedding_hnsw "
@@ -205,8 +292,12 @@
                              (let [actual (ids (rows handler vector-sql))]
                                [ef {:returned (count actual)
                                     :recall-at-k (recall exact-vector actual)
-                                    :timing (timings 5 20
-                                                     #(rows handler vector-sql))}]))
+                                    :timing
+                                    (profiled-timings
+                                     5 20
+                                     (select-keys stages
+                                                  [:datahike-query :proximum-search])
+                                     #(rows handler vector-sql))}]))
                            [40 100 200 400 800 1000]))
                 _ (checked handler "SET hnsw.ef_search = 1000")
                 indexed-vector (ids (rows handler vector-sql))
@@ -217,11 +308,20 @@
                 (mapv recall exact-quality-sample indexed-quality-sample)
                 indexed-filtered-10 (ids (rows handler filtered-10-sql))
                 indexed-filtered-1 (ids (rows handler filtered-1-sql))
-                indexed-vector-timing (timings 5 20 #(rows handler vector-sql))
+                indexed-vector-timing
+                (profiled-timings
+                 5 20 (select-keys stages [:datahike-query :proximum-search])
+                 #(rows handler vector-sql))
                 indexed-filtered-10-timing
-                (timings 3 10 #(rows handler filtered-10-sql))
+                (profiled-timings
+                 3 10
+                 (select-keys stages [:datahike-query :proximum-filtered-search])
+                 #(rows handler filtered-10-sql))
                 indexed-filtered-1-timing
-                (timings 3 10 #(rows handler filtered-1-sql))]
+                (profiled-timings
+                 3 10
+                 (select-keys stages [:datahike-query :proximum-filtered-search])
+                 #(rows handler filtered-1-sql))]
             {:rows n
              :dimension dimension
              :hnsw {:m 16 :ef-construction hnsw-ef-construction}
