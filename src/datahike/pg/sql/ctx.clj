@@ -30,7 +30,8 @@
             [datahike.api :as d]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.fns :as fns]
-            [datahike.pg.sql.params :as params])
+            [datahike.pg.sql.params :as params]
+            [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.expression Alias]
            [net.sf.jsqlparser.schema Column Table]))
 
@@ -384,6 +385,10 @@
    ;; the `:__null__` sentinel becomes joinable and NULL = NULL rows
    ;; reappear.
    :required-join-patterns (atom #{})
+   ;; A top-level equality binds a unique attribute to one concrete value.
+   ;; For a single-table SELECT this proves result cardinality <= 1 and lets
+   ;; stmt/translate-select omit its otherwise-default entity-id ordering.
+   :unique-value-bound? (atom false)
    ;; Prepared-statement parameter placeholders. Map {index → ?var},
    ;; populated when translate-expr encounters a JSqlParser JdbcParameter
    ;; (`?` or `$N`). The handler looks at `:param-placeholders` on the
@@ -396,7 +401,7 @@
    :with-vars :in-params :in-args :vector-distance-candidates
    :text-search-candidates
    :runtime-subqueries? :left-join-evars :nullable-vars
-   :required-join-patterns :param-placeholders])
+   :required-join-patterns :unique-value-bound? :param-placeholders])
 
 (defn snapshot
   "Capture every mutable slot of the translation context.
@@ -888,6 +893,8 @@
         (when match?
           (add-clause! ctx [(:evar c) (:attr c) v])
           (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) v])
+          (when (get-in (:schema ctx) [(:attr c) :db/unique])
+            (reset! (:unique-value-bound? ctx) true))
           true)))))
 
 (defn bind-col-param!
@@ -896,16 +903,40 @@
    engine seeks the index with the bound value instead of scanning a
    get-else binding + equality predicate (this was why `pgbench -M
    prepared` point lookups were 10x slower than interpolated literals).
-   SQL `col = NULL` must yield zero rows: the `(some? ?pN)` guard
-   enforces that — a nil `:in` binding degrades the pattern itself to a
-   scan, but the guard then rejects every row. Same soundness rules as
-   bind-col-value! (top-level conjunct, plain column). Returns true
-   when handled."
+   SQL `col = NULL` must yield zero rows: Execute-time coercion replaces
+   NULL (and values that cannot inhabit the column's storage type) with
+   the private seek-no-match sentinel, so the pattern remains an index
+   seek and cannot become a nil wildcard scan. Same soundness rules as
+   bind-col-value! (top-level conjunct, plain column). Returns true when
+   handled."
   [ctx resolved pvar]
   (when (symbol? pvar)
     (when-let [c (plain-join-col ctx resolved)]
-      (let [vtype (get-in (:schema ctx) [(:attr c) :db/valueType])
-            ;; A datom pattern matches by value equality, which is
+      (when-let [param-idx (some (fn [[idx v]] (when (= v pvar) idx))
+                                 @(:param-placeholders ctx))]
+        (let [vtype (get-in (:schema ctx) [(:attr c) :db/valueType])
+              param-oid (get params/*declared-param-oids* param-idx)
+              ;; PostgreSQL compares an exact column with a float parameter
+              ;; in floating-point space. That relation is many-to-one above
+              ;; 2^53, so it cannot be represented by reverse-coercing the
+              ;; parameter to one exact AVET key. Keep the predicate path.
+              float-param? (contains? #{types/oid-float4 types/oid-float8}
+                                      param-oid)
+              exact-storage? (contains? #{:db.type/long :db.type/bigdec} vtype)
+              ;; Keep this an audited allowlist. Native bigint/ref/tuple and
+              ;; temporal carriers need their own exact SQL-parameter to
+              ;; storage-key proof; falling back to sql-eq? is slower but
+              ;; correct. In particular :db.type/bigint stores BigInteger,
+              ;; not the Long advertised at the wire boundary.
+              seek-storage? (contains? #{:db.type/long :db.type/double
+                                         :db.type/float :db.type/bigdec
+                                         :db.type/string :db.type/boolean
+                                         :db.type/uuid :db.type/keyword
+                                         :db.type/symbol}
+                                       vtype)]
+          (when (and seek-storage?
+                     (not (and float-param? exact-storage?)))
+            (let [;; A datom pattern matches by value equality, which is
             ;; type-sensitive, so the seek key must be the type the
             ;; column actually STORES. bind-col-value! has always known
             ;; this -- it refuses the fast path outright when the
@@ -915,12 +946,20 @@
             ;; 1.5` on a float8 column seeked with a BigDecimal and
             ;; matched nothing. Narrowing keeps the seek AND makes it
             ;; correct; see fns/seek-key for the not-representable case.
-            kvar (fresh-var! ctx)]
-        (add-clause! ctx [(list 'datahike.pg.sql/seek-key pvar vtype) kvar])
-        (add-clause! ctx [(:evar c) (:attr c) kvar])
-        (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) kvar])
-        (add-clause! ctx [(list 'some? pvar)])
-        true))))
+                  kvar (fresh-var! ctx)]
+        ;; Coerce once at the prepared-argument boundary and make the
+        ;; storage-compatible key an ordinary scalar :in binding.  Keeping
+        ;; seek-key as a query function made the AVET pattern look unbound to
+        ;; Datahike's direct executor and turned a point lookup into relation
+        ;; processing.  A separate binding per occurrence is necessary when
+        ;; one `$N` is compared with columns of different storage types.
+              (swap! (:in-params ctx) conj kvar)
+              (swap! (:in-args ctx) conj (params/seek-param-ref param-idx vtype))
+              (add-clause! ctx [(:evar c) (:attr c) kvar])
+              (swap! (:required-join-patterns ctx) conj [(:evar c) (:attr c) kvar])
+              (when (get-in (:schema ctx) [(:attr c) :db/unique])
+                (reset! (:unique-value-bound? ctx) true))
+              true)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Expression helpers

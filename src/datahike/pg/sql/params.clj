@@ -30,6 +30,7 @@
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
+            [datahike.pg.sql.fns :as fns]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
@@ -125,6 +126,36 @@
    Execute time to substitute real values."
   [x]
   (instance? ParamRef x))
+
+(defn seek-param-ref
+  "Return a ParamRef whose bound value is coerced once into the exact
+   Datahike storage representation required by an indexed equality seek.
+
+   Keep the coercion as data on the placeholder rather than as a closure so
+   parsed plans remain readable and comparable.  A single SQL parameter can
+   be compared with columns of different storage types; callers therefore
+   create one transformed ParamRef per seek instead of mutating the raw
+   parameter binding shared by every occurrence of `$N`."
+  [idx value-type]
+  (assoc (->ParamRef idx) ::coercion [:seek-key value-type]))
+
+(defn resolve-param-ref
+  "Resolve one ParamRef through the 1-based `fetch` function, applying any
+   boundary coercion carried by the placeholder."
+  [ref fetch]
+  (let [value (fetch (:idx ref))]
+    (case (first (::coercion ref))
+      :seek-key
+      ;; SQL `col = NULL` is UNKNOWN and therefore cannot match.  A nil
+      ;; Datahike pattern component means wildcard, so never pass nil into
+      ;; the index seek: use the same no-match sentinel as an inexact numeric
+      ;; comparison instead.
+      (let [value-type (second (::coercion ref))]
+        (if (or (nil? value) (= :__null__ value))
+          (fns/seek-no-match-key value-type)
+          (fns/seek-key value value-type)))
+
+      value)))
 
 (def ^:dynamic *bound-params*
   "Dynamically bound at Execute time to a 0-indexed vector (or nil if
@@ -398,7 +429,7 @@
   (let [fetch (if (fn? bound) bound #(nth bound (dec (long %))))]
     (letfn [(walk [v]
               (cond
-                (param-ref? v)   (fetch (:idx v))
+                (param-ref? v)   (resolve-param-ref v fetch)
                 (call-marker? v) v
                 (map? v)         (reduce-kv (fn [m k x]
                                               (assoc m k (walk x)))

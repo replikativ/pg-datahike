@@ -249,6 +249,7 @@
 (def filter-percentile-disc fns/filter-percentile-disc)
 (def filter-mode            fns/filter-mode)
 (def seek-key fns/seek-key)
+(def resolve-param-ref params/resolve-param-ref)
 (def filter-sum-float4 fns/filter-sum-float4)
 (def sql-f4+ fns/sql-f4+)
 (def sql-f4- fns/sql-f4-)

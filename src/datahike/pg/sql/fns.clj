@@ -917,6 +917,56 @@
    index lookup correctly finds nothing."
   ::seek-no-match)
 
+(defn seek-no-match-key
+  "Return a seek key whose JVM type cannot inhabit `value-type`.
+
+   A single sentinel is not safe for every Datahike scalar type: keywords
+   are valid stored values too.  NULL equality must never find a user value,
+   so keyword columns use a String and ref columns avoid a Keyword that
+   Datahike could resolve as an ident.  The remaining SQL-visible storage
+   types cannot contain this private keyword."
+  [value-type]
+  (if (contains? #{:db.type/keyword :db.type/ref} value-type)
+    "\u0000pg-datahike/no-seek-match"
+    seek-no-match))
+
+(defn- exact-long-seek-key
+  "Return the exactly equal int64 representation of `v`, or
+   `seek-no-match` when none exists.
+
+   Never decide integrality through `double`: that loses integer bits above
+   2^53, rounds high-scale decimals, and represents Long/MAX_VALUE as 2^63.
+   PostgreSQL's bigint = numeric comparison is exact, so reverse-coercing the
+   comparison constant for an index seek must be exact and range checked too."
+  [v]
+  (try
+    (cond
+      (instance? java.math.BigDecimal v)
+      (.longValueExact ^java.math.BigDecimal v)
+
+      (instance? java.math.BigInteger v)
+      (.longValueExact ^java.math.BigInteger v)
+
+      (ratio? v)
+      (let [n (numerator v)
+            d (denominator v)]
+        (if (zero? (mod n d))
+          (exact-long-seek-key (quot n d))
+          seek-no-match))
+
+      (integer? v)
+      (.longValueExact ^java.math.BigInteger (biginteger v))
+
+      (or (instance? Double v) (instance? Float v))
+      (let [d (double v)]
+        (if (Double/isFinite d)
+          (.longValueExact (java.math.BigDecimal/valueOf d))
+          seek-no-match))
+
+      :else seek-no-match)
+    (catch ArithmeticException _
+      seek-no-match)))
+
 (defn seek-key
   "Narrow a comparison constant to an attribute's stored type so that
    `col = <const>` can stay an INDEX SEEK rather than a scan.
@@ -935,17 +985,33 @@
   [v vtype]
   (cond
     (or (nil? v) (= :__null__ v)) v
+
+    (= vtype :db.type/keyword)
+    (cond
+      (keyword? v) v
+      (symbol? v) (keyword v)
+      (and (string? v) (not (str/blank? v))) (keyword v)
+      :else (seek-no-match-key vtype))
+
+    (= vtype :db.type/symbol)
+    (cond
+      (symbol? v) v
+      (keyword? v) (symbol (namespace v) (name v))
+      (and (string? v) (not (str/blank? v))) (symbol v)
+      :else (seek-no-match-key vtype))
+
+    (= vtype :db.type/bigdec)
+    (cond
+      (types/numeric-special? v) (types/numeric-value->storage v)
+      (number? v) (bigdec v)
+      :else (seek-no-match-key vtype))
+
     (not (number? v)) v
     :else
     (case vtype
-      :db.type/long   (cond
-                        (integer? v) v
-                        ;; exactly integral -> the integer it equals
-                        (== v (Math/rint (double v))) (long v)
-                        :else seek-no-match)
+      :db.type/long   (exact-long-seek-key v)
       :db.type/double (double v)
       :db.type/float  (float v)
-      :db.type/bigdec (bigdec v)
       v)))
 
 (defn- temporal-instant
