@@ -363,12 +363,26 @@ public final class PgWireServer {
         final short[] resultFormats;
         /** True once a Describe('P', …) has emitted RowDescription; Execute then skips it. */
         boolean described;
+        /**
+         * A row-returning statement is executed once and retained while
+         * Execute(maxRows) drains it. This is the eager backing for PostgreSQL
+         * portal suspension; a future RowStream can replace the array without
+         * changing the portal lifecycle.
+         */
+        QueryResult activeResult;
+        int nextRow;
+        boolean complete;
+        String completionTag;
 
         Portal(PreparedStmt stmt, Object[] boundParams, short[] resultFormats) {
             this.stmt = stmt;
             this.boundParams = boundParams;
             this.resultFormats = resultFormats;
             this.described = false;
+            this.activeResult = null;
+            this.nextRow = 0;
+            this.complete = false;
+            this.completionTag = null;
         }
     }
 
@@ -996,6 +1010,10 @@ public final class PgWireServer {
                         // The group errored — roll back the implicit
                         // transaction it opened (if any).
                         try { handler.rollbackImplicit(); } catch (Exception ignore) {}
+                        // An error aborts the transaction/command context in
+                        // which every non-holdable portal was created. Do not
+                        // retain eager rows or allow stale resume after Sync.
+                        portals.clear();
                         sendReadyForQuery(out, txStatus[0]);
                         out.flush();
                         inError[0] = false;
@@ -1062,13 +1080,27 @@ public final class PgWireServer {
                     }
 
                     switch (msgType) {
-                        case 'Q' -> handleQuery(body, out, txStatus, handler, copyState, batch);
+                        case 'Q' -> {
+                            String simpleQuery = readCString(ByteBuffer.wrap(body));
+                            if (!stripComments(simpleQuery).trim().isEmpty()) {
+                                // Every nonempty Simple Query creates/replaces
+                                // PostgreSQL's unnamed portal, even while an
+                                // explicit transaction remains open.
+                                portals.remove("");
+                            }
+                            handleQuery(body, out, txStatus, handler, copyState, batch);
+                            // Simple Query includes its own transaction
+                            // boundary. BEGIN leaves 'T'; COMMIT, ROLLBACK,
+                            // autocommit, and failed transactions invalidate
+                            // every non-holdable extended-query portal.
+                            if (txStatus[0] != 'T') portals.clear();
+                        }
                         case 'X' -> { return; }
                         case 'P' -> handleParse(body, extBatch.curOut, statements, handler);
                         case 'B' -> handleBind(body, extBatch.curOut, statements, portals);
                         case 'D' -> handleDescribe(body, extBatch.curOut, statements, portals, handler);
                         case 'E' -> handleExecuteMsg(body, out, portals, txStatus, handler, copyState, extBatch);
-                        case 'S' -> handleSync(out, txStatus, handler, extBatch);
+                        case 'S' -> handleSync(out, txStatus, handler, extBatch, portals);
                         case 'C' -> handleClose(body, extBatch.curOut, statements, portals);
                         // Flush ('H'): PG asks the server to send all
                         // pending output. With Option-A buffering this
@@ -1840,6 +1872,12 @@ public final class PgWireServer {
             throw new PgProtocolException("26000",
                 "prepared statement \"" + stmtName + "\" does not exist");
         }
+        // Only the unnamed portal is implicitly replaceable. PostgreSQL
+        // requires an explicit Close before rebinding a live named portal.
+        if (!portalName.isEmpty() && portals.containsKey(portalName)) {
+            throw new PgProtocolException("42P03",
+                "cursor \"" + portalName + "\" already exists");
+        }
 
         // Parameter format codes: 0 codes = all text, 1 code = apply to
         // all, N codes = one per param.
@@ -1905,6 +1943,7 @@ public final class PgWireServer {
         trace("recv Describe '" + (char) descType + "' name=\"" + name + "\"");
 
         PreparedStmt stmt;
+        Portal describedPortal = null;
         if (descType == 'S') {
             stmt = statements.get(name);
             if (stmt == null) {
@@ -1948,6 +1987,7 @@ public final class PgWireServer {
                     "portal \"" + name + "\" does not exist");
             }
             stmt = p.stmt;
+            describedPortal = p;
         } else {
             throw new PgProtocolException("08P01",
                 "invalid Describe type: " + (char) descType);
@@ -1961,9 +2001,12 @@ public final class PgWireServer {
             out.writeInt(4);
             trace("send NoData");
         } else {
+            short[] resultFormats = describedPortal == null
+                    ? null : describedPortal.resultFormats;
+            validateResultFormats(resultFormats, meta.columnNames.length);
             sendRowDescription(out, meta.columnNames, meta.columnOids,
                               meta.columnTableOids, meta.columnAttnums,
-                              meta.columnTypmods, null);
+                              meta.columnTypmods, resultFormats);
             trace("send RowDescription cols=" + meta.columnNames.length);
             // Mark BOTH the portal and the underlying statement as
             // described. pgJDBC caches row metadata per-statement: once
@@ -2025,9 +2068,34 @@ public final class PgWireServer {
             return;
         }
 
-        QueryResult result = handler.executePrepared(portal.stmt.parsed, portal.boundParams);
-        // Clear any interrupt bit left by the safety-net cancel path.
-        Thread.interrupted();
+        // An exhausted portal is not executed again. PostgreSQL reports the
+        // number of rows processed by *this* Execute, so an EOF Execute is
+        // SELECT 0/FETCH 0 rather than repeating the statement's total.
+        // Keep only that tiny zero-row tag after completion so the eager
+        // result array can be reclaimed immediately.
+        if (portal.complete) {
+            QueryResult flushErr = flushExtHeld(out, handler, extBatch);
+            if (flushErr != null) {
+                throw new PgProtocolException(
+                    flushErr.sqlstate != null ? flushErr.sqlstate : "XX000",
+                    flushErr.error, flushErr.errorFields);
+            }
+            extBatch.cur.writeTo(out);
+            extBatch.resetCur();
+            sendCommandComplete(out, portal.completionTag);
+            return;
+        }
+
+        QueryResult result = portal.activeResult;
+        if (result == null) {
+            result = handler.executePrepared(portal.stmt.parsed, portal.boundParams);
+            // Clear any interrupt bit left by the safety-net cancel path.
+            Thread.interrupted();
+            if (result != null && result.error == null
+                    && result.columnNames != null && result.columnNames.length > 0) {
+                portal.activeResult = result;
+            }
+        }
 
         if (result != null && result.txStatus != '\0') {
             txStatus[0] = result.txStatus;
@@ -2101,8 +2169,16 @@ public final class PgWireServer {
             extBatch.resetCur();
             sendCommandComplete(out, result.commandTag);
             trace("send CommandComplete \"" + result.commandTag + "\"");
+            // Transaction-ending commands destroy non-holdable portals
+            // during Execute, not at the later Sync. This matters when a
+            // client pipelines another Execute before that Sync arrives.
+            if ("COMMIT".equals(result.commandTag)
+                    || "ROLLBACK".equals(result.commandTag)) {
+                portals.clear();
+            }
         } else {
             // SELECT or other row-returning result.
+            validateResultFormats(portal.resultFormats, result.columnNames.length);
             QueryResult flushErr = flushExtHeld(out, handler, extBatch);
             if (flushErr != null) {
                 throw new PgProtocolException(
@@ -2123,16 +2199,41 @@ public final class PgWireServer {
                                   result.columnTypmods,
                                   portal.resultFormats);
                 trace("send RowDescription cols=" + result.columnNames.length);
+                // A RowDescription emitted by Execute belongs to this portal.
+                // Mark it so a resumed Execute sends only the next DataRows.
+                portal.described = true;
             } else {
                 trace("skip RowDescription (already described: portal=" + portal.described
                       + " stmt=" + portal.stmt.described + ")");
             }
-            for (String[] row : result.rows) {
-                sendDataRow(out, row, result.columnOids, portal.resultFormats);
+            int start = portal.nextRow;
+            // PostgreSQL's exec_execute_message maps every max_rows <= 0
+            // value to FETCH_ALL, not only zero.
+            int end = maxRows <= 0
+                    ? result.rows.length
+                    : (int) Math.min((long) result.rows.length,
+                                     (long) start + (long) maxRows);
+            for (int i = start; i < end; i++) {
+                sendDataRow(out, result.rows[i], result.columnOids, portal.resultFormats);
             }
-            trace("send DataRow x" + result.rows.length);
-            sendCommandComplete(out, result.commandTag);
-            trace("send CommandComplete \"" + result.commandTag + "\"");
+            portal.nextRow = end;
+            trace("send DataRow x" + (end - start));
+            int pageRows = end - start;
+            // PostgreSQL cannot know that the producer is exactly exhausted
+            // when it stopped after maxRows tuples. It suspends on an exact
+            // boundary; the next Execute probes EOF and returns SELECT 0.
+            boolean stoppedAtLimit = maxRows > 0 && pageRows == maxRows;
+            if (end < result.rows.length || stoppedAtLimit) {
+                sendPortalSuspended(out);
+                trace("send PortalSuspended at row " + end);
+            } else {
+                portal.complete = true;
+                String pageTag = commandTagForPage(result.commandTag, pageRows);
+                portal.completionTag = commandTagForPage(result.commandTag, 0);
+                portal.activeResult = null;
+                sendCommandComplete(out, pageTag);
+                trace("send CommandComplete \"" + pageTag + "\"");
+            }
         }
 
         // Per PG spec, unnamed portals persist until end-of-transaction
@@ -2148,8 +2249,20 @@ public final class PgWireServer {
         // overflows it, and handleSync/'H' drain the rest.
     }
 
+    private static String commandTagForPage(String commandTag, int rowCount) {
+        if (commandTag == null) return "SELECT " + rowCount;
+        if (commandTag.startsWith("SELECT ")) return "SELECT " + rowCount;
+        if (commandTag.startsWith("FETCH ")) return "FETCH " + rowCount;
+        if (commandTag.startsWith("INSERT ")) return "INSERT 0 " + rowCount;
+        if (commandTag.startsWith("UPDATE ")) return "UPDATE " + rowCount;
+        if (commandTag.startsWith("DELETE ")) return "DELETE " + rowCount;
+        if (commandTag.startsWith("MERGE ")) return "MERGE " + rowCount;
+        return commandTag;
+    }
+
     private void handleSync(DataOutputStream out, char[] txStatus,
-                             QueryHandler handler, ExtBatchBuffer extBatch) throws IOException {
+                             QueryHandler handler, ExtBatchBuffer extBatch,
+                             java.util.Map<String, Portal> portals) throws IOException {
         trace("recv Sync → send RFQ '" + txStatus[0] + "'");
         // Sync ends the extended-query message group. Drain any
         // accumulated batch (commits held INSERTs) and any cur-buffer
@@ -2181,6 +2294,14 @@ public final class PgWireServer {
                           implErr.error, implErr.errorFields);
                 if (txStatus[0] == 'T') txStatus[0] = 'E';
             }
+        }
+        // A non-holdable portal is transaction-scoped. Sync ends an implicit
+        // transaction, while an explicit transaction keeps status 'T' across
+        // Syncs. COMMIT/ROLLBACK, an aborted explicit transaction, or an
+        // implicit commit failure therefore all invalidate retained results.
+        // This also releases the eager String[][] backing promptly.
+        if (txStatus[0] != 'T') {
+            portals.clear();
         }
         sendReadyForQuery(out, txStatus[0]);
         out.flush();
@@ -2318,6 +2439,22 @@ public final class PgWireServer {
         return formats[i];
     }
 
+    private static void validateResultFormats(short[] formats, int columnCount) {
+        if (formats == null || formats.length == 0) return;
+        if (formats.length != 1 && formats.length != columnCount) {
+            throw new PgProtocolException(
+                "08P01",
+                "bind message has " + formats.length
+                    + " result formats but query has " + columnCount + " columns");
+        }
+        for (short format : formats) {
+            if (format != 0 && format != 1) {
+                throw new PgProtocolException(
+                    "08P01", "unsupported result format code: " + format);
+            }
+        }
+    }
+
     private void sendRowDescription(DataOutputStream out, String[] names, int[] oids,
                                     int[] tableOids, short[] attnums,
                                     int[] typmods,
@@ -2401,6 +2538,11 @@ public final class PgWireServer {
         out.write(tagBytes);
         out.writeByte(0);
 
+    }
+
+    private void sendPortalSuspended(DataOutputStream out) throws IOException {
+        out.writeByte('s');
+        out.writeInt(4);
     }
 
     /**

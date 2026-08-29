@@ -11,14 +11,6 @@
 # regression in those. Root-cause taxonomy lives in the triage notes
 # (.internal/triage/) and doc/design-alignment.md "Coverage tail".
 #
-# Deselected (NOT listed here, removed from the run via run.sh --deselect):
-#   tests/test_cursor.py::TestIterableCursor  (the whole class)
-#   — server-side cursor streaming: asyncpg fetches in portal batches
-#     expecting PortalSuspended (portal-streaming structural gap, A3).
-#     Against our non-streaming server these are unreliable — _02 hangs,
-#     _06 flips by order — so they can't be stable expected-failures.
-#     The deterministic TestCursor tests still run (02/04 listed below).
-#
 # THIS MANIFEST TRACKS CI, NOT YOUR LAPTOP. A local `bash run.sh` and the
 # CircleCI job disagree substantially — as of this writing 95 passed / 74
 # failed locally against 45 / 127 in CI, on the same commit and a freshly

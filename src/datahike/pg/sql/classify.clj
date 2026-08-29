@@ -1215,11 +1215,17 @@
   [^String sql toks]
   (let [name (ident-text (first toks))
         for-idx (find-kw-idx toks "for")
-        for-tok (when for-idx (nth toks for-idx nil))]
+        for-tok (when for-idx (nth toks for-idx nil))
+        options (when for-idx (take for-idx toks))
+        with-hold? (boolean
+                    (some (fn [[a b]]
+                            (and (kw=? a "with") (kw=? b "hold")))
+                          (partition 2 1 options)))]
     (if for-idx
-      {:kind :declare-cursor
-       :name (when name (str/lower-case name))
-       :inner-sql (text-tail sql (:end for-tok))}
+      (cond-> {:kind :declare-cursor
+               :name (when name (str/lower-case name))
+               :inner-sql (text-tail sql (:end for-tok))}
+        with-hold? (assoc :with-hold? true))
       {:kind :generic-sql})))
 
 (def ^:private cursor-directions

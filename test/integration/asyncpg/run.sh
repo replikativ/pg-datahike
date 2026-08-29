@@ -63,27 +63,14 @@ echo "[run] python -m pytest -v ${MODULES[*]}"
 echo "[run] full output -> ${LOG}"
 
 # Run each module as its OWN pytest invocation wrapped in a hard wall-clock
-# `timeout`. A single combined run can hang indefinitely: a server-side
-# protocol desync (e.g. the order-dependent test_cursor_iterable_02 stall)
-# leaves asyncpg blocked inside its C-extension socket read, which neither
+# `timeout`. A server-side protocol desync can leave asyncpg blocked inside
+# its C-extension socket read, which neither
 # pytest-timeout (signal can't interrupt the C select) nor a soft cap can
 # unstick — only an external SIGKILL. Per-module + `timeout` means a hung
 # module is killed and counted, and the remaining modules still run, so the
 # suite always completes and reports. Per-module invocation also gives each
 # module a clean interpreter (less cross-module state bleed).
 PER_MODULE_TIMEOUT="${ASYNCPG_MODULE_TIMEOUT:-120}"
-
-# Deselect the whole async-iterable-cursor class. It exercises server-side
-# cursor STREAMING (asyncpg fetches rows in portal batches expecting
-# PortalSuspended) — a known structural gap (portal streaming / A3, see
-# doc/design-alignment.md). Against our non-streaming server these tests are
-# unreliable: test_cursor_iterable_02 hangs outright, and _06 flips
-# pass/fail by execution order. Flaky/hanging tests can't be expressed as
-# stable "expected failures", so the class is removed from collection. The
-# deterministic non-streaming TestCursor tests still run (02/04 are listed
-# in expected-failures.txt). The per-module SIGKILL timeout above stays a
-# backstop: any OTHER module that hangs is then an unexpected regression.
-DESELECT="tests/test_cursor.py::TestIterableCursor"
 
 P=0; F=0; S=0; E=0; TIMED_OUT=()
 set +e
@@ -93,7 +80,7 @@ for m in "${MODULES[@]}"; do
   echo "==================== ${m} ====================" >> "${LOG}"
   timeout --signal=KILL "${PER_MODULE_TIMEOUT}" \
     python -m pytest -v --tb=short -p no:cacheprovider \
-    --deselect "${DESELECT}" "${m}" >> "${LOG}" 2>&1
+    "${m}" >> "${LOG}" 2>&1
   rc=$?
   if [[ ${rc} -eq 137 ]]; then
     # SIGKILL from `timeout` — the module hung.
@@ -155,8 +142,7 @@ MISSING="$(comm -13 "${RAN_TMP}" "${EXPECTED_TMP}")"
 rc=0
 if [[ ${#TIMED_OUT[@]} -gt 0 ]]; then
   echo
-  echo "REGRESSION: module(s) hung and were SIGKILLed. The only known hang"
-  echo "(test_cursor_iterable_02) is deselected, so this is unexpected:"
+  echo "REGRESSION: module(s) hung and were SIGKILLed:"
   printf '  %s\n' "${TIMED_OUT[@]}"
   rc=1
 fi

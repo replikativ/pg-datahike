@@ -75,9 +75,12 @@ These need execution beyond one `d/q` over one snapshot:
   through that same binding, with `*from-bindings*` holding the outer values.
   That is why they keep the parse cache and fast-select lanes a
   materialisation approach would forfeit.
-- **Portal streaming / row limits**. Extended-protocol `Execute` with a row cap
-  (`PortalSuspended`) — driver `fetchSize`, server-side cursors over large
-  results. Today all rows materialise from one `d/q`.
+- **Bounded query-result streaming**. Extended-protocol `Execute` now honors a
+  row cap, emits `PortalSuspended`, and resumes the same portal without
+  rerunning the statement, so driver `fetchSize` and asyncpg iterable cursors
+  are protocol-correct. The backing `d/q` relation and its `String[][]` wire
+  representation are still materialised eagerly, however; portal paging does
+  not yet bound server heap or improve first-row latency for large results.
 - **ProjectSet around grouping, windows, and `DISTINCT ON`**. Target-list SRFs
   now expand into rows, zip same-level SRFs with NULL padding, preserve nested
   levels, and feed derived tables, CTAS, INSERT…SELECT, set operations, sorting,

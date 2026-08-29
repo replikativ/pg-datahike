@@ -85,8 +85,40 @@
 ;; SQL-level PREPARE / EXECUTE / DEALLOCATE
 ;; ============================================================================
 
+(deftest test-declare-cursor-requires-transaction
+  (let [r (.execute *handler* "DECLARE outside CURSOR FOR SELECT 1")]
+    (is (= "25P01" (sqlstate r)))
+    (is (re-find #"transaction blocks" (err r)))))
+
+(deftest test-prepared-declare-cursor-probes-inner-select
+  (.execute *handler* "BEGIN")
+  (let [parsed (.parse *handler* "DECLARE prepared CURSOR FOR SELECT $1"
+                       (int-array [23]))
+        result (.executePrepared *handler* parsed (object-array [nil 42]))]
+    (is (nil? (err result)))
+    (is (= "DECLARE CURSOR" (.commandTag result)))
+    (is (= [["42"]]
+           (mapv vec (.rows (.execute *handler* "FETCH ALL FROM prepared")))))))
+
+(deftest test-cursor-is-dropped-at-transaction-end
+  (doseq [end-sql ["COMMIT" "ROLLBACK"]]
+    (.execute *handler* "BEGIN")
+    (is (nil? (err (.execute *handler*
+                             "DECLARE ended CURSOR FOR SELECT 1"))))
+    (is (nil? (err (.execute *handler* end-sql))))
+    (let [result (.execute *handler* "FETCH ALL FROM ended")]
+      (is (= "34000" (sqlstate result)) end-sql))))
+
+(deftest test-cursor-with-hold-is-rejected-until-supported
+  (.execute *handler* "BEGIN")
+  (let [result (.execute *handler*
+                         "DECLARE held CURSOR WITH HOLD FOR SELECT 1")]
+    (is (= "0A000" (sqlstate result)))
+    (is (re-find #"WITH HOLD" (err result)))))
+
 (deftest test-cursor-sees-declare-time-snapshot
   (testing "FETCH sees DB state at DECLARE, not later writes"
+    (.execute *handler* "BEGIN")
     ;; Requires a real datahike conn to transact into between FETCHes.
     ;; The fixture builds *handler* from a fresh conn; we can grab it back
     ;; via a closure workaround — the fixture didn't expose it. Use
@@ -107,6 +139,7 @@
 
 (deftest test-cursor-preserves-order-by-across-pages
   (testing "ORDER BY in the declared query is honored on every FETCH"
+    (.execute *handler* "BEGIN")
     ;; 5 persons with distinct ages so ORDER BY gives a stable order.
     (is (nil? (err (.execute *handler*
                              "DECLARE c_ord CURSOR FOR SELECT age FROM person ORDER BY age"))))
@@ -120,6 +153,7 @@
 
 (deftest test-cursor-respects-user-limit
   (testing "user-supplied LIMIT caps the cursor's total result"
+    (.execute *handler* "BEGIN")
     (is (nil? (err (.execute *handler*
                              "DECLARE c_cap CURSOR FOR SELECT age FROM person ORDER BY age LIMIT 2"))))
     ;; Only 2 rows available total.
@@ -131,6 +165,7 @@
 
 (deftest test-cursor-declare-fetch-close
   (testing "DECLARE / FETCH / CLOSE cursor lifecycle"
+    (.execute *handler* "BEGIN")
     (is (nil? (err (.execute *handler*
                              "DECLARE c1 CURSOR FOR SELECT name FROM person ORDER BY age"))))
     (let [r (.execute *handler* "FETCH 2 FROM c1")]
