@@ -144,6 +144,10 @@
   {:datahike-query (requiring-resolve 'datahike.api/q)
    :candidate-page (requiring-resolve 'datahike.index.secondary/candidate-page)
    :secondary-search (requiring-resolve 'datahike.index.secondary/search-with-vt)
+   :stratum-query (requiring-resolve 'stratum.api/q)
+   :scriptum-candidate-page (requiring-resolve 'scriptum.core/candidate-page)
+   :scriptum-generation-search (requiring-resolve 'scriptum.core/search)
+   :scriptum-snapshot-search (requiring-resolve 'scriptum.core/search-store-snapshot)
    :proximum-search (requiring-resolve 'proximum.core/search)
    :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)})
 
@@ -277,7 +281,8 @@
                 indexed-scalar-order (ids (rows handler scalar-order-sql))
                 indexed-scalar-order-timing
                 (profiled-timings
-                 5 20 (select-keys stages [:datahike-query :candidate-page])
+                 5 20 (select-keys stages [:datahike-query :candidate-page
+                                           :stratum-query])
                  #(rows handler scalar-order-sql))
                 text-build-start (now-nanos)
                 _ (checked handler
@@ -289,15 +294,24 @@
                 indexed-fulltext-01 (ids (rows handler fulltext-01-sql))
                 indexed-fulltext-timing
                 (profiled-timings
-                 3 10 (select-keys stages [:datahike-query :secondary-search])
+                 3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :scriptum-candidate-page
+                                           :scriptum-generation-search
+                                           :scriptum-snapshot-search])
                  #(rows handler fulltext-sql))
                 indexed-fulltext-1-timing
                 (profiled-timings
-                 3 10 (select-keys stages [:datahike-query :secondary-search])
+                 3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :scriptum-candidate-page
+                                           :scriptum-generation-search
+                                           :scriptum-snapshot-search])
                  #(rows handler fulltext-1-sql))
                 indexed-fulltext-01-timing
                 (profiled-timings
-                 3 10 (select-keys stages [:datahike-query :secondary-search])
+                 3 10 (select-keys stages [:datahike-query :secondary-search
+                                           :scriptum-candidate-page
+                                           :scriptum-generation-search
+                                           :scriptum-snapshot-search])
                  #(rows handler fulltext-01-sql))
                 vector-build-start (now-nanos)
                 _ (checked handler

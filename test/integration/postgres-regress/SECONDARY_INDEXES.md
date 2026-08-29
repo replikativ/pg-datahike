@@ -232,6 +232,25 @@ real crossover to retain, not hide. Build time was about 1.65 s for Stratum,
 `ef_construction=200`, versus 10.7 ms for PostgreSQL B-tree and 6.6 ms for GIN
 on this small corpus.
 
+A separate 10k-row, 16-dimensional diagnostic run after collapsing the SQL
+path to one `datahike.api/q` call per statement located the remaining time more
+precisely. Stratum's `q` accounted for 2.7 ms of a 2.75 ms candidate page and a
+4.6 ms scalar SQL query. Scriptum's native candidate page accounted for 8.3 ms
+of a 26.8 ms Datahike query and a 46 ms SQL query at 1,000 matches; at 10
+matches those figures fell to 1.1, 5.3, and 6.2 ms. Unfiltered Proximum search
+accounted for about 2.0 ms of a 5.6 ms Datahike query and 6.5 ms SQL query at
+`ef_search=1000`. For filtered ANN, however, Proximum used only 7.5 ms of a
+55 ms Datahike query at 10% selectivity, and the exact 36.5 ms scan still won.
+
+These are inclusive stage timings, not additive components, but the direction
+is stable: the native engines are useful and no longer hidden behind repeated
+query dispatch. The next large gain is a physical candidate/recheck/projection
+pipeline that does not materialize a general Datalog relation and then perform
+SQL sorting/rendering for access paths that already identify a small ordered
+row set. Stratum's own top-N query and Proximum build/filtered-search curves
+remain adapter-level targets; replacing the generation protocol would not
+address the dominant read-side cost shown here.
+
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,
 useful indexed growth curves, bounded memory/write amplification, and no
 unexplained performance cliffs. Profile candidate enumeration, primary
