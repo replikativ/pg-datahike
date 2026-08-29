@@ -5685,13 +5685,16 @@
    index can intentionally change membership, as it can in pgvector; exact
    recheck guarantees distances and predicates only within its candidates.
 
-   The generic external-engine clause is deliberate: Datahike can run ordinary
-   selective predicates first and pass their EntityBitSet to Proximum's native
-   filtered HNSW search. Materializing an unfiltered eid vector here would lose
-   that cross-index composition and reproduce pgvector's post-filter underfill
-   cliff unnecessarily."
+   WHERE-bearing plans use the generic external-engine clause so Datahike can
+   run selective predicates first and pass their EntityBitSet to Proximum's
+   native filtered HNSW search.  An unfiltered top-k has no upstream relation
+   to compose, so materialize its bounded candidate page once and pass the
+   entity IDs to the authoritative Datalog distance/recheck query.  This avoids
+   routing a ten-row access path through the general external-engine planner
+   while keeping projection, exact distance, ordering, and LIMIT in one SQL
+   implementation."
   [db query in-args
-   {:keys [entity-var metric query-vector limit candidate-limit ef
+   {:keys [entity-var attribute metric query-vector limit candidate-limit ef
            prefer-entity-filter?] :as spec}]
   (if spec
     (try
@@ -5701,26 +5704,62 @@
         ;; therefore the only semantics-preserving path for this shape.
         (if (and (= :cosine metric) (zero-vector? query-vector))
           [query in-args nil]
-          (if-let [[idx-ident _index]
+          (if-let [[idx-ident index]
                    (matching-vector-secondary db (assoc spec :query-vector query-vector))]
             (let [candidate-limit (max 1 (long (or candidate-limit limit)))
                   query-spec {:vector query-vector
                               :k candidate-limit
+                              :candidate-limit candidate-limit
                               :ef (or ef 40)}
-                  spec-var (gensym "?proximum-query-spec")
-                  candidate-fn (if prefer-entity-filter?
-                                 'datahike.pg.secondary/filtered-candidates
-                                 'datahike.pg.secondary/candidates)
-                  query (-> query
-                            (update :in (fn [inputs]
-                                          (conj (vec (or inputs ['$])) spec-var)))
-                            (update :where conj
-                                    [(list candidate-fn idx-ident spec-var)
-                                     [entity-var '...]]))]
-              [query (conj (vec in-args) query-spec)
-               {:kind :proximum-filter-aware
-                :candidate-limit candidate-limit
-                :ef (:ef query-spec)}])
+                  external-plan
+                  (fn []
+                    (let [spec-var (gensym "?proximum-query-spec")
+                          candidate-fn (if prefer-entity-filter?
+                                         'datahike.pg.secondary/filtered-candidates
+                                         'datahike.pg.secondary/candidates)]
+                      [(-> query
+                           (update :in (fn [inputs]
+                                         (conj (vec (or inputs ['$])) spec-var)))
+                           (update :where conj
+                                   [(list candidate-fn idx-ident spec-var)
+                                    [entity-var '...]]))
+                       (conj (vec in-args) query-spec)
+                       {:kind :proximum-filter-aware
+                        :candidate-limit candidate-limit
+                        :ef (:ef query-spec)}]))]
+              (if prefer-entity-filter?
+                (external-plan)
+                ;; Candidate paging is optional so a released/third-party
+                ;; adapter that only implements ISecondaryIndex keeps using
+                ;; the external-engine path.  Current Proximum generations
+                ;; take this bounded lane.
+                (if-let [candidate-page (candidate-page-entrypoint)]
+                  (try
+                    (let [page (candidate-page
+                                db idx-ident index query-spec nil
+                                {:limit candidate-limit})
+                          eids (->> (:candidates page)
+                                    (keep (fn [candidate]
+                                            (when (= attribute
+                                                     (:attribute candidate))
+                                              (:entity-id candidate))))
+                                    distinct
+                                    vec)
+                          query (update query :in
+                                        (fn [inputs]
+                                          (conj (vec (or inputs ['$]))
+                                                [entity-var '...])))]
+                      [query (conj (vec in-args) eids)
+                       {:kind :proximum-materialized
+                        :candidate-count (count eids)
+                        :candidate-limit candidate-limit
+                        :precision (:precision page)
+                        :recall (:recall page)
+                        :ordering (:ordering page)
+                        :ef (:ef query-spec)}])
+                    (catch Exception _
+                      (external-plan)))
+                  (external-plan))))
             [query in-args nil])))
       ;; Candidate scans are optional accelerators. The exact scan is both the
       ;; compatibility path and the fail-safe for an adapter generation that
