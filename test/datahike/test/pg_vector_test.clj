@@ -198,9 +198,10 @@
         "nested SELECT bodies are opaque to the volatility walker")))
 
 (deftest vector-candidates-are-only-a-rechecked-restriction
-  (run "CREATE TABLE vector_recheck (id int PRIMARY KEY, embedding vector(2))")
+  (run (str "CREATE TABLE vector_recheck "
+            "(id int PRIMARY KEY, category int, embedding vector(2))"))
   (run (str "INSERT INTO vector_recheck VALUES "
-            "(1, '[0,0]'), (2, '[1,0]'), (3, '[4,0]')"))
+            "(1, 10, '[0,0]'), (2, 20, '[1,0]'), (3, 30, '[4,0]')"))
   (let [query-sql (str "SELECT id FROM vector_recheck "
                        "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
         _ (is (= [["2"] ["1"]] (rows query-sql))
@@ -245,6 +246,30 @@
         (is (= 2 (get-in filtered-access [:query-spec :candidate-limit])))
         (is (= 128 (:probe-limit filtered-access)))
         (is (some? (:filtered-entrypoints filtered-access)))))
+
+    (testing "an indexed exact value binding prefilters before probing ANN"
+      (let [filtered (sql/parse-sql
+                      (str "SELECT id FROM vector_recheck WHERE id = 2 "
+                           "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
+                      (dbi/-schema db) db)
+            [filtered-query filtered-args filtered-access]
+            (restrict indexed-db (:query filtered) (:in-args filtered)
+                      (:secondary-candidate filtered))]
+        (is (= (:query filtered) filtered-query))
+        (is (= (:in-args filtered) filtered-args))
+        (is (= :proximum-prefiltered (:kind filtered-access))
+            "the measured entity set chooses exact distance or filtered ANN")))
+
+    (testing "an unindexed equality keeps the bounded probe first"
+      (let [filtered (sql/parse-sql
+                      (str "SELECT id FROM vector_recheck WHERE category = 20 "
+                           "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
+                      (dbi/-schema db) db)
+            [_ _ filtered-access]
+            (restrict indexed-db (:query filtered) (:in-args filtered)
+                      (:secondary-candidate filtered))]
+        (is (= :proximum-hybrid (:kind filtered-access))
+            "common/skewed values must not force an O(N) prefilter")))
 
     (testing "an explicit beam does not change SQL k"
       (let [[_ args _]

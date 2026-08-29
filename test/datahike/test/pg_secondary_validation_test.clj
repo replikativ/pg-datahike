@@ -242,7 +242,7 @@
                (is (= before @candidate-calls)
                    "the one-shot filtered probe does not open a cursor")
                (is (pos? @probe-calls)
-                   "a filtered top-k starts with a bounded Proximum probe"))))
+                   "an unindexed equality starts with a bounded ANN probe"))))
         (is (zero? @filtered-calls)
             "the one-row filter fills the probe and avoids a second native search"))
 

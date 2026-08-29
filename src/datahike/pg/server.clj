@@ -5546,6 +5546,44 @@
                            :v (symbol "?v")}
                           (get schema marker))))))
 
+(defn- vector-indexed-exact-filter-binding?
+  "Recognize a WHERE equality that can start with a cheap primary lookup.
+
+   SQL's nullable parameter lowering represents `column = value` as a data
+   pattern plus `(seek-key ?parameter type)`. Literal equality may instead be
+   a ground data pattern. Only AVET/unique attributes qualify: an unindexed
+   equality can require an O(N) AEVT scan, in which case the bounded ANN probe
+   remains the safer first step for common or skewed prepared values."
+  [db query in-args entity-var]
+  (let [schema (dbi/-schema db)
+        bound-inputs (set (keys (zipmap (rest (:in query)) in-args)))
+        seek-values
+        (into #{}
+              (keep (fn [clause]
+                      (when (and (vector? clause)
+                                 (= 2 (count clause))
+                                 (seq? (first clause))
+                                 (= 'datahike.pg.sql/seek-key (ffirst clause))
+                                 (contains? bound-inputs
+                                            (second (first clause))))
+                        (second clause))))
+              (:where query))]
+    (boolean
+     (some (fn [clause]
+             (and (vector? clause)
+                  (= 3 (count clause))
+                  (= entity-var (first clause))
+                  (keyword? (second clause))
+                  (not= "db-row-exists" (name (second clause)))
+                  (let [attribute (second clause)
+                        attr-schema (get schema attribute)
+                        value (nth clause 2)]
+                    (and (or (:db/index attr-schema)
+                             (:db/unique attr-schema))
+                         (or (not (symbol? value))
+                             (contains? seek-values value))))))
+           (:where query)))))
+
 (defn- text-secondary-worthwhile?
   "Use Scriptum only when its exact hit estimate is selective enough.
 
@@ -5754,6 +5792,10 @@
                               :k candidate-limit
                               :candidate-limit candidate-limit
                               :ef (or ef 40)}
+                  prefilter-first?
+                  (when prefer-entity-filter?
+                    (vector-indexed-exact-filter-binding?
+                     db query in-args entity-var))
                   external-plan
                   (fn []
                     (let [spec-var (gensym "?proximum-query-spec")
@@ -5771,7 +5813,9 @@
               (if prefer-entity-filter?
                 (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
                   [query in-args
-                   {:kind :proximum-hybrid
+                   {:kind (if prefilter-first?
+                            :proximum-prefiltered
+                            :proximum-hybrid)
                     :filtered-entrypoints filtered-entrypoints
                     :index-ident idx-ident
                     :index index
