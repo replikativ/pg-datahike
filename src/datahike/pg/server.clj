@@ -5695,25 +5695,67 @@
 
    This is the PostgreSQL-B-tree-shaped path: O(log N + k), exact full-width
    values, and forward/backward iteration from the same immutable database
-   root used by the authoritative SQL recheck. Keep the initial admission
-   deliberately narrow. Same-key range bounds will follow once their inclusive
-   cursor contract is explicit; nullable columns need physical NULL placement."
+   root used by the authoritative SQL recheck. Admission stays deliberately
+   narrow: every WHERE term must be a simple comparison on this same key.
+   Nullable columns still need explicit physical NULL placement."
   [db attribute direction where candidate-limit]
-  (let [attr-schema (get (dbi/-schema db) attribute)]
-    (when (and (empty? where)
+  (let [attr-schema (get (dbi/-schema db) attribute)
+        attr-name (name attribute)
+        clauses (when (every? (fn [[op clause-attr _ :as clause]]
+                                (and (= 3 (count clause))
+                                     (contains? #{:= :> :>= :< :<=} op)
+                                     (= attr-name (some-> clause-attr name))))
+                              where)
+                  where)]
+    (when (and (some? clauses)
                (not-null-attribute? db attribute)
                (or (:db/index attr-schema) (:db/unique attr-schema)))
-      (let [datoms (if (= :desc direction)
-                     (d/rseek-datoms db :avet attribute)
-                     (d/datoms db :avet attribute))]
-        (into []
-              (comp (take-while #(= attribute (:a %)))
-                    (take candidate-limit)
-                    (map (fn [datom]
-                           {:entity-id (long (:e datom))
-                            :attribute attribute
-                            :value (:v datom)})))
-              datoms)))))
+      (try
+        (letfn [(satisfies? [value [op _ bound]]
+                  (let [c (compare value bound)]
+                    (case op
+                      := (zero? c)
+                      :> (pos? c)
+                      :>= (not (neg? c))
+                      :< (neg? c)
+                      :<= (not (pos? c)))))
+                (strongest-bound [bound-clauses choose]
+                  (when (seq bound-clauses)
+                    (reduce (fn [best [_ _ value :as clause]]
+                              (if (choose (compare value (nth best 2)))
+                                clause
+                                best))
+                            (first bound-clauses)
+                            (next bound-clauses))))]
+          (let [lower-clauses (filterv #(contains? #{:= :> :>=} (first %))
+                                       clauses)
+                upper-clauses (filterv #(contains? #{:= :< :<=} (first %))
+                                       clauses)
+                lower (strongest-bound lower-clauses pos?)
+                upper (strongest-bound upper-clauses neg?)
+                descending? (= :desc direction)
+                datoms (if descending?
+                         (if upper
+                           (d/rseek-datoms db :avet attribute (nth upper 2))
+                           (d/rseek-datoms db :avet attribute))
+                         (if lower
+                           (d/seek-datoms db :avet attribute (nth lower 2))
+                           (d/datoms db :avet attribute)))
+                stopping-clauses (if descending? lower-clauses upper-clauses)]
+            (into []
+                  (comp (take-while #(= attribute (:a %)))
+                        (take-while
+                         #(every? (partial satisfies? (:v %)) stopping-clauses))
+                        (filter #(every? (partial satisfies? (:v %)) clauses))
+                        (take candidate-limit)
+                        (map (fn [datom]
+                               {:entity-id (long (:e datom))
+                                :attribute attribute
+                                :value (:v datom)})))
+                  datoms)))
+        ;; An access path must not make a query fail merely because an older
+        ;; index comparator cannot represent a newly admitted SQL carrier.
+        (catch Throwable _ nil)))))
 
 (declare restrict-query-to-entities)
 

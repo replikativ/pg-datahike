@@ -226,8 +226,16 @@
                         (apply original args))}
           #(is (= [["3"] ["2"]]
                   (rows "SELECT id FROM secondary_docs ORDER BY id DESC LIMIT 2"))))
-        (is (pos? @calls)
-            "an already indexed primary key uses the O(log N + k) AVET path"))
+        (with-redefs-fn
+          {native-var (fn [& args]
+                        (swap! calls inc)
+                        (apply original args))}
+          #(is (= [["3"] ["2"]]
+                  (rows (str "SELECT id FROM secondary_docs "
+                             "WHERE id > 1 AND id <= 3 "
+                             "ORDER BY id DESC LIMIT 2")))))
+        (is (= 2 @calls)
+            "an indexed primary-key range uses the O(log N + k) AVET path"))
       (let [^PgWireServer$QueryResult index-result
             (result "CREATE INDEX secondary_docs_priority_idx ON secondary_docs (priority)")]
         (is (nil? (.-sqlstate index-result)) (.-error index-result)))
