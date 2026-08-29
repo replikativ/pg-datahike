@@ -238,6 +238,18 @@
       (is (nil? (err r)))
       (is (= [["hello, world"]] (mapv vec (.rows r)))))))
 
+(deftest test-sql-prepare-rejects-result-type-change-after-ddl
+  (is (nil? (err (.execute *handler* "PREPARE p_shape AS SELECT * FROM person"))))
+  (is (nil? (err (.execute *handler* "ALTER TABLE person ADD COLUMN note TEXT"))))
+  (let [r (.execute *handler* "EXECUTE p_shape")]
+    (is (= "0A000" (.sqlstate r)))
+    (is (re-find #"cached plan must not change result type" (err r)))))
+
+(deftest test-prepared-plan-token-tracks-session-planning-context
+  (let [before (.planCacheToken *handler*)]
+    (is (nil? (err (.execute *handler* "SET search_path TO analytics, public"))))
+    (is (not= before (.planCacheToken *handler*)))))
+
 (defn- tag [^PgWireServer$QueryResult r] (.commandTag r))
 
 (defn- first-val [^PgWireServer$QueryResult r]

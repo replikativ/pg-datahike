@@ -206,6 +206,106 @@
           ;; ? IS NULL is TRUE → all 3 rows match
           (loop [n 0] (if (.next rs) (recur (inc n)) (is (= 3 n)))))))))
 
+(deftest test-prepared-statement-revalidates-after-ddl
+  (testing "DDL replans a prepared statement when its result type is unchanged"
+    (with-conn [c {:preferQueryMode "extended" :prepareThreshold "1"}]
+      (with-open [ps (.prepareStatement c "SELECT name FROM t WHERE id = 1")]
+        (with-open [rs (.executeQuery ps)]
+          (is (.next rs))
+          (is (= "Alice" (.getString rs 1))))
+        (with-open [st (.createStatement c)]
+          (.executeUpdate st "ALTER TABLE t ADD COLUMN note TEXT"))
+        (with-open [rs (.executeQuery ps)]
+          (is (.next rs))
+          (is (= "Alice" (.getString rs 1))))))))
+
+(deftest test-prepared-statement-rejects-result-type-change-after-ddl
+  (testing "DDL cannot silently change a prepared statement's row descriptor"
+    (with-conn [c {:preferQueryMode "extended"
+                   :prepareThreshold "1"
+                   :autosave "never"}]
+      (with-open [ps (.prepareStatement c "SELECT * FROM t WHERE id = 1")]
+        (with-open [rs (.executeQuery ps)]
+          (is (= 3 (.getColumnCount (.getMetaData rs)))))
+        (with-open [st (.createStatement c)]
+          (.executeUpdate st "ALTER TABLE t ADD COLUMN note TEXT"))
+        (try
+          (.executeQuery ps)
+          (is false "expected cached-plan result-type error")
+          (catch SQLException e
+            (is (= "0A000" (.getSQLState e)))
+            (is (str/includes? (.getMessage e)
+                               "cached plan must not change result type"))))))))
+
+(deftest test-prepared-statement-revalidation-follows-ddl-commit
+  (testing "a pre-commit invalidation cannot hide the later published schema"
+    (with-conn [reader {:preferQueryMode "extended"
+                        :prepareThreshold "1"
+                        :autosave "never"}]
+      (with-open [writer (open {:preferQueryMode "extended"})
+                  ps (.prepareStatement reader "SELECT * FROM t WHERE id = 1")]
+        (with-open [rs (.executeQuery ps)]
+          (is (= 3 (.getColumnCount (.getMetaData rs)))))
+        (.setAutoCommit writer false)
+        (with-open [st (.createStatement writer)]
+          (.executeUpdate st "ALTER TABLE t ADD COLUMN note TEXT"))
+        ;; The statement-level epoch may advance, but another connection
+        ;; must still replan against the committed three-column schema.
+        (with-open [rs (.executeQuery ps)]
+          (is (= 3 (.getColumnCount (.getMetaData rs)))))
+        (.commit writer)
+        (try
+          (.executeQuery ps)
+          (is false "expected result-type error after DDL commit")
+          (catch SQLException e
+            (is (= "0A000" (.getSQLState e)))))))))
+
+(deftest test-prepared-plan-wire-error-aborts-explicit-transaction
+  (testing "a wire-level cached-plan error cannot let speculative DDL commit"
+    (with-conn [c {:preferQueryMode "extended"
+                   :prepareThreshold "1"
+                   :autosave "never"}]
+      (.setAutoCommit c false)
+      (with-open [ps (.prepareStatement c "SELECT * FROM t WHERE id = 1")]
+        (with-open [rs (.executeQuery ps)]
+          (is (= 3 (.getColumnCount (.getMetaData rs)))))
+        (with-open [st (.createStatement c)]
+          (.executeUpdate st "ALTER TABLE t ADD COLUMN note TEXT"))
+        (try
+          (.executeQuery ps)
+          (is false "expected cached-plan result-type error")
+          (catch SQLException e
+            (is (= "0A000" (.getSQLState e)))))
+        ;; PostgreSQL accepts COMMIT in a failed transaction as ROLLBACK.
+        (.commit c)
+        (with-open [st (.createStatement c)]
+          (try
+            (.executeQuery st "SELECT note FROM t")
+            (is false "the aborted transaction must not publish its column")
+            (catch SQLException e
+              (is (= "42703" (.getSQLState e))))))))))
+
+(deftest test-prepared-plan-invalidates-on-rollback-to-savepoint
+  (testing "plans translated against discarded speculative DDL are not retained"
+    (with-conn [c {:preferQueryMode "extended"
+                   :prepareThreshold "1"
+                   :autosave "never"}]
+      (.setAutoCommit c false)
+      (with-open [st (.createStatement c)]
+        (.execute st "SAVEPOINT before_ddl")
+        (.executeUpdate st "ALTER TABLE t ADD COLUMN note TEXT")
+        (with-open [ps (.prepareStatement c "SELECT note FROM t WHERE id = 1")]
+          (with-open [rs (.executeQuery ps)]
+            (is (.next rs))
+            (is (nil? (.getString rs 1))))
+          (.execute st "ROLLBACK TO SAVEPOINT before_ddl")
+          (try
+            (.executeQuery ps)
+            (is false "expected the rolled-back column to be undefined")
+            (catch SQLException e
+              (is (= "42703" (.getSQLState e))))))
+        (.rollback c)))))
+
 (deftest test-parameter-description-inference
   (testing "Describe('S') infers INSERT/UPDATE/WHERE param OIDs from schema"
     (with-conn [c {:preferQueryMode "extended"}]
