@@ -5478,6 +5478,19 @@
    generations age out."
   (pg-cache/bounded-cache 512))
 
+(defn- retain-select-shape-plan
+  "Carry the stable translated SELECT object through parameter substitution.
+
+   Both extended-query Bind and simple-protocol numeric templating produce a
+   fresh resolved map for every execution. Result metadata depends on the
+   translated shape and schema, not those concrete values, so retaining this
+   identity lets select-shape-cache serve the six catalog queries otherwise
+   repeated for every execution."
+  [resolved plan]
+  (if (= :select (:type resolved))
+    (assoc resolved ::select-shape-plan plan)
+    resolved))
+
 (defn- candidate-page-entrypoint
   "Resolve the candidate protocol only when the running Datahike provides it.
    pg-datahike remains usable on the released core and on JDK 17 without
@@ -6049,7 +6062,8 @@
               ;; non-DDL transactions). Only for the base db — an enriched-db
               ;; (CTE / SRF virtual tables) carries per-execution type info.
               shape-key (when (identical? query-db db)
-                          [(pg-cache/identity-key parsed)
+                          [(pg-cache/identity-key
+                            (or (::select-shape-plan parsed) parsed))
                            (pg-cache/identity-key (dbi/-schema db))
                            find-aliases])
               cached-shape (when shape-key
@@ -8537,8 +8551,10 @@
                                    ;; :pg/type; without it a parameterised
                                    ;; INSERT into a jsonb column skipped
                                    ;; canonicalization.
-                                   (coerce-insert-tx-data
-                                    (resolve-param-refs cached bound) schema db))
+                                   (retain-select-shape-plan
+                                    (coerce-insert-tx-data
+                                     (resolve-param-refs cached bound) schema db)
+                                    cached))
                                  cached)}
                               ;; Simple-protocol plan stability: rewrite
                               ;; bare number literals to $N so every cache
@@ -8586,7 +8602,9 @@
                                         ;; ParamRefs are 1-indexed; prepend
                                         ;; an unused slot like the wire path.
                                         (let [bound (into [nil] tvals)]
-                                          {:parsed (resolve-param-refs p bound)
+                                          {:parsed (retain-select-shape-plan
+                                                    (resolve-param-refs p bound)
+                                                    p)
                                            ;; UPDATE/DELETE re-translate their
                                            ;; WHERE AST at execute time and eval
                                            ;; SET expressions against

@@ -127,6 +127,45 @@
         (is (= [["2" "0"] ["3" "0"]] (table-state h)))
         (finally (release! h))))))
 
+(deftest parameterized-selects-reuse-result-shape
+  (testing "simple numeric templates avoid repeated RowDescription queries"
+    (let [h (fresh-handler)
+          q d/q
+          calls (atom 0)]
+      (try
+        (seed-accounts! h)
+        (with-redefs [d/q (fn [& args]
+                            (swap! calls inc)
+                            (apply q args))]
+          ;; First execution populates the result-shape cache. A different
+          ;; literal reuses the same translated numeric-template shape.
+          (is (= [["100"]] (rows (exec h "SELECT bal FROM t WHERE id = 1"))))
+          (reset! calls 0)
+          (is (= [["200"]] (rows (exec h "SELECT bal FROM t WHERE id = 2"))))
+          (is (= 1 @calls) "only the row query should reach Datahike"))
+        (finally (release! h)))))
+  (testing "extended-query Bind avoids repeated RowDescription queries"
+    (let [h (fresh-handler)
+          q d/q
+          calls (atom 0)]
+      (try
+        (seed-accounts! h)
+        (let [^PgWireServer$QueryHandler handler (:handler h)
+              parsed (.parse handler "SELECT bal FROM t WHERE id = $1"
+                             (int-array [23]))]
+          (with-redefs [d/q (fn [& args]
+                              (swap! calls inc)
+                              (apply q args))]
+            (is (= [["100"]]
+                   (rows (.executePrepared handler parsed
+                                           (object-array [nil (long 1)])))))
+            (reset! calls 0)
+            (is (= [["200"]]
+                   (rows (.executePrepared handler parsed
+                                           (object-array [nil (long 2)])))))
+            (is (= 1 @calls) "only the row query should reach Datahike")))
+        (finally (release! h))))))
+
 (deftest blacklisted-statements-keep-untemplated-behavior
   (testing "HAVING / BETWEEN / IN statements bypass the templater and still work"
     ;; Premise guard: these must NOT template (parse-time literal
