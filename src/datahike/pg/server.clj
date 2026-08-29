@@ -5760,7 +5760,7 @@
                          seen-candidates #{}
                          acc []]
                     (reset! continuation* continuation)
-                    (let [request (cond-> {:limit (min 256 remaining)}
+                    (let [request (cond-> {:limit (min 1024 remaining)}
                                     (some? continuation)
                                     (assoc :continuation continuation))
                           page (candidate-page

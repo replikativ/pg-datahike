@@ -147,7 +147,32 @@
       (is (= [] args))
       (is (nil? access))
       (is (= [[::index :opaque]] @closes)
-          "a rejected declaration closes the adapter-owned scan"))))
+          "a rejected declaration closes the adapter-owned scan"))
+    (reset! closes [])
+    (let [requests (atom [])
+          candidates (mapv (fn [entity-id]
+                             {:entity-id entity-id
+                              :attribute :docs/rank
+                              :value entity-id})
+                           (range 267))
+          page {:candidates candidates
+                :precision :exact
+                :recall :complete
+                :ordering :exact
+                :exhausted? true}
+          [_ args access]
+          (with-redefs-fn
+            (assoc redefine-base
+                   candidate-entrypoint
+                   (constantly
+                    (fn [_ _ _ _ _ request]
+                      (swap! requests conj request)
+                      page)))
+            #(restrict ::db query [] (assoc spec :candidate-limit 267)))]
+      (is (= [{:limit 267}] @requests)
+          "bounded OFFSET prefixes stay in one streaming top-N page")
+      (is (= 267 (count (first args))))
+      (is (= :stratum-order (:kind access))))))
 
 (deftest stratum-btree-declines-non-order-preserving-carriers
   (if-not secondary-stack-available?
