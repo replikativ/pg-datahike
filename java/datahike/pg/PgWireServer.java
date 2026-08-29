@@ -173,6 +173,17 @@ public final class PgWireServer {
         QueryResult executePrepared(Object parsed, Object[] boundParams);
 
         /**
+         * Monotonic generation for schema and SQL-catalog metadata used by
+         * prepared plans. Implementations that return a changing value let
+         * the wire layer reparse named statements after DDL. The default
+         * preserves compatibility for handlers without schema metadata.
+         */
+        default Object planCacheToken() { return null; }
+
+        /** Mark the handler's explicit transaction aborted after a wire-level error. */
+        default void markTransactionFailed() { /* default: no-op */ }
+
+        /**
          * Invoked when the pgwire client disconnects. Implementations
          * should release any resources (locks, pending transactions)
          * associated with this connection — analogous to a PostgreSQL
@@ -327,7 +338,9 @@ public final class PgWireServer {
     static final class PreparedStmt {
         final String sql;
         final int[] paramOids;
-        final Object parsed;  // opaque; handler-specific
+        Object parsed;  // opaque; handler-specific; replaced after DDL revalidation
+        QueryResult resultDescription;
+        Object planCacheToken;
         /**
          * Set to true once Describe('S', name) has emitted
          * RowDescription for this statement. All Portals bound from
@@ -337,10 +350,13 @@ public final class PgWireServer {
          */
         boolean described;
 
-        PreparedStmt(String sql, int[] paramOids, Object parsed) {
+        PreparedStmt(String sql, int[] paramOids, Object parsed,
+                     QueryResult resultDescription, Object planCacheToken) {
             this.sql = sql;
             this.paramOids = paramOids;
             this.parsed = parsed;
+            this.resultDescription = resultDescription;
+            this.planCacheToken = planCacheToken;
             this.described = false;
         }
     }
@@ -352,6 +368,9 @@ public final class PgWireServer {
      */
     static final class Portal {
         final PreparedStmt stmt;
+        /** The plan is pinned at Bind; later statement invalidation cannot replace it. */
+        final Object parsed;
+        final QueryResult resultDescription;
         /** 1-indexed; element 0 unused. A {@code null} element is SQL NULL. */
         final Object[] boundParams;
         /**
@@ -376,6 +395,8 @@ public final class PgWireServer {
 
         Portal(PreparedStmt stmt, Object[] boundParams, short[] resultFormats) {
             this.stmt = stmt;
+            this.parsed = stmt.parsed;
+            this.resultDescription = stmt.resultDescription;
             this.boundParams = boundParams;
             this.resultFormats = resultFormats;
             this.described = false;
@@ -1097,7 +1118,7 @@ public final class PgWireServer {
                         }
                         case 'X' -> { return; }
                         case 'P' -> handleParse(body, extBatch.curOut, statements, handler);
-                        case 'B' -> handleBind(body, extBatch.curOut, statements, portals);
+                        case 'B' -> handleBind(body, extBatch.curOut, statements, portals, handler);
                         case 'D' -> handleDescribe(body, extBatch.curOut, statements, portals, handler);
                         case 'E' -> handleExecuteMsg(body, out, portals, txStatus, handler, copyState, extBatch);
                         case 'S' -> handleSync(out, txStatus, handler, extBatch, portals);
@@ -1157,6 +1178,7 @@ public final class PgWireServer {
                     // Matches PG: the first error in a tx aborts it, subsequent
                     // statements get 25P02 until ROLLBACK.
                     if (txStatus[0] == 'T') {
+                        handler.markTransactionFailed();
                         txStatus[0] = 'E';
                     }
                     // Extended-query messages enter error-skip mode; Simple Query
@@ -1773,6 +1795,51 @@ public final class PgWireServer {
         if (WIRE_TRACE) System.err.println("[WIRE] " + msg);
     }
 
+    /**
+     * PostgreSQL permits a cached statement to be replanned after DDL only
+     * when its externally visible row type is unchanged. Table provenance is
+     * not part of that row type; names, type OIDs, and typmods are.
+     */
+    private static boolean sameResultDescription(QueryResult a, QueryResult b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        return java.util.Arrays.equals(a.columnNames, b.columnNames)
+            && java.util.Arrays.equals(a.columnOids, b.columnOids)
+            && java.util.Arrays.equals(normalizedTypmods(a), normalizedTypmods(b));
+    }
+
+    private static int[] normalizedTypmods(QueryResult result) {
+        if (result.columnTypmods != null) return result.columnTypmods;
+        int n = result.columnNames == null ? 0 : result.columnNames.length;
+        int[] typmods = new int[n];
+        java.util.Arrays.fill(typmods, -1);
+        return typmods;
+    }
+
+    /** Reparse one prepared statement when its schema/session planning token changes. */
+    private static void revalidatePrepared(PreparedStmt stmt, QueryHandler handler) {
+        Object currentToken = handler.planCacheToken();
+        if (java.util.Objects.equals(stmt.planCacheToken, currentToken)
+                || stmt.parsed == null) return;
+
+        while (true) {
+            Object before = handler.planCacheToken();
+            Object reparsed = handler.parse(stmt.sql, stmt.paramOids);
+            QueryResult newDescription = handler.describeResult(reparsed);
+            Object after = handler.planCacheToken();
+            if (!java.util.Objects.equals(before, after)) continue;
+
+            if (!sameResultDescription(stmt.resultDescription, newDescription)) {
+                throw new PgProtocolException("0A000",
+                    "cached plan must not change result type");
+            }
+            stmt.parsed = reparsed;
+            stmt.resultDescription = newDescription;
+            stmt.planCacheToken = after;
+            return;
+        }
+    }
+
     private void handleParse(byte[] body, DataOutputStream out,
                              java.util.Map<String, PreparedStmt> statements,
                              QueryHandler handler) throws IOException {
@@ -1827,8 +1894,7 @@ public final class PgWireServer {
         // sent ";" to JSqlParser and errored at Parse time (issue #18);
         // `query` is already comment-stripped above, so this catches the
         // comment-only form too.
-        Object parsed = splitStatements(query).length == 0
-            ? null : handler.parse(query, paramOids);
+        boolean emptyQuery = splitStatements(query).length == 0;
 
         // Resolve parameter types the way PostgreSQL does at Parse time:
         // the client may declare some/none, and the server infers the rest
@@ -1839,20 +1905,33 @@ public final class PgWireServer {
         // decodes untyped text parameters to the right runtime type even
         // when the client never sends Describe (node-postgres binds text
         // params with zero declared types and skips ParameterDescription).
-        int[] effectiveOids = paramOids;
-        if (parsed != null) {
-            int[] inferred = handler.describeParams(parsed);
-            if (inferred != null && inferred.length > 0) {
-                int n = Math.max(paramOids.length, inferred.length);
-                effectiveOids = new int[n];
-                for (int i = 0; i < n; i++) {
-                    int declared = (i < paramOids.length) ? paramOids[i] : 0;
-                    int inf = (i < inferred.length) ? inferred[i] : 0;
-                    effectiveOids[i] = (declared != 0) ? declared : inf;
+        Object parsed;
+        int[] effectiveOids;
+        QueryResult resultDescription;
+        Object stableToken;
+        while (true) {
+            Object before = handler.planCacheToken();
+            parsed = emptyQuery ? null : handler.parse(query, paramOids);
+            effectiveOids = paramOids;
+            if (parsed != null) {
+                int[] inferred = handler.describeParams(parsed);
+                if (inferred != null && inferred.length > 0) {
+                    int n = Math.max(paramOids.length, inferred.length);
+                    effectiveOids = new int[n];
+                    for (int i = 0; i < n; i++) {
+                        int declared = (i < paramOids.length) ? paramOids[i] : 0;
+                        int inf = (i < inferred.length) ? inferred[i] : 0;
+                        effectiveOids[i] = (declared != 0) ? declared : inf;
+                    }
                 }
             }
+            resultDescription = parsed == null ? null
+                : handler.describeResult(parsed);
+            stableToken = handler.planCacheToken();
+            if (java.util.Objects.equals(before, stableToken)) break;
         }
-        statements.put(stmtName, new PreparedStmt(query, effectiveOids, parsed));
+        statements.put(stmtName, new PreparedStmt(
+            query, effectiveOids, parsed, resultDescription, stableToken));
 
         out.writeByte('1'); // ParseComplete
         out.writeInt(4);
@@ -1861,7 +1940,8 @@ public final class PgWireServer {
 
     private void handleBind(byte[] body, DataOutputStream out,
                             java.util.Map<String, PreparedStmt> statements,
-                            java.util.Map<String, Portal> portals) throws IOException {
+                            java.util.Map<String, Portal> portals,
+                            QueryHandler handler) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String portalName = readCString(buf);
         String stmtName   = readCString(buf);
@@ -1878,6 +1958,7 @@ public final class PgWireServer {
             throw new PgProtocolException("42P03",
                 "cursor \"" + portalName + "\" already exists");
         }
+        revalidatePrepared(stmt, handler);
 
         // Parameter format codes: 0 codes = all text, 1 code = apply to
         // all, N codes = one per param.
@@ -1944,12 +2025,15 @@ public final class PgWireServer {
 
         PreparedStmt stmt;
         Portal describedPortal = null;
+        QueryResult meta;
         if (descType == 'S') {
             stmt = statements.get(name);
             if (stmt == null) {
                 throw new PgProtocolException("26000",
                     "prepared statement \"" + name + "\" does not exist");
             }
+            revalidatePrepared(stmt, handler);
+            meta = stmt.resultDescription;
             // Statement Describe always starts with ParameterDescription.
             //
             // stmt.paramOids is ALREADY the effective list: handleParse
@@ -1988,14 +2072,13 @@ public final class PgWireServer {
             }
             stmt = p.stmt;
             describedPortal = p;
+            meta = p.resultDescription;
         } else {
             throw new PgProtocolException("08P01",
                 "invalid Describe type: " + (char) descType);
         }
 
         // Empty-query statement: emit NoData regardless of type.
-        QueryResult meta = (stmt.parsed == null) ? null
-                                                 : handler.describeResult(stmt.parsed);
         if (meta == null || meta.columnNames == null || meta.columnNames.length == 0) {
             out.writeByte('n'); // NoData
             out.writeInt(4);
@@ -2045,12 +2128,11 @@ public final class PgWireServer {
             throw new PgProtocolException("34000",
                 "portal \"" + portalName + "\" does not exist");
         }
-
         // Empty-query prepared statement (pgJDBC isValid ping): emit
         // EmptyQueryResponse instead of running anything. Matches PG:
         // src/backend/tcop/postgres.c — exec_execute_message, where an
         // empty portal produces 'I' and clients know it's a no-op.
-        if (portal.stmt.parsed == null) {
+        if (portal.parsed == null) {
             // The empty-query statement still went through Parse/Bind
             // (so PC, BC, ND were buffered into extBatch.cur). Drain
             // whatever's there along with any held INSERTs before the
@@ -2088,7 +2170,7 @@ public final class PgWireServer {
 
         QueryResult result = portal.activeResult;
         if (result == null) {
-            result = handler.executePrepared(portal.stmt.parsed, portal.boundParams);
+            result = handler.executePrepared(portal.parsed, portal.boundParams);
             // Clear any interrupt bit left by the safety-net cancel path.
             Thread.interrupted();
             if (result != null && result.error == null

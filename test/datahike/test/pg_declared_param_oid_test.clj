@@ -26,7 +26,8 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [datahike.pg PgWireServer PgWireServer$QueryHandlerFactory]
+  (:import [datahike.pg PgWireServer PgWireServer$QueryHandler
+            PgWireServer$QueryHandlerFactory PgWireServer$QueryResult]
            [java.io DataInputStream DataOutputStream]
            [java.net Socket]
            [java.nio.charset StandardCharsets]))
@@ -509,6 +510,54 @@
           (is (= [["1"] ["2"] ["3"]] (:rows result)))
           (is (= "SELECT 3" (:command-complete result)))
           (is (not (:portal-suspended? result))))))))
+(deftest portal-pins-plan-and-description-at-bind
+  (let [token (atom 0)
+        width (atom 1)
+        handler (reify PgWireServer$QueryHandler
+                  (execute [_ _] (PgWireServer$QueryResult/empty "SELECT 0"))
+                  (parse [_ _ _] @width)
+                  (describeParams [_ _] (int-array 0))
+                  (describeResult [_ parsed]
+                    (PgWireServer$QueryResult.
+                     (into-array String (take parsed ["a" "b"]))
+                     (int-array (repeat parsed oid-text))
+                     (into-array (Class/forName "[Ljava.lang.String;")
+                                 (make-array String 0 0))
+                     "SELECT 0"))
+                  (executePrepared [_ parsed _]
+                    (PgWireServer$QueryResult.
+                     (into-array String (take parsed ["a" "b"]))
+                     (int-array (repeat parsed oid-text))
+                     (into-array (Class/forName "[Ljava.lang.String;")
+                                 [(into-array String (take parsed ["old" "new"]))])
+                     "SELECT 1"))
+                  (planCacheToken [_] @token))
+        factory (reify PgWireServer$QueryHandlerFactory
+                  (create [_] handler))
+        server (PgWireServer. 0 "127.0.0.1" factory)]
+    (.start server)
+    (try
+      (binding [*port* (.getPort server)]
+        (with-conn
+          (fn [in out]
+            (send-msg! out \P (ba (cstr "s") (cstr "SELECT ignored") [:i16 0]))
+            (send-msg! out \B (ba (cstr "p") (cstr "s")
+                                  [:i16 0] [:i16 0] [:i16 0]))
+            (send-msg! out \S (byte-array 0))
+            (read-until-ready in)
+            ;; Invalidate the statement after Bind. A Portal owns the old
+            ;; plan and descriptor, just as PostgreSQL's Portal does.
+            (reset! width 2)
+            (swap! token inc)
+            (send-msg! out \D (ba (.getBytes "P" StandardCharsets/UTF_8)
+                                  (cstr "p")))
+            (send-msg! out \E (ba (cstr "p") [:i32 0]))
+            (send-msg! out \S (byte-array 0))
+            (let [result (decode (read-until-ready in))]
+              (is (= ["a"] (mapv :name (:columns result))))
+              (is (= [["old"]] (:rows result)))))))
+      (finally
+        (.stop server)))))
 
 ;; ---------------------------------------------------------------------------
 ;; ParameterDescription echoes the client's declaration
