@@ -8660,6 +8660,13 @@
                                   {:parsed (let [p (sql/parse-sql sql schema db)]
                                              (when bump-dispatch! (bump-dispatch! p))
                                              p)}))
+                            ;; Even an otherwise unchanged SELECT with
+                            ;; :in-args is rebuilt by resolve-nextval-markers
+                            ;; below. Anchor its translated shape before that
+                            ;; pass so result metadata remains cacheable.
+                            parsed (retain-select-shape-plan
+                                    parsed
+                                    (or (::select-shape-plan parsed) parsed))
                             ;; Sibling pass to ParamRef substitution: any
                             ;; `nextval('s')` markers left in tx-data/in-args
                             ;; resolve here against the live conn (PG's
