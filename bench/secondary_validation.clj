@@ -72,6 +72,19 @@
                                     (- (now-nanos) start))
                          (update-in [stage :calls] (fnil inc 0)))))))))))
 
+(defn- pg-call-site []
+  (some (fn [^StackTraceElement frame]
+          (when (str/starts-with? (.getClassName frame) "datahike.pg.")
+            (str (.getClassName frame) "/" (.getMethodName frame)
+                 ":" (.getLineNumber frame))))
+        (.getStackTrace (Thread/currentThread))))
+
+(defn- call-site-wrapper [stage call-sites f]
+  (fn [& args]
+    (swap! call-sites update-in [stage (or (pg-call-site) :unknown)]
+           (fnil inc 0))
+    (apply f args)))
+
 (defn- profiled-timings
   "End-to-end latency plus inclusive time in selected nested calls.
 
@@ -82,10 +95,17 @@
   [warmups iterations stages f]
   (dotimes [_ warmups] (f))
   (let [samples (atom {})
+        call-sites (atom {})
         replacements
         (into {}
               (map (fn [[stage v]] [v (stage-wrapper stage @v)]))
               stages)
+        call-site-replacements
+        (into {}
+              (map (fn [[stage v]]
+                     [v (call-site-wrapper stage call-sites @v)]))
+              stages)
+        _ (with-redefs-fn call-site-replacements f)
         totals
         (with-redefs-fn
           replacements
@@ -115,7 +135,9 @@
                         [stage (assoc (timing-summary elapsed-ms)
                                       :calls-per-query
                                       {:min (apply min calls)
-                                       :max (apply max calls)})]))
+                                       :max (apply max calls)}
+                                      :call-sites
+                                      (get @call-sites stage {}))]))
                  @samples))))
 
 (defn- profiling-stages []
