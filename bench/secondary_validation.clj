@@ -29,6 +29,27 @@
 
 (defn- now-nanos [] (System/nanoTime))
 
+(defn- slurp-trim [path]
+  (try (str/trim (slurp path))
+       (catch Exception _ nil)))
+
+(defn- benchmark-environment []
+  {:epoch (or (System/getenv "SECONDARY_BENCH_EPOCH") "unspecified")
+   :recorded-at (str (java.time.Instant/now))
+   :java-version (System/getProperty "java.version")
+   :available-processors (.availableProcessors (Runtime/getRuntime))
+   ;; With the active intel_pstate driver, scaling_governor may still read
+   ;; "powersave" while energy_performance_preference is "performance".
+   ;; Preserve both so results from different power-policy epochs cannot be
+   ;; combined accidentally.
+   :cpu {:scaling-driver
+         (slurp-trim "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver")
+         :scaling-governor
+         (slurp-trim "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+         :energy-performance-preference
+         (slurp-trim
+          "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")}})
+
 (defn- elapsed-ms [start]
   (/ (double (- (now-nanos) start)) 1e6))
 
@@ -439,7 +460,8 @@
                                :datahike-query
                                :exact-cosine-distance])
                  #(rows handler filtered-01-sql))]
-            {:rows n
+            {:environment (benchmark-environment)
+             :rows n
              :dimension dimension
              :hnsw {:m 16 :ef-construction hnsw-ef-construction}
              :load-ms load-ms
