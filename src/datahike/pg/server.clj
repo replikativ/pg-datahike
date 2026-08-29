@@ -5527,13 +5527,58 @@
     (requiring-resolve 'datahike.index.secondary/candidate-page)
     (catch Exception _ nil)))
 
+(defn- secondary-estimate-entrypoint []
+  (try
+    (requiring-resolve 'datahike.index.secondary/-estimate)
+    (catch Exception _ nil)))
+
+(defn- pattern-estimate-entrypoint []
+  (try
+    (requiring-resolve 'datahike.query.estimate/estimate-pattern)
+    (catch Exception _ nil)))
+
+(def ^:private text-secondary-selectivity 0.05)
+(def ^:private text-secondary-absolute-floor 64)
+
+(defn- table-row-estimate
+  "Estimate one SQL table's row-marker cardinality without scanning it."
+  [db attribute]
+  (when-let [table (namespace attribute)]
+    (let [marker (keyword table "db-row-exists")
+          schema (dbi/-schema db)]
+      (when-let [estimate-pattern (pattern-estimate-entrypoint)]
+        (estimate-pattern db
+                          {:e (symbol "?e")
+                           :a marker
+                           :v (symbol "?v")}
+                          (get schema marker))))))
+
+(defn- text-secondary-worthwhile?
+  "Use Scriptum only when its exact hit estimate is selective enough.
+
+   The absolute floor keeps tiny relations and small result sets on the tested
+   secondary path. Above it, five percent is the measured crossover at which
+   enumerating and rechecking Lucene candidates stopped beating the primary
+   scan. Missing estimate support preserves the compatibility path."
+  [db index attribute query-spec]
+  (try
+    (if-let [estimate (secondary-estimate-entrypoint)]
+      (let [hits (long (estimate index query-spec))
+            rows (long (or (table-row-estimate db attribute) 0))
+            threshold (max text-secondary-absolute-floor
+                           (long (Math/floor
+                                  (* text-secondary-selectivity rows))))]
+        (or (zero? rows) (<= hits threshold)))
+      true)
+    (catch Exception _ true)))
+
 (defn- matching-text-secondary [db attribute]
   (some (fn [[ident entry]]
           (when (and (= :scriptum (:db.secondary/type entry))
                      (contains? (set (:db.secondary/attrs entry)) attribute)
                      (contains? #{nil :ready} (:db.secondary/status entry))
                      (get (:secondary-indices db) ident))
-            ident))
+            [ident (get (:secondary-indices db) ident)]))
         (dbi/-schema db)))
 
 (defn- not-null-attribute?
@@ -5557,17 +5602,19 @@
   (reduce
    (fn [[datalog in-args] {:keys [entity-var attribute] :as candidate}]
      (try
-       (if-let [idx-ident (matching-text-secondary db attribute)]
+       (if-let [[idx-ident index] (matching-text-secondary db attribute)]
          (if-let [query-spec (pg-secondary/scriptum-query-spec (:query candidate))]
-           (let [spec-var (gensym "?scriptum-query-spec")]
-             [(-> datalog
-                  (update :in (fn [inputs]
-                                (conj (vec (or inputs ['$])) spec-var)))
-                  (update :where conj
-                          [(list 'datahike.pg.secondary/candidates
-                                 idx-ident spec-var)
-                           [entity-var '...]]))
-              (conj (vec in-args) query-spec)])
+           (if (text-secondary-worthwhile? db index attribute query-spec)
+             (let [spec-var (gensym "?scriptum-query-spec")]
+               [(-> datalog
+                    (update :in (fn [inputs]
+                                  (conj (vec (or inputs ['$])) spec-var)))
+                    (update :where conj
+                            [(list 'datahike.pg.secondary/candidates
+                                   idx-ident spec-var)
+                             [entity-var '...]]))
+                (conj (vec in-args) query-spec)])
+             [datalog in-args])
            [datalog in-args])
          [datalog in-args])
        ;; A secondary is an optional access path. Missing adapters, an old
