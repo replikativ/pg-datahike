@@ -135,7 +135,9 @@ not predict build/query behavior at 384- or 768-dimensional production shapes.
    now reselects that group's driver from live upstream bindings and rotates a
    sufficiently selective indexed merge into an AVET/EAVT scan. At 20k rows
    this reduces the full SQL path to 2.50 ms and `d/q` to ~0.99 ms, versus
-   PostgreSQL at ~0.10 ms in the final rerun. The access complexity is now
+   PostgreSQL at ~0.10–0.17 ms in the final reruns. Inclusive stage timing
+   attributes ~0.94 ms to `d/q`, ~1.03 ms to wire-result formatting, and only
+   ~0.014 ms to cached SQL parsing. The access complexity is now
    `O(log N + matches)` on both sides. Remaining work is constant overhead and
    observability: `explain` still prints the static pre-binding driver rather
    than the runtime-selected one.

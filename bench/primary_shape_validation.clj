@@ -143,6 +143,43 @@
            :datahike-q-ms-per-query
            (when (pos? @calls) (/ (double @nanos) 1e6 @calls)))))
 
+(defn- stage-timer [^longs counters f]
+  (fn [& args]
+    (let [start (now-nanos)]
+      (try
+        (apply f args)
+        (finally
+          (aset-long counters 0 (inc (aget counters 0)))
+          (aset-long counters 1 (+ (aget counters 1) (- (now-nanos) start))))))))
+
+(defn- profile-datahike-stages
+  "Break the handler path into inclusive stages without changing production
+   dispatch. Each stage is invoked only once per ordinary SELECT, so two
+   primitive counter writes are less perturbing than allocation profiling."
+  [handler sql]
+  (let [stages {:parse-sql     #'sql/parse-sql
+                :exec-select   (ns-resolve 'datahike.pg.server 'exec-select)
+                :datahike-q    #'d/q
+                :format-result (ns-resolve 'datahike.pg.server 'format-query-result)}
+        counters (into {} (map (fn [[k _]] [k (long-array 2)])) stages)
+        replacements
+        (into {}
+              (map (fn [[k v]]
+                     [v (stage-timer (get counters k) @v)]))
+              stages)
+        timing (with-redefs-fn replacements
+                 #(timings 5 20 (fn [] (datahike-rows handler sql))))]
+    (assoc timing
+           :stages
+           (into (sorted-map)
+                 (map (fn [[k ^longs values]]
+                        (let [calls (aget values 0)]
+                          [k {:calls calls
+                              :ms-per-call (when (pos? calls)
+                                             (/ (double (aget values 1))
+                                                1e6 calls))}]))
+                 counters)))))
+
 (defn- fact-row [i parent-count]
   (into {:shape_fact/db-row-exists true
          :shape_fact/id i
@@ -184,6 +221,7 @@
             {:load-ms (elapsed-ms load-start)
              :queries (benchmark-queries #(datahike-rows handler %) n parent-count)
              :indexed-fanout-profile (profile-datahike-query handler fanout-sql)
+             :indexed-fanout-stages (profile-datahike-stages handler fanout-sql)
              :indexed-fanout-plan
              (apply q/explain (:query parsed) db (:in-args parsed))}))
         (finally

@@ -128,8 +128,13 @@ actual Datahike plan for the indexed join:
 ```bash
 bench/realpg.sh start
 PRIMARY_BENCH_ROWS=20000 \
-  clojure -J-Xmx3g -M:dev:local-dh bench/primary_shape_validation.clj
+  clojure -Sdeps '{:aliases {:bench-dh {:extra-paths ["/absolute/path/to/datahike/src-secondary"] :override-deps {org.replikativ/datahike {:local/root "/absolute/path/to/datahike"}}}}}' \
+    -J-Xmx3g -M:dev:bench-dh bench/primary_shape_validation.clj
 ```
 
-Use an absolute `:local/root` override when running from a worktree whose
-relative `../datahike` is not the checkout under test.
+Replace both absolute paths with the Datahike checkout under test. Keep the
+override inside an activated alias: a top-level `:override-deps` passed through
+`-Sdeps` is ignored by the Clojure CLI and can silently benchmark the released
+Datahike dependency instead. The output includes inclusive timings for SQL
+parse/lowering, `exec-select`, `d/q`, and wire-result formatting on the fanout
+shape.
