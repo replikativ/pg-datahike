@@ -628,6 +628,44 @@
            (prefilter-query base-query entity-var distance-var
                             :doc/other-embedding)))))
 
+(deftest sparse-native-range-skips-the-unfiltered-vector-probe
+  (let [small-range? (ns-resolve 'datahike.pg.server
+                                 'small-indexed-vector-range?)
+        native-candidates (ns-resolve 'datahike.pg.server
+                                      'native-avet-order-candidates)
+        calls (atom [])
+        entity-var '?doc
+        query {:find [entity-var]
+               :in ['$ '?p1]
+               :where [[entity-var :doc/id '?id]
+                       [(list '< '?id '?p1)]]}]
+    (with-redefs-fn
+      {native-candidates
+       (fn [& args]
+         (swap! calls conj args)
+         (vec (range 10)))}
+      #(is (true? (small-range? ::db query [10] entity-var 10))))
+    (is (= [[::db :doc/id :asc [[:< :doc/id 10]] 257]] @calls))
+    (with-redefs-fn
+      {native-candidates
+       (fn [_db _attribute _direction _where candidate-limit]
+         (vec (range candidate-limit)))}
+      #(is (false? (small-range? ::db query [10] entity-var 10))))
+    (reset! calls [])
+    (with-redefs-fn
+      {native-candidates
+       (fn [& args]
+         (swap! calls conj args)
+         [])}
+      #(do
+         (is (true?
+              (small-range?
+               ::db (assoc query :where [[entity-var :doc/id '?id]
+                                         [(list '> '?p1 '?id)]])
+               [10] entity-var 10)))
+         (is (false? (small-range? ::db query [10.5] entity-var 10)))))
+    (is (= 1 (count @calls)))))
+
 (deftest large-vector-prefilter-uses-the-native-entity-filter
   (let [run-prefiltered (ns-resolve 'datahike.pg.server
                                     'run-prefiltered-vector-query)

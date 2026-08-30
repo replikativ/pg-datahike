@@ -5610,6 +5610,8 @@
       false)
     (catch Throwable _ false)))
 
+(declare native-avet-order-candidates)
+
 (defn- small-indexed-vector-equality?
   [db {:keys [kind attribute value]} candidate-limit]
   (try
@@ -5621,6 +5623,69 @@
                       {:e (symbol "?e") :a attribute :v value}
                       (get (dbi/-schema db) attribute)))
                (max 256 (* 8 (long candidate-limit))))))
+    (catch Throwable _ false)))
+
+(defn- small-indexed-vector-range?
+  "Whether a safe native AVET range is a hard-small upper bound for WHERE.
+
+   `specialize-indexed-integral-ranges` adds these predicates only for indexed,
+   NOT NULL long columns whose runtime bound is integral. Count at most one row
+   beyond the exact-distance threshold using the same seek/stop primitive as
+   scalar top-N. Other WHERE terms can only shrink this range, so a small range
+   is sufficient to skip an unfiltered ANN probe without estimating their
+   selectivity."
+  [db query in-args entity-var candidate-limit]
+  (try
+    (let [threshold (max 256 (* 8 (long candidate-limit)))
+          input-values (zipmap (rest (:in query)) in-args)
+          patterns
+          (into {}
+                (keep (fn [clause]
+                        (when (and (vector? clause)
+                                   (= 3 (count clause))
+                                   (= entity-var (first clause))
+                                   (keyword? (second clause))
+                                   (symbol? (nth clause 2)))
+                          [(nth clause 2) (second clause)])))
+                (:where query))
+          resolve-bound #(if (and (symbol? %)
+                                  (contains? input-values %))
+                           (get input-values %)
+                           %)
+          flip {'< :> '<= :>= '> :< '>= :<=}
+          op-key {'< :< '<= :<= '> :> '>= :>=}
+          ranges
+          (reduce
+           (fn [groups clause]
+             (if (and (vector? clause)
+                      (= 1 (count clause))
+                      (seq? (first clause)))
+               (let [[op left right] (first clause)
+                     [attribute effective-op bound]
+                     (cond
+                       (and (contains? op-key op) (contains? patterns left))
+                       [(get patterns left) (get op-key op)
+                        (resolve-bound right)]
+
+                       (and (contains? flip op) (contains? patterns right))
+                       [(get patterns right) (get flip op)
+                        (resolve-bound left)]
+
+                       :else nil)]
+                 (if (and attribute (integer? bound))
+                   (update groups attribute (fnil conj [])
+                           [effective-op attribute bound])
+                   groups))
+               groups))
+           {}
+           (:where query))]
+      (boolean
+       (some (fn [[attribute clauses]]
+               (when-let [candidates
+                          (native-avet-order-candidates
+                           db attribute :asc clauses (inc threshold))]
+                 (<= (count candidates) threshold)))
+             ranges)))
     (catch Throwable _ false)))
 
 (defn- bounded-unindexed-vector-equality?
@@ -6129,8 +6194,10 @@
                   (when prefer-entity-filter?
                     (vector-exact-filter-binding db query in-args entity-var))
                   prefilter-first?
-                  (small-indexed-vector-equality?
-                   db equality-binding candidate-limit)
+                  (or (small-indexed-vector-equality?
+                       db equality-binding candidate-limit)
+                      (small-indexed-vector-range?
+                       db query in-args entity-var candidate-limit))
                   unindexed-equality?
                   (= :unindexed (:kind equality-binding))
                   bounded-unindexed-equality?
