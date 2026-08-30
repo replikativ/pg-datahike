@@ -592,6 +592,42 @@
     (is (= [[::index :live] [::index false]] @closed)
         "both ordinary and false live tokens are released on early LIMIT")))
 
+(deftest vector-prefilter-removes-only-a-dead-vector-lookup
+  (let [prefilter-query (ns-resolve 'datahike.pg.server
+                                    'vector-prefilter-query)
+        entity-var '?doc
+        embedding-var '?embedding
+        distance-var '?distance
+        producer [(list 'get-else '$ entity-var :doc/embedding :__null__)
+                  embedding-var]
+        distance [(list 'vector-distance embedding-var '[0.0 0.0])
+                  distance-var]
+        base-query {:find ['?id distance-var]
+                    :with [entity-var]
+                    :where [[entity-var :doc/id '?id]
+                            producer
+                            distance]
+                    :order-by [1 :asc]
+                    :limit 10}]
+    (is (= {:find [entity-var]
+            :where [[entity-var :doc/id '?id]]}
+           (prefilter-query base-query entity-var distance-var
+                            :doc/embedding)))
+    (is (= {:find [entity-var]
+            :where [[entity-var :doc/id '?id]
+                    producer
+                    [(list 'not= embedding-var :__null__)]]}
+           (prefilter-query
+            (update base-query :where
+                    #(vec (concat (butlast %)
+                                  [[(list 'not= embedding-var :__null__)]
+                                   (last %)])))
+            entity-var distance-var :doc/embedding)))
+    (is (= {:find [entity-var]
+            :where [[entity-var :doc/id '?id] producer]}
+           (prefilter-query base-query entity-var distance-var
+                            :doc/other-embedding)))))
+
 (deftest large-vector-prefilter-uses-the-native-entity-filter
   (let [run-prefiltered (ns-resolve 'datahike.pg.server
                                     'run-prefiltered-vector-query)

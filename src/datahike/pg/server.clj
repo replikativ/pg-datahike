@@ -6230,23 +6230,56 @@
              (conj (vec (or inputs ['$])) [entity-var '...])))
    (conj (vec in-args) eids)])
 
+(defn- form-contains-symbol?
+  [form target]
+  (boolean (some #(= target %) (tree-seq coll? seq form))))
+
 (defn- vector-prefilter-query
   "Project only entity ids after removing the exact distance binding/order.
 
    The remaining clauses are the complete translated SQL WHERE plus the base
-   table bindings. Returning nil is a fail-closed signal if the expected fresh
+   table bindings. If the vector attribute lookup feeds only the removed
+   distance expression, remove that dead producer too; retaining it makes a
+   selective primary prefilter scan every stored vector. Any other use keeps
+   the producer. Returning nil is a fail-closed signal if the expected fresh
    distance binding is not structurally present exactly once."
-  [query entity-var result-var]
+  [query entity-var result-var attribute]
   (let [where (:where query)
-        retained (filterv (fn [clause]
-                            (not (and (vector? clause)
-                                      (= 2 (count clause))
-                                      (= result-var (second clause)))))
-                          where)]
-    (when (= 1 (- (count where) (count retained)))
+        distance-clauses
+        (filterv (fn [clause]
+                   (and (vector? clause)
+                        (= 2 (count clause))
+                        (= result-var (second clause))))
+                 where)
+        distance-clause (when (= 1 (count distance-clauses))
+                          (first distance-clauses))
+        retained (if distance-clause
+                   (filterv #(not= distance-clause %) where)
+                   where)
+        distance-inputs
+        (when (and distance-clause (seq? (first distance-clause)))
+          (into #{} (filter symbol?) (rest (first distance-clause))))
+        dead-producer
+        (when distance-inputs
+          (let [producers
+                (filterv
+                 (fn [clause]
+                   (when-let [{producer-attribute :attribute
+                               value-var :value-var}
+                              (get-else-column-binding clause)]
+                     (and (= attribute producer-attribute)
+                          (contains? distance-inputs value-var)
+                          (not-any? #(and (not= clause %)
+                                          (form-contains-symbol? % value-var))
+                                    retained))))
+                 retained)]
+            (when (= 1 (count producers)) (first producers))))]
+    (when distance-clause
       (-> query
           (assoc :find [entity-var]
-                 :where retained)
+                 :where (if dead-producer
+                          (filterv #(not= dead-producer %) retained)
+                          retained))
           (dissoc :with :order-by :limit :offset)))))
 
 (defn- secondary-result-entities
@@ -6269,9 +6302,10 @@
    threshold is intentionally absolute: exact distance cost grows with the
    number of surviving entities, regardless of their fraction of the table."
   [db exact-query exact-in-args run-query
-   {:keys [filtered-entrypoints index entity-var result-var query-spec]}]
+   {:keys [filtered-entrypoints index entity-var result-var attribute
+           query-spec]}]
   (if-let [prefilter-query (vector-prefilter-query
-                            exact-query entity-var result-var)]
+                            exact-query entity-var result-var attribute)]
     (let [{:keys [search entity-set entity-count]} filtered-entrypoints
           prefilter-rows (run-query prefilter-query exact-in-args false)
           filter-eids (mapv (fn [row]
