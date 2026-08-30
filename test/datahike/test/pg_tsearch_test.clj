@@ -121,6 +121,21 @@
                                              "(foo | baz) <-> bar")
                           (catch Exception e e))))))))
 
+(deftest repeated-rechecks-parse-one-query-once
+  (let [lexeme (str "cacheprobe" (System/nanoTime))
+        vector (str "'" lexeme "':1")
+        query (str lexeme " & " lexeme)
+        original tsearch/parse-tsquery
+        parses (atom 0)]
+    (with-redefs [tsearch/parse-tsquery
+                  (fn [value]
+                    (swap! parses inc)
+                    (original value))]
+      (is (tsearch/ts-match? vector query))
+      (is (tsearch/ts-match? vector query))
+      (is (= 1 @parses)
+          "one constant @@ query is shared by every candidate recheck"))))
+
 (deftest secondary-candidate-plans-have-no-false-negative-shortcuts
   (is (= {:op :term :lexeme "foo"}
          (:query (tsearch/tsquery-candidate-plan "foo & !bar"))))
