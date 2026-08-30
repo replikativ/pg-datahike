@@ -107,15 +107,18 @@
     (apply f args)))
 
 (defn- profiled-timings
-  "End-to-end latency plus inclusive time in selected nested calls.
+  "Uninstrumented end-to-end latency plus inclusive selected-call diagnostics.
 
    Stage times are diagnostic rather than a subtraction identity: the
    Datahike query stage contains the Scriptum/Proximum stage when an external
-   engine runs inside d/q. Recording starts after warmup so setup calls cannot
-   pollute the per-statement distributions."
+   engine runs inside d/q. `with-redefs` also prevents normal Var inlining and
+   can materially perturb a hot query path, so headline timing is collected in
+   a separate pass and the instrumented total is retained only as an explicit
+   diagnostic. Recording starts after warmup so setup calls cannot pollute the
+   per-statement distributions."
   [warmups iterations stages f]
-  (dotimes [_ warmups] (f))
-  (let [samples (atom {})
+  (let [end-to-end (timings warmups iterations f)
+        samples (atom {})
         call-sites (atom {})
         replacements
         (into {}
@@ -127,7 +130,7 @@
                      [v (call-site-wrapper stage call-sites @v)]))
               stages)
         _ (with-redefs-fn call-site-replacements f)
-        totals
+        instrumented-totals
         (with-redefs-fn
           replacements
           (fn []
@@ -149,7 +152,8 @@
                                   (update-in [stage :calls] (fnil conj []) calls)))
                             acc @per-query)))
                   (elapsed-ms start)))))))]
-    (assoc (timing-summary totals)
+    (assoc end-to-end
+           :instrumented-timing (timing-summary instrumented-totals)
            :stages
            (into {}
                  (map (fn [[stage {:keys [elapsed-ms calls]}]]
