@@ -175,6 +175,22 @@
    :scalar-candidate-restriction
    (requiring-resolve 'datahike.pg.server/restrict-to-scalar-order-candidates)
    :datahike-query (requiring-resolve 'datahike.api/q)
+   ;; Datahike query decomposition. These are deliberately inclusive stages:
+   ;; `execute-planned-direct` contains prepared/direct execution, while `q`
+   ;; contains all of them. The nesting is the useful evidence—we can tell
+   ;; whether a selective secondary result spends its remaining time planning,
+   ;; scanning/joining, or shaping the final result without sampling a whole
+   ;; benchmark process whose index builds dominate the profile.
+   :datahike-plan
+   (requiring-resolve 'datahike.query/get-or-create-plan)
+   :datahike-planned-direct
+   (requiring-resolve 'datahike.query/execute-planned-direct)
+   :datahike-post-process
+   (requiring-resolve 'datahike.query/post-process-result)
+   :datahike-execute-prepared
+   (requiring-resolve 'datahike.query.execute/execute-plan-prepared)
+   :datahike-execute-direct
+   (requiring-resolve 'datahike.query.execute/execute-plan-direct)
    :exact-cosine-distance (requiring-resolve 'datahike.pg.vector/cosine-distance)
    :candidate-page (requiring-resolve 'datahike.index.secondary/candidate-page)
    :secondary-search (requiring-resolve 'datahike.index.secondary/search-with-vt)
@@ -383,7 +399,7 @@
                                [ef {:returned (count actual)
                                     :recall-at-k (recall exact-vector actual)
                                     :timing
-                                     (profiled-timings
+                                    (profiled-timings
                                      5 20
                                      (select-keys stages
                                                   [:vector-candidate-restriction
