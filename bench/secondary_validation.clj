@@ -11,6 +11,7 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.index.entity-set :as es]
             [datahike.pg.server :as pg]
             [datahike.query :as q])
   (:import [datahike.pg PgWireServer$QueryResult]))
@@ -79,11 +80,64 @@
   "Per-query stage accumulator used only by the maintainer benchmark."
   nil)
 
+(defn- result-count [result]
+  (cond
+    (es/entity-bitset? result) (es/entity-bitset-cardinality result)
+    (instance? java.util.Collection result) (.size ^java.util.Collection result)
+    (counted? result) (count result)
+    :else nil))
+
+(defn- stage-observation
+  "Small, non-realizing description of a production-path stage result.
+
+   This deliberately avoids Datahike's `:stats?` mode: that mode selects the
+   legacy relational executor and therefore reports a different access path.
+   Only already-counted collections, native EntityBitSets, and explicit
+   candidate envelopes are observed here."
+  [stage result]
+  (cond
+    (and (map? result) (contains? result :candidates))
+    (cond-> {:candidates (count (:candidates result))}
+      (contains? result :exhausted?) (assoc :exhausted? (:exhausted? result))
+      (:precision result) (assoc :precision (:precision result))
+      (:recall result) (assoc :recall (:recall result))
+      (:ordering result) (assoc :ordering (:ordering result))
+      (:stop-reason result) (assoc :stop-reason (:stop-reason result))
+      (:stats result) (assoc :stats (:stats result)))
+
+    ;; Candidate restriction functions return [query args access]. Preserve
+    ;; the optimizer's decision and declared candidate bound.
+    (and (vector? result) (= 3 (count result)) (map? (nth result 2 nil)))
+    (select-keys (nth result 2)
+                 [:kind :candidate-count :candidate-limit :precision :recall
+                  :ordering :underfill-fallback :filter-strategy])
+
+    (es/entity-bitset? result)
+    {:entities (es/entity-bitset-cardinality result)}
+
+    (contains? #{:datahike-query :datahike-post-process
+                 :datahike-planned-direct :datahike-execute-prepared
+                 :datahike-execute-direct :stratum-query
+                 :scriptum-generation-search :scriptum-snapshot-search
+                 :proximum-search :proximum-api-search
+                 :proximum-filtered-search :proximum-api-filtered-search
+                 :vector-prefiltered-query :vector-materialized-probe
+                 :vector-iterative-query}
+               stage)
+    (when-some [n (result-count result)] {:results n})
+
+    :else nil))
+
 (defn- stage-wrapper [stage f]
   (fn [& args]
     (let [start (now-nanos)]
       (try
-        (apply f args)
+        (let [result (apply f args)]
+          (when (and *stage-recorder* result)
+            (when-some [observation (stage-observation stage result)]
+              (swap! *stage-recorder* update-in [stage :observations]
+                     (fnil conj []) observation)))
+          result)
         (finally
           (when *stage-recorder*
             (swap! *stage-recorder*
@@ -145,22 +199,26 @@
                   (swap! samples
                          (fn [acc]
                            (reduce-kv
-                            (fn [acc stage {:keys [nanos calls]}]
+                            (fn [acc stage {:keys [nanos calls observations]}]
                               (-> acc
                                   (update-in [stage :elapsed-ms] (fnil conj [])
                                              (/ (double nanos) 1e6))
-                                  (update-in [stage :calls] (fnil conj []) calls)))
+                                  (update-in [stage :calls] (fnil conj []) calls)
+                                  (update-in [stage :observations] (fnil into [])
+                                             observations)))
                             acc @per-query)))
                   (elapsed-ms start)))))))]
     (assoc end-to-end
            :instrumented-timing (timing-summary instrumented-totals)
            :stages
            (into {}
-                 (map (fn [[stage {:keys [elapsed-ms calls]}]]
+                 (map (fn [[stage {:keys [elapsed-ms calls observations]}]]
                         [stage (assoc (timing-summary elapsed-ms)
                                       :calls-per-query
                                       {:min (apply min calls)
                                        :max (apply max calls)}
+                                      :observations
+                                      (frequencies observations)
                                       :call-sites
                                       (get @call-sites stage {}))]))
                  @samples))))
