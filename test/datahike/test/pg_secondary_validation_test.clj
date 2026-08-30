@@ -181,8 +181,8 @@
                   (swap! requests conj request)
                   page)))
         #(restrict ::db query [] (assoc spec :candidate-limit 1024)))
-      (is (= [{:limit 1023}] @requests)
-          "Stratum's lookahead stays within its 1024-row Top-N ceiling"))))
+      (is (= [{:limit 1024}] @requests)
+          "a large exact prefix is requested once rather than repeatedly sorting OFFSET pages"))))
 
 (deftest stratum-btree-declines-non-order-preserving-carriers
   (if-not secondary-stack-available?
