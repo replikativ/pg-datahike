@@ -6284,7 +6284,27 @@
           exact-filtered #(run-query filtered-query filtered-args)
           exact-threshold (max 256 (* 8 (:candidate-limit query-spec)))]
       (if (<= (count filter-eids) exact-threshold)
-        (exact-filtered)
+        ;; Sparse exact distance belongs next to the vector segment: Proximum
+        ;; can score only the allowed internal IDs with SIMD and return a
+        ;; complete top-k. Datahike still re-evaluates the authoritative SQL
+        ;; distance/order over those k rows. Older or unavailable adapters
+        ;; fail closed to the established exact Datalog path.
+        (let [expected-count (min (long (:candidate-limit query-spec))
+                                  (count filter-eids))
+              [exact-entities exact-count]
+              (try
+                (secondary-result-entities
+                 (search db index
+                         (assoc query-spec :filter-strategy :exact)
+                         filter-entities)
+                 entity-count)
+                (catch Exception _ [nil 0]))]
+          (if (and exact-entities (= expected-count exact-count))
+            (let [[candidate-query candidate-args]
+                  (restrict-query-to-entities
+                   exact-query exact-in-args entity-var exact-entities)]
+              (run-query candidate-query candidate-args))
+            (exact-filtered)))
         (let [[ann-entities ann-count]
               (try
                 (secondary-result-entities

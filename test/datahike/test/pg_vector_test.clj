@@ -651,6 +651,57 @@
                  (dissoc :in))))
       (is (= [ann-eids] args)))))
 
+(deftest sparse-vector-prefilter-uses-native-exact-top-k
+  (let [run-prefiltered (ns-resolve 'datahike.pg.server
+                                    'run-prefiltered-vector-query)
+        native-call* (atom nil)
+        exact-call* (atom nil)
+        distance-var '?distance
+        entity-var '?doc
+        exact-query {:find ['?id distance-var]
+                     :with [entity-var]
+                     :where [[entity-var :doc/id '?id]
+                             [entity-var :doc/category '?category]
+                             [(list 'vector-distance '?embedding '[0.0 0.0])
+                              distance-var]]
+                     :order-by [1 :asc]
+                     :limit 10}
+        filter-eids (vec (range 1 101))
+        nearest-eids (vec (range 51 61))
+        run-query
+        (fn
+          ([query args]
+           (reset! exact-call* [query args])
+           [[:native-exact-result]])
+          ([_query _args apply-bounds?]
+           (is (false? apply-bounds?))
+           (mapv vector filter-eids)))
+        access
+        {:index ::index
+         :entity-var entity-var
+         :result-var distance-var
+         :query-spec {:vector [0.0 0.0]
+                      :candidate-limit 10}
+         :filtered-entrypoints
+         {:entity-set #(do (is (= filter-eids %)) ::entity-filter)
+          :entity-count (fn [_] (throw (AssertionError. "sequential result")))
+          :search (fn [db index query-spec entity-filter]
+                    (reset! native-call*
+                            [db index query-spec entity-filter])
+                    nearest-eids)}}]
+    (is (= [[:native-exact-result]]
+           (run-prefiltered ::db exact-query [] run-query access)))
+    (is (= [::db ::index
+            (assoc (:query-spec access) :filter-strategy :exact)
+            ::entity-filter]
+           @native-call*))
+    (let [[query args] @exact-call*]
+      (is (= exact-query
+             (-> query
+                 (update :in pop)
+                 (dissoc :in))))
+      (is (= [nearest-eids] args)))))
+
 (deftest vector-extension-discovery-and-binary-codec
   (is (= "CREATE EXTENSION"
          (.-commandTag ^PgWireServer$QueryResult
