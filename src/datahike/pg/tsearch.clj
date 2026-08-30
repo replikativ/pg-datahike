@@ -4,7 +4,7 @@
    This namespace owns the SQL-visible normalization and canonical text form.
    A secondary index (Scriptum or otherwise) may use these values to find
    candidates, but must not substitute its parser, analyzer, or scores for
-   PostgreSQL semantics."
+  PostgreSQL semantics."
   (:require [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr])
   (:import [org.tartarus.snowball.ext EnglishStemmer]))
@@ -319,6 +319,31 @@
           (syntax-error! "tsquery" input j "unexpected token"))
         ast))))
 
+(defonce ^:private ^ThreadLocal parsed-tsquery-cache
+  ;; @@ invokes its predicate once per candidate row. A SQL literal or bound
+  ;; prepared parameter is constant for that execution, so reparsing it for
+  ;; every tsvector is pure overhead. Retain only the last [text AST] per query
+  ;; worker: the hot path is one ThreadLocal read and equality check, while
+  ;; arbitrary ad-hoc query text cannot grow retained entry count.
+  (ThreadLocal.))
+
+(def ^:private max-cached-tsquery-chars 65536)
+
+(defn- cached-parse-tsquery [value]
+  (let [key (str value)
+        ^objects cached (.get parsed-tsquery-cache)]
+    (cond
+      (and cached (= key (aget cached 0)))
+      (aget cached 1)
+
+      (> (.length ^String key) max-cached-tsquery-chars)
+      (parse-tsquery key)
+
+      :else
+      (let [parsed (parse-tsquery key)]
+        (.set parsed-tsquery-cache (object-array [key parsed]))
+        parsed))))
+
 (defn- query-text [ast parent-precedence]
   (if (= :term (:type ast))
     (str (quote-lexeme (:lexeme ast))
@@ -457,7 +482,8 @@
   [vector query]
   (and (some? vector) (not= :__null__ vector)
        (some? query) (not= :__null__ query)
-       (:match? (eval-query (parse-tsvector vector) (parse-tsquery query)))))
+       (:match? (eval-query (parse-tsvector vector)
+                            (cached-parse-tsquery query)))))
 
 (defn ts-match3
   "Value-position @@ with PostgreSQL's strict NULL propagation."
