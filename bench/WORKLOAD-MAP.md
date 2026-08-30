@@ -112,6 +112,7 @@ The clean same-host p50 comparison for that run was:
 | filtered vector, 1% | 12.90 ms, recall 1.0 | 8.32 ms, recall 0.8 | not semantically equivalent; pg-datahike pays for complete fallback |
 | filtered vector, 0.1% / 100 rows | 1.13 ms | 0.112 ms | both choose exact primary-prefilter top-N; same shape, ~1 ms JVM floor |
 | exact vector scan | 298 ms | 10.64 ms | largest primary relation/expression constant; not an HNSW problem |
+| indexed parent→fact fanout, 100 rows | 2.50 ms | 0.10 ms | runtime AVET parameterization fixes the former full fact scan; Datahike `d/q` is ~0.99 ms |
 
 These are development measurements, not a general engine ranking. The
 pg-datahike side calls its in-process query handler while PostgreSQL includes
@@ -128,13 +129,16 @@ not predict build/query behavior at 384- or 768-dimensional production shapes.
    at sixteen. For a 100-row range it grew from 2.57 to 8.22 ms, versus
    PostgreSQL 0.11 to 0.28 ms. The access complexity is acceptable, but the
    per-entity/per-attribute relation constant is large on multi-row output.
-2. **Parameterized indexed joins.** An indexed 100-row parent→fact fanout took
-   23.1 ms versus PostgreSQL's 0.35 ms. Datahike's plan binds the unique parent
-   through AVET, but the second entity group still scans every fact row through
-   AEVT and treats `[?fact :parent-id ?bound-parent]` as a merge. It does not
-   yet turn a small upstream binding relation into parameterized AVET seeks.
-   This is a genuine `O(N)` versus `O(log N + matches)` gap and is the next
-   primary-planner target.
+2. **Parameterized indexed joins.** The original indexed 100-row parent→fact
+   fanout took 23.1 ms because the second entity group scanned every fact row
+   through AEVT and only then merged the bound parent id. Relation execution
+   now reselects that group's driver from live upstream bindings and rotates a
+   sufficiently selective indexed merge into an AVET/EAVT scan. At 20k rows
+   this reduces the full SQL path to 2.50 ms and `d/q` to ~0.99 ms, versus
+   PostgreSQL at ~0.10 ms in the final rerun. The access complexity is now
+   `O(log N + matches)` on both sides. Remaining work is constant overhead and
+   observability: `explain` still prints the static pre-binding driver rather
+   than the runtime-selected one.
 3. **Demand propagation.** PostgreSQL's pull executor lets `Limit` stop its
    child. Datahike propagates demand for a proven-safe single entity group, but
    post-filters, multiple groups, many joins, aggregation, and generic ordering
