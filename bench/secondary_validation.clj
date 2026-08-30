@@ -5,7 +5,9 @@
      clojure -J-Xmx3g -M:dev:local-secondary-stack bench/secondary_validation.clj
 
    Set SECONDARY_BENCH_ROWS to override the default 10,000 rows. Results are
-   printed as one EDN map so runs can be compared without scraping prose.
+   printed as one EDN map so runs can be compared without scraping prose. Set
+   SECONDARY_BENCH_COMPACT=true for a growth-run summary that retains timings,
+   cardinalities, and optimizer decisions but omits call sites and tails.
    SECONDARY_BENCH_DIMENSION raises the vector width from the cheap 16-float
    smoke shape to realistic embedding widths such as 384 or 768."
   (:require [clojure.set :as set]
@@ -337,7 +339,8 @@
           (str "SELECT id FROM secondary_bench WHERE category = 0 "
                "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
           filtered-01-sql
-          (str "SELECT id FROM secondary_bench WHERE id < 10 "
+          (str "SELECT id FROM secondary_bench WHERE id < "
+               (max 10 (quot n 1000)) " "
                "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")]
       (try
         (checked handler
@@ -601,4 +604,52 @@
           (d/release conn)
           (d/delete-database cfg))))))
 
-(prn (run-benchmark))
+(defn- compact-timing [timing]
+  (cond-> (select-keys timing [:p50-ms :p95-ms])
+    (:stages timing)
+    (assoc :stages
+           (into {}
+                 (map (fn [[stage details]]
+                        [stage (select-keys details
+                                            [:p50-ms :p95-ms
+                                             :calls-per-query :observations])]))
+                 (:stages timing)))))
+
+(defn- compact-case [benchmark-case]
+  (cond-> (select-keys benchmark-case
+                       [:matches :returned :same-results? :recall-at-k])
+    (:exact benchmark-case) (assoc :exact (compact-timing (:exact benchmark-case)))
+    (:indexed benchmark-case)
+    (assoc :indexed (compact-timing (:indexed benchmark-case)))
+    (:timing benchmark-case) (assoc :timing (compact-timing (:timing benchmark-case)))))
+
+(defn- compact-result [result]
+  {:environment (:environment result)
+   :rows (:rows result)
+   :dimension (:dimension result)
+   :load-ms (:load-ms result)
+   :build-ms (:build-ms result)
+   :scalar-order (compact-case (:scalar-order result))
+   :fulltext (update-vals (:fulltext result) compact-case)
+   :vector
+   (let [vector (:vector result)
+         unfiltered (:unfiltered vector)]
+     {:k (:k vector)
+      :exact (compact-timing (:exact vector))
+      :unfiltered
+      {:beam-sweep
+       (into (sorted-map)
+             (map (fn [[ef benchmark-case]]
+                    [ef (compact-case benchmark-case)]))
+             (:beam-sweep unfiltered))
+       :quality-sample (:quality-sample unfiltered)
+       :ef-1000-confirmation
+       (compact-case (:ef-1000-confirmation unfiltered))}
+      :filter-10-percent (compact-case (:filter-10-percent vector))
+      :filter-1-percent (compact-case (:filter-1-percent vector))
+      :filter-0.1-percent (compact-case (:filter-0.1-percent vector))})})
+
+(let [result (run-benchmark)]
+  (prn (if (= "true" (System/getenv "SECONDARY_BENCH_COMPACT"))
+         (compact-result result)
+         result)))

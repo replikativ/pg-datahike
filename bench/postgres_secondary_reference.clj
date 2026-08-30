@@ -144,6 +144,10 @@
         filtered-1-sql
         (str "SELECT id FROM secondary_bench_reference WHERE category = 0 "
              "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
+        filtered-01-sql
+        (str "SELECT id FROM secondary_bench_reference WHERE id < "
+             (max 10 (quot n 1000)) " "
+             "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
         quality-query-vectors
         (let [quality-random (java.util.Random. 991)]
           (mapv (fn [_]
@@ -188,11 +192,14 @@
                     quality-query-vectors)
               exact-filtered-10 (query-ids conn filtered-10-sql)
               exact-filtered-1 (query-ids conn filtered-1-sql)
+              exact-filtered-01 (query-ids conn filtered-01-sql)
               exact-vector-timing (timings 5 20 #(query-ids conn vector-sql))
               exact-filtered-10-timing
               (timings 3 10 #(query-ids conn filtered-10-sql))
               exact-filtered-1-timing
               (timings 3 10 #(query-ids conn filtered-1-sql))
+              exact-filtered-01-timing
+              (timings 3 10 #(query-ids conn filtered-01-sql))
               scalar-build-start (now-nanos)
               _ (execute! conn
                           (str "CREATE INDEX secondary_bench_reference_rank_btree "
@@ -244,10 +251,13 @@
               indexed-vector-timing (timings 5 20 #(query-ids conn vector-sql))
               indexed-filtered-10 (query-ids conn filtered-10-sql)
               indexed-filtered-1 (query-ids conn filtered-1-sql)
+              indexed-filtered-01 (query-ids conn filtered-01-sql)
               indexed-filtered-10-timing
               (timings 3 10 #(query-ids conn filtered-10-sql))
               indexed-filtered-1-timing
-              (timings 3 10 #(query-ids conn filtered-1-sql))]
+              (timings 3 10 #(query-ids conn filtered-1-sql))
+              indexed-filtered-01-timing
+              (timings 3 10 #(query-ids conn filtered-01-sql))]
           {:environment (benchmark-environment)
            :postgres-version (query-string conn "SHOW server_version")
            :pgvector-version
@@ -311,6 +321,12 @@
              :exact exact-filtered-1-timing
              :indexed indexed-filtered-1-timing
              :plan (explain conn filtered-1-sql)}
+            :filter-0.1-percent
+            {:returned (count indexed-filtered-01)
+             :recall-at-k (recall exact-filtered-01 indexed-filtered-01)
+             :exact exact-filtered-01-timing
+             :indexed indexed-filtered-01-timing
+             :plan (explain conn filtered-01-sql)}
             :exact exact-vector-timing}})))))
 
 (prn (run-benchmark))
