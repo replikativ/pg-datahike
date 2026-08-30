@@ -5,8 +5,12 @@ import java.net.*;
 import java.nio.*;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
 
 /**
  * Minimal PostgreSQL wire protocol (v3) server for Datahike.
@@ -17,8 +21,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>Protocol flow:
  * <ol>
- *   <li>SSL negotiation → reject with 'N'</li>
- *   <li>StartupMessage → AuthenticationOk + ParameterStatus + BackendKeyData + ReadyForQuery</li>
+ *   <li>Optional SSL negotiation</li>
+ *   <li>StartupMessage → optional password challenge + AuthenticationOk + ParameterStatus + BackendKeyData + ReadyForQuery</li>
  *   <li>Query ('Q') → delegate to QueryHandler → RowDescription + DataRow* + CommandComplete + ReadyForQuery</li>
  *   <li>Terminate ('X') → close connection</li>
  * </ol>
@@ -29,6 +33,40 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * along with the rest of pg-datahike. See NOTICE.
  */
 public final class PgWireServer {
+
+    /**
+     * Deployment-owned password verifier. The wire layer deliberately does
+     * not own users or password storage; callers can back this with a secret
+     * store, an application database, or a fixed deployment configuration.
+     */
+    @FunctionalInterface
+    public interface PasswordAuthenticator {
+        boolean authenticate(AuthenticationContext context, char[] password) throws Exception;
+    }
+
+    /** Immutable connection metadata supplied to a password authenticator. */
+    public static final class AuthenticationContext {
+        private final java.util.Map<String, String> startupParameters;
+        private final SocketAddress remoteAddress;
+        private final boolean tls;
+
+        AuthenticationContext(java.util.Map<String, String> startupParameters,
+                              SocketAddress remoteAddress, boolean tls) {
+            this.startupParameters = Collections.unmodifiableMap(
+                new java.util.LinkedHashMap<>(startupParameters));
+            this.remoteAddress = remoteAddress;
+            this.tls = tls;
+        }
+
+        public java.util.Map<String, String> getStartupParameters() {
+            return startupParameters;
+        }
+
+        public String getUser() { return startupParameters.get("user"); }
+        public String getDatabase() { return startupParameters.get("database"); }
+        public SocketAddress getRemoteAddress() { return remoteAddress; }
+        public boolean isTls() { return tls; }
+    }
 
     /**
      * A protocol-level exception carrying a PostgreSQL SQLSTATE code.
@@ -661,6 +699,9 @@ public final class PgWireServer {
     /** Maximum message body size: 64 MB. */
     private static final int MAX_MESSAGE_LENGTH = 64 * 1024 * 1024;
 
+    /** Authentication packets have no reason to approach query-message size. */
+    private static final int MAX_PASSWORD_MESSAGE_LENGTH = 65535 + 4;
+
     /** Maximum SSL/startup negotiation rounds before closing connection. */
     private static final int MAX_STARTUP_ROUNDS = 5;
 
@@ -670,6 +711,9 @@ public final class PgWireServer {
     private final int port;
     private final String host;
     private final QueryHandlerFactory handlerFactory;
+    private final PasswordAuthenticator passwordAuthenticator;
+    private final SSLContext sslContext;
+    private final boolean requireTls;
     private ServerSocket serverSocket;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread acceptThread;
@@ -787,9 +831,29 @@ public final class PgWireServer {
      * Each connection creates a fresh handler with independent transaction state.
      */
     public PgWireServer(int port, String host, QueryHandlerFactory factory) {
+        this(port, host, factory, null, null);
+    }
+
+    /**
+     * Create a server with optional password authentication and PostgreSQL
+     * TLS negotiation. A null authenticator preserves trusted local mode; a
+     * null SSL context rejects SSLRequest with PostgreSQL's single-byte 'N'.
+     */
+    public PgWireServer(int port, String host, QueryHandlerFactory factory,
+                        PasswordAuthenticator passwordAuthenticator,
+                        SSLContext sslContext) {
+        this(port, host, factory, passwordAuthenticator, sslContext, false);
+    }
+
+    public PgWireServer(int port, String host, QueryHandlerFactory factory,
+                        PasswordAuthenticator passwordAuthenticator,
+                        SSLContext sslContext, boolean requireTls) {
         this.port = port;
         this.host = host;
         this.handlerFactory = factory;
+        this.passwordAuthenticator = passwordAuthenticator;
+        this.sslContext = sslContext;
+        this.requireTls = requireTls;
     }
 
     /**
@@ -871,24 +935,22 @@ public final class PgWireServer {
 
     private void handleConnection(Socket client) {
         QueryHandler handler = null;
+        Socket transport = client;
         AtomicBoolean[] cancelState = new AtomicBoolean[]{null};
         long[] cancelKeys = new long[]{0L};
-        @SuppressWarnings("unchecked")
-        java.util.Map<String, String>[] startupParamsHolder = new java.util.Map[]{null};
-        try (client;
-             DataInputStream in = new DataInputStream(new BufferedInputStream(client.getInputStream()));
-             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(client.getOutputStream()))) {
-
-            if (!handleStartup(in, out, cancelState, cancelKeys, startupParamsHolder)) {
+        try {
+            StartupResult startup = handleStartup(client, cancelState, cancelKeys);
+            if (startup == null) {
                 return;
             }
+            transport = startup.socket;
+            DataInputStream in = startup.in;
+            DataOutputStream out = startup.out;
 
             // Per-connection handler (each connection gets independent tx state).
             // Factory sees the parsed StartupMessage params (database, user,
             // application_name, …) so multi-DB registries can route on `database`.
-            java.util.Map<String, String> startupParams = startupParamsHolder[0];
-            if (startupParams == null) startupParams = java.util.Collections.emptyMap();
-            handler = handlerFactory.create(startupParams);
+            handler = handlerFactory.create(startup.startupParameters);
 
             // Per-connection state
             // Prepared statements keyed by name. "" is the unnamed statement,
@@ -1158,6 +1220,10 @@ public final class PgWireServer {
                 e.printStackTrace(System.err);
             }
         } finally {
+            try { transport.close(); } catch (IOException ignored) {}
+            if (transport != client) {
+                try { client.close(); } catch (IOException ignored) {}
+            }
             // Release any per-connection state (row locks, pending tx) —
             // analogous to PG's backend termination implicitly rolling back.
             if (handler != null) {
@@ -1202,17 +1268,67 @@ public final class PgWireServer {
         return params;
     }
 
-    private boolean handleStartup(DataInputStream in, DataOutputStream out,
-                                   AtomicBoolean[] cancelState, long[] cancelKeys,
-                                   java.util.Map<String, String>[] startupParamsHolder) throws IOException {
+    private static final class StartupResult {
+        final Socket socket;
+        final DataInputStream in;
+        final DataOutputStream out;
+        final java.util.Map<String, String> startupParameters;
+
+        StartupResult(Socket socket, DataInputStream in, DataOutputStream out,
+                      java.util.Map<String, String> startupParameters) {
+            this.socket = socket;
+            this.in = in;
+            this.out = out;
+            this.startupParameters = startupParameters;
+        }
+    }
+
+    private StartupResult handleStartup(Socket client,
+                                        AtomicBoolean[] cancelState,
+                                        long[] cancelKeys) throws IOException {
+        Socket transport = client;
+        // Do not buffer before an SSL upgrade. PostgreSQL requires the server
+        // to consume exactly SSLRequest before handing the connection to TLS;
+        // read-ahead here creates the buffer-stuffing class of vulnerability.
+        DataInputStream in = new DataInputStream(transport.getInputStream());
+        DataOutputStream out = new DataOutputStream(transport.getOutputStream());
+        boolean tls = false;
         for (int round = 0; round < MAX_STARTUP_ROUNDS; round++) {
             int len = in.readInt();
             int code = in.readInt();
+            if (len < 8 || len > MAX_MESSAGE_LENGTH) {
+                sendError(out, "FATAL", "08P01", "invalid startup packet length");
+                out.flush();
+                return null;
+            }
 
             if (code == 80877103) {
-                // SSLRequest — reject
-                out.writeByte('N');
+                if (len != 8 || tls) return null;
+                if (sslContext == null) {
+                    out.writeByte('N');
+                    out.flush();
+                    continue;
+                }
+
+                // PostgreSQL SSL negotiation: exactly one unframed 'S' byte,
+                // then a normal TLS server handshake on the same socket.
+                out.writeByte('S');
                 out.flush();
+                SSLSocket sslSocket = (SSLSocket) sslContext.getSocketFactory()
+                    .createSocket(client, client.getInetAddress().getHostAddress(),
+                                  client.getPort(), false);
+                sslSocket.setUseClientMode(false);
+                java.util.Set<String> supported = new java.util.HashSet<>(
+                    Arrays.asList(sslSocket.getSupportedProtocols()));
+                java.util.List<String> protocols = new java.util.ArrayList<>(2);
+                if (supported.contains("TLSv1.3")) protocols.add("TLSv1.3");
+                if (supported.contains("TLSv1.2")) protocols.add("TLSv1.2");
+                sslSocket.setEnabledProtocols(protocols.toArray(new String[0]));
+                sslSocket.startHandshake();
+                transport = sslSocket;
+                in = new DataInputStream(transport.getInputStream());
+                out = new DataOutputStream(transport.getOutputStream());
+                tls = true;
                 continue;
             }
 
@@ -1226,6 +1342,7 @@ public final class PgWireServer {
                 // loop for the next message. We neither support nor
                 // plan to support GSS encryption; 'N' is the correct
                 // "proceed in plaintext" signal.
+                if (len != 8) return null;
                 out.writeByte('N');
                 out.flush();
                 continue;
@@ -1237,9 +1354,23 @@ public final class PgWireServer {
                 in.readFully(params);
                 // Parse key/value pairs and surface them to the caller so
                 // handlerFactory.create(params) can route on `database`.
-                startupParamsHolder[0] = parseStartupParams(params);
+                java.util.Map<String, String> startupParameters = parseStartupParams(params);
                 if (System.getenv("DATAHIKE_WIRE_DEBUG") != null) {
-                    System.err.println("PgWire startup parameters: " + startupParamsHolder[0]);
+                    System.err.println("PgWire startup parameters: " + startupParameters);
+                }
+
+                if (requireTls && !tls) {
+                    sendError(out, "FATAL", "28000",
+                              "SSL connection is required");
+                    out.flush();
+                    return null;
+                }
+
+                if (passwordAuthenticator != null) {
+                    if (!authenticate(in, out, startupParameters,
+                                      client.getRemoteSocketAddress(), tls)) {
+                        return null;
+                    }
                 }
 
                 // AuthenticationOk
@@ -1280,7 +1411,13 @@ public final class PgWireServer {
 
                 sendReadyForQuery(out, 'I');
                 out.flush();
-                return true;
+                // Negotiation is complete, so buffering is safe again and
+                // preserves the existing low-syscall query response path.
+                return new StartupResult(
+                    transport,
+                    new DataInputStream(new BufferedInputStream(transport.getInputStream())),
+                    new DataOutputStream(new BufferedOutputStream(transport.getOutputStream())),
+                    startupParameters);
             }
 
             if (code == 80877102) {
@@ -1317,12 +1454,93 @@ public final class PgWireServer {
                         if (tgt != null) tgt.interrupt();
                     }
                 }
-                return false;
+                return null;
             }
 
+            return null;
+        }
+        return null;
+    }
+
+    /** PostgreSQL AuthenticationCleartextPassword exchange (auth code 3). */
+    private boolean authenticate(DataInputStream in, DataOutputStream out,
+                                 java.util.Map<String, String> startupParameters,
+                                 SocketAddress remoteAddress, boolean tls) throws IOException {
+        out.writeByte('R');
+        out.writeInt(8);
+        out.writeInt(3);
+        out.flush();
+
+        int type = in.read();
+        if (type != 'p') {
+            sendError(out, "FATAL", "08P01", "expected password response");
+            out.flush();
             return false;
         }
-        return false;
+        int len = in.readInt();
+        if (len < 5 || len > MAX_PASSWORD_MESSAGE_LENGTH) {
+            sendError(out, "FATAL", "08P01", "invalid password packet length");
+            out.flush();
+            return false;
+        }
+        byte[] body = new byte[len - 4];
+        in.readFully(body);
+        if (body[body.length - 1] != 0) {
+            Arrays.fill(body, (byte) 0);
+            sendError(out, "FATAL", "08P01", "invalid password packet");
+            out.flush();
+            return false;
+        }
+        if (body.length == 1) {
+            Arrays.fill(body, (byte) 0);
+            sendError(out, "FATAL", "28P01", "empty password returned by client");
+            out.flush();
+            return false;
+        }
+        for (int i = 0; i < body.length - 1; i++) {
+            if (body[i] == 0) {
+                Arrays.fill(body, (byte) 0);
+                sendError(out, "FATAL", "08P01", "invalid password packet size");
+                out.flush();
+                return false;
+            }
+        }
+
+        char[] password;
+        try {
+            java.nio.CharBuffer decoded = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(body, 0, body.length - 1));
+            password = new char[decoded.remaining()];
+            decoded.get(password);
+        } catch (java.nio.charset.CharacterCodingException e) {
+            sendError(out, "FATAL", "08P01", "password is not valid UTF-8");
+            out.flush();
+            return false;
+        } finally {
+            Arrays.fill(body, (byte) 0);
+        }
+        boolean accepted = false;
+        try {
+            AuthenticationContext context = new AuthenticationContext(
+                startupParameters, remoteAddress, tls);
+            accepted = passwordAuthenticator.authenticate(context, password);
+        } catch (Exception e) {
+            if (System.getenv("DATAHIKE_WIRE_DEBUG") != null) {
+                System.err.println("PgWire authenticator error: " + e.getMessage());
+            }
+        } finally {
+            Arrays.fill(password, '\0');
+        }
+
+        if (!accepted) {
+            String user = startupParameters.getOrDefault("user", "");
+            sendError(out, "FATAL", "28P01",
+                      "password authentication failed for user \"" + user + "\"");
+            out.flush();
+        }
+        return accepted;
     }
 
     // ========================================================================

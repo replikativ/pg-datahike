@@ -22,6 +22,22 @@ features, and planner controls are generally outside this compatibility target.
 Their syntax may still be recognized where that is useful, but applications
 must not assume that arbitrary PostgreSQL SQL or extensions will run unchanged.
 
+## Wire security
+
+pg-datahike implements PostgreSQL's conventional `SSLRequest` negotiation and
+cleartext-password authentication exchange. The password exchange is intended
+to run inside TLS: `start-server` rejects a non-loopback bind unless both TLS
+and a password authenticator are configured, and it rejects a plaintext
+StartupMessage before asking for a password. Standard client modes including
+`sslmode=require` and `sslmode=verify-full` are tested with pgjdbc and psql.
+
+Authentication is a deployment boundary rather than a PostgreSQL role system.
+The wire layer delegates verification to an application callback, with a fixed
+user map available for small deployments. Authenticated users are not yet
+mapped to Datahike's per-database authorization model. PostgreSQL HBA rules,
+SCRAM, MD5, client-certificate authentication, GSS encryption, and direct TLS
+negotiation are outside the current surface.
+
 ## Compatibility guarantees
 
 Supported behavior is established by focused tests, client and framework

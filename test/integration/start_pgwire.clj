@@ -1,6 +1,6 @@
 ;; Start a PgWire server for integration testing.
 ;; Run with: clj -A:test -M test/integration/start_pgwire.clj
-;; The server listens on port 15432 and blocks until killed.
+;; The server listens on loopback port 15432 and blocks until killed.
 ;;
 ;; Also starts an nREPL on port 15433 for dual-access:
 ;;   SQL via pgwire on 15432 + Datalog via nREPL on 15433
@@ -46,7 +46,9 @@
       (pg/start-server
        {"datahike" conn}
        {:port port
-        :host "0.0.0.0"
+        ;; Every integration client runs in this process' host/container.
+        ;; Keep the unauthenticated test listener inside that trust boundary.
+        :host "127.0.0.1"
         ;; SQL CREATE/DROP DATABASE → fresh in-memory Datahike db.
         :database-template {:store {:backend :memory}
                             :schema-flexibility :write

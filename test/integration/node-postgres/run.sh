@@ -34,7 +34,7 @@ export PGDATABASE=datahike
 export PGPASSWORD=datahike
 export PGTESTNOSSL=1       # upstream flag: skip SSL tests
 # Leave PG_CLIENT_ENCODING / PGSSLMODE unset: the default path is already
-# cleartext, no-TLS.
+# trusted-local, no-TLS test harness.
 
 PG_DIR="${CLONE_DIR}/packages/pg"
 if [[ ! -d "${PG_DIR}/test/integration/client" ]]; then

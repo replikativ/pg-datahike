@@ -110,6 +110,19 @@
   "Stop a running pgwire server."
   server/stop-server)
 
+(def password-authenticator
+  "Adapt a Clojure password-verifier function to pgwire's authentication
+   interface. See datahike.pg.server/password-authenticator."
+  server/password-authenticator)
+
+(def users-authenticator
+  "Build a password authenticator from a small deployment-owned user map."
+  server/users-authenticator)
+
+(def ssl-context-from-pkcs12
+  "Load a server TLS context from a PKCS#12 keystore."
+  server/ssl-context-from-pkcs12)
+
 (def make-query-handler
   "Create an in-process QueryHandler. Bypasses the wire layer — use
    this for tests, REPL work, or applications that embed Datahike
