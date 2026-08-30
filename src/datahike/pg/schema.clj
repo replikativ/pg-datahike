@@ -599,6 +599,16 @@
                    pg-types)
            ::column-order column-order)))
 
+(def ^:private schema-hints-last-cache
+  "Last `[db result]` pair for steady-state statement parsing.
+
+   `d/db` returns the same immutable DB object until the connection advances.
+   Identity therefore gives exact invalidation on every transaction without
+   invoking DB equality (or retaining a map of historical roots). Concurrent
+   misses may duplicate the three small catalog queries; they cannot publish a
+   result for the wrong DB."
+  (volatile! [nil nil]))
+
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
    by scanning the db for :datahike.pg/for-ident-rooted hint entities.
@@ -612,10 +622,21 @@
     (some? *catalog-tx-cache*)
     (let [^java.util.IdentityHashMap m (:hints *catalog-tx-cache*)]
       (or (.get m db)
-          (let [v (schema-hints* db)]
+          (let [[cached-db cached-value] @schema-hints-last-cache
+                v (if (identical? cached-db db)
+                    cached-value
+                    (let [computed (schema-hints* db)]
+                      (vreset! schema-hints-last-cache [db computed])
+                      computed))]
             (.put m db v)
             v)))
-    :else (schema-hints* db)))
+    :else
+    (let [[cached-db cached-value] @schema-hints-last-cache]
+      (if (identical? cached-db db)
+        cached-value
+        (let [computed (schema-hints* db)]
+          (vreset! schema-hints-last-cache [db computed])
+          computed)))))
 
 (defn row-marker-attr
   "Return the row-existence marker attribute for a table.

@@ -74,6 +74,19 @@
     (is (= {:column "name"} (get hs :widget/full_name)))
     (is (= {:hidden true}   (get hs :widget/internal_note)))))
 
+(deftest schema-hints-cache-follows-immutable-db-root
+  (let [db-before (d/db *conn*)
+        first-result (pgs/schema-hints db-before)]
+    (is (identical? first-result (pgs/schema-hints db-before))
+        "the unchanged immutable DB root reuses its catalog scan")
+    (pgs/set-hint! *conn* :widget/full_name {:column "display_name"})
+    (let [db-after (d/db *conn*)
+          after-result (pgs/schema-hints db-after)]
+      (is (not (identical? db-before db-after)))
+      (is (= {:column "display_name"}
+             (get after-result :widget/full_name))
+          "a transaction publishes a new DB root and invalidates the cache"))))
+
 (deftest information-schema-reflects-hints
   (with-open [c (jdbc)]
     (is (= [["sku"] ["name"]]
