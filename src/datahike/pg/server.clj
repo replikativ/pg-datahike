@@ -6235,9 +6235,12 @@
                       :attribute attribute
                       :query-spec query-spec
                       :probe-limit 128
-                      :underfill-fallback (if equality-binding
-                                            :exact
-                                            :prefilter)}]
+                      ;; A probe that under-fills has measured that the WHERE
+                      ;; result is sparse enough to project once. Let the
+                      ;; adapter choose exact-filtered versus filtered ANN from
+                      ;; that runtime cardinality instead of paying for the
+                      ;; complete distance query after the failed probe.
+                      :underfill-fallback :prefilter}]
                     (if-let [candidate-page (and (close-candidate-scan-entrypoint)
                                                  (candidate-page-entrypoint))]
                       [query in-args
@@ -6617,10 +6620,8 @@
               :proximum-hybrid
               (run-materialized-vector-probe
                query-db exact-query exact-in-args run-query limit vector-access
-               (if (= :exact (:underfill-fallback vector-access))
-                 #(run-query exact-query exact-in-args)
-                 #(run-prefiltered-vector-query
-                   query-db exact-query exact-in-args run-query vector-access)))
+               #(run-prefiltered-vector-query
+                 query-db exact-query exact-in-args run-query vector-access))
 
               :proximum-prefiltered
               (run-prefiltered-vector-query

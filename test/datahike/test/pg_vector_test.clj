@@ -276,8 +276,8 @@
               #(restrict common-db (:query filtered) (:in-args filtered)
                          (:secondary-candidate filtered)))]
         (is (= :proximum-hybrid (:kind filtered-access)))
-        (is (= :exact (:underfill-fallback filtered-access))
-            "underfill executes one authoritative query, not a full set copy")))
+        (is (= :prefilter (:underfill-fallback filtered-access))
+            "observed underfill projects the matching ids once so the adapter can choose exact filtered search")))
 
     (testing "a selective unindexed equality keeps one authoritative pass"
       (let [filtered (sql/parse-sql
