@@ -109,10 +109,13 @@ SECONDARY_BENCH_ROWS=20000 SECONDARY_BENCH_DIMENSION=384 \
   clojure -M:dev bench/postgres_secondary_reference.clj
 ```
 
-The reference forces a sequential plan for the exact baseline and a GIN plan
-for the indexed full-text baseline, reports the selected plans, and includes
-result materialization in all timings. Its vector corpus and deterministic
-query sample use the same RNG seeds, cosine operator class, `m`,
+The reference forces a sequential plan for the exact baseline, then restores
+PostgreSQL's natural planner after building and analyzing all indexes. It
+reports actual rows and buffers for the selected plans and includes result
+materialization in all timings. This deliberately allows a sparse filtered
+vector query to choose an exact primary-index top-N path instead of forcing
+HNSW. Its vector corpus and deterministic query sample use the same RNG seeds,
+cosine operator class, `m`,
 `ef_construction`, and `ef_search` sweep as `secondary_validation.clj`, so
 pgvector and Proximum results are directly comparable. pgvector remains an
 optional prerequisite because PostgreSQL itself does not ship the extension.

@@ -63,7 +63,9 @@
 
 (defn- explain [^Connection conn sql]
   (with-open [^Statement statement (.createStatement conn)
-              ^ResultSet results (.executeQuery statement (str "EXPLAIN " sql))]
+              ^ResultSet results
+              (.executeQuery statement
+                             (str "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) " sql))]
     (loop [lines []]
       (if (.next results)
         ;; A 384-dimensional literal otherwise dominates the EDN result and
@@ -218,9 +220,16 @@
                                "WITH (m=16, ef_construction="
                                hnsw-ef-construction ")"))
               vector-build-ms (elapsed-ms vector-build-start)
+              ;; Keep estimates and actual-row plans meaningful. Bulk INSERT
+              ;; plus immediate CREATE INDEX does not guarantee autovacuum has
+              ;; populated statistics before this short-lived benchmark ends.
+              _ (execute! conn "ANALYZE secondary_bench_reference")
               _ (execute! conn "SET enable_indexscan = on")
               _ (execute! conn "SET enable_bitmapscan = on")
-              _ (execute! conn "SET enable_seqscan = off")
+              ;; The indexed/natural half represents what an application sees,
+              ;; including PostgreSQL choosing a selective primary index plus
+              ;; exact top-N instead of HNSW when that is cheaper.
+              _ (execute! conn "SET enable_seqscan = on")
               indexed-results (query-ids conn fulltext-sql)
               indexed-results-1 (query-ids conn fulltext-1-sql)
               indexed-results-01 (query-ids conn fulltext-01-sql)

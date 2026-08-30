@@ -118,6 +118,7 @@
     {:entities (es/entity-bitset-cardinality result)}
 
     (contains? #{:datahike-query :datahike-post-process
+                 :datahike-bounded-order-by
                  :datahike-planned-direct :datahike-execute-prepared
                  :datahike-execute-direct :stratum-query
                  :scriptum-generation-search :scriptum-snapshot-search
@@ -226,8 +227,9 @@
                  @samples))))
 
 (defn- profiling-stages []
-  {:vector-candidate-restriction
-   (requiring-resolve 'datahike.pg.server/restrict-to-vector-candidates)
+  (cond->
+   {:vector-candidate-restriction
+    (requiring-resolve 'datahike.pg.server/restrict-to-vector-candidates)
    :vector-iterative-query
    (requiring-resolve 'datahike.pg.server/run-iterative-vector-query)
    :vector-prefiltered-query
@@ -263,11 +265,15 @@
    :scriptum-candidate-page (requiring-resolve 'scriptum.core/candidate-page)
    :scriptum-generation-search (requiring-resolve 'scriptum.core/search)
    :scriptum-snapshot-search (requiring-resolve 'scriptum.core/search-store-snapshot)
+   :ts-match-recheck (requiring-resolve 'datahike.pg.tsearch/ts-match?)
    :proximum-search (requiring-resolve 'proximum.core/search)
    :proximum-api-search (requiring-resolve 'proximum.api-impl/search)
    :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)
-   :proximum-api-filtered-search
-   (requiring-resolve 'proximum.api-impl/search-filtered)})
+    :proximum-api-filtered-search
+    (requiring-resolve 'proximum.api-impl/search-filtered)}
+    (ns-resolve 'datahike.query 'bounded-order-by)
+    (assoc :datahike-bounded-order-by
+           (ns-resolve 'datahike.query 'bounded-order-by))))
 
 (defn- random-vector [^java.util.Random random dimension]
   (float-array
@@ -390,7 +396,11 @@
                 exact-fulltext-01-timing
                 (timings 3 10 #(rows handler fulltext-01-sql))
                 exact-scalar-order-timing
-                (timings 5 20 #(rows handler scalar-order-sql))
+                (profiled-timings
+                 5 20
+                 (select-keys stages
+                              [:datahike-query :datahike-bounded-order-by])
+                 #(rows handler scalar-order-sql))
                 exact-vector-timing
                 (profiled-timings 5 20
                                   (select-keys stages
@@ -428,7 +438,8 @@
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
-                                           :scriptum-snapshot-search])
+                                           :scriptum-snapshot-search
+                                           :ts-match-recheck])
                  #(rows handler fulltext-sql))
                 indexed-fulltext-1-timing
                 (profiled-timings
@@ -437,7 +448,8 @@
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
-                                           :scriptum-snapshot-search])
+                                           :scriptum-snapshot-search
+                                           :ts-match-recheck])
                  #(rows handler fulltext-1-sql))
                 indexed-fulltext-01-timing
                 (profiled-timings
@@ -446,7 +458,8 @@
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
-                                           :scriptum-snapshot-search])
+                                           :scriptum-snapshot-search
+                                           :ts-match-recheck])
                  #(rows handler fulltext-01-sql))
                 vector-build-start (now-nanos)
                 _ (checked handler

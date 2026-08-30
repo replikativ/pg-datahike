@@ -47,11 +47,11 @@ measures immutable index writes, commit-root publication, and conflict retries.
 
 | Workload | PostgreSQL path | pg-datahike path | Current complexity verdict |
 |---|---|---|---|
-| unindexed scalar `ORDER BY rank LIMIT k` | sequential scan plus bounded top-N heap, `O(N log k)` memory `O(k)` | generic Datahike result construction plus full sort, `O(N log N)` memory `O(N)` | **Structural gap.** Add bounded top-N to the generic ordered-result path. |
+| unindexed scalar `ORDER BY rank LIMIT k` | sequential scan plus bounded top-N heap, `O(N log k)` memory `O(k)` | generic Datahike result construction plus a bounded, stable top-N heap on the JVM, `O(N log k)` memory `O(k)` | Same selection complexity now. Datahike still allocates the upstream relation rather than pulling rows through a demand-driven operator. |
 | indexed scalar order | backward B-tree scan stopped by `Limit`, `O(log N + k)` | exact AVET forward/reverse slice when SQL/Datahike ordering is proven compatible; otherwise exact Stratum page and primary recheck | AVET path has the right shape. Stratum one-page top-N is `O(N log k)` today, not B-tree-shaped; OFFSET continuations can repeat that work. |
 | unindexed full text | sequential row scan and exact `@@` evaluation | primary tsvector scan and exact PostgreSQL-compatible matcher | Same linear class. Datahike performs attribute-oriented reads rather than one heap-row fetch. |
 | GIN/Scriptum full-text filter | posting-list/bitmap combination, heap recheck, then requested SQL order | Lucene posting-list query to an entity bitmap, planner pushdown, authoritative tsvector recheck, then requested SQL order | Same `O(p + candidates)` access class. Entity-filter composition is pushed into Lucene. Ranking remains an exact primary operation. |
-| exact vector top-k | sequential distance scan plus bounded top-N heap, `O(N*d + N log k)` | sequential distance evaluation followed by generic full sort in the fallback | **Structural gap in the baseline.** Distance work matches; result selection should be `O(N log k)`, not `O(N log N)`. |
+| exact vector top-k | sequential distance scan plus bounded top-N heap, `O(N*d + N log k)` | sequential distance evaluation and relation construction followed by pg-datahike's bounded top-N heap | Same distance/selection complexity and `O(k)` selection memory. The much larger constant is now attributable to EAV relation construction, expression evaluation, and JVM allocation—not a full sort. |
 | unfiltered HNSW top-k | pgvector HNSW search, then heap visibility/recheck | Proximum HNSW search, bounded entity candidates, then exact distance/projection recheck | Same graph-search class plus `O(k)` primary recheck. Recall/beam and deterministic tie ordering must be compared separately. |
 | filtered HNSW, moderate selectivity | pgvector normally searches HNSW then filters heap rows; iterative scan resumes graph search until enough rows or budget exhaustion | bounded ANN probe and/or Proximum filtered HNSW using one primary entity bitmap, followed by authoritative recheck | Comparable graph-search class. pg-datahike avoids rerunning the SQL predicate on every ANN page. |
 | filtered vector, sparse | pgvector iterative scan visits roughly `k/selectivity` ordered candidates; planner may choose a different primary plan when available | one AVET primary prefilter, Proximum exact top-k over selected IDs, final `k`-row recheck | Desired shape is `O(log N + s*d + s log k)`. Current Proximum filter translation/cardinality walk adds `O(N/word-size)` dense-bitset work and `O(s log N)` external-ID translation. |
@@ -77,6 +77,48 @@ restricted to those candidates. It does not scan all stored vectors. The
 ordinary Datahike statistics path misleadingly reports a 10k scan because
 enabling statistics switches away from the optimized planner.
 
+## Production-path evidence from the current 100k fixture
+
+The benchmark now instruments the optimized path without enabling Datahike's
+legacy `:stats?` executor. A matched 100k × 16-dimensional run observed:
+
+| Workload | pg-datahike boundaries | PostgreSQL 17.10 actual plan |
+|---|---|---|
+| scalar indexed top-10 | Stratum emits 11 to establish continuation state; the candidate contract and final Datahike query each contain 10 | backward B-tree scan emits 10 and touches 3 shared buffers |
+| full text, 1% | Scriptum page 1,000 → entity bitmap 1,000 → authoritative query 1,000 | GIN emits 1,000 TIDs → bitmap heap scan 1,000 rows |
+| full text, 0.1% | Scriptum page 100 → entity bitmap 100 → authoritative query 100 | GIN emits 100 TIDs → bitmap heap scan 100 rows |
+| unfiltered HNSW top-10 | Proximum page 10 → final exact-distance/projection query 10 | HNSW index scan emits 10 |
+| filtered HNSW, 10% | one 128-entity ANN set → 18 exact matches → top-10 | HNSW rejects 55 rows and emits 10 |
+| filtered vector, 1% | 128-entity ANN set under-fills with 3–4; the fallback projects 1,000 primary IDs once, Proximum exact-scores them, and the final query rechecks 10 | HNSW rejects 738 rows and emits 10 with recall@10 0.8 in this fixture |
+| filtered vector, 0.1% | primary range emits 100 → Proximum exact filtered top-10 → final query 10 | the natural planner also chooses primary-key range 100 → bounded exact top-10 → 10 |
+
+This is the key structural result: scalar, full-text, and unfiltered ANN no
+longer leak table cardinality across the secondary boundary. The remaining
+1%-filtered vector loss is a planner crossover—the engine pays for a bounded
+ANN attempt and then performs the exact primary plan that was already cheaper.
+PostgreSQL accepts approximate recall on its selected HNSW plan; pg-datahike's
+current compatibility path instead guarantees a complete SQL `LIMIT` result.
+
+The clean same-host p50 comparison for that run was:
+
+| Operation | pg-datahike | PostgreSQL 17.10 | Interpretation |
+|---|---:|---:|---|
+| scalar top-10 through Stratum | 3.21 ms | 0.035 ms | large gap; Stratum chunks are not B-tree-shaped |
+| scalar top-10 through experimental AVET backfill | 0.28–0.43 ms | 0.035 ms | right access path; remaining sub-ms runtime/formatting constant |
+| full text, 1% / 1,000 matches | 20.24 ms | 0.55 ms | Scriptum 3.25 ms + Datahike/recheck relation 12.65 ms dominate |
+| full text, 0.1% / 100 matches | 6.23 ms | 0.108 ms | fixed query/relation setup dominates |
+| HNSW top-10, `ef_search=1000` | 1.65 ms | 7.31 ms | Proximum is faster at equal recall@10 1.0 |
+| filtered HNSW, 10% | 6.14 ms | 7.42 ms | pg-datahike is faster at equal recall@10 1.0 |
+| filtered vector, 1% | 12.90 ms, recall 1.0 | 8.32 ms, recall 0.8 | not semantically equivalent; pg-datahike pays for complete fallback |
+| filtered vector, 0.1% / 100 rows | 1.13 ms | 0.112 ms | both choose exact primary-prefilter top-N; same shape, ~1 ms JVM floor |
+| exact vector scan | 298 ms | 10.64 ms | largest primary relation/expression constant; not an HNSW problem |
+
+These are development measurements, not a general engine ranking. The
+pg-datahike side calls its in-process query handler while PostgreSQL includes
+JDBC result materialization, so the remaining gaps cannot be blamed on wire
+round trips. Conversely, Proximum's advantage at this small vector width does
+not predict build/query behavior at 384- or 768-dimensional production shapes.
+
 ## Cross-cutting structural gaps
 
 1. **Wide-row projection.** PostgreSQL obtains `m` columns from one heap tuple.
@@ -87,10 +129,10 @@ enabling statistics switches away from the optimized planner.
    child. Datahike propagates demand for a proven-safe single entity group, but
    post-filters, multiple groups, many joins, aggregation, and generic ordering
    still materialize upstream results.
-3. **Sort and spill.** PostgreSQL has bounded top-N and external sort. Generic
-   Datahike ordering fully sorts in memory. Hash joins and aggregates also lack
-   PostgreSQL's general spill machinery, so equal CPU big-O can still become an
-   OOM cliff.
+3. **Sort and spill.** Positive-limit JVM ordering now uses bounded top-N in
+   both Datahike and pg-datahike. Unbounded sorts, hash joins, and aggregates
+   still lack PostgreSQL's general spill machinery, so equal CPU big-O can
+   still become an OOM cliff.
 4. **Stratum pagination.** Candidate continuations carry an offset. A later page
    can recompute and discard the prefix; keyset/cursor continuation is required
    before calling this B-tree-equivalent pagination.
