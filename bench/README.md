@@ -119,3 +119,17 @@ cosine operator class, `m`,
 `ef_construction`, and `ef_search` sweep as `secondary_validation.clj`, so
 pgvector and Proximum results are directly comparable. pgvector remains an
 optional prerequisite because PostgreSQL itself does not ship the extension.
+
+The primary row-shape probe isolates projection width and cross-entity join
+costs from the secondary engines. It asserts every result cardinality before
+timing, creates the fanout index before loading on both engines, and reports the
+actual Datahike plan for the indexed join:
+
+```bash
+bench/realpg.sh start
+PRIMARY_BENCH_ROWS=20000 \
+  clojure -J-Xmx3g -M:dev:local-dh bench/primary_shape_validation.clj
+```
+
+Use an absolute `:local/root` override when running from a worktree whose
+relative `../datahike` is not the checkout under test.

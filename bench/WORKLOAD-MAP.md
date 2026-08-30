@@ -121,25 +121,35 @@ not predict build/query behavior at 384- or 768-dimensional production shapes.
 
 ## Cross-cutting structural gaps
 
-1. **Wide-row projection.** PostgreSQL obtains `m` columns from one heap tuple.
-   Datahike normally performs one driving seek plus up to `m-1` EAVT seeks.
-   Fused entity groups reduce allocation but not the number of tree lookups.
-   This is `O(m log N)` versus `O(log N + m)` and needs explicit width scaling.
-2. **Demand propagation.** PostgreSQL's pull executor lets `Limit` stop its
+1. **Wide-row projection.** PostgreSQL obtains `m` columns from one heap tuple;
+   Datahike's fused entity-group executor scans and merges the requested EAVT
+   attributes. The measured point path is not `m` independent root seeks: at
+   20k rows, one-row projection grew only from 0.77 ms at one column to 1.07 ms
+   at sixteen. For a 100-row range it grew from 2.57 to 8.22 ms, versus
+   PostgreSQL 0.11 to 0.28 ms. The access complexity is acceptable, but the
+   per-entity/per-attribute relation constant is large on multi-row output.
+2. **Parameterized indexed joins.** An indexed 100-row parent→fact fanout took
+   23.1 ms versus PostgreSQL's 0.35 ms. Datahike's plan binds the unique parent
+   through AVET, but the second entity group still scans every fact row through
+   AEVT and treats `[?fact :parent-id ?bound-parent]` as a merge. It does not
+   yet turn a small upstream binding relation into parameterized AVET seeks.
+   This is a genuine `O(N)` versus `O(log N + matches)` gap and is the next
+   primary-planner target.
+3. **Demand propagation.** PostgreSQL's pull executor lets `Limit` stop its
    child. Datahike propagates demand for a proven-safe single entity group, but
    post-filters, multiple groups, many joins, aggregation, and generic ordering
    still materialize upstream results.
-3. **Sort and spill.** Positive-limit JVM ordering now uses bounded top-N in
+4. **Sort and spill.** Positive-limit JVM ordering now uses bounded top-N in
    both Datahike and pg-datahike. Unbounded sorts, hash joins, and aggregates
    still lack PostgreSQL's general spill machinery, so equal CPU big-O can
    still become an OOM cliff.
-4. **Stratum pagination.** Candidate continuations carry an offset. A later page
+5. **Stratum pagination.** Candidate continuations carry an offset. A later page
    can recompute and discard the prefix; keyset/cursor continuation is required
    before calling this B-tree-equivalent pagination.
-5. **Sparse Proximum filters.** Exact distance evaluation walks only set bits,
-   but allocating the dense bitset, computing its cardinality, and crossing
-   zero words still scale with total vector capacity. A sorted internal-ID
-   representation should keep the sparse lane proportional to `s`.
+6. **Sparse Proximum filters.** Cardinality is now O(1), sparse iteration jumps
+   between nonzero words, and filtered HNSW enforces `ef >= k`. Constructing a
+   dense entity bitmap still has a compact total-capacity footprint, but the
+   scoring/search loop no longer crosses every zero word.
 
 ## Acceptance matrix
 
