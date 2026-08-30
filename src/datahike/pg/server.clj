@@ -5712,6 +5712,107 @@
      (get-in (read-column-constraints db table-name)
              [(name attr) :not-null?]))))
 
+(def ^:private sql-integral-range-ops
+  {'datahike.pg.sql/sql-lt? '<
+   'datahike.pg.sql/sql-gt? '>
+   'datahike.pg.sql/sql-le? '<=
+   'datahike.pg.sql/sql-ge? '>=})
+
+(defn- get-else-column-binding
+  "Return the column lookup represented by a translated SQL get-else clause."
+  [clause]
+  (when (and (vector? clause)
+             (= 2 (count clause))
+             (seq? (first clause))
+             (= 'get-else (ffirst clause)))
+    (let [[_ source entity attribute default] (first clause)
+          value-var (second clause)]
+      (when (and (symbol? source)
+                 (symbol? entity)
+                 (keyword? attribute)
+                 (= :__null__ default)
+                 (symbol? value-var))
+        {:source source
+         :entity entity
+         :attribute attribute
+         :value-var value-var
+         :clause clause}))))
+
+(defn- specialize-indexed-integral-ranges
+  "Expose safe PostgreSQL integer ranges to Datahike's AVET planner.
+
+   SQL comparisons retain their `sql-lt?`/etc. predicate as the authoritative
+   PostgreSQL check. For an indexed integral column whose SQL metadata proves
+   NOT NULL, this additionally:
+
+   * replaces the nullable `get-else` lookup with an ordinary data pattern;
+   * adds the equivalent native comparison as an index-bound hint.
+
+   Restricting this to integral values avoids PostgreSQL/JVM ordering seams
+   such as floating NaN and UUID ordering. Requiring the runtime bound to be an
+   integer also makes a NULL parameter decline the hint before planning."
+  [db query in-args]
+  (let [schema (dbi/-schema db)
+        input-values (zipmap (rest (:in query)) in-args)
+        bindings
+        (into {}
+              (keep (fn [clause]
+                      (when-let [{:keys [value-var] :as binding}
+                                 (get-else-column-binding clause)]
+                        [value-var binding])))
+              (:where query))
+        eligible-bindings
+        (into {}
+              (filter (fn [[_ {:keys [attribute]}]]
+                        (let [attr-schema (get schema attribute)]
+                          (and (= :db.type/long (:db/valueType attr-schema))
+                               (or (:db/index attr-schema)
+                                   (:db/unique attr-schema))
+                               (not-null-attribute? db attribute)))))
+              bindings)
+        resolve-bound
+        (fn [value]
+          (if (and (symbol? value) (contains? input-values value))
+            (get input-values value)
+            value))
+        hints
+        (into []
+              (keep (fn [clause]
+                      (when (and (vector? clause)
+                                 (= 1 (count clause))
+                                 (seq? (first clause)))
+                        (let [[sql-op left right] (first clause)
+                              native-op (sql-integral-range-ops sql-op)
+                              [column-var bound]
+                              (cond
+                                (contains? eligible-bindings left) [left right]
+                                (contains? eligible-bindings right) [right left]
+                                :else nil)
+                              bound-value (resolve-bound bound)]
+                          (when (and native-op column-var
+                                     (integer? bound-value))
+                            {:column-var column-var
+                             :clause [(list native-op left right)]})))))
+              (:where query))
+        specialized-vars (into #{} (map :column-var) hints)]
+    (if (empty? hints)
+      query
+      (update query :where
+              (fn [clauses]
+                (into []
+                      (concat
+                       (map (fn [clause]
+                              (if-let [{:keys [source entity attribute value-var]}
+                                       (get-else-column-binding clause)]
+                                (if (contains? specialized-vars value-var)
+                                  (if (= '$ source)
+                                    [entity attribute value-var]
+                                    [source entity attribute value-var])
+                                  clause)
+                                clause))
+                            clauses)
+                       (map :clause hints))))))))
+
 (defn- restrict-to-text-candidates
   "Precede conjunctive PostgreSQL @@ predicates with complete Scriptum
    candidate sets. Datahike's external-engine planner keeps candidates as an
@@ -6360,6 +6461,7 @@
                                    (stmt/materialize-recursive-rows! spec d)))
                                query-db specs)
                        query-db)
+            query (specialize-indexed-integral-ranges query-db query in-args)
             hidden-count (or hidden-count 0)
             [exact-query exact-in-args]
             (restrict-to-text-candidates

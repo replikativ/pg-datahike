@@ -234,6 +234,44 @@
                     "WHERE f > 'Infinity'::float8 ORDER BY f LIMIT 1")))
       "PostgreSQL orders NaN after positive infinity"))
 
+(deftest indexed-integral-ranges-expose-safe-avet-bounds
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (do
+      (result "CREATE TABLE range_hints (id int PRIMARY KEY, nullable_n int)")
+      (let [specialize (ns-resolve 'datahike.pg.server
+                                   'specialize-indexed-integral-ranges)
+            eid '?range_hints_eid
+            id '?range_hints_id
+            nullable '?range_hints_nullable_n
+            p '?p1
+            base {:find [eid]
+                  :in ['$ p]
+                  :where [[eid :range_hints/db-row-exists true]
+                          [(list 'get-else '$ eid :range_hints/id :__null__) id]
+                          [(list 'not= id :__null__)]
+                          [(list 'datahike.pg.sql/sql-lt? id p)]]}
+            specialized (specialize (d/db *conn*) base [10])
+            nullable-query
+            (assoc base :where
+                   [[eid :range_hints/db-row-exists true]
+                    [(list 'get-else '$ eid :range_hints/nullable_n :__null__)
+                     nullable]
+                    [(list 'not= nullable :__null__)]
+                    [(list 'datahike.pg.sql/sql-lt? nullable p)]])]
+        (is (some #{[eid :range_hints/id id]} (:where specialized))
+            "NOT NULL indexed columns use a direct data pattern")
+        (is (some #{[(list '< id p)]} (:where specialized))
+            "the native predicate is an AVET bound hint")
+        (is (some #{[(list 'datahike.pg.sql/sql-lt? id p)]}
+                  (:where specialized))
+            "the PostgreSQL comparator remains authoritative")
+        (is (= nullable-query
+               (specialize (d/db *conn*) nullable-query [10]))
+            "nullable columns retain get-else semantics")
+        (is (= base (specialize (d/db *conn*) base [nil]))
+            "a NULL parameter declines the native range hint")))))
+
 (deftest postgres-secondary-index-vertical
   (if-not secondary-stack-available?
     (secondary-stack-unavailable-assertion)
