@@ -91,6 +91,26 @@
       (finally
         (pg/stop-server server)))))
 
+(deftest authenticator-receives-context-and-password-is-cleared
+  (let [seen (atom nil)
+        server (start-test-server
+                {:authenticator
+                 (fn [connection password]
+                   (reset! seen {:connection connection :password password})
+                   (= "correct" (String. ^chars password)))})
+        port (.getPort ^PgWireServer (:server server))]
+    (try
+      (with-open [connection
+                  (open-jdbc port
+                             "user=alice&password=correct&sslmode=disable")]
+        (is (not (.isClosed connection))))
+      (is (= {:user "alice" :database "datahike" :tls? false}
+             (select-keys (:connection @seen) [:user :database :tls?])))
+      (is (every? zero? (map int (:password @seen)))
+          "wire layer clears the callback password buffer")
+      (finally
+        (pg/stop-server server)))))
+
 (deftest tls-upgrade-supports-require-and-verify-full
   (let [files (test-keystore)
         server (start-test-server
@@ -131,4 +151,3 @@
        clojure.lang.ExceptionInfo
        #"require password authentication and TLS"
        (start-test-server {:host "0.0.0.0"}))))
-
