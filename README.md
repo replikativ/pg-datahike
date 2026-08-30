@@ -27,6 +27,21 @@ Flyway-style migrations). Not a full PG dialect; see
 
 ## Quickstart
 
+### Full Datahike server (recommended for deployments)
+
+When PostgreSQL is one way into a broader Datahike deployment, prefer the
+[batteries-included Datahike server](https://github.com/replikativ/datahike/blob/main/doc/distributed.md#docker-and-podman).
+Its versioned standalone JAR and `ghcr.io/replikativ/datahike-server` image
+bundle this adapter with Datahike's HTTP/CBOR API, persistent system catalog,
+database lifecycle administration, and portable storage backends. The
+[PostgreSQL listener configuration](https://github.com/replikativ/datahike/blob/main/doc/http-routes.md#optional-postgresql-listener-beta)
+also documents deployment-level password authentication and TLS.
+
+Use pg-datahike's standalone JAR below for a focused pgwire process, adapter
+evaluation, migration and compatibility testing, or when embedding the full
+Datahike server is unnecessary. Both distributions run the same SQL adapter;
+the distinction is packaging and the surrounding Datahike services.
+
 ### Standalone server (no Clojure setup)
 
 Each pg-datahike release ships a runnable uberjar on
