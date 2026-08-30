@@ -40,9 +40,9 @@ upstream runs as a separate `node file.js` invocation. A file passes iff
 | `test/unit/**/*` | Pure unit tests with no DB; not our concern. |
 | `test/cloudflare/**` | Cloudflare Workers runtime; requires `wrangler` + vitest. |
 | `test/native/**` | `pg-native` bindings (libpq). Compile-time dep; not our path. |
-| `test/integration/connection-pool/tls-tests.js` | TLS not implemented. |
+| `test/integration/connection-pool/tls-tests.js` | Core TLS is covered separately; this upstream fixture expects its own certificate/server matrix. |
 | `test/integration/connection-pool/**` | Pool tests are mostly timing/LISTEN based. Can be added later if stable. |
-| `test/integration/client/ssl-tests.js` | TLS not implemented. |
+| `test/integration/client/ssl-tests.js` | Core TLS is covered separately; this upstream fixture expects its own certificate/server matrix. |
 | `test/integration/client/sasl-scram-tests.js` | SCRAM auth not implemented. |
 | `test/integration/client/notice-tests.js` | `NoticeResponse` channel not populated. |
 | `test/integration/client/connection-timeout-tests.js` | Timing-sensitive; flaky locally. |

@@ -44,6 +44,41 @@ java -jar pg-datahike-standalone.jar --port 5432 --memory
 psql postgresql://datahike@localhost:5432/datahike
 ```
 
+The default listener is deliberately local-only and does not authenticate.
+Use Datahike Server for a batteries-included network deployment, or configure
+password authentication and TLS when embedding pg-datahike. A non-loopback
+`start-server` bind is rejected unless both are effective:
+
+```clojure
+(pg/start-server
+ {"prod" prod-conn}
+ {:host "0.0.0.0"
+  :port 5432
+  :users {"app" (System/getenv "PG_DATAHIKE_PASSWORD")}
+  :tls {:keystore "/run/secrets/pg-datahike.p12"
+        :keystore-password (System/getenv "PG_DATAHIKE_KEYSTORE_PASSWORD")}})
+```
+
+The TLS shorthand loads a PKCS#12 keystore. Applications with their own
+certificate lifecycle can pass a configured `javax.net.ssl.SSLContext` as
+`:ssl-context`. For external identity stores, replace `:users` with an
+`:authenticator` function receiving connection metadata and a short-lived
+password char array. PostgreSQL users are currently a node-level access gate;
+they are not yet mapped to per-database Datahike principals.
+
+Clients use ordinary PostgreSQL TLS settings:
+
+```bash
+PGPASSWORD="$PG_DATAHIKE_PASSWORD" \
+  psql "host=datahike.example port=5432 dbname=prod user=app sslmode=verify-full sslrootcert=/path/to/ca.crt"
+```
+
+Password authentication uses PostgreSQL's cleartext password exchange inside
+TLS. MD5 is deprecated by PostgreSQL and intentionally unsupported; SCRAM is a
+future verifier-only credential option. `:require-tls? true` applies the same
+TLS requirement to a loopback listener and is automatic for non-loopback
+binds.
+
 Useful flags (`--help` for the full list):
 
 ```bash

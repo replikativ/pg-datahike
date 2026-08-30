@@ -43,7 +43,14 @@
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
-            PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException PgParamCodec]
+            PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException
+            PgWireServer$PasswordAuthenticator PgParamCodec]
+           [java.io FileInputStream]
+           [java.net InetAddress]
+           [java.nio.charset StandardCharsets]
+           [java.security KeyStore MessageDigest SecureRandom]
+           [java.util Arrays]
+           [javax.net.ssl KeyManagerFactory SSLContext]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column]
            [net.sf.jsqlparser.statement.select PlainSelect Limit Offset]
@@ -8410,6 +8417,110 @@
                                          :registered-databases names)))
             (reject-unknown-db-handler requested)))))))
 
+(defn password-authenticator
+  "Adapt `(fn [connection password-chars] -> boolean)` to the pgwire
+   PasswordAuthenticator interface. `connection` contains `:user`,
+   `:database`, `:remote-address`, `:tls?`, and `:startup-parameters`.
+
+   The password is a mutable char array which is cleared immediately after the
+   callback returns. Do not retain it. Authentication failures must return
+   false rather than exposing a reason to the client."
+  ^PgWireServer$PasswordAuthenticator [f]
+  (reify PgWireServer$PasswordAuthenticator
+    (authenticate [_ context password]
+      (boolean
+       (f {:user (.getUser context)
+           :database (.getDatabase context)
+           :remote-address (.getRemoteAddress context)
+           :tls? (.isTls context)
+           :startup-parameters (into {} (.getStartupParameters context))}
+          password)))))
+
+(defn users-authenticator
+  "Build a constant-time password authenticator from `{username password}`.
+   Intended for small deployment-owned credential maps, not as a user store."
+  ^PgWireServer$PasswordAuthenticator [users]
+  (when-let [[user _] (first (filter (fn [[user password]]
+                                       (or (str/blank? (str user))
+                                           (str/blank? (str password))))
+                                     users))]
+    (throw (ex-info "pgwire usernames and passwords must be nonblank"
+                    {:type :datahike.pg/invalid-auth-config
+                     :user user})))
+  (let [digest (fn [^String value]
+                 (.digest (MessageDigest/getInstance "SHA-256")
+                          (.getBytes value StandardCharsets/UTF_8)))
+        expected (into {} (map (fn [[user password]]
+                                 [(str user) (digest (str password))])) users)
+        missing (byte-array 32)]
+    (password-authenticator
+     (fn [{:keys [user]} password]
+       (let [candidate-bytes (.getBytes (String. ^chars password)
+                                        StandardCharsets/UTF_8)]
+         (try
+           (let [candidate (.digest (MessageDigest/getInstance "SHA-256")
+                                    candidate-bytes)]
+             (MessageDigest/isEqual ^bytes (get expected user missing)
+                                    ^bytes candidate))
+           (finally
+             (Arrays/fill candidate-bytes (byte 0)))))))))
+
+(defn ssl-context-from-pkcs12
+  "Load a server SSLContext from a PKCS#12 keystore.
+
+   `password` unlocks both the keystore and its private key. Operators can
+   generate or convert this deployment artefact with `keytool` or OpenSSL."
+  ^SSLContext [path password]
+  (let [password-chars (.toCharArray (str password))
+        keystore (KeyStore/getInstance "PKCS12")]
+    (try
+      (with-open [in (FileInputStream. (str path))]
+        (.load keystore in password-chars))
+      (let [kmf (KeyManagerFactory/getInstance
+                 (KeyManagerFactory/getDefaultAlgorithm))
+            context (SSLContext/getInstance "TLS")]
+        (.init kmf keystore password-chars)
+        (.init context (.getKeyManagers kmf) nil (SecureRandom.))
+        context)
+      (finally
+        (Arrays/fill password-chars \u0000)))))
+
+(defn- loopback-host? [host]
+  (try
+    (let [addresses (InetAddress/getAllByName (str host))]
+      (and (pos? (alength addresses))
+           (every? #(.isLoopbackAddress ^InetAddress %) addresses)))
+    (catch Exception _ false)))
+
+(defn- resolve-wire-security [{:keys [host users authenticator ssl-context tls
+                                      require-tls?]}]
+  (when (and users authenticator)
+    (throw (ex-info ":users and :authenticator are mutually exclusive"
+                    {:type :datahike.pg/invalid-auth-config})))
+  (when (and ssl-context tls)
+    (throw (ex-info ":ssl-context and :tls are mutually exclusive"
+                    {:type :datahike.pg/invalid-tls-config})))
+  (let [auth (cond
+               (instance? PgWireServer$PasswordAuthenticator authenticator)
+               authenticator
+
+               authenticator (password-authenticator authenticator)
+               users (users-authenticator users))
+        ssl (or ssl-context
+                (when tls
+                  (ssl-context-from-pkcs12 (:keystore tls)
+                                           (:keystore-password tls))))
+        public? (not (loopback-host? host))]
+    (when (and public?
+               (not (and auth ssl)))
+      (throw (ex-info
+              "non-loopback pgwire binds require password authentication and TLS"
+              {:type :datahike.pg/unsafe-bind :host host})))
+    (when (and require-tls? (nil? ssl))
+      (throw (ex-info ":require-tls? needs :tls or :ssl-context"
+                      {:type :datahike.pg/invalid-tls-config})))
+    [auth ssl (or public? require-tls?)]))
+
 (defn start-server
   "Start a PostgreSQL wire protocol server for one or more Datahike
    connections.
@@ -8424,6 +8535,19 @@
    Options:
      :port      — Port to listen on (default 5432)
      :host      — Host to bind to (default \"127.0.0.1\")
+     :users     — Small deployment-owned `{username password}` map. Mutually
+                  exclusive with :authenticator.
+     :authenticator
+                — PgWireServer.PasswordAuthenticator or
+                  `(fn [connection password-chars] -> boolean)`.
+     :ssl-context
+                — Preconfigured javax.net.ssl.SSLContext.
+     :tls       — `{:keystore path :keystore-password secret}` shorthand for
+                  a PKCS#12 server keystore. Mutually exclusive with
+                  :ssl-context.
+     :require-tls?
+                — Reject plaintext startup before requesting a password.
+                  Automatically true for every non-loopback bind.
      :on-query  — Callback (fn [sql-string]) for logging
      :default   — Database name used when `conn-or-registry` is a bare
                   conn (default \"datahike\"). Ignored when a map is
@@ -8497,7 +8621,9 @@
                          (cond-> on-create (assoc :on-create-database on-create)
                                  on-delete (assoc :on-delete-database on-delete)))
         factory  (make-query-handler-factory registry-atom factory-opts)
-        server   (PgWireServer. (int port) ^String host factory)]
+        [auth ssl require-tls?] (resolve-wire-security (assoc opts :host host))
+        server   (PgWireServer. (int port) ^String host factory auth ssl
+                                (boolean require-tls?))]
     (.start server)
     (println (str "Datahike PgWire server listening on " host ":" port
                   " — databases: " (vec (keys registry))))

@@ -4,6 +4,25 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Password authentication and TLS
+
+- The pgwire server can now request and verify PostgreSQL cleartext-password
+  authentication through a deployment-owned callback or a small fixed `:users`
+  map. Authentication failures use PostgreSQL's `28P01` response without
+  revealing whether a user exists.
+- PostgreSQL `SSLRequest` can now upgrade the existing connection to native
+  TLS through an injected `SSLContext` or a PKCS#12 keystore. The pre-upgrade
+  reader does not buffer or consume bytes past `SSLRequest`, matching
+  PostgreSQL's protection against TLS buffer-stuffing attacks.
+- Non-loopback `start-server` binds now require both password authentication
+  and TLS, and reject plaintext startup before requesting a password. Existing
+  loopback development listeners remain compatible and unauthenticated by
+  default.
+- JDBC coverage exercises accepted and rejected passwords,
+  `sslmode=require`, hostname/certificate verification with
+  `sslmode=verify-full`, and plaintext rejection. SCRAM and PostgreSQL MD5
+  authentication are not part of this change.
+
 ### Licensing
 
 - **pg-datahike is now under the PostgreSQL License**, replacing the Eclipse

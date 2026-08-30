@@ -49,8 +49,8 @@ produces only noise.
 | `BlobTest`, `BlobTransactionTest` | Large-object API (`lo_*` server functions) not implemented. |
 | `NotifyTest` | `LISTEN` / `NOTIFY` async messages not implemented. |
 | `ReplicationTest`, `LogicalReplicationTest`, `V3ReplicationProtocolTest` | Logical / physical replication not implemented. |
-| `SslTest`, `Ssl*Test`, anything under `test/ssl/` | TLS not implemented in pgwire server. |
-| `ScramTest`, SASL-related auth | SCRAM auth not implemented (we accept any password as plaintext). |
+| `SslTest`, `Ssl*Test`, anything under `test/ssl/` | Core TLS, `sslmode=require`, and `verify-full` are covered in pg-datahike. The upstream suite additionally controls a PostgreSQL installation's certificate/client-auth matrix, which this harness does not provision. |
+| `ScramTest`, SASL-related auth | SCRAM auth is not implemented; configured servers use PostgreSQL cleartext-password authentication inside TLS. |
 | `XA*Test`, `test/xa/` | XA / two-phase commit not implemented. |
 | `CallableStmtTest`, `Jdbc42CallableStatementTest` | Stored procedures / functions / `CALL` not supported. |
 | `ArrayTest`, `EnumTest`, `GeometricTest`, `IntervalTest`, `JsonbTest`, `UUIDTest`, `XmlTest` | Non-core PG types; partial support only, excluded for signal. |
