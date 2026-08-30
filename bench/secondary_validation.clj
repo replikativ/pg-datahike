@@ -149,6 +149,7 @@
    :scriptum-candidate-page (requiring-resolve 'scriptum.core/candidate-page)
    :scriptum-generation-search (requiring-resolve 'scriptum.core/search)
    :scriptum-snapshot-search (requiring-resolve 'scriptum.core/search-store-snapshot)
+   :ts-match-recheck (requiring-resolve 'datahike.pg.tsearch/ts-match?)
    :proximum-search (requiring-resolve 'proximum.core/search)
    :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)})
 
@@ -299,7 +300,8 @@
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
-                                           :scriptum-snapshot-search])
+                                           :scriptum-snapshot-search
+                                           :ts-match-recheck])
                  #(rows handler fulltext-sql))
                 indexed-fulltext-1-timing
                 (profiled-timings
@@ -307,7 +309,8 @@
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
-                                           :scriptum-snapshot-search])
+                                           :scriptum-snapshot-search
+                                           :ts-match-recheck])
                  #(rows handler fulltext-1-sql))
                 indexed-fulltext-01-timing
                 (profiled-timings
@@ -315,7 +318,8 @@
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
-                                           :scriptum-snapshot-search])
+                                           :scriptum-snapshot-search
+                                           :ts-match-recheck])
                  #(rows handler fulltext-01-sql))
                 vector-build-start (now-nanos)
                 _ (checked handler
