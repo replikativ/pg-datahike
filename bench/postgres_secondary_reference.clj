@@ -94,6 +94,9 @@
 (defn- query-vector-text [dimension]
   (str "[1" (apply str (repeat (dec dimension) ",0")) "]"))
 
+(defn- opposite-query-vector-text [dimension]
+  (str "[-1" (apply str (repeat (dec dimension) ",0")) "]"))
+
 (defn- vector-query-sql [query-vector]
   (str "SELECT id FROM secondary_bench_reference ORDER BY embedding <=> '"
        query-vector "'::vector LIMIT 10"))
@@ -120,13 +123,25 @@
       (when (pos? (mod n 500))
         (.executeBatch statement)))))
 
+(def ^:dynamic *benchmark-rows* nil)
+(def ^:dynamic *benchmark-dimension* nil)
+(def ^:dynamic *benchmark-ef-construction* nil)
+(def ^:dynamic *postgres-reference-url* nil)
+
 (defn- run-benchmark []
-  (let [n (parse-long (or (System/getenv "SECONDARY_BENCH_ROWS") "10000"))
+  (let [n (long (or *benchmark-rows*
+                    (parse-long
+                     (or (System/getenv "SECONDARY_BENCH_ROWS") "10000"))))
         dimension
-        (parse-long (or (System/getenv "SECONDARY_BENCH_DIMENSION") "16"))
+        (long (or *benchmark-dimension*
+                  (parse-long
+                   (or (System/getenv "SECONDARY_BENCH_DIMENSION") "16"))))
         hnsw-ef-construction
-        (parse-long (or (System/getenv "SECONDARY_BENCH_EF_CONSTRUCTION") "64"))
-        url (or (System/getenv "POSTGRES_REFERENCE_URL")
+        (long (or *benchmark-ef-construction*
+                  (parse-long
+                   (or (System/getenv "SECONDARY_BENCH_EF_CONSTRUCTION") "64"))))
+        url (or *postgres-reference-url*
+                (System/getenv "POSTGRES_REFERENCE_URL")
                 "jdbc:postgresql://127.0.0.1:15499/datahike")
         user (or (System/getenv "PGUSER") "datahike")
         password (or (System/getenv "PGPASSWORD") "datahike")
@@ -139,7 +154,17 @@
         scalar-order-sql
         "SELECT id FROM secondary_bench_reference ORDER BY rank DESC LIMIT 10"
         query-vector (query-vector-text dimension)
+        opposite-query-vector (opposite-query-vector-text dimension)
         vector-sql (vector-query-sql query-vector)
+        vector-update-sqls
+        [(str "UPDATE secondary_bench_reference SET embedding = '" query-vector
+              "'::vector WHERE id = 0")
+         (str "UPDATE secondary_bench_reference SET embedding = '"
+              opposite-query-vector "'::vector WHERE id = 0")]
+        vector-update-turn (atom -1)
+        next-vector-update-sql
+        #(nth vector-update-sqls
+              (mod (swap! vector-update-turn inc) 2))
         filtered-10-sql
         (str "SELECT id FROM secondary_bench_reference WHERE category < 10 "
              "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
@@ -266,7 +291,9 @@
               indexed-filtered-1-timing
               (timings 3 10 #(query-ids conn filtered-1-sql))
               indexed-filtered-01-timing
-              (timings 3 10 #(query-ids conn filtered-01-sql))]
+              (timings 3 10 #(query-ids conn filtered-01-sql))
+              indexed-vector-update-timing
+              (timings 2 5 #(execute! conn (next-vector-update-sql)))]
           {:environment (benchmark-environment)
            :postgres-version (query-string conn "SHOW server_version")
            :pgvector-version
@@ -305,6 +332,7 @@
              :plan (explain conn fulltext-01-sql)}}
            :vector
            {:k 10
+            :update indexed-vector-update-timing
             :unfiltered
             {:beam-sweep beam-sweep
              :quality-sample
@@ -338,4 +366,5 @@
              :plan (explain conn filtered-01-sql)}
             :exact exact-vector-timing}})))))
 
-(prn (run-benchmark))
+(when-not (some #{"--no-run"} *command-line-args*)
+  (prn (run-benchmark)))

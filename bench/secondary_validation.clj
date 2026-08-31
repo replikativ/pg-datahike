@@ -128,7 +128,8 @@
                  :proximum-search :proximum-api-search
                  :proximum-filtered-search :proximum-api-filtered-search
                  :vector-prefiltered-query :vector-materialized-probe
-                 :vector-iterative-query :primary-filtered-vector}
+                 :vector-iterative-query :primary-filtered-vector
+                 :primary-candidate-vector-recheck}
                stage)
     (when-some [n (result-count result)] {:results n})
 
@@ -200,7 +201,11 @@
               (fn []
                 (let [per-query (atom {})
                       start (now-nanos)]
-                  (binding [*stage-recorder* per-query]
+                  ;; Write lifecycles run in core.async workers, which do not
+                  ;; inherit the caller's dynamic binding. This benchmark is
+                  ;; deliberately single-threaded, so a temporary root binding
+                  ;; lets those workers report into the current statement too.
+                  (with-redefs [*stage-recorder* per-query]
                     (f))
                   (swap! samples
                          (fn [acc]
@@ -244,6 +249,8 @@
    :primary-filtered-vector
    (requiring-resolve
     'datahike.pg.server/run-primary-filtered-exact-vector-query)
+   :primary-candidate-vector-recheck
+   (ns-resolve 'datahike.pg.server 'run-primary-filtered-vector-entities)
    :text-candidate-restriction
    (requiring-resolve 'datahike.pg.server/restrict-to-text-candidates)
    :simple-entity-projection
@@ -285,8 +292,19 @@
    :proximum-search (requiring-resolve 'proximum.core/search)
    :proximum-api-search (requiring-resolve 'proximum.api-impl/search)
    :proximum-filtered-search (requiring-resolve 'proximum.core/search-filtered)
-    :proximum-api-filtered-search
-    (requiring-resolve 'proximum.api-impl/search-filtered)}
+   :proximum-api-filtered-search
+   (requiring-resolve 'proximum.api-impl/search-filtered)
+   ;; Write-path decomposition. These generation operations are synchronous at
+   ;; their public boundary, so their inclusive wall time remains meaningful
+   ;; even though the surrounding Datahike transaction is channel based.
+   :proximum-generation-begin
+   (requiring-resolve 'proximum.generations/begin-generation)
+   :proximum-generation-seal
+   (requiring-resolve 'proximum.generations/seal!)
+   :proximum-generation-view-transfer
+   (requiring-resolve 'proximum.generations/take-generation-view!)
+   :proximum-generation-root
+   (requiring-resolve 'proximum.generations/rooted!)}
     (ns-resolve 'datahike.query 'bounded-order-by)
     (assoc :datahike-bounded-order-by
            (ns-resolve 'datahike.query 'bounded-order-by))))
@@ -298,6 +316,9 @@
 
 (defn- query-vector-text [dimension]
   (str "[1" (apply str (repeat (dec dimension) ",0")) "]"))
+
+(defn- opposite-query-vector-text [dimension]
+  (str "[-1" (apply str (repeat (dec dimension) ",0")) "]"))
 
 (defn- vector-text [vector]
   (str "[" (str/join "," (map #(Float/toString (float %)) vector)) "]"))
@@ -319,15 +340,27 @@
   "REPL override for the fixture cardinality; nil uses SECONDARY_BENCH_ROWS."
   nil)
 
+(def ^:dynamic *benchmark-dimension*
+  "REPL override for vector width; nil uses SECONDARY_BENCH_DIMENSION."
+  nil)
+
+(def ^:dynamic *benchmark-ef-construction*
+  "REPL override for HNSW construction breadth."
+  nil)
+
 (defn- run-benchmark []
   (require 'datahike.index.secondary.scriptum)
   (require 'datahike.index.secondary.proximum)
   (let [n (long (or *benchmark-rows*
                     (parse-long (or (System/getenv "SECONDARY_BENCH_ROWS") "10000"))))
         hnsw-ef-construction
-        (parse-long (or (System/getenv "SECONDARY_BENCH_EF_CONSTRUCTION") "64"))
+        (long (or *benchmark-ef-construction*
+                  (parse-long
+                   (or (System/getenv "SECONDARY_BENCH_EF_CONSTRUCTION") "64"))))
         dimension
-        (parse-long (or (System/getenv "SECONDARY_BENCH_DIMENSION") "16"))
+        (long (or *benchmark-dimension*
+                  (parse-long
+                   (or (System/getenv "SECONDARY_BENCH_DIMENSION") "16"))))
         cfg {:store {:backend :memory :id (random-uuid)}
              :writer {:backend :self :writer-ownership :exclusive}
              :schema-flexibility :write
@@ -346,6 +379,7 @@
                                        :id vector-store-id}}
              :stratum {}}})
           query-vector (query-vector-text dimension)
+          opposite-query-vector (opposite-query-vector-text dimension)
           quality-query-vectors
           (let [quality-random (java.util.Random. 991)]
             (mapv (comp vector-text
@@ -360,6 +394,16 @@
           scalar-order-sql
           "SELECT id FROM secondary_bench ORDER BY rank DESC LIMIT 10"
           vector-sql (vector-query-sql query-vector)
+          vector-update-sqls
+          [(str "UPDATE secondary_bench SET embedding = '" query-vector
+                "'::vector WHERE id = 0")
+           (str "UPDATE secondary_bench SET embedding = '" opposite-query-vector
+                "'::vector WHERE id = 0")]
+          vector-update-turn (atom -1)
+          update-vector!
+          #(checked handler
+                    (nth vector-update-sqls
+                         (mod (swap! vector-update-turn inc) 2)))
           filtered-10-sql
           (str "SELECT id FROM secondary_bench WHERE category < 10 "
                "ORDER BY embedding <=> '" query-vector "'::vector LIMIT 10")
@@ -546,6 +590,7 @@
                  (select-keys stages
                               [:vector-candidate-restriction
                                :vector-materialized-probe
+                               :primary-candidate-vector-recheck
                                :vector-prefiltered-query
                                :vector-iterative-query
                                :candidate-page
@@ -561,6 +606,7 @@
                  (select-keys stages
                               [:vector-candidate-restriction
                                :vector-materialized-probe
+                               :primary-candidate-vector-recheck
                                :vector-prefiltered-query
                                :vector-iterative-query
                                :candidate-page
@@ -576,6 +622,7 @@
                  (select-keys stages
                               [:vector-candidate-restriction
                                :vector-materialized-probe
+                               :primary-candidate-vector-recheck
                                :vector-prefiltered-query
                                :vector-iterative-query
                                :candidate-page
@@ -584,7 +631,16 @@
                                :proximum-api-filtered-search
                                :datahike-query
                                :exact-cosine-distance])
-                 #(rows handler filtered-01-sql))]
+                 #(rows handler filtered-01-sql))
+                indexed-vector-update-timing
+                (profiled-timings
+                 2 5
+                 (select-keys stages
+                              [:proximum-generation-begin
+                               :proximum-generation-seal
+                               :proximum-generation-view-transfer
+                               :proximum-generation-root])
+                 update-vector!)]
             {:environment (benchmark-environment)
              :rows n
              :dimension dimension
@@ -615,6 +671,7 @@
                :indexed indexed-fulltext-01-timing}}
              :vector
              {:k 10
+              :update indexed-vector-update-timing
               :unfiltered
               {:beam-sweep beam-sweep
                :quality-sample
@@ -679,6 +736,7 @@
    (let [vector (:vector result)
          unfiltered (:unfiltered vector)]
      {:k (:k vector)
+      :update (compact-timing (:update vector))
       :exact (compact-timing (:exact vector))
       :unfiltered
       {:beam-sweep
