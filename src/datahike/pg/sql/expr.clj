@@ -3646,6 +3646,7 @@
           (swap! (:vector-distance-candidates ctx) conj
                  {:result-var result-var
                   :entity-var (ctx/entity-var! ctx alias)
+                  :table (get (:table-aliases ctx) alias alias)
                   :attribute attr
                   :operator op-text
                   :metric (case op-text
@@ -6500,7 +6501,10 @@
             (swap! (:text-search-candidates ctx) conj
                    {:entity-var (ctx/entity-var! ctx alias)
                     :attribute attr
-                    :query candidate-query}))))
+                    :query candidate-query
+                    :value-var l
+                    :predicate-clause
+                    [(list 'datahike.pg.tsearch/ts-match? l r)]}))))
       [[(list 'datahike.pg.tsearch/ts-match? l r)]])
 
     (instance? EqualsTo expr)

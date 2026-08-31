@@ -116,6 +116,26 @@
   (let [vs (remove #(= :__null__ %) coll)]
     (if (empty? vs) :__null__ (/ (double (reduce + 0 vs)) (count vs)))))
 
+(defn- stable-input-values
+  "Values from `[row-identity value]` aggregate inputs in scan order.
+
+   Datahike relations are sets, so the collection handed to an aggregate has
+   no useful iteration order.  PostgreSQL feeds a plain aggregate in plan
+   order; for our ordinary EAVT table scan that is entity order.  The SQL
+   lowering carries the participating entity id(s) as `row-identity` for
+   aggregates whose result depends on transition order."
+  [coll]
+  (map second (sort-by first coll)))
+
+(defn filter-sum-stable [coll]
+  (filter-sum (stable-input-values coll)))
+
+(defn filter-sum-float4-stable [coll]
+  (filter-sum-float4 (stable-input-values coll)))
+
+(defn filter-avg-stable [coll]
+  (filter-avg (stable-input-values coll)))
+
 (def ^:private ^:const numeric-min-sig-digits
   "Mirrors PG's `NUMERIC_MIN_SIG_DIGITS` (16). AVG / division aim for
    at least this many significant digits so numeric is no less
@@ -329,6 +349,15 @@
   (cond
     (and (bytes? a) (bytes? b))
     (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
+    ;; These dominate ordinary SQL ORDER BY and have the same semantics as
+    ;; Clojure compare. Keep them ahead of the generic numeric/NaN probes,
+    ;; which otherwise box, classify and coerce every integer comparison.
+    (and (instance? Long a) (instance? Long b))
+    (Long/compare (long a) (long b))
+    (and (instance? Integer a) (instance? Integer b))
+    (Integer/compare (int a) (int b))
+    (and (string? a) (string? b))
+    (.compareTo ^String a ^String b)
     (and (pg-vector/vector-value? a) (pg-vector/vector-value? b))
     (pg-vector/compare-values a b)
     (or (types/numeric-special? a) (types/numeric-special? b))
@@ -482,6 +511,12 @@
                           (map (fn [v] (if (= :__null__ v) :datahike.pg.jsonb/json-null v))))
                  coll)]
     (if (empty? vs) :__null__ vs)))
+
+(defn filter-array-agg-stable [coll]
+  (filter-array-agg (stable-input-values coll)))
+
+(defn filter-jsonb-agg-stable [coll]
+  (filter-jsonb-agg (stable-input-values coll)))
 
 (defn- akey-compare
   "Null-safe comparator for in-aggregate `ORDER BY` keys. A key is a
@@ -764,6 +799,18 @@
   (let [v (filter-variance-pop coll)]
     (if (= :__null__ v) :__null__ (Math/sqrt (double v)))))
 
+(defn filter-variance-samp-stable [coll]
+  (filter-variance-samp (stable-input-values coll)))
+
+(defn filter-variance-pop-stable [coll]
+  (filter-variance-pop (stable-input-values coll)))
+
+(defn filter-stddev-samp-stable [coll]
+  (filter-stddev-samp (stable-input-values coll)))
+
+(defn filter-stddev-pop-stable [coll]
+  (filter-stddev-pop (stable-input-values coll)))
+
 (defn filter-jsonb-object-agg
   "SQL `jsonb_object_agg(k, v)` — one object over the whole group.
    Input is a collection of `[k v]` pairs, the shape the two-argument
@@ -784,6 +831,9 @@
                         :datahike.pg.jsonb/json-null
                         v))]))
             ps))))
+
+(defn filter-jsonb-object-agg-stable [coll]
+  (filter-jsonb-object-agg (stable-input-values coll)))
 
 (defn filter-string-agg
   "SQL `string_agg(expr, delimiter)` — ONE string over the whole group.
@@ -809,6 +859,9 @@
       (let [d (second (first ps))]
         (str/join (if (or (nil? d) (= :__null__ d)) "" (str d))
                   (map (comp str first) ps))))))
+
+(defn filter-string-agg-stable [coll]
+  (filter-string-agg (stable-input-values coll)))
 
 (defn filter-string-agg-ordered
   "SQL `string_agg(expr, delim ORDER BY … ASC)` — `coll` is a collection
@@ -845,6 +898,9 @@
                               (second p))))
                       ps))
            " }"))))
+
+(defn filter-json-object-agg-stable [coll]
+  (filter-json-object-agg (stable-input-values coll)))
 
 (defn filter-corr
   "SQL CORR(y, x) — Pearson correlation. Input is a collection of [x y]
@@ -883,6 +939,9 @@
           (if (zero? denom)
             :__null__
             (/ (- (* n sxy) (* sx sy)) denom)))))))
+
+(defn filter-corr-stable [coll]
+  (filter-corr (stable-input-values coll)))
 
 ;; ---------------------------------------------------------------------------
 ;; null-safe wrapper + SQL null-safe arithmetic

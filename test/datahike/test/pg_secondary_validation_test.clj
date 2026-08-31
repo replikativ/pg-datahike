@@ -44,6 +44,7 @@
     (let [cfg {:store {:backend :memory :id (random-uuid)}
                :writer {:backend :self :writer-ownership :exclusive}
                :schema-flexibility :write
+               :allow-index-backfill? true
                :max-string-length 0}
           vector-store-id (random-uuid)]
       (d/create-database cfg)
@@ -84,13 +85,37 @@
                  {estimate-entrypoint (constantly (fn [_ _] hits))
                   row-estimate (fn [_ _] rows)}
                  #(worthwhile ::db ::index :docs/body ::query)))]
-    (is (use? 500 10000) "the measured five-percent boundary uses Scriptum")
-    (is (not (use? 501 10000)) "a larger candidate relation stays primary")
+    (is (use? 2000 10000) "the measured twenty-percent boundary uses Scriptum")
+    (is (not (use? 2001 10000)) "a larger candidate relation stays primary")
     (is (use? 64 100) "small absolute result sets retain the secondary path")
     (is (not (use? 65 100)))
     (is (with-redefs-fn {estimate-entrypoint (constantly nil)}
           #(worthwhile ::db ::index :docs/body ::query))
         "an older adapter without estimates preserves the compatibility path")))
+
+(deftest unindexed-vector-equality-cost-gate
+  (let [likely-small? (ns-resolve 'datahike.pg.server
+                                  'likely-small-unindexed-vector-equality?)
+        estimate-entrypoint (ns-resolve 'datahike.pg.server
+                                        'pattern-estimate-entrypoint)
+        row-estimate (ns-resolve 'datahike.pg.server 'table-row-estimate)
+        schema-fn (ns-resolve 'datahike.db.interface '-schema)
+        use? (fn [hits rows]
+               (with-redefs-fn
+                 {estimate-entrypoint (constantly (fn [& _] hits))
+                  row-estimate (fn [_ _] rows)
+                  schema-fn (fn [_] {:docs/category {}})}
+                 #(likely-small? ::db
+                                 {:kind :unindexed
+                                  :attribute :docs/category
+                                  :value 7}
+                                 10)))]
+    (is (use? 1000 100000)
+        "a sampled one-percent equality skips the wasted ANN probe")
+    (is (not (use? 5000 100000))
+        "a common equality retains the bounded ANN-first path")
+    (is (not (use? 1000 10000))
+        "the relative selectivity cap prevents a ten-percent primary pass")))
 
 (deftest scalar-candidate-pages-enforce-contract-and-close
   (let [restrict (ns-resolve 'datahike.pg.server
@@ -195,7 +220,7 @@
       (is (nil? (get-in (d/db *conn*)
                         [:schema :datahike.pg.index/secondary_numeric_order_idx]))))))
 
-(deftest stratum-btree-preserves-full-width-bigint-order
+(deftest native-btree-preserves-full-width-bigint-order
   (if-not secondary-stack-available?
     (secondary-stack-unavailable-assertion)
     (do
@@ -211,28 +236,54 @@
                    (str "CREATE INDEX secondary_bigint_order_idx "
                         "ON secondary_bigint_order (rank)"))))
         (is (= exact (rows query))
-            "Stratum must not collapse distinct int64 keys through double")))))
+            "the AVET cursor must preserve full-width int64 ordering")
+        (is (nil? (sqlstate "DROP INDEX secondary_bigint_order_idx")))
+        (is (not (:db/index
+                  (get-in (d/db *conn*) [:schema :secondary_bigint_order/rank])))
+            "the last named SQL owner removes its AVET carrier")))))
+
+(deftest native-btree-lifecycle-counts-named-sql-owners
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (do
+      (result "CREATE TABLE native_owner (id int PRIMARY KEY, rank bigint NOT NULL)")
+      (result "INSERT INTO native_owner VALUES (1, 10), (2, 20)")
+      (result "CREATE INDEX native_owner_rank_a ON native_owner (rank)")
+      (result "CREATE INDEX native_owner_rank_b ON native_owner (rank)")
+      (is (:db/index (get-in (d/db *conn*) [:schema :native_owner/rank])))
+      (is (nil? (get-in (d/db *conn*)
+                        [:secondary-indices :datahike.pg.index/native_owner_rank_a]))
+          "native catalog entries do not maintain a duplicate Stratum copy")
+      (result "DROP INDEX native_owner_rank_a")
+      (is (:db/index (get-in (d/db *conn*) [:schema :native_owner/rank]))
+          "one remaining named owner retains AVET")
+      (result "DROP INDEX native_owner_rank_b")
+      (is (not (:db/index (get-in (d/db *conn*) [:schema :native_owner/rank])))
+          "the final owner removes AVET"))))
 
 (deftest native-avet-order-declines-postgres-divergent-comparators
-  (result (str "CREATE TABLE avet_comparator_guard ("
-               "id int PRIMARY KEY, u uuid NOT NULL, "
-               "f double precision NOT NULL)"))
-  ;; Install ordinary AVET entries before data exists, without introducing a
-  ;; Stratum generation; this isolates native primary-index admission.
-  (d/transact *conn* [{:db/ident :avet_comparator_guard/u :db/index true}
-                      {:db/ident :avet_comparator_guard/f :db/index true}])
-  (result (str "INSERT INTO avet_comparator_guard VALUES "
-               "(1, '00000000-0000-0000-0000-000000000000', 'Infinity'), "
-               "(2, '80000000-0000-0000-0000-000000000000', 'NaN')"))
-  (is (= [["2"]]
-         (rows (str "SELECT id FROM avet_comparator_guard "
-                    "WHERE u > '00000000-0000-0000-0000-000000000000'::uuid "
-                    "ORDER BY u LIMIT 1")))
-      "PostgreSQL UUID order is unsigned, unlike java.util.UUID.compareTo")
-  (is (= [["2"]]
-         (rows (str "SELECT id FROM avet_comparator_guard "
-                    "WHERE f > 'Infinity'::float8 ORDER BY f LIMIT 1")))
-      "PostgreSQL orders NaN after positive infinity"))
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (do
+      (result (str "CREATE TABLE avet_comparator_guard ("
+                   "id int PRIMARY KEY, u uuid NOT NULL, "
+                   "f double precision NOT NULL)"))
+      ;; Install ordinary AVET entries before data exists, without introducing
+      ;; a Stratum generation; this isolates native primary-index admission.
+      (d/transact *conn* [{:db/ident :avet_comparator_guard/u :db/index true}
+                          {:db/ident :avet_comparator_guard/f :db/index true}])
+      (result (str "INSERT INTO avet_comparator_guard VALUES "
+                   "(1, '00000000-0000-0000-0000-000000000000', 'Infinity'), "
+                   "(2, '80000000-0000-0000-0000-000000000000', 'NaN')"))
+      (is (= [["2"]]
+             (rows (str "SELECT id FROM avet_comparator_guard "
+                        "WHERE u > '00000000-0000-0000-0000-000000000000'::uuid "
+                        "ORDER BY u LIMIT 1")))
+          "PostgreSQL UUID order is unsigned, unlike java.util.UUID.compareTo")
+      (is (= [["2"]]
+             (rows (str "SELECT id FROM avet_comparator_guard "
+                        "WHERE f > 'Infinity'::float8 ORDER BY f LIMIT 1")))
+          "PostgreSQL orders NaN after positive infinity"))))
 
 (deftest indexed-integral-ranges-expose-safe-avet-bounds
   (if-not secondary-stack-available?
@@ -317,6 +368,21 @@
                       "USING hnsw (embedding vector_cosine_ops) "
                       "WITH (m=8, ef_construction=32)"))))
 
+      (let [fused-var
+            (ns-resolve 'datahike.pg.server
+                        'run-primary-filtered-exact-vector-query)
+            fused-original @fused-var
+            fused-calls (atom 0)]
+        (with-redefs-fn
+          {fused-var (fn [& args]
+                       (swap! fused-calls inc)
+                       (apply fused-original args))}
+          #(is (= [["1"] ["3"]]
+                  (rows (str "SELECT id FROM secondary_docs WHERE id < 4 "
+                             "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 2")))))
+        (is (= 1 @fused-calls)
+            "a complete small AVET range fuses predicate, exact distance, and top-N"))
+
       (let [schema (:schema (d/db *conn*))]
         (is (= :ready
                (get-in schema
@@ -326,10 +392,12 @@
                (get-in schema
                        [:datahike.pg.index/secondary_docs_body_gist
                         :db.secondary/status])))
-        (is (= :ready
-               (get-in schema
-                       [:datahike.pg.index/secondary_docs_priority_idx
-                        :db.secondary/status])))
+        (is (= #{[:secondary_docs/priority true]}
+               (d/q '{:find [?attr ?native]
+                      :where [[?index :pg/index-name "secondary_docs_priority_idx"]
+                              [?index :pg/index-attr ?attr]
+                              [?index :pg/index-native-avet ?native]]}
+                    (d/db *conn*))))
         (is (= {:dim 3 :distance :cosine :m 8 :ef-construction 32}
                (select-keys
                 (get-in schema
@@ -370,16 +438,16 @@
                                "'alpha beta') ORDER BY id"))))))
         (is (pos? @calls) "SQL @@ invoked Scriptum rather than only the exact scan"))
 
-      (let [candidate-var (requiring-resolve
-                           'datahike.index.secondary/candidate-page)
-            original @candidate-var
-            calls (atom 0)
-            query-specs (atom [])]
+      (let [native-var (ns-resolve 'datahike.pg.server
+                                   'native-avet-order-candidates)
+            original @native-var
+            successful-plans (atom 0)]
         (with-redefs-fn
-          {candidate-var (fn [& args]
-                           (swap! calls inc)
-                           (swap! query-specs conj (nth args 3))
-                           (apply original args))}
+          {native-var (fn [& args]
+                        (let [result (apply original args)]
+                          (when (some? result)
+                            (swap! successful-plans inc))
+                          result))}
           #(do
              (is (= [["2"] ["3"]]
                     (rows (str "SELECT id FROM secondary_docs "
@@ -396,17 +464,14 @@
              (is (= [["1"]]
                     (rows (str "SELECT id FROM secondary_docs WHERE priority > 25 "
                                "ORDER BY priority ASC LIMIT 2"))))
-             (let [before @calls]
+             (let [before @successful-plans]
                (is (= [["1"]]
                       (rows (str "SELECT id FROM secondary_docs WHERE id = 1 "
                                  "ORDER BY priority ASC LIMIT 1"))))
-               (is (= before @calls)
-                   "an unpushed filter declines Stratum rather than under-filling"))))
-        (is (pos? @calls) "SQL scalar ordering invoked Stratum candidate paging")
-        (is (some #(= [[:> :priority 15]] (:where %)) @query-specs)
-            "a same-key range is evaluated inside Stratum before top-N")
-        (is (some #(= [[:> :priority 25]] (:where %)) @query-specs)
-            "numeric plan reuse substitutes the current range boundary"))
+               (is (= before @successful-plans)
+                   "an unpushed filter declines AVET rather than under-filling"))))
+        (is (= 5 @successful-plans)
+            "PostgreSQL-compatible integral ordering uses native AVET for top-N and ranges"))
 
       (let [filtered-var (requiring-resolve 'proximum.core/search-filtered)
             filtered-original @filtered-var
@@ -444,7 +509,7 @@
                (is (zero? @probe-calls)
                    "a hard-small relation avoids a wasted ANN probe"))))
         (is (zero? @filtered-calls)
-            "the one-row filter fills the probe and avoids a second native search"))
+            "the hard-small AVET filter stays on the cheaper primary exact path"))
 
       (doseq [index-name ["secondary_docs_priority_idx"
                           "secondary_docs_body_gin"
@@ -457,6 +522,9 @@
                         :datahike.pg.index/secondary_docs_body_gin
                         :datahike.pg.index/secondary_docs_body_gist
                         :datahike.pg.index/secondary_docs_embedding_hnsw])))
+      (is (not (:db/index
+                (get-in (d/db *conn*) [:schema :secondary_docs/priority])))
+          "DROP of the last SQL B-tree owner atomically removes AVET")
       (is (nil? (sqlstate "DROP INDEX IF EXISTS secondary_docs_priority_idx")))
       (is (= "42704" (sqlstate "DROP INDEX secondary_docs_priority_idx")))
 

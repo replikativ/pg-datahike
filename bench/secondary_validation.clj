@@ -107,6 +107,9 @@
       (:stop-reason result) (assoc :stop-reason (:stop-reason result))
       (:stats result) (assoc :stats (:stats result)))
 
+    (and (map? result) (contains? result :rows))
+    {:results (count (:rows result))}
+
     ;; Candidate restriction functions return [query args access]. Preserve
     ;; the optimizer's decision and declared candidate bound.
     (and (vector? result) (= 3 (count result)) (map? (nth result 2 nil)))
@@ -125,7 +128,7 @@
                  :proximum-search :proximum-api-search
                  :proximum-filtered-search :proximum-api-filtered-search
                  :vector-prefiltered-query :vector-materialized-probe
-                 :vector-iterative-query}
+                 :vector-iterative-query :primary-filtered-vector}
                stage)
     (when-some [n (result-count result)] {:results n})
 
@@ -236,8 +239,21 @@
    (requiring-resolve 'datahike.pg.server/run-prefiltered-vector-query)
    :vector-materialized-probe
    (requiring-resolve 'datahike.pg.server/run-materialized-vector-probe)
+   :primary-exact-vector
+   (requiring-resolve 'datahike.pg.server/run-primary-exact-vector-query)
+   :primary-filtered-vector
+   (requiring-resolve
+    'datahike.pg.server/run-primary-filtered-exact-vector-query)
    :text-candidate-restriction
    (requiring-resolve 'datahike.pg.server/restrict-to-text-candidates)
+   :simple-entity-projection
+   (requiring-resolve 'datahike.pg.server/simple-entity-projection)
+   :format-query-result
+   (requiring-resolve 'datahike.pg.server/format-query-result)
+   :execute-select
+   (requiring-resolve 'datahike.pg.server/exec-select)
+   :parse-sql
+   (requiring-resolve 'datahike.pg.sql/parse-sql)
    :scalar-candidate-restriction
    (requiring-resolve 'datahike.pg.server/restrict-to-scalar-order-candidates)
    :datahike-query (requiring-resolve 'datahike.api/q)
@@ -299,10 +315,15 @@
     (/ (double (count (set/intersection (set expected) (set actual))))
        (count expected))))
 
+(def ^:dynamic *benchmark-rows*
+  "REPL override for the fixture cardinality; nil uses SECONDARY_BENCH_ROWS."
+  nil)
+
 (defn- run-benchmark []
   (require 'datahike.index.secondary.scriptum)
   (require 'datahike.index.secondary.proximum)
-  (let [n (parse-long (or (System/getenv "SECONDARY_BENCH_ROWS") "10000"))
+  (let [n (long (or *benchmark-rows*
+                    (parse-long (or (System/getenv "SECONDARY_BENCH_ROWS") "10000"))))
         hnsw-ef-construction
         (parse-long (or (System/getenv "SECONDARY_BENCH_EF_CONSTRUCTION") "64"))
         dimension
@@ -310,6 +331,7 @@
         cfg {:store {:backend :memory :id (random-uuid)}
              :writer {:backend :self :writer-ownership :exclusive}
              :schema-flexibility :write
+             :allow-index-backfill? true
              :max-string-length 0}
         vector-store-id (random-uuid)
         random (java.util.Random. 7331)]
@@ -399,12 +421,14 @@
                 (profiled-timings
                  5 20
                  (select-keys stages
-                              [:datahike-query :datahike-bounded-order-by])
+                              [:datahike-query :datahike-bounded-order-by
+                               :simple-entity-projection])
                  #(rows handler scalar-order-sql))
                 exact-vector-timing
                 (profiled-timings 5 20
                                   (select-keys stages
                                                [:datahike-query
+                                                :primary-exact-vector
                                                 :exact-cosine-distance])
                                   #(rows handler vector-sql))
                 exact-filtered-10-timing (timings 3 10 #(rows handler filtered-10-sql))
@@ -421,7 +445,11 @@
                 (profiled-timings
                  5 20 (select-keys stages [:datahike-query :candidate-page
                                            :stratum-query
-                                           :scalar-candidate-restriction])
+                                           :scalar-candidate-restriction
+                                           :simple-entity-projection
+                                           :format-query-result
+                                           :execute-select
+                                           :parse-sql])
                  #(rows handler scalar-order-sql))
                 text-build-start (now-nanos)
                 _ (checked handler
@@ -435,6 +463,7 @@
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
                                            :text-candidate-restriction
+                                           :simple-entity-projection
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
@@ -445,6 +474,7 @@
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
                                            :text-candidate-restriction
+                                           :simple-entity-projection
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
@@ -455,6 +485,7 @@
                 (profiled-timings
                  3 10 (select-keys stages [:datahike-query :secondary-search
                                            :text-candidate-restriction
+                                           :simple-entity-projection
                                            :scriptum-count
                                            :scriptum-candidate-page
                                            :scriptum-generation-search
@@ -662,7 +693,8 @@
       :filter-1-percent (compact-case (:filter-1-percent vector))
       :filter-0.1-percent (compact-case (:filter-0.1-percent vector))})})
 
-(let [result (run-benchmark)]
-  (prn (if (= "true" (System/getenv "SECONDARY_BENCH_COMPACT"))
-         (compact-result result)
-         result)))
+(when-not (some #{"--no-run"} *command-line-args*)
+  (let [result (run-benchmark)]
+    (prn (if (= "true" (System/getenv "SECONDARY_BENCH_COMPACT"))
+           (compact-result result)
+           result))))

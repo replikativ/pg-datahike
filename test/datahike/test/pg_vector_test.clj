@@ -9,7 +9,7 @@
             [datahike.pg.sql :as sql]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as vector])
-  (:import [datahike.pg PgParamCodec PgWireServer$PgProtocolException
+  (:import [datahike.pg PgParamCodec PgVectorMath PgWireServer$PgProtocolException
             PgWireServer$QueryResult]
            [java.nio ByteBuffer ByteOrder]))
 
@@ -74,6 +74,19 @@
   (is (= "22000" (sqlstate #(vector/l2-distance (vector/parse "[1,2]")
                                                 (vector/parse "[3]"))))))
 
+(deftest primary-scan-kernels-match-authoritative-vector-math
+  (let [random (java.util.Random. 9182)]
+    (dotimes [_ 100]
+      (let [a (float-array (repeatedly 17 #(- (* 2.0 (.nextDouble random)) 1.0)))
+            b (float-array (repeatedly 17 #(- (* 2.0 (.nextDouble random)) 1.0)))
+            b-norm (PgVectorMath/squaredNorm b)]
+        (is (= (vector/l2-distance a b)
+               (PgVectorMath/distance PgVectorMath/EUCLIDEAN a b b-norm)))
+        (is (= (vector/negative-inner-product a b)
+               (PgVectorMath/distance PgVectorMath/INNER_PRODUCT a b b-norm)))
+        (is (= (vector/cosine-distance a b)
+               (PgVectorMath/distance PgVectorMath/COSINE a b b-norm)))))))
+
 (deftest vector-ddl-write-catalog-and-scalar-sql
   (run "CREATE TABLE embeddings (id int PRIMARY KEY, embedding vector(3))")
   (run "INSERT INTO embeddings VALUES (1, ' [ 1, 2, 3 ] ')")
@@ -122,6 +135,37 @@
   (is (= [["3"] ["1"]]
          (rows (str "SELECT id FROM vector_nullable "
                     "ORDER BY embedding <-> '[0]'::vector LIMIT 2")))))
+
+(deftest sparse-filtered-vector-kernel-keeps-null-order-and-rechecks-predicates
+  (run "CREATE TABLE vector_sparse (id int PRIMARY KEY, category int, embedding vector(3))")
+  (run (str "INSERT INTO vector_sparse VALUES "
+            "(1, 1, '[1,0,0]'), (2, 1, '[0,1,0]'), "
+            "(3, 2, '[0.9,0.1,0]'), (4, 2, NULL)"))
+  (let [matching-var (ns-resolve 'datahike.pg.server
+                                 'matching-vector-secondary)
+        fused-var (ns-resolve 'datahike.pg.server
+                              'run-primary-filtered-exact-vector-query)
+        fused-original @fused-var
+        calls (atom 0)]
+    ;; A hard-small indexed range never touches the ANN value. Returning a
+    ;; marker here makes the physical choice available without making this
+    ;; scalar-kernel test depend on Proximum's optional JDK profile.
+    (with-redefs-fn
+      {matching-var (fn [& _] [:idx/vector-sparse ::unused])
+       fused-var (fn [& args]
+                   (swap! calls inc)
+                   (apply fused-original args))}
+      #(do
+         (is (= [["1"] ["3"] ["2"] ["4"]]
+                (rows (str "SELECT id FROM vector_sparse WHERE id < 5 "
+                           "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 4")))
+             "NULL distance sorts after every finite distance")
+         (is (= [["3"] ["4"]]
+                (rows (str "SELECT id FROM vector_sparse "
+                           "WHERE id < 5 AND category > 1 "
+                           "ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 2")))
+             "non-index predicates remain an authoritative exact recheck")))
+    (is (= 2 @calls))))
 
 (deftest vector-hnsw-ddl-and-candidate-shape-are-preserved
   (run "CREATE TABLE vector_ann (id int PRIMARY KEY, embedding vector(3))")
@@ -173,11 +217,12 @@
                                     "WHERE id < (SELECT 10) "
                                     "ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 5"))]
     (is (= {:attribute :vector_ann/embedding
+            :table "vector_ann"
             :operator "<->"
             :metric :euclidean
             :limit 5}
            (select-keys (:secondary-candidate eligible)
-                        [:attribute :operator :metric :limit])))
+                        [:attribute :table :operator :metric :limit])))
     (is (= "[1,2,3]"
            (vector/to-pg-text
             (:query-vector (:secondary-candidate eligible)))))
@@ -218,10 +263,16 @@
                               {:idx/vector_recheck ::fake-index}))
         restrict (ns-resolve 'datahike.pg.server
                              'restrict-to-vector-candidates)
+        [_primary-query _primary-args primary-access]
+        (restrict db (:query parsed) (:in-args parsed)
+                  (:secondary-candidate parsed))
         [candidate-query candidate-args access]
         (restrict indexed-db (:query parsed) (:in-args parsed)
                   (:secondary-candidate parsed))
         query-spec (peek candidate-args)]
+    (is (= :primary-vector-exact (:kind primary-access)))
+    (is (= "vector_recheck" (:table primary-access)))
+    (is (= 2 (:candidate-limit primary-access)))
     (is (= :proximum-filter-aware (:kind access)))
     (is (= 2 (:k query-spec)))
     (is (= 40 (:ef query-spec)))
@@ -247,7 +298,7 @@
         (is (= 128 (:probe-limit filtered-access)))
         (is (some? (:filtered-entrypoints filtered-access)))))
 
-    (testing "an indexed exact value binding prefilters before probing ANN"
+    (testing "a hard-small indexed binding stays primary"
       (let [filtered (sql/parse-sql
                       (str "SELECT id FROM vector_recheck WHERE id = 2 "
                            "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
@@ -257,8 +308,8 @@
                       (:secondary-candidate filtered))]
         (is (= (:query filtered) filtered-query))
         (is (= (:in-args filtered) filtered-args))
-        (is (= :proximum-prefiltered (:kind filtered-access))
-            "the measured entity set chooses exact distance or filtered ANN")))
+        (is (nil? filtered-access)
+            "one exact AVET row is cheaper than crossing the Proximum boundary")))
 
     (testing "a common indexed equality probes before materializing its set"
       (let [filtered (sql/parse-sql
@@ -301,6 +352,67 @@
                       (assoc (:secondary-candidate parsed) :ef 1))]
         (is (= 1 (:ef (peek args))))
         (is (= 2 (:k (peek args))))))))
+
+(deftest primary-exact-vector-top-k-is-bounded-and-fail-closed
+  (run "CREATE TABLE vector_primary (id int PRIMARY KEY, embedding vector(2))")
+  (run (str "INSERT INTO vector_primary VALUES "
+            "(1, '[3,0]'), (2, '[1,0]'), (3, '[2,0]')"))
+  ;; A direct Datahike writer can attach the table's vector attribute without
+  ;; creating a SQL row. It must never displace a real nearest neighbour.
+  (d/transact *conn* [{:vector_primary/embedding (vector/parse "[0,0]")}])
+  (let [db (d/db *conn*)
+        stray-eid (.-e ^datahike.datom.Datom
+                   (last (d/datoms db :aevt :vector_primary/embedding)))
+        parsed (sql/parse-sql
+                (str "SELECT id FROM vector_primary "
+                     "ORDER BY embedding <-> '[0,0]'::vector LIMIT 2")
+                (dbi/-schema db) db)
+        restrict (ns-resolve 'datahike.pg.server
+                             'restrict-to-vector-candidates)
+        run-primary (ns-resolve 'datahike.pg.server
+                                'run-primary-exact-vector-query)
+        [_ _ access]
+        (restrict db (:query parsed) (:in-args parsed)
+                  (:secondary-candidate parsed))
+        call (atom nil)
+        run-query (fn [query args]
+                    (reset! call [query args])
+                    [["2"] ["3"]])]
+    (is (= [["2"] ["3"]]
+           (run-primary db (:query parsed) (:in-args parsed)
+                        run-query access)))
+    (let [[candidate-query candidate-args] @call
+          eids (peek candidate-args)]
+      (is (= [(get-in parsed [:secondary-candidate :entity-var]) '...]
+             (peek (:in candidate-query))))
+      (is (= 2 (count eids)))
+      (is (not-any? #(= stray-eid %) eids)
+          "an attribute without the SQL row marker is not a candidate")))
+
+  (testing "NULL vectors that enter the requested window use the full query"
+    (run "CREATE TABLE vector_primary_null (id int PRIMARY KEY, embedding vector(2))")
+    (run "INSERT INTO vector_primary_null VALUES (1, '[1,0]'), (2, NULL), (3, NULL)")
+    (let [db (d/db *conn*)
+          parsed (sql/parse-sql
+                  (str "SELECT id FROM vector_primary_null "
+                       "ORDER BY embedding <-> '[0,0]'::vector LIMIT 2")
+                  (dbi/-schema db) db)
+          restrict (ns-resolve 'datahike.pg.server
+                               'restrict-to-vector-candidates)
+          run-primary (ns-resolve 'datahike.pg.server
+                                  'run-primary-exact-vector-query)
+          [_ _ access]
+          (restrict db (:query parsed) (:in-args parsed)
+                    (:secondary-candidate parsed))
+          calls (atom [])
+          run-query (fn [query args]
+                      (swap! calls conj [query args])
+                      [["full"]])]
+      (is (= [["full"]]
+             (run-primary db (:query parsed) (:in-args parsed)
+                          run-query access)))
+      (is (= [[(:query parsed) (:in-args parsed)]] @calls)
+          "underfill does not run a lossy candidate recheck first"))))
 
 (deftest iterative-vector-candidates-observe-full-query-demand-and-close
   (let [run-iterative (ns-resolve 'datahike.pg.server
@@ -628,9 +740,9 @@
            (prefilter-query base-query entity-var distance-var
                             :doc/other-embedding)))))
 
-(deftest sparse-native-range-skips-the-unfiltered-vector-probe
-  (let [small-range? (ns-resolve 'datahike.pg.server
-                                 'small-indexed-vector-range?)
+(deftest sparse-native-range-carries-the-complete-prefilter
+  (let [small-range (ns-resolve 'datahike.pg.server
+                                'small-indexed-vector-range)
         native-candidates (ns-resolve 'datahike.pg.server
                                       'native-avet-order-candidates)
         calls (atom [])
@@ -644,13 +756,16 @@
        (fn [& args]
          (swap! calls conj args)
          (vec (range 10)))}
-      #(is (true? (small-range? ::db query [10] entity-var 10))))
+      #(is (= {:attribute :doc/id
+               :clauses [[:< :doc/id 10]]
+               :entities (vec (range 10))}
+              (small-range ::db query [10] entity-var 10))))
     (is (= [[::db :doc/id :asc [[:< :doc/id 10]] 257]] @calls))
     (with-redefs-fn
       {native-candidates
        (fn [_db _attribute _direction _where candidate-limit]
          (vec (range candidate-limit)))}
-      #(is (false? (small-range? ::db query [10] entity-var 10))))
+      #(is (nil? (small-range ::db query [10] entity-var 10))))
     (reset! calls [])
     (with-redefs-fn
       {native-candidates
@@ -658,12 +773,13 @@
          (swap! calls conj args)
          [])}
       #(do
-         (is (true?
-              (small-range?
-               ::db (assoc query :where [[entity-var :doc/id '?id]
-                                         [(list '> '?p1 '?id)]])
-               [10] entity-var 10)))
-         (is (false? (small-range? ::db query [10.5] entity-var 10)))))
+         (is (= []
+                (:entities
+                 (small-range
+                  ::db (assoc query :where [[entity-var :doc/id '?id]
+                                            [(list '> '?p1 '?id)]])
+                  [10] entity-var 10))))
+         (is (nil? (small-range ::db query [10.5] entity-var 10)))))
     (is (= 1 (count @calls)))))
 
 (deftest large-vector-prefilter-uses-the-native-entity-filter

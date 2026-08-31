@@ -41,9 +41,10 @@
             [datahike.pg.sql.temporal :as sql-temporal]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]
+            [datahike.pg.tsearch :as tsearch]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb])
-  (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
+  (:import [datahike.pg PgVectorMath PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
             PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException
             PgWireServer$PasswordAuthenticator PgParamCodec]
            [java.io FileInputStream]
@@ -332,6 +333,19 @@
      ;; from SQL NULL above. It must be tested BEFORE the generic
      ;; keyword branch, which would otherwise print the sentinel's name.
      (= jb/json-null v) "null"
+     ;; The overwhelmingly common wire scalars must precede the protocol-
+     ;; shaped wrappers below. Testing PgArray/PgBit/PgRecord/PgVector for
+     ;; every integer cell made formatting 1,000 one-column rows slower than
+     ;; the cached Datahike query itself.
+     (string? v) v
+     (keyword? v) (if-let [ns (namespace v)]
+                    (str ns "/" (name v))
+                    (name v))
+     (boolean? v) (if v "t" "f")
+     (instance? Long v) (Long/toString (long v))
+     (instance? Integer v) (Integer/toString (int v))
+     (instance? Short v) (Short/toString (short v))
+     (instance? Byte v) (Byte/toString (byte v))
     ;; PgArray → PG canonical array text format `{…}` (see
     ;; datahike.pg.arrays/to-pg-text). Checked before vector? because
     ;; PgArray is a defrecord and vectors would otherwise intercept.
@@ -347,11 +361,6 @@
                              (fn [t oids] (PgParamCodec/registerRecordLayout t oids)) v)
                             (pg-rec/to-pg-text v))
      (pg-vector/vector-value? v) (pg-vector/to-pg-text v)
-     (string? v)  v
-     (keyword? v) (if-let [ns (namespace v)]
-                    (str ns "/" (name v))
-                    (name v))
-     (boolean? v) (if v "t" "f")
      (instance? clojure.lang.Ratio v) (str (double v))
     ;; PG float text format emits the shortest round-trip representation,
     ;; so 1.0/-2.0/0.0 come across as "1"/"-2"/"0" (no ".0" suffix).
@@ -687,6 +696,16 @@
             (first branch-oids)
             (rest branch-oids))))
 
+(defn- formatted-cell
+  [value ^long oid typmods ^long column]
+  (let [text (value->string value oid)
+        typmod (when (and typmods (< column (alength ^ints typmods)))
+                 (aget ^ints typmods column))]
+    (if (and text (= oid types/oid-bpchar)
+             typmod (>= typmod 4) (< (count text) (- typmod 4)))
+      (str text (.repeat " " (- (- typmod 4) (count text))))
+      text)))
+
 (defn- format-query-result
   "Format Datalog query results into a PgWire QueryResult.
    Handles empty result sets by returning proper column metadata with 0 rows.
@@ -730,29 +749,42 @@
                 :else (int-array (repeat (count find-aliases) PgWireServer/OID_TEXT)))
         ;; Convert rows to String[][]
          rows (if result-seq
-                (into-array (Class/forName "[Ljava.lang.String;")
-                            (for [row result-seq]
-                              (into-array String
-                                          (if (sequential? row)
-                                            (map-indexed
-                                             (fn [i v]
-                                               (let [oid (when (< i (alength ^ints oids))
-                                                           (aget ^ints oids i))
-                                                     s (value->string v oid)
-                                                     tm (when (and typmods
-                                                                   (< i (alength ^ints typmods)))
-                                                          (aget ^ints typmods i))]
-                                                 (if (and s (= oid types/oid-bpchar)
-                                                          tm (>= tm 4)
-                                                          (< (count s) (- tm 4)))
-                                                   (str s (apply str (repeat (- (- tm 4) (count s))
-                                                                             \space)))
-                                                   s)))
-                                             row)
-                                            [(value->string row (when (pos? (alength ^ints oids))
-                                                                  (aget ^ints oids 0)))]))))
-                (into-array (Class/forName "[Ljava.lang.String;")
-                            (make-array String 0 0)))]
+                ;; QueryResult, PersistentVector, SubVector and ArraySeq all
+                ;; provide indexed List access. A sort/filter pipeline may
+                ;; instead return an ISeq; it must be fully consumed for the
+                ;; wire matrix anyway, so realize it once into the same indexed
+                ;; path. Fill the final Java matrix directly: the former `for`
+                ;; + map-indexed + two into-array levels allocated three lazy-
+                ;; seq layers per row and took longer than the Datahike query
+                ;; for 100--1000-row reads.
+                (let [^java.util.List indexed-results
+                      (if (instance? java.util.List results)
+                        results
+                        (vec result-seq))
+                      row-count (.size indexed-results)
+                      column-count (count find-aliases)
+                      ^"[[Ljava.lang.String;" out
+                      (make-array String row-count column-count)]
+                  (dotimes [row-index row-count]
+                    (let [row (.get indexed-results row-index)
+                          indexed? (instance? clojure.lang.Indexed row)
+                          sequential? (sequential? row)
+                          ^objects target (aget out row-index)]
+                      (dotimes [column column-count]
+                        (let [value (cond
+                                      indexed?
+                                      (.nth ^clojure.lang.Indexed row column)
+
+                                      sequential? (nth row column)
+                                      (zero? column) row
+                                      :else nil)
+                              oid (if (< column (alength ^ints oids))
+                                    (aget ^ints oids column)
+                                    PgWireServer/OID_TEXT)]
+                          (aset target column
+                                (formatted-cell value oid typmods column))))))
+                  out)
+                (make-array String 0 0))]
      (PgWireServer$QueryResult.
       col-names oids rows
       (str "SELECT " (alength ^"[[Ljava.lang.String;" rows))))))
@@ -3275,7 +3307,18 @@
               [:pg/fk-parent-table str1]
               [:pg/fk-parent-cols str1]
               [:pg/fk-on-delete kw1]
-              [:pg/fk-on-update kw1]]
+              [:pg/fk-on-update kw1]
+              ;; Native AVET-backed SQL B-trees. These are catalog entities,
+              ;; separate from external secondary generations: AVET already
+              ;; lives in the Datahike root and is maintained atomically with
+              ;; primary datoms. The removable marker records whether the
+              ;; first SQL index enabled AVET, so the last DROP may undo it.
+              [:pg/index-name (assoc str1 :db/unique :db.unique/identity)]
+              [:pg/index-table str1]
+              [:pg/index-method kw1]
+              [:pg/index-attr kw1]
+              [:pg/index-native-avet bool1]
+              [:pg/index-avet-removable bool1]]
         missing (into []
                       (keep (fn [[ident tmpl]]
                               (when-not (get schema ident)
@@ -5256,13 +5299,31 @@
    NULLS LAST for ASC and NULLS FIRST for DESC, i.e. NULL sorts as the
    largest value."
   [sql-order-by]
-  (fn [a b]
-    (let [av (if (sequential? a) a [a])
-          bv (if (sequential? b) b [b])]
-      (loop [specs (partition 3 sql-order-by)]
-        (if-let [[idx dir nulls] (first specs)]
-          (let [va (nth av idx nil)
-                vb (nth bv idx nil)
+  ;; Compile the flat SQL order description once. The old comparator ran
+  ;; `partition`, sequence destructuring, and row wrapping for every TimSort
+  ;; comparison; sorting 1,000 one-column rows spent ~2.7 ms in that
+  ;; scaffolding alone.
+  (let [specs (mapv vec (partition 3 sql-order-by))]
+    ;; Return an IFn rather than only java.util.Comparator: Clojure sort adapts
+    ;; either, while top-k and WITH TIES also call this object directly.
+    (fn [a b]
+      (loop [spec-index 0]
+        (if (< spec-index (count specs))
+          (let [[idx dir nulls] (nth specs spec-index)
+                va (cond
+                     (instance? java.util.List a)
+                     (.get ^java.util.List a (int idx))
+
+                     (sequential? a) (nth a idx nil)
+                     (zero? idx) a
+                     :else nil)
+                vb (cond
+                     (instance? java.util.List b)
+                     (.get ^java.util.List b (int idx))
+
+                     (sequential? b) (nth b idx nil)
+                     (zero? idx) b
+                     :else nil)
                 a-null? (or (nil? va) (= :__null__ va))
                 b-null? (or (nil? vb) (= :__null__ vb))
                 ;; Explicit NULLS FIRST/LAST wins; otherwise the PG default.
@@ -5281,7 +5342,7 @@
                             (sql/order-cmp vb va)
                             (sql/order-cmp va vb)))]
             (if (zero? c)
-              (recur (rest specs))
+              (recur (inc spec-index))
               c))
           0)))))
 
@@ -5530,7 +5591,7 @@
     (requiring-resolve 'datahike.query.estimate/estimate-pattern)
     (catch Exception _ nil)))
 
-(def ^:private text-secondary-selectivity 0.05)
+(def ^:private text-secondary-selectivity 0.20)
 (def ^:private text-secondary-absolute-floor 64)
 
 (defn- table-row-estimate
@@ -5594,11 +5655,6 @@
                           raw-value)})))
           (:where query))))
 
-(defn- vector-indexed-exact-filter-binding?
-  [db query in-args entity-var]
-  (= :indexed
-     (:kind (vector-exact-filter-binding db query in-args entity-var))))
-
 (defn- exact-pattern-cardinality?
   "True when planner cardinalities come from subtree counts, not legacy
    heuristics. Cost choices described as hard bounds must fail closed here."
@@ -5625,8 +5681,33 @@
                (max 256 (* 8 (long candidate-limit))))))
     (catch Throwable _ false)))
 
-(defn- small-indexed-vector-range?
-  "Whether a safe native AVET range is a hard-small upper bound for WHERE.
+(defn- likely-small-unindexed-vector-equality?
+  "Cost hint for choosing primary-prefilter before an ANN probe.
+
+   Unlike `small-indexed-vector-equality?`, an AEVT estimate is not a hard
+   cardinality bound and is therefore used only to choose between two
+   semantics-preserving access paths. If sampling is wrong, performance may
+   be suboptimal but results cannot change. A four-percent cap avoids paying an
+   O(N) primary pass for plausibly common values. The 4,096-row absolute cap
+   is a measured prefilter/probe crossover, separate from the smaller threshold
+   at which Proximum switches from filtered HNSW to exact SIMD scoring."
+  [db {:keys [kind attribute value]} candidate-limit]
+  (try
+    (and (= :unindexed kind)
+         (when-let [estimate-pattern (pattern-estimate-entrypoint)]
+           (let [estimated (long (estimate-pattern
+                                  db
+                                  {:e (symbol "?e") :a attribute :v value}
+                                  (get (dbi/-schema db) attribute)))
+                 rows (long (or (table-row-estimate db attribute) 0))
+                 absolute (max 4096 (* 64 (long candidate-limit)))]
+             (and (pos? rows)
+                  (<= estimated absolute)
+                  (<= estimated (long (Math/ceil (* 0.04 rows))))))))
+    (catch Throwable _ false)))
+
+(defn- small-indexed-vector-range
+  "Return a safe native AVET range when it is a hard-small bound for WHERE.
 
    `specialize-indexed-integral-ranges` adds these predicates only for indexed,
    NOT NULL long columns whose runtime bound is integral. Count at most one row
@@ -5679,14 +5760,20 @@
                groups))
            {}
            (:where query))]
-      (boolean
-       (some (fn [[attribute clauses]]
-               (when-let [candidates
-                          (native-avet-order-candidates
-                           db attribute :asc clauses (inc threshold))]
-                 (<= (count candidates) threshold)))
-             ranges)))
-    (catch Throwable _ false)))
+      (some (fn [[attribute clauses]]
+              (when-let [candidates
+                         (native-avet-order-candidates
+                          db attribute :asc clauses (inc threshold))]
+                (when (<= (count candidates) threshold)
+                  {:attribute attribute
+                   :clauses clauses
+                   :entities (mapv (fn [candidate]
+                                     (if (map? candidate)
+                                       (:entity-id candidate)
+                                       candidate))
+                                   candidates)})))
+            ranges))
+    (catch Throwable _ nil)))
 
 (defn- bounded-unindexed-vector-equality?
   "Prefer one exact query when the entire input relation has a hard small bound.
@@ -5741,9 +5828,10 @@
   "Use Scriptum only when its exact hit estimate is selective enough.
 
    The absolute floor keeps tiny relations and small result sets on the tested
-   secondary path. Above it, five percent is the measured crossover at which
-   enumerating and rechecking Lucene candidates stopped beating the primary
-   scan. Missing estimate support preserves the compatibility path."
+   secondary path. Direct candidate recheck and eager result materialization
+   moved the measured crossover above the previous five-percent threshold;
+   twenty percent remains conservative on the 100k corpus. Missing estimate
+   support preserves the compatibility path."
   [db index attribute query-spec]
   (try
     (if-let [estimate (secondary-estimate-entrypoint)]
@@ -5764,6 +5852,13 @@
                      (get (:secondary-indices db) ident))
             [ident (get (:secondary-indices db) ident)]))
         (dbi/-schema db)))
+
+(def ^:private text-exact-candidate-cache
+  "Bounded by immutable [db generation, secondary generation, predicate].
+   A new transaction or secondary root gets a new identity and cannot reuse an
+   earlier exact recheck. Repeated reads of one snapshot avoid repeating both
+   the Lucene search and PostgreSQL tsvector parsing."
+  (pg-cache/bounded-cache 128))
 
 (defn- not-null-attribute?
   "Whether PostgreSQL metadata guarantees that every table row has `attr`.
@@ -5878,34 +5973,112 @@
                             clauses)
                        (map :clause hints))))))))
 
+(declare restrict-query-to-entities)
+
 (defn- restrict-to-text-candidates
-  "Precede conjunctive PostgreSQL @@ predicates with complete Scriptum
-   candidate sets. Datahike's external-engine planner keeps candidates as an
-   EntityBitSet; the existing ts-match? clause remains the authoritative
-   PostgreSQL recheck for phrases, positions, weights, prefixes, and NOT."
+  "Replace eligible conjunctive @@ predicates with exact entity restrictions.
+
+   Scriptum first supplies a complete candidate EntityBitSet. pg-datahike then
+   reads only those entities' authoritative tsvectors and applies ts-match?
+   before removing the predicate clause. The ordinary Datalog query still
+   owns every other predicate, ordering rule, and projection. This is the same
+   candidate+heap-recheck split PostgreSQL uses, but avoids constructing one
+   general function-bearing relation per Lucene hit.
+
+   Exact entity ids are cached by immutable database/index generation and
+   predicate. Any missing protocol, malformed generation, or recheck failure
+   leaves the original query untouched."
   [db query in-args candidates]
   (reduce
-   (fn [[datalog in-args] {:keys [entity-var attribute] :as candidate}]
+   (fn [[datalog in-args]
+        {:keys [entity-var attribute query value-var predicate-clause] :as candidate}]
      (try
-       (if-let [[idx-ident index] (matching-text-secondary db attribute)]
+       (if-let [[_idx-ident index] (matching-text-secondary db attribute)]
          (if-let [query-spec (pg-secondary/scriptum-query-spec (:query candidate))]
-           (if (text-secondary-worthwhile? db index attribute query-spec)
-             (let [spec-var (gensym "?scriptum-query-spec")]
-               [(-> datalog
-                    (update :in (fn [inputs]
-                                  (conj (vec (or inputs ['$])) spec-var)))
-                    (update :where conj
-                            [(list 'datahike.pg.secondary/candidates
-                                   idx-ident spec-var)
-                             [entity-var '...]]))
-                (conj (vec in-args) query-spec)])
+           (if-let [{:keys [search entity-seq entity-set]}
+                    (filtered-vector-entrypoints)]
+             (let [cache-key [(pg-cache/identity-key db)
+                              (pg-cache/identity-key index)
+                              attribute query]
+                   cached (.get ^java.util.Map text-exact-candidate-cache
+                                cache-key)
+                   exact-eids
+                   (if (some? cached)
+                     cached
+                     (when (text-secondary-worthwhile?
+                            db index attribute query-spec)
+                       (let [candidate-set (search db index query-spec nil)
+                             candidate-eids
+                             (if (sequential? candidate-set)
+                               (map (fn [value]
+                                      (long (if (map? value)
+                                              (:entity-id value)
+                                              value)))
+                                    candidate-set)
+                               (entity-seq candidate-set))
+                             cancel (current-cancel)
+                             exact
+                             (entity-set
+                              (into []
+                                    (keep-indexed
+                                     (fn [i eid]
+                                       (when (and cancel
+                                                  (zero? (bit-and i 255))
+                                                  @cancel)
+                                         (throw (ex-info
+                                                 "query canceled"
+                                                 {:datahike/canceled true})))
+                                       (when-let [^datahike.datom.Datom datom
+                                                  (first (d/datoms db :eavt
+                                                                   eid attribute))]
+                                         (when (tsearch/ts-match? (.-v datom)
+                                                                  query)
+                                           (long eid)))))
+                                    candidate-eids))]
+                         (.put ^java.util.Map text-exact-candidate-cache
+                               cache-key exact)
+                         exact)))]
+               (if (some? exact-eids)
+                 (let [[datalog in-args]
+                       (restrict-query-to-entities datalog in-args
+                                                   entity-var exact-eids)
+                       without-predicate
+                       (filterv #(not= predicate-clause %) (:where datalog))
+                       producer
+                       (some (fn [clause]
+                               (when-let [binding
+                                          (get-else-column-binding clause)]
+                                 (when (and (= entity-var (:entity binding))
+                                            (= attribute (:attribute binding))
+                                            (= value-var (:value-var binding)))
+                                   clause)))
+                             without-predicate)
+                       referenced-elsewhere?
+                       (and producer
+                            (some #(= value-var %)
+                                  (tree-seq coll? seq
+                                            [(:find datalog) (:with datalog)
+                                             (remove #{producer}
+                                                     without-predicate)])))
+                       where (if (and producer (not referenced-elsewhere?))
+                               (filterv #(not= producer %) without-predicate)
+                               without-predicate)]
+                   [(assoc datalog :where where)
+                    in-args])
+                 [datalog in-args]))
              [datalog in-args])
            [datalog in-args])
          [datalog in-args])
        ;; A secondary is an optional access path. Missing adapters, an old
        ;; Datahike planner, or a generation that cannot serve this snapshot all
        ;; leave the exact primary scan unchanged.
-       (catch Throwable _ [datalog in-args])))
+       (catch Throwable failure
+         ;; Cancellation is a statement-level control signal, not an access
+         ;; path failure.  Swallowing it here would restart the same work as a
+         ;; primary scan after the client had already canceled the query.
+         (if (:datahike/canceled (ex-data failure))
+           (throw failure)
+           [datalog in-args]))))
    [query in-args]
    candidates))
 
@@ -5944,6 +6117,45 @@
                 [ident index])))
           (dbi/-schema db))))
 
+(defn- native-avet-order-carrier?
+  "Whether Datahike AVET and PostgreSQL have the same total order.
+
+   This is intentionally narrower than AVET's ability to store a value. A
+   bounded top-N access path is correct only when the physical order itself is
+   PostgreSQL-compatible; floating NaN, UUID, and collation-aware text need a
+   different comparator/index representation."
+  [attr-schema]
+  (contains? #{:db.type/long :db.type/boolean}
+             (:db/valueType attr-schema)))
+
+(defn- native-avet-backfill-admissible?
+  "Whether a SQL B-tree may use Datahike's value-ordered AVET carrier.
+
+   A populated attribute needs Datahike's explicit migration opt-in. Already
+   indexed and empty attributes require no backfill. Comparator admission is
+   kept separate and deliberately narrow in `native-avet-order-carrier?`."
+  [db attribute attr-schema]
+  (and (native-avet-order-carrier? attr-schema)
+       (or (:db/index attr-schema)
+           (:db/unique attr-schema)
+           (:allow-index-backfill? (dbi/-config db))
+           (nil? (first (d/datoms db :aevt attribute))))))
+
+(defn- native-avet-index-entries
+  [db attribute]
+  (mapv (fn [[entity-id ident]]
+          [ident (d/pull db
+                         [:pg/index-name :pg/index-table :pg/index-method
+                          :pg/index-attr :pg/index-native-avet
+                          :pg/index-avet-removable]
+                         entity-id)])
+        (d/q '{:find [?entity ?ident]
+               :in [$ ?attribute]
+               :where [[?entity :pg/index-native-avet true]
+                       [?entity :pg/index-attr ?attribute]
+                       [?entity :db/ident ?ident]]}
+             db attribute)))
+
 (defn- native-avet-order-candidates
   "Read an exact top-N directly from Datahike's value-ordered AVET index.
 
@@ -5966,8 +6178,7 @@
                ;; Datahike's total order is not PostgreSQL's for every AVET
                ;; carrier (notably UUID and floating NaN). Only truncate a
                ;; page when the physical and SQL comparators are proven equal.
-               (contains? #{:db.type/long :db.type/boolean}
-                          (:db/valueType attr-schema))
+               (native-avet-order-carrier? attr-schema)
                (or (:db/index attr-schema) (:db/unique attr-schema)))
       (try
         (letfn [(satisfies? [value [op _ bound]]
@@ -6173,16 +6384,30 @@
    Datalog distance/recheck query. This keeps projection, exact distance,
    ordering, and LIMIT in one SQL implementation."
   [db query in-args
-   {:keys [entity-var result-var attribute metric query-vector limit
+   {:keys [entity-var result-var table attribute metric query-vector limit
            candidate-limit ef prefer-entity-filter?] :as spec}]
   (if spec
     (try
-      (let [query-vector (pg-vector/coerce query-vector)]
+      (let [query-vector (pg-vector/coerce query-vector)
+            primary-exact
+            (fn []
+              [query in-args
+               (when (and (not prefer-entity-filter?)
+                          (<= (long candidate-limit) Integer/MAX_VALUE))
+                 {:kind :primary-vector-exact
+                  :entity-var entity-var
+                  :table table
+                  :attribute attribute
+                  :metric metric
+                  :query-vector query-vector
+                  :limit limit
+                  :candidate-limit candidate-limit})])]
         ;; Cosine has no ordering for a zero query vector. pgvector's HNSW
         ;; index does not index zero vectors for cosine distance; exact scan is
-        ;; therefore the only semantics-preserving path for this shape.
+        ;; therefore the only semantics-preserving path for this shape. The
+        ;; primary exact path retains that ordering without involving ANN.
         (if (and (= :cosine metric) (zero-vector? query-vector))
-          [query in-args nil]
+          (primary-exact)
           (if-let [[idx-ident index]
                    (matching-vector-secondary db (assoc spec :query-vector query-vector))]
             (let [candidate-limit (max 1 (long (or candidate-limit limit)))
@@ -6193,11 +6418,15 @@
                   equality-binding
                   (when prefer-entity-filter?
                     (vector-exact-filter-binding db query in-args entity-var))
+                  hard-small-equality?
+                  (small-indexed-vector-equality?
+                   db equality-binding candidate-limit)
+                  hard-small-range
+                  (small-indexed-vector-range
+                   db query in-args entity-var candidate-limit)
                   prefilter-first?
-                  (or (small-indexed-vector-equality?
-                       db equality-binding candidate-limit)
-                      (small-indexed-vector-range?
-                       db query in-args entity-var candidate-limit))
+                  (likely-small-unindexed-vector-equality?
+                   db equality-binding candidate-limit)
                   unindexed-equality?
                   (= :unindexed (:kind equality-binding))
                   bounded-unindexed-equality?
@@ -6219,74 +6448,86 @@
                        {:kind :proximum-filter-aware
                         :candidate-limit candidate-limit
                         :ef (:ef query-spec)}]))]
-              (if bounded-unindexed-equality?
+              (if (or bounded-unindexed-equality? hard-small-equality?)
                 [query in-args nil]
-                (if prefer-entity-filter?
-                  (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
-                    [query in-args
-                     {:kind (if prefilter-first?
-                              :proximum-prefiltered
-                              :proximum-hybrid)
-                      :filtered-entrypoints filtered-entrypoints
-                      :index-ident idx-ident
-                      :index index
-                      :entity-var entity-var
-                      :result-var result-var
-                      :attribute attribute
-                      :query-spec query-spec
-                      :probe-limit 128
+                (if (map? hard-small-range)
+                  [query in-args
+                   {:kind :primary-vector-filtered-exact
+                    :entity-var entity-var
+                    :result-var result-var
+                    :table table
+                    :attribute attribute
+                    :metric metric
+                    :query-vector query-vector
+                    :limit limit
+                    :candidate-limit candidate-limit
+                    :range hard-small-range}]
+                  (if prefer-entity-filter?
+                    (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
+                      [query in-args
+                       {:kind (if prefilter-first?
+                                :proximum-prefiltered
+                                :proximum-hybrid)
+                        :filtered-entrypoints filtered-entrypoints
+                        :index-ident idx-ident
+                        :index index
+                        :entity-var entity-var
+                        :result-var result-var
+                        :attribute attribute
+                        :query-spec query-spec
+                        :probe-limit 128
                       ;; A probe that under-fills has measured that the WHERE
                       ;; result is sparse enough to project once. Let the
                       ;; adapter choose exact-filtered versus filtered ANN from
                       ;; that runtime cardinality instead of paying for the
                       ;; complete distance query after the failed probe.
-                      :underfill-fallback :prefilter}]
-                    (if-let [candidate-page (and (close-candidate-scan-entrypoint)
-                                                 (candidate-page-entrypoint))]
-                      [query in-args
-                       {:kind :proximum-iterative
-                        :candidate-page candidate-page
-                        :index-ident idx-ident
-                        :index index
-                        :entity-var entity-var
-                        :attribute attribute
-                        :query-spec (assoc query-spec
-                                           :scan-mode :iterative
-                                           :strict-order? true)
-                        :page-limit 512}]
-                      [query in-args nil]))
+                        :underfill-fallback :prefilter}]
+                      (if-let [candidate-page (and (close-candidate-scan-entrypoint)
+                                                   (candidate-page-entrypoint))]
+                        [query in-args
+                         {:kind :proximum-iterative
+                          :candidate-page candidate-page
+                          :index-ident idx-ident
+                          :index index
+                          :entity-var entity-var
+                          :attribute attribute
+                          :query-spec (assoc query-spec
+                                             :scan-mode :iterative
+                                             :strict-order? true)
+                          :page-limit 512}]
+                        [query in-args nil]))
                 ;; Candidate paging is optional so a released/third-party
                 ;; adapter that only implements ISecondaryIndex keeps using
                 ;; the external-engine path.  Current Proximum generations
                 ;; take this bounded lane.
-                  (if-let [candidate-page (candidate-page-entrypoint)]
-                    (try
-                      (let [page (candidate-page
-                                  db idx-ident index query-spec nil
-                                  {:limit candidate-limit})
-                            eids (->> (:candidates page)
-                                      (keep (fn [candidate]
-                                              (when (= attribute
-                                                       (:attribute candidate))
-                                                (:entity-id candidate))))
-                                      distinct
-                                      vec)
-                            query (update query :in
-                                          (fn [inputs]
-                                            (conj (vec (or inputs ['$]))
-                                                  [entity-var '...])))]
-                        [query (conj (vec in-args) eids)
-                         {:kind :proximum-materialized
-                          :candidate-count (count eids)
-                          :candidate-limit candidate-limit
-                          :precision (:precision page)
-                          :recall (:recall page)
-                          :ordering (:ordering page)
-                          :ef (:ef query-spec)}])
-                      (catch Exception _
-                        (external-plan)))
-                    (external-plan)))))
-            [query in-args nil])))
+                    (if-let [candidate-page (candidate-page-entrypoint)]
+                      (try
+                        (let [page (candidate-page
+                                    db idx-ident index query-spec nil
+                                    {:limit candidate-limit})
+                              eids (->> (:candidates page)
+                                        (keep (fn [candidate]
+                                                (when (= attribute
+                                                         (:attribute candidate))
+                                                  (:entity-id candidate))))
+                                        distinct
+                                        vec)
+                              query (update query :in
+                                            (fn [inputs]
+                                              (conj (vec (or inputs ['$]))
+                                                    [entity-var '...])))]
+                          [query (conj (vec in-args) eids)
+                           {:kind :proximum-materialized
+                            :candidate-count (count eids)
+                            :candidate-limit candidate-limit
+                            :precision (:precision page)
+                            :recall (:recall page)
+                            :ordering (:ordering page)
+                            :ef (:ef query-spec)}])
+                        (catch Exception _
+                          (external-plan)))
+                      (external-plan))))))
+            (primary-exact))))
       ;; Candidate scans are optional accelerators. The exact scan is both the
       ;; compatibility path and the fail-safe for an adapter generation that
       ;; cannot serve this snapshot.
@@ -6299,6 +6540,326 @@
            (fn [inputs]
              (conj (vec (or inputs ['$])) [entity-var '...])))
    (conj (vec in-args) eids)])
+
+(defn- vector-distance-fn
+  [metric]
+  (case metric
+    :euclidean pg-vector/l2-distance
+    :inner-product pg-vector/negative-inner-product
+    :cosine pg-vector/cosine-distance
+    nil))
+
+(defn- run-primary-exact-vector-query
+  "Answer an unfiltered exact vector top-k with an allocation-bounded AEVT
+   scan, then run the ordinary SQL query over only those entity ids.
+
+   PostgreSQL's exact vector plan maintains a bounded top-N heap while scanning
+   the table. The generic Datahike expression path instead materializes every
+   distance-bearing result tuple before applying its bounded sort. This lane
+   restores the PostgreSQL physical shape without making vector projection a
+   second SQL implementation: it computes only [entity-id distance], and the
+   existing query remains the authoritative distance, NULL-ordering,
+   projection, OFFSET, and LIMIT recheck over the bounded candidates.
+
+   The vector attribute and the table row marker are merge-scanned in entity
+   order. That is both cheap and important for correctness when a Datahike
+   client has written an attribute on an entity that is not a SQL row. Missing
+   vectors sort after every non-NULL distance; when fewer than OFFSET+LIMIT
+   non-NULL values exist we fall back to the full query so NULL rows are
+   included faithfully."
+  [db exact-query exact-in-args run-query
+   {:keys [entity-var table attribute metric query-vector limit
+           candidate-limit]}]
+  (let [bound (long candidate-limit)
+        marker (when table (pgs/row-marker-attr table))
+        distance-fn (vector-distance-fn metric)]
+    (if-not (and (pos? bound)
+                 marker
+                 distance-fn
+                 (contains? (dbi/-schema db) marker))
+      (run-query exact-query exact-in-args)
+      (let [^floats query-vector (pg-vector/coerce query-vector)
+            metric-id (case metric
+                        :euclidean PgVectorMath/EUCLIDEAN
+                        :inner-product PgVectorMath/INNER_PRODUCT
+                        :cosine PgVectorMath/COSINE)
+            query-squared-norm (PgVectorMath/squaredNorm query-vector)
+            ;; PriorityQueue is a min-heap. Reverse distance and ordinal so
+            ;; peek is the worst retained candidate. The ordinal makes equal
+            ;; distances stable in the same entity order as the full scan.
+            worst-first
+            (reify java.util.Comparator
+              (compare [_ a b]
+                (let [^objects a a
+                      ^objects b b
+                      c (Double/compare (double (aget b 1))
+                                        (double (aget a 1)))]
+                  (if (zero? c)
+                    (Long/compare (long (aget b 2)) (long (aget a 2)))
+                    c))))
+            best-first
+            (reify java.util.Comparator
+              (compare [_ a b]
+                (let [^objects a a
+                      ^objects b b
+                      c (Double/compare (double (aget a 1))
+                                        (double (aget b 1)))]
+                  (if (zero? c)
+                    (Long/compare (long (aget a 2)) (long (aget b 2)))
+                    c))))
+            ^java.util.PriorityQueue heap
+            (java.util.PriorityQueue. (int (max 1 (min bound 1024))) worst-first)
+            cancel (current-cancel)
+            scored
+            (loop [vectors (seq (d/datoms db :aevt attribute))
+                   markers (seq (d/datoms db :aevt marker))
+                   ordinal (long 0)
+                   steps (long 0)]
+              (if (and vectors markers)
+                (let [_ (when (and cancel (zero? (bit-and steps 255)) @cancel)
+                          (throw (ex-info "query canceled"
+                                          {:datahike/canceled true})))
+                      ^datahike.datom.Datom vector-datom (first vectors)
+                      ^datahike.datom.Datom marker-datom (first markers)
+                      vector-eid (.-e vector-datom)
+                      marker-eid (.-e marker-datom)]
+                  (cond
+                    (< vector-eid marker-eid)
+                    (recur (next vectors) markers ordinal (unchecked-inc steps))
+
+                    (> vector-eid marker-eid)
+                    (recur vectors (next markers) ordinal (unchecked-inc steps))
+
+                    (not (true? (.-v marker-datom)))
+                    (recur (next vectors) (next markers) ordinal
+                           (unchecked-inc steps))
+
+                    :else
+                    (let [^floats stored (pg-vector/coerce (.-v vector-datom))
+                          ;; The static kernel's length guard is cheaper than
+                          ;; running a second Clojure distance solely to check
+                          ;; dimensions. On mismatch, call the authoritative
+                          ;; implementation so its PostgreSQL error survives.
+                          distance (if (= (alength stored) (alength query-vector))
+                                     (PgVectorMath/distance
+                                      metric-id stored query-vector
+                                      query-squared-norm)
+                                     (double (distance-fn stored query-vector)))
+                          retain?
+                          (or (< (.size heap) bound)
+                              (let [^objects worst (.peek heap)]
+                                (neg? (Double/compare distance
+                                                      (double (aget worst 1))))))]
+                      (when retain?
+                        (when (>= (.size heap) bound) (.poll heap))
+                        (let [^objects entry (object-array 3)]
+                          (aset entry 0 (Long/valueOf vector-eid))
+                          (aset entry 1 (Double/valueOf distance))
+                          (aset entry 2 (Long/valueOf ordinal))
+                          (.add heap entry)))
+                      (recur (next vectors) (next markers)
+                             (unchecked-inc ordinal) (unchecked-inc steps)))))
+                ordinal))]
+        ;; If NULL vectors can enter the requested window, only the full SQL
+        ;; path knows which NULL rows and projections to return.
+        (if (< scored bound)
+          (run-query exact-query exact-in-args)
+          (let [eids (mapv (fn [entry]
+                             (long (aget ^objects entry 0)))
+                           (sort best-first (seq (.toArray heap))))
+                [candidate-query candidate-args]
+                (restrict-query-to-entities exact-query exact-in-args
+                                            entity-var eids)
+                result (run-query candidate-query candidate-args)]
+            ;; Fail closed for malformed/non-SQL entities or any future
+            ;; eligibility widening that filters during authoritative recheck.
+            (if (and (pos-int? limit) (< (count result) limit))
+              (run-query exact-query exact-in-args)
+              result)))))))
+
+(defn- distance-order-compare
+  "PostgreSQL ascending distance order: finite values before SQL NULL."
+  ^long [a b]
+  (cond
+    (nil? a) (if (nil? b) 0 1)
+    (nil? b) -1
+    :else (Double/compare (double a) (double b))))
+
+(defn- primary-filtered-vector-projection-spec
+  "Recognize a single-row-source vector query that can be evaluated directly.
+
+   Ordinary column producers and scalar predicate clauses remain
+   authoritative; joins, disjunctions, rules, aggregates, and expression
+   projections decline this lane."
+  [query entity-var result-var vector-attribute]
+  (let [marker-clause
+        (some (fn [clause]
+                (when (and (vector? clause)
+                           (= 3 (count clause))
+                           (= entity-var (first clause))
+                           (keyword? (second clause))
+                           (= "db-row-exists" (name (second clause)))
+                           (true? (nth clause 2)))
+                  clause))
+              (:where query))
+        producer-binding
+        (fn [clause]
+          (or (when-let [{:keys [entity attribute value-var]}
+                         (get-else-column-binding clause)]
+                (when (= entity-var entity)
+                  {:attribute attribute :value-var value-var}))
+              (when (and (vector? clause)
+                         (= 3 (count clause))
+                         (= entity-var (first clause))
+                         (keyword? (second clause))
+                         (symbol? (nth clause 2)))
+                {:attribute (second clause) :value-var (nth clause 2)})))
+        producers
+        (into {}
+              (keep (fn [clause]
+                      (when-let [{:keys [attribute value-var]}
+                                 (producer-binding clause)]
+                        [value-var attribute])))
+              (:where query))
+        distance-clauses
+        (filterv (fn [clause]
+                   (and (vector? clause)
+                        (= 2 (count clause))
+                        (= result-var (second clause))
+                        (seq? (first clause))))
+                 (:where query))
+        distance-clause (when (= 1 (count distance-clauses))
+                          (first distance-clauses))
+        vector-var
+        (some (fn [[value-var attribute]]
+                (when (= vector-attribute attribute) value-var))
+              producers)
+        predicate-clauses
+        (filterv (fn [clause]
+                   (and (vector? clause)
+                        (= 1 (count clause))
+                        (seq? (first clause))))
+                 (:where query))
+        allowed?
+        (fn [clause]
+          (or (= marker-clause clause)
+              (= distance-clause clause)
+              (some? (producer-binding clause))
+              (some #{clause} predicate-clauses)))
+        find-vars (:find query)]
+    (when (and marker-clause distance-clause vector-var
+               (every? allowed? (:where query))
+               (every? symbol? find-vars)
+               (every? #(or (= result-var %)
+                            (contains? producers %))
+                       find-vars)
+               (or (nil? (:with query))
+                   (= [entity-var] (:with query))))
+      {:marker (second marker-clause)
+       :producers producers
+       :find-vars find-vars
+       :vector-var vector-var
+       :predicate-clauses predicate-clauses})))
+
+(defn- run-primary-filtered-exact-vector-query
+  "Evaluate a hard-small AVET-prefiltered vector top-N without a Datalog
+   relation round trip.
+
+   The AVET range is a complete upper bound. Each candidate's contiguous EAVT
+   row is read once, all remaining scalar predicates are interpreted exactly,
+   primitive distance is computed, and only OFFSET+LIMIT rows are retained.
+   Returning nil means the query shape is outside this deliberately narrow
+   physical lane and the caller must use the ordinary exact query."
+  [db query in-args
+   {:keys [entity-var result-var attribute metric query-vector candidate-limit
+           range]}]
+  (when-let [{:keys [marker producers find-vars vector-var predicate-clauses]}
+             (primary-filtered-vector-projection-spec
+              query entity-var result-var attribute)]
+    (let [bound (long candidate-limit)
+          distance-fn (vector-distance-fn metric)]
+      (when (and (pos? bound) distance-fn)
+        (let [^floats query-vector (pg-vector/coerce query-vector)
+              metric-id (case metric
+                          :euclidean PgVectorMath/EUCLIDEAN
+                          :inner-product PgVectorMath/INNER_PRODUCT
+                          :cosine PgVectorMath/COSINE)
+              query-squared-norm (PgVectorMath/squaredNorm query-vector)
+              input-values (zipmap (rest (:in query)) in-args)
+              attrs (into #{marker} (vals producers))
+              worst-first
+              (reify java.util.Comparator
+                (compare [_ a b]
+                  (let [^objects a a
+                        ^objects b b
+                        c (distance-order-compare (aget b 1) (aget a 1))]
+                    (if (zero? c)
+                      (Long/compare (long (aget b 2)) (long (aget a 2)))
+                      c))))
+              best-first
+              (reify java.util.Comparator
+                (compare [_ a b]
+                  (let [^objects a a
+                        ^objects b b
+                        c (distance-order-compare (aget a 1) (aget b 1))]
+                    (if (zero? c)
+                      (Long/compare (long (aget a 2)) (long (aget b 2)))
+                      c))))
+              ^java.util.PriorityQueue heap
+              (java.util.PriorityQueue. (int (max 1 (min bound 1024)))
+                                        worst-first)
+              cancel (current-cancel)]
+          (doseq [[ordinal eid] (map-indexed vector (:entities range))]
+            (when (and cancel (zero? (bit-and ordinal 255)) @cancel)
+              (throw (ex-info "query canceled" {:datahike/canceled true})))
+            (let [values
+                  (reduce
+                   (fn [values datom]
+                     (let [attr (:a datom)]
+                       (if (contains? attrs attr)
+                         (assoc values attr (:v datom))
+                         values)))
+                   {}
+                   (d/datoms db :eavt eid))
+                  bindings
+                  (reduce-kv (fn [bindings value-var attr]
+                               (assoc bindings value-var
+                                      (get values attr :__null__)))
+                             (assoc input-values entity-var eid)
+                             producers)]
+              (when (and (true? (get values marker))
+                         (every? (fn [clause]
+                                   (true? (expr/interpret-form
+                                           (first clause) bindings)))
+                                 predicate-clauses))
+                (let [stored-value (get bindings vector-var)
+                      distance
+                      (when-not (or (nil? stored-value)
+                                    (= :__null__ stored-value))
+                        (let [^floats stored (pg-vector/coerce stored-value)]
+                          (if (= (alength stored) (alength query-vector))
+                            (PgVectorMath/distance metric-id stored query-vector
+                                                   query-squared-norm)
+                            (double (distance-fn stored query-vector)))))
+                      row (mapv (fn [find-var]
+                                  (if (= result-var find-var)
+                                    (or distance :__null__)
+                                    (get bindings find-var :__null__)))
+                                find-vars)
+                      retain?
+                      (or (< (.size heap) bound)
+                          (let [^objects worst (.peek heap)]
+                            (neg? (distance-order-compare
+                                   distance (aget worst 1)))))]
+                  (when retain?
+                    (when (>= (.size heap) bound) (.poll heap))
+                    (let [^objects entry (object-array 3)]
+                      (aset entry 0 row)
+                      (aset entry 1 distance)
+                      (aset entry 2 (Long/valueOf (long ordinal)))
+                      (.add heap entry)))))))
+          (mapv (fn [entry] (aget ^objects entry 0))
+                (sort best-first (seq (.toArray heap)))))))))
 
 (defn- form-contains-symbol?
   [form target]
@@ -6536,6 +7097,145 @@
                         (or declaration page-declaration) pages-read))))))
        (finally (close-owned!))))))
 
+(defn- simple-entity-projection
+  "Project an exact entity-set query without rebuilding a Datalog relation.
+
+   This physical lane is deliberately narrower than SQL expression execution:
+   one collection input binds the table entity, WHERE contains only the row
+   marker and ordinary card-one column producers, and FIND contains only those
+   produced values. Scriptum has already performed PostgreSQL-exact recheck;
+   AVET has already produced an exact ordered page. `pull-many` performs the
+   remaining EAVT projection in one shared primitive before the normal SQL
+   sort/limit/hidden-column/format pipeline resumes.  For ordinary-width SQL
+   rows, scanning each candidate's contiguous EAVT slice is substantially
+   cheaper than entering the general pull state machine once per projected
+   attribute.  Very wide rows retain the pull lane, where point seeks avoid
+   walking unrelated columns.
+
+   Returns `{:rows ...}` so an exact empty result is distinct from an
+   ineligible shape (`nil`)."
+  [db query in-args]
+  (try
+    (let [inputs (vec (rest (:in query)))
+          binding (when (= 1 (count inputs)) (first inputs))
+          entity-var (when (and (vector? binding)
+                                (= 2 (count binding))
+                                (= '... (second binding)))
+                       (first binding))
+          marker-clause
+          (when entity-var
+            (some (fn [clause]
+                    (when (and (vector? clause)
+                               (= 3 (count clause))
+                               (= entity-var (first clause))
+                               (keyword? (second clause))
+                               (= "db-row-exists" (name (second clause)))
+                               (true? (nth clause 2)))
+                      clause))
+                  (:where query)))
+          marker (second marker-clause)
+          producers
+          (when marker
+            (reduce
+             (fn [acc clause]
+               (cond
+                 (= clause marker-clause) acc
+
+                 (get-else-column-binding clause)
+                 (let [{:keys [entity attribute value-var]}
+                       (get-else-column-binding clause)]
+                   (if (= entity-var entity)
+                     (assoc acc value-var attribute)
+                     (reduced nil)))
+
+                 (and (vector? clause)
+                      (= 3 (count clause))
+                      (= entity-var (first clause))
+                      (keyword? (second clause))
+                      (symbol? (nth clause 2)))
+                 (assoc acc (nth clause 2) (second clause))
+
+                 :else (reduced nil)))
+             {}
+             (:where query)))
+          find-vars (:find query)]
+      (when (and marker producers
+                 (= 1 (count in-args))
+                 (every? symbol? find-vars)
+                 (every? #(contains? producers %) find-vars)
+                 (or (nil? (:with query))
+                     (= [entity-var] (:with query))))
+        (let [candidate-input (first in-args)
+              eids (if (sequential? candidate-input)
+                     candidate-input
+                     (when-let [entity-seq
+                                (:entity-seq (filtered-vector-entrypoints))]
+                       (entity-seq candidate-input)))
+              eids (when eids (vec eids))]
+          (when (some? eids)
+            (let [find-attrs (mapv producers find-vars)
+                  attrs (into #{marker} find-attrs)
+                  table-ns (namespace marker)
+                  table-width
+                  (count
+                   (filter (fn [attr]
+                             (and (keyword? attr)
+                                  (= table-ns (namespace attr))))
+                           (keys (dbi/-schema db))))
+                  ;; A direct EAVT walk is linear in the physical row width;
+                  ;; pull-many is linear in the number of requested columns.
+                  ;; The constants measured at 100k rows favour the walk by
+                  ;; roughly an order of magnitude for normal SQL shapes.
+                  direct-eavt? (and (<= (count eids) 16384)
+                                    (<= table-width
+                                        (max 16 (* 8 (count attrs)))))
+                  pull-many? (and (not direct-eavt?)
+                                  (<= (count eids) 2048))
+                  cancel (current-cancel)
+                  check-cancel!
+                  (fn [i]
+                    (when (and cancel (zero? (bit-and i 255)) @cancel)
+                      (throw (ex-info "query canceled"
+                                      {:datahike/canceled true}))))]
+              (cond
+                direct-eavt?
+                {:rows
+                 (into []
+                       (keep-indexed
+                        (fn [i eid]
+                          (check-cancel! i)
+                          (let [values
+                                (reduce
+                                 (fn [values datom]
+                                   (let [attr (:a datom)]
+                                     (if (contains? attrs attr)
+                                       (assoc values attr (:v datom))
+                                       values)))
+                                 {}
+                                 (d/datoms db :eavt eid))]
+                            (when (true? (get values marker))
+                              (mapv #(get values % :__null__) find-attrs))))
+                        eids))}
+
+                pull-many?
+                (let [pulled (if (seq eids)
+                               (d/pull-many db (vec attrs) eids)
+                               [])]
+                  {:rows
+                   (into []
+                         (keep-indexed
+                          (fn [i entity]
+                            (check-cancel! i)
+                            (when (true? (get entity marker))
+                              (mapv #(get entity % :__null__) find-attrs)))
+                          pulled))})
+
+                :else nil))))))
+    (catch Throwable failure
+      (if (:datahike/canceled (ex-data failure))
+        (throw failure)
+        nil))))
+
 (defn- exec-select
   "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
    UPDATE row-locking variants (skip / nowait / block), aggregate-on-
@@ -6615,23 +7315,37 @@
                    (if (seq args)
                      (run-param-query q-input #(apply d/q q-input query-db args))
                      (run-param-query q-input #(d/q q-input query-db)))))))
+            direct-projection
+            (when (nil? vector-access)
+              (simple-entity-projection query-db query in-args))
             candidate-results
-            (case (:kind vector-access)
-              :proximum-hybrid
-              (run-materialized-vector-probe
-               query-db exact-query exact-in-args run-query limit vector-access
-               #(run-prefiltered-vector-query
-                 query-db exact-query exact-in-args run-query vector-access))
+            (if direct-projection
+              (:rows direct-projection)
+              (case (:kind vector-access)
+                :primary-vector-filtered-exact
+                (or (run-primary-filtered-exact-vector-query
+                     query-db query in-args vector-access)
+                    (run-query query in-args))
 
-              :proximum-prefiltered
-              (run-prefiltered-vector-query
-               query-db exact-query exact-in-args run-query vector-access)
+                :primary-vector-exact
+                (run-primary-exact-vector-query
+                 query-db exact-query exact-in-args run-query vector-access)
 
-              :proximum-iterative
-              (run-iterative-vector-query
-               query-db exact-query exact-in-args run-query limit vector-access)
+                :proximum-hybrid
+                (run-materialized-vector-probe
+                 query-db exact-query exact-in-args run-query limit vector-access
+                 #(run-prefiltered-vector-query
+                   query-db exact-query exact-in-args run-query vector-access))
 
-              (run-query query in-args))
+                :proximum-prefiltered
+                (run-prefiltered-vector-query
+                 query-db exact-query exact-in-args run-query vector-access)
+
+                :proximum-iterative
+                (run-iterative-vector-query
+                 query-db exact-query exact-in-args run-query limit vector-access)
+
+                (run-query query in-args)))
             ;; Scalar pages are accepted only when their range predicate,
             ;; precision, recall, and ordering are exact, so an exhausted
             ;; relation shorter than LIMIT is a final result rather than a
@@ -6755,7 +7469,13 @@
                         (if use-top-k?
                           (cond->> (top-k-sort k null-safe-cmp results)
                             sql-offset (drop sql-offset))
-                          (let [sorted (sort null-safe-cmp results)]
+                          ;; Realize TimSort's result before handing it to the
+                          ;; wire formatter. Keeping this as a lazy seq made
+                          ;; `seq`/first-row inspection followed by matrix
+                          ;; materialization repeatedly traverse the lazy sort
+                          ;; wrapper: 10k randomly ordered scalar rows took
+                          ;; ~230 ms here versus ~4 ms when realized once.
+                          (let [sorted (vec (sort null-safe-cmp results))]
                             ;; With window functions the OFFSET/LIMIT must wait:
                             ;; PostgreSQL evaluates a window over the whole
                             ;; result and only then trims, so trimming here made
@@ -6779,7 +7499,7 @@
                       (stmt/apply-project-set results project-set)
                       results)
             results (if (seq project-order-by)
-                      (sort (null-safe-order-cmp project-order-by) results)
+                      (vec (sort (null-safe-order-cmp project-order-by) results))
                       results)
             results (if (seq project-set)
                       (let [offset-results (cond->> results
@@ -7959,6 +8679,9 @@
         {:message (str "materialized secondary CREATE INDEX requires autocommit; "
                        "commit the current transaction first")})))
     (load-secondary-adapter! index-type)
+     ;; Publish the secondary declaration through one Datahike root. The
+     ;; adapter later publishes its ready generation through the same writer;
+     ;; readers therefore see either the old root or a complete new root.
     (transact-recorded!
      conn
      [{:db/ident index-ident
@@ -7975,6 +8698,36 @@
     (await-secondary-ready! conn index-ident
                             (long (or secondary-index-build-timeout-ms 60000)))
     (empty-result "CREATE INDEX")))
+
+(defn- create-native-avet-index!
+  "Publish a named SQL B-tree and, when necessary, enable AVET in one root.
+
+   The catalog entity is not a second data structure. It controls SQL
+   visibility/lifecycle while the actual ordered datoms remain in Datahike's
+   primary AVET root. Datahike's reversible index transition makes the final
+   DROP equally atomic."
+  [ctx parsed attr attr-schema db]
+  (let [{:keys [conn tx-state]} ctx
+        existing (native-avet-index-entries db attr)
+        preexisting? (boolean (or (:db/index attr-schema)
+                                  (:db/unique attr-schema)))
+        removable? (if-let [[_ entry] (first existing)]
+                     (boolean (:pg/index-avet-removable entry))
+                     (not preexisting?))
+        tx-data (cond-> [{:db/ident (secondary-index-ident (:name parsed))
+                          :pg/index-name (:name parsed)
+                          :pg/index-table (:table parsed)
+                          :pg/index-method :btree
+                          :pg/index-attr attr
+                          :pg/index-native-avet true
+                          :pg/index-avet-removable removable?}]
+                  (not preexisting?)
+                  (conj {:db/ident attr :db/index true}))]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE INDEX")
+      (do
+        (transact-recorded! conn tx-data)
+        (empty-result "CREATE INDEX")))))
 
 (defn- exec-ddl-create-index
   [ctx parsed]
@@ -8080,25 +8833,28 @@
            (errors/pg-error
             :feature-not-supported
             {:message "btree indexes on vector columns are not supported"}))
-          (if (and (map? secondary-index-config)
-                   (contains? secondary-index-config :stratum))
-            (if (:unique? parsed)
-              (throw
-               (errors/pg-error
-                :feature-not-supported
-                {:message (str "materialized Stratum btree indexes do not yet "
-                               "enforce uniqueness")}))
-              (if (stratum-orderable-attribute? db attr)
-                (materialize-secondary-index!
-                 ctx parsed :stratum attr
-                 (configured-secondary-options
-                  secondary-index-config :stratum parsed))
+          (if (and (not (:unique? parsed))
+                   (native-avet-backfill-admissible? db attr attr-schema))
+            (create-native-avet-index! ctx parsed attr attr-schema db)
+            (if (and (map? secondary-index-config)
+                     (contains? secondary-index-config :stratum))
+              (if (:unique? parsed)
                 (throw
                  (errors/pg-error
                   :feature-not-supported
-                  {:message (str "Stratum does not preserve PostgreSQL btree "
-                                 "ordering for column type " pg-type)}))))
-            (empty-result "CREATE INDEX")))
+                  {:message (str "materialized Stratum btree indexes do not yet "
+                                 "enforce uniqueness")}))
+                (if (stratum-orderable-attribute? db attr)
+                  (materialize-secondary-index!
+                   ctx parsed :stratum attr
+                   (configured-secondary-options
+                    secondary-index-config :stratum parsed))
+                  (throw
+                   (errors/pg-error
+                    :feature-not-supported
+                    {:message (str "Stratum does not preserve PostgreSQL btree "
+                                   "ordering for column type " pg-type)}))))
+              (empty-result "CREATE INDEX"))))
 
         :else
         (throw
@@ -8135,14 +8891,36 @@
           {:message "secondary DROP INDEX inside a transaction is not yet supported"})))
       (let [index-ident (secondary-index-ident (:name parsed))
             db (d/db conn)
+            schema (dbi/-schema db)
             entity-id (d/q '{:find [?entity .]
                              :in [$ ?ident]
                              :where [[?entity :db/ident ?ident]]}
-                           db index-ident)]
+                           db index-ident)
+            index-entry (when entity-id
+                          (d/pull db
+                                  [:pg/index-name :pg/index-table :pg/index-method
+                                   :pg/index-attr :pg/index-native-avet
+                                   :pg/index-avet-removable]
+                                  entity-id))]
         (cond
           entity-id
-          (do
-            (transact-recorded! conn [[:db/retractEntity entity-id]])
+          (let [attribute (:pg/index-attr index-entry)
+                native? (:pg/index-native-avet index-entry)
+                other-native?
+                (and native?
+                     (some (fn [[ident _]] (not= ident index-ident))
+                           (native-avet-index-entries db attribute)))
+                attr-schema (get schema attribute)
+                remove-avet?
+                (and native?
+                     (:pg/index-avet-removable index-entry)
+                     (not other-native?)
+                     (not (:db/unique attr-schema))
+                     (not= :db.type/ref (:db/valueType attr-schema)))
+                tx-data (cond-> [[:db/retractEntity entity-id]]
+                          remove-avet?
+                          (conj [:db/retract attribute :db/index true]))]
+            (transact-recorded! conn tx-data)
             (empty-result "DROP INDEX"))
 
           (:if-exists? parsed)
@@ -8317,9 +9095,17 @@
                                         db ident)]
                           [:db/retractEntity entity-id]))))
               db-schema)
+        native-index-tx-data
+        (mapv (fn [[entity-id]] [:db/retractEntity entity-id])
+              (d/q '{:find [?entity]
+                     :in [$ ?table]
+                     :where [[?entity :pg/index-native-avet true]
+                             [?entity :pg/index-table ?table]]}
+                   db table))
         all-tx-data (into data-tx-data
                           (concat (filter some? schema-tx-data)
-                                  secondary-tx-data))]
+                                  secondary-tx-data
+                                  native-index-tx-data))]
     (when (seq all-tx-data)
       (transact-recorded! conn all-tx-data))))
 

@@ -51,7 +51,7 @@ measures immutable index writes, commit-root publication, and conflict retries.
 | indexed scalar order | backward B-tree scan stopped by `Limit`, `O(log N + k)` | exact AVET forward/reverse slice when SQL/Datahike ordering is proven compatible; otherwise exact Stratum page and primary recheck | AVET path has the right shape. Stratum one-page top-N is `O(N log k)` today, not B-tree-shaped; OFFSET continuations can repeat that work. |
 | unindexed full text | sequential row scan and exact `@@` evaluation | primary tsvector scan and exact PostgreSQL-compatible matcher | Same linear class. Datahike performs attribute-oriented reads rather than one heap-row fetch. |
 | GIN/Scriptum full-text filter | posting-list/bitmap combination, heap recheck, then requested SQL order | Lucene posting-list query to an entity bitmap, planner pushdown, authoritative tsvector recheck, then requested SQL order | Same `O(p + candidates)` access class. Entity-filter composition is pushed into Lucene. Ranking remains an exact primary operation. |
-| exact vector top-k | sequential distance scan plus bounded top-N heap, `O(N*d + N log k)` | sequential distance evaluation and relation construction followed by pg-datahike's bounded top-N heap | Same distance/selection complexity and `O(k)` selection memory. The much larger constant is now attributable to EAV relation construction, expression evaluation, and JVM allocation—not a full sort. |
+| exact vector top-k | sequential distance scan plus bounded top-N heap, `O(N*d + N log k)` | allocation-bounded AEVT scan with primitive vector distance and a stable top-N heap | Same distance/selection complexity and `O(k)` selection memory. The primary physical lane avoids constructing the full Datalog relation. |
 | unfiltered HNSW top-k | pgvector HNSW search, then heap visibility/recheck | Proximum HNSW search, bounded entity candidates, then exact distance/projection recheck | Same graph-search class plus `O(k)` primary recheck. Recall/beam and deterministic tie ordering must be compared separately. |
 | filtered HNSW, moderate selectivity | pgvector normally searches HNSW then filters heap rows; iterative scan resumes graph search until enough rows or budget exhaustion | bounded ANN probe and/or Proximum filtered HNSW using one primary entity bitmap, followed by authoritative recheck | Comparable graph-search class. pg-datahike avoids rerunning the SQL predicate on every ANN page. |
 | filtered vector, sparse | pgvector iterative scan visits roughly `k/selectivity` ordered candidates; planner may choose a different primary plan when available | one AVET primary prefilter, Proximum exact top-k over selected IDs, final `k`-row recheck | Desired shape is `O(log N + s*d + s log k)`. Current Proximum filter translation/cardinality walk adds `O(N/word-size)` dense-bitset work and `O(s log N)` external-ID translation. |
@@ -84,34 +84,34 @@ legacy `:stats?` executor. A matched 100k × 16-dimensional run observed:
 
 | Workload | pg-datahike boundaries | PostgreSQL 17.10 actual plan |
 |---|---|---|
-| scalar indexed top-10 | Stratum emits 11 to establish continuation state; the candidate contract and final Datahike query each contain 10 | backward B-tree scan emits 10 and touches 3 shared buffers |
-| full text, 1% | Scriptum page 1,000 → entity bitmap 1,000 → authoritative query 1,000 | GIN emits 1,000 TIDs → bitmap heap scan 1,000 rows |
-| full text, 0.1% | Scriptum page 100 → entity bitmap 100 → authoritative query 100 | GIN emits 100 TIDs → bitmap heap scan 100 rows |
+| scalar indexed top-10 | AVET emits 10, then the exact-entity projector scans 10 contiguous EAVT row slices | backward B-tree scan emits 10 and touches 3 shared buffers |
+| full text, 1% | Scriptum bitmap 1,000 → authoritative tsvector recheck bitmap 1,000 → 1,000 contiguous EAVT row slices | GIN emits 1,000 TIDs → bitmap heap scan 1,000 rows |
+| full text, 0.1% | Scriptum bitmap 100 → authoritative tsvector recheck bitmap 100 → 100 contiguous EAVT row slices | GIN emits 100 TIDs → bitmap heap scan 100 rows |
 | unfiltered HNSW top-10 | Proximum page 10 → final exact-distance/projection query 10 | HNSW index scan emits 10 |
 | filtered HNSW, 10% | one 128-entity ANN set → 18 exact matches → top-10 | HNSW rejects 55 rows and emits 10 |
-| filtered vector, 1% | 128-entity ANN set under-fills with 3–4; the fallback projects 1,000 primary IDs once, Proximum exact-scores them, and the final query rechecks 10 | HNSW rejects 738 rows and emits 10 with recall@10 0.8 in this fixture |
-| filtered vector, 0.1% | primary range emits 100 → Proximum exact filtered top-10 → final query 10 | the natural planner also chooses primary-key range 100 → bounded exact top-10 → 10 |
+| filtered vector, 1% | the sampled equality estimate skips the wasted ANN probe; primary projection emits 1,000, Proximum filtered search emits 10, final SQL rechecks 10 | HNSW rejects 735 rows and emits 10 with recall@10 0.8 in this fixture |
+| filtered vector, 0.1% | AVET range 100 → fused EAVT predicate/projection + primitive bounded exact top-10 → 10 | the natural planner also chooses primary-key range 100 → bounded exact top-10 → 10 |
 
 This is the key structural result: scalar, full-text, and unfiltered ANN no
-longer leak table cardinality across the secondary boundary. The remaining
-1%-filtered vector loss is a planner crossover—the engine pays for a bounded
-ANN attempt and then performs the exact primary plan that was already cheaper.
-PostgreSQL accepts approximate recall on its selected HNSW plan; pg-datahike's
-current compatibility path instead guarantees a complete SQL `LIMIT` result.
+longer leak table cardinality across the secondary boundary. The 1%-filtered
+vector path no longer pays for a probe it will predictably under-fill, and the
+hard-small 0.1% range no longer crosses the Proximum boundary at all.
+PostgreSQL accepts approximate recall on its selected 1% HNSW plan;
+pg-datahike's path instead returns recall 1.0 on this fixture.
 
 The clean same-host p50 comparison for that run was:
 
 | Operation | pg-datahike | PostgreSQL 17.10 | Interpretation |
 |---|---:|---:|---|
-| scalar top-10 through Stratum | 3.21 ms | 0.035 ms | large gap; Stratum chunks are not B-tree-shaped |
-| scalar top-10 through experimental AVET backfill | 0.28–0.43 ms | 0.035 ms | right access path; remaining sub-ms runtime/formatting constant |
-| full text, 1% / 1,000 matches | 20.24 ms | 0.55 ms | Scriptum 3.25 ms + Datahike/recheck relation 12.65 ms dominate |
-| full text, 0.1% / 100 matches | 6.23 ms | 0.108 ms | fixed query/relation setup dominates |
-| HNSW top-10, `ef_search=1000` | 1.65 ms | 7.31 ms | Proximum is faster at equal recall@10 1.0 |
-| filtered HNSW, 10% | 6.14 ms | 7.42 ms | pg-datahike is faster at equal recall@10 1.0 |
-| filtered vector, 1% | 12.90 ms, recall 1.0 | 8.32 ms, recall 0.8 | not semantically equivalent; pg-datahike pays for complete fallback |
-| filtered vector, 0.1% / 100 rows | 1.13 ms | 0.112 ms | both choose exact primary-prefilter top-N; same shape, ~1 ms JVM floor |
-| exact vector scan | 298 ms | 10.64 ms | largest primary relation/expression constant; not an HNSW problem |
+| scalar top-10 through AVET | 0.105 ms | 0.032 ms | right `O(log N + k)` path and 3.3× end-to-end; the AVET page itself is ~0.013 ms |
+| full text, 10% / 10,000 matches | 9.25 ms | 2.42 ms | same bitmap/recheck/sort shape and 3.8×; direct EAVT projection removes the former relation/pull cliff |
+| full text, 1% / 1,000 matches | 1.15 ms | 0.52 ms | same shape and 2.2×; projection is ~0.76 ms |
+| full text, 0.1% / 100 matches | 0.229 ms | 0.092 ms | same shape and 2.5×; fixed query setup is now visible |
+| HNSW top-10, `ef_search=1000` | 1.54–1.97 ms | 4.77 ms | Proximum is faster at equal recall@10 1.0 |
+| filtered HNSW, 10% | 6.45–6.65 ms | 3.99 ms | same recall and within 1.7× |
+| filtered vector, 1% | 8.3–9.0 ms, recall 1.0 | 4.40 ms, recall 0.8 | under 2.1× despite stronger membership quality |
+| filtered vector, 0.1% / 100 rows | 0.331 ms | 0.089 ms | same exact primary shape and 3.7×; the AVET bound, scalar predicates, primitive distance, and top-N are fused |
+| exact vector scan | 7.99–8.80 ms | 9.52 ms | bounded primitive top-N scan now beats PostgreSQL on this 16-D corpus |
 | indexed parent→fact fanout, 100 rows | 2.50 ms | 0.10 ms | runtime AVET parameterization fixes the former full fact scan; Datahike `d/q` is ~0.99 ms |
 
 These are development measurements, not a general engine ranking. The
@@ -119,12 +119,21 @@ pg-datahike side calls its in-process query handler while PostgreSQL includes
 JDBC result materialization, so the remaining gaps cannot be blamed on wire
 round trips. Conversely, Proximum's advantage at this small vector width does
 not predict build/query behavior at 384- or 768-dimensional production shapes.
+The pg-datahike timings disable Datahike's whole-query result cache. Scriptum's
+exact candidate bitmap cache is warm because the benchmark checks result
+parity before timing; its key includes both immutable primary and secondary
+generation identities, so a write necessarily pays a fresh search/recheck.
 
 ## Cross-cutting structural gaps
 
-1. **Wide-row projection.** PostgreSQL obtains `m` columns from one heap tuple;
-   Datahike's fused entity-group executor scans and merges the requested EAVT
-   attributes. The measured point path is not `m` independent root seeks: at
+1. **Wide-row projection.** PostgreSQL obtains `m` columns from one heap tuple.
+   Exact secondary pages over ordinary-width SQL rows now scan each entity's
+   contiguous EAVT slice directly; a 10-row scalar projection measured 0.023 ms
+   inside the instrumented handler, and this removed the full-text cliff up to
+   10,000 matches. Very wide rows deliberately retain targeted `pull-many` or
+   the fused entity-group executor so a narrow SELECT does not scan thousands
+   of unrelated attributes. The general measured point path is not `m`
+   independent root seeks: at
    20k rows, one-row projection grew only from 0.77 ms at one column to 1.07 ms
    at sixteen. For a 100-row range it grew from 2.57 to 8.22 ms, versus
    PostgreSQL 0.11 to 0.28 ms. The access complexity is acceptable, but the

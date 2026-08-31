@@ -2832,6 +2832,57 @@
   "Aggregates whose implementation takes [v1 v2] pairs."
   #{"string_agg" "corr" "jsonb_object_agg" "json_object_agg"})
 
+(def ^:private stable-multi-arg-aggs
+  "Plain aggregates whose transition order is observable.  Their ordinary
+   Datahike input is a set; the stable variants receive `[row-id payload]`."
+  {'datahike.pg.sql/filter-corr
+   'datahike.pg.sql/filter-corr-stable
+   'datahike.pg.sql/filter-string-agg
+   'datahike.pg.sql/filter-string-agg-stable
+   'datahike.pg.sql/filter-jsonb-object-agg
+   'datahike.pg.sql/filter-jsonb-object-agg-stable
+   'datahike.pg.sql/filter-json-object-agg
+   'datahike.pg.sql/filter-json-object-agg-stable})
+
+(def ^:private stable-single-arg-aggs
+  {'datahike.pg.sql/filter-sum
+   'datahike.pg.sql/filter-sum-stable
+   'datahike.pg.sql/filter-sum-float4
+   'datahike.pg.sql/filter-sum-float4-stable
+   'datahike.pg.sql/filter-avg
+   'datahike.pg.sql/filter-avg-stable
+   'datahike.pg.sql/filter-variance-samp
+   'datahike.pg.sql/filter-variance-samp-stable
+   'datahike.pg.sql/filter-variance-pop
+   'datahike.pg.sql/filter-variance-pop-stable
+   'datahike.pg.sql/filter-stddev-samp
+   'datahike.pg.sql/filter-stddev-samp-stable
+   'datahike.pg.sql/filter-stddev-pop
+   'datahike.pg.sql/filter-stddev-pop-stable
+   'datahike.pg.sql/filter-array-agg
+   'datahike.pg.sql/filter-array-agg-stable
+   'datahike.pg.sql/filter-jsonb-agg
+   'datahike.pg.sql/filter-jsonb-agg-stable})
+
+(defn- stable-aggregate-input!
+  "Carry a deterministic row identity into an order-sensitive aggregate.
+
+   A multi-relation row is identified by all entity variables known at this
+   point, in stable variable-name order.  Besides matching a normal EAVT scan,
+   this preserves multiplicity for joins better than the historical single
+   `default-table` :with variable."
+  [ctx default-table value-var]
+  (when default-table
+    (ctx/entity-var! ctx default-table)
+    (let [entity-vars (->> @(:entity-vars ctx) vals distinct (sort-by str) vec)
+          _ (swap! (:with-vars ctx) into entity-vars)
+          row-id (if (= 1 (count entity-vars))
+                   (first entity-vars)
+                   (ctx/materialize-arg! ctx (apply list 'vector entity-vars)))
+          stable-var (ctx/fresh-var! ctx)]
+      (ctx/add-clause! ctx [(list 'vector row-id value-var) stable-var])
+      stable-var)))
+
 (def ^:private null-preserving-aggs
   "Aggregates that KEEP a NULL input value, so an excluded row has to be
    marked as something other than NULL -- see `fns/filtered-out`."
@@ -3876,7 +3927,13 @@
                                        pair-var)))
                         (do
                           (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
-                          (swap! find-elements conj (list agg-sym pair-var))))
+                          (let [stable-sym (get stable-multi-arg-aggs agg-sym)
+                                stable-var (when stable-sym
+                                             (stable-aggregate-input!
+                                              ctx default-table pair-var))]
+                            (swap! find-elements conj
+                                   (list (if stable-var stable-sym agg-sym)
+                                         (or stable-var pair-var))))))
                       (swap! find-aliases conj (or alias0 fname)))
                           ;; Single-argument: COUNT(col), SUM(col), AVG(col), etc.
                     (let [inner-expr (first params)
@@ -3913,10 +3970,10 @@
                                 ;; OID rule). Falls back silently to default
                                 ;; agg-sym when input type doesn't match the
                                 ;; precision-sensitive set.
-                          precision-variant (when inner-expr
-                                              (pick-precision-variant
-                                               fname
-                                               (oid/expr-oid inner-expr agg-oid-env)))
+                          input-oid (when inner-expr
+                                      (oid/expr-oid inner-expr agg-oid-env))
+                          precision-variant (when input-oid
+                                              (pick-precision-variant fname input-oid))
                           agg-sym (cond
                                     (and is-count-col? is-distinct?)
                                     'datahike.pg.sql/filter-count-distinct
@@ -3941,7 +3998,15 @@
                             ;; asyncpg's introspection depends on this). Direction
                             ;; is taken uniformly from the keys (all-DESC → desc).
                       (let [order-els (when (= fname "array_agg")
-                                        (seq (.getOrderByElements f)))]
+                                        (seq (.getOrderByElements f)))
+                            stable-sym (when (or (contains? #{"array_agg"
+                                                              "jsonb_agg"
+                                                              "json_agg"}
+                                                            fname)
+                                                 (contains? #{types/oid-float4
+                                                              types/oid-float8}
+                                                            input-oid))
+                                         (get stable-single-arg-aggs agg-sym))]
                         (if order-els
                           (let [key-vars (mapv (fn [^net.sf.jsqlparser.statement.select.OrderByElement o]
                                                  (let [kv (expr/translate-expr ctx (.getExpression o))]
@@ -3959,7 +4024,12 @@
                                           'datahike.pg.sql/filter-array-agg-ordered)]
                             (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
                             (swap! find-elements conj (list ord-sym pair-var)))
-                          (swap! find-elements conj (list agg-sym v))))
+                          (let [stable-var (when stable-sym
+                                             (stable-aggregate-input!
+                                              ctx default-table v))]
+                            (swap! find-elements conj
+                                   (list (if stable-var stable-sym agg-sym)
+                                         (or stable-var v))))))
                       (swap! find-aliases conj (or alias0 fname)))))))
             idx))
 
