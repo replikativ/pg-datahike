@@ -295,7 +295,7 @@
         (is (= (:in-args filtered) filtered-args))
         (is (= :proximum-hybrid (:kind filtered-access)))
         (is (= 2 (get-in filtered-access [:query-spec :candidate-limit])))
-        (is (= 128 (:probe-limit filtered-access)))
+        (is (= 256 (:probe-limit filtered-access)))
         (is (some? (:filtered-entrypoints filtered-access)))))
 
     (testing "a hard-small indexed binding stays primary"
@@ -504,7 +504,11 @@
 (deftest materialized-vector-probe-falls-back-after-full-query-underfill
   (let [run-probe (ns-resolve 'datahike.pg.server
                               'run-materialized-vector-probe)
+        bounded-recheck-var
+        (ns-resolve 'datahike.pg.server
+                    'run-primary-filtered-vector-entities)
         search-call (atom nil)
+        bounded-recheck-call (atom nil)
         query-call (atom nil)
         fallback-calls (atom 0)
         access {:index ::index
@@ -531,7 +535,24 @@
             nil]
            @search-call))
     (is (= [[1 2 3]] (second @query-call)))
-    (is (= 1 @fallback-calls))))
+    (is (= 1 @fallback-calls))
+
+    (testing "an eligible bounded probe rechecks without a Datalog relation"
+      (reset! query-call nil)
+      (with-redefs-fn
+        {bounded-recheck-var
+         (fn [& args]
+           (reset! bounded-recheck-call args)
+           [[:fast]])}
+        (fn []
+          (is (= [[:fast]]
+                 (run-probe
+                  ::db {:find ['?doc]} [] run-query 1 access
+                  #(do (swap! fallback-calls inc) [[:fallback]]))))))
+      (is (= [::db {:find ['?doc]} [] access [1 2 3]]
+             @bounded-recheck-call))
+      (is (nil? @query-call))
+      (is (= 1 @fallback-calls)))))
 
 (deftest iterative-vector-demand-applies-offset-to-the-cumulative-recheck
   (let [run-iterative (ns-resolve 'datahike.pg.server

@@ -6474,8 +6474,16 @@
                         :entity-var entity-var
                         :result-var result-var
                         :attribute attribute
+                        :metric metric
+                        :query-vector query-vector
+                        :candidate-limit candidate-limit
                         :query-spec query-spec
-                        :probe-limit 128
+                        ;; For a 10% predicate, 128 global neighbours contain
+                        ;; only about 13 matches on average. Keep enough slack
+                        ;; that the bounded probe usually contains the exact
+                        ;; filtered top-k while remaining much cheaper than a
+                        ;; complete primary prefilter pass.
+                        :probe-limit 256
                       ;; A probe that under-fills has measured that the WHERE
                       ;; result is sparse enough to project once. Let the
                       ;; adapter choose exact-filtered versus filtered ANN from
@@ -6761,18 +6769,17 @@
        :vector-var vector-var
        :predicate-clauses predicate-clauses})))
 
-(defn- run-primary-filtered-exact-vector-query
-  "Evaluate a hard-small AVET-prefiltered vector top-N without a Datalog
-   relation round trip.
+(defn- run-primary-filtered-vector-entities
+  "Evaluate an authoritative vector top-N over a bounded entity collection.
 
-   The AVET range is a complete upper bound. Each candidate's contiguous EAVT
+   The supplied entities are an upper bound. Each candidate's contiguous EAVT
    row is read once, all remaining scalar predicates are interpreted exactly,
    primitive distance is computed, and only OFFSET+LIMIT rows are retained.
    Returning nil means the query shape is outside this deliberately narrow
    physical lane and the caller must use the ordinary exact query."
   [db query in-args
-   {:keys [entity-var result-var attribute metric query-vector candidate-limit
-           range]}]
+   {:keys [entity-var result-var attribute metric query-vector candidate-limit]}
+   entities]
   (when-let [{:keys [marker producers find-vars vector-var predicate-clauses]}
              (primary-filtered-vector-projection-spec
               query entity-var result-var attribute)]
@@ -6809,7 +6816,7 @@
               (java.util.PriorityQueue. (int (max 1 (min bound 1024)))
                                         worst-first)
               cancel (current-cancel)]
-          (doseq [[ordinal eid] (map-indexed vector (:entities range))]
+          (doseq [[ordinal eid] (map-indexed vector entities)]
             (when (and cancel (zero? (bit-and ordinal 255)) @cancel)
               (throw (ex-info "query canceled" {:datahike/canceled true})))
             (let [values
@@ -6860,6 +6867,13 @@
                       (.add heap entry)))))))
           (mapv (fn [entry] (aget ^objects entry 0))
                 (sort best-first (seq (.toArray heap)))))))))
+
+(defn- run-primary-filtered-exact-vector-query
+  "Evaluate a hard-small AVET-prefiltered vector top-N without a Datalog
+   relation round trip."
+  [db query in-args {:keys [range] :as access}]
+  (run-primary-filtered-vector-entities
+   db query in-args access (:entities range)))
 
 (defn- form-contains-symbol?
   [form target]
@@ -6993,9 +7007,10 @@
    a cursor owns corpus-sized resumable traversal state. SQL predicates,
    distance, order, OFFSET, and LIMIT remain authoritative in run-query."
   [db exact-query exact-in-args run-query limit
-   {:keys [filtered-entrypoints index entity-var query-spec probe-limit]}
+   {:keys [filtered-entrypoints index entity-var query-spec probe-limit]
+    :as access}
    fallback]
-  (let [{:keys [search entity-count]} filtered-entrypoints
+  (let [{:keys [search entity-count entity-seq]} filtered-entrypoints
         demand (or limit (:candidate-limit query-spec))
         probe-limit (max (:candidate-limit query-spec) probe-limit)
         probe-spec (assoc query-spec
@@ -7010,7 +7025,13 @@
       (let [[probe-query probe-args]
             (restrict-query-to-entities
              exact-query exact-in-args entity-var probe-entities)
-            results (run-query probe-query probe-args)]
+            results
+            (or (run-primary-filtered-vector-entities
+                 db exact-query exact-in-args access
+                 (if (sequential? probe-entities)
+                   probe-entities
+                   (entity-seq probe-entities)))
+                (run-query probe-query probe-args))]
         (if (>= (count results) demand) results (fallback)))
       (fallback))))
 
