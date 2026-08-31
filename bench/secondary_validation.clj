@@ -234,6 +234,39 @@
                                       (get @call-sites stage {}))]))
                  @samples))))
 
+(defn- profiled-once
+  "Instrument one non-repeatable operation such as CREATE INDEX.
+
+   The elapsed time is intentionally diagnostic: wrapping a protocol Var on
+   every backfilled datom perturbs the build. Stage totals and call counts show
+   where work lives; the ordinary uninstrumented `:build-ms` remains the number
+   used for PostgreSQL comparisons when `*profile-builds?*` is false."
+  [stages f]
+  (let [per-operation (atom {})
+        replacements (into {}
+                           (map (fn [[stage v]]
+                                  [v (stage-wrapper stage @v)]))
+                           stages)
+        start (now-nanos)]
+    (with-redefs-fn
+      replacements
+      #(with-redefs [*stage-recorder* per-operation]
+         (f)))
+    {:elapsed-ms (elapsed-ms start)
+     :stages
+     (into {}
+           (map (fn [[stage {:keys [nanos calls]}]]
+                  [stage {:elapsed-ms (/ (double nanos) 1e6)
+                          :calls calls}]))
+           @per-operation)}))
+
+(defn- measured-once [stages f]
+  (if (seq stages)
+    (profiled-once stages f)
+    (let [start (now-nanos)]
+      (f)
+      {:elapsed-ms (elapsed-ms start)})))
+
 (defn- profiling-stages []
   (cond->
    {:vector-candidate-restriction
@@ -310,7 +343,30 @@
    :proximum-generation-view-transfer
    (requiring-resolve 'proximum.generations/take-generation-view!)
    :proximum-generation-root
-   (requiring-resolve 'proximum.generations/rooted!)}
+   (requiring-resolve 'proximum.generations/rooted!)
+   ;; Generic Datahike backfill protocol. `-transact!` is expected once per
+   ;; source datom and `-persistent!` once per batch. Adapter-specific stages
+   ;; below distinguish ingestion from immutable-generation sealing.
+   :secondary-as-transient
+   (requiring-resolve 'datahike.index.secondary/-as-transient)
+   :secondary-transact
+   (requiring-resolve 'datahike.index.secondary/-transact!)
+   :secondary-persistent
+   (requiring-resolve 'datahike.index.secondary/-persistent!)
+   :secondary-prepare
+   (requiring-resolve 'datahike.index.secondary/-sec-prepare)
+   :stratum-batch-persist
+   (requiring-resolve
+    'datahike.index.secondary.stratum/persist-transient-stratum-index)
+   :stratum-initial-dataset
+   (requiring-resolve
+    'datahike.index.secondary.stratum/create-dataset-from-specs)
+   :stratum-seal
+   (requiring-resolve 'stratum.dataset/seal-generation!)
+   :scriptum-add-document
+   (requiring-resolve 'scriptum.core/add-doc)
+   :scriptum-seal
+   (requiring-resolve 'scriptum.core/seal-generation!)}
     (ns-resolve 'datahike.query 'bounded-order-by)
     (assoc :datahike-bounded-order-by
            (ns-resolve 'datahike.query 'bounded-order-by))))
@@ -353,6 +409,13 @@
 (def ^:dynamic *benchmark-ef-construction*
   "REPL override for HNSW construction breadth."
   nil)
+
+(def ^:dynamic *profile-builds?*
+  "Instrument the three one-shot CREATE INDEX operations.
+
+   This is a diagnostic REPL mode, not a headline benchmark: wrapping the
+   per-datom protocol path adds measurement overhead."
+  false)
 
 (defn- run-benchmark []
   (require 'datahike.index.secondary.scriptum)
@@ -485,11 +548,24 @@
                 exact-filtered-1-timing (timings 3 10 #(rows handler filtered-1-sql))
                 exact-filtered-01-timing
                 (timings 3 10 #(rows handler filtered-01-sql))
-                scalar-build-start (now-nanos)
-                _ (checked handler
+                build-profile-stages
+                (when *profile-builds?*
+                  (select-keys
+                   stages
+                   [:secondary-as-transient :secondary-transact
+                    :secondary-persistent :secondary-prepare
+                    :stratum-batch-persist :stratum-initial-dataset
+                    :stratum-seal :scriptum-add-document :scriptum-seal
+                    :proximum-generation-begin :proximum-generation-seal
+                    :proximum-generation-view-transfer
+                    :proximum-generation-root]))
+                scalar-build
+                (measured-once
+                 build-profile-stages
+                 #(checked handler
                            (str "CREATE INDEX secondary_bench_rank_btree "
-                                "ON secondary_bench (rank)"))
-                scalar-build-ms (elapsed-ms scalar-build-start)
+                                "ON secondary_bench (rank)")))
+                scalar-build-ms (:elapsed-ms scalar-build)
                 indexed-scalar-order (ids (rows handler scalar-order-sql))
                 indexed-scalar-order-timing
                 (profiled-timings
@@ -501,11 +577,13 @@
                                            :execute-select
                                            :parse-sql])
                  #(rows handler scalar-order-sql))
-                text-build-start (now-nanos)
-                _ (checked handler
+                text-build
+                (measured-once
+                 build-profile-stages
+                 #(checked handler
                            (str "CREATE INDEX secondary_bench_body_gin "
-                                "ON secondary_bench USING gin (body)"))
-                text-build-ms (elapsed-ms text-build-start)
+                                "ON secondary_bench USING gin (body)")))
+                text-build-ms (:elapsed-ms text-build)
                 indexed-fulltext (ids (rows handler fulltext-sql))
                 indexed-fulltext-1 (ids (rows handler fulltext-1-sql))
                 indexed-fulltext-01 (ids (rows handler fulltext-01-sql))
@@ -542,14 +620,16 @@
                                            :scriptum-snapshot-search
                                            :ts-match-recheck])
                  #(rows handler fulltext-01-sql))
-                vector-build-start (now-nanos)
-                _ (checked handler
+                vector-build
+                (measured-once
+                 build-profile-stages
+                 #(checked handler
                            (str "CREATE INDEX secondary_bench_embedding_hnsw "
                                 "ON secondary_bench USING hnsw "
                                 "(embedding vector_cosine_ops) "
                                 "WITH (m=16, ef_construction="
-                                hnsw-ef-construction ")"))
-                vector-build-ms (elapsed-ms vector-build-start)
+                                hnsw-ef-construction ")")))
+                vector-build-ms (:elapsed-ms vector-build)
                 beam-sweep
                 (into (sorted-map)
                       (map (fn [ef]
@@ -661,6 +741,11 @@
              :build-ms {:stratum scalar-build-ms
                         :scriptum text-build-ms
                         :proximum vector-build-ms}
+             :build-profile
+             (when *profile-builds?*
+               {:stratum (:stages scalar-build)
+                :scriptum (:stages text-build)
+                :proximum (:stages vector-build)})
              :scalar-order
              {:same-results? (= exact-scalar-order indexed-scalar-order)
               :exact exact-scalar-order-timing
@@ -742,6 +827,7 @@
    :dimension (:dimension result)
    :load-ms (:load-ms result)
    :build-ms (:build-ms result)
+   :build-profile (:build-profile result)
    :scalar-order (compact-case (:scalar-order result))
    :fulltext (update-vals (:fulltext result) compact-case)
    :vector

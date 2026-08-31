@@ -476,12 +476,30 @@ membership, exact distance, NULL order, and projection. A bad selectivity
 estimate can therefore choose a slower scan but cannot change the answer.
 
 The query/read target is now met for these matched, acceptable-recall cases.
-Build throughput is not: on the same fixture Stratum took roughly 76 ms versus
-6 ms for B-tree, and Scriptum 331 ms versus 5 ms for GIN. Proximum's 735 ms
-HNSW build was faster than pgvector's 1.88 s at this small 16-dimensional
-shape. The next performance work should separate Datahike backfill dispatch,
-adapter batch ingestion, and sealing before changing the read or generation
-protocols.
+The first CREATE INDEX numbers included a 20 ms readiness polling quantum.
+Waiting on the local connection's immutable-root watch instead (with polling
+retained for non-watchable connections) reduced repeated hot 10k-row Stratum
+builds to 11.7--19.8 ms, versus 6.1 ms for PostgreSQL B-tree. Scriptum remained
+95--144 ms versus 4.6 ms for GIN. Proximum took 467--580 ms versus pgvector's
+1.88 s at this small 16-dimensional shape.
+
+Opt-in stage accounting confirms that the generic backfill is already one
+batch, not one generation per datom. Stratum accumulates all cells and persists
+once. Scriptum adds all 10k documents through one Lucene writer and seals once;
+in a hot instrumented build, document ingestion accounted for about 28 ms and
+the actual seal for about 10 ms of a roughly 102 ms statement. The remaining
+cost is the primary AEVT scan, transaction metadata/recheck envelopes, and
+Datahike root preparation/publication. Instrumentation wraps every add and is
+therefore diagnostic rather than a headline result.
+
+Stratum and Proximum no longer show a build-path structural cliff. Scriptum
+build latency is still materially farther from PostgreSQL than its query
+latency, though its absolute per-row cost is modest and online backfill does
+not block the Datahike writer. The next falsification is a 10k/100k/1m growth
+curve plus allocation profile before deciding whether Scriptum needs a lean
+candidate-only document layout, a bulk-ingestion hook, or merely documented
+build-time expectations. None of those findings call for changing immutable
+generation publication.
 
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,
 useful indexed growth curves, bounded memory/write amplification, and no
