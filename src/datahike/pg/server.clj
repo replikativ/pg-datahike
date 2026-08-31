@@ -8963,7 +8963,10 @@
             {:message (str method " does not support unique indexes")}))
           (materialize-secondary-index!
            ctx parsed :scriptum attr
-           (configured-secondary-options secondary-index-config :scriptum parsed)))
+           (merge {:payload-mode :candidate-only
+                   :cardinality :one}
+                  (configured-secondary-options
+                   secondary-index-config :scriptum parsed))))
 
         ;; Datahike's native AVET/AEVT indices already serve ordinary scalar
         ;; equality and range predicates. Keep accepting their PostgreSQL

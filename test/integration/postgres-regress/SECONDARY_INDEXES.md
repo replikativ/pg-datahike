@@ -274,6 +274,10 @@ SECONDARY_BENCH_ROWS=20000 SECONDARY_BENCH_DIMENSION=384 \
 bench/realpg.sh start
 SECONDARY_BENCH_ROWS=20000 \
   clojure -M:dev bench/postgres_secondary_reference.clj
+
+SECONDARY_BUILD_ROWS=10000,100000 \
+  clojure -J-Xmx4g -M:dev:local-secondary-stack \
+  bench/scriptum_build_growth.clj
 ```
 
 One same-host 20k-row development run (not a release claim) measured:
@@ -492,13 +496,44 @@ cost is the primary AEVT scan, transaction metadata/recheck envelopes, and
 Datahike root preparation/publication. Instrumentation wraps every add and is
 therefore diagnostic rather than a headline result.
 
-Stratum and Proximum no longer show a build-path structural cliff. Scriptum
-build latency is still materially farther from PostgreSQL than its query
-latency, though its absolute per-row cost is modest and online backfill does
-not block the Datahike writer. The next falsification is a 10k/100k/1m growth
-curve plus allocation profile before deciding whether Scriptum needs a lean
-candidate-only document layout, a bulk-ingestion hook, or merely documented
-build-time expectations. None of those findings call for changing immutable
+The follow-up 10k/100k growth and allocation probe found two accidental costs.
+The adapter computed `secondary-only-hash` for ordinary, primary-backed values,
+and its generic five-field document map stored a duplicate value, attribute,
+hash, and key for every candidate. `hasch.core/uuid` took 316--398 ms for 100k
+distinct strings in the same REPL; `hasch.fast/uuid` took 24--25 ms. Changing
+the hash function is nevertheless a persistent-format migration because
+`:db.secondary/only` primary datoms contain the old, currently unversioned hash.
+The safe fix is to avoid hashing where it has no semantic consumer and retain
+the stable hash for authoritative secondary-only data until a versioned/dual
+lookup migration exists.
+
+The SQL full-text index now declares a cardinality-one, candidate-only layout.
+It stores only the indexed tsvector text and retrievable entity ID, deletes by
+that ID, and uses a public Scriptum pre-built-document entry point rather than
+decoding nested Clojure field maps per row. Datahike remains authoritative and
+performs PostgreSQL `@@` recheck. Multiple attributes, cardinality-many values,
+and secondary-only values fail closed instead of selecting this layout.
+
+On the performance CPU governor, the 100k build fell from roughly 759--784 ms
+to 127--140 ms; PostgreSQL 17 GIN was 22.96 ms (about 5.5x at the best stable
+hot point). Under the powersave governor, matched hot runs measured 276.9--279.1
+ms versus PostgreSQL's 39.9--41.9 ms. A direct Scriptum build with the same two
+Lucene fields took 278.9 ms (211.3 ms ingestion and 67.6 ms sealing), while the
+Datahike AEVT scan took 0.5--1.7 ms. The governor changes absolute times and
+JIT convergence, but both comparisons locate the remaining build gap inside
+Scriptum/Lucene document ingestion and sealing, not in Datahike traversal,
+publication polling, or one-generation-per-datom behavior.
+
+Stratum and Proximum therefore no longer show a build-path structural cliff,
+and Scriptum no longer justifies a new Datahike bulk protocol from this
+evidence. Its build latency is still materially farther from PostgreSQL than
+its query latency, though online backfill does not block the writer. A possible
+next Scriptum-specific experiment is indexing canonical tsvector lexemes as
+pre-tokenized exact terms: PostgreSQL GIN receives an already-parsed tsvector,
+whereas the current Scriptum path analyzes its canonical string again. That
+optimization must preserve arbitrary PostgreSQL lexemes and complete candidate
+recall; it should not leak a PostgreSQL representation into the generic
+secondary protocol. None of these findings call for changing immutable
 generation publication.
 
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,
