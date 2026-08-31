@@ -511,19 +511,32 @@ lookup migration exists.
 The SQL full-text index now declares a cardinality-one, candidate-only layout.
 It stores only the indexed tsvector text and retrievable entity ID, deletes by
 that ID, and uses a public Scriptum pre-built-document entry point rather than
-decoding nested Clojure field maps per row. Datahike remains authoritative and
-performs PostgreSQL `@@` recheck. Multiple attributes, cardinality-many values,
-and secondary-only values fail closed instead of selecting this layout.
+decoding nested Clojure field maps per row. The ID is a Lucene `LongField`, not
+a distinct decimal-string term: exact/set filters and deletion remain native,
+while the term dictionary no longer grows by one string per entity. Datahike
+remains authoritative and performs PostgreSQL `@@` recheck. Multiple attributes,
+cardinality-many values, and secondary-only values fail closed instead of
+selecting this layout.
 
 On the performance CPU governor, the 100k build fell from roughly 759--784 ms
 to 127--140 ms; PostgreSQL 17 GIN was 22.96 ms (about 5.5x at the best stable
 hot point). Under the powersave governor, matched hot runs measured 276.9--279.1
 ms versus PostgreSQL's 39.9--41.9 ms. A direct Scriptum build with the same two
-Lucene fields took 278.9 ms (211.3 ms ingestion and 67.6 ms sealing), while the
+then-current string-ID Lucene fields took 278.9 ms (211.3 ms ingestion and
+67.6 ms sealing), while the
 Datahike AEVT scan took 0.5--1.7 ms. The governor changes absolute times and
 JIT convergence, but both comparisons locate the remaining build gap inside
 Scriptum/Lucene document ingestion and sealing, not in Datahike traversal,
 publication polling, or one-generation-per-datom behavior.
+
+The numeric entity-ID follow-up removed another representation cost. On a
+fresh matched powersave run, PostgreSQL's last three 100k GIN builds were
+42.1--44.5 ms. pg-datahike's stable last four were 199.6--240.4 ms with a
+215.5 ms median, versus PostgreSQL's 43.5 ms hot median: 4.95x. Raw Lucene with
+the same text and numeric-ID fields took 156--163 ms hot, and direct Scriptum
+took 165--167 ms, so immutable Scriptum/Konserve publication adds about six
+percent at this scale. The remaining bounded overhead is Datahike's build and
+transaction publication envelope rather than different asymptotic work.
 
 Stratum and Proximum therefore no longer show a build-path structural cliff,
 and Scriptum no longer justifies a new Datahike bulk protocol from this
