@@ -491,10 +491,11 @@ Opt-in stage accounting confirms that the generic backfill is already one
 batch, not one generation per datom. Stratum accumulates all cells and persists
 once. Scriptum adds all 10k documents through one Lucene writer and seals once;
 in a hot instrumented build, document ingestion accounted for about 28 ms and
-the actual seal for about 10 ms of a roughly 102 ms statement. The remaining
-cost is the primary AEVT scan, transaction metadata/recheck envelopes, and
-Datahike root preparation/publication. Instrumentation wraps every add and is
-therefore diagnostic rather than a headline result.
+the actual seal for about 10 ms of a roughly 102 ms statement. That preliminary
+split did not account reliably for JIT convergence and per-add instrumentation;
+the matched 100k direct-API experiment below is the stronger attribution.
+Instrumentation wraps every add and is therefore diagnostic rather than a
+headline result.
 
 The follow-up 10k/100k growth and allocation probe found two accidental costs.
 The adapter computed `secondary-only-hash` for ordinary, primary-backed values,
@@ -527,13 +528,14 @@ publication polling, or one-generation-per-datom behavior.
 Stratum and Proximum therefore no longer show a build-path structural cliff,
 and Scriptum no longer justifies a new Datahike bulk protocol from this
 evidence. Its build latency is still materially farther from PostgreSQL than
-its query latency, though online backfill does not block the writer. A possible
-next Scriptum-specific experiment is indexing canonical tsvector lexemes as
-pre-tokenized exact terms: PostgreSQL GIN receives an already-parsed tsvector,
-whereas the current Scriptum path analyzes its canonical string again. That
-optimization must preserve arbitrary PostgreSQL lexemes and complete candidate
-recall; it should not leak a PostgreSQL representation into the generic
-secondary protocol. None of these findings call for changing immutable
+its query latency, though online backfill does not block the writer. Two direct
+follow-ups falsified reparsing as the explanation: indexing normalized text
+through the analyzer took 287.1 ms, statistically indistinguishable from the
+canonical 278.9 ms path, while emitting repeated exact-term fields took
+438.7 ms. A PostgreSQL-specific pre-tokenized representation would therefore
+add semantic and storage complexity without a measured build benefit. The
+remaining work belongs in Scriptum/Lucene profiling and tuning; none of these
+findings call for changing the generic secondary protocol or immutable
 generation publication.
 
 The beta gate is not PostgreSQL parity. It is: no silent false negatives,
