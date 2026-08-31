@@ -533,10 +533,16 @@ The numeric entity-ID follow-up removed another representation cost. On a
 fresh matched powersave run, PostgreSQL's last three 100k GIN builds were
 42.1--44.5 ms. pg-datahike's stable last four were 199.6--240.4 ms with a
 215.5 ms median, versus PostgreSQL's 43.5 ms hot median: 4.95x. Raw Lucene with
-the same text and numeric-ID fields took 156--163 ms hot, and direct Scriptum
-took 165--167 ms, so immutable Scriptum/Konserve publication adds about six
-percent at this scale. The remaining bounded overhead is Datahike's build and
-transaction publication envelope rather than different asymptotic work.
+the same text and numeric-ID fields took 156--163 ms hot in separate runs, and
+direct Scriptum took 165--167 ms. A later interleaved run measured 146--153 ms
+versus 172--173 ms. Run order and the powersave governor move the ratio, but the
+immutable Scriptum/Konserve layer consistently adds only low tens of
+milliseconds (roughly 6--18 percent), not another per-document complexity
+cliff. The remaining bounded overhead is Datahike's build and transaction
+publication envelope rather than different asymptotic work.
+The raw/Scriptum split is reproducible with
+`bench/scriptum_layer_breakdown.clj`; it reports timings rather than enforcing
+a machine-dependent CI threshold.
 
 Stratum and Proximum therefore no longer show a build-path structural cliff,
 and Scriptum no longer justifies a new Datahike bulk protocol from this
