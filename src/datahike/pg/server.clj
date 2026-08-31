@@ -6374,10 +6374,11 @@
 
    A WHERE-bearing plan must not insert an ANN marker into the freely reordered
    Datalog plan: an entity binding does not prove that every SQL predicate has
-   run. Instead exec-select first evaluates the complete WHERE as an entity-only
-   query. Tiny sets use exact distance directly; larger sets are pushed into
-   Proximum's native filtered HNSW search, followed by the authoritative SQL
-   recheck. A resumable post-filter scan remains the compatibility fallback.
+   run. Indexed filters use bounded primary ranges; a recognized selective
+   unindexed equality scans that scalar attribute once and feeds the exact
+   bounded row evaluator. Other shapes use Proximum's native filtered HNSW
+   search followed by authoritative SQL recheck. A resumable post-filter scan
+   remains the compatibility fallback.
 
    An unfiltered top-k has no upstream relation to compose, so materialize its
    bounded candidate page once and pass the entity IDs to the authoritative
@@ -6463,12 +6464,9 @@
                     :candidate-limit candidate-limit
                     :range hard-small-range}]
                   (if prefer-entity-filter?
-                    (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
+                    (if (and prefilter-first? unindexed-equality?)
                       [query in-args
-                       {:kind (if prefilter-first?
-                                :proximum-prefiltered
-                                :proximum-hybrid)
-                        :filtered-entrypoints filtered-entrypoints
+                       {:kind :primary-vector-filter-scan
                         :index-ident idx-ident
                         :index index
                         :entity-var entity-var
@@ -6478,32 +6476,46 @@
                         :query-vector query-vector
                         :candidate-limit candidate-limit
                         :query-spec query-spec
-                        ;; For a 10% predicate, 128 global neighbours contain
-                        ;; only about 13 matches on average. Keep enough slack
-                        ;; that the bounded probe usually contains the exact
-                        ;; filtered top-k while remaining much cheaper than a
-                        ;; complete primary prefilter pass.
-                        :probe-limit 256
-                      ;; A probe that under-fills has measured that the WHERE
-                      ;; result is sparse enough to project once. Let the
-                      ;; adapter choose exact-filtered versus filtered ANN from
-                      ;; that runtime cardinality instead of paying for the
-                      ;; complete distance query after the failed probe.
-                        :underfill-fallback :prefilter}]
-                      (if-let [candidate-page (and (close-candidate-scan-entrypoint)
-                                                   (candidate-page-entrypoint))]
+                        :filter equality-binding}]
+                      (if-let [filtered-entrypoints (filtered-vector-entrypoints)]
                         [query in-args
-                         {:kind :proximum-iterative
-                          :candidate-page candidate-page
+                         {:kind :proximum-hybrid
+                          :filtered-entrypoints filtered-entrypoints
                           :index-ident idx-ident
                           :index index
                           :entity-var entity-var
+                          :result-var result-var
                           :attribute attribute
-                          :query-spec (assoc query-spec
-                                             :scan-mode :iterative
-                                             :strict-order? true)
-                          :page-limit 512}]
-                        [query in-args nil]))
+                          :metric metric
+                          :query-vector query-vector
+                          :candidate-limit candidate-limit
+                          :query-spec query-spec
+                          ;; For a 10% predicate, 128 global neighbours contain
+                          ;; only about 13 matches on average. Keep enough slack
+                          ;; that the bounded probe usually contains the exact
+                          ;; filtered top-k while remaining much cheaper than a
+                          ;; complete primary prefilter pass.
+                          :probe-limit 256
+                          ;; A probe that under-fills has measured that the WHERE
+                          ;; result is sparse enough to project once. Let the
+                          ;; adapter choose exact-filtered versus filtered ANN from
+                          ;; that runtime cardinality instead of paying for the
+                          ;; complete distance query after the failed probe.
+                          :underfill-fallback :prefilter}]
+                        (if-let [candidate-page (and (close-candidate-scan-entrypoint)
+                                                     (candidate-page-entrypoint))]
+                          [query in-args
+                           {:kind :proximum-iterative
+                            :candidate-page candidate-page
+                            :index-ident idx-ident
+                            :index index
+                            :entity-var entity-var
+                            :attribute attribute
+                            :query-spec (assoc query-spec
+                                               :scan-mode :iterative
+                                               :strict-order? true)
+                            :page-limit 512}]
+                          [query in-args nil])))
                 ;; Candidate paging is optional so a released/third-party
                 ;; adapter that only implements ISecondaryIndex keeps using
                 ;; the external-engine path.  Current Proximum generations
@@ -6748,11 +6760,24 @@
                         (= 1 (count clause))
                         (seq? (first clause))))
                  (:where query))
+        ;; Nullable SQL equality lowers to a value producer plus
+        ;; `[(seek-key ?parameter type) ?value]`. The direct evaluator repeats
+        ;; this binding check against the authoritative row value; candidate
+        ;; generation is never trusted to have enforced it.
+        seek-key-clauses
+        (filterv (fn [clause]
+                   (and (vector? clause)
+                        (= 2 (count clause))
+                        (seq? (first clause))
+                        (= 'datahike.pg.sql/seek-key (ffirst clause))
+                        (contains? producers (second clause))))
+                 (:where query))
         allowed?
         (fn [clause]
           (or (= marker-clause clause)
               (= distance-clause clause)
               (some? (producer-binding clause))
+              (some #{clause} seek-key-clauses)
               (some #{clause} predicate-clauses)))
         find-vars (:find query)]
     (when (and marker-clause distance-clause vector-var
@@ -6767,6 +6792,7 @@
        :producers producers
        :find-vars find-vars
        :vector-var vector-var
+       :seek-key-clauses seek-key-clauses
        :predicate-clauses predicate-clauses})))
 
 (defn- run-primary-filtered-vector-entities
@@ -6780,7 +6806,8 @@
   [db query in-args
    {:keys [entity-var result-var attribute metric query-vector candidate-limit]}
    entities]
-  (when-let [{:keys [marker producers find-vars vector-var predicate-clauses]}
+  (when-let [{:keys [marker producers find-vars vector-var predicate-clauses
+                     seek-key-clauses]}
              (primary-filtered-vector-projection-spec
               query entity-var result-var attribute)]
     (let [bound (long candidate-limit)
@@ -6835,6 +6862,17 @@
                              (assoc input-values entity-var eid)
                              producers)]
               (when (and (true? (get values marker))
+                         (every?
+                          (fn [[form output-var]]
+                            (let [[_ input type] form
+                                  input-value (if (symbol? input)
+                                                (get bindings input)
+                                                input)
+                                  seek-value (sql/seek-key input-value type)]
+                              (true? (sql/sql-eq?
+                                      (get bindings output-var :__null__)
+                                      seek-value))))
+                          seek-key-clauses)
                          (every? (fn [clause]
                                    (true? (expr/interpret-form
                                            (first clause) bindings)))
@@ -6874,6 +6912,57 @@
   [db query in-args {:keys [range] :as access}]
   (run-primary-filtered-vector-entities
    db query in-args access (:entities range)))
+
+(defn- primary-equality-filter-entities
+  "Scan one unindexed scalar column into exact entity candidates.
+
+   This is the physical counterpart to `likely-small-unindexed-vector-equality?`:
+   that estimate may choose this lane, but it never decides membership. The
+   scan uses PostgreSQL equality and the ordinary vector projection rechecks
+   the complete translated WHERE, so a poor estimate can only cost time."
+  [db {:keys [attribute value]}]
+  (let [cancel (current-cancel)
+        value-type (get-in (dbi/-schema db) [attribute :db/valueType])
+        ;; `vector-exact-filter-binding` already ran seek-key, so a long bound
+        ;; is in the column's stored representation. Keep this hot scan
+        ;; primitive; uncommon types retain the full PostgreSQL equality path.
+        primitive-long? (and (= :db.type/long value-type) (integer? value))
+        long-value (when primitive-long? (long value))]
+    (loop [datoms (seq (d/datoms db :aevt attribute))
+           step (long 0)
+           entities (transient [])]
+      (if-let [^datahike.datom.Datom datom (first datoms)]
+        (do
+          (when (and cancel (zero? (bit-and step 255)) @cancel)
+            (throw (ex-info "query canceled" {:datahike/canceled true})))
+          (recur (next datoms)
+                 (unchecked-inc step)
+                 (if (if primitive-long?
+                       (== (long (.-v datom)) long-value)
+                       (true? (sql/sql-eq? (.-v datom) value)))
+                   (conj! entities (.-e datom))
+                   entities)))
+        (persistent! entities)))))
+
+(defn- run-primary-filter-scan-vector-query
+  "Fuse a selective unindexed equality scan with bounded exact vector top-N.
+
+   PostgreSQL commonly prefers a table scan over HNSW for this shape. The old
+   path evaluated the complete Datalog query once to materialize entity IDs and
+   a second time to recheck the top-k. Here AEVT supplies only the candidate
+   entity IDs; `run-primary-filtered-vector-entities` remains authoritative for
+   row membership, every SQL predicate, distance, ordering, and projection."
+  [db query in-args {:keys [filter] :as access}]
+  ;; Check the deliberately narrow projection before doing the O(N) scalar
+  ;; scan. An unsupported shape must decline as cheaply as it did before this
+  ;; access path existed.
+  (when (and (= :unindexed (:kind filter))
+             (primary-filtered-vector-projection-spec
+              query (:entity-var access) (:result-var access)
+              (:attribute access)))
+    (run-primary-filtered-vector-entities
+     db query in-args access
+     (primary-equality-filter-entities db filter))))
 
 (defn- form-contains-symbol?
   [form target]
@@ -7345,6 +7434,11 @@
               (case (:kind vector-access)
                 :primary-vector-filtered-exact
                 (or (run-primary-filtered-exact-vector-query
+                     query-db query in-args vector-access)
+                    (run-query query in-args))
+
+                :primary-vector-filter-scan
+                (or (run-primary-filter-scan-vector-query
                      query-db query in-args vector-access)
                     (run-query query in-args))
 

@@ -249,6 +249,12 @@
    :primary-filtered-vector
    (requiring-resolve
     'datahike.pg.server/run-primary-filtered-exact-vector-query)
+   :primary-filter-scan-vector
+   (requiring-resolve
+    'datahike.pg.server/run-primary-filter-scan-vector-query)
+   :primary-equality-filter-scan
+   (requiring-resolve
+    'datahike.pg.server/primary-equality-filter-entities)
    :primary-candidate-vector-recheck
    (ns-resolve 'datahike.pg.server 'run-primary-filtered-vector-entities)
    :text-candidate-restriction
@@ -591,6 +597,8 @@
                               [:vector-candidate-restriction
                                :vector-materialized-probe
                                :primary-candidate-vector-recheck
+                               :primary-filter-scan-vector
+                               :primary-equality-filter-scan
                                :vector-prefiltered-query
                                :vector-iterative-query
                                :candidate-page
@@ -607,6 +615,8 @@
                               [:vector-candidate-restriction
                                :vector-materialized-probe
                                :primary-candidate-vector-recheck
+                               :primary-filter-scan-vector
+                               :primary-equality-filter-scan
                                :vector-prefiltered-query
                                :vector-iterative-query
                                :candidate-page
@@ -623,6 +633,8 @@
                               [:vector-candidate-restriction
                                :vector-materialized-probe
                                :primary-candidate-vector-recheck
+                               :primary-filter-scan-vector
+                               :primary-equality-filter-scan
                                :vector-prefiltered-query
                                :vector-iterative-query
                                :candidate-page

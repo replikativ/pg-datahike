@@ -167,6 +167,57 @@
              "non-index predicates remain an authoritative exact recheck")))
     (is (= 2 @calls))))
 
+(deftest selective-unindexed-vector-filter-uses-one-primary-scan
+  (run "CREATE TABLE vector_unindexed_filter
+        (id int PRIMARY KEY, category int, embedding vector(2))")
+  (run (str "INSERT INTO vector_unindexed_filter VALUES "
+            "(1, 1, '[3,0]'), (2, 2, '[0,0]'), "
+            "(3, 1, '[1,0]'), (4, 1, NULL)"))
+  (let [matching (ns-resolve 'datahike.pg.server
+                             'matching-vector-secondary)
+        likely-small (ns-resolve 'datahike.pg.server
+                                 'likely-small-unindexed-vector-equality?)
+        bounded-table (ns-resolve 'datahike.pg.server
+                                  'bounded-unindexed-vector-equality?)
+        fused (ns-resolve 'datahike.pg.server
+                          'run-primary-filter-scan-vector-query)
+        fused-original @fused
+        calls (atom 0)]
+    ;; Force the measured large-table planner choice while retaining a tiny,
+    ;; readable semantic fixture. The physical lane does not inspect the fake
+    ;; ANN generation: it scans category once and rechecks the translated SQL.
+    (with-redefs-fn
+      {matching (fn [& _] [:idx/vector-unindexed ::unused])
+       likely-small (constantly true)
+       bounded-table (constantly false)
+       fused (fn [& args]
+               (swap! calls inc)
+               (apply fused-original args))}
+      #(do
+         (is (= [["3"] ["1"] ["4"]]
+                (rows (str "SELECT id FROM vector_unindexed_filter "
+                           "WHERE category = 1 "
+                           "ORDER BY embedding <-> '[0,0]'::vector LIMIT 3")))
+             "finite distances precede SQL NULL")
+         (is (= [["3"] ["4"]]
+                (rows (str "SELECT id FROM vector_unindexed_filter "
+                           "WHERE category = 1 AND id > 1 "
+                           "ORDER BY embedding <-> '[0,0]'::vector LIMIT 2")))
+             "a hard-small indexed range retains its exact primary lane")
+         (is (empty?
+              (rows (str "SELECT id FROM vector_unindexed_filter "
+                         "WHERE category = 1.5 "
+                         "ORDER BY embedding <-> '[0,0]'::vector LIMIT 2")))
+             "a numeric value not representable by the column matches nothing")
+         (is (empty?
+              (rows (str "SELECT id FROM vector_unindexed_filter "
+                         "WHERE category = NULL "
+                         "ORDER BY embedding <-> '[0,0]'::vector LIMIT 2")))
+             "SQL NULL equality matches nothing")))
+    ;; The non-representable numeric comparison takes the fused lane. SQL NULL
+    ;; is rejected earlier by the ordinary nullable predicate lowering.
+    (is (= 2 @calls))))
+
 (deftest vector-hnsw-ddl-and-candidate-shape-are-preserved
   (run "CREATE TABLE vector_ann (id int PRIMARY KEY, embedding vector(3))")
   (let [ddl (sql/parse-sql
