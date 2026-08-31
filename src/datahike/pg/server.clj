@@ -8758,22 +8758,49 @@
 
 (defn- await-secondary-ready!
   [conn index-ident timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-    (loop []
-      (let [status (get-in (d/db conn) [:schema index-ident :db.secondary/status])]
-        (cond
-          (= :ready status) true
-          (= :disabled status)
-          (throw
-           (errors/pg-error
-            :object-not-in-prerequisite-state
-            {:message (str "index \"" (name index-ident) "\" is disabled")}))
-          (>= (System/currentTimeMillis) deadline)
-          (throw
-           (errors/pg-error
-            :query-canceled
-            {:message (str "timed out building index \"" (name index-ident) "\"")}))
-          :else (do (Thread/sleep 20) (recur)))))))
+  (let [timeout! #(throw
+                   (errors/pg-error
+                    :query-canceled
+                    {:message (str "timed out building index \""
+                                   (name index-ident) "\"")}))
+        disabled! #(throw
+                    (errors/pg-error
+                     :object-not-in-prerequisite-state
+                     {:message (str "index \"" (name index-ident)
+                                    "\" is disabled")}))]
+    ;; A local Datahike Connection is watchable. Waiting for its immutable db
+    ;; root to change avoids quantizing every small build to the old 20 ms poll
+    ;; interval. Install may race with watch registration, so observe the
+    ;; current root only after the watch is installed. Non-watchable connection
+    ;; implementations retain the conservative polling fallback.
+    (if (instance? clojure.lang.IRef conn)
+      (let [completion (promise)
+            watch-key (Object.)
+            observe! (fn [db]
+                       (let [status (get-in db
+                                            [:schema index-ident
+                                             :db.secondary/status])]
+                         (when (contains? #{:ready :disabled} status)
+                           (deliver completion status))))]
+        (try
+          (add-watch conn watch-key
+                     (fn [_ _ _ new-db] (observe! new-db)))
+          (observe! (d/db conn))
+          (case (deref completion timeout-ms ::timeout)
+            :ready true
+            :disabled (disabled!)
+            (timeout!))
+          (finally
+            (remove-watch conn watch-key))))
+      (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+        (loop []
+          (let [status (get-in (d/db conn)
+                               [:schema index-ident :db.secondary/status])]
+            (cond
+              (= :ready status) true
+              (= :disabled status) (disabled!)
+              (>= (System/currentTimeMillis) deadline) (timeout!)
+              :else (do (Thread/sleep 20) (recur)))))))))
 
 (defn- materialize-secondary-index!
   [ctx parsed index-type attr config]
