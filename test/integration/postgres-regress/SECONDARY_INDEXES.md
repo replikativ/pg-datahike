@@ -403,18 +403,20 @@ sparse-copy-capable filesystem. The fixed logical capacity and shelling out to
 `cp` remain portability and bounded-space concerns, but they do not explain
 the initial-build gap measured here.
 
-Proximum already contains a transient `insert-batch` path which the Datahike
-adapter does not use. The same 10k fixture measured:
+Proximum's transient `insert-batch` path isolated the former per-datom adapter
+cost. The same 10k fixture measured:
 
 | Construction path | Time |
 |---|---:|
-| current per-datom generation `put!` | 20.43 s |
+| former per-datom generation `put!` | 20.43 s |
 | one deterministic, single-thread batch | 16.64 s |
 | one eight-way batch | 8.15 s |
 | streaming 1,000-vector eight-way batches | 6.95–8.06 s |
 
 The streaming result means Datahike need not accumulate an unbounded backfill
-to benefit. At `ef_search=400` the per-row, one-batch, and streaming graphs all
+to benefit. The adapter now buffers bounded batches (256 by default) and calls
+`put-batch!`; it never accumulates the whole backfill. At `ef_search=400` the
+per-row, one-batch, and streaming graphs all
 had recall@10 0.8 for the fixed hard query; at `ef_search=1000` all reached
 1.0. That one query is not enough to approve parallel construction, however:
 Proximum documents the parallel neighbor-selection races as nondeterministic.
@@ -422,14 +424,15 @@ A production bulk protocol must either make the parallel graph reproducible or
 declare and test that secondary generation bytes may vary while query semantics
 and the published immutable root remain sound.
 
-Warm single-row SQL vector updates measured 195, 136, and 113 ms. The median
-call spent about 19 ms forking the source generation, 3 ms deleting the old
-node, 5 ms inserting the new node, 5 ms sealing, and 69 ms reopening the just
-sealed generation. A sealed generation is already immutable and queryable.
-An explicit ownership transfer from `SealedGeneration` to a ref-counted
-`GenerationView` can remove that cold reopen without changing publication:
-the GC guard is still released only after Datahike commits the generation ID in
-its root, and abort still closes the unpublished handle.
+Warm single-row SQL vector updates initially measured 195, 136, and 113 ms. The
+median call spent about 19 ms forking the source generation, 3 ms deleting the
+old node, 5 ms inserting the new node, 5 ms sealing, and 69 ms reopening the
+just-sealed generation. The current path transfers that already immutable view
+into a ref-counted `GenerationView` and shares its append-only mmap along the
+one linear descendant chain. The matched checkpoint below measures 9.7 ms per
+update. Publication semantics are unchanged: the GC guard is released only
+after Datahike commits the generation ID in its root, and abort closes the
+unpublished handle.
 
 Filter translation has a separate density cliff. Turning external Datahike
 entity IDs into Proximum internal IDs by one persistent-sorted-set lookup per
