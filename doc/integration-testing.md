@@ -12,7 +12,7 @@ bb test
 bb sqllogictest
 ```
 
-A current full run reports 1,526 tests / 6,273 assertions and the SQLLogic
+A current full run reports 1,604 tests / 6,808 assertions and the SQLLogic
 runner reports 61 assertions. Treat the runner output, rather than these
 snapshot counts, as authoritative as coverage grows.
 
@@ -30,7 +30,7 @@ Three application-level jobs run against a live pgwire server on :15432:
 
 ```
 pgjdbc-conformance       80 ResultSetTest cases — ~6 min warm daemon
-hibernate-app-conformance 13 end-to-end tests — ~2 min
+hibernate-app-conformance 14 end-to-end tests — ~2 min
 sqlalchemy-conformance    16 tests across 7 phases — <30 s
 ```
 
@@ -64,8 +64,7 @@ unsupported cases. Their checked-in manifests keep those gaps visible while
 making any new failure a per-commit regression. When an expected failure starts
 passing, the harness reports it so the manifest can be tightened.
 
-The asyncpg and node-postgres jobs gate deployment; the pg_dump round-trip runs
-per commit but is not currently in the `deploy` job's dependency list.
+The asyncpg, node-postgres, and pg_dump round-trip jobs gate deployment.
 
 Each harness follows the same shape:
 
@@ -135,6 +134,11 @@ all-or-nothing CI gate. The pinned campaign accounts for PostgreSQL's full
 waves, and server-internal files are explicitly out of scope. Exact admitted
 line slices are linked to focused tests and act as strict per-commit gates.
 
+CI materializes the exact pinned PostgreSQL tag and validates the complete
+campaign inventory on every commit. Use `bb pg-regress-setup` to create the
+same ignored checkout locally without modifying an existing `../postgres`
+tree.
+
 A discovery run that produces differences exits successfully and retains its
 full output under `.internal/pg-regress/`; a harness failure still fails. The
 summary highlights frequent target errors and internal-looking failures so
@@ -144,6 +148,13 @@ lost connections.
 Use `PG_REGRESS_STRICT=1` only for an admitted test that is expected to match
 completely. Endpoint, PostgreSQL checkout, and binary overrides are documented
 in `test/integration/postgres-regress/README.md`.
+
+## Beta-exit coverage
+
+The release-facing matrix, open blockers, manual release gates and explicit
+non-goals live in [beta-exit.md](beta-exit.md) and
+`test/integration/beta-exit.edn`. `bb beta-exit` validates that every named
+evidence path and CI job exists and that every required job gates deployment.
 
 ## Golden-file catalog tests
 

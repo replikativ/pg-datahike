@@ -11,8 +11,12 @@
 (def repo-root (-> here fs/parent fs/parent fs/parent))
 (def campaign (edn/read-string (slurp (fs/file here "campaign.edn"))))
 (def scope (edn/read-string (slurp (fs/file here "scope.edn"))))
+(def pinned-postgres-source
+  (fs/file repo-root ".internal" (str "postgres-" (:postgres-ref campaign))))
 (def postgres-source
   (fs/file (or (System/getenv "POSTGRES_SOURCE")
+               (when (fs/directory? pinned-postgres-source)
+                 (str pinned-postgres-source))
                (str (fs/file repo-root ".." "postgres")))))
 
 (defn fail! [message]

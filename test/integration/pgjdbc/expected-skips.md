@@ -26,7 +26,7 @@ that blocks it from joining the per-commit CI list:
 | `StatementTest` | TBD. |
 | `PreparedStatementTest` (+ `jdbc42`) | ~30% fail rate; one specific bug is `testUpdateWithPGobject` under FORCE binary (addressed), others open. |
 | `ServerPreparedStmtTest` | TBD. |
-| `BatchExecuteTest` | **Known bug**: DELETE of a row inserted in the same transaction emits `[:db/retractEntity <tempid>]` which Datahike rejects ("Tempids are allowed in :db/add only"). Fix: make `server.clj:3562`'s commit-buffer DELETE path drop the matching :db/add entries instead of emitting retract+tempid. Tracked as a 0.1.x item. |
+| `BatchExecuteTest` | 118/132 passed on 2026-09-01. Four distinct failures remain across the binary/rewrite matrix: `testMixedBatch` retracts a tempid when a row inserted in the transaction is deleted; `testBatchWithEmbeddedNulls` accepts an embedded NUL that PostgreSQL rejects; `testBatchWithAlternatingTypes` lets an unresolved `ParamRef` reach bigint coercion; and rewritten `testBatchReturningMixedNulls` does not provide the expected chained `BatchUpdateException`. |
 | `ResultSetMetaDataTest` | TBD. |
 | `GetXXXTest` | TBD. |
 | `DatabaseMetaDataTest` / `jdbc4` / `jdbc42` | Pounds pg_catalog / information_schema projections; our virtual catalogs cover most but not all columns. |

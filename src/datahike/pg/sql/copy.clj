@@ -450,7 +450,7 @@
    or without timezone."
   ^java.util.Date [^String s]
   (try
-    (.parse (java.time.format.DateTimeFormatter/ISO_INSTANT) s
+    (.parse java.time.format.DateTimeFormatter/ISO_INSTANT s
             java.time.Instant/from)
     (catch Throwable _
       (try

@@ -1,0 +1,164 @@
+{:target "0.2.0"
+ :rule "No silent wrong answers or internal failures in the supported surface; unsupported behavior fails explicitly with a PostgreSQL SQLSTATE."
+
+ :gates
+ [{:id :unit
+   :cadence :commit
+   :status :gating
+   :ci-job "unittest"
+   :release-gate? true
+   :evidence ["test/datahike/test"]
+   :claim "translator, execution, catalog, pgwire, temporal and regression behavior"}
+  {:id :sqllogic
+   :cadence :commit
+   :status :gating
+   :ci-job "sqllogictest"
+   :release-gate? true
+   :evidence ["test/sqllogictest"]
+   :claim "application-facing SQL semantics"}
+  {:id :secondary-stack
+   :cadence :commit
+   :status :gating
+   :ci-job "secondary-index-validation"
+   :release-gate? true
+   :evidence ["test/datahike/test/pg_secondary_validation_test.clj"
+              "test/datahike/test/pg_secondary_lifecycle_test.clj"]
+   :claim "released Datahike, Scriptum, Proximum and Stratum stack"}
+  {:id :pgjdbc
+   :cadence :commit
+   :status :gating
+   :ci-job "pgjdbc-conformance"
+   :release-gate? true
+   :evidence ["test/integration/pgjdbc/run.sh"
+              "test/integration/pgjdbc/expected-skips.md"]
+   :claim "ResultSetTest only; broader JDBC admission remains a campaign item"}
+  {:id :hibernate
+   :cadence :commit
+   :status :gating
+   :ci-job "hibernate-app-conformance"
+   :release-gate? true
+   :evidence ["test/integration/hibernate-app"]
+   :claim "Hibernate 6 application CRUD, relationships, HQL and transactions"}
+  {:id :sqlalchemy
+   :cadence :commit
+   :status :gating
+   :ci-job "sqlalchemy-conformance"
+   :release-gate? true
+   :evidence ["test/integration/test_sqlalchemy.py"]
+   :claim "SQLAlchemy 2 and psycopg2 application smoke"}
+  {:id :asyncpg
+   :cadence :commit
+   :status :gating
+   :ci-job "asyncpg-conformance"
+   :release-gate? true
+   :evidence ["test/integration/asyncpg/run.sh"
+              "test/integration/asyncpg/expected-failures.txt"]
+   :claim "eleven upstream modules with per-test expected failures"}
+  {:id :node-postgres
+   :cadence :commit
+   :status :gating
+   :ci-job "node-postgres-conformance"
+   :release-gate? true
+   :evidence ["test/integration/node-postgres/run.sh"
+              "test/integration/node-postgres/expected-skips.md"]
+   :claim "fourteen must-pass and eight expected-failure upstream files"}
+  {:id :pg-dump
+   :cadence :commit
+   :status :gating
+   :ci-job "pgdump-roundtrip"
+   :release-gate? true
+   :evidence ["test/integration/pgdump/run.sh"]
+   :claim "default COPY-format Pagila restore with source/target row-count equality"}
+  {:id :postgres-inventory
+   :cadence :commit
+   :status :gating
+   :ci-job "campaign-inventory"
+   :release-gate? true
+   :evidence ["test/integration/postgres-regress/campaign.edn"
+              "test/integration/postgres-regress/scope.edn"]
+   :claim "complete classification of the pinned PostgreSQL 17.7 schedule and valid strict slices"}
+  {:id :odoo
+   :cadence :release
+   :status :manual
+   :evidence ["test/integration/odoo/run.sh"
+              "test/integration/odoo/expected-skips.md"]
+   :claim "Odoo 19 module boot and TestORM floor"}
+  {:id :metabase
+   :cadence :release
+   :status :manual
+   :evidence ["test/integration/metabase/run.sh"
+              "test/integration/metabase/expected-skips.md"]
+   :claim "Metabase catalog sync and native query"}]
+
+ :blockers
+ [{:id :three-valued-null
+   :wave 1
+   :status :open
+   :evidence ["test/integration/node-postgres/expected-skips.md"]
+   :exit "NULL comparisons never become true or false silently when PostgreSQL returns NULL."}
+  {:id :transaction-buffer-delete
+   :wave 1
+   :status :open
+   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :exit "Deleting a row inserted in the same transaction does not retract a tempid."}
+  {:id :embedded-nul-input
+   :wave 1
+   :status :open
+   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :exit "Text parameters containing an embedded NUL are rejected with a PostgreSQL-compatible error."}
+  {:id :alternating-batch-types
+   :wave 1
+   :status :open
+   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :exit "Changing compatible parameter types across a JDBC batch never leaks an unresolved ParamRef into coercion."}
+  {:id :temp-table-isolation
+   :wave 1
+   :status :open
+   :evidence ["test/integration/node-postgres/expected-skips.md"]
+   :exit "Concurrent sessions isolate same-named temporary tables or CREATE TEMP fails explicitly."}
+  {:id :startup-database-validation
+   :wave 1
+   :status :open
+   :evidence ["test/integration/node-postgres/expected-skips.md"]
+   :exit "A nonexistent startup database is rejected with SQLSTATE 3D000."}
+  {:id :query-cancellation
+   :wave 2
+   :status :open
+   :evidence ["test/datahike/test/pg_cancel_test.clj"
+              "test/integration/node-postgres/expected-skips.md"]
+   :exit "CancelRequest reliably stops in-flight work and leaves the connection protocol-synchronized."}
+  {:id :bounded-results
+   :wave 2
+   :status :open
+   :evidence ["doc/design-alignment.md"]
+   :exit "The supported server deployment has a tested bound on query-result heap use or a documented enforced result cap."}
+  {:id :asyncpg-baseline
+   :wave 3
+   :status :open
+   :evidence ["test/integration/asyncpg/expected-failures.txt"]
+   :exit "Local and CI baselines agree, every manifest entry runs, and every expected failure has a current rationale."}
+  {:id :pgjdbc-breadth
+   :wave 3
+   :status :open
+   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :exit "Every deferred application-facing class is rerun and classified; stable classes join the gate."}
+  {:id :batch-error-chain
+   :wave 3
+   :status :open
+   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :exit "Rewritten JDBC batch failures expose PostgreSQL-compatible update counts and a chained SQLException."}
+  {:id :server-release-soak
+   :wave 4
+   :status :open
+   :evidence ["README.md"]
+   :exit "The version-pinned Datahike Server Docker/JAR deployment passes restart, persistence, TLS/auth and connection-drop soak tests."}]
+
+ :non-goals
+ [:postgresql-storage-engine-parity
+  :plpgsql
+  :replication
+  :xa-transactions
+  :listen-notify
+  :multiple-postgresql-schemas
+  :scram
+  :complete-postgresql-type-and-catalog-parity]}
