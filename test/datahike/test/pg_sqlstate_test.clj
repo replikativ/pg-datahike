@@ -240,7 +240,13 @@
   (let [e (ex-info "x" {:error :query-canceled})
         [code msg _] (errors/classify-exception e)]
     (is (= "57014" code))
-    (is (re-find #"user request" msg))))
+    (is (re-find #"user request" msg)))
+  (let [e (errors/pg-error :query-canceled
+                           {:message "secondary-index build was canceled"})
+        [code msg _] (errors/classify-exception e)]
+    (is (= "57014" code))
+    (is (= "secondary-index build was canceled" msg))
+    (is (= msg (ex-message e)))))
 
 (deftest test-explicit-sqlstate-skips-formatter
   (testing "explicit :sqlstate wins over :error category — message stays as-is"

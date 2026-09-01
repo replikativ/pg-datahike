@@ -27,7 +27,56 @@ Flyway-style migrations). Not a full PG dialect; see
 
 ## Quickstart
 
-### Standalone server (no Clojure setup)
+### Datahike Server (recommended)
+
+For a network deployment, start with
+[Datahike Server](https://github.com/replikativ/datahike). Its Docker image and
+standalone JAR bundle pg-datahike with Datahike's HTTP API, durable system
+catalog, authentication, and backend configuration. Enable the beta
+PostgreSQL listener in the server configuration:
+
+```clojure
+{:host "0.0.0.0"
+ :port 4444
+ :token "replace-with-a-long-random-token"
+ :system-db {:store {:backend :file :path "/var/lib/datahike/system"}}
+ :pg-listener
+ {:host "0.0.0.0"
+  :port 5432
+  :users {"app" "replace-with-a-separate-postgresql-password"}
+  :tls {:keystore "/run/secrets/datahike-pg.p12"
+        :keystore-password "replace-with-the-keystore-password"}}}
+```
+
+With that configuration saved as `server.edn`, run the published container:
+
+```bash
+docker volume create datahike-data
+docker run --name datahike --detach \
+  --publish 4444:4444 --publish 5432:5432 \
+  --mount type=volume,source=datahike-data,target=/var/lib/datahike \
+  --mount type=bind,source="$PWD/server.edn",target=/run/secrets/server.edn,readonly \
+  --mount type=bind,source="$PWD/datahike-pg.p12",target=/run/secrets/datahike-pg.p12,readonly \
+  ghcr.io/replikativ/datahike-server:latest \
+  --config /run/secrets/server.edn
+```
+
+Alternatively, download `datahike-http-server-VERSION-standalone.jar` from a
+[Datahike release](https://github.com/replikativ/datahike/releases) and run:
+
+```bash
+java -jar datahike-http-server-VERSION-standalone.jar --config server.edn
+```
+
+See Datahike's
+[server deployment guide](https://github.com/replikativ/datahike/blob/main/doc/distributed.md#docker-and-podman)
+for version-pinned images, secret files, storage, and TLS details.
+
+### pg-datahike standalone (direct adapter)
+
+Using pg-datahike directly remains supported and is useful for local work,
+small single-purpose services, or deployments that provide their own catalog,
+authentication, and lifecycle management.
 
 Each pg-datahike release ships a runnable uberjar on
 [GitHub releases](https://github.com/replikativ/pg-datahike/releases) —
