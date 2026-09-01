@@ -115,6 +115,35 @@
         (is (= #{1} (ids r2)) "re-acquire in same session still returns the row"))
       (ex s "COMMIT"))))
 
+(deftest update-rebases-after-released-concurrent-holder
+  (testing "A later UPDATE rebases after a concurrent holder already committed"
+    (let [s1 (mk-session)
+          s2 (mk-session)]
+      (ex s1 "BEGIN")
+      (is (= "UPDATE 1" (:tag (ex s1 "UPDATE t SET name='first' WHERE id=1"))))
+      (ex s2 "BEGIN")
+      (is (= "UPDATE 1" (:tag (ex s2 "UPDATE t SET name='other' WHERE id=2"))))
+      (is (= "COMMIT" (:tag (ex s2 "COMMIT"))))
+      ;; s2 released row 2 just before s1's first lock probe. Waiting alone
+      ;; therefore cannot reveal the stale snapshot; the post-lock watermark
+      ;; check must rebase and rebuild this statement.
+      (is (= "UPDATE 1" (:tag (ex s1 "UPDATE t SET name=name || '-second' WHERE id=2"))))
+      (is (= "COMMIT" (:tag (ex s1 "COMMIT"))))
+      (is (= [["other-second"]] (:rows (ex s1 "SELECT name FROM t WHERE id=2")))))))
+
+(deftest delete-rebases-after-released-concurrent-holder
+  (testing "A later DELETE rebases after a concurrent holder already committed"
+    (let [s1 (mk-session)
+          s2 (mk-session)]
+      (ex s1 "BEGIN")
+      (is (= "UPDATE 1" (:tag (ex s1 "UPDATE t SET name='first' WHERE id=1"))))
+      (ex s2 "BEGIN")
+      (is (= "UPDATE 1" (:tag (ex s2 "UPDATE t SET name='other' WHERE id=2"))))
+      (is (= "COMMIT" (:tag (ex s2 "COMMIT"))))
+      (is (= "DELETE 1" (:tag (ex s1 "DELETE FROM t WHERE id=2"))))
+      (is (= "COMMIT" (:tag (ex s1 "COMMIT"))))
+      (is (empty? (:rows (ex s1 "SELECT id FROM t WHERE id=2")))))))
+
 ;; ============================================================================
 ;; NOWAIT
 ;; ============================================================================

@@ -6120,12 +6120,21 @@
                       {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
-                           (nil? (:origin-db spec-db))
-                           (= :waited (lock-rows-blocking! session-id tx-state
-                                                           (:table parsed) lockable
-                                                           row-lock-timeout-ms)))
-                    (do (rebase-tx-state! conn tx-state)
-                        (recur))
+                           (nil? (:origin-db spec-db)))
+                    (let [watermark (:begin-max-tx @tx-state)
+                          _ (lock-rows-blocking! session-id tx-state
+                                                 (:table parsed) lockable
+                                                 row-lock-timeout-ms)
+                          ;; A conflicting holder may commit and release just
+                          ;; before our first registry probe, so "did we wait?"
+                          ;; is not a sufficient freshness signal. Recheck the
+                          ;; DB watermark after owning every target lock and
+                          ;; rebuild the statement on a rebased speculative DB
+                          ;; whenever it advanced.
+                          _ (rebase-tx-state! conn tx-state)]
+                      (if (not= watermark (:begin-max-tx @tx-state))
+                        (recur)
+                        built))
                     built)))
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
@@ -6179,12 +6188,15 @@
                       {:keys [eids] :as built} (with-cte-namespaces parsed (build-delete-tx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
-                           (nil? (:origin-db spec-db))
-                           (= :waited (lock-rows-blocking! session-id tx-state
-                                                           (:table parsed) lockable
-                                                           row-lock-timeout-ms)))
-                    (do (rebase-tx-state! conn tx-state)
-                        (recur))
+                           (nil? (:origin-db spec-db)))
+                    (let [watermark (:begin-max-tx @tx-state)
+                          _ (lock-rows-blocking! session-id tx-state
+                                                 (:table parsed) lockable
+                                                 row-lock-timeout-ms)
+                          _ (rebase-tx-state! conn tx-state)]
+                      (if (not= watermark (:begin-max-tx @tx-state))
+                        (recur)
+                        built))
                     built)))
               spec-db (:speculative-db @tx-state)
               eid->tempid (:eid->tempid @tx-state)
