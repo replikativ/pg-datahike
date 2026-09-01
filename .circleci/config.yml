@@ -20,6 +20,14 @@ executors:
       - image: cimg/openjdk:21.0
     resource_class: medium
 
+  # Proximum's released generation implementation targets the JDK 22+
+  # incubating Vector API. Keep this separate from the JDK 17-compatible
+  # pg-datahike runtime and use it only for the optional secondary vertical.
+  clj-jdk25:
+    docker:
+      - image: cimg/openjdk:25.0
+    resource_class: medium
+
 commands:
   install-clj-tools:
     description: "Install Clojure CLI + babashka on a bare JDK image."
@@ -185,6 +193,23 @@ jobs:
           name: Run unit tests
           command: bb test
           no_output_timeout: 10m
+
+  secondary-index-validation:
+    executor: clj-jdk25
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci
+      - install-clj-tools
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - run:
+          name: Validate released secondary index stack
+          command: >-
+            clojure -J-Xmx2g -M:secondary-stack:test
+            --focus datahike.test.pg-secondary-validation-test
+          no_output_timeout: 15m
 
   sqllogictest:
     executor: clj-jdk21
@@ -568,6 +593,10 @@ workflows:
           context: ghcr-read-package
           requires:
             - build
+      - secondary-index-validation:
+          context: ghcr-read-package
+          requires:
+            - build
       - sqllogictest:
           context: ghcr-read-package
           requires:
@@ -607,6 +636,7 @@ workflows:
             - format
             - lint
             - unittest
+            - secondary-index-validation
             - sqllogictest
             - pgjdbc-conformance
             - hibernate-app-conformance

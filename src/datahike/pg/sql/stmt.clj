@@ -812,6 +812,91 @@
 
 (declare translate-select)
 (declare extract-value)
+
+(defn- stratum-range-predicates
+  "Translate a complete conjunction of simple comparisons on `attr`.
+
+   Returns Stratum `:where` clauses, or nil when any predicate is not safely
+   representable. Declining the whole conjunction is essential: choosing top-N
+   before an unpushed filter can silently under-fill a PostgreSQL LIMIT."
+  [ctx attr attr-schema predicate schema db]
+  (letfn [(column-attr [candidate]
+            (when (instance? Column candidate)
+              (let [resolved (ctx/resolve-column
+                              candidate (:table-aliases ctx) (:default-table ctx)
+                              (:col-overrides ctx) (:derived-aliases ctx)
+                              (:ci-index ctx))]
+                (ctx/attr-of ctx resolved))))
+          (literal-value [candidate]
+            (when (or (instance? LongValue candidate)
+                      (instance? DoubleValue candidate)
+                      (instance? StringValue candidate)
+                      (instance? JdbcParameter candidate)
+                      (and (instance? SignedExpression candidate)
+                           (or (instance? LongValue
+                                          (.getExpression ^SignedExpression candidate))
+                               (instance? DoubleValue
+                                          (.getExpression ^SignedExpression candidate)))))
+              (let [value (if (instance? JdbcParameter candidate)
+                            (->ParamRef (.getIndex ^JdbcParameter candidate))
+                            (extract-value candidate schema db))
+                    value-type (:db/valueType attr-schema)]
+                ;; Parameter OID inference has already tied a JdbcParameter to
+                ;; this column's PostgreSQL type. Preserve its ParamRef in the
+                ;; cached candidate descriptor; executePrepared and the simple
+                ;; numeric-template path substitute the decoded value before
+                ;; Stratum sees it. Baking the first literal into this plan
+                ;; would make the parse cache return wrong ranges later.
+                (when (or (params/param-ref? value)
+                          (case value-type
+                            :db.type/long (integer? value)
+                            (:db.type/double :db.type/float) (number? value)
+                            :db.type/string (string? value)
+                            false))
+                  value))))
+          (comparison-op [candidate]
+            (cond
+              (instance? EqualsTo candidate) :=
+              (instance? GreaterThan candidate) :>
+              (instance? GreaterThanEquals candidate) :>=
+              (instance? MinorThan candidate) :<
+              (instance? MinorThanEquals candidate) :<=
+              :else nil))
+          (reverse-op [op]
+            ({:> :<, :>= :<=, :< :>, :<= :>=, := :=} op))
+          (walk [candidate]
+            (cond
+              (instance? Parenthesis candidate)
+              (walk (.getExpression ^Parenthesis candidate))
+
+              (instance? AndExpression candidate)
+              (let [^AndExpression and-expr candidate
+                    left (walk (.getLeftExpression and-expr))
+                    right (walk (.getRightExpression and-expr))]
+                (when (and (some? left) (some? right))
+                  (into left right)))
+
+              (comparison-op candidate)
+              (let [^net.sf.jsqlparser.expression.BinaryExpression comparison candidate
+                    left (.getLeftExpression comparison)
+                    right (.getRightExpression comparison)
+                    op (comparison-op comparison)
+                    left-attr (column-attr left)
+                    right-attr (column-attr right)
+                    left-value (literal-value left)
+                    right-value (literal-value right)
+                    col-key (keyword (name attr))]
+                (cond
+                  (and (= attr left-attr) (some? right-value))
+                  [[op col-key right-value]]
+
+                  (and (= attr right-attr) (some? left-value))
+                  [[(reverse-op op) col-key left-value]]
+
+                  :else nil))
+
+              :else nil))]
+    (if predicate (walk predicate) [])))
 (declare apply-sql-cast)
 (declare eval-corr-scalar)
 (declare ^:dynamic *eval-update-db*)
@@ -5663,8 +5748,65 @@
                     (when (= order-var (:result-var candidate))
                       (assoc candidate
                              :limit limit-val
+                             :prefer-entity-filter? (some? where-expr)
                              :candidate-limit (+ limit-val (or offset-val 0)))))
                   @(:vector-distance-candidates ctx))))
+        scalar-order-candidate
+        ;; A PostgreSQL B-tree can answer a one-column ORDER BY / LIMIT from
+        ;; its physical order. Keep this shape separate from ANN: membership,
+        ;; value, and order are all exact, while ordinary WHERE predicates are
+        ;; still evaluated by the primary query after candidate restriction.
+        ;; More complex ORDER BY aliases/expressions remain on the ordinary
+        ;; Datahike path until expression indexes have a schema contract.
+        (when (and (pos-int? limit-val)
+                   (= 1 (count order-by))
+                   (= 1 (count order-by-spec))
+                   (not fetch-with-ties?)
+                   default-table
+                   (not @has-aggregates?)
+                   (not has-distinct?)
+                   (empty? joins)
+                   (empty? group-by)
+                   (nil? having-expr)
+                   (empty? @window-specs)
+                   (empty? project-set-specs)
+                   (empty? correlated-subqs))
+          (let [^OrderByElement obe (first order-by)
+                order-expr (.getExpression obe)]
+            (when (instance? Column order-expr)
+              (let [resolved (ctx/resolve-column
+                              order-expr table-aliases default-table
+                              (:col-overrides ctx) (:derived-aliases ctx)
+                              (:ci-index ctx))
+                    attr (ctx/attr-of ctx resolved)
+                    attr-schema (get schema attr)
+                    alias (cond
+                            (and (vector? resolved)
+                                 (= :aliased (first resolved)))
+                            (second resolved)
+
+                            (keyword? resolved) (namespace resolved)
+                            :else nil)
+                    range-predicates
+                    (when attr
+                      (stratum-range-predicates
+                       ctx attr attr-schema where-expr schema db))]
+                (when (and attr alias (some? range-predicates))
+                  {:entity-var (ctx/entity-var! ctx alias)
+                   :attribute attr
+                   :direction (second (first order-by-spec))
+                   :nulls (nth (first order-by-spec) 2 nil)
+                   :where range-predicates
+                   :limit limit-val
+                   :candidate-limit (+ limit-val (or offset-val 0))})))))
+        text-search-candidates
+        ;; A conjunctive @@ predicate may use Scriptum as a complete posting-
+        ;; list source. The ordinary translated predicate remains in :where,
+        ;; so candidate selection cannot change PostgreSQL-visible matching.
+        (when (and default-table
+                   (not @has-aggregates?)
+                   (not has-distinct?))
+          (vec @(:text-search-candidates ctx)))
         ;; A constant implicit HAVING group deliberately detached from its
         ;; source relation above must not keep that relation's entity id in
         ;; :with: it is now unbound and would suppress the singleton row.
@@ -5833,6 +5975,10 @@
              :param-placeholders @(:param-placeholders ctx)}
       secondary-candidate
       (assoc :secondary-candidate secondary-candidate)
+      scalar-order-candidate
+      (assoc :secondary-order-candidate scalar-order-candidate)
+      (seq text-search-candidates)
+      (assoc :secondary-text-candidates text-search-candidates)
       ;; Include join metadata for outer join handling
       (some #(#{:left :right :full} (:join-type %)) join-infos)
       (assoc :join-infos join-infos

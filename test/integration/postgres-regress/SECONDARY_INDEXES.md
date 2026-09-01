@@ -1,0 +1,396 @@
+# Secondary-index validation
+
+This is a maintainer checklist for validating Datahike's secondary-index
+abstraction against PostgreSQL access-method semantics. It is not a promise
+that every PostgreSQL index declaration or extension is supported.
+
+Primary references:
+
+- PostgreSQL `IndexAmRoutine`: `../postgres/src/include/access/amapi.h`
+- [PostgreSQL index access methods](https://www.postgresql.org/docs/current/indexam.html)
+- [PostgreSQL index method functions](https://www.postgresql.org/docs/current/index-functions.html)
+- [PostgreSQL index types](https://www.postgresql.org/docs/current/indextypes.html)
+- [pgvector](https://github.com/pgvector/pgvector)
+
+## Core contract under test
+
+An adapter generation is an immutable value named by the Datahike database
+root. The adapter may prepare content-addressed objects before commit, but it
+must not publish through a mutable native branch or `latest` cell. Committing
+the Datahike root is the only visibility point. Konserve GC marks generation
+addresses reachable from retained roots.
+
+Candidate pages declare three independent properties:
+
+| Property | Values | Meaning |
+|---|---|---|
+| precision | `:exact`, `:recheck` | Whether every candidate already satisfies the operator |
+| recall | `:complete`, `:approximate` | Whether exhaustion covers every possible match |
+| ordering | `:exact`, `:approximate`, `:none` | Strength of the requested candidate order |
+
+Collapsing these into one `exact?` flag is incorrect. Full-text is commonly
+`:recheck/:complete/:none`; HNSW is
+`:recheck/:approximate/:exact` for its frozen discovered set; scalar Stratum
+order is `:exact/:complete/:exact`.
+
+These properties are validated by the adapter protocol, but are not yet a
+general Datahike physical-plan node. Planner-native entity-filter pushdown
+currently goes through `ISecondaryIndex/-search` and `-slice-ordered`.
+pg-datahike calls the paged protocol directly for the scalar Stratum top-N
+path; Scriptum and Proximum SQL clauses use the planner-integrated search
+protocol. A future paged plan node must preserve Proximum's native filtered
+search rather than filtering an already frozen ANN page.
+
+## PostgreSQL mapping
+
+| PostgreSQL shape | Validation adapter | Current boundary |
+|---|---|---|
+| B-tree equality/range/order | native AVET plus opt-in Stratum candidate pages | one non-null scalar column; exact order, range conjunctions, LIMIT/OFFSET |
+| Hash equality | native AVET point lookup | no separate physical adapter needed |
+| GIN/GiST `tsvector @@ tsquery` | Scriptum candidates plus exact `@@` | constants, `plainto_tsquery`, and `phraseto_tsquery`; complete paging beyond 1,000 matches |
+| GiST/SP-GiST KNN | ordered candidate protocol | represented; no general operator-class registry yet |
+| pgvector HNSW | Proximum frozen ANN candidate pages | L2, inner product, cosine; exact distance recheck; approximate membership |
+| pgvector IVFFlat | none | rejected explicitly |
+| BRIN summaries | none | next synthetic complete-but-lossy adapter test |
+| GIN arrays/JSONB | none | next Boring-backed extraction experiment |
+| expression/partial/multicolumn/INCLUDE | none | needs a planner-visible capability/projection descriptor |
+
+Unique constraints remain a transactor concern. A secondary adapter cannot
+claim PostgreSQL uniqueness merely because it can return an ordered or exact
+candidate set.
+
+## Access-method capability audit
+
+PostgreSQL's `IndexAmRoutine` separates access-method properties from scan
+callbacks. The local `../postgres` checkout is PostgreSQL 19devel; its current
+flags include value ordering, operator ordering, equality/hash consistency,
+backward scans, uniqueness, multicolumn keys, optional leading keys, array and
+NULL search, stored key types, clustering, predicate locks, parallel build and
+scan, INCLUDE columns, and summarizing storage. Mapping those properties onto
+Datahike exposes the following boundaries:
+
+| Capability dimension | Datahike secondary shape | Assessment |
+|---|---|---|
+| snapshot visibility | immutable generation key-map in the database root | strong; one root publishes primary and secondary state |
+| insert/build/abort | transient builder, prepare, release outcome | covered; concurrent backfill remains lifecycle-tested |
+| exact vs lossy match | candidate `:precision` plus primary recheck | represented and validated; planner-native candidate-page recheck is still required |
+| complete vs approximate membership | candidate `:recall` | represented and intentionally separate from recheck; not yet planner-costed |
+| value or operator order | candidate `:ordering`, `-slice-ordered` | `-slice-ordered` is planner-integrated for one key; paged ordering metadata is not yet planner-consumed |
+| bitmap/filter composition | `EntityBitSet`, optional or required upstream filter | covered for entity sets; the required dependency fails closed |
+| scan/rescan | opaque page continuation | stable adapter paging covered; no general physical plan node or adaptive planner feedback yet |
+| operator classes/strategies | opaque query spec, SQL-side hard-coded mapping | works for current adapters; needs a declarative capability registry |
+| multicolumn/expression/partial/INCLUDE | attrs/config can carry metadata | not planner-normalized or executable end to end |
+| uniqueness | primary transactor constraint | correctly outside the read adapter; materialized unique secondaries are rejected |
+| index-only payload | candidate result columns | representable, but SQL has no visibility/coverage cost rule yet |
+| BRIN-style block summaries | individual entity candidates only | semantic fallback is possible but not competitive; needs compact candidate domains |
+| vacuum/GC | mark immutable key-maps, fence Konserve writes | Datahike-owned stores covered; external-store root export is still required |
+
+That last GC distinction remains even though every current index uses
+Konserve. Scriptum and Stratum generations live in Datahike's store and are
+marked directly from retained roots. Proximum currently owns a separate store;
+its collector must receive the complete set of generation IDs retained by all
+Datahike roots. A common Konserve guard closes the write-before-root race, but
+does not by itself tell an external collector which historical roots the owner
+still retains.
+
+## Next interface falsification: summarizing scan domains
+
+The current candidate protocol is a good fit for access methods that eventually
+name tuples: B-tree, GIN/GiST/SP-GiST bitmap scans, and HNSW can all yield entity
+IDs with independent match, recall, and ordering guarantees. It should not be
+stretched to pretend that every index works that way.
+
+PostgreSQL BRIN stores one summary for a range of heap pages. A matching summary
+adds the *whole page range* to a lossy bitmap; the heap scan then visits and
+rechecks its tuples. Unsummarized ranges must also be scanned. Expanding those
+ranges into tuple IDs inside the secondary would preserve answers but destroy
+the representation and I/O advantage that the experiment is meant to test.
+
+A useful Datahike analogue is a second result domain alongside entity candidate
+pages:
+
+```clojure
+{:domain :entity-intervals
+ :intervals [[first-eid last-eid] ...]
+ :precision :recheck
+ :recall :complete
+ :ordering :none
+ :continuation ...}
+```
+
+Fixed logical entity-ID intervals are preferable to persistent-tree node
+addresses for the first experiment: they survive node rebalancing, can be
+searched as bounded EAVT ranges, and tend to retain insertion correlation for
+SQL table rows. They are not an imitation of PostgreSQL heap blocks; they are
+the stable primary-scan partition available in Datahike's model. Each interval
+would store min/max (then bloom or multi-minmax) summaries for configured
+attributes. Inserts widen a summary, deletion may leave it conservatively
+loose, and compaction can tighten it. Missing or unsummarized intervals are
+always returned, so failure costs performance rather than recall.
+
+This needs one query-engine addition: an `:external-domain` plan node that
+constrains an entity variable without binding it, then intersects that domain
+with the primary relation without first materializing every entity ID. It does *not*
+need a different publication protocol—the immutable summary generation is
+still prepared before, and named by, the same Datahike database root. A
+synthetic min/max adapter plus exact no-index differential and range-selectivity
+benchmark is the next high-value design test.
+
+Intervals should be sorted, disjoint, half-open, and normalized by merging
+adjacent ranges. EAVT can then issue one bounded slice per interval while the
+ordinary predicate remains the authoritative recheck. Stratum can prototype
+this from its aligned entity-id column and existing chunk zone maps. That first
+version will still inspect every chunk header: persistent-sorted-set exposes
+aggregate measures but not yet a measure-aware subtree visitor returning key
+ranges. A later `walk-measured-ranges` operation would let Stratum prune whole
+subtrees from merged statistics before loading descendant chunks.
+
+The other PostgreSQL families divide cleanly after that experiment:
+
+- Hash equality already maps to Datahike AVET point lookup; another physical
+  adapter would add little semantic coverage.
+- GIN arrays and JSONB reuse complete/recheck inverted candidates, but require
+  typed extraction and an operator-class registry rather than Lucene text
+  analysis.
+- General GiST/SP-GiST and multicolumn B-tree need declarative operator-family,
+  key projection, partial-predicate, and ordering capabilities. The immutable
+  generation and candidate contracts do not need to change.
+- `INCLUDE` and index-only scans need candidate payload columns plus a planner
+  rule that proves the payload belongs to the current immutable generation;
+  they are a performance extension, not a matching-semantics extension.
+
+## Required semantic waves
+
+1. Lifecycle: empty/populated build, concurrent writes during backfill,
+   failure/abort, restart, branch/history restoration, dump/restore, purge,
+   and GC marking.
+2. Full-text: AND/OR/NOT, prefix, weights, phrase distance, empty query,
+   cardinality-many values, more than 1,000 matches, and bitmap composition.
+   Every indexed result is compared with the exact no-index SQL result.
+3. Vector: each operator class, dimensions/options, NULL and cosine-zero
+   behavior, deterministic recall@k, filters at 100/10/1/0.1 percent, updates,
+   deletes, branches, and restart.
+4. New shapes: Stratum range/order, a BRIN-like range-summary adapter, then
+   JSONB GIN extraction. These are interface tests, not only features.
+
+Filtered ANN requires special care. PostgreSQL/pgvector normally applies an
+ordinary filter after an approximate scan and can expand that scan iteratively.
+Datahike can now make an external engine depend on an upstream entity relation
+and pass the resulting bitmap into Proximum's native filtered search. The
+contract is explicit: accepting a filter and requiring one are distinct, and a
+required filter fails closed if no producer ran. pg-datahike still retries the
+exact query if an approximate filtered result under-fills SQL LIMIT. Adaptive
+continuations remain the next step for filters which cannot be cheaply
+materialized before ANN.
+
+`DROP INDEX` is an atomic declaration/root transition: the new database value
+omits the generation and retained historical values keep it. `DROP TABLE`
+cascades materialized declarations in the same transaction when the covered
+attributes can be removed. Dropping and recreating a *populated* SQL table
+while Datahike retains history is a separate open schema-identity problem:
+reusing the same keyword for a different PostgreSQL relation generation would
+make old datoms acquire the new schema. The secondary work must not bypass
+Datahike's guard against that unsafe transition.
+
+The SQL lifecycle is still beta in one important respect. Non-concurrent
+`CREATE INDEX` waits without a default deadline while Datahike backfills and
+publishes the immutable generation, leaving the writer available. Datahike
+0.8.1863 does not yet expose a fenced failure/cancellation result to the
+caller. An operator may set `:secondary-index-build-timeout-ms`, but a timeout
+only stops this SQL wait; it does not cancel or roll back the asynchronous
+build. A stable lifecycle needs a generation-bound cancel/fail transition that
+also clears the buffered delta journal before pg-datahike can promise
+PostgreSQL-equivalent CREATE INDEX failure semantics.
+
+## Reproducible probes
+
+Against the pinned released Datahike, Scriptum, Proximum, and Stratum stack on
+JDK 22 or newer:
+
+```bash
+clojure -J-Xmx2g -M:secondary-stack:test \
+  --focus datahike.test.pg-secondary-validation-test
+
+SECONDARY_BENCH_ROWS=20000 SECONDARY_BENCH_DIMENSION=384 \
+  SECONDARY_BENCH_EF_CONSTRUCTION=200 \
+  clojure -J-Xmx6g -M:dev:secondary-stack \
+  bench/secondary_validation.clj
+
+bench/realpg.sh start
+SECONDARY_BENCH_ROWS=20000 \
+  clojure -M:dev bench/postgres_secondary_reference.clj
+```
+
+One same-host 20k-row development run (not a release claim) measured:
+
+| Operation | pg-datahike exact | pg-datahike indexed | PostgreSQL 17 indexed |
+|---|---:|---:|---:|
+| scalar ORDER BY/LIMIT p50 | 17.7 ms | 3.1 ms | 0.13 ms |
+| full-text, 10% / 2k matches p50 | 51.3 ms | 34.2 ms | 1.35 ms |
+| full-text, 1% / 200 matches p50 | 38.0 ms | 5.7 ms | 0.71 ms |
+| full-text, 0.1% / 20 matches p50 | 35.0 ms | 3.3 ms | 0.12 ms |
+| vector(384) top-10 p50 | 93.0 ms | 5.2 ms at `ef_search=1000` | see matched pgvector run below |
+
+At `ef_search=1000`, a 12-query deterministic vector sample measured mean
+recall@10 0.992, minimum 0.9. The fixed `[1,0,...]` probe was the minimum; the
+default `ef_search=40` found only one of its ten exact neighbors, so default
+quality is not release-ready for this high-dimensional shape. Filter-aware ANN
+had complete recall in the two probes but remained slower than the already
+selective exact scan (35.7 vs 29.3 ms at 10%, 20.9 vs 15.5 ms at 1%). That is a
+real crossover to retain, not hide. Build time was about 1.65 s for Stratum,
+0.57 s for Scriptum, and 18.7 s for Proximum at 384 dimensions and
+`ef_construction=200`, versus 10.7 ms for PostgreSQL B-tree and 6.6 ms for GIN
+on this small corpus.
+
+A separate 10k-row, 16-dimensional diagnostic run after collapsing the SQL
+path to one `datahike.api/q` call per statement located the remaining time more
+precisely. Stratum's `q` accounted for 2.7 ms of a 2.75 ms candidate page and a
+4.6 ms scalar SQL query. Scriptum's native candidate page accounted for 8.3 ms
+of a 26.8 ms Datahike query and a 46 ms SQL query at 1,000 matches; at 10
+matches those figures fell to 1.1, 5.3, and 6.2 ms. Unfiltered Proximum search
+accounted for about 2.0 ms of a 5.6 ms Datahike query and 6.5 ms SQL query at
+`ef_search=1000`. For filtered ANN, however, Proximum used only 7.5 ms of a
+55 ms Datahike query at 10% selectivity, and the exact 36.5 ms scan still won.
+
+These are inclusive stage timings, not additive components, but the direction
+is stable: the native engines are useful and no longer hidden behind repeated
+query dispatch. A first bounded physical split now materializes an unfiltered
+Proximum candidate page outside the general external-engine planner, then
+passes only those entity IDs to the existing authoritative Datalog distance,
+ordering, and projection query. On the same live 10k-row REPL fixture at
+`ef_search=1000`, this reduced top-10 p50 from 8.65 ms through the generic
+external-engine route to 4.19 ms. Filtered ANN deliberately stays in the
+planner so an upstream `EntityBitSet` reaches Proximum.
+
+Full-text planning now asks Scriptum for an exact hit count against the same
+immutable snapshot before making the access-path decision. A same-JVM 10k-row
+probe measured the 10%-selective candidate path at 58.7 ms versus 19.9 ms for
+the primary scan, while the maintained benchmark continued to show clear
+secondary wins at 1% and 0.1%. The initial conservative gate therefore retains
+Scriptum for at most five percent of a table (or 64 absolute hits) and otherwise
+keeps the exact primary path. The benchmark records the count call separately;
+the >1,000-hit continuation test explicitly forces Scriptum because it tests
+adapter completeness rather than planner choice.
+
+The next gains are narrower: avoid general relation construction only where a
+candidate contract and a recognized simple SQL shape prove that canonical
+recheck/projection remain bounded. Stratum's own top-N query and Proximum
+build/filtered-search curves remain adapter-level targets. Full text still
+requires PostgreSQL's exact `@@` recheck, and high-cardinality matches still
+need the general relation path. Replacing the generation protocol would not
+address the dominant read-side cost shown here.
+
+### Matched pgvector HNSW reference
+
+With pgvector 0.8.0 installed into the same PostgreSQL 17.10 instance, a
+matched 20k-row, 384-dimensional run used the identical generated vectors and
+query sample, cosine distance, `m=16`, `ef_construction=200`, and
+`ef_search=1000`:
+
+| Operation | pg-datahike / Proximum | PostgreSQL / pgvector |
+|---|---:|---:|
+| HNSW build | 55.7 s | 20.4 s |
+| Exact top-10 p50 | 282.5 ms | 16.1 ms |
+| HNSW top-10 p50 | 8.4 ms | 39.3 ms |
+| 12-query mean/min recall@10 | 0.975 / 0.9 | 0.983 / 0.9 |
+| 10%-filtered exact / HNSW p50 | 91.8 / 153.2 ms | 11.0 / 39.1 ms |
+| 1%-filtered exact / HNSW p50 | 6.2 / 35.9 ms | 10.2 / 37.2 ms |
+
+This is a bounded development run, not a general engine ranking. It does show
+three different costs that must not be collapsed into “vector performance”:
+Proximum's query graph is competitive, its current build path is not yet, and
+pg-datahike's exact/recheck path has a much larger cliff than PostgreSQL's. At
+the two filtered probes Proximum returned all ten exact neighbors, while
+pgvector returned ten with recall 0.9. The isolation below shows that initial
+construction, unlike descendant updates, is not dominated by a generation
+mmap copy.
+
+pgvector 0.8.0 also demonstrates why filtered ANN needs an explicit
+continuation contract. With `ef_search=40` and a 1% post-filter, its default
+`hnsw.iterative_scan=off` visited forty candidates and returned zero rows in a
+22 ms `EXPLAIN ANALYZE` probe. `strict_order` continued until it found ten rows,
+touching 726 rejected candidates and taking 60 ms. Proximum's candidate cursor
+and Datahike's `ISecondaryCandidateScan` have the right semantic shape for this;
+the remaining work is a planner-controlled breadth/continuation policy and a
+bounded authoritative recheck, not a different generation model.
+
+### Proximum layer isolation
+
+A warm in-process REPL probe on 10k deterministic 384-dimensional vectors,
+using cosine distance, `m=16`, and `ef_construction=200`, separated the same
+stack into native, Datahike, and SQL work. These figures are diagnostic rather
+than a cross-process benchmark:
+
+| Query stage, `ef_search=1000` | p50 |
+|---|---:|
+| Proximum native top-10 search | 4.68 ms |
+| Proximum candidate cursor | 3.90 ms |
+| Datahike validated candidate page | 4.16 ms |
+| pg-datahike indexed SQL, including exact distance recheck | 8.36 ms |
+| pg-datahike exact scan without HNSW | 136.65 ms |
+
+The secondary protocol and `EntityBitSet` boundary add little to an unfiltered
+search. About 2.6 ms of an instrumented SQL query was the authoritative
+Datahike recheck over ten candidates; parsing, lowering, and result production
+accounted for the remaining small fixed cost. The useful optimization target
+is therefore not a pg-datahike-native vector representation on this path.
+
+Initial index construction took 21.96 s end to end. Reading the 10k vectors
+from Datahike took 39.9 ms, creating the rootless builder 12.6 ms, inserting
+them one at a time into HNSW 20.43 s, and sealing 85.6 ms. More than 90 percent
+of the build is graph construction. The mmap was 2 GiB logical but only about
+15 MiB allocated, and a descendant-generation fork took about 20 ms on this
+sparse-copy-capable filesystem. The fixed logical capacity and shelling out to
+`cp` remain portability and bounded-space concerns, but they do not explain
+the initial-build gap measured here.
+
+Proximum already contains a transient `insert-batch` path which the Datahike
+adapter does not use. The same 10k fixture measured:
+
+| Construction path | Time |
+|---|---:|
+| current per-datom generation `put!` | 20.43 s |
+| one deterministic, single-thread batch | 16.64 s |
+| one eight-way batch | 8.15 s |
+| streaming 1,000-vector eight-way batches | 6.95–8.06 s |
+
+The streaming result means Datahike need not accumulate an unbounded backfill
+to benefit. At `ef_search=400` the per-row, one-batch, and streaming graphs all
+had recall@10 0.8 for the fixed hard query; at `ef_search=1000` all reached
+1.0. That one query is not enough to approve parallel construction, however:
+Proximum documents the parallel neighbor-selection races as nondeterministic.
+A production bulk protocol must either make the parallel graph reproducible or
+declare and test that secondary generation bytes may vary while query semantics
+and the published immutable root remain sound.
+
+Warm single-row SQL vector updates measured 195, 136, and 113 ms. The median
+call spent about 19 ms forking the source generation, 3 ms deleting the old
+node, 5 ms inserting the new node, 5 ms sealing, and 69 ms reopening the just
+sealed generation. A sealed generation is already immutable and queryable.
+An explicit ownership transfer from `SealedGeneration` to a ref-counted
+`GenerationView` can remove that cold reopen without changing publication:
+the GC guard is still released only after Datahike commits the generation ID in
+its root, and abort still closes the unpublished handle.
+
+Filter translation has a separate density cliff. Turning external Datahike
+entity IDs into Proximum internal IDs by one persistent-sorted-set lookup per
+ID cost 0.21, 2.55, 9.43, and 15.19 ms for 100, 1k, 5k, and 10k IDs. Scanning
+the numeric external-ID range once and building `ArrayBitSet` directly stayed
+between 3.25 and 3.93 ms. Proximum should choose point lookup for sparse sets,
+a sorted merge/range scan for dense sets, and ordinary unfiltered HNSW when the
+filter covers the corpus. The API should accept a primitive iterator/bitmap so
+this optimization is not coupled to Datahike's concrete bitmap type.
+
+Finally, Datahike's raw AVET range scan produced 100, 1k, 5k, and 10k entity
+IDs in 0.09, 0.18, 0.55, and 0.67 ms. The corresponding SQL range predicate
+still went through a generic relation and erased that advantage. SQL should
+lower recognized scalar ranges to an AVET-backed entity-set producer, preserve
+its cardinality, and cost exact filtered distance against ANN. On this fixture
+exact search already won at one percent selectivity; forcing ANN for every
+filter would make a correct index predictably slower.
+
+The beta gate is not PostgreSQL parity. It is: no silent false negatives,
+useful indexed growth curves, bounded memory/write amplification, and no
+unexplained performance cliffs. Profile candidate enumeration, primary
+recheck, relation materialization, and wire rendering separately before
+changing the storage protocol to chase an end-to-end number.

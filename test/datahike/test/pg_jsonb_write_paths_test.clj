@@ -26,9 +26,12 @@
    than reading as \"not jsonb\".
 
    Expectations captured from PostgreSQL 17."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
-            [datahike.pg.server :as pg])
+            [datahike.pg.jsonb :as jsonb]
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.fns :as fns])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult
             PgWireServer$QueryHandlerFactory]
            [java.sql Connection DriverManager]))
@@ -332,9 +335,15 @@
             aggregate path CORR already used"
     (is (= "{\"a\": 2, \"b\": 1, \"c\": 3}" (v "SELECT jsonb_object_agg(k,v) FROM oa")))
     (is (= 2 (count (rows "SELECT g, jsonb_object_agg(k,v) FROM oa GROUP BY g")))))
-  (testing "json_object_agg keeps insertion order and pads its braces,
-            which is PostgreSQL's own punctuation for that function"
-    (is (= "{ \"b\" : 1, \"a\" : 2, \"c\" : 3 }" (v "SELECT json_object_agg(k,v) FROM oa")))))
+  (testing "json_object_agg keeps the order of the pairs it receives and pads
+            its braces, which is PostgreSQL's own punctuation. SQL does not
+            define an aggregate's input order without ORDER BY, so keep that
+            ordering assertion below the query planner boundary."
+    (is (= "{ \"b\" : 1, \"a\" : 2, \"c\" : 3 }"
+           (fns/filter-json-object-agg [["b" 1] ["a" 2] ["c" 3]])))
+    (let [out (v "SELECT json_object_agg(k,v) FROM oa")]
+      (is (and (str/starts-with? out "{ ") (str/ends-with? out " }")))
+      (is (= {"a" 2M "b" 1M "c" 3M} (jsonb/parse-jsonb out))))))
 
 (deftest table-free-object-aggregate
   (testing "a constant two-argument aggregate has one synthetic input row,

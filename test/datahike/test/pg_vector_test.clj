@@ -127,6 +127,8 @@
             :name "vector_ann_embedding_hnsw"
             :table "vector_ann"
             :method "hnsw"
+            :unique? false
+            :if-not-exists? false
             :columns ["embedding"]
             :column-specs [{:name "embedding" :params ["vector_l2_ops"]}]
             :options {:m 16 :ef_construction 64}}
@@ -180,14 +182,9 @@
   (let [query-sql (str "SELECT id FROM vector_recheck "
                        "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
         _ (is (= [["2"] ["1"]] (rows query-sql))
-              "the released core, without candidate scans, stays exact")
+              "without a matching generation the primary scan stays exact")
         db (d/db *conn*)
-        parsed (sql/parse-sql query-sql
-                              (dbi/-schema db) db)
-        eid-by-id (into {}
-                        (d/q '[:find ?id ?e
-                               :where [?e :vector_recheck/id ?id]]
-                             db))
+        parsed (sql/parse-sql query-sql (dbi/-schema db) db)
         indexed-db (-> db
                        (assoc-in [:schema :idx/vector_recheck]
                                  {:db.secondary/type :proximum
@@ -198,64 +195,37 @@
                               {:idx/vector_recheck ::fake-index}))
         restrict (ns-resolve 'datahike.pg.server
                              'restrict-to-vector-candidates)
-        entrypoint (ns-resolve 'datahike.pg.server
-                               'candidate-page-entrypoint)
-        seen (atom [])
-        page-fn (fn [_db idx-ident index query-spec _filter request]
-                  (swap! seen conj {:idx-ident idx-ident
-                                    :index index
-                                    :query-spec query-spec
-                                    :request request})
-                  ;; Deliberately page and reverse/widen candidate order. The
-                  ;; SQL distance expression must still establish the result.
-                  (if (:continuation request)
-                    {:candidates [{:entity-id (eid-by-id 1)
-                                   :attribute :vector_recheck/embedding}
-                                  {:entity-id (eid-by-id 2)
-                                   :attribute :vector_recheck/embedding}]
-                     :precision :recheck :recall :approximate
-                     :ordering :approximate :exhausted? true
-                     :continuation nil}
-                    {:candidates [{:entity-id (eid-by-id 3)
-                                   :attribute :vector_recheck/embedding}]
-                     :precision :recheck :recall :approximate
-                     :ordering :approximate :exhausted? false
-                     :continuation :page-2}))
-        [query args]
-        (with-redefs-fn {entrypoint (fn [] page-fn)}
-          #(restrict indexed-db (:query parsed) (:in-args parsed)
-                     (:secondary-candidate parsed)))
-        result (apply d/q (assoc query :limit (:limit parsed)) indexed-db args)]
-    (is (= 2 (count @seen)))
-    (is (= :idx/vector_recheck (:idx-ident (first @seen))))
-    (is (= ::fake-index (:index (first @seen))))
-    (is (= 40 (get-in (first @seen) [:query-spec :candidate-limit])))
-    (is (= :page-2 (get-in (second @seen) [:request :continuation])))
-    (is (= [2 1] (mapv first result))
-        "the exact scalar distance, not candidate order, determines top-k")
+        [candidate-query candidate-args access]
+        (restrict indexed-db (:query parsed) (:in-args parsed)
+                  (:secondary-candidate parsed))
+        query-spec (peek candidate-args)]
+    (is (= :proximum-filter-aware (:kind access)))
+    (is (= 2 (:k query-spec)))
+    (is (= 40 (:ef query-spec)))
+    (is (= "[0.9,0]" (vector/to-pg-text (:vector query-spec))))
+    (is (= (:where (:query parsed))
+           (subvec (:where candidate-query) 0 (count (:where (:query parsed)))))
+        "the authoritative SQL distance and predicates remain in the query")
     (is (= [(get-in parsed [:secondary-candidate :entity-var]) '...]
-           (last (:in query))))
+           (second (peek (:where candidate-query)))))
 
-    (testing "one prepared plan supplies each bind's decoded query vector"
-      (reset! *conn* indexed-db)
-      (reset! seen [])
-      (let [prepared (.parse *handler*
-                             (str "SELECT id FROM vector_recheck "
-                                  "ORDER BY embedding <-> $1::vector LIMIT 2")
-                             (int-array [types/oid-vector]))
-            execute #(with-redefs-fn {entrypoint (fn [] page-fn)}
-                       (fn []
-                         (.executePrepared
-                          *handler* prepared
-                          (object-array [nil (vector/parse %)]))))
-            r1 (execute "[0.9,0]")
-            r2 (execute "[3.9,0]")
-            first-query (get-in (first @seen) [:query-spec :vector])
-            second-query (get-in (nth @seen 2) [:query-spec :vector])]
-        (is (= [["2"] ["1"]] (mapv vec (.-rows r1))))
-        (is (= [["3"] ["2"]] (mapv vec (.-rows r2))))
-        (is (= "[0.9,0]" (vector/to-pg-text first-query)))
-        (is (= "[3.9,0]" (vector/to-pg-text second-query)))))))
+    (testing "a WHERE-bearing candidate declares the upstream filter dependency"
+      (let [filtered (sql/parse-sql
+                      (str "SELECT id FROM vector_recheck WHERE id > 1 "
+                           "ORDER BY embedding <-> '[0.9,0]'::vector LIMIT 2")
+                      (dbi/-schema db) db)
+            [filtered-query _ _]
+            (restrict indexed-db (:query filtered) (:in-args filtered)
+                      (:secondary-candidate filtered))]
+        (is (= 'datahike.pg.secondary/filtered-candidates
+               (ffirst (peek (:where filtered-query)))))))
+
+    (testing "an explicit beam does not change SQL k"
+      (let [[_ args _]
+            (restrict indexed-db (:query parsed) (:in-args parsed)
+                      (assoc (:secondary-candidate parsed) :ef 1))]
+        (is (= 1 (:ef (peek args))))
+        (is (= 2 (:k (peek args))))))))
 
 (deftest vector-extension-discovery-and-binary-codec
   (is (= "CREATE EXTENSION"
@@ -269,6 +239,16 @@
   (let [wire (PgParamCodec/encodeBinary types/oid-vector "[1,-0,3.5]")
         decoded (PgParamCodec/decodeBinary types/oid-vector wire)]
     (is (= "[1,-0,3.5]" (vector/to-pg-text decoded)))))
+
+(deftest hnsw-search-beam-is-session-configurable
+  (is (= [["40"]] (rows "SHOW hnsw.ef_search")))
+  (is (nil? (state "SET hnsw.ef_search = 400")))
+  (is (= [["400"]] (rows "SHOW hnsw.ef_search")))
+  (is (nil? (state "RESET hnsw.ef_search")))
+  (is (= [["40"]] (rows "SHOW hnsw.ef_search")))
+  (is (= "22023" (state "SET hnsw.ef_search = 0")))
+  (is (= "22023" (state "SET hnsw.ef_search = 1001")))
+  (is (= "22023" (state "SET hnsw.ef_search = nope"))))
 
 (deftest vector-analysis-and-supported-boundary
   (testing "typmods and qualified spellings survive every cast path"

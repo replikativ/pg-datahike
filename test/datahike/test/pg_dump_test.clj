@@ -80,6 +80,7 @@
   (let [out (dump-text)]
     (is (not (str/includes? out "CREATE TABLE \"db\"")))
     (is (not (str/includes? out "CREATE TABLE \"datahike.pg\"")))
+    (is (not (str/includes? out "CREATE TABLE \"datahike.pg.index\"")))
     (is (not (str/includes? out "CREATE TABLE \"pg\"")))))
 
 ;; ============================================================================
