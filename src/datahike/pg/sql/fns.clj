@@ -293,12 +293,20 @@
    and equal to itself, then +Infinity, then the finite values, then
    -Infinity (numeric.c cmp_numerics)."
   ^long [a b]
-  (let [rank (fn [x] (case (:kind x) :nan 2 :inf 1 :-inf -1))]
+  (let [kind (fn [x]
+               (cond
+                 (numspecial? x) (:kind x)
+                 (and (number? x) (Double/isNaN (double x))) :nan
+                 (and (number? x) (= Double/POSITIVE_INFINITY (double x))) :inf
+                 (and (number? x) (= Double/NEGATIVE_INFINITY (double x))) :-inf
+                 :else nil))
+        rank (fn [k] (case k :nan 2 :inf 1 :-inf -1))
+        ka (kind a)
+        kb (kind b)]
     (cond
-      (and (numspecial? a) (numspecial? b))
-      (let [ra (rank a) rb (rank b)] (long (compare ra rb)))
-      (numspecial? a) (long (if (= :-inf (:kind a)) -1 1))
-      (numspecial? b) (long (if (= :-inf (:kind b)) 1 -1))
+      (and ka kb) (long (compare (rank ka) (rank kb)))
+      ka (long (if (= :-inf ka) -1 1))
+      kb (long (if (= :-inf kb) 1 -1))
       :else 0)))
 
 (defn nan-num? [x]
@@ -1064,7 +1072,7 @@
     ;; A numeric special compares by PostgreSQL's total order, and equals
     ;; only its own kind.
     (or (numspecial? a) (numspecial? b))
-    (and (numspecial? a) (numspecial? b) (= (:kind a) (:kind b)))
+    (zero? (numeric-special-cmp a b))
     ;; PostgreSQL's float and numeric comparisons treat NaN as EQUAL to
     ;; itself (float.c float8_cmp_internal, numeric.c cmp_numerics) --
     ;; unlike IEEE-754, and unlike Clojure's `==`, which answers false.

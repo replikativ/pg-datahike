@@ -914,7 +914,15 @@
     (when-let [c (plain-join-col ctx resolved)]
       (when-let [param-idx (some (fn [[idx v]] (when (= v pvar) idx))
                                  @(:param-placeholders ctx))]
-        (let [vtype (get-in (:schema ctx) [(:attr c) :db/valueType])
+        (let [attr-schema (get-in (:schema ctx) [(:attr c)])
+              vtype (:db/valueType attr-schema)
+              pg-type (or (get-in (:hints ctx) [(:attr c) :pg-type])
+                          (:pg/type attr-schema)
+                          (:datahike.pg/type attr-schema))
+              pg-base (some-> pg-type
+                              types/normalize-sql-type-name
+                              (str/replace #"\s*\([^)]*\)" "")
+                              str/trim)
               param-oid (get params/*declared-param-oids* param-idx)
               ;; PostgreSQL compares an exact column with a float parameter
               ;; in floating-point space. That relation is many-to-one above
@@ -928,12 +936,44 @@
               ;; storage-key proof; falling back to sql-eq? is slower but
               ;; correct. In particular :db.type/bigint stores BigInteger,
               ;; not the Long advertised at the wire boundary.
-              seek-storage? (contains? #{:db.type/long :db.type/double
-                                         :db.type/float :db.type/bigdec
-                                         :db.type/string :db.type/boolean
-                                         :db.type/uuid :db.type/keyword
-                                         :db.type/symbol}
-                                       vtype)]
+              ;; The PostgreSQL logical type matters as much as Datahike's
+              ;; carrier. jsonb, bpchar, bit strings, time, tsvector and
+              ;; extension types can all be :db.type/string while defining
+              ;; equality that is NOT Java String equality. A carrier-only
+              ;; allowlist made prepared jsonb `1.00 = 1` silently miss.
+              seek-storage?
+              (case vtype
+                :db.type/long
+                (or (nil? pg-base)
+                    (= :integer (types/cast-category pg-base)))
+
+                ;; Datahike's sorted value comparator treats NaN as equal to
+                ;; unrelated finite values. A value-position AVET seek can
+                ;; therefore return arbitrary rows for NaN; retain the exact
+                ;; SQL predicate until the core comparator has a PostgreSQL-
+                ;; compatible total float order.
+                (:db.type/double :db.type/float) false
+
+                :db.type/bigdec
+                (or (nil? pg-base)
+                    (contains? #{:numeric :money}
+                               (types/cast-category pg-base)))
+
+                :db.type/string
+                (or (nil? pg-base)
+                    (contains? #{"text" "varchar" "character varying" "name"}
+                               pg-base))
+
+                :db.type/boolean
+                (or (nil? pg-base)
+                    (= :boolean (types/cast-category pg-base)))
+
+                :db.type/uuid
+                (or (nil? pg-base)
+                    (= :uuid (types/cast-category pg-base)))
+
+                (:db.type/keyword :db.type/symbol) true
+                false)]
           (when (and seek-storage?
                      (not (and float-param? exact-storage?)))
             (let [;; A datom pattern matches by value equality, which is

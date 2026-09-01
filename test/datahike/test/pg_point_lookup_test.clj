@@ -39,12 +39,15 @@
         (d/release conn)
         (d/delete-database cfg)))))
 
-(defn- prepared-rows [handler parsed value]
+(defn- prepared-result [handler parsed value]
   (let [bound (object-array 2)]
     (aset bound 1 value)
-    (let [result (.executePrepared handler parsed bound)]
-      (is (nil? (.error result)) (str (.error result)))
-      (mapv vec (.rows result)))))
+    (.executePrepared handler parsed bound)))
+
+(defn- prepared-rows [handler parsed value]
+  (let [result (prepared-result handler parsed value)]
+    (is (nil? (.error result)) (str (.error result)))
+    (mapv vec (.rows result))))
 
 (deftest prepared-unique-equality-is-a-direct-seek-shape
   (with-handler
@@ -91,8 +94,7 @@
                                 "WHERE id = $1 AND f = $1")
                            (int-array [1700]))
             coercions (keep #(get % ::params/coercion) (:in-args parsed))]
-        (is (= [[:seek-key :db.type/long]
-                [:seek-key :db.type/double]]
+        (is (= [[:seek-key :db.type/long]]
                coercions))
         (is (= [["2"]] (prepared-rows handler parsed (bigdec "2.0"))))
         (is (= [] (prepared-rows handler parsed (bigdec "2.5"))))))))
@@ -125,6 +127,38 @@
         (is (= [["1"]] (prepared-rows handler parsed types/nan-numeric)))
         (is (= [["2"]] (prepared-rows handler parsed types/inf-numeric)))
         (is (= [["3"]] (prepared-rows handler parsed types/-inf-numeric)))))))
+
+(deftest numeric-to-float-comparisons-decline-unsound-seeks
+  (with-handler
+    (fn [handler]
+      (is (nil? (.error (.execute handler
+                                  "CREATE TABLE float_special(id int PRIMARY KEY, f float8)"))))
+      (is (nil? (.error (.execute handler
+                                  (str "INSERT INTO float_special VALUES "
+                                       "(7, 'Infinity'::float8), "
+                                       "(8, 'NaN'::float8), (9, 9.0)")))))
+      (let [parsed (.parse handler
+                           "SELECT id FROM float_special WHERE f = $1"
+                           (int-array [1700]))]
+        (is (empty? (keep #(get % ::params/coercion) (:in-args parsed)))
+            "NaN makes Datahike's current float value seek unsound")
+        (is (= [["7"]] (prepared-rows handler parsed types/inf-numeric)))
+        (is (= [["8"]] (prepared-rows handler parsed types/nan-numeric)))))))
+
+(deftest encoded-string-types-decline-direct-seeks
+  (with-handler
+    (fn [handler]
+      (is (nil? (.error (.execute handler
+                                  "CREATE TABLE json_seek(id int PRIMARY KEY, j jsonb)"))))
+      (is (nil? (.error (.execute handler
+                                  (str "INSERT INTO json_seek VALUES "
+                                       "(1, '1.00'::jsonb), (2, '1'::jsonb)")))))
+      (let [parsed (.parse handler
+                           "SELECT id FROM json_seek WHERE j = $1 ORDER BY id"
+                           (int-array [3802]))]
+        (is (empty? (keep #(get % ::params/coercion) (:in-args parsed)))
+            "jsonb equality is structural, not stored-string equality")
+        (is (= [["1"] ["2"]] (prepared-rows handler parsed "1")))))))
 
 (deftest null-seek-cannot-collide-with-a-stored-keyword
   (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
