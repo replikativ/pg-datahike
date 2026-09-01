@@ -71,7 +71,8 @@
   ;; API (JDK 22+), while pg-datahike's ordinary SQL/runtime baseline remains
   ;; JDK 17. CircleCI exercises this exact released stack on JDK 25.
   :secondary-stack
-  {:jvm-opts ["-XX:-UsePerfData"
+  {:jvm-opts ["-XX:+UnlockExperimentalVMOptions"
+              "-XX:-UsePerfData"
               "-XX:-UseJVMCICompiler"
               "--add-modules=jdk.incubator.vector"
               "--enable-native-access=ALL-UNNAMED"]
@@ -87,7 +88,8 @@
   ;; changes. Compose with the same tests as :secondary-stack.
   :local-secondary-stack
   {:extra-paths ["../datahike/src-secondary"]
-   :jvm-opts ["-XX:-UsePerfData"
+   :jvm-opts ["-XX:+UnlockExperimentalVMOptions"
+              "-XX:-UsePerfData"
               "-XX:-UseJVMCICompiler"
               "--add-modules=jdk.incubator.vector"
               "--enable-native-access=ALL-UNNAMED"]

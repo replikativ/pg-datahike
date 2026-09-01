@@ -77,7 +77,7 @@
     ;; and for DDL-emitted constraints / catalog integrity. These live
     ;; on ident entities to tune the SQL-side view; they must not
     ;; themselves appear as virtual tables.
-    "datahike.pg" "pg"})
+    "datahike.pg" "datahike.pg.index" "pg"})
 
 ;; ============================================================================
 ;; User-facing schema hints
