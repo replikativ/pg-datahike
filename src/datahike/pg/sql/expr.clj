@@ -6604,8 +6604,11 @@
               ;; translate-expr on the same JdbcParameter returns the
               ;; cached ?pN without duplicating :in-args).
               (let [v (ctx/col-var! ctx resolved)
-                    guards (ctx/null-guard-clauses ctx [v])]
-                (conj guards [(list 'datahike.pg.sql/sql-eq? v pv)]))))
+                    guards (ctx/null-guard-clauses ctx [v])
+                    equality-fn (if (jsonb-column? ctx left)
+                                  'datahike.pg.sql/jsonb-eq?
+                                  'datahike.pg.sql/sql-eq?)]
+                (conj guards [(list equality-fn v pv)]))))
           (if (and (instance? Column left)
                    (not= types/oid-vector (source-oid ctx left))
                    (nil? (.getArrayConstructor ^Column left))

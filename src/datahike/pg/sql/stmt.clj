@@ -5708,6 +5708,13 @@
           (if-let [evar (and (not @has-aggregates?)
                              (not has-distinct?)
                              (not (seq group-by))
+                             ;; A unique equality in a simple single-table
+                             ;; query yields at most one row. Sorting that row
+                             ;; by its hidden entity id changes no observable
+                             ;; result and used to dominate prepared point-read
+                             ;; latency.
+                             (not (and (empty? joins)
+                                       @(:unique-value-bound? ctx)))
                              default-table
                              (ctx/entity-var! ctx default-table))]
             (let [already (.indexOf ^java.util.List find-elems-vec evar)
@@ -5811,6 +5818,18 @@
         ;; source relation above must not keep that relation's entity id in
         ;; :with: it is now unbound and would suppress the singleton row.
         with-vars (if degenerate-having? [] @(:with-vars ctx))
+        ;; A top-level equality on a unique attribute proves that this
+        ;; simple single-table query produces at most one source row. SQL
+        ;; bag preservation is therefore vacuous, and keeping the entity id
+        ;; in :with would unnecessarily disqualify Datahike's direct
+        ;; point-lookup executor. Do not remove any other :with vars (for
+        ;; example ordinality), and do not apply the proof across joins: a
+        ;; unique row on one side can still join to many rows on the other.
+        with-vars (if (and (empty? joins)
+                           @(:unique-value-bound? ctx)
+                           default-table)
+                    (remove #{(ctx/entity-var! ctx default-table)} with-vars)
+                    with-vars)
         ;; Remove :with vars that appear in :find (Datahike disallows overlap)
         find-syms (set (mapcat (fn [elem]
                                  (if (seq? elem) (filter symbol? (flatten elem)) [elem]))

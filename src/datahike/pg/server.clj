@@ -5536,7 +5536,7 @@
          :exec
          (fn [db bound]
            (let [args (mapv (fn [a] (if (sql/param-ref? a)
-                                      (nth bound (:idx a))
+                                      (sql/resolve-param-ref a #(nth bound %))
                                       a))
                             in-args)
                  res (run-param-query query #(apply d/q query db args))
