@@ -145,23 +145,29 @@
                                    oid (.getInt bb)
                                    typlen (.getShort bb)
                                    typmod (.getInt bb)
-                                   _fmt (.getShort bb)]
+                                   fmt (.getShort bb)]
                                {:name nm :oid oid :typlen typlen
-                                :typmod typmod}))))))
+                                :typmod typmod :format fmt}))))))
        ;; DataRow
        \D (let [bb (buf body)
                 n (.getShort bb)
-                row (vec (repeatedly
-                          n (fn []
-                              (let [len (.getInt bb)]
-                                (when-not (neg? len)
-                                  (let [b (byte-array len)]
-                                    (.get bb b)
-                                    (String. b StandardCharsets/UTF_8)))))))]
-            (update acc :rows (fnil conj []) row))
+                fields (vec (repeatedly
+                             n (fn []
+                                 (let [len (.getInt bb)]
+                                   (when-not (neg? len)
+                                     (let [b (byte-array len)]
+                                       (.get bb b)
+                                       b))))))
+                row (mapv #(when % (String. ^bytes % StandardCharsets/UTF_8)) fields)
+                raw-row (mapv #(when % (mapv (fn [b] (bit-and (int b) 0xff)) %))
+                              fields)]
+            (-> acc
+                (update :rows (fnil conj []) row)
+                (update :raw-rows (fnil conj []) raw-row)))
        \n (assoc acc :no-data? true)
        \C (assoc acc :command-complete
                  (String. body 0 (dec (alength body)) StandardCharsets/UTF_8))
+       \s (assoc acc :portal-suspended? true)
        \E (let [bb (buf body)]
             (assoc acc :error
                    (loop [m {}]
@@ -196,8 +202,8 @@
             (recur))))
       (f in out))))
 
-(defn- bind-body [statement-name params]
-  (apply ba (cstr "") (cstr statement-name)
+(defn- bind-body-formats [portal-name statement-name params result-formats]
+  (apply ba (cstr portal-name) (cstr statement-name)
          [:i16 0]                    ; all params text
          [:i16 (count params)]
          (concat
@@ -207,12 +213,22 @@
                       (let [b (.getBytes p StandardCharsets/UTF_8)]
                         [[:i32 (alength b)] b])))
                   params)
-          [[:i16 0]])))              ; all results text
+          [[:i16 (count result-formats)]]
+          (map (fn [format] [:i16 format]) result-formats))))
+
+(defn- bind-body [statement-name params]
+  (bind-body-formats "" statement-name params []))
 
 (defn- send-bind-execute-sync! [^DataOutputStream out statement-name params]
   (send-msg! out \B (bind-body statement-name params))
   (send-msg! out \E (ba (cstr "") [:i32 0]))
   (send-msg! out \S (byte-array 0)))
+
+(defn- read-until-tag [^DataInputStream in terminal]
+  (loop [acc []]
+    (let [[tag body :as msg] (read-msg in)
+          acc (conj acc msg)]
+      (if (= terminal tag) acc (recur acc)))))
 
 (defn- parse-describe-execute-many
   "Parse and Describe one named statement, then Bind and Execute it for
@@ -246,6 +262,253 @@
     (fn [in out]
       (send-msg! out \Q (cstr sql))
       (decode (read-until-ready in)))))
+
+(deftest execute-max-rows-suspends-and-resumes-one-portal
+  (with-conn
+    (fn [in out]
+      (let [statement-name "paged"
+            sql "SELECT * FROM generate_series(1,5) AS g"]
+        (send-msg! out \P (ba (cstr statement-name) (cstr sql) [:i16 0]))
+        (send-msg! out \B (bind-body statement-name []))
+
+        ;; Execute and Flush twice without rebinding. The second page must
+        ;; continue at row 3; rerunning the handler would repeat rows 1 and 2.
+        (send-msg! out \E (ba (cstr "") [:i32 2]))
+        (send-msg! out \H (byte-array 0))
+        (let [page-1 (decode (read-until-tag in \s))]
+          (is (= [["1"] ["2"]] (:rows page-1)))
+          (is (:portal-suspended? page-1))
+          (is (nil? (:command-complete page-1))))
+
+        (send-msg! out \E (ba (cstr "") [:i32 2]))
+        (send-msg! out \H (byte-array 0))
+        (let [page-2 (decode (read-until-tag in \s))]
+          (is (= [["3"] ["4"]] (:rows page-2)))
+          (is (:portal-suspended? page-2))
+          ;; RowDescription is a one-time portal response, not repeated on
+          ;; every resumed Execute.
+          (is (nil? (:columns page-2))))
+
+        (send-msg! out \E (ba (cstr "") [:i32 2]))
+        (send-msg! out \H (byte-array 0))
+        (let [page-3 (decode (read-until-tag in \C))]
+          (is (= [["5"]] (:rows page-3)))
+          ;; CommandComplete counts rows processed by this Execute, not the
+          ;; statement's total cardinality.
+          (is (= "SELECT 1" (:command-complete page-3)))
+          (is (not (:portal-suspended? page-3))))
+
+        ;; Before transaction end, Execute at EOF reports zero rows and does
+        ;; not rerun or retain/replay the completed row array.
+        (send-msg! out \E (ba (cstr "") [:i32 2]))
+        (send-msg! out \H (byte-array 0))
+        (let [exhausted (decode (read-until-tag in \C))]
+          (is (nil? (:rows exhausted)))
+          (is (= "SELECT 0" (:command-complete exhausted))))
+
+        ;; Sync ends the implicit transaction and drops non-holdable portals.
+        (send-msg! out \S (byte-array 0))
+        (read-until-ready in)
+        (send-msg! out \E (ba (cstr "") [:i32 2]))
+        (send-msg! out \S (byte-array 0))
+        (let [after-sync (decode (read-until-ready in))]
+          (is (= "34000" (get-in after-sync [:error \C]))))))))
+
+(deftest exact-page-boundary-suspends-before-eof-probe
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P (ba (cstr "exact_stmt")
+                            (cstr "SELECT * FROM generate_series(1,2)")
+                            [:i16 0]))
+      (send-msg! out \B (bind-body-formats "exact_portal" "exact_stmt" [] []))
+      (send-msg! out \E (ba (cstr "exact_portal") [:i32 2]))
+      (send-msg! out \H (byte-array 0))
+      (let [page (decode (read-until-tag in \s))]
+        (is (= [["1"] ["2"]] (:rows page)))
+        (is (:portal-suspended? page))
+        (is (nil? (:command-complete page))))
+
+      ;; PostgreSQL only discovers exhaustion on the next Execute because
+      ;; the producer stopped exactly at maxRows.
+      (send-msg! out \E (ba (cstr "exact_portal") [:i32 2]))
+      (send-msg! out \S (byte-array 0))
+      (let [eof (decode (read-until-ready in))]
+        (is (nil? (:rows eof)))
+        (is (= "SELECT 0" (:command-complete eof)))))))
+
+(deftest portal-describe-advertises-bound-result-format
+  (with-conn
+    (fn [in out]
+      (let [statement-name "fmt"
+            portal-name "binary"]
+        (send-msg! out \P (ba (cstr statement-name) (cstr "SELECT 42") [:i16 0]))
+        (send-msg! out \B (bind-body-formats portal-name statement-name [] [1]))
+        (send-msg! out \D (ba (.getBytes "P" StandardCharsets/UTF_8)
+                              (cstr portal-name)))
+        (send-msg! out \S (byte-array 0))
+        (let [result (decode (read-until-ready in))]
+          (is (= 1 (:format (first (:columns result))))))))))
+
+(deftest suspended-portal-survives-sync-only-inside-explicit-transaction
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P (ba (cstr "tx_stmt")
+                            (cstr "SELECT * FROM generate_series(1,2)")
+                            [:i16 0]))
+      (send-msg! out \B (bind-body-formats "tx_portal" "tx_stmt" [] []))
+      (send-msg! out \E (ba (cstr "tx_portal") [:i32 1]))
+      (send-msg! out \S (byte-array 0))
+      (let [first-page (decode (read-until-ready in))]
+        (is (= [["1"]] (:rows first-page)))
+        (is (:portal-suspended? first-page)))
+
+      ;; Sync does not end an explicit transaction, so the named portal can
+      ;; resume. The final tag counts only this Execute's row.
+      (send-msg! out \E (ba (cstr "tx_portal") [:i32 1]))
+      (send-msg! out \S (byte-array 0))
+      (let [second-page (decode (read-until-ready in))]
+        (is (= [["2"]] (:rows second-page)))
+        (is (:portal-suspended? second-page)))
+
+      (send-msg! out \E (ba (cstr "tx_portal") [:i32 1]))
+      (send-msg! out \S (byte-array 0))
+      (let [eof (decode (read-until-ready in))]
+        (is (= "SELECT 0" (:command-complete eof))))
+
+      ;; COMMIT is a Simple Query transaction boundary and must invalidate
+      ;; the non-holdable extended-query portal as well.
+      (send-msg! out \Q (cstr "COMMIT"))
+      (read-until-ready in)
+      (send-msg! out \E (ba (cstr "tx_portal") [:i32 1]))
+      (send-msg! out \S (byte-array 0))
+      (is (= "34000"
+             (get-in (decode (read-until-ready in)) [:error \C]))))))
+
+(deftest named-portal-requires-close-before-rebind
+  (with-conn
+    (fn [in out]
+      (send-msg! out \P (ba (cstr "named_stmt") (cstr "SELECT 1") [:i16 0]))
+      (send-msg! out \B (bind-body-formats "named_portal" "named_stmt" [] []))
+      (send-msg! out \B (bind-body-formats "named_portal" "named_stmt" [] []))
+      (send-msg! out \S (byte-array 0))
+      (is (= "42P03"
+             (get-in (decode (read-until-ready in)) [:error \C]))))))
+
+(deftest extended-commit-drops-portals-before-sync
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P (ba (cstr "old_stmt")
+                            (cstr "SELECT * FROM generate_series(1,2)")
+                            [:i16 0]))
+      (send-msg! out \B (bind-body-formats "old_portal" "old_stmt" [] []))
+      (send-msg! out \E (ba (cstr "old_portal") [:i32 1]))
+      (send-msg! out \H (byte-array 0))
+      (is (:portal-suspended? (decode (read-until-tag in \s))))
+
+      ;; Pipeline an old-portal Execute after COMMIT but before Sync. The
+      ;; transaction command destroys that portal during its own Execute.
+      (send-msg! out \P (ba (cstr "commit_stmt") (cstr "COMMIT") [:i16 0]))
+      (send-msg! out \B (bind-body-formats "commit_portal" "commit_stmt" [] []))
+      (send-msg! out \E (ba (cstr "commit_portal") [:i32 0]))
+      (send-msg! out \E (ba (cstr "old_portal") [:i32 1]))
+      (send-msg! out \S (byte-array 0))
+      (let [result (decode (read-until-ready in))]
+        (is (= "COMMIT" (:command-complete result)))
+        (is (= "34000" (get-in result [:error \C])))))))
+
+(deftest nonempty-simple-query-replaces-unnamed-portal-inside-transaction
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P (ba (cstr "")
+                            (cstr "SELECT * FROM generate_series(1,2)")
+                            [:i16 0]))
+      (send-msg! out \B (bind-body "" []))
+      (send-msg! out \E (ba (cstr "") [:i32 1]))
+      (send-msg! out \H (byte-array 0))
+      (is (:portal-suspended? (decode (read-until-tag in \s))))
+
+      (send-msg! out \Q (cstr "SELECT 99"))
+      (is (= [["99"]] (:rows (decode (read-until-ready in)))))
+      (send-msg! out \E (ba (cstr "") [:i32 1]))
+      (send-msg! out \S (byte-array 0))
+      (is (= "34000"
+             (get-in (decode (read-until-ready in)) [:error \C]))))))
+
+(deftest binary-data-rows-retain-format-across-pages
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P (ba (cstr "binary_stmt")
+                            (cstr "SELECT x::int4 FROM generate_series(1,3) AS x")
+                            [:i16 0]))
+      (send-msg! out \B (bind-body-formats "binary_portal" "binary_stmt" [] [1]))
+      (send-msg! out \E (ba (cstr "binary_portal") [:i32 2]))
+      (send-msg! out \H (byte-array 0))
+      (let [first-page (decode (read-until-tag in \s))]
+        (is (= [[[0 0 0 1]] [[0 0 0 2]]] (:raw-rows first-page))))
+      (send-msg! out \E (ba (cstr "binary_portal") [:i32 2]))
+      (send-msg! out \S (byte-array 0))
+      (let [second-page (decode (read-until-ready in))]
+        (is (= [[[0 0 0 3]]] (:raw-rows second-page)))
+        (is (= "SELECT 1" (:command-complete second-page)))))))
+
+(deftest returning-command-tags-count-each-execute-page
+  (with-conn
+    (fn [in out]
+      (send-msg! out \Q (cstr "CREATE TABLE portal_returning (id int PRIMARY KEY)"))
+      (read-until-ready in)
+      (send-msg! out \Q (cstr "BEGIN"))
+      (read-until-ready in)
+      (send-msg! out \P
+                 (ba (cstr "returning_stmt")
+                     (cstr (str "INSERT INTO portal_returning VALUES (1), (2), (3) "
+                                "RETURNING id"))
+                     [:i16 0]))
+      (send-msg! out \B
+                 (bind-body-formats "returning_portal" "returning_stmt" [] []))
+      (send-msg! out \E (ba (cstr "returning_portal") [:i32 2]))
+      (send-msg! out \H (byte-array 0))
+      (let [first-page (decode (read-until-tag in \s))]
+        (is (= 2 (count (:rows first-page))))
+        (is (nil? (:command-complete first-page))))
+
+      (send-msg! out \E (ba (cstr "returning_portal") [:i32 2]))
+      (send-msg! out \H (byte-array 0))
+      (let [final-page (decode (read-until-tag in \C))]
+        (is (= 1 (count (:rows final-page))))
+        (is (= "INSERT 0 1" (:command-complete final-page))))
+
+      (send-msg! out \E (ba (cstr "returning_portal") [:i32 2]))
+      (send-msg! out \S (byte-array 0))
+      (let [eof (decode (read-until-ready in))]
+        (is (= "INSERT 0 0" (:command-complete eof)))))))
+
+(deftest nonpositive-execute-row-limit-means-fetch-all
+  ;; PostgreSQL's exec_execute_message treats every max_rows <= 0 as
+  ;; FETCH_ALL. Exercise -1 explicitly; zero is used throughout the helpers.
+  (with-conn
+    (fn [in out]
+      (let [statement-name "all"]
+        (send-msg! out \P
+                   (ba (cstr statement-name)
+                       (cstr "SELECT * FROM generate_series(1,3) AS g")
+                       [:i16 0]))
+        (send-msg! out \B (bind-body statement-name []))
+        (send-msg! out \E (ba (cstr "") [:i32 -1]))
+        (send-msg! out \S (byte-array 0))
+        (let [result (decode (read-until-ready in))]
+          (is (= [["1"] ["2"] ["3"]] (:rows result)))
+          (is (= "SELECT 3" (:command-complete result)))
+          (is (not (:portal-suspended? result))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; ParameterDescription echoes the client's declaration

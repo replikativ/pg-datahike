@@ -3976,20 +3976,45 @@
                (if (:in-tx? @tx-state)
                  (or (:speculative-db @tx-state) base)
                  base))]
-    (if (and cname cquery)
+    (cond
+      (not (:in-tx? @tx-state))
+      (error-result "DECLARE CURSOR can only be used in transaction blocks" "25P01")
+
+      (:with-hold? parsed)
+      (error-result "DECLARE CURSOR WITH HOLD is not supported" "0A000")
+
+      (and cname cquery)
       (let [probe-sql (rewrite-cursor-page cquery 0 0)
+            bound (vec (or *cached-bound* [nil]))
+            declared (:declared-param-oids parsed)
+            nparams (long (reduce max 0 (keys declared)))
+            param-oids (int-array
+                        (map #(int (get declared % 0))
+                             (range 1 (inc nparams))))
+            ;; A prepared DECLARE reaches this handler with the outer plan.
+            ;; Parse the inner SELECT as a separate prepared statement: using
+            ;; the outer plan recurses, while dropping the prepared context
+            ;; loses $N values. FETCH repeats this for its LIMIT/OFFSET page
+            ;; and applies the same bound values without textual interpolation.
+            probe-parsed (.parse ^PgWireServer$QueryHandler handler
+                                 probe-sql param-oids)
             probe (binding [*snapshot-db* snap]
-                    (.execute ^PgWireServer$QueryHandler handler probe-sql))]
+                    (.executePrepared ^PgWireServer$QueryHandler handler
+                                      probe-parsed (object-array bound)))]
         (if (.error ^PgWireServer$QueryResult probe)
           probe
           (do (swap! cursors assoc cname
                      {:sql     cquery
+                      :bound   bound
+                      :param-oids (vec param-oids)
                       :columns (vec (.columnNames ^PgWireServer$QueryResult probe))
                       :oids    (vec (.columnOids ^PgWireServer$QueryResult probe))
                       :snap    snap
                       :pos     (atom 0)
                       :done?   (atom false)})
               (empty-result "DECLARE CURSOR"))))
+
+      :else
       (error-result "DECLARE: syntax error" "42601"))))
 
 (defn- handle-fetch-cursor
@@ -4019,8 +4044,12 @@
            (int-array (:oids rec))
            (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
            "FETCH 0")
-          (let [result (binding [*snapshot-db* (:snap rec)]
-                         (.execute ^PgWireServer$QueryHandler handler query-sql))]
+          (let [page-parsed (.parse ^PgWireServer$QueryHandler handler
+                                    query-sql (int-array (:param-oids rec)))
+                result (binding [*snapshot-db* (:snap rec)]
+                         (.executePrepared ^PgWireServer$QueryHandler handler
+                                           page-parsed
+                                           (object-array (:bound rec))))]
             (if (.error ^PgWireServer$QueryResult result)
               result
               (let [rows (.rows ^PgWireServer$QueryResult result)
@@ -4270,7 +4299,11 @@
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
    the end of every transaction (explicit or implicit, commit or abort)."
-  [session-id tx-state]
+  [session-id tx-state cursors]
+  ;; SQL cursors are non-holdable until WITH HOLD is implemented, hence
+  ;; every transaction-ending path must discard their snapshot and page
+  ;; state. This includes commit failures and implicit rollback at Sync.
+  (reset! cursors {})
   (release-session-locks! session-id)
   (release-advisory-locks! session-id true)
   (swap! tx-state assoc
@@ -4290,27 +4323,27 @@
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
 
 (defn- handle-commit
-  [{:keys [conn session-id tx-state]} _parsed]
+  [{:keys [conn session-id tx-state cursors]} _parsed]
   (if (:in-tx? @tx-state)
     (if (:aborted? @tx-state)
       ;; PostgreSQL accepts COMMIT in a failed transaction, discards all
       ;; buffered work, and reports ROLLBACK.  Rejecting COMMIT with 25P02
       ;; leaves clients permanently stuck until they happen to issue an
       ;; explicit ROLLBACK.
-      (do (end-tx! session-id tx-state)
+      (do (end-tx! session-id tx-state cursors)
           (tag-tx-status (empty-result "ROLLBACK") tx-state))
       (try
         (transact-tx-buffer! conn tx-state)
-        (end-tx! session-id tx-state)
+        (end-tx! session-id tx-state cursors)
         (tag-tx-status (empty-result "COMMIT") tx-state)
         (catch Exception e
-          (end-tx! session-id tx-state)
+          (end-tx! session-id tx-state cursors)
           (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
-  [{:keys [session-id tx-state]} _parsed]
-  (end-tx! session-id tx-state)
+  [{:keys [session-id tx-state cursors]} _parsed]
+  (end-tx! session-id tx-state cursors)
   (tag-tx-status (empty-result "ROLLBACK") tx-state))
 
 (defn- handle-rollback-to-savepoint
@@ -7370,11 +7403,11 @@
         ;; name(args)). Session-scoped: dropped on close / DISCARD ALL.
         ;; Keyed by lowercased name → {:sql "..." :types [...]}.
         sql-prepared (atom {})
-        ;; Cursors (DECLARE name CURSOR FOR select; FETCH n FROM name;
-        ;; CLOSE name). Eagerly materialized: we run the SELECT at
-        ;; DECLARE and hand out slices on FETCH. Good enough for the
-        ;; small-result-set ORM usage pattern — streaming cursors would
-        ;; need a deeper refactor.
+        ;; SQL cursors (DECLARE name CURSOR FOR select; FETCH n FROM name;
+        ;; CLOSE name). DECLARE captures a snapshot and metadata; FETCH
+        ;; executes bounded LIMIT/OFFSET pages against that snapshot. These
+        ;; are distinct from extended-query wire portals, whose current
+        ;; backing result remains eager.
         cursors (atom {})
         ;; COPY-IN session state. Set when exec-copy-from-stdin returns
         ;; a copyInMode QueryResult; the wire layer then routes
@@ -7548,13 +7581,13 @@
       (commitImplicit [_]
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
           (if (:aborted? @tx-state)
-            (do (end-tx! session-id tx-state) nil)
+            (do (end-tx! session-id tx-state cursors) nil)
             (try
               (transact-tx-buffer! conn tx-state)
-              (end-tx! session-id tx-state)
+              (end-tx! session-id tx-state cursors)
               nil
               (catch Exception e
-                (end-tx! session-id tx-state)
+                (end-tx! session-id tx-state cursors)
                 (classified-error "COMMIT (implicit) failed: " e))))))
 
       ;; Roll back the implicit transaction WITHOUT committing — called by
@@ -7564,7 +7597,7 @@
       ;; COMMIT/ROLLBACK governs.
       (rollbackImplicit [_]
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
-          (end-tx! session-id tx-state))
+          (end-tx! session-id tx-state cursors))
         nil)
 
       ;; --- Extended Query protocol methods -------------------------------
