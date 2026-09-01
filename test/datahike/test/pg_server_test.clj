@@ -81,6 +81,25 @@
 
 (defn- sqlstate [^PgWireServer$QueryResult r] (.sqlstate r))
 
+(deftest scalar-wire-values-skip-structured-dispatch
+  ;; Keep this structural rather than timing-based: a scalar result must not
+  ;; consult any of the comparatively expensive structured-value predicates.
+  ;; This pins the dispatch order that keeps large ordinary result sets cheap.
+  (let [structured-preds (mapv requiring-resolve
+                               '[datahike.pg.arrays/array?
+                                 datahike.pg.bits/pg-bit?
+                                 datahike.pg.records/record?
+                                 datahike.pg.vector/vector-value?])
+        unexpected (fn [_]
+                     (throw (ex-info "structured predicate called for scalar"
+                                     {})))]
+    (with-redefs-fn (zipmap structured-preds (repeat unexpected))
+      #(do
+         (is (= "42" (#'pg/value->string 42)))
+         (is (= "hello" (#'pg/value->string "hello")))
+         (is (= "t" (#'pg/value->string true)))
+         (is (= "app/status" (#'pg/value->string :app/status)))))))
+
 ;; ============================================================================
 ;; SQL-level PREPARE / EXECUTE / DEALLOCATE
 ;; ============================================================================
