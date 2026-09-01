@@ -85,11 +85,11 @@ The cross-repository PostgreSQL secondary vertical has a bounded correctness
 and growth probe (JDK 22+):
 
 ```bash
-clojure -J-Xmx3g -M:dev:local-secondary-stack bench/secondary_validation.clj
+clojure -J-Xmx3g -M:dev:secondary-stack bench/secondary_validation.clj
 SECONDARY_BENCH_ROWS=100000 \
-  clojure -J-Xmx6g -M:dev:local-secondary-stack bench/secondary_validation.clj
+  clojure -J-Xmx6g -M:dev:secondary-stack bench/secondary_validation.clj
 SECONDARY_BENCH_ROWS=50000 SECONDARY_BENCH_DIMENSION=384 \
-  clojure -J-Xmx6g -M:dev:local-secondary-stack bench/secondary_validation.clj
+  clojure -J-Xmx6g -M:dev:secondary-stack bench/secondary_validation.clj
 ```
 
 It compares exact and indexed PostgreSQL full-text results/latency at 10%, 1%,

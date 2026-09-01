@@ -192,18 +192,28 @@ reusing the same keyword for a different PostgreSQL relation generation would
 make old datoms acquire the new schema. The secondary work must not bypass
 Datahike's guard against that unsafe transition.
 
+The SQL lifecycle is still beta in one important respect. Non-concurrent
+`CREATE INDEX` waits without a default deadline while Datahike backfills and
+publishes the immutable generation, leaving the writer available. Datahike
+0.8.1863 does not yet expose a fenced failure/cancellation result to the
+caller. An operator may set `:secondary-index-build-timeout-ms`, but a timeout
+only stops this SQL wait; it does not cancel or roll back the asynchronous
+build. A stable lifecycle needs a generation-bound cancel/fail transition that
+also clears the buffered delta journal before pg-datahike can promise
+PostgreSQL-equivalent CREATE INDEX failure semantics.
+
 ## Reproducible probes
 
-With the corresponding local Datahike, Scriptum, Proximum, and Stratum branches
-checked out on JDK 22 or newer:
+Against the pinned released Datahike, Scriptum, Proximum, and Stratum stack on
+JDK 22 or newer:
 
 ```bash
-clojure -J-Xmx2g -M:local-secondary-stack:test \
+clojure -J-Xmx2g -M:secondary-stack:test \
   --focus datahike.test.pg-secondary-validation-test
 
 SECONDARY_BENCH_ROWS=20000 SECONDARY_BENCH_DIMENSION=384 \
   SECONDARY_BENCH_EF_CONSTRUCTION=200 \
-  clojure -J-Xmx6g -M:dev:local-secondary-stack \
+  clojure -J-Xmx6g -M:dev:secondary-stack \
   bench/secondary_validation.clj
 
 bench/realpg.sh start

@@ -1,7 +1,8 @@
 (ns datahike.test.pg-secondary-validation-test
-  "End-to-end PostgreSQL access-path validation against the local secondary
-   stack. The released runtime remains JDK 17 compatible; these tests activate
-   only under the opt-in :local-secondary-stack alias (JDK 22+)."
+  "End-to-end PostgreSQL access-path validation against the optional secondary
+   stack. The ordinary runtime remains JDK 17 compatible; these tests activate
+   under the released :secondary-stack or development :local-secondary-stack
+   alias (JDK 22+)."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
@@ -35,7 +36,7 @@
 
 (defn- secondary-stack-unavailable-assertion []
   (is (not (:stale? secondary-stack-probe))
-      (str ":local-secondary-stack resolved legacy or unrelated sibling branches: "
+      (str "secondary-stack resolved legacy or unrelated adapters: "
            (:error secondary-stack-probe))))
 
 (defn- fixture [f]
@@ -52,7 +53,8 @@
             (pg/make-query-handler
              conn
              {:secondary-index-config
-              {:proximum {:store-config {:backend :memory
+              {:scriptum {}
+               :proximum {:store-config {:backend :memory
                                          :id vector-store-id}}
                :stratum {}}})]
         (try
@@ -72,6 +74,41 @@
 
 (defn- sqlstate [sql]
   (.-sqlstate ^PgWireServer$QueryResult (result sql)))
+
+(deftest optional-adapters-require-explicit-configuration
+  (if-not secondary-stack-available?
+    (secondary-stack-unavailable-assertion)
+    (let [handler (pg/make-query-handler *conn*)
+          execute (fn [sql] (.execute handler sql))
+          state (fn [sql]
+                  (.-sqlstate ^PgWireServer$QueryResult (execute sql)))]
+      (try
+        (is (nil? (state (str "CREATE TABLE secondary_unconfigured ("
+                              "id int PRIMARY KEY, priority int NOT NULL, "
+                              "body tsvector)"))))
+        (is (nil? (state (str "CREATE INDEX secondary_unconfigured_body_gin "
+                              "ON secondary_unconfigured USING gin (body)"))))
+        (is (nil? (state (str "CREATE INDEX secondary_unconfigured_priority_idx "
+                              "ON secondary_unconfigured (priority)"))))
+        (doseq [ident [:datahike.pg.index/secondary_unconfigured_body_gin
+                       :datahike.pg.index/secondary_unconfigured_priority_idx]]
+          (let [db (d/db *conn*)
+                entry (get-in db [:schema ident])
+                table (d/q '{:find [?table .]
+                             :in [$ ?ident]
+                             :where [[?entity :db/ident ?ident]
+                                     [?entity :datahike.pg.index/table ?table]]}
+                           db ident)]
+            (is (= "secondary_unconfigured"
+                   table))
+            (is (nil? (:db.secondary/type entry))
+                "classpath presence alone must not materialize an adapter")))
+        (is (nil? (state "DROP INDEX secondary_unconfigured_body_gin")))
+        (is (nil? (state "DROP INDEX secondary_unconfigured_priority_idx")))
+        (is (= "42704"
+               (state "DROP INDEX secondary_unconfigured_priority_idx")))
+        (finally
+          (.close handler))))))
 
 (deftest scriptum-selectivity-cost-gate
   (let [worthwhile (ns-resolve 'datahike.pg.server

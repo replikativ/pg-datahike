@@ -2,7 +2,7 @@
 
  :deps
  {org.clojure/clojure               {:mvn/version "1.12.4"}
-  org.replikativ/datahike           {:mvn/version "0.8.1813"}
+  org.replikativ/datahike           {:mvn/version "0.8.1863"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
   com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}
   ;; JSON codec for the json/jsonb types. Declared rather than inherited
@@ -66,12 +66,25 @@
   ;; fixing planner bugs. Compose: `clojure -M:server:local-dh`.
   :local-dh {:override-deps {org.replikativ/datahike {:local/root "../datahike"}}}
 
-  ;; Cross-repository secondary-index validation. This is deliberately an
-  ;; opt-in development profile: Scriptum uses Lucene 10 (JDK 21+) and
-  ;; Proximum uses the incubating Vector API (JDK 22+), while pg-datahike's
-  ;; ordinary SQL/runtime baseline remains JDK 17. The tests fail (rather than
-  ;; silently skip) when these roots resolve legacy adapters; check out the
-  ;; branches from Datahike #1012, Scriptum #8, and Proximum #21 first.
+  ;; Released secondary-index validation stack. This remains opt-in:
+  ;; Scriptum uses Lucene 10 (JDK 21+) and Proximum uses the incubating Vector
+  ;; API (JDK 22+), while pg-datahike's ordinary SQL/runtime baseline remains
+  ;; JDK 17. CircleCI exercises this exact released stack on JDK 25.
+  :secondary-stack
+  {:jvm-opts ["-XX:-UsePerfData"
+              "-XX:-UseJVMCICompiler"
+              "--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"]
+   :override-deps
+   {org.apache.lucene/lucene-analysis-common {:mvn/version "10.3.2"}}
+   :extra-deps
+   {org.replikativ/scriptum {:mvn/version "0.1.32"}
+    org.replikativ/proximum {:mvn/version "0.1.38"
+                             :exclusions [org.slf4j/slf4j-simple]}
+    org.replikativ/stratum {:mvn/version "0.3.84"}}}
+
+  ;; Cross-repository development override for testing unpublished leaf
+  ;; changes. Compose with the same tests as :secondary-stack.
   :local-secondary-stack
   {:extra-paths ["../datahike/src-secondary"]
    :jvm-opts ["-XX:-UsePerfData"
@@ -83,8 +96,9 @@
     org.apache.lucene/lucene-analysis-common {:mvn/version "10.3.2"}}
    :extra-deps
    {org.replikativ/scriptum {:local/root "../scriptum"}
-    org.replikativ/proximum {:local/root "../proximum"}
-    org.replikativ/stratum {:mvn/version "0.3.83"}}}
+    org.replikativ/proximum {:local/root "../proximum"
+                             :exclusions [org.slf4j/slf4j-simple]}
+    org.replikativ/stratum {:mvn/version "0.3.84"}}}
 
   ;; tools.build-based jar / install / deploy.
   :build {:extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}

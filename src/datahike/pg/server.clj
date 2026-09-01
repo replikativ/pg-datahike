@@ -3269,7 +3269,14 @@
               [:pg/fk-parent-table str1]
               [:pg/fk-parent-cols str1]
               [:pg/fk-on-delete kw1]
-              [:pg/fk-on-update kw1]]
+              [:pg/fk-on-update kw1]
+              ;; PostgreSQL compatibility index declarations. Materialized
+              ;; secondaries carry these facts too; an ordinary B-tree (or an
+              ;; optional method whose adapter is disabled) keeps only this
+              ;; lightweight catalog identity so CREATE/DROP/recreate and
+              ;; DROP TABLE have a coherent lifecycle.
+              [:datahike.pg.index/table str1]
+              [:datahike.pg.index/method str1]]
         missing (into []
                       (keep (fn [[ident tmpl]]
                               (when-not (get schema ident)
@@ -7184,9 +7191,16 @@
                 (configured (assoc spec :secondary-type index-type))
                 (get configured index-type))]
     (cond
-      (fn? entry) (or (entry spec) {})
+      (fn? entry) (let [resolved (entry spec)]
+                    (if (or (nil? resolved) (map? resolved))
+                      resolved
+                      (throw
+                       (errors/pg-error
+                        :invalid-parameter-value
+                        {:message (str "invalid :secondary-index-config for "
+                                       (name index-type))}))))
       (map? entry) entry
-      (nil? entry) {}
+      (nil? entry) nil
       :else
       (throw
        (errors/pg-error
@@ -7195,7 +7209,8 @@
 
 (defn- await-secondary-ready!
   [conn index-ident timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+  (let [deadline (when timeout-ms
+                   (+ (System/currentTimeMillis) timeout-ms))]
     (loop []
       (let [status (get-in (d/db conn) [:schema index-ident :db.secondary/status])]
         (cond
@@ -7205,12 +7220,36 @@
            (errors/pg-error
             :object-not-in-prerequisite-state
             {:message (str "index \"" (name index-ident) "\" is disabled")}))
-          (>= (System/currentTimeMillis) deadline)
+          (nil? status)
+          (throw
+           (errors/pg-error
+            :undefined-object
+            {:kind "index" :name (name index-ident)}))
+          (and deadline (>= (System/currentTimeMillis) deadline))
           (throw
            (errors/pg-error
             :query-canceled
-            {:message (str "timed out building index \"" (name index-ident) "\"")}))
+            {:message (str "timed out waiting for index \"" (name index-ident)
+                           "\"; its asynchronous build was not canceled")}))
           :else (do (Thread/sleep 20) (recur)))))))
+
+(defn- record-compatibility-index!
+  "Persist the SQL identity of an index whose access method is not enabled.
+
+   Datahike's native AVET/AEVT paths already provide scalar lookup/range
+   access, and optional adapters must not become active merely because a jar
+   appears on the classpath. Keeping lightweight metadata makes duplicate
+   CREATE, DROP INDEX, and DROP TABLE deterministic without pretending that a
+   physical secondary generation exists."
+  [conn tx-state parsed]
+  (let [tx-data [{:db/ident (secondary-index-ident (:name parsed))
+                  :datahike.pg.index/table (:table parsed)
+                  :datahike.pg.index/method (or (:method parsed) "btree")}]]
+    (if (:in-tx? @tx-state)
+      (execute-ddl-in-tx tx-state tx-data "CREATE INDEX")
+      (do
+        (transact-recorded! conn tx-data)
+        (empty-result "CREATE INDEX")))))
 
 (defn- materialize-secondary-index!
   [ctx parsed index-type attr config]
@@ -7234,6 +7273,8 @@
     (transact-recorded!
      conn
      [{:db/ident index-ident
+       :datahike.pg.index/table (:table parsed)
+       :datahike.pg.index/method (or (:method parsed) "btree")
        :db.secondary/type index-type
        :db.secondary/attrs [attr]
        :db.secondary/config
@@ -7244,8 +7285,13 @@
     ;; PostgreSQL's non-CONCURRENT CREATE INDEX does not return while the
     ;; index is still being built. Datahike's writer remains available during
     ;; the asynchronous backfill; only this SQL request waits for publication.
+    ;; There is intentionally no default deadline. A fixed 60-second cutoff
+    ;; made a healthy long build return an error while continuing in the
+    ;; background and later becoming ready. An explicitly configured timeout
+    ;; remains an operational escape hatch; Datahike does not yet expose the
+    ;; fenced cancellation/failure protocol needed to roll it back safely.
     (await-secondary-ready! conn index-ident
-                            (long (or secondary-index-build-timeout-ms 60000)))
+                            (some-> secondary-index-build-timeout-ms long))
     (empty-result "CREATE INDEX")))
 
 (defn- exec-ddl-create-index
@@ -7274,7 +7320,7 @@
            (errors/pg-error
             :feature-not-supported
             {:message (str method " secondary indexes currently require exactly one column")}))
-          (empty-result "CREATE INDEX"))
+          (record-compatibility-index! conn tx-state parsed))
 
         (nil? attr-schema)
         (throw (errors/pg-error :undefined-column
@@ -7338,9 +7384,11 @@
            (errors/pg-error
             :feature-not-supported
             {:message (str method " does not support unique indexes")}))
-          (materialize-secondary-index!
-           ctx parsed :scriptum attr
-           (configured-secondary-options secondary-index-config :scriptum parsed)))
+          (let [config (configured-secondary-options
+                        secondary-index-config :scriptum parsed)]
+            (if config
+              (materialize-secondary-index! ctx parsed :scriptum attr config)
+              (record-compatibility-index! conn tx-state parsed))))
 
         ;; Datahike's native AVET/AEVT indices already serve ordinary scalar
         ;; equality and range predicates. Keep accepting their PostgreSQL
@@ -7352,8 +7400,8 @@
            (errors/pg-error
             :feature-not-supported
             {:message "btree indexes on vector columns are not supported"}))
-          (if (and (map? secondary-index-config)
-                   (contains? secondary-index-config :stratum))
+          (if-let [config (configured-secondary-options
+                           secondary-index-config :stratum parsed)]
             (if (:unique? parsed)
               (throw
                (errors/pg-error
@@ -7361,10 +7409,8 @@
                 {:message (str "materialized Stratum btree indexes do not yet "
                                "enforce uniqueness")}))
               (materialize-secondary-index!
-               ctx parsed :stratum attr
-               (configured-secondary-options
-                secondary-index-config :stratum parsed)))
-            (empty-result "CREATE INDEX")))
+               ctx parsed :stratum attr config))
+            (record-compatibility-index! conn tx-state parsed)))
 
         :else
         (throw
@@ -7572,17 +7618,30 @@
         ;; Retract declarations in the SAME root transaction so no committed
         ;; database value can retain an index whose covered attributes have
         ;; already disappeared.
-        secondary-tx-data
-        (into []
+        ;; New declarations have a queryable catalog fact. Keep the schema
+        ;; scan as a compatibility bridge for materialized generations written
+        ;; by the first secondary-index beta, before that fact existed.
+        declared-index-eids
+        (if (get db-schema :datahike.pg.index/table)
+          (into #{}
+                (map first)
+                (d/q '{:find [?entity]
+                       :in [$ ?table]
+                       :where [[?entity :datahike.pg.index/table ?table]]}
+                     db table))
+          #{})
+        legacy-secondary-eids
+        (into #{}
               (keep (fn [[ident entry]]
                       (when (= table (get-in entry [:db.secondary/config :pg/table]))
-                        (when-let [entity-id
-                                   (d/q '{:find [?entity .]
-                                          :in [$ ?ident]
-                                          :where [[?entity :db/ident ?ident]]}
-                                        db ident)]
-                          [:db/retractEntity entity-id]))))
+                        (d/q '{:find [?entity .]
+                               :in [$ ?ident]
+                               :where [[?entity :db/ident ?ident]]}
+                             db ident))))
               db-schema)
+        secondary-tx-data
+        (mapv (fn [entity-id] [:db/retractEntity entity-id])
+              (into declared-index-eids legacy-secondary-eids))
         all-tx-data (into data-tx-data
                           (concat (filter some? schema-tx-data)
                                   secondary-tx-data))]
