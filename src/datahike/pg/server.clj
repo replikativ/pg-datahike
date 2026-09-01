@@ -1699,16 +1699,25 @@
   cache-stats
   (atom {:hit 0 :miss 0}))
 
+(defonce ^:private schema-cache-generation
+  ;; Prepared statements retain translated plans outside the ordinary LRUs.
+  ;; Advancing this generation lets the wire layer revalidate those plans
+  ;; after DDL, including metadata-only changes not visible in -schema.
+  (atom 0))
+
 (defn invalidate-schema-cache!
   "Clear the per-schema cache. Called from every DDL exec branch. Also
    clears the enriched-db catalog cache, whose schema-hash key is blind to
    registry-entity additions (CREATE TYPE/ENUM/DOMAIN) and ALTER typmod
-   changes — see sql/invalidate-catalog-cache!."
+  changes — see sql/invalidate-catalog-cache!."
   []
   (.clear ^java.util.Map schema-deriv-cache)
   (sql/invalidate-catalog-cache!)
   (sql/invalidate-parse-cache!)
-  (stmt/invalidate-enriched-schema-cache!))
+  (stmt/invalidate-enriched-schema-cache!)
+  ;; Publish only after every cache is empty. Parse/revalidation samples this
+  ;; token before and after planning and retries if it changes.
+  (swap! schema-cache-generation inc))
 
 (defn- schema-cached
   "`(schema-cached db cache-key produce)` — memoise `(produce)`
@@ -3931,13 +3940,38 @@
 
 ;; --- Prepared-statement handlers --------------------------------------------
 
+(defn- result-description-signature
+  [^PgWireServer$QueryResult result]
+  (when result
+    (let [names (vec (or (.columnNames result) (make-array String 0)))
+          oids (vec (or (.columnOids result) (int-array 0)))
+          typmods (if-let [tm (.columnTypmods result)]
+                    (vec tm)
+                    (vec (repeat (count names) -1)))]
+      [names oids typmods])))
+
+(defn- plan-sql-prepared
+  "Parse one SQL-level PREPARE template under a stable schema/session token."
+  [^PgWireServer$QueryHandler handler template]
+  (loop []
+    (let [before (.planCacheToken handler)
+          parsed (.parse handler template (int-array 0))
+          description (.describeResult handler parsed)
+          after (.planCacheToken handler)]
+      (if (= before after)
+        {:parsed parsed
+         :result-signature (result-description-signature description)
+         :plan-token after}
+        (recur)))))
+
 (defn- handle-prepare
   "PREPARE name [(types)] AS sql — classify extracts :name and :template."
-  [{:keys [sql-prepared]} parsed]
+  [{:keys [sql-prepared handler]} parsed]
   (let [pname (:name parsed)
         tmpl  (:template parsed)]
     (if (and pname tmpl)
-      (do (swap! sql-prepared assoc pname {:sql tmpl})
+      (do (swap! sql-prepared assoc pname
+                 (assoc (plan-sql-prepared handler tmpl) :sql tmpl))
           (empty-result "PREPARE"))
       (error-result "PREPARE: syntax error" "42601"))))
 
@@ -3953,7 +3987,16 @@
         rec (when pname (get @sql-prepared pname))]
     (if-not rec
       (error-result (str "prepared statement \"" pname "\" does not exist") "26000")
-      (let [args (parse-execute-args args-text)
+      (let [rec (if (= (:plan-token rec) (.planCacheToken ^PgWireServer$QueryHandler handler))
+                  rec
+                  (let [replanned (plan-sql-prepared handler (:sql rec))]
+                    (when (not= (:result-signature rec) (:result-signature replanned))
+                      (throw (ex-info "cached plan must not change result type"
+                                      {:sqlstate "0A000"})))
+                    (let [updated (merge rec replanned)]
+                      (swap! sql-prepared assoc pname updated)
+                      updated)))
+            args (parse-execute-args args-text)
             template (:sql rec)
             sql-out (substitute-prepared-params template args)]
         (.execute ^PgWireServer$QueryHandler handler sql-out)))))
@@ -4136,6 +4179,7 @@
     (let [real-db (d/db conn)]
       (swap! tx-state assoc
              :in-tx? true :aborted? false :tx-buffer []
+             :ddl-version 0
              ;; `BEGIN ISOLATION LEVEL X` pins the tx's level (classify
              ;; supplies :isolation); nil means inherit the session
              ;; default — effective-isolation handles the fallback.
@@ -4159,6 +4203,7 @@
   (let [real-db (d/db conn)]
     (swap! tx-state assoc
            :in-tx? true :implicit? true :aborted? false :tx-buffer []
+           :ddl-version 0
            :speculative-db (apply-temporal real-db session-state)
            :begin-max-tx (:max-tx real-db)
            :eid->tempid {} :savepoints [])))
@@ -4176,6 +4221,7 @@
                   :tx-buffer (:tx-buffer @tx-state)
                   :eid->tempid (:eid->tempid @tx-state)
                   :owned-locks (:owned-locks @tx-state)
+                  :ddl-version (:ddl-version @tx-state)
                   ;; The conflict watermark travels WITH the snapshot: a
                   ;; rebase after this savepoint advances begin-max-tx, and
                   ;; ROLLBACK TO must restore the old value — otherwise the
@@ -4308,7 +4354,13 @@
                              :detail (str "base=" begin-max-tx
                                           ", current=" current-max-tx)})))))
       (when (seq buf)
-        (transact-recorded! conn buf)))))
+        (transact-recorded! conn buf))
+      ;; A successful DDL commit publishes schema/catalog changes after the
+      ;; statement-level cache bust. Advance once more now so a concurrent
+      ;; session that revalidated against the pre-commit DB cannot retain a
+      ;; stale prepared plan under the statement's earlier generation.
+      (when (pos? (long (or (:ddl-version @tx-state) 0)))
+        (invalidate-schema-cache!)))))
 
 (defn- end-tx!
   "Release this session's locks and reset tx-state to not-in-tx. Used at
@@ -4322,6 +4374,7 @@
   (release-advisory-locks! session-id true)
   (swap! tx-state assoc
          :in-tx? false :implicit? false :aborted? false
+         :ddl-version 0
          :owned-locks #{}))
 
 (def ^:private write-parse-types
@@ -4333,11 +4386,32 @@
   #{:insert :update :update-with-recursive :delete :truncate
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
-    :ddl-create-domain :ddl-drop-domain
+    :ddl-create-composite :ddl-create-domain :ddl-drop-domain
     ;; Ordinary B-tree CREATE INDEX remains a transaction-compatible
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
+
+(defn- execute-ddl-invalidating
+  "Run one DDL statement with cache invalidation on both sides. The first
+   bust protects the implementation from stale derivations; the second
+   publishes a new prepared-plan generation after success. Speculative DDL
+   is marked so COMMIT advances the generation after the new root is visible."
+  [tx-state execute]
+  (invalidate-schema-cache!)
+  (let [result (execute)]
+    (when (nil? (.error ^PgWireServer$QueryResult result))
+      (when (:in-tx? @tx-state)
+        (swap! tx-state update :ddl-version (fnil inc 0)))
+      (invalidate-schema-cache!))
+    result))
+
+(defn- invalidate-rolled-back-ddl!
+  "Publish that speculative schema/catalog state disappeared. Plans may have
+   been prepared against it while the transaction or savepoint was active."
+  [tx-state]
+  (when (pos? (long (or (:ddl-version @tx-state) 0)))
+    (invalidate-schema-cache!)))
 
 (defn- handle-commit
   [{:keys [conn session-id tx-state cursors]} _parsed]
@@ -4347,19 +4421,22 @@
       ;; buffered work, and reports ROLLBACK.  Rejecting COMMIT with 25P02
       ;; leaves clients permanently stuck until they happen to issue an
       ;; explicit ROLLBACK.
-      (do (end-tx! session-id tx-state cursors)
+      (do (invalidate-rolled-back-ddl! tx-state)
+          (end-tx! session-id tx-state cursors)
           (tag-tx-status (empty-result "ROLLBACK") tx-state))
       (try
         (transact-tx-buffer! conn tx-state)
         (end-tx! session-id tx-state cursors)
         (tag-tx-status (empty-result "COMMIT") tx-state)
         (catch Exception e
+          (invalidate-rolled-back-ddl! tx-state)
           (end-tx! session-id tx-state cursors)
           (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
   [{:keys [session-id tx-state cursors]} _parsed]
+  (invalidate-rolled-back-ddl! tx-state)
   (end-tx! session-id tx-state cursors)
   (tag-tx-status (empty-result "ROLLBACK") tx-state))
 
@@ -4385,7 +4462,9 @@
       :else
       (let [target (nth sp-stack target-idx)
             {:keys [speculative-db tx-buffer eid->tempid
-                    owned-locks begin-max-tx]} target
+                    owned-locks begin-max-tx ddl-version]} target
+            current-ddl-version (long (or (:ddl-version @tx-state) 0))
+            target-ddl-version (long (or ddl-version 0))
             current-locks (:owned-locks @tx-state)
             to-release (clojure.set/difference current-locks
                                                (or owned-locks #{}))]
@@ -4394,6 +4473,8 @@
                  (fn [reg]
                    (reduce (fn [r k] (dissoc r k))
                            reg to-release))))
+        (when (> current-ddl-version target-ddl-version)
+          (invalidate-schema-cache!))
         (swap! tx-state assoc
                :aborted? false
                :speculative-db speculative-db
@@ -4404,6 +4485,7 @@
                ;; see handle-savepoint. Snapshots from before this field
                ;; existed fall back to the current watermark.
                :begin-max-tx (or begin-max-tx (:begin-max-tx @tx-state))
+               :ddl-version target-ddl-version
                ;; Keep savepoints up to AND INCLUDING the target (the
                ;; target stays active, more recent ones go).
                :savepoints (subvec sp-stack 0 (inc target-idx)))
@@ -4415,6 +4497,7 @@
    behavior in src/backend/commands/discard.c — clients use this
    between connection-pool checkouts."
   [{:keys [session-id tx-state session-state sql-prepared cursors]} _parsed]
+  (invalidate-rolled-back-ddl! tx-state)
   (release-session-locks! session-id)
   (release-advisory-locks! session-id)
   (reset! tx-state {:in-tx? false :aborted? false
@@ -7088,34 +7171,16 @@
         (classified-error "DROP DOMAIN error: " e)))))
 
 (defn- exec-savepoint
-  [ctx _parsed]
-  (let [{:keys [tx-state]} ctx]
-    (do (swap! tx-state update :savepoints (fnil conj [])
-               {:speculative-db (:speculative-db @tx-state)
-                :tx-buffer (:tx-buffer @tx-state)
-                :eid->tempid (:eid->tempid @tx-state)})
-        (empty-result "SAVEPOINT"))))
+  [ctx parsed]
+  (handle-savepoint ctx parsed))
 
 (defn- exec-release-savepoint
-  [ctx _parsed]
-  (let [{:keys [tx-state]} ctx]
-    (do (swap! tx-state update :savepoints
-               (fn [sp] (if (seq sp) (pop sp) [])))
-        (empty-result "RELEASE SAVEPOINT"))))
+  [ctx parsed]
+  (handle-release-savepoint ctx parsed))
 
 (defn- exec-rollback-to-savepoint
-  [ctx _parsed]
-  (let [{:keys [tx-state]} ctx
-        sp-stack (:savepoints @tx-state)]
-    (when (seq sp-stack)
-      (let [{:keys [speculative-db tx-buffer eid->tempid]} (peek sp-stack)]
-        (swap! tx-state assoc
-               :aborted? false  ;; ROLLBACK TO clears error state
-               :speculative-db speculative-db
-               :tx-buffer tx-buffer
-               :eid->tempid eid->tempid
-               :savepoints (pop sp-stack))))
-    (empty-result "ROLLBACK")))
+  [ctx parsed]
+  (handle-rollback-to-savepoint ctx parsed))
 
 (def ^:private pgvector-opclasses
   {"vector_l2_ops" :euclidean
@@ -8078,6 +8143,7 @@
         ;; terminating. Release all row locks, advisory locks held by this
         ;; session, drop session-scoped temp tables, and clear transaction
         ;; state.
+        (invalidate-rolled-back-ddl! tx-state)
         (release-session-locks! session-id)
         (release-advisory-locks! session-id)
         ;; Drop CREATE TEMP tables — they live only for the session.
@@ -8206,12 +8272,14 @@
       (commitImplicit [_]
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
           (if (:aborted? @tx-state)
-            (do (end-tx! session-id tx-state cursors) nil)
+            (do (invalidate-rolled-back-ddl! tx-state)
+                (end-tx! session-id tx-state cursors) nil)
             (try
               (transact-tx-buffer! conn tx-state)
               (end-tx! session-id tx-state cursors)
               nil
               (catch Exception e
+                (invalidate-rolled-back-ddl! tx-state)
                 (end-tx! session-id tx-state cursors)
                 (classified-error "COMMIT (implicit) failed: " e))))))
 
@@ -8222,10 +8290,22 @@
       ;; COMMIT/ROLLBACK governs.
       (rollbackImplicit [_]
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
+          (invalidate-rolled-back-ddl! tx-state)
           (end-tx! session-id tx-state cursors))
         nil)
 
       ;; --- Extended Query protocol methods -------------------------------
+
+      (planCacheToken [_]
+        [@schema-cache-generation
+         (select-keys @session-state
+                      [:branch :commit-id :as-of :since :history
+                       :valid-at :valid-from :valid-to :valid-between
+                       :search-path])])
+
+      (markTransactionFailed [_]
+        (when (:in-tx? @tx-state)
+          (swap! tx-state assoc :aborted? true)))
 
       (parse [_ sql param-oids]
         ;; Translate once, return the parsed map as opaque state. The
@@ -8932,49 +9012,49 @@
                             ;; attribute entities but not in `(dbi/-schema db)`, so
                             ;; identity-keyed caches can't detect a constraint
                             ;; add via ALTER TABLE without an explicit bust.
-                              :ddl-create            (do (invalidate-schema-cache!)
-                                                         (exec-ddl-create ctx parsed))
-                              :ddl-create-view       (do (invalidate-schema-cache!)
-                                                         (execute-ddl-create-view
-                                                          (:conn ctx) parsed (:tx-state ctx)))
-                              :ddl-create-sequence   (do (invalidate-schema-cache!)
-                                                         (exec-ddl-create-sequence ctx parsed))
-                              :ddl-alter-sequence    (do (invalidate-schema-cache!)
-                                                         (exec-ddl-alter-sequence ctx parsed))
-                              :ddl-create-enum       (do (invalidate-schema-cache!)
-                                                         (exec-ddl-create-enum ctx parsed))
-                              :ddl-alter-enum        (do (invalidate-schema-cache!)
-                                                         (exec-ddl-alter-enum ctx parsed))
-                              :ddl-rename-enum       (do (invalidate-schema-cache!)
-                                                         (exec-ddl-rename-enum ctx parsed))
-                              :ddl-drop-enum         (do (invalidate-schema-cache!)
-                                                         (exec-ddl-drop-enum ctx parsed))
-                              :ddl-create-composite  (do (invalidate-schema-cache!)
-                                                         (exec-ddl-create-composite ctx parsed))
-                              :ddl-create-domain     (do (invalidate-schema-cache!)
-                                                         (exec-ddl-create-domain ctx parsed))
-                              :ddl-drop-domain       (do (invalidate-schema-cache!)
-                                                         (exec-ddl-drop-domain ctx parsed))
+                              :ddl-create            (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create ctx parsed))
+                              :ddl-create-view       (execute-ddl-invalidating
+                                                      tx-state #(execute-ddl-create-view
+                                                                 (:conn ctx) parsed (:tx-state ctx)))
+                              :ddl-create-sequence   (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-sequence ctx parsed))
+                              :ddl-alter-sequence    (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-alter-sequence ctx parsed))
+                              :ddl-create-enum       (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-enum ctx parsed))
+                              :ddl-alter-enum        (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-alter-enum ctx parsed))
+                              :ddl-rename-enum       (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-rename-enum ctx parsed))
+                              :ddl-drop-enum         (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-enum ctx parsed))
+                              :ddl-create-composite  (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-composite ctx parsed))
+                              :ddl-create-domain     (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-domain ctx parsed))
+                              :ddl-drop-domain       (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-domain ctx parsed))
                               :savepoint             (exec-savepoint ctx parsed)
                               :release-savepoint     (exec-release-savepoint ctx parsed)
                               :rollback-to-savepoint (exec-rollback-to-savepoint ctx parsed)
-                              :ddl-create-index      (do (invalidate-schema-cache!)
-                                                         (exec-ddl-create-index ctx parsed))
-                              :ddl-drop-index        (do (invalidate-schema-cache!)
-                                                         (exec-ddl-drop-index ctx parsed))
-                              :ddl-alter             (do (invalidate-schema-cache!)
-                                                         (exec-ddl-alter ctx parsed))
-                              :ddl-drop              (do (invalidate-schema-cache!)
-                                                         (exec-ddl-drop ctx parsed))
-                              :ddl-drop-view         (do (invalidate-schema-cache!)
-                                                         (execute-ddl-drop-view
-                                                          (:conn ctx) parsed (:tx-state ctx)))
-                              :ddl-drop-sequence     (do (invalidate-schema-cache!)
-                                                         (exec-ddl-drop-sequence ctx parsed))
+                              :ddl-create-index      (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-create-index ctx parsed))
+                              :ddl-drop-index        (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-index ctx parsed))
+                              :ddl-alter             (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-alter ctx parsed))
+                              :ddl-drop              (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop ctx parsed))
+                              :ddl-drop-view         (execute-ddl-invalidating
+                                                      tx-state #(execute-ddl-drop-view
+                                                                 (:conn ctx) parsed (:tx-state ctx)))
+                              :ddl-drop-sequence     (execute-ddl-invalidating
+                                                      tx-state #(exec-ddl-drop-sequence ctx parsed))
                               :set-operation         (exec-set-operation ctx parsed)
                               :full-join             (exec-full-join ctx parsed)
                               :error                 (exec-error ctx parsed)
-                            ;; fallback
+                                  ;; fallback
                               (error-result (str "Unknown parse result type: " (:type parsed)))))))))
                   (catch Exception e
                     (when (:in-tx? @tx-state) (swap! tx-state assoc :aborted? true))
