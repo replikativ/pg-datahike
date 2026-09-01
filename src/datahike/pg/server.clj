@@ -19,6 +19,7 @@
             [datahike.api :as d]
             [datahike.core :as dc]
             [datahike.db.interface :as dbi]
+            [datahike.writer :as writer]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.cache :as pg-cache]
@@ -7272,14 +7273,47 @@
         :invalid-parameter-value
         {:message (str "invalid :secondary-index-config for " (name index-type))})))))
 
+(defn- secondary-build-failure
+  [db index-ident building-since-tx]
+  (let [failure (get-in db [:secondary-index-build-failures index-ident])]
+    (when (and failure
+               (or (nil? building-since-tx)
+                   (= building-since-tx (:building-since-tx failure))))
+      failure)))
+
+(defn- secondary-build-failed!
+  [index-ident failure]
+  (throw
+   (errors/pg-error
+    :object-not-in-prerequisite-state
+    {:message (str "index \"" (name index-ident) "\" build failed"
+                   (when-let [message (:message failure)]
+                     (str ": " message)))})))
+
+(defn- throwable-type
+  [failure]
+  (some (comp :type ex-data)
+        (take-while some? (iterate ex-cause failure))))
+
+(defn- cancel-secondary-build!
+  [conn index-ident building-since-tx]
+  @(writer/cancel-secondary-index-build!
+    conn index-ident building-since-tx))
+
 (defn- await-secondary-ready!
   [conn index-ident timeout-ms]
   (let [deadline (when timeout-ms
                    (+ (System/currentTimeMillis) timeout-ms))]
-    (loop []
-      (let [status (get-in (d/db conn) [:schema index-ident :db.secondary/status])]
+    (loop [building-since-tx nil]
+      (let [db (d/db conn)
+            entry (get-in db [:schema index-ident])
+            status (:db.secondary/status entry)
+            generation (or building-since-tx
+                           (:db.secondary/building-since-tx entry))
+            failure (secondary-build-failure db index-ident generation)]
         (cond
           (= :ready status) true
+          failure (secondary-build-failed! index-ident failure)
           (= :disabled status)
           (throw
            (errors/pg-error
@@ -7291,12 +7325,37 @@
             :undefined-object
             {:kind "index" :name (name index-ident)}))
           (and deadline (>= (System/currentTimeMillis) deadline))
-          (throw
-           (errors/pg-error
-            :query-canceled
-            {:message (str "timed out waiting for index \"" (name index-ident)
-                           "\"; its asynchronous build was not canceled")}))
-          :else (do (Thread/sleep 20) (recur)))))))
+          (do
+            (try
+              (cancel-secondary-build! conn index-ident generation)
+              (catch Throwable cancellation
+                (when-not (= :secondary-index-build-generation-mismatch
+                             (throwable-type cancellation))
+                  (throw cancellation))))
+            ;; Installation, automatic failure cleanup, or a replacement
+            ;; generation can win the writer race with cancellation. Re-read
+            ;; the root and never cancel a generation other than the one this
+            ;; SQL request observed.
+            (let [after (d/db conn)
+                  after-entry (get-in after [:schema index-ident])
+                  after-status (:db.secondary/status after-entry)
+                  after-generation (:db.secondary/building-since-tx after-entry)
+                  after-failure (secondary-build-failure
+                                 after index-ident generation)]
+              (cond
+                (= :ready after-status) true
+                after-failure (secondary-build-failed! index-ident after-failure)
+                :else
+                (throw
+                 (errors/pg-error
+                  :query-canceled
+                  {:message
+                   (str "timed out waiting for index \"" (name index-ident) "\""
+                        (if (and (= :building after-status)
+                                 (not= generation after-generation))
+                          "; a replacement build was not canceled"
+                          "; its asynchronous build was canceled"))})))))
+          :else (do (Thread/sleep 20) (recur generation)))))))
 
 (defn- record-compatibility-index!
   "Persist the SQL identity of an index whose access method is not enabled.
@@ -7350,11 +7409,12 @@
     ;; PostgreSQL's non-CONCURRENT CREATE INDEX does not return while the
     ;; index is still being built. Datahike's writer remains available during
     ;; the asynchronous backfill; only this SQL request waits for publication.
-    ;; There is intentionally no default deadline. A fixed 60-second cutoff
-    ;; made a healthy long build return an error while continuing in the
-    ;; background and later becoming ready. An explicitly configured timeout
-    ;; remains an operational escape hatch; Datahike does not yet expose the
-    ;; fenced cancellation/failure protocol needed to roll it back safely.
+    ;; There is intentionally no default deadline: a healthy long build should
+    ;; not fail because of an arbitrary cutoff. When an operator configures a
+    ;; timeout, cancellation is fenced by this declaration's build boundary so
+    ;; it cannot tear down a replacement generation. Datahike also retracts a
+    ;; declaration whose asynchronous scan fails; the runtime diagnostic above
+    ;; turns that failure into PostgreSQL's prerequisite-state error.
     (await-secondary-ready! conn index-ident
                             (some-> secondary-index-build-timeout-ms long))
     (empty-result "CREATE INDEX")))

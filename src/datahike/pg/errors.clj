@@ -283,7 +283,8 @@
 
    :query-canceled
    {:sqlstate "57014"
-    :format (fn [_] "canceling statement due to user request")}
+    :format (fn [{:keys [message]}]
+              (or message "canceling statement due to user request"))}
 
    :statement-timeout
    {:sqlstate "57014"

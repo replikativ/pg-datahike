@@ -192,15 +192,13 @@ reusing the same keyword for a different PostgreSQL relation generation would
 make old datoms acquire the new schema. The secondary work must not bypass
 Datahike's guard against that unsafe transition.
 
-The SQL lifecycle is still beta in one important respect. Non-concurrent
-`CREATE INDEX` waits without a default deadline while Datahike backfills and
-publishes the immutable generation, leaving the writer available. Datahike
-0.8.1863 does not yet expose a fenced failure/cancellation result to the
-caller. An operator may set `:secondary-index-build-timeout-ms`, but a timeout
-only stops this SQL wait; it does not cancel or roll back the asynchronous
-build. A stable lifecycle needs a generation-bound cancel/fail transition that
-also clears the buffered delta journal before pg-datahike can promise
-PostgreSQL-equivalent CREATE INDEX failure semantics.
+Non-concurrent `CREATE INDEX` waits without a default deadline while Datahike
+backfills and publishes the immutable generation, leaving the writer
+available. An operator may set `:secondary-index-build-timeout-ms`; on expiry,
+pg-datahike cancels only the exact generation observed by that SQL request.
+The fenced transition retracts the declaration and clears its buffered delta
+journal. An asynchronous adapter failure performs the same cleanup and is
+reported to the waiting SQL request as SQLSTATE `55000`.
 
 ## Reproducible probes
 
