@@ -21,7 +21,8 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [datahike.pg PgWireServer PgWireServer$QueryHandlerFactory]
+  (:import [datahike.pg PgParamCodec PgWireServer PgWireServer$PgProtocolException
+            PgWireServer$QueryHandlerFactory]
            [java.sql Connection DriverManager PreparedStatement ResultSet
             SQLException Statement Types]))
 
@@ -205,6 +206,38 @@
         (with-open [rs (.executeQuery ps)]
           ;; ? IS NULL is TRUE → all 3 rows match
           (loop [n 0] (if (.next rs) (recur (inc n)) (is (= 3 n)))))))))
+
+(deftest test-text-parameter-decoder-rejects-invalid-utf8
+  (doseq [bytes [(byte-array [97 0 98])
+                 (byte-array [(unchecked-byte 0xc3)])]]
+    (let [raised (try
+                   (PgParamCodec/decodeUtf8 bytes)
+                   nil
+                   (catch PgWireServer$PgProtocolException e e))]
+      (is (some? raised))
+      (is (= "22021" (.-sqlstate ^PgWireServer$PgProtocolException raised))))))
+
+(deftest test-prepared-batch-rejects-embedded-nul
+  (testing "an embedded NUL aborts the batch with character_not_in_repertoire"
+    (with-conn [c {:preferQueryMode "extended"}]
+      (with-open [st (.createStatement c)]
+        (.executeUpdate st "CREATE TEMPORARY TABLE nul_batch (value TEXT)"))
+      (.setAutoCommit c false)
+      (with-open [ps (.prepareStatement c "INSERT INTO nul_batch VALUES (?)")]
+        (doseq [value ["a" "\u0000" "b"]]
+          (.setString ps 1 value)
+          (.addBatch ps))
+        (let [raised (try
+                       (.executeBatch ps)
+                       nil
+                       (catch SQLException e e))]
+          (is (some? raised) "expected the NUL parameter to reject the batch")
+          (is (= "22021" (.getSQLState ^SQLException raised)))))
+      (.rollback c)
+      (with-open [st (.createStatement c)
+                  rs (.executeQuery st "SELECT count(*) FROM nul_batch")]
+        (is (.next rs))
+        (is (zero? (.getLong rs 1)))))))
 
 (deftest test-prepared-statement-revalidates-after-ddl
   (testing "DDL replans a prepared statement when its result type is unchanged"

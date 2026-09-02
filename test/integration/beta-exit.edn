@@ -104,8 +104,9 @@
    :exit "Deleting a row inserted in the same transaction does not retract a tempid."}
   {:id :embedded-nul-input
    :wave 1
-   :status :open
-   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_wire_jdbc_test.clj"
+              "test/integration/pgjdbc/expected-skips.md"]
    :exit "Text parameters containing an embedded NUL are rejected with a PostgreSQL-compatible error."}
   {:id :alternating-batch-types
    :wave 1

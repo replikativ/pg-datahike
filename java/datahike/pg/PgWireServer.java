@@ -2204,7 +2204,7 @@ public final class PgWireServer {
             // as text and let the downstream coerce (same behaviour as
             // the prior text-interpolation path).
             if (oid == 0) {
-                bound[i + 1] = new String(bytes, StandardCharsets.UTF_8);
+                bound[i + 1] = PgParamCodec.decodeUtf8(bytes);
             } else {
                 bound[i + 1] = PgParamCodec.decode(oid, format, bytes);
             }
