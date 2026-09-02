@@ -19,6 +19,9 @@ All notable changes to pg-datahike.
   corrected so the stricter gate starts green.
 - Recorded the first local beta-exit baseline, including the environment-dependent
   asyncpg divergence and four distinct pgjdbc `BatchExecuteTest` failure classes.
+- Deleting a row inserted earlier in the same transaction now cancels its buffered
+  insert and update writes instead of asking Datahike to retract a tempid. All four
+  pgjdbc `testMixedBatch` variants now pass.
 
 ### Password authentication and TLS
 

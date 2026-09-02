@@ -6375,6 +6375,25 @@
     (assoc parsed :tx-data (remap-tempids (:tx-data parsed) (str "-" (gensym))))
     parsed))
 
+(defn- writes-tempid?
+  "True when a buffered entity map or entity operation targets one of
+   `tempids`. These writes belong to rows created earlier in the current
+   SQL transaction and can be discarded when those rows are deleted before
+   COMMIT. Transaction functions and writes to other entities are retained."
+  [tempids item]
+  (cond
+    (map? item)
+    (contains? tempids (:db/id item))
+
+    (vector? item)
+    (and (contains? #{:db/add :db/retract
+                      :db/cas :db.fn/cas
+                      :db/retractEntity :db.fn/retractEntity}
+                    (first item))
+         (contains? tempids (nth item 1 nil)))
+
+    :else false))
+
 (defn- exec-insert
   [ctx parsed]
   (let [{:keys [conn tx-state batch-state]} ctx]
@@ -6585,12 +6604,26 @@
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-tx-data (mapv (fn [eid] [:db/retractEntity eid]) eids)
               spec-report (dc/with spec-db spec-tx-data)
-              ;; For commit buffer, remap to tempids
-              commit-tx-data (mapv (fn [eid] [:db/retractEntity (get eid->tempid eid eid)]) eids)]
+              ;; A row inserted earlier in this SQL transaction has no
+              ;; committed entity to retract. Cancel its entity map and any
+              ;; subsequent updates instead of emitting retractEntity with a
+              ;; tempid, which Datahike rejects. Persisted rows still receive
+              ;; ordinary entity retractions.
+              inserted-eids (into #{} (filter #(contains? eid->tempid %)) eids)
+              deleted-tempids (into #{} (map eid->tempid) inserted-eids)
+              commit-tx-data (into []
+                                   (comp (remove inserted-eids)
+                                         (map (fn [eid] [:db/retractEntity eid])))
+                                   eids)]
           (swap! tx-state (fn [ts]
-                            (-> ts
-                                (update :tx-buffer into commit-tx-data)
-                                (assoc :speculative-db (:db-after spec-report)))))
+                            (let [buffer (if (seq deleted-tempids)
+                                           (into [] (remove #(writes-tempid? deleted-tempids %))
+                                                 (:tx-buffer ts))
+                                           (:tx-buffer ts))]
+                              (-> ts
+                                  (assoc :tx-buffer (into buffer commit-tx-data)
+                                         :speculative-db (:db-after spec-report))
+                                  (update :eid->tempid #(apply dissoc % inserted-eids))))))
           (or returning-result (empty-result (str "DELETE " (count eids)))))
         (catch Exception e
           (swap! tx-state assoc :aborted? true)

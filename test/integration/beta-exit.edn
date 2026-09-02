@@ -98,8 +98,9 @@
    :exit "NULL comparisons never become true or false silently when PostgreSQL returns NULL."}
   {:id :transaction-buffer-delete
    :wave 1
-   :status :open
-   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_server_test.clj"
+              "test/integration/pgjdbc/expected-skips.md"]
    :exit "Deleting a row inserted in the same transaction does not retract a tempid."}
   {:id :embedded-nul-input
    :wave 1

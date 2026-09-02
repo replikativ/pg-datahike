@@ -35,14 +35,14 @@ percentage: a SQL translator can execute every branch and still return the
 wrong rows, OIDs or SQLSTATE. Coverage grows by admitting observed behavior
 from PostgreSQL, drivers and applications into a strict repeatable gate.
 
-## Campaign baseline — 2026-09-01
+## Campaign status — 2026-09-01
 
-- Unit: 1,604 tests / 6,808 assertions, all passing.
+- Unit: 1,605 tests / 6,815 assertions, all passing.
 - SQLLogic: 61 assertion groups, all passing.
 - Released secondary stack: 5 tests / 75 assertions, all passing on JDK 25.
 - node-postgres: 14 admitted files passing, 8 known-gap files still xfail.
-- pgjdbc `ResultSetTest`: 80/80 passing. `BatchExecuteTest`: 118/132 passing,
-  with four distinct failure classes recorded in its manifest.
+- pgjdbc `ResultSetTest`: 80/80 passing. `BatchExecuteTest`: 122/132 passing,
+  with three distinct failure classes recorded in its manifest.
 - asyncpg: 106 passed, 69 failed and 32 skipped locally. Four failures were
   absent from the CI-derived manifest, while two manifest entries passed. This
   confirms that reconciling the environment-dependent baseline is a blocker;
