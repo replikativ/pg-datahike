@@ -139,11 +139,24 @@
   [idx value-type]
   (assoc (->ParamRef idx) ::coercion [:seek-key value-type]))
 
+(defn transform-param-ref
+  "Return `ref` with an Execute-time value transformation appended.
+
+   INSERT translation encounters explicit casts before Bind has supplied a
+   parameter value. Keeping the transformation on the ParamRef lets Parse
+   remain value-free while preserving the cast's semantics when the concrete
+   value arrives. A vector is used because casts can nest; transformations
+   run from the innermost cast to the outermost one."
+  [ref f]
+  (update ref ::transforms (fnil conj []) f))
+
 (defn resolve-param-ref
   "Resolve one ParamRef through the 1-based `fetch` function, applying any
    boundary coercion carried by the placeholder."
   [ref fetch]
-  (let [value (fetch (:idx ref))]
+  (let [value (reduce (fn [v f] (f v))
+                      (fetch (:idx ref))
+                      (::transforms ref))]
     (case (first (::coercion ref))
       :seek-key
       ;; SQL `col = NULL` is UNKNOWN and therefore cannot match.  A nil

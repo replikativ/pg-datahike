@@ -207,6 +207,43 @@
           ;; ? IS NULL is TRUE → all 3 rows match
           (loop [n 0] (if (.next rs) (recur (inc n)) (is (= 3 n)))))))))
 
+(deftest test-prepared-batch-allows-alternating-parameter-types-through-cast
+  (testing "an explicit cast remains deferred across pgjdbc batch type changes"
+    (doseq [[suffix binary-transfer rewrite-batch]
+            (map-indexed (fn [i [binary rewrite]] [i binary rewrite])
+                         (for [binary ["false" "true"]
+                               rewrite ["false" "true"]]
+                           [binary rewrite]))]
+      (let [table (str "alternating_batch_" suffix)]
+        (with-conn [c {:preferQueryMode "extended"
+                       :prepareThreshold "1"
+                       :binaryTransfer binary-transfer
+                       :reWriteBatchedInserts rewrite-batch}]
+          (with-open [st (.createStatement c)]
+            (.executeUpdate st (str "CREATE TEMPORARY TABLE " table
+                                    " (a INTEGER, b INTEGER)")))
+          (.setAutoCommit c false)
+          (with-open [ps (.prepareStatement
+                          c (str "INSERT INTO " table
+                                 " (a, b) VALUES (?::int4, ?)"))]
+            (.setInt ps 1 2)
+            (.setInt ps 2 2)
+            (dotimes [_ 5] (.addBatch ps))
+            (.setString ps 1 "1")
+            (.setInt ps 2 2)
+            (.addBatch ps)
+            (is (= 6 (count (.executeBatch ps))))
+
+            (.setString ps 1 "2")
+            (.setInt ps 2 2)
+            (.addBatch ps)
+            (is (= 1 (count (.executeBatch ps)))))
+          (.commit c)
+          (with-open [st (.createStatement c)
+                      rs (.executeQuery st (str "SELECT count(*) FROM " table))]
+            (is (.next rs))
+            (is (= 7 (.getInt rs 1)))))))))
+
 (deftest test-text-parameter-decoder-rejects-invalid-utf8
   (doseq [bytes [(byte-array [97 0 98])
                  (byte-array [(unchecked-byte 0xc3)])]]
