@@ -211,6 +211,21 @@ jobs:
             --focus datahike.test.pg-secondary-validation-test
           no_output_timeout: 15m
 
+  campaign-inventory:
+    executor: clj-jdk21
+    steps:
+      - checkout
+      - install-clj-tools
+      - run:
+          name: Materialize pinned PostgreSQL regression source
+          command: bb pg-regress-setup
+          no_output_timeout: 10m
+      - run:
+          name: Validate beta-exit and PostgreSQL campaign inventories
+          command: |
+            bb beta-exit
+            bb pg-regress-wave inventory
+
   sqllogictest:
     executor: clj-jdk21
     steps:
@@ -597,6 +612,10 @@ workflows:
           context: ghcr-read-package
           requires:
             - build
+      - campaign-inventory:
+          context: ghcr-read-package
+          requires:
+            - setup
       - sqllogictest:
           context: ghcr-read-package
           requires:
@@ -637,10 +656,12 @@ workflows:
             - lint
             - unittest
             - secondary-index-validation
+            - campaign-inventory
             - sqllogictest
             - pgjdbc-conformance
             - hibernate-app-conformance
             - sqlalchemy-conformance
+            - pgdump-roundtrip
             - asyncpg-conformance
             - node-postgres-conformance
       - build-uber:

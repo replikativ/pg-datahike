@@ -65,6 +65,18 @@ moves to another major release. For deliberate exploratory runs against a
 different revision, set `PG_REGRESS_ALLOW_UNPINNED=1`; do not use that override
 when admitting strict slices.
 
+Create and verify the pinned checkout under the ignored `.internal/` directory
+without modifying an existing `../postgres` tree:
+
+```bash
+bb pg-regress-setup
+bb pg-regress-wave inventory
+```
+
+Pass a target directory to `bb pg-regress-setup`, or set `POSTGRES_SOURCE`, to
+put the checkout elsewhere. The setup command refuses to rewrite an existing
+checkout at the wrong revision.
+
 `:unmeasured` means the upstream file has not yet been triaged on a clean
 fixture, `:discovery` means it is continuously useful but has classified
 prerequisites or differences, and `:strict` means its complete normalized API

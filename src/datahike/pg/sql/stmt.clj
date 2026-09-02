@@ -6619,11 +6619,11 @@
           (and (= vtype :db.type/instant) (instance? java.time.LocalDate val))
           (java.util.Date/from
            (.toInstant (.atStartOfDay ^java.time.LocalDate val
-                                      (java.time.ZoneOffset/UTC))))
+                                      java.time.ZoneOffset/UTC)))
           (and (= vtype :db.type/instant) (instance? java.time.LocalDateTime val))
           (java.util.Date/from
            (.toInstant ^java.time.LocalDateTime val
-                       (java.time.ZoneOffset/UTC)))
+                       java.time.ZoneOffset/UTC))
           (and (= vtype :db.type/instant) (instance? java.time.OffsetDateTime val))
           (java.util.Date/from (.toInstant ^java.time.OffsetDateTime val))
           (and (= vtype :db.type/instant) (instance? java.time.ZonedDateTime val))

@@ -619,7 +619,8 @@ test/integration/pgjdbc/run.sh      # ~5 min
 ```
 
 See `doc/integration-testing.md` for the full three-layer testing
-model and ORM-harness setup.
+model and ORM-harness setup. The [beta-exit campaign](doc/beta-exit.md) records
+the release gates, remaining blockers, and deliberately unsupported surface.
 
 ## Architecture
 

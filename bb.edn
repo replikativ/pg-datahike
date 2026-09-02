@@ -40,6 +40,13 @@
                    :task (apply shell "bb test/integration/postgres-regress/campaign.clj"
                                 *command-line-args*)}
 
+  pg-regress-setup {:doc "Clone/verify the PostgreSQL source pinned by the compatibility campaign."
+                    :task (apply shell "bash test/integration/postgres-regress/setup.sh"
+                                 *command-line-args*)}
+
+  beta-exit {:doc "Validate and print the beta-exit test/coverage campaign."
+             :task (shell "bb test/integration/beta_exit.clj")}
+
   pg-regress-bootstrap {:doc "Load PostgreSQL onek/tenk API fixtures after running test_setup on a fresh database."
                         :task (shell "bash test/integration/postgres-regress/bootstrap-api.sh")}
 
@@ -50,10 +57,12 @@
         :task (shell "clojure -M:ffix")}
 
   lint {:doc "Run clj-kondo on src/ + test/."
-        :task (do (clj-kondo/print!
-                   (clj-kondo/run! {:lint ["src" "test"]
-                                    :config {:output {:exclude-files ["test/integration/"]}}}))
-                  nil)}
+        :task (let [result (clj-kondo/run!
+                            {:lint ["src" "test"]
+                             :config {:output {:exclude-files ["test/integration/"]}}})]
+                (clj-kondo/print! result)
+                (when (pos? (get-in result [:summary :error] 0))
+                  (throw (ex-info "clj-kondo found errors" (:summary result)))))}
 
   clean {:doc "Remove build artifacts."
          :task (shell "clojure -T:build clean")}

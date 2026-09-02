@@ -4,6 +4,22 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Beta-exit verification
+
+- Added an executable 0.2.0 beta-exit ledger covering per-commit, manual-release,
+  and planned gates, with evidence paths and explicit non-goals. CI validates
+  that every required job exists and blocks deployment.
+- The PostgreSQL regression inventory now has a non-destructive setup command
+  for its pinned `REL_17_7` source. CI verifies all 222 scheduled tests remain
+  classified and all strict source slices still point to executable tests.
+- The default-format Pagila `pg_dump` round-trip now blocks deployment rather
+  than running as a non-release check.
+- Fixed the lint task's false-green exit behavior. It now fails when clj-kondo
+  reports errors; three pre-existing static-field invocation errors were
+  corrected so the stricter gate starts green.
+- Recorded the first local beta-exit baseline, including the environment-dependent
+  asyncpg divergence and four distinct pgjdbc `BatchExecuteTest` failure classes.
+
 ### Password authentication and TLS
 
 - The pgwire server can now request and verify PostgreSQL cleartext-password
