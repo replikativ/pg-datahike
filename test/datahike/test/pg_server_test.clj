@@ -705,6 +705,25 @@
       (is (= "DELETE 1" (tag r))))
     (is (= [["3"]] (rows (.execute *handler* "SELECT COUNT(*) FROM person"))))))
 
+(deftest test-transaction-insert-then-delete
+  (testing "deleting a row inserted in the same transaction cancels its buffered writes"
+    (is (nil? (err (.execute *handler* "BEGIN"))))
+    (is (nil? (err (.execute *handler*
+                             "INSERT INTO person (name, age) VALUES ('Transient', 20), ('Kept', 30)"))))
+    ;; Exercise the update form as well: every operation targeting the
+    ;; transient tempid must disappear when the row is deleted.
+    (is (nil? (err (.execute *handler*
+                             "UPDATE person SET age = 21 WHERE name = 'Transient'"))))
+    (is (= "DELETE 1"
+           (tag (.execute *handler*
+                          "DELETE FROM person WHERE name = 'Transient'"))))
+    (is (= [["4"]]
+           (rows (.execute *handler* "SELECT COUNT(*) FROM person"))))
+    (is (nil? (err (.execute *handler* "COMMIT"))))
+    (is (= [["Kept" "30"]]
+           (rows (.execute *handler*
+                           "SELECT name, age FROM person WHERE name IN ('Transient', 'Kept')"))))))
+
 ;; ============================================================================
 ;; System queries
 ;; ============================================================================
