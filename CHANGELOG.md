@@ -22,6 +22,10 @@ All notable changes to pg-datahike.
 - Deleting a row inserted earlier in the same transaction now cancels its buffered
   insert and update writes instead of asking Datahike to retract a tempid. All four
   pgjdbc `testMixedBatch` variants now pass.
+- Text-format Bind parameters now reject embedded NUL and malformed UTF-8 instead
+  of accepting Java replacement characters. The error uses PostgreSQL's `22021`
+  `character_not_in_repertoire` SQLSTATE, and all four pgjdbc embedded-NUL batch
+  variants now pass.
 
 ### Password authentication and TLS
 

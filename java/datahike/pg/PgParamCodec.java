@@ -4,6 +4,8 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -552,6 +554,30 @@ public final class PgParamCodec {
         }
     }
 
+    /**
+     * Decode a PostgreSQL text-format value without Java's replacement-
+     * character fallback. PostgreSQL's UTF8 server encoding rejects both
+     * malformed input and U+0000 with character_not_in_repertoire (22021).
+     */
+    public static String decodeUtf8(byte[] bytes) {
+        for (byte b : bytes) {
+            if (b == 0) {
+                throw new PgWireServer.PgProtocolException("22021",
+                    "invalid byte sequence for encoding \"UTF8\": 0x00");
+            }
+        }
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString();
+        } catch (CharacterCodingException e) {
+            throw new PgWireServer.PgProtocolException("22021",
+                "invalid byte sequence for encoding \"UTF8\"");
+        }
+    }
+
     // ========================================================================
     // Text format — values arrive as UTF-8 strings, converted per OID to the
     // matching Clojure/Java type. We don't rely on the downstream translator
@@ -559,7 +585,7 @@ public final class PgParamCodec {
     // ========================================================================
 
     public static Object decodeText(int oid, byte[] bytes) {
-        String s = new String(bytes, StandardCharsets.UTF_8);
+        String s = decodeUtf8(bytes);
         return switch (oid) {
             case PgWireServer.OID_BOOL ->
                 "t".equalsIgnoreCase(s) || "true".equalsIgnoreCase(s) || "1".equals(s);
@@ -1103,7 +1129,7 @@ public final class PgParamCodec {
             case PgWireServer.OID_TEXT,
                  PgWireServer.OID_VARCHAR,
                  PgWireServer.OID_NAME ->
-                new String(bytes, StandardCharsets.UTF_8);
+                decodeUtf8(bytes);
 
             // bytea — already raw; pass through.
             case PgWireServer.OID_BYTEA ->
@@ -1117,12 +1143,12 @@ public final class PgParamCodec {
                         "unsupported jsonb binary version: "
                         + (bytes.length == 0 ? "empty" : bytes[0]));
                 }
-                yield new String(bytes, 1, bytes.length - 1, StandardCharsets.UTF_8);
+                yield decodeUtf8(java.util.Arrays.copyOfRange(bytes, 1, bytes.length));
             }
 
             // json — UTF-8 JSON directly.
             case PgWireServer.OID_JSON ->
-                new String(bytes, StandardCharsets.UTF_8);
+                decodeUtf8(bytes);
 
             // vector_recv: reject malformed lengths, the reserved header
             // field, invalid dimensions, and non-finite elements before the
