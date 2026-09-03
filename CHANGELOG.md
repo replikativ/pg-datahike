@@ -26,6 +26,9 @@ All notable changes to pg-datahike.
   of accepting Java replacement characters. The error uses PostgreSQL's `22021`
   `character_not_in_repertoire` SQLSTATE, and all four pgjdbc embedded-NUL batch
   variants now pass.
+- Explicit casts around prepared INSERT parameters are now deferred until Bind
+  supplies a value instead of trying to cast the `ParamRef` placeholder during
+  Parse. All four pgjdbc alternating-parameter-type batch variants now pass.
 
 ### Password authentication and TLS
 

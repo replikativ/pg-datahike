@@ -6165,8 +6165,21 @@
          (- inner)
          inner))
      (instance? CastExpression e)
-     (apply-sql-cast (extract-value (.getLeftExpression ^CastExpression e) schema db)
-                     ^CastExpression e)
+     (let [^CastExpression ce e
+           inner (extract-value (.getLeftExpression ce) schema db)]
+       ;; Parse must stay value-free. Applying the cast to a ParamRef here
+       ;; tries to coerce the placeholder record itself (for example to
+       ;; bigint) and rejects the Parse before pgjdbc can send Bind. Retain
+       ;; the exact cast operation on the placeholder and apply it when the
+       ;; bound value is substituted. This also composes nested casts in
+       ;; inside-out order.
+       (if (params/param-ref? inner)
+         (params/transform-param-ref
+          inner
+          (fn [value]
+            (binding [params/*parse-db* db]
+              (apply-sql-cast value ce))))
+         (apply-sql-cast inner ce)))
      (instance? Addition e)
      (let [^Addition expression e
            value (extract-numeric-binary (.getLeftExpression expression)

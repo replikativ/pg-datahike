@@ -110,8 +110,9 @@
    :exit "Text parameters containing an embedded NUL are rejected with a PostgreSQL-compatible error."}
   {:id :alternating-batch-types
    :wave 1
-   :status :open
-   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_wire_jdbc_test.clj"
+              "test/integration/pgjdbc/expected-skips.md"]
    :exit "Changing compatible parameter types across a JDBC batch never leaks an unresolved ParamRef into coercion."}
   {:id :temp-table-isolation
    :wave 1
