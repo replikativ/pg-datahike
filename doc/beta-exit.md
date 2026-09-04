@@ -37,7 +37,7 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
 
 ## Campaign status — 2026-09-04
 
-- Unit: 1,609 tests / 6,854 assertions, all passing.
+- Unit: 1,615 tests / 6,905 assertions, all passing.
 - SQLLogic: 61 assertion groups, all passing.
 - Released secondary stack: 5 tests / 75 assertions, all passing on JDK 25.
 - node-postgres: 14 admitted files passing, 8 known-gap files still xfail.
@@ -48,7 +48,7 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   confirms that reconciling the environment-dependent baseline is a blocker;
   the manifest was not weakened to make the local run green.
 - PostgreSQL 17.7: all 222 scheduled files classified—57 campaign, 96 backlog
-  and 69 deliberate non-goals. The campaign contains 94 admitted strict
+  and 69 deliberate non-goals. The campaign contains 96 admitted strict
   slices; 3 complete files are strict and 54 are measured discovery files.
 
 ## Where coverage is still weak

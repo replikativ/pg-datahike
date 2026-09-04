@@ -382,8 +382,11 @@
   [^CreateTable ct]
   (when-let [opts (.getTableOptionsStrings ct)]
     (let [opts-vec (vec opts)
-          idx (.indexOf ^java.util.List opts-vec "INHERITS")]
-      (when (and (>= idx 0) (< (inc idx) (count opts-vec)))
+          idx (first (keep-indexed
+                      (fn [i option]
+                        (when (= "inherits" (str/lower-case (str option))) i))
+                      opts-vec))]
+      (when (and (some? idx) (< (inc idx) (count opts-vec)))
         ;; Next element is "(parent_table)" — strip parens
         (let [raw (str (nth opts-vec (inc idx)))]
           (-> raw

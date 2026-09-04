@@ -7905,20 +7905,14 @@
                              :sqlstate "42P01"
                              :table raw-table})))
         columns (.getColumns insert)
-        parent-table (when db
-                       (ffirst (d/q
-                                '{:find [?p]
-                                  :where [[?e :__inherit__/child ?c]
-                                          [?e :__inherit__/parent ?p]]
-                                  :in [$ ?c]}
-                                db raw-table)))
+        ancestor-tables (ctx/inheritance-ancestors db raw-table)
         raw-cols (if (seq columns)
                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
                    (let [own-order (or (pgs/column-order-from-db db raw-table)
                                        (when-let [cols (pgs/column-info schema raw-table)]
                                          (mapv :name (rest cols))))
-                         parent-order (when parent-table
-                                        (pgs/column-order-from-db db parent-table))]
+                         parent-order (mapcat #(pgs/column-order-from-db db %)
+                                              (reverse ancestor-tables))]
                      ;; PostgreSQL orders inherited columns before the
                      ;; child's own columns for INSERT without a target list.
                      ;; An empty child column-order is still a real value, so
@@ -8098,19 +8092,13 @@
             row-attrs (if has-marker?
                         (mapv #(assoc % marker true) row-attrs)
                         row-attrs)
-            parent-table (when db
-                           (ffirst (q-fn
-                                    '{:find [?p]
-                                      :where [[?e :__inherit__/child ?c]
-                                              [?e :__inherit__/parent ?p]]
-                                      :in [$ ?c]}
-                                    db table-name)))
-            row-attrs (if parent-table
-                        (let [parent-marker (pgs/row-marker-attr parent-table)]
-                          (if (get schema parent-marker)
-                            (mapv #(assoc % parent-marker true) row-attrs)
-                            row-attrs))
-                        row-attrs)
+            row-attrs (reduce
+                       (fn [rows ancestor]
+                         (let [marker (pgs/row-marker-attr ancestor)]
+                           (if (get schema marker)
+                             (mapv #(assoc % marker true) rows)
+                             rows)))
+                       row-attrs ancestor-tables)
             conflict-action (.getConflictAction insert)
             returning (extract-returning (.getReturningClause insert))]
         (cond
@@ -8314,12 +8302,13 @@
                         (mapv #(assoc % marker true) row-attrs)
                         row-attrs)
         ;; For INHERITS: also add parent's row-marker so parent queries find this entity
-            row-attrs (if parent-table
-                        (let [parent-marker (pgs/row-marker-attr parent-table)]
-                          (if (get schema parent-marker)
-                            (mapv #(assoc % parent-marker true) row-attrs)
-                            row-attrs))
-                        row-attrs)
+            row-attrs (reduce
+                       (fn [rows ancestor]
+                         (let [marker (pgs/row-marker-attr ancestor)]
+                           (if (get schema marker)
+                             (mapv #(assoc % marker true) rows)
+                             rows)))
+                       row-attrs ancestor-tables)
             result
             (if conflict-action
           ;; ON CONFLICT — build :db.fn/call for atomic upsert

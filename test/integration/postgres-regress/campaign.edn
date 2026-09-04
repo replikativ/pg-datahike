@@ -59,7 +59,7 @@
     {:name "rowtypes" :mode :discovery
      :boundaries #{:structural-type :row-comparisons :nulls}
      :blockers #{:composite-type-ddl :composite-storage :custom-operators
-                 :fixture-data :planner-explain :ddl-dispatch-fallthrough}
+                 :fixture-data :planner-explain}
      :strict-slices
      [{:id :standard-row-comparison-semantics
        :source-lines [98 109]
@@ -68,7 +68,15 @@
       {:id :named-composite-record-comparison
        :source-lines [222 254]
        :gate "test/datahike/test/pg_correlated_subquery_test.clj"
-       :test-var "row-comparisons-follow-postgresql-semantics"}]}
+       :test-var "row-comparisons-follow-postgresql-semantics"}
+      {:id :ctas-inheritance-implicit-insert
+       :source-lines [463 465]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "empty-inheritance-chain-after-ctas-accepts-an-implicit-insert"}
+      {:id :transitive-inheritance-implicit-insert
+       :source-lines [469 470]
+       :gate "test/datahike/test/pg_inherits_resolution_test.clj"
+       :test-var "empty-inheritance-chain-after-ctas-accepts-an-implicit-insert"}]}
     {:name "numeric" :mode :discovery
      :boundaries #{:scalar-type :operators :casts}
      ;; The remaining raw pg_regress diff is classified: row order in

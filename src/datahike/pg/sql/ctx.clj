@@ -194,6 +194,22 @@
            [:aliased alias-key kw]
            kw))))))
 
+(defn inheritance-ancestors
+  "Return a table's inheritance chain from its immediate parent to the root.
+   A seen set makes malformed/cyclic metadata terminate safely."
+  [db table-name]
+  (when db
+    (loop [child table-name, seen #{table-name}, ancestors []]
+      (let [parent (ffirst
+                    (d/q '{:find [?p]
+                           :where [[?e :__inherit__/child ?c]
+                                   [?e :__inherit__/parent ?p]]
+                           :in [$ ?c]}
+                         db child))]
+        (if (and parent (not (contains? seen parent)))
+          (recur parent (conj seen parent) (conj ancestors parent))
+          ancestors)))))
+
 (defn resolve-inherited-attr
   "For INHERITS support: check if an attribute exists in the table's schema.
    If not, walk up the inheritance chain to find it in a parent.
@@ -201,21 +217,13 @@
   [attr schema db]
   (if (get schema attr)
     attr  ;; attribute exists in the table's own namespace
-    ;; Check for inheritance: is there a parent table?
     (let [table-name (namespace attr)
-          col-name (name attr)
-          q-fn d/q
-          parent (ffirst (q-fn '{:find [?p]
-                                 :where [[?e :__inherit__/child ?c]
-                                         [?e :__inherit__/parent ?p]]
-                                 :in [$ ?c]}
-                               db table-name))]
-      (if parent
-        (let [parent-attr (keyword parent col-name)]
-          (if (get schema parent-attr)
-            parent-attr  ;; found in parent namespace
-            attr))       ;; not found in parent either, return original
-        attr))))
+          col-name (name attr)]
+      (or (some (fn [parent]
+                  (let [parent-attr (keyword parent col-name)]
+                    (when (get schema parent-attr) parent-attr)))
+                (inheritance-ancestors db table-name))
+          attr))))
 
 (defn attr-of
   "The Datahike attribute a `resolve-column` result denotes, with
