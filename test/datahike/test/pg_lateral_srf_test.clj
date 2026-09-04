@@ -45,6 +45,8 @@
 (defn- run [sql] (.execute *h* sql))
 (defn- rows [sql] (mapv vec (.-rows ^PgWireServer$QueryResult (run sql))))
 (defn- v [sql] (ffirst (rows sql)))
+(defn- state [sql] (.-sqlstate ^PgWireServer$QueryResult (run sql)))
+(defn- error [sql] (.-error ^PgWireServer$QueryResult (run sql)))
 
 (defn- seed! []
   (run "CREATE TABLE t (id int, n int)")
@@ -90,7 +92,13 @@
                   GROUP BY t.id ORDER BY t.id"))))
 
   (testing "a correlated argument in every position"
-    (is (= "2" (v "SELECT count(*) FROM t, LATERAL generate_series(t.n, t.n) AS g")))))
+    (is (= "2" (v "SELECT count(*) FROM t, LATERAL generate_series(t.n, t.n) AS g"))))
+
+  (testing "an unsupported nested correlated expression is explicit"
+    (let [sql (str "SELECT t.id, g.g FROM t, LATERAL "
+                   "generate_series(1, t.n + 1) AS g")]
+      (is (= "0A000" (state sql)))
+      (is (re-find #"cannot be evaluated in this context" (or (error sql) ""))))))
 
 (deftest duplicates-are-not-collapsed
   ;; Datalog is set-based: a function returning [x x x] yields ONE row
@@ -117,7 +125,8 @@
 (deftest constant-arguments-still-take-the-materialise-once-path
   ;; A constant EXPRESSION argument must not be mistaken for a
   ;; correlated one: `srf-const-eval` answers ::corr for both, so the
-  ;; discriminator is syntactic — a Column argument.
+  ;; discriminator is syntactic — a column reference anywhere in an argument
+  ;; prevents constant materialisation.
   (is (= [["1"] ["2"] ["3"]]
          (rows "SELECT * FROM generate_series(1, array_upper(current_schemas(false), 1) + 2)")))
   (is (= [["1"] ["2"]] (rows "SELECT * FROM generate_series(1,2)"))))

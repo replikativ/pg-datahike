@@ -999,6 +999,42 @@
           i (.lastIndexOf n ".")]
       (if (neg? i) n (subs n (inc i))))))
 
+(defn- table-function-has-column-reference?
+  "Whether a table function argument contains a column reference.
+
+   Look through the complete argument expression. Checking only for an
+   argument that *is* a Column misses `generate_series(1, t.n + 1)` and
+   `unnest(ARRAY[t.n])`; the latter was then materialised once as the string
+   `r` and silently returned that value for every outer row."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf]
+  (boolean
+   (some seq
+         (map params/ast-columns
+              (or (.getParameters (.getFunction tf)) [])))))
+
+(defn- reject-unmaterialized-table-function!
+  "Raise a PostgreSQL error when a FROM table function reaches the end of
+   the materialisation paths.
+
+   An unknown name is ordinary function resolution failure (42883). A name
+   we implement but cannot shape or evaluate in this context is an explicit
+   capability boundary (0A000). Neither case may fall through as an absent
+   relation: that used to return only the outer rows in comma joins, or leak
+   an unbound Datalog entity var when WITH ORDINALITY exposed columns."
+  [^net.sf.jsqlparser.statement.select.TableFunction tf]
+  (let [fname (srf-base-name (.getName (.getFunction tf)))]
+    (if (contains? known-srf-names fname)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "table function " fname
+                             " cannot be evaluated in this context")}))
+      (throw (errors/pg-error
+              :undefined-function
+              {:function (str fname "()")
+               :hint (str "No function matches the given name and "
+                          "argument types. You might need to add "
+                          "explicit type casts.")})))))
+
 (defn- target-list-srf?
   "Whether expr is a set-returning function supported by ProjectSet.
 
@@ -1528,15 +1564,15 @@
         fname (srf-base-name (.getName f))
         shape (get correlated-srf-shapes fname)
         params (vec (or (.getParameters f) []))
-        ;; Correlated iff an argument IS a column reference. This is a
-        ;; SYNTACTIC test on purpose. Evaluating instead does not
+        ;; Correlation is a SYNTACTIC test on purpose. Evaluating instead does not
         ;; discriminate: `srf-const-eval` answers ::corr for a constant
         ;; EXPRESSION too (`array_upper(current_schemas(false), 1)` --
         ;; the pgjdbc TypeInfoCache shape), and the widened evaluation
         ;; the materialise-once path uses goes the other way, happily
         ;; resolving `t.n` against some arbitrary row and reporting it
-        ;; constant. A Column argument is exactly what "correlated"
-        ;; means, and a function-call argument can never be one.
+        ;; constant. The current binding path supports a bare outer column;
+        ;; nested expressions are detected separately and rejected rather
+        ;; than materialised as constants.
         corr? (some #(instance? Column %) params)]
     (when (and shape corr? (seq params))
       (let [talias (when-let [a (.getAlias tf)]
@@ -3107,27 +3143,11 @@
 
           (and db (instance? net.sf.jsqlparser.statement.select.TableFunction from-item))
           (if-let [{vdb :db vschema :schema vname :name valias :alias}
-                   (table-fn->virtual-table
-                    ^net.sf.jsqlparser.statement.select.TableFunction from-item db)]
+                   (when-not (table-function-has-column-reference? from-item)
+                     (table-fn->virtual-table
+                      ^net.sf.jsqlparser.statement.select.TableFunction from-item db))]
             [vdb vschema vname valias]
-            ;; An unrecognised function in FROM used to fall through to
-            ;; "no relation", so `SELECT * FROM nosuchfunc(1)` answered
-            ;; ZERO ROWS and `count(*)` raised the internal
-            ;; `Query for unknown vars: [?_eid]`. PostgreSQL raises
-            ;; 42883. A name we DO know but could not materialise is a
-            ;; different case -- a correlated LATERAL argument -- and
-            ;; keeps the old behaviour until LATERAL lands.
-            (let [fname (srf-base-name
-                         (.getName (.getFunction
-                                    ^net.sf.jsqlparser.statement.select.TableFunction from-item)))]
-              (if (contains? known-srf-names fname)
-                [db schema nil nil]
-                (throw (errors/pg-error
-                        :undefined-function
-                        {:function (str fname "()")
-                         :hint (str "No function matches the given name and "
-                                    "argument types. You might need to add "
-                                    "explicit type casts.")})))))
+            (reject-unmaterialized-table-function! from-item))
 
           ;; A sequence is a relation in PG: `SELECT * FROM myseq` reads
           ;; its position. Materialise the three-column form so the rest
@@ -3219,6 +3239,7 @@
                ;; every reference to it raised `column "g" does not
                ;; exist`.
                (and db (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+                    (not (table-function-has-column-reference? rt))
                     (table-fn->virtual-table
                      ^net.sf.jsqlparser.statement.select.TableFunction rt db))
                (let [{vdb :db vschema :schema vname :name valias :alias}
@@ -3231,6 +3252,15 @@
                   ;; space, so it joins BY VALUE like a derived table.
                   (conj derived {:join j :alias (or valias vname)})
                   lsrfs])
+
+               ;; A TableFunction must be handled by one of the two branches
+               ;; above. Falling through used to ignore an unknown function
+               ;; in a comma/join position entirely, returning the OUTER rows
+               ;; as if the function were not in the query. WITH ORDINALITY
+               ;; was worse: its projected columns leaked an unbound ?f_eid
+               ;; into the Datalog query. Preserve neither failure mode.
+               (instance? net.sf.jsqlparser.statement.select.TableFunction rt)
+               (reject-unmaterialized-table-function! rt)
 
                (instance? Table rt)
                (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)]

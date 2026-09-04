@@ -294,8 +294,29 @@
   ;; Used to fall through to "no relation", so `SELECT * FROM
   ;; nosuchfunc(1)` answered ZERO ROWS and count(*) raised the internal
   ;; `Query for unknown vars: [?_eid]`. PostgreSQL raises 42883.
-  (let [^PgWireServer$QueryResult r (run "SELECT * FROM nosuchfunc(1)")]
-    (is (re-find #"function nosuchfunc\(\) does not exist" (or (.-error r) "")))))
+  (let [sql "SELECT * FROM nosuchfunc(1)"]
+    (is (= "42883" (state sql)))
+    (is (re-find #"function nosuchfunc\(\) does not exist" (or (error sql) "")))))
+
+(deftest unknown-function-in-join-raises-42883
+  ;; rangefuncs.sql:264-287 exposed both versions of this translator hole.
+  ;; Without projected function columns the join was silently ignored and
+  ;; returned the three VALUES rows. WITH ORDINALITY reached Datalog with an
+  ;; unbound ?f_eid. Both are ordinary PostgreSQL function lookup failures.
+  (doseq [sql ["SELECT * FROM (VALUES (1),(2),(3)) v(r), nosuchfunc(10+r,13)"
+               (str "SELECT * FROM (VALUES (1),(2),(3)) v(r), "
+                    "nosuchfunc(10+r,13) WITH ORDINALITY AS f(i,s,o)")]]
+    (is (= "42883" (state sql)) sql)
+    (is (re-find #"function nosuchfunc\(\) does not exist" (or (error sql) "")) sql)
+    (is (not (re-find #"unknown vars|\?f_eid" (or (error sql) ""))) sql)))
+
+(deftest unsupported-correlated-table-function-is-explicit
+  ;; We cannot yet derive the dynamic output shape of a correlated unnest.
+  ;; It used to materialise ARRAY[r] once as the literal string "r", which
+  ;; was a plausible-looking but false answer. Keep the boundary explicit.
+  (let [sql "SELECT * FROM (VALUES (1),(2)) v(r), unnest(ARRAY[r]) u"]
+    (is (= "0A000" (state sql)))
+    (is (re-find #"cannot be evaluated in this context" (or (error sql) "")))))
 
 (deftest record-srf-temporal-and-narrow-int-columns
   ;; The declared type has to reach BOTH the value and the catalog. A
