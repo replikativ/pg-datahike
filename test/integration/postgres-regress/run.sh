@@ -21,6 +21,10 @@ regress_timeout="${PG_REGRESS_TIMEOUT:-}"
 # Keep one pathological statement from pinning a regression connection
 # indefinitely. Set 0 to disable when deliberately profiling a slow query.
 statement_timeout="${PG_REGRESS_STATEMENT_TIMEOUT:-10s}"
+# These messages expose implementation exceptions or malformed generated
+# Datalog rather than a PostgreSQL-facing diagnostic. Keep the expression in
+# one place so the summary count and printed examples cannot drift apart.
+internal_failure_pattern='class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|No implementation of method:|not supported on this type:|Cannot parse (rule-vars|:[a-z-]+)|Character array is missing "e" notation exponential mark|Query for unknown vars|Query should be a vector or a map|Unknown parse result type|SQLSTATE XX000|server closed the connection'
 admin_db="${target_db}"
 isolated_db=""
 database_created=0
@@ -158,9 +162,7 @@ if (( ${#result_files[@]} > 0 )); then
     fi
     error_count="$(rg -c '^ERROR:  ' "${result_file}" || true)"
     aborted_count="$(rg -c '^ERROR:  current transaction is aborted' "${result_file}" || true)"
-    internal_count="$(rg -c \
-      'class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|Query for unknown vars|Query should be a vector or a map|Unknown parse result type|SQLSTATE XX000|server closed the connection' \
-      "${result_file}" || true)"
+    internal_count="$(rg -c "${internal_failure_pattern}" "${result_file}" || true)"
     api_match="n/a"
     if [[ -f "${expected_file}" ]]; then
       # PostgreSQL prints source excerpts and carets for parser/input errors.
@@ -198,9 +200,8 @@ if (( ${#result_files[@]} > 0 )); then
 
   echo
   echo "Internal-failure signatures (first 30):"
-  rg -n --no-heading \
-    'class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|Query for unknown vars|Query should be a vector or a map|Unknown parse result type|SQLSTATE XX000|server closed the connection' \
-    "${result_files[@]}" | head -30 || true
+  rg -n --no-heading "${internal_failure_pattern}" "${result_files[@]}" \
+    | head -30 || true
 fi
 
 case "${regress_status}" in

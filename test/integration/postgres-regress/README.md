@@ -156,8 +156,9 @@ also prints:
 - `api-match`, which compares complete output after removing only PostgreSQL's
   `LINE n:` source excerpt and caret presentation from errors;
 - the most frequent target-side errors;
-- internal-looking signatures such as JVM cast/nil failures, unknown Datalog
-  variables, and lost connections.
+- internal-looking signatures such as JVM cast/nil and protocol-dispatch
+  failures, malformed generated Datalog, raw numeric-parser errors, unknown
+  Datalog variables, and lost connections.
 
 An `aborted` count is not a count of independent defects. One unexpected error
 inside an explicit transaction can turn every following statement into
