@@ -7743,15 +7743,11 @@
       (catch Exception e
         (classified-error "ALTER TABLE error: " e)))))
 
-(defn- drop-table-tx!
-  "Retract every data entity and schema attribute belonging to `table`'s
-   namespace, committing against `conn`. Shared by the DROP TABLE handler
-   and the connection-close temp-table cleanup. Returns the tx-report (or
-   nil when the table had nothing to retract). Throws on transact failure
-   — callers decide whether to surface or swallow."
-  [conn table]
-  (let [db (d/db conn)
-        db-schema (dbi/-schema db)
+(defn- drop-table-tx-data
+  "Build the retractions for every row, schema attribute, and secondary-index
+   declaration belonging to `table` in `db`."
+  [db table]
+  (let [db-schema (dbi/-schema db)
         ;; All schema attributes in this table's namespace.
         table-attrs (into []
                           (keep (fn [[attr-kw _]]
@@ -7803,24 +7799,46 @@
         all-tx-data (into data-tx-data
                           (concat (filter some? schema-tx-data)
                                   secondary-tx-data))]
-    (when (seq all-tx-data)
-      (transact-recorded! conn all-tx-data))))
+    all-tx-data))
+
+(defn- drop-table-tx!
+  "Retract a table against `conn`. Used by connection-close temp-table
+   cleanup; SQL DROP goes through exec-ddl-drop so explicit transactions can
+   apply the same data to their speculative database."
+  [conn table]
+  (let [tx-data (drop-table-tx-data (d/db conn) table)]
+    (when (seq tx-data)
+      (transact-recorded! conn tx-data))))
 
 (defn- exec-ddl-drop
   "DROP TABLE — single name (:table, JSqlParser path) or a list
-   (:tables, classify's :drop-table-multi path). Per-table drops run
-   sequentially; a missing table is a no-op (drop-table-tx! finds no
-   attrs), so IF EXISTS needs no extra branch."
+   (:tables, classify's :drop-table-multi path). All names are retracted in
+   one transaction; a missing table contributes no tx-data, so IF EXISTS
+   needs no extra branch."
   [ctx parsed]
-  (let [{:keys [conn temp-tables]} ctx]
+  (let [{:keys [conn tx-state temp-tables]} ctx]
     (try
-      (doseq [raw-table (or (:tables parsed) [(:table parsed)])
-              :let [table (params/unquote-ident raw-table)]]
-        (drop-table-tx! conn table)
-        ;; A DROP TABLE on a tracked temp table means close() must not
-        ;; try to drop it again.
-        (when temp-tables (swap! temp-tables disj table)))
-      (empty-result "DROP TABLE")
+      (let [tables (mapv params/unquote-ident
+                         (or (:tables parsed) [(:table parsed)]))
+            db (if (:in-tx? @tx-state)
+                 (:speculative-db @tx-state)
+                 (d/db conn))
+            tx-data (into [] (mapcat #(drop-table-tx-data db %)) tables)
+            result (if (:in-tx? @tx-state)
+                     (execute-ddl-in-tx tx-state tx-data "DROP TABLE")
+                     (do
+                       (when (seq tx-data)
+                         (transact-recorded! conn tx-data))
+                       (empty-result "DROP TABLE")))]
+        ;; Outside a transaction, a dropped temp table no longer needs close
+        ;; cleanup. Inside one, retain the tracking entry conservatively:
+        ;; ROLLBACK restores the table, while after COMMIT close cleanup is a
+        ;; harmless no-op against the already-absent namespace.
+        (when (and temp-tables
+                   (not (:in-tx? @tx-state))
+                   (nil? (.-error ^PgWireServer$QueryResult result)))
+          (swap! temp-tables #(apply disj % tables)))
+        result)
       (catch Exception e
         (classified-error "DROP TABLE error: " e)))))
 

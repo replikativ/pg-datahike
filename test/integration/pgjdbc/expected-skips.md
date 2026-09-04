@@ -4,13 +4,14 @@ This file is the contract for what `run.sh` is and is not exercising. If
 you see a failure outside the lists below, treat it as a regression
 signal.
 
-## Included in 0.1 CI
+## Included in per-commit CI
 
-Just one class — the verified-stable surface:
+The verified-stable surface:
 
 | Class | Rationale |
 |---|---|
 | `org.postgresql.test.jdbc2.ResultSetTest` | 80/80 pass. Exercises cursor behavior, metadata, `wasNull`, type coercions on getters/setters, updatable-ResultSet flags. Binary + text modes both green. |
+| `org.postgresql.test.jdbc2.BatchExecuteTest` | 132/132 pass as of 2026-09-04. Exercises statement and prepared batches across regular/forced binary transfer and rewritten/non-rewritten inserts, including generated keys, mixed NULLs, error rollback and update counts. |
 
 ## Deferred to post-0.1
 
@@ -26,7 +27,6 @@ that blocks it from joining the per-commit CI list:
 | `StatementTest` | TBD. |
 | `PreparedStatementTest` (+ `jdbc42`) | ~30% fail rate; one specific bug is `testUpdateWithPGobject` under FORCE binary (addressed), others open. |
 | `ServerPreparedStmtTest` | TBD. |
-| `BatchExecuteTest` | 130/132 passed on 2026-09-02. `testMixedBatch`, `testBatchWithEmbeddedNulls`, and `testBatchWithAlternatingTypes` now pass all four binary/rewrite variants. One distinct failure remains: rewritten `testBatchReturningMixedNulls` does not provide the expected chained `BatchUpdateException`. |
 | `ResultSetMetaDataTest` | TBD. |
 | `GetXXXTest` | TBD. |
 | `DatabaseMetaDataTest` / `jdbc4` / `jdbc42` | Pounds pg_catalog / information_schema projections; our virtual catalogs cover most but not all columns. |
@@ -63,5 +63,5 @@ produces only noise.
 
 ## Expected failures within the focus list
 
-None currently. `ResultSetTest` runs clean. Any failure here = real
+None currently. Both admitted classes run clean. Any failure here = real
 regression.

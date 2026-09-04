@@ -37,13 +37,14 @@ exec 3<&-; exec 3>&-
 # If you add a class here, add a one-line rationale in expected-skips.md under
 # the "included" section.
 TESTS=(
-  # --- ResultSet shape — the verified-stable surface for 0.1.
-  # 80/80 pass on pg-datahike 0.1. The rest of the pgjdbc class list
-  # (DriverTest, ConnectionTest, BatchExecuteTest, PreparedStatementTest,
+  # --- Verified-stable JDBC surface.
+  # The rest of the pgjdbc class list
+  # (DriverTest, ConnectionTest, PreparedStatementTest,
   # DatabaseMetaData*, …) is in active development — see
   # `expected-skips.md → Deferred classes` for the specific gaps. When
   # those land, re-add the class name here one at a time and re-run.
   "org.postgresql.test.jdbc2.ResultSetTest"
+  "org.postgresql.test.jdbc2.BatchExecuteTest"
 )
 
 # Build the --tests argument list for gradle.
