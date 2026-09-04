@@ -30,6 +30,7 @@ upstream runs as a separate `node file.js` invocation. A file passes iff
 | `test/integration/client/query-column-names-tests.js` | Column alias propagation through descriptor. |
 | `test/integration/client/promise-api-tests.js` | Promise-returning `query()`. |
 | `test/integration/client/query-as-promise-tests.js` | `new Query(...)` + `.promise()`. |
+| `test/integration/client/api-tests.js` | Callback API behavior, including startup rejection for an unknown database. |
 | `test/integration/client/transaction-tests.js` | `BEGIN` / `COMMIT` / `ROLLBACK`. |
 | `test/integration/client/json-type-parsing-tests.js` | `json` / `jsonb` parsing. |
 
@@ -76,11 +77,10 @@ happens, move the file up into `FILES`.
 | `field-name-escape-tests.js` | quoted-identifier escaping | Backslash / exotic quoted-identifier rules differ from PG (JSqlParser identifier handling). Adversarial; low realistic-use value. |
 | `query-error-handling-tests.js` | "client can do nothing on cancellation" | Query cancellation via `pg_cancel_backend()` over `pg_stat_activity` not implemented. |
 | `query-error-handling-prepared-statement-tests.js` | backend-terminate path | `pg_terminate_backend()` over `pg_stat_activity` not implemented. |
-| `api-tests.js` | "raises error if cannot connect" (`.../ieieie`) | Connecting to a non-existent database must fail at **startup** with `3D000`. We accept the connection and only reject at query time, so `pool.connect()` succeeds. |
 | `type-coercion-tests.js` | "date range extremes" | PostgreSQL and ECMAScript accept timestamps up to year 275760 and BCE dates far outside `java.time`'s practical conversion path. The 13 core coercion cases, timestamptz round-trip, and "selecting nulls" (`7 <> $1`, `$1=NULL`) pass. |
 | `parse-int-8-tests.js` | `SELECT COUNT(*), '{1,2,3}'::bigint[] FROM asdf` | `COUNT(*)` over an empty table must return one row (count 0); plus the `'{1,2,3}'::bigint[]` array-literal cast. |
 
 Priority for closing these: per-session `pg_temp` isolation (2 files, high
-realistic-use value) first; `3D000`-at-connect and the array-literal cast
-next. The remaining query-error files require SQL helpers around
+realistic-use value) first, then the array-literal cast. The remaining
+query-error files require SQL helpers around
 `pg_stat_activity`; `field-name-escape` is adversarial and lowest priority.

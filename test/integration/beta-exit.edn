@@ -61,7 +61,7 @@
    :release-gate? true
    :evidence ["test/integration/node-postgres/run.sh"
               "test/integration/node-postgres/expected-skips.md"]
-   :claim "fourteen must-pass and eight expected-failure upstream files"}
+   :claim "fifteen must-pass and seven expected-failure upstream files"}
   {:id :pg-dump
    :cadence :commit
    :status :gating
@@ -123,8 +123,9 @@
    :exit "Concurrent sessions isolate same-named temporary tables or CREATE TEMP fails explicitly."}
   {:id :startup-database-validation
    :wave 1
-   :status :open
-   :evidence ["test/integration/node-postgres/expected-skips.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_multi_db_test.clj"
+              "test/integration/node-postgres/run.sh"]
    :exit "A nonexistent startup database is rejected with SQLSTATE 3D000."}
   {:id :query-cancellation
    :wave 2

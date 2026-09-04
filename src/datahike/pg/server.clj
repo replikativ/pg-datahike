@@ -9198,11 +9198,8 @@
   (reify PgWireServer$QueryHandler
     (close [_])
     (parse [_ _ _]
-      ;; Direct throw to Java wire layer — use pg-error so .getMessage()
-      ;; returns the PG-shaped string. Java's catch still emits XX000
-      ;; because we don't subclass PgProtocolException, but the message
-      ;; text now carries the right user-facing form.
-      (throw (errors/pg-error :undefined-database {:database db-name})))
+      (throw (PgWireServer$PgProtocolException.
+              "3D000" (str "database \"" db-name "\" does not exist"))))
     (describeParams [_ _] (int-array 0))
     (executePrepared [_ _ _]
       (-> (PgWireServer$QueryResult. (str "database \"" db-name "\" does not exist"))
@@ -9272,6 +9269,15 @@
                         (atom registry-or-atom))
         opts (assoc opts :registry-atom registry-atom)]
     (reify PgWireServer$QueryHandlerFactory
+      (validateStartup [_ startup-params]
+        (let [registry @registry-atom
+              raw (or (.get ^java.util.Map startup-params "database")
+                      (first (keys registry)))
+              [requested _] (parse-db-name raw)]
+          (when-not (contains? registry requested)
+            (throw (PgWireServer$PgProtocolException.
+                    "3D000"
+                    (str "database \"" requested "\" does not exist"))))))
       (create [_]
         ;; No startup params available (shouldn't happen with the real
         ;; Java server, but keep it safe). Use the first registered name.

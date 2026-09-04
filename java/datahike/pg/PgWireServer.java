@@ -360,6 +360,16 @@ public final class PgWireServer {
         QueryHandler create();
 
         /**
+         * Validate StartupMessage parameters before AuthenticationOk and
+         * ReadyForQuery are emitted. Implementations may throw a
+         * {@link PgProtocolException} to reject the connection with a FATAL
+         * PostgreSQL error (for example 3D000 for an unknown database).
+         */
+        default void validateStartup(java.util.Map<String, String> startupParams) {
+            // Legacy factories accept every StartupMessage.
+        }
+
+        /**
          * Startup-parameter-aware entry. Default delegates to {@link #create()}
          * so lambda implementations of the legacy form continue to compile.
          */
@@ -1425,6 +1435,17 @@ public final class PgWireServer {
                                       client.getRemoteSocketAddress(), tls)) {
                         return null;
                     }
+                }
+
+                // Database routing must fail before ReadyForQuery. Returning
+                // a handler which errors on the first statement is too late:
+                // pool.connect() has already succeeded by then.
+                try {
+                    handlerFactory.validateStartup(startupParameters);
+                } catch (PgProtocolException e) {
+                    sendError(out, "FATAL", e.sqlstate, e.getMessage(), e.errorFields);
+                    out.flush();
+                    return null;
                 }
 
                 // AuthenticationOk
