@@ -5309,20 +5309,9 @@
       (try
         (exec-copy-from-stdin ctx parsed)
         (catch clojure.lang.ExceptionInfo e
-          (let [data (ex-data e)
-                state (or (:sqlstate data)
-                          (case (:error data)
-                            :undefined-table "42P01"
-                            :feature-not-supported "0A000"
-                            :syntax-error "42601"
-                            "XX000"))]
-            (-> (PgWireServer$QueryResult.
-                 (str "COPY failed: " (.getMessage e)))
-                (.withSqlstate state))))
+          (classified-error "COPY failed: " e))
         (catch Throwable e
-          (-> (PgWireServer$QueryResult.
-               (str "COPY failed: " (.getMessage e)))
-              (.withSqlstate "XX000"))))
+          (classified-error "COPY failed: " e)))
 
       :create-database
       ;; SQL `CREATE DATABASE foo [WITH (...)];`. Routed via the
@@ -8182,9 +8171,23 @@
             (throw (ex-info (str "schema \"" ns "\" does not exist")
                             {:error :undefined-table :table (str ns "." table)})))
         ns table
-        col-names (or columns
-                      (columns-from-schema schema ns
-                                           (when conn (d/db conn))))]
+        db-now (when conn (d/db conn))
+        current-schema (or (some-> db-now :schema) schema)
+        table-exists? (some (fn [ident]
+                              (and (keyword? ident)
+                                   (= ns (namespace ident))))
+                            (keys current-schema))
+        available-columns (columns-from-schema current-schema ns db-now)
+        col-names (or columns available-columns)
+        unknown-columns (seq (remove (set available-columns) col-names))]
+    (when-not table-exists?
+      (throw (errors/pg-error :undefined-table {:table table})))
+    (when unknown-columns
+      ;; Validate before entering COPY-IN mode. Deferring this until the
+      ;; first data chunk let Datahike's raw "Bad entity attribute" escape
+      ;; as XX000 instead of PostgreSQL's undefined-column error.
+      (throw (errors/pg-error :undefined-column
+                              {:column (first unknown-columns)})))
     (when (empty? col-names)
       (throw (ex-info (str "no columns found for COPY into \"" table "\"")
                       {:error :undefined-table :table table})))
@@ -8225,9 +8228,17 @@
         rows (:pending-rows s)]
     (when (and (seq rows) (nil? (:error s)))
       (try
-        (let [tx-data' (-> rows
-                           (auto-populate-identity (:table s) (d/db conn))
-                           (apply-column-constraints (:table s) (:ns s) (d/db conn)))]
+        (let [db-now (d/db conn)
+              available (columns-from-schema (:schema db-now) (:ns s) db-now)
+              _ (when (empty? available)
+                  ;; A multi-statement simple query can currently reach COPY
+                  ;; data after a later DROP. Report the vanished relation
+                  ;; explicitly rather than leaking Datahike schema internals.
+                  (throw (errors/pg-error :undefined-table
+                                          {:table (:table s)})))
+              tx-data' (-> rows
+                           (auto-populate-identity (:table s) db-now)
+                           (apply-column-constraints (:table s) (:ns s) db-now))]
           (transact-recorded! conn tx-data')
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
@@ -8579,12 +8590,8 @@
                 (catch Throwable e
                   (let [committed (:rows-committed @copy-state)]
                     (reset! copy-state nil)
-                    (-> (PgWireServer$QueryResult.
-                         (str "COPY failed after " committed " rows: "
-                              (.getMessage e)))
-                        (.withSqlstate
-                         (or (some-> e ex-data :sqlstate)
-                             "XX000"))))))))))
+                    (classified-error
+                     (str "COPY failed after " committed " rows: ") e))))))))
 
       (copyAbort [_ _reason]
         (reset! copy-state nil))

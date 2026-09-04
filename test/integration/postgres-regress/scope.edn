@@ -16,18 +16,18 @@
   #{"tstypes"}
 
   :ddl-and-dml
-  #{"alter_generic" "alter_operator" "alter_table" "comments" "copy"
-    "copy2" "copydml" "copyselect" "create_aggregate" "create_cast"
+  #{"alter_generic" "alter_operator" "comments"
+    "create_aggregate" "create_cast"
     "create_function_sql" "create_index" "create_misc" "create_operator"
-    "create_procedure" "create_schema" "create_table_like" "create_view"
-    "drop_if_exists" "drop_operator" "fast_default" "foreign_key"
+    "create_procedure" "create_schema" "create_table_like"
+    "drop_if_exists" "drop_operator" "fast_default"
     "generated" "identity" "inherit" "largeobject" "matview" "merge"
-    "rules" "sequence" "temp" "triggers" "truncate" "typed_table"
+    "rules" "sequence" "triggers" "typed_table"
     "updatable_views"}
 
   :relational-queries
-  #{"groupingsets" "select" "select_distinct" "select_distinct_on"
-    "select_implicit" "select_into" "select_views" "tablesample"}
+  #{"groupingsets" "select_implicit" "select_into" "select_views"
+    "tablesample"}
 
   :transactions-and-concurrency
   #{"advisory_lock" "async" "lock" "mvcc" "plancache"
@@ -38,7 +38,7 @@
     "sqljson_jsontable" "sqljson_queryfuncs" "xml" "xmlmap"}
 
   :catalog-and-client-api
-  #{"database" "dbsize" "portals" "portals_p2" "psql" "psql_crosstab"
+  #{"database" "dbsize" "psql_crosstab"
     "sysviews" "test_setup"}}
 
  :out-of-scope

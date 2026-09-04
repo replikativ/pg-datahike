@@ -236,12 +236,20 @@
   (let [campaign-count (count (set (mapcat (comp (partial map :name) :tests)
                                            (:waves campaign))))
         entries (scope-entries)
+        backlog-count (count (filter #(= :backlog (:status %)) entries))
+        scheduled-count (count (scheduled-tests))
+        application-count (+ campaign-count backlog-count)
         {:keys [mode-counts slice-count slice-file-count gate-file-count
                 claimed-line-count unique-line-count duplicate-line-claims]}
         (campaign-metrics)]
     (println (format "PostgreSQL %d schedule: %d tests"
-                     (:postgres-major campaign) (count (scheduled-tests))))
+                     (:postgres-major campaign) scheduled-count))
     (println (format "  campaign     %d" campaign-count))
+    (println (format (str "    classified %.1f%% of %d application-facing files; "
+                          "%.1f%% of the complete schedule")
+                     (* 100.0 (/ campaign-count application-count))
+                     application-count
+                     (* 100.0 (/ campaign-count scheduled-count))))
     (println (format "    strict %d, discovery %d, unmeasured %d"
                      (get mode-counts :strict 0)
                      (get mode-counts :discovery 0)

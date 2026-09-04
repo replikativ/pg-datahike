@@ -543,6 +543,25 @@
         (.close h1)
         (.close h2)))))
 
+(deftest unsupported-on-commit-actions-fail-explicitly
+  (testing "temporary actions we do not implement never become silent no-ops"
+    (doseq [action ["DROP" "DELETE ROWS"]]
+      (let [r (.execute *handler*
+                        (str "CREATE TEMP TABLE on_commit_probe (value INTEGER) "
+                             "ON COMMIT " action))]
+        (is (= "0A000" (sqlstate r)))
+        (is (re-find (re-pattern action) (err r))))))
+  (testing "the supported preserve-rows behavior remains available"
+    (is (nil? (err (.execute *handler*
+                             "CREATE TEMP TABLE preserve_probe (value INTEGER) ON COMMIT PRESERVE ROWS"))))
+    (is (nil? (err (.execute *handler* "INSERT INTO preserve_probe VALUES (1)"))))
+    (is (= [["1"]] (rows (.execute *handler* "SELECT value FROM preserve_probe")))))
+  (testing "ON COMMIT on a permanent table keeps PostgreSQL's structural SQLSTATE"
+    (let [r (.execute *handler*
+                      "CREATE TABLE permanent_probe (value INTEGER) ON COMMIT PRESERVE ROWS")]
+      (is (= "42P16" (sqlstate r)))
+      (is (re-find #"temporary tables" (err r))))))
+
 (deftest test-pg-format-type
   (testing "format_type maps OIDs to canonical type names"
     (is (= [["integer"]]            (rows (.execute *handler* "SELECT format_type(23, -1)"))))
@@ -626,7 +645,10 @@
           "Department PK index def synthesized")))
 
   (testing "pg_get_indexdef(oid) reads the pre-baked column"
-    (let [r (rows (.execute *handler* "SELECT pg_get_indexdef(indexrelid) FROM pg_index ORDER BY indexrelid"))]
+    (let [result (.execute *handler* "SELECT pg_get_indexdef(indexrelid) FROM pg_index ORDER BY indexrelid")
+          r (rows result)]
+      (is (nil? (err result)))
+      (is (seq r))
       (is (every? #(re-find #"^CREATE UNIQUE INDEX " (first %)) r)
           "every row should be a CREATE UNIQUE INDEX statement"))))
 
