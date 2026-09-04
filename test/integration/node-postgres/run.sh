@@ -91,7 +91,7 @@ XFAIL_FILES=(
   # connecting to a non-existent database must fail at startup (3D000); we
   # currently accept the connection and only reject at query time.
   "test/integration/client/api-tests.js"
-  # SQL three-valued NULL logic (7 <> NULL ⇒ NULL) + extreme date range.
+  # Extreme PostgreSQL/ECMAScript date range; the NULL-comparison case passes.
   "test/integration/client/type-coercion-tests.js"
   # COUNT(*) over an empty table + '{1,2,3}'::bigint[] array-literal cast.
   "test/integration/client/parse-int-8-tests.js"

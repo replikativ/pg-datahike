@@ -132,6 +132,18 @@
     (testing "IS NULL is 2-valued and must NOT become UNKNOWN"
       (is (= ["f" "t" "f" "t"] (col2 c "SELECT id, a IS NULL FROM tvl ORDER BY id"))))))
 
+(deftest null-parameters-preserve-three-valued-comparisons
+  (with-open [c (jdbc)
+              ps (.prepareStatement c "SELECT 7 <> ?, 7 = ?, ?::int < 7")]
+    (.setObject ps 1 nil)
+    (.setObject ps 2 nil)
+    (.setObject ps 3 nil)
+    (with-open [rs (.executeQuery ps)]
+      (is (.next rs))
+      (is (nil? (.getString rs 1)))
+      (is (nil? (.getString rs 2)))
+      (is (nil? (.getString rs 3))))))
+
 (deftest nested-boolean-expressions-in-a-projection
   (with-open [c (jdbc)]
     (seed! c)
