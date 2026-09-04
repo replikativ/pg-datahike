@@ -59,11 +59,14 @@
     {:name "rowtypes" :mode :discovery
      :boundaries #{:structural-type :row-comparisons :nulls}
      :blockers #{:composite-type-ddl :composite-storage :custom-operators
-                 :fixture-data :planner-explain :record-comparison-internal-error
-                 :ddl-dispatch-fallthrough}
+                 :fixture-data :planner-explain :ddl-dispatch-fallthrough}
      :strict-slices
      [{:id :standard-row-comparison-semantics
        :source-lines [98 109]
+       :gate "test/datahike/test/pg_correlated_subquery_test.clj"
+       :test-var "row-comparisons-follow-postgresql-semantics"}
+      {:id :named-composite-record-comparison
+       :source-lines [222 254]
        :gate "test/datahike/test/pg_correlated_subquery_test.clj"
        :test-var "row-comparisons-follow-postgresql-semantics"}]}
     {:name "numeric" :mode :discovery

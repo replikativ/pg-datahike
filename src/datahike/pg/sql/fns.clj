@@ -41,6 +41,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.numeric-format :as numfmt]
+            [datahike.pg.records :as pg-rec]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.tsearch :as tsearch]
@@ -1034,6 +1035,106 @@
     (.toInstant (.atStartOfDay ^java.time.LocalDate v) java.time.ZoneOffset/UTC)
     :else nil))
 
+(declare sql-eq?)
+
+(def ^:private record-no-equality-oids
+  "Types PostgreSQL cannot compare for record equality."
+  #{types/oid-json types/oid-point})
+
+(def ^:private record-no-order-oids
+  "Types without a PostgreSQL btree comparison function."
+  #{types/oid-json types/oid-point})
+
+(defn- record-null? [v]
+  (or (nil? v) (= :__null__ v)))
+
+(defn- record-field-type-name [oid]
+  (get types/oid->pg-name oid (str "oid " oid)))
+
+(defn- check-record-field-types! [left right column]
+  (when-not (= (:oid left) (:oid right))
+    (throw (ex-info
+            (str "cannot compare dissimilar column types "
+                 (record-field-type-name (:oid left)) " and "
+                 (record-field-type-name (:oid right))
+                 " at record column " column)
+            {:error :datatype-mismatch
+             :sqlstate "42804"}))))
+
+(defn- record-width-error! []
+  (throw (ex-info "cannot compare record types with different numbers of columns"
+                  {:error :datatype-mismatch
+                   :sqlstate "42804"})))
+
+(defn- record-eq?
+  "PostgreSQL record_eq: compare fields in order, with two NULL fields equal.
+   Type and width mismatches are errors, not unequal records."
+  [left right]
+  (loop [lfs (:fields left), rfs (:fields right), column 1]
+    (let [lf (first lfs), rf (first rfs)]
+      (cond
+        (and (nil? lf) (nil? rf)) true
+        (or (nil? lf) (nil? rf)) (record-width-error!)
+        :else
+        (do
+          (check-record-field-types! lf rf column)
+          (when (contains? record-no-equality-oids (:oid lf))
+            (throw (ex-info
+                    (str "could not identify an equality operator for type "
+                         (record-field-type-name (:oid lf)))
+                    {:error :undefined-function
+                     :sqlstate "42883"})))
+          (let [lv (:value lf), rv (:value rf)]
+            (cond
+              (and (record-null? lv) (record-null? rv))
+              (recur (next lfs) (next rfs) (inc column))
+
+              (or (record-null? lv) (record-null? rv)) false
+
+              (sql-eq? lv rv)
+              (recur (next lfs) (next rfs) (inc column))
+
+              :else false)))))))
+
+(declare sql-order-cmp)
+
+(defn- record-order-cmp
+  "PostgreSQL record_cmp: lexicographic fields, with NULL greater than a
+   non-NULL field. Width is checked only if the shared prefix is equal."
+  [left right]
+  (loop [lfs (:fields left), rfs (:fields right), column 1]
+    (let [lf (first lfs), rf (first rfs)]
+      (cond
+        (and (nil? lf) (nil? rf)) 0
+        (or (nil? lf) (nil? rf)) (record-width-error!)
+        :else
+        (do
+          (check-record-field-types! lf rf column)
+          (when (contains? record-no-order-oids (:oid lf))
+            (throw (ex-info
+                    (str "could not identify a comparison function for type "
+                         (record-field-type-name (:oid lf)))
+                    {:error :undefined-function
+                     :sqlstate "42883"})))
+          (let [lv (:value lf), rv (:value rf)
+                cmp (cond
+                      (and (record-null? lv) (record-null? rv)) 0
+                      (record-null? lv) 1
+                      (record-null? rv) -1
+                      :else
+                      (try
+                        (sql-order-cmp lv rv)
+                        (catch ClassCastException _
+                          (throw (errors/pg-error
+                                  :feature-not-supported
+                                  {:message
+                                   (str "record comparison for type "
+                                        (record-field-type-name (:oid lf))
+                                        " is not supported")})))))]
+            (if (zero? cmp)
+              (recur (next lfs) (next rfs) (inc column))
+              cmp)))))))
+
 (defn sql-eq?
   "SQL `=`. Numbers compare BY VALUE across types.
 
@@ -1056,6 +1157,8 @@
    `<=` `>=` are already cross-type."
   [a b]
   (cond
+    (and (pg-rec/record? a) (pg-rec/record? b)) (record-eq? a b)
+    (or (pg-rec/record? a) (pg-rec/record? b)) false
     ;; An ARRAY column comes back as canonical PG text ("{1,2,3}") while an
     ;; ARRAY[...] literal is a PgArray record, so `arr = ARRAY[1,2,3]`
     ;; compared a String to a record and answered false for every row.
@@ -1082,6 +1185,38 @@
     (and (number? a) (number? b)) (== a b)
     :else (= a b)))
 
+(defn- sql-order-cmp [a b]
+  (cond
+    (and (pg-rec/record? a) (pg-rec/record? b))
+    (record-order-cmp a b)
+
+    (or (pg-rec/record? a) (pg-rec/record? b))
+    (throw (ex-info "cannot compare record and non-record values"
+                    {:error :datatype-mismatch
+                     :sqlstate "42804"}))
+
+    (and (temporal-instant a) (temporal-instant b))
+    (compare (temporal-instant a) (temporal-instant b))
+
+    (and (bytes? a) (bytes? b))
+    (java.util.Arrays/compareUnsigned ^bytes a ^bytes b)
+
+    (and (instance? java.util.UUID a) (instance? java.util.UUID b))
+    (let [^java.util.UUID a a
+          ^java.util.UUID b b
+          high (Long/compareUnsigned (.getMostSignificantBits a)
+                                     (.getMostSignificantBits b))]
+      (if (zero? high)
+        (Long/compareUnsigned (.getLeastSignificantBits a)
+                              (.getLeastSignificantBits b))
+        high))
+
+    (or (nan-num? a) (nan-num? b)
+        (types/numeric-special? a) (types/numeric-special? b))
+    (order-cmp a b)
+
+    :else (compare a b)))
+
 (defn- nan-cmp-op
   "PostgreSQL orders NaN ABOVE every non-NaN for float and numeric
    comparison (float.c float8_cmp_internal), so `'NaN' > 'Infinity'` is
@@ -1098,24 +1233,7 @@
       ;; FALSE (PostgreSQL collapses it at the qual boundary, EEOP_QUAL).
       ;; sql-eq? already answers false the same way, via `=`.
       (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) false
-      (and (temporal-instant a) (temporal-instant b))
-      (pred (compare (temporal-instant a) (temporal-instant b)) 0)
-      (and (bytes? a) (bytes? b))
-      (pred (java.util.Arrays/compareUnsigned ^bytes a ^bytes b) 0)
-      (and (instance? java.util.UUID a) (instance? java.util.UUID b))
-      (let [^java.util.UUID a a
-            ^java.util.UUID b b
-            high (Long/compareUnsigned (.getMostSignificantBits a)
-                                       (.getMostSignificantBits b))
-            cmp (if (zero? high)
-                  (Long/compareUnsigned (.getLeastSignificantBits a)
-                                        (.getLeastSignificantBits b))
-                  high)]
-        (pred cmp 0))
-      (or (nan-num? a) (nan-num? b)
-          (types/numeric-special? a) (types/numeric-special? b))
-      (pred (order-cmp a b) 0)
-      :else (pred (compare a b) 0))))
+      :else (pred (sql-order-cmp a b) 0))))
 
 (def sql-lt? (nan-cmp-op <))
 (def sql-gt? (nan-cmp-op >))

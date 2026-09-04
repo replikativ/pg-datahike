@@ -26,6 +26,21 @@
    (->PgRecord type-oid
                (mapv (fn [v] {:oid (oid-fn v) :value v}) values))))
 
+(defn with-layout
+  "Retag an anonymous record with a named composite type and its declared
+   field OIDs. Composite casts need this metadata after expression lowering:
+   the values alone cannot distinguish, for example, `text` from `point`,
+   because both currently use a string JVM carrier."
+  [^PgRecord record type-oid field-oids]
+  (when-not (= (count (:fields record)) (count field-oids))
+    (throw (ex-info "cannot cast record to a composite type with a different number of columns"
+                    {:error :cannot-coerce
+                     :sqlstate "42846"})))
+  (assoc record
+         :type-oid type-oid
+         :fields (mapv (fn [field oid] (assoc field :oid oid))
+                       (:fields record) field-oids)))
+
 (declare to-pg-text)
 
 (defn- field-needs-quote?

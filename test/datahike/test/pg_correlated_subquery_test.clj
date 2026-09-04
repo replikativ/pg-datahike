@@ -455,6 +455,44 @@
              (one c (str "SELECT ROW(date '2020-01-01',1) < "
                          "ROW(timestamp '2020-01-02',1)")))
           "cross-type temporal fields compare through their common timeline"))
+    (testing "named composite casts retain the declared record layout"
+      (exec! c "CREATE TYPE cmp_ints AS (a int, b int)")
+      (exec! c "CREATE TYPE cmp_mixed AS (a int, b text)")
+      (exec! c "CREATE TYPE cmp_short AS (a int)")
+      (exec! c "CREATE TYPE cmp_point AS (a int, b point)")
+      (doseq [[sql expected]
+              [["SELECT ROW(1,2)::cmp_ints < ROW(1,3)::cmp_ints" "t"]
+               ["SELECT ROW(1,2)::cmp_ints <= ROW(1,3)::cmp_ints" "t"]
+               ["SELECT ROW(1,2)::cmp_ints = ROW(1,2)::cmp_ints" "t"]
+               ["SELECT ROW(1,2)::cmp_ints <> ROW(1,3)::cmp_ints" "t"]
+               ["SELECT ROW(1,3)::cmp_ints >= ROW(1,2)::cmp_ints" "t"]
+               ["SELECT ROW(1,3)::cmp_ints > ROW(1,2)::cmp_ints" "t"]
+               ["SELECT ROW(1,-2)::cmp_ints < ROW(1,-3)::cmp_ints" "f"]
+               ["SELECT ROW(1,-2)::cmp_ints <= ROW(1,-3)::cmp_ints" "f"]
+               ["SELECT ROW(1,-2)::cmp_ints = ROW(1,-3)::cmp_ints" "f"]
+               ["SELECT ROW(1,-2)::cmp_ints <> ROW(1,-2)::cmp_ints" "f"]
+               ["SELECT ROW(1,-3)::cmp_ints >= ROW(1,-2)::cmp_ints" "f"]
+               ["SELECT ROW(1,-3)::cmp_ints > ROW(1,-2)::cmp_ints" "f"]
+               ["SELECT ROW(1,-2)::cmp_ints < ROW(1,3)::cmp_ints" "t"]
+               ["SELECT ROW(1,NULL)::cmp_ints = ROW(1,NULL)::cmp_ints" "t"]
+               ["SELECT ROW(1,NULL)::cmp_ints <> ROW(1,2)::cmp_ints" "t"]
+               ["SELECT ROW(1,NULL)::cmp_ints > ROW(1,2)::cmp_ints" "t"]
+               ["SELECT ROW(1,NULL)::cmp_ints <= ROW(1,NULL)::cmp_ints" "t"]]]
+        (is (= expected (one c sql)) sql))
+      (is (= "42804"
+             (sqlstate c "SELECT ROW(1,2)::cmp_ints < ROW(1,'abc')::cmp_mixed")))
+      (is (= "42804"
+             (sqlstate c "SELECT ROW(1,2)::cmp_ints <> ROW(1,'abc')::cmp_mixed")))
+      (is (= "42804"
+             (sqlstate c "SELECT ROW(1,2)::cmp_ints < ROW(1)::cmp_short")))
+      (is (= "42804"
+             (sqlstate c "SELECT ROW(1,2)::cmp_ints <> ROW(1)::cmp_short")))
+      (is (= "42883"
+             (sqlstate c (str "SELECT ROW(1,'(1,2)')::cmp_point < "
+                              "ROW(1,'(1,3)')::cmp_point"))))
+      (is (= "42883"
+             (sqlstate c (str "SELECT ROW(1,'(1,2)')::cmp_point <> "
+                              "ROW(1,'(1,3)')::cmp_point")))))
     (testing "operator selection and width checking are per field"
       (is (= "t" (one c "SELECT ROW(1,2) = ROW('1','2')")))
       (is (= "t" (one c "SELECT ROW(1,2) = ROW(1::bigint,2::numeric)")))
