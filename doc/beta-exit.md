@@ -21,7 +21,7 @@ bb beta-exit
 | Unit and focused regression tests | full suite, per commit | Known translator, execution, catalog, pgwire, temporal and fuzz findings remain fixed. |
 | SQLLogic | full local corpus, per commit | The admitted application-facing SQL examples return their checked results. |
 | Released secondary stack | focused Datahike/Scriptum/Proximum/Stratum vertical on JDK 25, per commit | Secondary creation, mutation, fallback, pagination, history and lifecycle contracts remain valid together. |
-| pgjdbc | `ResultSetTest`, 80 cases, per commit | The most exercised JDBC result and wire path remains compatible. It is not broad JDBC conformance. |
+| pgjdbc | `ResultSetTest` and `BatchExecuteTest`, 212 cases, per commit | Core JDBC result handling and batch execution remain compatible. It is not broad JDBC conformance. |
 | Hibernate | 14 application tests, per commit | Hibernate 6 DDL, CRUD, relationships, HQL and transaction flows work. |
 | SQLAlchemy | 16 application tests, per commit | SQLAlchemy 2 with psycopg2 can perform the documented application flow. |
 | asyncpg | 11 upstream modules, per commit | New per-test failures and module hangs fail CI; 67 known failures remain explicit. |
@@ -35,14 +35,14 @@ percentage: a SQL translator can execute every branch and still return the
 wrong rows, OIDs or SQLSTATE. Coverage grows by admitting observed behavior
 from PostgreSQL, drivers and applications into a strict repeatable gate.
 
-## Campaign status — 2026-09-02
+## Campaign status — 2026-09-04
 
-- Unit: 1,608 tests / 6,839 assertions, all passing.
+- Unit: 1,609 tests / 6,854 assertions, all passing.
 - SQLLogic: 61 assertion groups, all passing.
 - Released secondary stack: 5 tests / 75 assertions, all passing on JDK 25.
 - node-postgres: 14 admitted files passing, 8 known-gap files still xfail.
-- pgjdbc `ResultSetTest`: 80/80 passing. `BatchExecuteTest`: 130/132 passing,
-  with one distinct failure class recorded in its manifest.
+- pgjdbc `ResultSetTest`: 80/80 passing. `BatchExecuteTest`: 132/132 passing
+  across regular/forced binary transfer and rewritten/non-rewritten inserts.
 - asyncpg: 106 passed, 69 failed and 32 skipped locally. Four failures were
   absent from the CI-derived manifest, while two manifest entries passed. This
   confirms that reconciling the environment-dependent baseline is a blocker;
@@ -78,8 +78,8 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
    isolation and startup database validation.
 2. **Runtime safety:** cancellation and an enforced bound on result memory or
    result size.
-3. **Compatibility admission:** reconcile asyncpg, widen pgjdbc, provide the
-   expected JDBC batch error chain and tighten node-postgres allowances.
+3. **Compatibility admission:** reconcile asyncpg, widen pgjdbc beyond the two
+   admitted classes and tighten node-postgres allowances.
 4. **Release candidate:** run Odoo, Metabase and the version-pinned Datahike
    Server soak, then publish the evidence with the release candidate.
 

@@ -31,7 +31,7 @@
    :release-gate? true
    :evidence ["test/integration/pgjdbc/run.sh"
               "test/integration/pgjdbc/expected-skips.md"]
-   :claim "ResultSetTest only; broader JDBC admission remains a campaign item"}
+   :claim "ResultSetTest and BatchExecuteTest; broader JDBC admission remains a campaign item"}
   {:id :hibernate
    :cadence :commit
    :status :gating
@@ -147,9 +147,10 @@
    :exit "Every deferred application-facing class is rerun and classified; stable classes join the gate."}
   {:id :batch-error-chain
    :wave 3
-   :status :open
-   :evidence ["test/integration/pgjdbc/expected-skips.md"]
-   :exit "Rewritten JDBC batch failures expose PostgreSQL-compatible update counts and a chained SQLException."}
+   :status :closed
+   :evidence ["test/datahike/test/pg_truncate_drop_test.clj"
+              "test/integration/pgjdbc/expected-skips.md"]
+   :exit "BatchExecuteTest passes every binary/rewrite variant; its apparent exception-chain failure was a masked transactional DDL failure."}
   {:id :server-release-soak
    :wave 4
    :status :open

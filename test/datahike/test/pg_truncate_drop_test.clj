@@ -212,6 +212,28 @@
         (is (= [["2"]] (rows (exec h "SELECT aid FROM pgbench_accounts")))))
       (finally (release! h)))))
 
+(deftest drop-and-recreate-table-inside-transaction
+  (let [h (fresh-handler)]
+    (try
+      (is (nil? (.error (exec h "CREATE TABLE mixednulltest(key serial primary key, value text)"))))
+      (is (nil? (.error (exec h "INSERT INTO mixednulltest(value) VALUES ('old')"))))
+      (testing "DROP is visible to a following CREATE and both commit together"
+        (is (nil? (.error (exec h "BEGIN"))))
+        (is (nil? (.error (exec h "DROP TABLE IF EXISTS mixednulltest"))))
+        (is (nil? (.error (exec h "CREATE TABLE mixednulltest(key serial primary key, value text)"))))
+        (is (nil? (.error (exec h "INSERT INTO mixednulltest(value) VALUES ('new')"))))
+        (is (= [["new"]] (rows (exec h "SELECT value FROM mixednulltest"))))
+        (is (nil? (.error (exec h "COMMIT"))))
+        (is (= [["new"]] (rows (exec h "SELECT value FROM mixednulltest")))))
+      (testing "ROLLBACK restores the table that existed before DROP"
+        (is (nil? (.error (exec h "BEGIN"))))
+        (is (nil? (.error (exec h "DROP TABLE mixednulltest"))))
+        (is (nil? (.error (exec h "CREATE TABLE mixednulltest(other int)"))))
+        (is (nil? (.error (exec h "INSERT INTO mixednulltest(other) VALUES (7)"))))
+        (is (nil? (.error (exec h "ROLLBACK"))))
+        (is (= [["new"]] (rows (exec h "SELECT value FROM mixednulltest")))))
+      (finally (release! h)))))
+
 (deftest drop-table-with-wide-composite-primary-key
   (let [h (fresh-handler)]
     (try
