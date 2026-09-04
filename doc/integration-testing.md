@@ -29,7 +29,7 @@ round-trip tests.
 Three application-level jobs run against a live pgwire server on :15432:
 
 ```
-pgjdbc-conformance       80 ResultSetTest cases — ~6 min warm daemon
+pgjdbc-conformance       276 cases in 8 classes — ~6 min warm daemon
 hibernate-app-conformance 14 end-to-end tests — ~2 min
 sqlalchemy-conformance    16 tests across 7 phases — <30 s
 ```

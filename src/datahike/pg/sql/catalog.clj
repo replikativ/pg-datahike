@@ -56,7 +56,7 @@
   "Virtual catalog tables this layer materializes on demand. Extension
    tables are added via register-catalog-table! and don't appear here."
   #{"pg_type" "pg_class" "pg_tables" "pg_views" "pg_matviews" "pg_attribute"
-    "pg_namespace" "pg_database" "pg_proc" "pg_roles"
+    "pg_namespace" "pg_database" "pg_proc" "pg_roles" "pg_settings"
     "pg_indexes"
     ;; pg_sequences — the user-facing view over every sequence's
     ;; parameters and current position (issue #26). Distinct from
@@ -302,6 +302,10 @@
     [{:db/ident :pg_database/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_database/datdba :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_database") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_settings"
+    [{:db/ident :pg_settings/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_settings/setting :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_settings") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_proc"
     [{:db/ident :pg_proc/proname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_proc/provolatile :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -848,6 +852,10 @@
                    {:pg_database/datname name :pg_database/datdba 10
                     (pgs/row-marker-attr "pg_database") true}))
             real))
+    "pg_settings"
+    [{:pg_settings/name "max_index_keys"
+      :pg_settings/setting "32"
+      (pgs/row-marker-attr "pg_settings") true}]
     "pg_proc"
     (mapv (fn [[pname vol nargs ret args & [namespace-oid]]]
             {:pg_proc/proname pname
@@ -1692,6 +1700,7 @@
     ;; SET [LOCAL] TRANSACTION ISOLATION LEVEL … track the session/tx
     ;; isolation that SHOW transaction_isolation must report back.
     :set-session-isolation :set-transaction-isolation
+    :set-session-access :set-transaction-access
     :version :now :current-schema :current-database
     :pg-keywords :nextval :currval :lastval :setval
     :try-advisory-xact-lock :try-advisory-lock

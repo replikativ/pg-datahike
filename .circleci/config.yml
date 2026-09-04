@@ -274,9 +274,9 @@ jobs:
           command: bash test/integration/pgjdbc/setup.sh
       - start-pgwire-and-wait
       - run:
-          name: Run ResultSetTest
-          command: bash test/integration/pgjdbc/run-one.sh ResultSetTest
-          no_output_timeout: 10m
+          name: Run curated pgjdbc conformance suite
+          command: bash test/integration/pgjdbc/run.sh
+          no_output_timeout: 20m
 
   # --- Client-conformance integration jobs ----------------------------------
   # Each job provisions the client toolchain (Python venv, Node npm, Maven)

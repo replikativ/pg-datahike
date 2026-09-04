@@ -21,7 +21,7 @@ bb beta-exit
 | Unit and focused regression tests | full suite, per commit | Known translator, execution, catalog, pgwire, temporal and fuzz findings remain fixed. |
 | SQLLogic | full local corpus, per commit | The admitted application-facing SQL examples return their checked results. |
 | Released secondary stack | focused Datahike/Scriptum/Proximum/Stratum vertical on JDK 25, per commit | Secondary creation, mutation, fallback, pagination, history and lifecycle contracts remain valid together. |
-| pgjdbc | `ResultSetTest` and `BatchExecuteTest`, 212 cases, per commit | Core JDBC result handling and batch execution remain compatible. It is not broad JDBC conformance. |
+| pgjdbc | eight application-facing classes, 276 cases, per commit | 275 JDBC connection, statement, result, batch and metadata cases pass; one is skipped upstream. It is not complete JDBC conformance. |
 | Hibernate | 14 application tests, per commit | Hibernate 6 DDL, CRUD, relationships, HQL and transaction flows work. |
 | SQLAlchemy | 16 application tests, per commit | SQLAlchemy 2 with psycopg2 can perform the documented application flow. |
 | asyncpg | 11 upstream modules, per commit | New per-test failures and module hangs fail CI; 67 known failures remain explicit. |
@@ -41,29 +41,30 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
 - SQLLogic: 61 assertion groups, all passing.
 - Released secondary stack: 5 tests / 75 assertions, all passing on JDK 25.
 - node-postgres: 14 admitted files passing, 8 known-gap files still xfail.
-- pgjdbc `ResultSetTest`: 80/80 passing. `BatchExecuteTest`: 132/132 passing
-  across regular/forced binary transfer and rewritten/non-rewritten inserts.
-- asyncpg: 106 passed, 69 failed and 32 skipped locally. Four failures were
-  absent from the CI-derived manifest, while two manifest entries passed. This
-  confirms that reconciling the environment-dependent baseline is a blocker;
-  the manifest was not weakened to make the local run green.
+- pgjdbc: eight admitted classes, 275 passing and one upstream skip. This
+  includes connection/read-only behavior, server-prepared statements, result
+  handling, batch variants, JDBC 4.2 parameters and metadata properties.
+- asyncpg: the pinned local and CI baseline is reconciled. Eleven upstream
+  modules run per commit; 67 known failing test IDs remain explicit, and any
+  new failure, unexpected pass or missing test fails the gate.
 - PostgreSQL 17.7: all 222 scheduled files classified—57 campaign, 96 backlog
-  and 69 deliberate non-goals. The campaign contains 96 admitted strict
-  slices; 3 complete files are strict and 54 are measured discovery files.
+  and 69 deliberate non-goals. The campaign contains 100 admitted strict
+  slices across 24 upstream files and 28 local gate files; 3 complete files
+  are strict and 54 are measured discovery files.
 
 ## Where coverage is still weak
 
-- pgjdbc coverage is deep in one class and shallow across the rest of JDBC.
-  Every application-facing deferred class must be rerun and classified during
-  wave 3; `TBD` is not an acceptable final disposition.
-- asyncpg has a useful per-test manifest, but its local and CI results have
-  diverged. Until that is explained, a green job means “no new CI failure,” not
-  a portable compatibility baseline.
+- pgjdbc breadth has been rerun and classified. Eight stable classes gate each
+  commit; fixture-bound stored-function, identity-column, custom-type and
+  database-wide-setting suites remain explicitly deferred.
+- asyncpg's exact-set baseline is intentionally conservative: 67 known gaps
+  still pass through the harness on every commit and must be retired as their
+  underlying features become supported.
 - node-postgres allowances are file-grained. One expected failure can hide a
   regression elsewhere in the same file. Convert the high-value files to
   per-test admission as their blockers are fixed.
 - The PostgreSQL campaign has 57 application-facing files, but most remain in
-  discovery mode. Its 92 strict slices provide real regression evidence; the
+  discovery mode. Its 100 strict slices provide real regression evidence; the
   raw upstream diff is not itself a pass/fail score.
 - Odoo and Metabase are not yet per-commit jobs. They remain release gates
   until their runtime and setup costs are made reliable enough for CI.
@@ -77,8 +78,8 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
    embedded-NUL validation, alternating batch parameter types, temporary-table
    isolation and startup database validation.
 2. **Runtime safety:** an enforced bound on result memory or result size.
-3. **Compatibility admission:** reconcile asyncpg, widen pgjdbc beyond the two
-   admitted classes and tighten node-postgres allowances.
+3. **Compatibility admission:** reconcile asyncpg, widen and classify pgjdbc,
+   and tighten node-postgres allowances.
 4. **Release candidate:** run Odoo, Metabase and the version-pinned Datahike
    Server soak, then publish the evidence with the release candidate.
 

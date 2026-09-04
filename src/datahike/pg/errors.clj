@@ -304,6 +304,12 @@
    {:sqlstate "55000"
     :format (fn [{:keys [message detail]}] (or message detail))}
 
+   :read-only-sql-transaction
+   {:sqlstate "25006"
+    :format (fn [{:keys [operation]}]
+              (str "cannot execute " (or operation "write")
+                   " in a read-only transaction"))}
+
    ;; --- generic fallbacks ---------------------------------------------
    :invalid-parameter-value
    {:sqlstate "22023"

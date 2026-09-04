@@ -232,7 +232,24 @@
     (is (= "search_path" (:var (c/classify "SET LOCAL search_path TO public"))))
     (is (= "search_path" (:var (c/classify "SET SESSION search_path = public"))))
     (is (= ["notme" "public"]
-           (:values (c/classify "SET search_path = notme, public"))))))
+           (:values (c/classify "SET search_path = notme, public")))))
+  (testing "transaction access modes"
+    (is (= {:kind :set-session-access :read-only? true}
+           (c/classify "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")))
+    (is (= {:kind :set-transaction-access :read-only? false}
+           (c/classify "SET LOCAL TRANSACTION READ WRITE")))
+    (is (= {:kind :set-session-access
+            :read-only? true
+            :isolation "serializable"}
+           (c/classify
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY")))
+    (is (= {:kind :set-transaction-access
+            :read-only? false
+            :isolation "repeatable read"}
+           (c/classify
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE")))
+    (is (= {:kind :begin :read-only? true}
+           (c/classify "BEGIN READ ONLY")))))
 
 (deftest classify-maintenance-noops
   (is (= :maintenance-noop (kind "VACUUM")))

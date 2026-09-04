@@ -20,7 +20,8 @@ pgjdbc/
 
 ## Prerequisites
 
-- Java >= 17 on `PATH` (pgjdbc's build requires it; Java 25 / GraalVM works).
+- Java >= 17 on `PATH`. The pinned pgjdbc build supports Java through 23;
+  `run.sh` falls back to a system JDK 21 when the active Java is newer.
 - `git`.
 - Internet access the first time `setup.sh` runs.
 - A running Datahike pgwire server on `localhost:15432`, started from the
@@ -42,17 +43,18 @@ pgjdbc/
 The summary line looks like:
 
 ```
-SUMMARY: 412 passed, 0 failed, 7 skipped   (gradle rc=0)
+SUMMARY: 275 passed, 0 failed, 1 skipped   (gradle rc=0)
 ```
 
 `last-run.log` captures the full gradle output for triage.
 
 ## What is covered
 
-See `expected-skips.md`. In short: JDBC core surface (Driver / Connection /
-Statement / PreparedStatement / ResultSet / DatabaseMetaData / Batch) and
-nothing that depends on COPY, LISTEN/NOTIFY, SSL, SCRAM, replication, XA,
-large objects, or stored procedures.
+See `expected-skips.md`. In short: driver and connection behavior,
+server-prepared statements, ResultSet and batch execution, selected JDBC 4.2
+parameters, and metadata properties. Classes dominated by stored functions,
+generated identities, custom types, database-wide settings or unsupported
+protocol subsystems remain measured but deferred.
 
 ## Interpreting output
 

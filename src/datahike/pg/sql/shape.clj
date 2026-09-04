@@ -139,7 +139,7 @@
    tables for the LEFT-JOIN-able ones) for them."
   #{"pg_rewrite" "pg_trigger"
     "pg_stat_activity"
-    "pg_locks" "pg_settings"})
+    "pg_locks"})
 
 (def ^:private empty-catalog-fns
   "PG system functions that route to the empty-catalog handler. The set

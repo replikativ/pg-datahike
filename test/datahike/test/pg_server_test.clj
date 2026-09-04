@@ -443,6 +443,11 @@
       (is (some? (err r))
           "unknown setting without missing_ok must error"))))
 
+(deftest pg-settings-exposes-index-key-limit
+  (is (= [["32"]]
+         (rows (.execute *handler*
+                         "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'max_index_keys'")))))
+
 (deftest test-pg-set-config
   ;; set_config returns the NEW VALUE as text. asyncpg turns `jit` off
   ;; around type introspection and reads the answer back, so returning
@@ -458,6 +463,26 @@
     (is (= [["off" "off"]]
            (rows (.execute *handler*
                            "SELECT current_setting('jit') AS cur, set_config('jit', 'off', false) AS new"))))))
+
+(deftest transaction-read-only-enforcement
+  (is (nil? (err (.execute *handler* "BEGIN READ ONLY"))))
+  (is (= [["on"]] (rows (.execute *handler* "SHOW transaction_read_only"))))
+  (let [r (.execute *handler*
+                    "INSERT INTO person (name, age) VALUES ('Read Only', 1)")]
+    (is (= "25006" (.sqlstate r)))
+    (is (re-find #"read-only transaction" (err r))))
+  (is (nil? (err (.execute *handler* "ROLLBACK"))))
+  (is (= [["off"]] (rows (.execute *handler* "SHOW transaction_read_only"))))
+  (is (nil? (err (.execute *handler*
+                           "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"))))
+  (let [r (.execute *handler*
+                    "UPDATE person SET age = 2 WHERE name = 'Alice'")]
+    (is (= "25006" (.sqlstate r))))
+  (is (= "25006"
+         (.sqlstate (.execute *handler* "COPY person (name, age) FROM STDIN"))))
+  (is (nil? (err (.execute *handler* "RESET ALL"))))
+  (is (nil? (err (.execute *handler*
+                           "UPDATE person SET age = 2 WHERE name = 'Alice'")))))
 
 (deftest test-pg-format-type
   (testing "format_type maps OIDs to canonical type names"

@@ -1509,6 +1509,17 @@
                     (or (when session-state (:isolation @session-state))
                         default-isolation))
 
+      (= setting-name "default_transaction_read_only")
+      (show-setting "default_transaction_read_only"
+                    (if (:read-only? @session-state) "on" "off"))
+
+      (= setting-name "transaction_read_only")
+      (show-setting "transaction_read_only"
+                    (if (if (:in-tx? @tx-state)
+                          (:read-only? @tx-state)
+                          (:read-only? @session-state))
+                      "on" "off"))
+
       ;; `SHOW transaction_isolation` and `SHOW TRANSACTION ISOLATION
       ;; LEVEL` (classify yields :var "transaction" for the latter) report
       ;; the *effective* level for the current (possibly implicit) tx.
@@ -4228,6 +4239,9 @@
              ;; supplies :isolation); nil means inherit the session
              ;; default — effective-isolation handles the fallback.
              :isolation (:isolation parsed)
+             :read-only? (if (contains? parsed :read-only?)
+                           (:read-only? parsed)
+                           (boolean (:read-only? @session-state)))
              :speculative-db (apply-temporal real-db session-state)
              ;; Snapshot :max-tx at BEGIN so COMMIT can detect concurrent
              ;; writes by other sessions (emits 40001 serialization_failure
@@ -4248,6 +4262,7 @@
     (swap! tx-state assoc
            :in-tx? true :implicit? true :aborted? false :tx-buffer []
            :ddl-version 0
+           :read-only? (boolean (:read-only? @session-state))
            :speculative-db (apply-temporal real-db session-state)
            :begin-max-tx (:max-tx real-db)
            :eid->tempid {} :savepoints [])))
@@ -4418,6 +4433,7 @@
   (release-advisory-locks! session-id true)
   (swap! tx-state assoc
          :in-tx? false :implicit? false :aborted? false
+         :read-only? false
          :ddl-version 0
          :owned-locks #{}))
 
@@ -4435,6 +4451,23 @@
     ;; compatibility declaration. Materialized secondary methods reject a
     ;; buffered/explicit transaction at their narrower execution boundary.
     :ddl-create-index :ddl-alter :ddl-drop :ddl-drop-view :ddl-drop-sequence})
+
+(defn- reject-read-only-write!
+  [tx-state session-state parsed]
+  (let [write-type (if (= :copy-from-stdin (:kind parsed))
+                     ;; COPY owns its transaction/sub-protocol and therefore
+                     ;; is a :system parse, deliberately absent from
+                     ;; write-parse-types.
+                     :copy-from-stdin
+                     (:type parsed))]
+    (when (and (or (contains? write-parse-types write-type)
+                   (= :copy-from-stdin write-type))
+               (if (:in-tx? @tx-state)
+                 (:read-only? @tx-state)
+                 (:read-only? @session-state)))
+      (throw (errors/pg-error
+              :read-only-sql-transaction
+              {:operation (str/upper-case (name write-type))})))))
 
 (defn- execute-ddl-invalidating
   "Run one DDL statement with cache invalidation on both sides. The first
@@ -4556,7 +4589,7 @@
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
   [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search
-   :valid-at :valid-from :valid-to :statement-timeout :isolation])
+   :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?])
 
 (defn- handle-reset
   "RESET ALL / RESET <var>. The datahike.* temporal vars and
@@ -5384,6 +5417,18 @@
             (swap! tx-state assoc :isolation (:value parsed))
             (swap! session-state assoc :isolation (:value parsed)))
           (empty-result "SET"))
+      :set-session-access
+      (do (swap! session-state
+                 #(cond-> (assoc % :read-only? (:read-only? parsed))
+                    (:isolation parsed) (assoc :isolation (:isolation parsed))))
+          (empty-result "SET"))
+      :set-transaction-access
+      (if-not (:in-tx? @tx-state)
+        (error-result "SET TRANSACTION can only be used in transaction blocks" "25P01")
+        (do (swap! tx-state
+                   #(cond-> (assoc % :read-only? (:read-only? parsed))
+                      (:isolation parsed) (assoc :isolation (:isolation parsed))))
+            (empty-result "SET")))
 
       ;; Simple info queries
       :show              (handle-show (:var parsed) schema session-state tx-state)
@@ -9165,6 +9210,7 @@
                           ;; (up to Sync) commits/rolls-back atomically.
                           ;; See open-implicit-tx! / commitImplicit and
                           ;; doc/design-alignment.md.
+                          (reject-read-only-write! tx-state session-state parsed)
                           (when (and *implicit-tx-allowed*
                                      (not *snapshot-db*)
                                      (not (:in-tx? @tx-state))

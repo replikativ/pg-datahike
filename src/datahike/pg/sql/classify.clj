@@ -1293,6 +1293,21 @@
             :else w1))
         :else (recur (inc i))))))
 
+(defn- transaction-access-after
+  "Return true for READ ONLY, false for READ WRITE, and nil when no
+   transaction access mode appears in `toks`."
+  [toks]
+  (let [v (vec toks)]
+    (loop [i 0]
+      (if (>= i (dec (count v)))
+        nil
+        (let [a (nth v i)
+              b (nth v (inc i))]
+          (cond
+            (and (kw=? a "read") (kw=? b "only")) true
+            (and (kw=? a "read") (kw=? b "write")) false
+            :else (recur (inc i))))))))
+
 (defn- classify-set*
   "Generic SET name = value branch (no isolation special-casing)."
   [toks]
@@ -1335,17 +1350,28 @@
                (rest toks) toks)]
     (cond
       ;; SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <lvl>
-      ;; (and/or READ ONLY|WRITE — the READ-only part is a no-op for us).
+      ;; or ... READ ONLY|WRITE.
       (kw=? (first toks) "characteristics")
-      (if-let [lvl (isolation-level-after toks)]
-        {:kind :set-session-isolation :value lvl}
-        {:kind :set :var "session_characteristics"})
+      (let [read-only? (transaction-access-after toks)
+            isolation (isolation-level-after toks)]
+        (cond
+          (some? read-only?) (cond-> {:kind :set-session-access
+                                      :read-only? read-only?}
+                               isolation (assoc :isolation isolation))
+          isolation {:kind :set-session-isolation :value isolation}
+          :else {:kind :set :var "session_characteristics"}))
 
-      ;; SET [LOCAL] TRANSACTION ISOLATION LEVEL <lvl> (per-tx override).
+      ;; SET [LOCAL] TRANSACTION ISOLATION LEVEL <lvl> or READ ONLY|WRITE
+      ;; (per-tx override).
       (kw=? (first toks) "transaction")
-      (if-let [lvl (isolation-level-after toks)]
-        {:kind :set-transaction-isolation :value lvl}
-        {:kind :set :var "transaction"})
+      (let [read-only? (transaction-access-after toks)
+            isolation (isolation-level-after toks)]
+        (cond
+          (some? read-only?) (cond-> {:kind :set-transaction-access
+                                      :read-only? read-only?}
+                               isolation (assoc :isolation isolation))
+          isolation {:kind :set-transaction-isolation :value isolation}
+          :else {:kind :set :var "transaction"}))
 
       :else
       (classify-set* toks))))
@@ -1425,11 +1451,15 @@
           ;; --- Transaction control
           "begin"   (cond-> {:kind :begin}
                       (isolation-level-after rest-toks)
-                      (assoc :isolation (isolation-level-after rest-toks)))
+                      (assoc :isolation (isolation-level-after rest-toks))
+                      (some? (transaction-access-after rest-toks))
+                      (assoc :read-only? (transaction-access-after rest-toks)))
           "start"   (if (kw=? (first rest-toks) "transaction")
                       (cond-> {:kind :begin}
                         (isolation-level-after rest-toks)
-                        (assoc :isolation (isolation-level-after rest-toks)))
+                        (assoc :isolation (isolation-level-after rest-toks))
+                        (some? (transaction-access-after rest-toks))
+                        (assoc :read-only? (transaction-access-after rest-toks)))
                       {:kind :generic-sql})
           "commit"  {:kind :commit}
           ;; Bare END / END WORK / END TRANSACTION = COMMIT. A trailing
