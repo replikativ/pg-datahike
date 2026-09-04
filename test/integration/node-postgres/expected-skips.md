@@ -77,11 +77,10 @@ happens, move the file up into `FILES`.
 | `query-error-handling-tests.js` | "client can do nothing on cancellation" | Query cancellation via `pg_cancel_backend()` over `pg_stat_activity` not implemented. |
 | `query-error-handling-prepared-statement-tests.js` | backend-terminate path | `pg_terminate_backend()` over `pg_stat_activity` not implemented. |
 | `api-tests.js` | "raises error if cannot connect" (`.../ieieie`) | Connecting to a non-existent database must fail at **startup** with `3D000`. We accept the connection and only reject at query time, so `pool.connect()` succeeds. |
-| `type-coercion-tests.js` | "selecting nulls" (`7 <> $1`, $1=NULL) + "date range extremes" | SQL three-valued NULL logic (a comparison with a NULL operand is NULL, not true/false) is not applied to Datalog-emitted comparisons; plus 271821 BCE..275760 CE extreme date range. The 13 core type-coercion cases + the timestamptz round-trip pass. |
+| `type-coercion-tests.js` | "date range extremes" | PostgreSQL and ECMAScript accept timestamps up to year 275760 and BCE dates far outside `java.time`'s practical conversion path. The 13 core coercion cases, timestamptz round-trip, and "selecting nulls" (`7 <> $1`, `$1=NULL`) pass. |
 | `parse-int-8-tests.js` | `SELECT COUNT(*), '{1,2,3}'::bigint[] FROM asdf` | `COUNT(*)` over an empty table must return one row (count 0); plus the `'{1,2,3}'::bigint[]` array-literal cast. |
 
 Priority for closing these: per-session `pg_temp` isolation (2 files, high
-realistic-use value) and three-valued NULL logic (fundamental SQL
-semantics) first; query cancellation next; `3D000`-at-connect and the
-array-literal cast after; `field-name-escape` is adversarial and lowest
-priority.
+realistic-use value) first; `3D000`-at-connect and the array-literal cast
+next. The remaining query-error files require SQL helpers around
+`pg_stat_activity`; `field-name-escape` is adversarial and lowest priority.

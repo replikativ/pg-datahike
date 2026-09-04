@@ -91,10 +91,12 @@
    :claim "Metabase catalog sync and native query"}]
 
  :blockers
- [{:id :three-valued-null
+  [{:id :three-valued-null
    :wave 1
-   :status :open
-   :evidence ["test/integration/node-postgres/expected-skips.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_null_value_test.clj"
+              "test/datahike/test/pg_null_where_test.clj"
+              "test/integration/node-postgres/expected-skips.md"]
    :exit "NULL comparisons never become true or false silently when PostgreSQL returns NULL."}
   {:id :transaction-buffer-delete
    :wave 1
