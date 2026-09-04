@@ -467,6 +467,21 @@
                                     :in [$ ?c]}
                                   db table-name)))
         parent-table (or parent-from-sql parent-from-db)
+        ;; JSqlParser exposes the whole `INHERITS (p1, p2)` list as one
+        ;; option string. pg-datahike's inheritance model remains
+        ;; single-parent, but the regression fixture deliberately creates a
+        ;; multiple-parent table whose own column is still useful. Validate
+        ;; every named parent without treating the comma-joined spelling as
+        ;; one relation.
+        missing-parent (when (and parent-from-sql db)
+                         (some (fn [parent]
+                                 (let [parent (str/trim parent)]
+                                   (when (nil? (pgs/column-info
+                                                (:schema db) parent db))
+                                     parent)))
+                               (str/split parent-from-sql #",")))
+        _ (when missing-parent
+            (throw (errors/pg-error :undefined-table {:table missing-parent})))
         vector-columns
         (into #{}
               (keep (fn [^ColumnDefinition col]
