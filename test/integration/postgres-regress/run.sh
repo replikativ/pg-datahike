@@ -17,6 +17,7 @@ target_host="${PG_REGRESS_HOST:-127.0.0.1}"
 target_port="${PG_REGRESS_PORT:-15432}"
 target_user="${PG_REGRESS_USER:-datahike}"
 target_db="${PG_REGRESS_DB:-datahike}"
+regress_timeout="${PG_REGRESS_TIMEOUT:-}"
 admin_db="${target_db}"
 isolated_db=""
 database_created=0
@@ -85,20 +86,36 @@ if [[ -n "${isolated_db}" ]]; then
 fi
 echo "Tests:             $*"
 echo "Artifacts:         ${output_dir}"
+if [[ -n "${regress_timeout}" ]]; then
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "PG_REGRESS_TIMEOUT requires GNU timeout on PATH" >&2
+    exit 2
+  fi
+  echo "Runtime limit:     ${regress_timeout} for this pg_regress invocation"
+fi
+
+regress_command=(
+  "${pg_regress}"
+  --use-existing
+  --host="${target_host}"
+  --port="${target_port}"
+  --user="${target_user}"
+  --dbname="${target_db}"
+  --bindir="${pg_bindir}"
+  --inputdir="${input_dir}"
+  --expecteddir="${input_dir}"
+  --outputdir="${output_dir}"
+  "$@"
+)
 
 set +e
-"${pg_regress}" \
-  --use-existing \
-  --host="${target_host}" \
-  --port="${target_port}" \
-  --user="${target_user}" \
-  --dbname="${target_db}" \
-  --bindir="${pg_bindir}" \
-  --inputdir="${input_dir}" \
-  --expecteddir="${input_dir}" \
-  --outputdir="${output_dir}" \
-  "$@"
-regress_status=$?
+if [[ -n "${regress_timeout}" ]]; then
+  timeout "${regress_timeout}" "${regress_command[@]}" \
+    2>&1 | tee "${output_dir}/pg_regress.log"
+else
+  "${regress_command[@]}" 2>&1 | tee "${output_dir}/pg_regress.log"
+fi
+regress_status="${PIPESTATUS[0]}"
 set -e
 
 diff_file="${output_dir}/regression.diffs"
@@ -112,6 +129,9 @@ result_files=("${output_dir}"/results/*.out)
 all_api_match=0
 if (( ${#result_files[@]} > 0 )); then
   all_api_match=1
+  summary_file="${output_dir}/summary.tsv"
+  printf 'test\texpected-errors\ttarget-errors\tdelta\taborted\tinternal\tapi-match\n' \
+    > "${summary_file}"
   echo
   echo "Per-test target error summary:"
   printf '%-24s %8s %8s %8s %8s %8s %10s\n' \
@@ -151,6 +171,11 @@ if (( ${#result_files[@]} > 0 )); then
       "${test_name}" "${expected_error_count}" "${error_count}" \
       "$((error_count - expected_error_count))" \
       "${aborted_count:-0}" "${internal_count:-0}" "${api_match}"
+    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\n' \
+      "${test_name}" "${expected_error_count}" "${error_count}" \
+      "$((error_count - expected_error_count))" \
+      "${aborted_count:-0}" "${internal_count:-0}" "${api_match}" \
+      >> "${summary_file}"
   done
 
   echo
@@ -184,6 +209,12 @@ case "${regress_status}" in
         exit 1
       fi
     fi
+    ;;
+  124)
+    echo
+    echo "pg_regress exceeded PG_REGRESS_TIMEOUT=${regress_timeout}." >&2
+    echo "The last progress line is retained in ${output_dir}/pg_regress.log." >&2
+    exit 124
     ;;
   *)
     echo

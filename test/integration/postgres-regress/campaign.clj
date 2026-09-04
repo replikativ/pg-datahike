@@ -42,6 +42,30 @@
         name names]
     {:name name :status status :reason reason}))
 
+(defn campaign-tests []
+  (mapcat :tests (:waves campaign)))
+
+(defn slice-entries []
+  (for [test (campaign-tests)
+        slice (:strict-slices test)]
+    [test slice]))
+
+(defn campaign-metrics []
+  (let [tests (campaign-tests)
+        slices (slice-entries)
+        line-claims (for [[test {:keys [id source-lines]}] slices
+                          line (range (first source-lines)
+                                      (inc (second source-lines)))]
+                      [(:name test) line id])
+        unique-lines (set (map #(subvec (vec %) 0 2) line-claims))]
+    {:mode-counts (frequencies (map :mode tests))
+     :slice-count (count slices)
+     :slice-file-count (count (set (map (comp :name first) slices)))
+     :gate-file-count (count (set (map (comp :gate second) slices)))
+     :claimed-line-count (count line-claims)
+     :unique-line-count (count unique-lines)
+     :duplicate-line-claims (- (count line-claims) (count unique-lines))}))
+
 (defn validate-postgres-ref! []
   (let [expected (:postgres-ref campaign)
         allow-unpinned? (= "1" (System/getenv "PG_REGRESS_ALLOW_UNPINNED"))
@@ -92,8 +116,19 @@
         _ (when (seq malformed-groups)
             (fail! (str "scope.edn groups must map keyword reasons to sets of "
                         "test-name strings: " (pr-str malformed-groups))))
-        tests (mapcat :tests (:waves campaign))
-        slices (for [test tests, slice (:strict-slices test)] [test slice])
+        waves (:waves campaign)
+        wave-ids (map :id waves)
+        duplicate-wave-ids (->> wave-ids frequencies
+                                (keep (fn [[id c]] (when (> c 1) id))))
+        malformed-waves (for [{:keys [id name tests]} waves
+                              :when (or (not (integer? id))
+                                        (not (pos? id))
+                                        (not (string? name))
+                                        (str/blank? name)
+                                        (not (vector? tests)))]
+                          id)
+        tests (campaign-tests)
+        slices (slice-entries)
         names (map :name tests)
         prerequisites (mapcat :requires tests)
         duplicates (->> names frequencies (keep (fn [[n c]] (when (> c 1) n))) sort)
@@ -116,6 +151,11 @@
         unscheduled (sort (set/difference inventoried scheduled))
         doubly-classified (sort (set/intersection campaign-names
                                                   (set scoped-names)))]
+    (when (seq duplicate-wave-ids)
+      (fail! (str "duplicate wave IDs: " (pr-str duplicate-wave-ids))))
+    (when (seq malformed-waves)
+      (fail! (str "waves require a positive integer ID, nonblank name, and test vector: "
+                  (pr-str malformed-waves))))
     (when (seq duplicates) (fail! (str "duplicate tests: " (str/join ", " duplicates))))
     (when (seq bad-modes) (fail! (str "unknown modes: " (pr-str (set bad-modes)))))
     (when (seq missing) (fail! (str "missing upstream SQL: " (str/join ", " missing))))
@@ -134,6 +174,30 @@
     (when (seq unscheduled)
       (fail! (str "inventory entries absent from the PostgreSQL schedule: "
                   (str/join ", " unscheduled))))
+    (doseq [{:keys [name mode boundaries blockers accepted-differences requires]} tests]
+      (when-not (and (string? name) (not (str/blank? name)))
+        (fail! (str "campaign test name must be a nonblank string: " (pr-str name))))
+      (when-not (and (set? boundaries) (seq boundaries)
+                     (every? keyword? boundaries))
+        (fail! (str "boundaries must be a nonempty keyword set for " name)))
+      (when-not (and (or (nil? requires) (vector? requires))
+                     (every? string? requires)
+                     (= (count requires) (count (distinct requires))))
+        (fail! (str "requires must be a vector of distinct test names for " name)))
+      (when-not (and (or (nil? blockers) (set? blockers))
+                     (every? keyword? blockers))
+        (fail! (str "blockers must be a keyword set for " name)))
+      (when-not (and (or (nil? accepted-differences)
+                         (set? accepted-differences))
+                     (every? keyword? accepted-differences))
+        (fail! (str "accepted-differences must be a keyword set for " name)))
+      (when (and (= :strict mode)
+                 (or (seq blockers) (seq accepted-differences)))
+        (fail! (str "strict test cannot retain blockers or accepted differences: " name)))
+      (when (and (= :discovery mode)
+                 (empty? blockers)
+                 (empty? accepted-differences))
+        (fail! (str "discovery test must classify blockers or accepted differences: " name))))
     (doseq [{:keys [name strict-slices]} tests]
       (let [ids (map :id strict-slices)
             duplicate-ids (->> ids frequencies
@@ -171,10 +235,21 @@
 (defn print-inventory! []
   (let [campaign-count (count (set (mapcat (comp (partial map :name) :tests)
                                            (:waves campaign))))
-        entries (scope-entries)]
+        entries (scope-entries)
+        {:keys [mode-counts slice-count slice-file-count gate-file-count
+                claimed-line-count unique-line-count duplicate-line-claims]}
+        (campaign-metrics)]
     (println (format "PostgreSQL %d schedule: %d tests"
                      (:postgres-major campaign) (count (scheduled-tests))))
     (println (format "  campaign     %d" campaign-count))
+    (println (format "    strict %d, discovery %d, unmeasured %d"
+                     (get mode-counts :strict 0)
+                     (get mode-counts :discovery 0)
+                     (get mode-counts :unmeasured 0)))
+    (println (format (str "    %d admitted slices across %d upstream files and %d gate files; "
+                          "%d claimed source lines, %d unique (%d overlapping claims)")
+                     slice-count slice-file-count gate-file-count claimed-line-count
+                     unique-line-count duplicate-line-claims))
     (doseq [status [:backlog :out-of-scope]]
       (let [selected (filter #(= status (:status %)) entries)]
         (println (format "  %-12s %d" (name status) (count selected)))
@@ -223,7 +298,13 @@
                                            (if api-fixtures?
                                              "run-with-api-fixtures.sh"
                                              "run.sh")))]
-              command (if (= mode :strict)
-                        (into ["env" "PG_REGRESS_API_STRICT=1"] runner)
-                        runner)]
+              ;; Validation and execution must use the same checkout. Without
+              ;; this explicit environment entry, run.sh falls back to the
+              ;; developer's moving ../postgres tree even though the campaign
+              ;; above was validated against .internal/postgres-REL_17_7.
+              command (into ["env"
+                             (str "POSTGRES_SOURCE=" postgres-source)]
+                            (concat (when (= mode :strict)
+                                      ["PG_REGRESS_API_STRICT=1"])
+                                    runner))]
           (apply shell {:dir (str repo-root)} (concat command names)))))))

@@ -28,8 +28,9 @@
      :requires ["test_setup"]
      :boundaries #{:scalar-type :operators}
      :blockers #{:non-decimal-integer-input :numeric-formatting :parser-aliases}}
-    {:name "bit" :mode :strict
+    {:name "bit" :mode :discovery
      :boundaries #{:scalar-type :operators :nulls}
+     :blockers #{:psql-describe-catalog :diagnostic-detail-fidelity}
      :strict-slices
      [{:id :shift-storage
        :source-lines [174 179]
@@ -58,7 +59,8 @@
     {:name "rowtypes" :mode :discovery
      :boundaries #{:structural-type :row-comparisons :nulls}
      :blockers #{:composite-type-ddl :composite-storage :custom-operators
-                 :fixture-data :planner-explain}
+                 :fixture-data :planner-explain :record-comparison-internal-error
+                 :ddl-dispatch-fallthrough}
      :strict-slices
      [{:id :standard-row-comparison-semantics
        :source-lines [98 109]
@@ -199,7 +201,8 @@
     {:name "arrays" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:array-codec :array-expressions :polymorphism}
-     :blockers #{:postgres-vector-types :create-function}}
+     :blockers #{:postgres-vector-types :create-function
+                 :array-null-coercion-internal-error}}
     {:name "uuid" :mode :discovery
      :boundaries #{:scalar-type :input-codec :operators :volatile-functions
                    :type-inference :temporal-extraction}
@@ -249,7 +252,8 @@
     {:name "rangefuncs" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:set-returning-functions :lateral :parameter-inference}
-     :blockers #{:create-function :fixture-dependencies}}
+     :blockers #{:create-function :fixture-dependencies
+                 :unbound-datalog-var-internal-error}}
     {:name "explain" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:utility-grammar :errors}
@@ -622,8 +626,10 @@
        :source-lines [60 93]
        :gate "test/datahike/test/pg_json_input_validation_test.clj"
        :test-var "postgres-json-input-regression-slices"}]}
-    {:name "jsonpath" :mode :unmeasured :boundaries #{:jsonpath}}
-    {:name "sqljson" :mode :unmeasured :boundaries #{:sql-json}}
+    {:name "jsonpath" :mode :discovery :boundaries #{:jsonpath}
+     :blockers #{:jsonpath-type :jsonpath-parser-and-execution}}
+    {:name "sqljson" :mode :discovery :boundaries #{:sql-json}
+     :blockers #{:sql-json-grammar :sql-json-functions :json-returning}}
     {:name "tsearch" :mode :discovery
      :boundaries #{:full-text :normalization :wire-result-type}
      :blockers #{:postgres-token-parser :explicit-tsquery-parser :matching
@@ -654,4 +660,6 @@
        :source-lines [58 81]
        :gate "test/datahike/test/pg_tsearch_test.clj"
        :test-var "sql-match-operator-slice"}]}
-    {:name "tsdicts" :mode :unmeasured :boundaries #{:full-text}}]}]}
+    {:name "tsdicts" :mode :discovery :boundaries #{:full-text}
+     :blockers #{:text-search-dictionary-ddl :dictionary-files
+                 :catalog-configurations}}]}]}
