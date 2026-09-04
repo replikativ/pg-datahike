@@ -3705,6 +3705,27 @@
             (throw (errors/pg-error
                     :feature-not-supported
                     {:message "DISTINCT aggregates over vector values are not supported"}))))
+        reject-ordered-set-boundary!
+        (fn [fname agg-sym inner-expr within-group?]
+          (when (and within-group?
+                     (contains? #{"rank" "dense_rank"
+                                  "percent_rank" "cume_dist"}
+                                fname))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message (str "hypothetical-set aggregate " fname
+                                   " is not supported")})))
+          (when (and within-group? (nil? agg-sym))
+            (throw (errors/pg-error
+                    :undefined-function
+                    {:function (str fname "(...) WITHIN GROUP")})))
+          (when (and within-group?
+                     (contains? #{"percentile_cont" "percentile_disc"} fname)
+                     (instance? ArrayConstructor inner-expr))
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message (str fname
+                                   " with an array of fractions is not supported")}))))
         ;; Per-input-type runtime variant for precision-sensitive
         ;; aggregates. Single source of truth: oid-infer's
         ;; `sql-aggregate->return-oid` says e.g. AVG(int8) → numeric;
@@ -3746,7 +3767,9 @@
                 agg-sym (get fns/sql-aggregate->datalog fname)
                 inner-expr (.getExpression ae)
                 filter-expr (.getFilterExpression ae)
+                within-group? (= "WITHIN_GROUP" (str (.getType ae)))
                 idx (count @find-elements)]
+            (reject-ordered-set-boundary! fname agg-sym inner-expr within-group?)
             (reject-vector-distinct-aggregate! (.isDistinct ae) inner-expr)
             (reset! has-aggregates? true)
             (if (and filter-expr agg-sym)
@@ -3801,6 +3824,10 @@
                   agg-sym (get fns/sql-aggregate->datalog fname)
                   params (.getParameters f)
                   is-distinct? (.isDistinct f)]
+              (when (contains? #{"percentile_cont" "percentile_disc" "mode"} fname)
+                (throw (errors/pg-error
+                        :undefined-function
+                        {:function (str fname "(...) without WITHIN GROUP")})))
               (reject-vector-distinct-aggregate!
                is-distinct? (when (seq params) (first params)))
               (reset! has-aggregates? true)
@@ -4135,6 +4162,7 @@
                                       (or (= "OVER" analytic-type)
                                           (seq partition-list) (seq order-by-list)
                                           window-elem (contains? ranking-fns fname)))]
+                  (reject-ordered-set-boundary! fname agg-sym inner-expr within-group?)
                   (cond
                     ;; Ordered-set aggregate via WITHIN GROUP — translate
                     ;; with the same pair-aggregate pattern filter-corr
