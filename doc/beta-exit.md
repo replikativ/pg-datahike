@@ -49,7 +49,7 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   the manifest was not weakened to make the local run green.
 - PostgreSQL 17.7: all 222 scheduled files classified—57 campaign, 96 backlog
   and 69 deliberate non-goals. The campaign contains 92 admitted strict
-  slices; 4 complete files are strict, 50 are discovery and 3 unmeasured.
+  slices; 3 complete files are strict and 54 are measured discovery files.
 
 ## Where coverage is still weak
 

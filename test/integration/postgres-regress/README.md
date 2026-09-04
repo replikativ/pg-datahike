@@ -46,6 +46,7 @@ bb pg-regress-wave
 bb pg-regress-wave inventory
 bb pg-regress-wave 1
 bb pg-regress-wave 1 discovery
+bb pg-regress-wave 2 strict
 ```
 
 The inventory accounts for every test in PostgreSQL's pinned
@@ -80,8 +81,9 @@ checkout at the wrong revision.
 `:unmeasured` means the upstream file has not yet been triaged on a clean
 fixture, `:discovery` means it is continuously useful but has classified
 prerequisites or differences, and `:strict` means its complete normalized API
-output is a gate. Promote coherent application-facing statement groups into
-focused differential tests before marking a dependency-heavy file strict.
+output must match whenever that mode is run. Promote coherent
+application-facing statement groups into focused differential tests before
+marking a dependency-heavy file strict.
 Such admitted statement groups are recorded as `:strict-slices` with their
 exact upstream line range and executable Clojure test var; campaign validation
 fails if either provenance or gate goes stale.
@@ -94,9 +96,15 @@ the client protocol. The complete setup and selected tests share one
 automatically removed database.
 
 Artifacts are written below `.internal/pg-regress/`: PostgreSQL's complete
-result output, unified diff, and summary. A normal mismatch (`pg_regress`
-status 1) is reported but does not fail the task. Harness failures remain
-fatal. Set `PG_REGRESS_STRICT=1` when an admitted test is expected to match
+result output, unified diff, console log, and a machine-readable `summary.tsv`.
+A normal mismatch (`pg_regress` status 1) is reported but does not fail the
+task. Harness failures remain fatal. Bound an exploratory invocation with, for
+example, `PG_REGRESS_TIMEOUT=15m`; status 124 then identifies the incomplete
+run, while `pg_regress.log` preserves its last progress line. The bound covers
+the selected invocation, not each SQL statement, and cannot cancel server work
+until pg-datahike implements query cancellation.
+
+Set `PG_REGRESS_STRICT=1` when an admitted test is expected to match
 raw psql output, including source-position presentation. Campaign tests in
 `:strict` mode instead gate on the documented API-normalized comparison, which
 retains messages, DETAIL/HINT fields, rows, labels, types, and formatting while
