@@ -64,6 +64,7 @@ FILES=(
   # --- API shape (promise / callback) ------------------------------------
   "test/integration/client/promise-api-tests.js"
   "test/integration/client/query-as-promise-tests.js"
+  "test/integration/client/api-tests.js"
 
   # --- transactions ------------------------------------------------------
   "test/integration/client/transaction-tests.js"
@@ -88,9 +89,6 @@ XFAIL_FILES=(
   # pg_stat_activity not implemented.
   "test/integration/client/query-error-handling-tests.js"
   "test/integration/client/query-error-handling-prepared-statement-tests.js"
-  # connecting to a non-existent database must fail at startup (3D000); we
-  # currently accept the connection and only reject at query time.
-  "test/integration/client/api-tests.js"
   # Extreme PostgreSQL/ECMAScript date range; the NULL-comparison case passes.
   "test/integration/client/type-coercion-tests.js"
   # COUNT(*) over an empty table + '{1,2,3}'::bigint[] array-literal cast.

@@ -97,17 +97,14 @@
           (is (= ["prod" "staging" "template0" "template1"] names)))))))
 
 (deftest unknown-database-is-rejected
-  (testing "connecting with a bogus database name raises 3D000"
+  (testing "startup itself rejects a bogus database name with 3D000"
     (let [thrown
           (try
-            (with-open [c (connect-to "nonsuch")]
-              (scalar c "SELECT 1"))
+            (with-open [_ (connect-to "nonsuch")]
+              :connected)
             nil
             (catch SQLException e e))]
       (is (some? thrown))
       (when thrown
-        ;; pgjdbc surfaces our ErrorResponse as a generic SQLException;
-        ;; the important contract is SQLSTATE 3D000 (or
-        ;; invalid_catalog_name wording as a fallback).
-        (is (or (= "3D000" (.getSQLState thrown))
-                (str/includes? (.getMessage thrown) "does not exist")))))))
+        (is (= "3D000" (.getSQLState thrown)))
+        (is (str/includes? (.getMessage thrown) "does not exist"))))))

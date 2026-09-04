@@ -25,7 +25,7 @@ bb beta-exit
 | Hibernate | 14 application tests, per commit | Hibernate 6 DDL, CRUD, relationships, HQL and transaction flows work. |
 | SQLAlchemy | 16 application tests, per commit | SQLAlchemy 2 with psycopg2 can perform the documented application flow. |
 | asyncpg | 11 upstream modules, per commit | New per-test failures and module hangs fail CI; 67 known failures remain explicit. |
-| node-postgres | 14 must-pass and 8 expected-failure files, per commit | The admitted JS client files stay green and known-gap files continue to run. |
+| node-postgres | 15 must-pass and 7 expected-failure files, per commit | The admitted JS client files stay green and known-gap files continue to run. |
 | `pg_dump` | default COPY-format Pagila round-trip, per commit | Every compared table restores with the same row count and no COPY data failure. |
 | PostgreSQL regression corpus | complete pinned 17.7 inventory plus admitted strict slices | Every scheduled upstream file is classified, and every strict slice points to a real focused regression test. |
 | Odoo and Metabase | manual release gates | Their documented end-to-end application probes pass before a release candidate is promoted. |
