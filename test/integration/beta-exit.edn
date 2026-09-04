@@ -88,7 +88,14 @@
    :status :manual
    :evidence ["test/integration/metabase/run.sh"
               "test/integration/metabase/expected-skips.md"]
-   :claim "Metabase catalog sync and native query"}]
+   :claim "Metabase catalog sync and native query"}
+  {:id :datahike-server
+   :cadence :release
+   :status :manual
+   :evidence ["test/integration/datahike-server/run-jar.sh"
+              "test/integration/datahike-server/run-container.sh"
+              "test/integration/datahike-server/README.md"]
+   :claim "version-pinned Datahike Server JAR and non-root container lifecycle"}]
 
  :blockers
   [{:id :three-valued-null
@@ -165,8 +172,10 @@
    :exit "BatchExecuteTest passes every binary/rewrite variant; its apparent exception-chain failure was a masked transactional DDL failure."}
   {:id :server-release-soak
    :wave 4
-   :status :open
-   :evidence ["README.md"]
+   :status :closed
+   :evidence ["test/integration/datahike-server/run-jar.sh"
+              "test/integration/datahike-server/run-container.sh"
+              "test/integration/datahike-server/README.md"]
    :exit "The version-pinned Datahike Server Docker/JAR deployment passes restart, persistence, TLS/auth and connection-drop soak tests."}]
 
  :non-goals
