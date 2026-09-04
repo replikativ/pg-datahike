@@ -126,9 +126,9 @@
    :exit "A nonexistent startup database is rejected with SQLSTATE 3D000."}
   {:id :query-cancellation
    :wave 2
-   :status :open
+   :status :closed
    :evidence ["test/datahike/test/pg_cancel_test.clj"
-              "test/integration/node-postgres/expected-skips.md"]
+              "test/integration/postgres-regress/README.md"]
    :exit "CancelRequest reliably stops in-flight work and leaves the connection protocol-synchronized."}
   {:id :bounded-results
    :wave 2

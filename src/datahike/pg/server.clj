@@ -3512,6 +3512,17 @@
         (= kind :reset) 0
         (= kind :set)   (when value (parse-statement-timeout-value value))))))
 
+(defn- parse-startup-statement-timeout
+  "Extract `-c statement_timeout=VALUE` from a StartupMessage options
+   parameter. libpq/psql use this form for PGOPTIONS. Other startup options
+   remain untouched and ignored by this compatibility layer."
+  [^String options]
+  (when options
+    (when-let [[_ raw]
+               (re-find #"(?i)(?:^|\s)-c\s*statement_timeout\s*=\s*([^\s]+)"
+                        options)]
+      (parse-statement-timeout-value raw))))
+
 (defn- apply-temporal
   "Apply temporal + branch wrappers to a database based on session state.
 
@@ -8165,6 +8176,7 @@
      SET datahike.history = 'true'
      RESET datahike.as_of"
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
+                                              initial-statement-timeout
                                               release-conn-on-close?
                                               dispatch-stats
                                               on-create-database on-delete-database
@@ -8191,7 +8203,9 @@
                               ;; every query on this session reads/writes-
                               ;; read-path against it without needing an
                               ;; explicit SET.
-                              initial-branch (assoc :branch initial-branch)))
+                              initial-branch (assoc :branch initial-branch)
+                              (some? initial-statement-timeout)
+                              (assoc :statement-timeout initial-statement-timeout)))
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
@@ -8791,6 +8805,7 @@
                   params/*statement-time* (java.util.Date.)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
+                  params/*cancel* (current-cancel)
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
         ;; If aborted, reject everything except ROLLBACK / ROLLBACK TO /
@@ -9270,22 +9285,26 @@
               names (vec (keys registry))
               raw (or (.get ^java.util.Map startup-params "database")
                       (first names))
-              [requested branch] (parse-db-name raw)]
+              [requested branch] (parse-db-name raw)
+              initial-timeout
+              (parse-startup-statement-timeout
+               (.get ^java.util.Map startup-params "options"))
+              handler-opts (cond-> (assoc opts
+                                          :db-name requested
+                                          :registered-databases names)
+                             (some? initial-timeout)
+                             (assoc :initial-statement-timeout initial-timeout))]
           (if-let [conn (get registry requested)]
             (if branch
               (let [branch-conn (connect-branch conn branch)]
                 (try
                   (make-query-handler branch-conn
-                                      (assoc opts
-                                             :db-name requested
-                                             :registered-databases names
+                                      (assoc handler-opts
                                              :release-conn-on-close? true))
                   (catch Throwable e
                     (d/release branch-conn)
                     (throw e))))
-              (make-query-handler conn
-                                  (assoc opts :db-name requested
-                                         :registered-databases names)))
+              (make-query-handler conn handler-opts))
             (reject-unknown-db-handler requested)))))))
 
 (defn password-authenticator

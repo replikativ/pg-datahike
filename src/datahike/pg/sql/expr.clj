@@ -3918,11 +3918,13 @@
 
 (defn- run-subquery-leaf
   [p db]
+  (params/check-cancel!)
   (throw-subquery-error! p)
   (reject-unapplied-subquery-stages! p)
   (let [q (cond-> (:query p)
             (and (:limit p) (not (:has-aggregates? p))) (assoc :limit (:limit p))
-            (and (:offset p) (not (:has-aggregates? p))) (assoc :offset (:offset p)))
+            (and (:offset p) (not (:has-aggregates? p))) (assoc :offset (:offset p))
+            params/*cancel* (assoc :cancel params/*cancel*))
         in-args (:in-args p)
         query-db (or (:enriched-db p) db)
         raw (cond
@@ -4104,6 +4106,7 @@
   ([parse-fn inner schema db left-oids relation-namespaces
     {:keys [op unknown-from-left? expected-width]
      :or {op := unknown-from-left? true}}]
+   (params/check-cancel!)
    (let [runtime-db params/*runtime-db*
         ;; Query-local relations live only in the enriched parse-time DB.
         ;; Ordinary prepared subqueries must instead read the current
@@ -4124,6 +4127,7 @@
               :else db)
          p (binding [ctx/*relation-namespaces* relation-namespaces]
              (parse-fn (str inner) schema db))
+         _ (params/check-cancel!)
          output-oids (parsed-output-oids p)
          resolution-oids (if (= :set-operation (:type p))
                            output-oids

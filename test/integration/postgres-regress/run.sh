@@ -18,6 +18,9 @@ target_port="${PG_REGRESS_PORT:-15432}"
 target_user="${PG_REGRESS_USER:-datahike}"
 target_db="${PG_REGRESS_DB:-datahike}"
 regress_timeout="${PG_REGRESS_TIMEOUT:-}"
+# Keep one pathological statement from pinning a regression connection
+# indefinitely. Set 0 to disable when deliberately profiling a slow query.
+statement_timeout="${PG_REGRESS_STATEMENT_TIMEOUT:-10s}"
 admin_db="${target_db}"
 isolated_db=""
 database_created=0
@@ -93,6 +96,9 @@ if [[ -n "${regress_timeout}" ]]; then
   fi
   echo "Runtime limit:     ${regress_timeout} for this pg_regress invocation"
 fi
+if [[ -n "${statement_timeout}" ]]; then
+  echo "Statement limit:   ${statement_timeout} via StartupMessage PGOPTIONS"
+fi
 
 regress_command=(
   "${pg_regress}"
@@ -109,6 +115,13 @@ regress_command=(
 )
 
 set +e
+if [[ -n "${statement_timeout}" ]]; then
+  if [[ -n "${PGOPTIONS:-}" ]]; then
+    export PGOPTIONS="${PGOPTIONS} -c statement_timeout=${statement_timeout}"
+  else
+    export PGOPTIONS="-c statement_timeout=${statement_timeout}"
+  fi
+fi
 if [[ -n "${regress_timeout}" ]]; then
   timeout "${regress_timeout}" "${regress_command[@]}" \
     2>&1 | tee "${output_dir}/pg_regress.log"
