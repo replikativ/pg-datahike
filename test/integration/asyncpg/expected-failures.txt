@@ -44,8 +44,9 @@ tests/test_codecs.py::TestCodecs::test_custom_codec_on_domain
 tests/test_codecs.py::TestCodecs::test_custom_codec_on_enum
 tests/test_codecs.py::TestCodecs::test_custom_codec_on_enum_array
 tests/test_codecs.py::TestCodecs::test_custom_codec_override_text
-# Tuple-codec subtests reuse a temporary relation; pg_temp isolation remains
-# an explicit beta gap and the later cases see the earlier physical table.
+# Tuple-codec cases need binary/tuple codec support. Their permanent scratch
+# table can then remain after the first unsupported case because Datahike's
+# historical datoms prevent that failed teardown from retracting its schema.
 tests/test_codecs.py::TestCodecs::test_custom_codec_override_tuple
 tests/test_codecs.py::TestCodecs::test_custom_codec_text
 tests/test_codecs.py::TestCodecs::test_domains

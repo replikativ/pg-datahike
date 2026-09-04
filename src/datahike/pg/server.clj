@@ -4228,7 +4228,7 @@
 ;; --- Transaction handlers ---------------------------------------------------
 
 (defn- handle-begin
-  [{:keys [conn tx-state session-state]} parsed]
+  [{:keys [conn tx-state session-state temp-tables]} parsed]
   (if (:in-tx? @tx-state)
     (tag-tx-status (empty-result "BEGIN") tx-state)
     (let [real-db (d/db conn)]
@@ -4247,7 +4247,8 @@
              ;; writes by other sessions (emits 40001 serialization_failure
              ;; — the code Odoo/ORMs retry on).
              :begin-max-tx (:max-tx real-db)
-             :eid->tempid {} :savepoints [])
+             :eid->tempid {} :savepoints []
+             :temp-tables-before @temp-tables)
       (tag-tx-status (empty-result "BEGIN") tx-state))))
 
 (defn- open-implicit-tx!
@@ -4257,7 +4258,7 @@
    the group boundary (commitImplicit). Same shape as handle-begin but
    tagged :implicit? — the difference is who commits it (the wire layer
    at Sync, not a client COMMIT). See doc/design-alignment.md."
-  [{:keys [conn tx-state session-state]}]
+  [{:keys [conn tx-state session-state temp-tables]}]
   (let [real-db (d/db conn)]
     (swap! tx-state assoc
            :in-tx? true :implicit? true :aborted? false :tx-buffer []
@@ -4265,12 +4266,13 @@
            :read-only? (boolean (:read-only? @session-state))
            :speculative-db (apply-temporal real-db session-state)
            :begin-max-tx (:max-tx real-db)
-           :eid->tempid {} :savepoints [])))
+           :eid->tempid {} :savepoints []
+           :temp-tables-before @temp-tables)))
 
 (defn- handle-savepoint
   "Savepoint names are unique within a tx but may be reused after RELEASE.
    Outside a tx PG raises 25P01."
-  [{:keys [tx-state]} parsed]
+  [{:keys [tx-state temp-tables]} parsed]
   (let [name (:name parsed)]
     (if-not (:in-tx? @tx-state)
       (error-result "SAVEPOINT can only be used in transaction blocks" "25P01")
@@ -4281,6 +4283,7 @@
                   :eid->tempid (:eid->tempid @tx-state)
                   :owned-locks (:owned-locks @tx-state)
                   :ddl-version (:ddl-version @tx-state)
+                  :temp-tables @temp-tables
                   ;; The conflict watermark travels WITH the snapshot: a
                   ;; rebase after this savepoint advances begin-max-tx, and
                   ;; ROLLBACK TO must restore the old value — otherwise the
@@ -4431,11 +4434,21 @@
   (reset! cursors {})
   (release-session-locks! session-id)
   (release-advisory-locks! session-id true)
-  (swap! tx-state assoc
-         :in-tx? false :implicit? false :aborted? false
-         :read-only? false
-         :ddl-version 0
-         :owned-locks #{}))
+  (swap! tx-state
+         (fn [state]
+           (-> state
+               (assoc :in-tx? false :implicit? false :aborted? false
+                      :read-only? false
+                      :ddl-version 0
+                      :owned-locks #{})
+               (dissoc :temp-tables-before)))))
+
+(defn- restore-temp-tables!
+  "Restore the session temp namespace to its transaction-start snapshot."
+  [tx-state temp-tables]
+  (when (and (:in-tx? @tx-state)
+             (contains? @tx-state :temp-tables-before))
+    (reset! temp-tables (:temp-tables-before @tx-state))))
 
 (def ^:private write-parse-types
   "Parsed :type values that mutate the database. A write executed in an
@@ -4491,7 +4504,7 @@
     (invalidate-schema-cache!)))
 
 (defn- handle-commit
-  [{:keys [conn session-id tx-state cursors]} _parsed]
+  [{:keys [conn session-id tx-state cursors temp-tables]} _parsed]
   (if (:in-tx? @tx-state)
     (if (:aborted? @tx-state)
       ;; PostgreSQL accepts COMMIT in a failed transaction, discards all
@@ -4499,6 +4512,7 @@
       ;; leaves clients permanently stuck until they happen to issue an
       ;; explicit ROLLBACK.
       (do (invalidate-rolled-back-ddl! tx-state)
+          (restore-temp-tables! tx-state temp-tables)
           (end-tx! session-id tx-state cursors)
           (tag-tx-status (empty-result "ROLLBACK") tx-state))
       (try
@@ -4507,13 +4521,15 @@
         (tag-tx-status (empty-result "COMMIT") tx-state)
         (catch Exception e
           (invalidate-rolled-back-ddl! tx-state)
+          (restore-temp-tables! tx-state temp-tables)
           (end-tx! session-id tx-state cursors)
           (classified-error "COMMIT failed: " e))))
     (tag-tx-status (empty-result "COMMIT") tx-state)))
 
 (defn- handle-rollback
-  [{:keys [session-id tx-state cursors]} _parsed]
+  [{:keys [session-id tx-state cursors temp-tables]} _parsed]
   (invalidate-rolled-back-ddl! tx-state)
+  (restore-temp-tables! tx-state temp-tables)
   (end-tx! session-id tx-state cursors)
   (tag-tx-status (empty-result "ROLLBACK") tx-state))
 
@@ -4522,7 +4538,7 @@
    savepoint (which remains active). Locks acquired after the target
    are released. Raises 25P01 outside a tx, 3B001 if the savepoint
    name isn't active."
-  [{:keys [tx-state]} parsed]
+  [{:keys [tx-state temp-tables]} parsed]
   (let [sp-stack (:savepoints @tx-state)
         name (:name parsed)
         target-idx (when (seq sp-stack)
@@ -4540,6 +4556,7 @@
       (let [target (nth sp-stack target-idx)
             {:keys [speculative-db tx-buffer eid->tempid
                     owned-locks begin-max-tx ddl-version]} target
+            target-temp-tables (:temp-tables target)
             current-ddl-version (long (or (:ddl-version @tx-state) 0))
             target-ddl-version (long (or ddl-version 0))
             current-locks (:owned-locks @tx-state)
@@ -4552,6 +4569,7 @@
                            reg to-release))))
         (when (> current-ddl-version target-ddl-version)
           (invalidate-schema-cache!))
+        (reset! temp-tables target-temp-tables)
         (swap! tx-state assoc
                :aborted? false
                :speculative-db speculative-db
@@ -4573,8 +4591,9 @@
    abort any in-progress tx, clear per-handler caches. Matches PG's
    behavior in src/backend/commands/discard.c — clients use this
    between connection-pool checkouts."
-  [{:keys [session-id tx-state session-state sql-prepared cursors]} _parsed]
+  [{:keys [session-id tx-state session-state sql-prepared cursors temp-tables]} _parsed]
   (invalidate-rolled-back-ddl! tx-state)
+  (restore-temp-tables! tx-state temp-tables)
   (release-session-locks! session-id)
   (release-advisory-locks! session-id)
   (reset! tx-state {:in-tx? false :aborted? false
@@ -6835,13 +6854,14 @@
 (defn- exec-ddl-create
   [ctx parsed]
   (let [{:keys [conn tx-state temp-tables]} ctx
+        logical (:temp-logical-name parsed)
         ^PgWireServer$QueryResult result (execute-ddl-create conn parsed tx-state)]
     ;; Record CREATE TEMP/TEMPORARY TABLE so the connection-close hook can
     ;; drop it (PG temp tables live for the session, not forever). Only
     ;; track on a non-error result so a failed/duplicate create doesn't
     ;; schedule a spurious drop.
-    (when (and temp-tables (:temp? parsed) (nil? (.-error result)))
-      (swap! temp-tables conj (:table-name parsed)))
+    (when (and temp-tables (:new-temp-mapping? parsed) (nil? (.-error result)))
+      (swap! temp-tables assoc logical (:table-name parsed)))
     result))
 
 (defn- sequence-current-params
@@ -7935,14 +7955,13 @@
                        (when (seq tx-data)
                          (transact-recorded! conn tx-data))
                        (empty-result "DROP TABLE")))]
-        ;; Outside a transaction, a dropped temp table no longer needs close
-        ;; cleanup. Inside one, retain the tracking entry conservatively:
-        ;; ROLLBACK restores the table, while after COMMIT close cleanup is a
-        ;; harmless no-op against the already-absent namespace.
+        ;; A successful drop immediately changes this transaction's visible
+        ;; namespace. ROLLBACK and ROLLBACK TO restore the saved mapping.
         (when (and temp-tables
-                   (not (:in-tx? @tx-state))
                    (nil? (.-error ^PgWireServer$QueryResult result)))
-          (swap! temp-tables #(apply disj % tables)))
+          (swap! temp-tables
+                 (fn [mapping]
+                   (into {} (remove (comp (set tables) val)) mapping))))
         result)
       (catch Exception e
         (classified-error "DROP TABLE error: " e)))))
@@ -8233,6 +8252,143 @@
     (when (>= (count (:pending-rows @copy-state)) batch-size)
       (copy-flush-batch! ctx))))
 
+(def ^:private temp-table-prefix "__dh_pg_temp_")
+
+(defn- temp-storage-name [session-id logical-name]
+  (str temp-table-prefix (str/replace session-id "-" "") "_" logical-name))
+
+(defn- visible-session-schema
+  "Return a SQL-facing schema where this session's physical temp namespaces
+   appear under their logical names and every other temp namespace is hidden.
+   An owned temp table also shadows a permanent table of the same name."
+  [schema temp-tables db]
+  (let [logical->physical @temp-tables
+        physical->logical (clojure.set/map-invert logical->physical)
+        shadowed (set (keys logical->physical))
+        hints (pgs/schema-hints db)]
+    (reduce-kv
+     (fn [visible ident props]
+       (if-not (keyword? ident)
+         (assoc visible ident props)
+         (let [table (namespace ident)]
+           (cond
+             (contains? physical->logical table)
+             (let [hint (get hints ident)]
+               (assoc visible
+                      (keyword (get physical->logical table) (name ident))
+                      (cond-> props
+                        (:pg-type hint) (assoc :pg/type (:pg-type hint)))))
+
+             (and table (str/starts-with? table temp-table-prefix))
+             visible
+
+             (contains? shadowed table)
+             visible
+
+             :else
+             (assoc visible ident props)))))
+     (empty schema)
+     schema)))
+
+(defn- table-reference-key? [k]
+  (and (keyword? k)
+       (or (= k :ns)
+           (= k :inherits)
+           (= k :seq-name)
+           (str/includes? (name k) "table"))))
+
+(defn- physicalize-temp-parse
+  "Rewrite a SQL parse from session-visible temp names to the unique physical
+   namespaces stored in Datahike. Literal strings are left alone; only schema
+   keywords and structural table-name fields are rewritten."
+  [parsed temp-tables session-id]
+  (let [logical (:table-name parsed)
+        new-temp? (and (:temp? parsed)
+                       logical
+                       (not (contains? @temp-tables logical)))
+        ;; Parsing must not make a prepared CREATE TEMP visible. Use a local
+        ;; candidate mapping; exec-ddl-create publishes it only after success.
+        logical->physical (cond-> @temp-tables
+                            new-temp? (assoc logical
+                                             (temp-storage-name session-id logical)))
+        rewrite-name #(get logical->physical % %)
+        rewritten
+        (letfn [(rewrite [x]
+                  (cond
+                    ;; ParamRef and other translator records deliberately do
+                    ;; not implement empty; they also contain no schema attrs.
+                    (record? x) x
+
+                    (and (keyword? x)
+                         (contains? logical->physical (namespace x)))
+                    (keyword (rewrite-name (namespace x)) (name x))
+
+                    (map? x)
+                    (reduce-kv
+                     (fn [m k v]
+                       (let [v (rewrite v)]
+                         (assoc m (rewrite k)
+                                (cond
+                                  (and (string? v) (table-reference-key? k))
+                                  (rewrite-name v)
+
+                                  (and (sequential? v) (table-reference-key? k))
+                                  (mapv #(if (string? %) (rewrite-name %) %) v)
+
+                                  (= k :table-aliases)
+                                  (update-vals v rewrite-name)
+
+                                  :else v))))
+                     (empty x) x)
+
+                    (vector? x) (mapv rewrite x)
+                    (set? x) (into (empty x) (map rewrite) x)
+                    (list? x) (with-meta (apply list (map rewrite x)) (meta x))
+                    (seq? x) (doall (map rewrite x))
+                    :else x))]
+          (rewrite parsed))
+        ;; Session-local rows must not survive in the historical indexes.
+        ;; Besides matching PostgreSQL's temp-table lifetime, this lets close
+        ;; retract the rows and their schema even when the database otherwise
+        ;; keeps history.
+        rewritten (if (:temp? parsed)
+                    (update rewritten :tx-data
+                            (fn [tx-data]
+                              (mapv (fn [form]
+                                      (if (and (map? form)
+                                               (keyword? (:db/ident form))
+                                               (str/starts-with?
+                                                (or (namespace (:db/ident form)) "")
+                                                temp-table-prefix))
+                                        (assoc form :db/noHistory true)
+                                        form))
+                                    tx-data)))
+                    rewritten)]
+    (cond-> rewritten
+      (:temp? parsed) (assoc :temp-logical-name logical)
+      new-temp? (assoc :new-temp-mapping? true))))
+
+(defn- parse-session-sql [sql schema db temp-tables session-id]
+  (let [mapping @temp-tables
+        temp-schema? (or (seq mapping)
+                         (some (fn [ident]
+                                 (and (keyword? ident)
+                                      (str/starts-with?
+                                       (or (namespace ident) "")
+                                       temp-table-prefix)))
+                               (keys schema)))
+        parse-schema (if temp-schema?
+                       (visible-session-schema schema temp-tables db)
+                       schema)
+        parsed (binding [params/*temp-table-map* mapping]
+                 (sql/parse-sql sql parse-schema db))]
+    ;; Preserve the ordinary parser's schema identity and deferred values for
+    ;; sessions with no temp namespace. Rewriting is only needed once a temp
+    ;; table exists or for the CREATE that introduces one.
+    (if (or (seq mapping) (:temp? parsed))
+      (physicalize-temp-parse parsed temp-tables session-id)
+      parsed)))
+
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
 
@@ -8336,14 +8492,10 @@
         ;;    :pending-rows  vec of partial-batch rows
         ;;    :batch-size    long}
         copy-state (atom nil)
-        ;; Names of CREATE TEMP/TEMPORARY tables created on this session.
-        ;; Dropped in close() so they don't outlive the connection (PG
-        ;; temp tables are session-scoped). See exec-ddl-create /
-        ;; exec-ddl-drop. Not true per-session isolation — Datahike has a
-        ;; single shared schema — but matches PG's session lifetime for
-        ;; the sequential single-connection usage the conformance suites
-        ;; exercise.
-        temp-tables (atom #{})
+        ;; Logical-to-physical names for this session's temp tables. Physical
+        ;; namespaces include session-id, so concurrent sessions can create
+        ;; the same logical name without sharing schema or rows.
+        temp-tables (atom {})
         ;; Deferred-CC INSERT batching state (see exec-insert's batchable
         ;; branch). Set by beginBatchScope to a per-handler atom; nil when
         ;; the handler isn't being driven by a wire layer that supports
@@ -8374,10 +8526,10 @@
         ;; Drop CREATE TEMP tables — they live only for the session.
         ;; Best-effort: a table already dropped by hand, or one whose
         ;; create rolled back, simply has nothing to retract.
-        (doseq [t @temp-tables]
+        (doseq [t (vals @temp-tables)]
           (try (drop-table-tx! conn t)
                (catch Exception _ nil)))
-        (reset! temp-tables #{})
+        (reset! temp-tables {})
         (reset! copy-state nil)
         (reset! tx-state {:in-tx? false :aborted? false
                           :session-id session-id
@@ -8498,6 +8650,7 @@
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
           (if (:aborted? @tx-state)
             (do (invalidate-rolled-back-ddl! tx-state)
+                (restore-temp-tables! tx-state temp-tables)
                 (end-tx! session-id tx-state cursors) nil)
             (try
               (transact-tx-buffer! conn tx-state)
@@ -8505,6 +8658,7 @@
               nil
               (catch Exception e
                 (invalidate-rolled-back-ddl! tx-state)
+                (restore-temp-tables! tx-state temp-tables)
                 (end-tx! session-id tx-state cursors)
                 (classified-error "COMMIT (implicit) failed: " e))))))
 
@@ -8516,6 +8670,7 @@
       (rollbackImplicit [_]
         (when (and (:in-tx? @tx-state) (:implicit? @tx-state))
           (invalidate-rolled-back-ddl! tx-state)
+          (restore-temp-tables! tx-state temp-tables)
           (end-tx! session-id tx-state cursors))
         nil)
 
@@ -8571,7 +8726,8 @@
                   db (if (:in-tx? @tx-state)
                        (or (:speculative-db @tx-state) base-db)
                        base-db)
-                  parsed (sql/parse-sql sql (dbi/-schema db) db)]
+                  parsed (parse-session-sql sql (dbi/-schema db) db
+                                            temp-tables session-id)]
             ;; Surface parse-time errors (undefined relation/column,
             ;; syntax errors) as a Parse-message failure, matching
             ;; PostgreSQL: it validates the statement at Parse and raises
@@ -8870,7 +9026,8 @@
                          (binding [params/*bound-params* (vec (rest bound))
                                    params/*declared-param-oids*
                                    (:declared-param-oids parsed)]
-                           (assoc (sql/parse-sql (:sql parsed) (dbi/-schema db) db)
+                           (assoc (parse-session-sql (:sql parsed) (dbi/-schema db) db
+                                                     temp-tables session-id)
                                   :sql (:sql parsed)
                                   :declared-param-oids (:declared-param-oids parsed))))
                        parsed)]
@@ -9028,7 +9185,8 @@
                                                 (binding [params/*bound-params* (vec (rest bound))
                                                           params/*declared-param-oids*
                                                           (:declared-param-oids cached)]
-                                                  (assoc (sql/parse-sql sql schema db)
+                                                  (assoc (parse-session-sql sql schema db
+                                                                            temp-tables session-id)
                                                          :sql (:sql cached)
                                                          :declared-param-oids
                                                          (:declared-param-oids cached)))
@@ -9072,7 +9230,8 @@
                                                         (into {} (map-indexed
                                                                   (fn [i o] [(inc i) o]))
                                                               toids))]
-                                              (sql/parse-sql tsql schema db))]
+                                              (parse-session-sql tsql schema db
+                                                                 temp-tables session-id))]
                                       (when (and p (not= :error (:type p))
                                                  ;; Runtime subqueries reparse
                                                  ;; their inner SELECT during
@@ -9108,7 +9267,8 @@
                                            ;; :insert-gated — is a no-op.
                                            :bound (when (not= :select (:type p))
                                                     bound)}))))
-                                  {:parsed (let [p (sql/parse-sql sql schema db)]
+                                  {:parsed (let [p (parse-session-sql sql schema db
+                                                                      temp-tables session-id)]
                                              (when bump-dispatch! (bump-dispatch! p))
                                              p)}))
                             ;; Even an otherwise unchanged SELECT with

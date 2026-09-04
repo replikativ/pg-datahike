@@ -19,6 +19,7 @@ upstream runs as a separate `node file.js` invocation. A file passes iff
 | File | Rationale |
 |---|---|
 | `test/integration/client/big-simple-query-tests.js` | Large result sets, streaming chunking. |
+| `test/integration/client/simple-query-tests.js` | Simple/multi-query execution, including isolated same-named temp tables on concurrent clients. |
 | `test/integration/client/empty-query-tests.js` | `EmptyQueryResponse` handling. |
 | `test/integration/client/prepared-statement-tests.js` | Extended-query protocol end-to-end. |
 | `test/integration/client/multiple-results-tests.js` | `;`-separated statements in one Query. |
@@ -72,15 +73,13 @@ happens, move the file up into `FILES`.
 
 | File | Failing test(s) | Missing feature |
 |---|---|---|
-| `simple-query-tests.js` | second client's `create temp table bang` → "already exists" | Per-session `pg_temp` isolation: temp tables live in the shared db and are visible across connections, so two sessions creating the same-named temp table collide. (Drop-on-disconnect exists; isolation does not.) |
-| `error-handling-tests.js` | `create temp table boom` across connections | Same per-session `pg_temp` isolation gap. |
+| `error-handling-tests.js` | `non-query error with callback` | The harness connects with an unknown user but this unauthenticated local server accepts it, so the callback receives no `Error`. Temp-table isolation cases in this file now pass. |
 | `field-name-escape-tests.js` | quoted-identifier escaping | Backslash / exotic quoted-identifier rules differ from PG (JSqlParser identifier handling). Adversarial; low realistic-use value. |
 | `query-error-handling-tests.js` | "client can do nothing on cancellation" | Query cancellation via `pg_cancel_backend()` over `pg_stat_activity` not implemented. |
 | `query-error-handling-prepared-statement-tests.js` | backend-terminate path | `pg_terminate_backend()` over `pg_stat_activity` not implemented. |
 | `type-coercion-tests.js` | "date range extremes" | PostgreSQL and ECMAScript accept timestamps up to year 275760 and BCE dates far outside `java.time`'s practical conversion path. The 13 core coercion cases, timestamptz round-trip, and "selecting nulls" (`7 <> $1`, `$1=NULL`) pass. |
 | `parse-int-8-tests.js` | `SELECT COUNT(*), '{1,2,3}'::bigint[] FROM asdf` | `COUNT(*)` over an empty table must return one row (count 0); plus the `'{1,2,3}'::bigint[]` array-literal cast. |
 
-Priority for closing these: per-session `pg_temp` isolation (2 files, high
-realistic-use value) first, then the array-literal cast. The remaining
-query-error files require SQL helpers around
+Priority for closing these: the array-literal cast, then narrower authentication
+and query-error cases. The latter require SQL helpers around
 `pg_stat_activity`; `field-name-escape` is adversarial and lowest priority.

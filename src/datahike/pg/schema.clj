@@ -820,7 +820,9 @@
                                    vtype (:db/valueType props)
                                    col {:name        col-name
                                         :attr        ident
-                                        :oid         (declared-col-oid (:pg-type h) vtype)
+                                        :oid         (declared-col-oid
+                                                      (or (:pg-type h) (:pg/type props))
+                                                      vtype)
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
                                         :unique      (:db/unique props)

@@ -166,7 +166,10 @@ to close:
   immutable snapshots. `FOR UPDATE` / advisory locks / savepoints are
   approximated; genuinely concurrent isolation levels are not the model. This is
   the most important boundary for pooled workloads.
-- **Per-session `pg_temp` isolation**: drop-on-disconnect covers sequential use;
-  concurrent same-name temp tables across sessions are not namespaced.
+- **Temporary-table storage**: SQL sessions receive unique physical Datahike
+  namespaces, so same-named temp tables remain isolated and are hidden from
+  other sessions. Their attributes use `:db/noHistory` and are retracted on
+  disconnect; a process crash can leave hidden physical schema that is safe
+  but requires later garbage collection.
 - **Adversarial parser edge cases** (e.g. a backslash inside a quoted
   identifier): a jsqlparser lexer limitation.

@@ -51,6 +51,7 @@ fi
 FILES=(
   # --- core protocol surface ---------------------------------------------
   "test/integration/client/big-simple-query-tests.js"
+  "test/integration/client/simple-query-tests.js"
   "test/integration/client/empty-query-tests.js"
   "test/integration/client/prepared-statement-tests.js"
   "test/integration/client/multiple-results-tests.js"
@@ -79,9 +80,6 @@ FILES=(
 # fix flips one green (reported as XPASS — promote it into FILES above).
 # A failure here counts as "skipped", not "failed", so the job stays green.
 XFAIL_FILES=(
-  # temp tables are not per-session isolated yet (shared pg_temp); a second
-  # connection's CREATE TEMP TABLE collides with the first's.
-  "test/integration/client/simple-query-tests.js"
   "test/integration/client/error-handling-tests.js"
   # backslash / exotic quoted-identifier escaping (JSqlParser identifier rules).
   "test/integration/client/field-name-escape-tests.js"
