@@ -510,7 +510,11 @@
       {:id :numeric-special-aggregates
        :source-lines [90 113]
        :gate "test/datahike/test/pg_numeric_special_test.clj"
-       :test-var "numeric-aggregates-preserve-special-values"}]}
+       :test-var "numeric-aggregates-preserve-special-values"}
+      {:id :aggregate-filter-planning
+       :source-lines [890 895]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "aggregate-filter-planning-errors-do-not-reach-datalog"}]}
     {:name "window" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:windows :aggregates :expressions}
