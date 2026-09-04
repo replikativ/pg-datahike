@@ -125,6 +125,12 @@
       (is (= 0 (parse "SET statement_timeout TO DEFAULT")))
       (is (= 0 (parse "RESET statement_timeout"))))))
 
+(deftest statement-timeout-startup-option-extracted
+  (let [parse #'datahike.pg.server/parse-startup-statement-timeout]
+    (is (= 5000 (parse "-c statement_timeout=5s")))
+    (is (= 250 (parse "-c search_path=public -cstatement_timeout=250ms")))
+    (is (nil? (parse "-c search_path=public")))))
+
 ;; ============================================================================
 ;; INDEX/KEY varchar — quote reserved-word column names
 ;; ============================================================================

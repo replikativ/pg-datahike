@@ -44,9 +44,12 @@
 ;; the per-test :each setup would repeat.
 (def ^:dynamic ^:private *server-state* nil)
 
-(defn- reset-latches! [state]
-  (reset! (:dispatch-started state) (CountDownLatch. 1))
-  (reset! (:cancel-landed state) (promise)))
+(defn- reset-latches!
+  ([state] (reset-latches! state true))
+  ([state pause-dispatch?]
+   (reset! (:dispatch-started state) (CountDownLatch. 1))
+   (reset! (:cancel-landed state) (promise))
+   (reset! (:pause-dispatch? state) pause-dispatch?)))
 
 (defn- cancel-fixture [f]
   (pg/reset-lock-registry!)
@@ -64,7 +67,8 @@
           ;; Hold the mutable latches in atoms so each test resets them
           ;; without rebuilding the fixture.
           state {:dispatch-started (atom (CountDownLatch. 1))
-                 :cancel-landed    (atom (promise))}]
+                 :cancel-landed    (atom (promise))
+                 :pause-dispatch?  (atom true)}]
       (load-db conn 1000)
       (let [factory (reify PgWireServer$QueryHandlerFactory
                       (create [_]
@@ -81,8 +85,9 @@
                               ;; — it just returns — so we fall
                               ;; straight into d/q with the flag set.
                               (.countDown ^CountDownLatch @(:dispatch-started state))
-                              (LockSupport/parkNanos (* 10 1000 1000 1000)) ;; 10s ceiling
-                              (deliver @(:cancel-landed state) true)))})))
+                              (when @(:pause-dispatch? state)
+                                (LockSupport/parkNanos (* 10 1000 1000 1000)) ;; 10s ceiling
+                                (deliver @(:cancel-landed state) true))))})))
             server (PgWireServer. 0 "127.0.0.1" factory)]
         (.start server)
         (try
@@ -101,6 +106,11 @@
   (DriverManager/getConnection
    (str "jdbc:postgresql://127.0.0.1:" *port*
         "/datahike?user=datahike&password=x&sslmode=disable&binaryTransfer=false")))
+
+(def ^:private correlated-cancel-sql
+  (str "SELECT avg((SELECT avg(a1.col1 ORDER BY "
+       "(SELECT avg(a2.col2) FROM x a3)) "
+       "FROM x a1(col1))) FROM x a2(col2)"))
 
 (deftest cancel-request-interrupts-long-scan
   (reset-latches! *server-state*)
@@ -165,3 +175,40 @@
         (with-open [rs (.executeQuery st "SELECT COUNT(*) FROM x")]
           (is (.next rs))
           (is (= 1000 (.getLong rs 1))))))))
+
+(deftest statement-timeout-cancels-correlated-subquery-work
+  (reset-latches! *server-state* false)
+  (testing "translation-time nested queries observe the same cancel token"
+    (with-open [c (open)]
+      (with-open [st (.createStatement c)]
+        (.execute st "SET statement_timeout = 50")
+        (let [outcome
+              (try
+                (.executeQuery st correlated-cancel-sql)
+                :completed
+                (catch SQLException e (.getSQLState e)))]
+          (is (= "57014" outcome)))
+        (.execute st "RESET statement_timeout")
+        (with-open [rs (.executeQuery st "SELECT 1")]
+          (is (.next rs))
+          (is (= 1 (.getInt rs 1))))))))
+
+(deftest cancel-request-stops-correlated-subquery-work-without-a-pause
+  (reset-latches! *server-state* false)
+  (with-open [c (open)]
+    (with-open [st (.createStatement c)]
+      (let [outcome (promise)
+            runner (future
+                     (try
+                       (.executeQuery st correlated-cancel-sql)
+                       (deliver outcome :completed)
+                       (catch SQLException e
+                         (deliver outcome (.getSQLState e)))))]
+        (is (.await ^CountDownLatch @(:dispatch-started *server-state*)
+                    10 TimeUnit/SECONDS))
+        (.cancel st)
+        (is (= "57014" (deref outcome 10000 :timeout)))
+        @runner)
+      (with-open [rs (.executeQuery st "SELECT 1")]
+        (is (.next rs))
+        (is (= 1 (.getInt rs 1)))))))

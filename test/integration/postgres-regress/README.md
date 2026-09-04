@@ -100,9 +100,12 @@ result output, unified diff, console log, and a machine-readable `summary.tsv`.
 A normal mismatch (`pg_regress` status 1) is reported but does not fail the
 task. Harness failures remain fatal. Bound an exploratory invocation with, for
 example, `PG_REGRESS_TIMEOUT=15m`; status 124 then identifies the incomplete
-run, while `pg_regress.log` preserves its last progress line. The bound covers
-the selected invocation, not each SQL statement, and cannot cancel server work
-until pg-datahike implements query cancellation.
+run, while `pg_regress.log` preserves its last progress line. The runner also
+passes a 10-second server-side `statement_timeout` through PGOPTIONS by
+default. This bounds each statement independently and lets the file continue
+after a pathological query; set `PG_REGRESS_STATEMENT_TIMEOUT` to another
+duration or to `0` to disable it. Keep the invocation timeout as the outer
+harness safety net.
 
 Set `PG_REGRESS_STRICT=1` when an admitted test is expected to match
 raw psql output, including source-position presentation. Campaign tests in

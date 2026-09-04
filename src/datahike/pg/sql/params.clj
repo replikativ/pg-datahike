@@ -220,6 +220,21 @@
    keep returning answers from the snapshot on which they were prepared."
   nil)
 
+(def ^:dynamic *cancel*
+  "The current pgwire statement's cancellation token, or nil outside a
+   cancellable execution. Translation-time work and nested queries use the
+   same IDeref as the top-level Datahike query so CancelRequest and
+   statement_timeout cannot be stranded at a subquery boundary."
+  nil)
+
+(defn check-cancel!
+  "Raise Datahike's protocol-neutral cancellation marker when the current
+   statement has been cancelled. Cheap and nil-safe for non-server callers."
+  []
+  (when-let [^clojure.lang.IDeref cancel *cancel*]
+    (when (.deref cancel)
+      (throw (ex-info "query canceled" {:datahike/canceled true})))))
+
 (defn registered-enum-values
   "Return the declared label set for a CREATE TYPE ... AS ENUM registry
    entry, or nil when `type-name` is not a registered enum."

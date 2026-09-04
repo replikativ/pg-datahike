@@ -37,7 +37,7 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
 
 ## Campaign status — 2026-09-04
 
-- Unit: 1,615 tests / 6,905 assertions, all passing.
+- Unit: 1,618 tests / 6,915 assertions, all passing.
 - SQLLogic: 61 assertion groups, all passing.
 - Released secondary stack: 5 tests / 75 assertions, all passing on JDK 25.
 - node-postgres: 14 admitted files passing, 8 known-gap files still xfail.
@@ -76,8 +76,7 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
 1. **Correctness:** three-valued NULLs, insert-then-delete in one transaction,
    embedded-NUL validation, alternating batch parameter types, temporary-table
    isolation and startup database validation.
-2. **Runtime safety:** cancellation and an enforced bound on result memory or
-   result size.
+2. **Runtime safety:** an enforced bound on result memory or result size.
 3. **Compatibility admission:** reconcile asyncpg, widen pgjdbc beyond the two
    admitted classes and tighten node-postgres allowances.
 4. **Release candidate:** run Odoo, Metabase and the version-pinned Datahike
