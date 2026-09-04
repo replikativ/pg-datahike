@@ -37,14 +37,16 @@ exec 3<&-; exec 3>&-
 # If you add a class here, add a one-line rationale in expected-skips.md under
 # the "included" section.
 TESTS=(
-  # --- Verified-stable JDBC surface.
-  # The rest of the pgjdbc class list
-  # (DriverTest, ConnectionTest, PreparedStatementTest,
-  # DatabaseMetaData*, …) is in active development — see
-  # `expected-skips.md → Deferred classes` for the specific gaps. When
-  # those land, re-add the class name here one at a time and re-run.
+  # --- Verified-stable JDBC surface. See expected-skips.md for the measured
+  # results and for the explicit disposition of every adjacent class.
+  "org.postgresql.test.jdbc2.DriverTest"
+  "org.postgresql.test.jdbc2.ConnectionTest"
+  "org.postgresql.test.jdbc2.MiscTest"
+  "org.postgresql.test.jdbc2.ServerPreparedStmtTest"
   "org.postgresql.test.jdbc2.ResultSetTest"
   "org.postgresql.test.jdbc2.BatchExecuteTest"
+  "org.postgresql.test.jdbc2.DatabaseMetaDataPropertiesTest"
+  "org.postgresql.test.jdbc42.PreparedStatementTest"
 )
 
 # Build the --tests argument list for gradle.

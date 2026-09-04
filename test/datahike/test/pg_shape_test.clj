@@ -89,8 +89,8 @@
     (is (= :empty-catalog
            (shape/catalog-probe
             "SELECT * FROM pg_catalog.pg_trigger"))))
-  (testing "pg_settings / pg_trigger still unmaterialized"
-    (is (= :empty-catalog (shape/catalog-probe "SELECT * FROM pg_settings")))
+  (testing "pg_settings is materialized; pg_trigger remains empty"
+    (is (nil? (shape/catalog-probe "SELECT * FROM pg_settings")))
     (is (= :empty-catalog (shape/catalog-probe "SELECT * FROM pg_trigger"))))
   (testing "pg_constraint is now materialized — no shape-level shortcut"
     (is (nil? (shape/catalog-probe

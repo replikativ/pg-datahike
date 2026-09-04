@@ -31,7 +31,7 @@
    :release-gate? true
    :evidence ["test/integration/pgjdbc/run.sh"
               "test/integration/pgjdbc/expected-skips.md"]
-   :claim "ResultSetTest and BatchExecuteTest; broader JDBC admission remains a campaign item"}
+   :claim "eight application-facing pgjdbc classes; 275 passing cases and one upstream skip"}
   {:id :hibernate
    :cadence :commit
    :status :gating
@@ -150,8 +150,10 @@
    :exit "Local and CI baselines agree, every manifest entry runs, and every expected failure has a current rationale."}
   {:id :pgjdbc-breadth
    :wave 3
-   :status :open
-   :evidence ["test/integration/pgjdbc/expected-skips.md"]
+   :status :closed
+   :evidence ["test/integration/pgjdbc/run.sh"
+              "test/integration/pgjdbc/expected-skips.md"
+              "test/datahike/test/pg_server_test.clj"]
    :exit "Every deferred application-facing class is rerun and classified; stable classes join the gate."}
   {:id :batch-error-chain
    :wave 3

@@ -21,7 +21,7 @@ setup. Temporal queries (`as-of`, `history`, `since`) are exposed through
 `SET datahike.as_of`.
 
 Status: **beta**. Ready for the workloads it has been tested
-against (pgjdbc `ResultSetTest` 80/80, Odoo 19 module boot + TestORM,
+against (275 pgjdbc cases across eight classes, Odoo 19 module boot + TestORM,
 Flyway-style migrations). Not a full PG dialect; see
 [Compatibility](#compatibility).
 
@@ -535,7 +535,7 @@ transactions and PostgreSQL-style row-locking concurrency.
 ## Compatibility
 
 Tested against:
-- **pgjdbc** 42.7.x — `ResultSetTest` 80/80
+- **pgjdbc** 42.7.x — 275 passing cases across eight admitted classes
 - **psql** / libpq
 - **psycopg2** (Python)
 - **Hibernate** / Spring (via pgjdbc)
