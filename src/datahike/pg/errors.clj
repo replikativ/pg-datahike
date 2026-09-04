@@ -253,6 +253,10 @@
    {:sqlstate "42P16"
     :format (fn [{:keys [message detail]}] (or message detail))}
 
+   :generated-always
+   {:sqlstate "428C9"
+    :format (fn [{:keys [message detail]}] (or message detail))}
+
    :feature-not-supported
    {:sqlstate "0A000"
     :format (fn [{:keys [feature message detail]}]

@@ -16,13 +16,13 @@
   #{"tstypes"}
 
   :ddl-and-dml
-  #{"alter_generic" "alter_operator" "comments"
+  #{"alter_generic" "alter_operator"
     "create_aggregate" "create_cast"
-    "create_function_sql" "create_index" "create_misc" "create_operator"
-    "create_procedure" "create_schema" "create_table_like"
-    "drop_if_exists" "drop_operator" "fast_default"
-    "generated" "identity" "inherit" "largeobject" "matview" "merge"
-    "rules" "sequence" "triggers" "typed_table"
+    "create_function_sql" "create_misc" "create_operator"
+    "create_procedure"
+    "drop_operator" "fast_default"
+    "inherit" "largeobject" "matview" "merge"
+    "rules" "triggers" "typed_table"
     "updatable_views"}
 
   :relational-queries
