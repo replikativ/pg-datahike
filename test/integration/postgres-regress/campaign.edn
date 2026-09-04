@@ -256,8 +256,7 @@
     {:name "rangefuncs" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:set-returning-functions :lateral :parameter-inference}
-     :blockers #{:create-function :fixture-dependencies
-                 :unbound-datalog-var-internal-error}}
+     :blockers #{:create-function :fixture-dependencies}}
     {:name "explain" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:utility-grammar :errors}
