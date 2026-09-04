@@ -94,6 +94,30 @@
     (float? v)   (java.math.BigDecimal/valueOf (double v))
     :else        (java.math.BigDecimal. (str v))))
 
+(defn- sum-numeric-values
+  "Accumulate finite and special NUMERIC values with PostgreSQL semantics."
+  [vs]
+  (let [special-kinds (into #{}
+                            (comp (filter types/numeric-special?)
+                                  (map :kind))
+                            vs)]
+    (cond
+      (or (contains? special-kinds :nan)
+          (and (contains? special-kinds :inf)
+               (contains? special-kinds :-inf)))
+      types/nan-numeric
+
+      (contains? special-kinds :inf)
+      types/inf-numeric
+
+      (contains? special-kinds :-inf)
+      types/-inf-numeric
+
+      :else
+      (reduce (fn [^java.math.BigDecimal acc v] (.add acc (->bigdec v)))
+              java.math.BigDecimal/ZERO
+              vs))))
+
 (defn filter-sum-numeric
   "SUM with explicit BigDecimal accumulation. PG returns NUMERIC for
    SUM(int8) and SUM(numeric) to avoid overflow; this variant matches
@@ -104,9 +128,7 @@
   (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
     (if (empty? vs)
       :__null__
-      (reduce (fn [^java.math.BigDecimal acc v] (.add acc (->bigdec v)))
-              java.math.BigDecimal/ZERO
-              vs))))
+      (sum-numeric-values vs))))
 
 (defn filter-avg
   "AVG that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
@@ -214,11 +236,12 @@
   (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
     (if (empty? vs)
       :__null__
-      (avg-numeric-of (reduce (fn [^java.math.BigDecimal acc v]
-                                (.add acc (->bigdec v)))
-                              java.math.BigDecimal/ZERO
-                              vs)
-                      (count vs)))))
+      (let [sum (sum-numeric-values vs)]
+        ;; Dividing either infinity by a finite count leaves the same
+        ;; infinity; NaN remains NaN. BigDecimal handles the finite path.
+        (if (types/numeric-special? sum)
+          sum
+          (avg-numeric-of sum (count vs)))))))
 
 (defn sql-null?
   "SQL NULL, however it is carried. NULL travels as the `:__null__`

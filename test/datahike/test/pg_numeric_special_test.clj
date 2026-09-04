@@ -46,6 +46,12 @@
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
     (when (.next rs) (.getString rs 1))))
 
+(defn- one-row [^Connection c sql]
+  (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+    (when (.next rs)
+      (let [n (.getColumnCount (.getMetaData rs))]
+        (mapv #(.getString rs %) (range 1 (inc n)))))))
+
 (defn- rows [^Connection c sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
     (loop [out []]
@@ -80,6 +86,30 @@
               `map?` to spot an aggregate marker -- so these came back as
               the printed form of a compound-aggregate descriptor"
       (is (not (re-find #"compound-agg" (str (one c "SELECT 'NaN'::numeric + 1"))))))))
+
+(deftest numeric-aggregates-preserve-special-values
+  (with-open [c (jdbc)]
+    (testing "NaN propagates through numeric SUM and AVG"
+      (is (= "NaN"
+             (one c "SELECT sum('NaN'::numeric) FROM generate_series(1,3)")))
+      (is (= "NaN"
+             (one c "SELECT avg('NaN'::numeric) FROM generate_series(1,3)"))))
+    (testing "infinities follow PostgreSQL's numeric aggregate table"
+      ;; PostgreSQL 17 aggregates.sql lines 94-113 exercise the same five
+      ;; orderings for float8 and numeric. Keep the exact three-aggregate
+      ;; projection so the regression slice stays executable here.
+      (doseq [type ["float8" "numeric"]
+              [values expected]
+              [["('1'), ('infinity')" "Infinity"]
+               ["('infinity'), ('1')" "Infinity"]
+               ["('infinity'), ('infinity')" "Infinity"]
+               ["('-infinity'), ('infinity')" "NaN"]
+               ["('-infinity'), ('-infinity')" "-Infinity"]]]
+        (is (= [expected expected "NaN"]
+               (one-row c
+                        (str "SELECT sum(x::" type "), avg(x::" type
+                             "), var_pop(x::" type ") FROM (VALUES "
+                             values ") v(x)"))))))))
 
 (deftest special-division-and-modulo-matrix
   (with-open [c (jdbc)]

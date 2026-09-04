@@ -506,7 +506,11 @@
      [{:id :corr-unknown-nan-input
        :source-lines [155 159]
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
-       :test-var "corr-resolves-unknown-literals-as-float8"}]}
+       :test-var "corr-resolves-unknown-literals-as-float8"}
+      {:id :numeric-special-aggregates
+       :source-lines [90 113]
+       :gate "test/datahike/test/pg_numeric_special_test.clj"
+       :test-var "numeric-aggregates-preserve-special-values"}]}
     {:name "window" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:windows :aggregates :expressions}
