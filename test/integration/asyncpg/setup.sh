@@ -61,15 +61,21 @@ if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
 
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
+# Invoke the environment's interpreter directly. Activation scripts embed the
+# absolute path from venv creation time, so a renamed/moved checkout otherwise
+# prepends a dead directory and silently falls back to a global `python`.
+VENV_PYTHON="${VENV_DIR}/bin/python"
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "ERROR: virtualenv has no executable Python: ${VENV_PYTHON}" >&2
+  exit 2
+fi
 
-python -m pip install --upgrade --quiet pip wheel
+"${VENV_PYTHON}" -m pip install --upgrade --quiet pip wheel
 # Pin setuptools < 81 — asyncpg v0.30.0's setup.py imports pkg_resources
 # which setuptools 81 removed. Build isolation takes the latest by
 # default, so we also pass --no-build-isolation below to force use of
 # this pinned version during the C-ext compile.
-python -m pip install --quiet 'setuptools<81' cython
+"${VENV_PYTHON}" -m pip install --quiet 'setuptools<81' cython
 
 # ---- install asyncpg + test deps --------------------------------------------
 #
@@ -77,20 +83,21 @@ python -m pip install --quiet 'setuptools<81' cython
 # enough to pick up upstream changes. The `[test]` extra is defined in the
 # upstream pyproject.toml.
 
-if python -c 'import asyncpg' 2>/dev/null \
-  && python -c 'import pytest' 2>/dev/null \
-  && python -c 'import uvloop' 2>/dev/null; then
-  echo "[setup] asyncpg + pytest + uvloop already installed in venv"
+if "${VENV_PYTHON}" -c 'import asyncpg' 2>/dev/null; then
+  echo "[setup] asyncpg already installed in venv"
 else
   echo "[setup] building and installing asyncpg from source (this compiles C ext)"
-  (cd "${CLONE_DIR}" && python -m pip install --quiet --no-build-isolation -e .)
-  # The test-group is declared under [dependency-groups] in pyproject.toml,
-  # which `pip install -e .` does not pick up. Install it explicitly.
-  python -m pip install --quiet \
-    pytest \
-    pytest-timeout \
-    uvloop \
-    distro
+  (cd "${CLONE_DIR}" && "${VENV_PYTHON}" -m pip install --quiet --no-build-isolation -e .)
 fi
+
+# The test group is declared under [dependency-groups] in pyproject.toml,
+# which `pip install -e .` does not pick up. Keep exact versions here so a
+# fresh CI environment and a reused developer checkout collect and report the
+# same verdict set.
+"${VENV_PYTHON}" -m pip install --quiet \
+  'pytest==9.1.1' \
+  'pytest-timeout==2.4.0' \
+  'uvloop==0.22.1' \
+  'distro==1.9.0'
 
 echo "[setup] done. Start the pgwire server, then run:  ./run.sh"

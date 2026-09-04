@@ -27,17 +27,18 @@ regression.
 
 ## Excluded (deliberately not in the focus list)
 
-These exercise features our pgwire server does not implement. Including them
-would be pure noise.
+These modules sit outside the focused gate. Some contain useful supported
+cases, but each is dominated by another protocol subsystem or by timing-heavy
+behavior. They should enter through separately classified tranches.
 
 | Module | Why excluded |
 |---|---|
-| `tests/test_copy.py` | COPY IN/OUT protocol not implemented. |
+| `tests/test_copy.py` | pg-datahike supports streamed text/CSV COPY FROM. The module is dominated by COPY OUT, binary records, file/sink APIs, and cancellation variants that remain incomplete. |
 | `tests/test_listeners.py` | LISTEN/NOTIFY not implemented. |
-| `tests/test_pool.py` | Connection pool tests rely on LISTEN-based cancel. |
+| `tests/test_pool.py` | Broad pool lifecycle and reset coverage, including LISTEN state and backend termination; admit as a separate tranche. |
 | `tests/test_logging.py` | `LoggingMessage` streaming from PG depends on NoticeResponse patterns we don't emit. |
-| `tests/test_timeout.py` | Server-driven timeouts (`statement_timeout` etc.) not configurable. |
-| `tests/test_cancellation.py` | Full cancel-request key protocol - our implementation is partial. |
+| `tests/test_timeout.py` | Mostly asyncpg client-deadline races around `pg_sleep`. Server `statement_timeout` has dedicated tests, but this matrix is not yet classified. |
+| `tests/test_cancellation.py` | CancelRequest has dedicated pg-datahike wire tests. This module adds `pg_sleep` and precise scheduling races and needs separate classification. |
 | `tests/test_adversity.py` | Fuzzing proxy + chaos testing; out of scope for a smoke test. |
 | `tests/test_subinterpreters.py` | CPython subinterpreter machinery; unrelated to server. |
 | `tests/test__environment.py`, `tests/test__sourcecode.py` | Upstream CI-only checks (version matching, lint). |
@@ -45,12 +46,10 @@ would be pure noise.
 
 ## Expected failures within the focus list (known gaps, NOT regressions)
 
-Populate after the first successful run. Suggested format:
-
-```
-test_prepare.py::TestPrepare::test_prepare_30_pgbouncer_safe - DEALLOCATE ALL unsupported. [#NNN]
-test_types.py::TestTypes::test_interval_binary - binary interval codec absent. [#NNN]
-```
+`expected-failures.txt` is an executable, per-test baseline, grouped by module
+with comments for non-obvious causes. The live failure-ID set must equal it:
+new failures, newly passing entries, and entries that did not run all fail the
+job.
 
 ## Known caveats of this harness
 
@@ -61,6 +60,10 @@ test_types.py::TestTypes::test_interval_binary - binary interval codec absent. [
 - Many tests `CREATE TABLE test_xyz` / `DROP TABLE` at module scope. Our
   in-memory DB resets when the pgwire JVM is restarted, but within a single
   run we rely on correct `DROP TABLE IF EXISTS` semantics.
+- Start each baseline run with a fresh server. A failed cleanup can leave
+  relations behind and cause misleading cascades in later modules.
+- Run `setup.sh` after moving the checkout or changing Python. It uses the
+  virtualenv interpreter directly and pins the harness dependencies.
 - Some tests use `asyncio.wait_for(..., timeout=1)` to catch hangs. Our
   server is usually fast enough, but a busy laptop may hit these. Re-run
   before filing a regression.
