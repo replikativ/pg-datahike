@@ -61,7 +61,7 @@
    :release-gate? true
    :evidence ["test/integration/node-postgres/run.sh"
               "test/integration/node-postgres/expected-skips.md"]
-   :claim "fifteen must-pass and seven expected-failure upstream files"}
+   :claim "sixteen must-pass and six expected-failure upstream files"}
   {:id :pg-dump
    :cadence :commit
    :status :gating
@@ -118,8 +118,10 @@
    :exit "Changing compatible parameter types across a JDBC batch never leaks an unresolved ParamRef into coercion."}
   {:id :temp-table-isolation
    :wave 1
-   :status :open
-   :evidence ["test/integration/node-postgres/expected-skips.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_server_test.clj"
+              "test/integration/node-postgres/run.sh"
+              "test/integration/node-postgres/expected-skips.md"]
    :exit "Concurrent sessions isolate same-named temporary tables or CREATE TEMP fails explicitly."}
   {:id :startup-database-validation
    :wave 1

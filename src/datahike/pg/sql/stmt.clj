@@ -38,7 +38,8 @@
      stmt → fns  (aggregate lookups)
      stmt → params (ParamRef, *from-bindings*, *parse-db*)
      stmt → jsonb, schema, types   (type coercion + jsonb ops)"
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.datom]
             [datahike.query :as dq]
@@ -7959,20 +7960,51 @@
                              :sqlstate "42P01"
                              :table raw-table})))
         columns (.getColumns insert)
-        ancestor-tables (ctx/inheritance-ancestors db raw-table)
+        ;; Session temp relations are presented under their logical SQL name,
+        ;; while inheritance/order metadata is stored under the unique
+        ;; physical namespace. The visible schema carries that lookup only as
+        ;; metadata so it cannot be mistaken for a column.
+        temp-table-map params/*temp-table-map*
+        physical->logical (set/map-invert temp-table-map)
+        db-table (get temp-table-map raw-table raw-table)
+        ancestor-db-tables (ctx/inheritance-ancestors db db-table)
+        ancestor-tables (mapv #(get physical->logical % %) ancestor-db-tables)
         raw-cols (if (seq columns)
                    (mapv #(unquote-ident (.getColumnName ^Column %)) columns)
-                   (let [own-order (or (pgs/column-order-from-db db raw-table)
-                                       (when-let [cols (pgs/column-info schema raw-table)]
-                                         (mapv :name (rest cols))))
+                   (let [db-order (pgs/column-order-from-db db db-table)
+                         ;; A session-visible temp table can map to a unique
+                         ;; physical namespace in `schema` while `db` has no
+                         ;; logical-name ident to order. Fall back to the
+                         ;; supplied schema in that case. Preserve an empty
+                         ;; order for an INHERITS child: its parent columns are
+                         ;; intentionally prepended below.
+                         own-order (if (or (seq db-order) (seq ancestor-tables))
+                                     db-order
+                                     (when-let [cols (pgs/column-info schema raw-table)]
+                                       (mapv :name (rest cols))))
                          parent-order (mapcat #(pgs/column-order-from-db db %)
-                                              (reverse ancestor-tables))]
+                                              (reverse ancestor-db-tables))]
                      ;; PostgreSQL orders inherited columns before the
                      ;; child's own columns for INSERT without a target list.
                      ;; An empty child column-order is still a real value, so
                      ;; plain `or` previously hid the parent completely.
                      (vec (distinct (concat parent-order own-order)))))
         [table-name col-names] (canonical-relation schema raw-table raw-cols)
+        ns table-name
+        resolve-target-attr
+        (fn [col-name]
+          (if (contains? temp-table-map raw-table)
+            (let [db-attr (keyword db-table col-name)
+                  resolved (if db
+                             (ctx/resolve-inherited-attr db-attr (:schema db) db)
+                             db-attr)
+                  logical-ns (get physical->logical (namespace resolved)
+                                  (namespace resolved))]
+              (keyword logical-ns (name resolved)))
+            (let [raw-attr (keyword ns col-name)]
+              (if db
+                (ctx/resolve-inherited-attr raw-attr schema db)
+                raw-attr))))
         ;; PostgreSQL rejects a target column named twice. We built a
         ;; map from the column list, so the last value silently won and
         ;; `INSERT INTO t (id, id) VALUES (91, 92)` reported INSERT 0 1
@@ -7987,7 +8019,6 @@
                               {:error :duplicate-column
                                :sqlstate "42701"
                                :column dup}))))
-        ns table-name
         select (.getSelect insert)
         ;; ON CONFLICT handling
         ^net.sf.jsqlparser.statement.insert.InsertConflictAction
@@ -8115,10 +8146,7 @@
             (mapv (fn [row]
                     (into {}
                           (keep (fn [[col-name val]]
-                                  (let [raw-attr (keyword ns col-name)
-                                        attr (if db
-                                               (ctx/resolve-inherited-attr raw-attr schema db)
-                                               raw-attr)
+                                  (let [attr (resolve-target-attr col-name)
                                         ;; A row coming FROM A SELECT carries SQL
                                         ;; NULL as the `:__null__` sentinel, not
                                         ;; nil, and the sentinel reached the
@@ -8330,10 +8358,7 @@
             row-attrs (mapv (fn [row]
                               (into {}
                                     (keep (fn [[col-name val]]
-                                            (let [raw-attr (keyword ns col-name)
-                                                  attr (if db
-                                                         (ctx/resolve-inherited-attr raw-attr schema db)
-                                                         raw-attr)
+                                            (let [attr (resolve-target-attr col-name)
                                                   coerced (coerce-insert-value val attr schema)]
                                           ;; DEFAULT means omitted; explicit
                                           ;; NULL remains a present nil so a

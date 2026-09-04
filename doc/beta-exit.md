@@ -25,7 +25,7 @@ bb beta-exit
 | Hibernate | 14 application tests, per commit | Hibernate 6 DDL, CRUD, relationships, HQL and transaction flows work. |
 | SQLAlchemy | 16 application tests, per commit | SQLAlchemy 2 with psycopg2 can perform the documented application flow. |
 | asyncpg | 11 upstream modules, per commit | New per-test failures and module hangs fail CI; 67 known failures remain explicit. |
-| node-postgres | 15 must-pass and 7 expected-failure files, per commit | The admitted JS client files stay green and known-gap files continue to run. |
+| node-postgres | 16 must-pass and 6 expected-failure files, per commit | The admitted JS client files stay green and known-gap files continue to run. |
 | `pg_dump` | default COPY-format Pagila round-trip, per commit | Every compared table restores with the same row count and no COPY data failure. |
 | PostgreSQL regression corpus | complete pinned 17.7 inventory plus admitted strict slices | Every scheduled upstream file is classified, and every strict slice points to a real focused regression test. |
 | Odoo and Metabase | manual release gates | Their documented end-to-end application probes pass before a release candidate is promoted. |
@@ -37,10 +37,10 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
 
 ## Campaign status — 2026-09-04
 
-- Unit: 1,618 tests / 6,915 assertions, all passing.
+- Unit: 1,630 tests / 7,003 assertions, all passing.
 - SQLLogic: 61 assertion groups, all passing.
 - Released secondary stack: 5 tests / 75 assertions, all passing on JDK 25.
-- node-postgres: 14 admitted files passing, 8 known-gap files still xfail.
+- node-postgres: 16 admitted files passing, 6 known-gap files still xfail.
 - pgjdbc: eight admitted classes, 275 passing and one upstream skip. This
   includes connection/read-only behavior, server-prepared statements, result
   handling, batch variants, JDBC 4.2 parameters and metadata properties.

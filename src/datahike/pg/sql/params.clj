@@ -220,6 +220,12 @@
    keep returning answers from the snapshot on which they were prepared."
   nil)
 
+(def ^:dynamic *temp-table-map*
+  "Session-local `{logical-name physical-name}` mapping bound while parsing.
+   Translators that consult persisted schema metadata use the physical name;
+   SQL-facing relation and column resolution continues to use the logical one."
+  {})
+
 (def ^:dynamic *cancel*
   "The current pgwire statement's cancellation token, or nil outside a
    cancellable execution. Translation-time work and nested queries use the

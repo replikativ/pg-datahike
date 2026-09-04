@@ -433,7 +433,11 @@
           ;; `:pg/type "_T"` on the ident entity. Look it up so the
           ;; column reports its declared array OID even though the
           ;; storage type is `:db.type/string`.
-          pg-type-name (when (and db attr) (#'params/pg-type-of-attr db attr))
+          ;; A session-visible temp schema rekeys its physical attribute to
+          ;; the logical table name and carries the declared PG type on the
+          ;; in-memory props. Prefer that before probing the physical db.
+          pg-type-name (or (:pg/type props)
+                           (when (and db attr) (#'params/pg-type-of-attr db attr)))
           pg-name-oid  (when pg-type-name (get types/pg-name->oid pg-type-name))]
       (cond
         ;; A pre-analyzed correlated reference is represented by NULL at

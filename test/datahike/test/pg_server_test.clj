@@ -3,7 +3,8 @@
 
    Tests the SQL-to-Datalog translation, schema introspection, query handler,
    aggregates, functions, CASE WHEN, CAST, DML, DDL, and system queries."
-  (:require [clojure.test :refer [deftest testing is use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg]
             [datahike.pg.schema :as pgs]
@@ -483,6 +484,64 @@
   (is (nil? (err (.execute *handler* "RESET ALL"))))
   (is (nil? (err (.execute *handler*
                            "UPDATE person SET age = 2 WHERE name = 'Alice'")))))
+
+(deftest temporary-tables-are-hidden-across-sessions
+  (let [h1 (pg/make-query-handler *conn*)
+        h2 (pg/make-query-handler *conn*)]
+    (try
+      (is (nil? (err (.execute h1 "CREATE TEMP TABLE session_tmp (value INTEGER)"))))
+      (is (nil? (err (.execute h1 "INSERT INTO session_tmp VALUES (1)"))))
+      (let [r (.execute h1 "SELECT value FROM session_tmp")]
+        (is (= [["1"]] (rows r)))
+        (is (= [23] (vec (.-columnOids ^PgWireServer$QueryResult r)))))
+
+      (is (= "42P01" (sqlstate (.execute h2 "SELECT value FROM session_tmp")))
+          "another session must not resolve the temporary relation")
+      (is (nil? (err (.execute h2 "CREATE TEMP TABLE session_tmp (value INTEGER)"))))
+      (is (nil? (err (.execute h2 "INSERT INTO session_tmp (value) VALUES (2)"))))
+      (is (= [["1"]] (rows (.execute h1 "SELECT value FROM session_tmp"))))
+      (is (= [["2"]] (rows (.execute h2 "SELECT value FROM session_tmp"))))
+
+      (is (some? (.parse h2 "CREATE TEMP TABLE parsed_only (value INTEGER)"
+                         (int-array 0))))
+      (is (= "42P01" (sqlstate (.execute h2 "SELECT value FROM parsed_only")))
+          "parsing a prepared CREATE must not publish the temp relation")
+
+      (is (nil? (err (.execute h2 "BEGIN"))))
+      (is (nil? (err (.execute h2 "SAVEPOINT before_drop"))))
+      (is (nil? (err (.execute h2 "DROP TABLE session_tmp"))))
+      (is (nil? (err (.execute h2 "ROLLBACK TO SAVEPOINT before_drop"))))
+      (is (= [["2"]] (rows (.execute h2 "SELECT value FROM session_tmp")))
+          "rolling back a drop restores the session namespace")
+      (is (nil? (err (.execute h2 "COMMIT"))))
+
+      (is (nil? (err (.execute h2 "BEGIN"))))
+      (is (nil? (err (.execute h2 "DROP TABLE session_tmp"))))
+      (is (nil? (err (.execute h2 "CREATE TEMP TABLE session_tmp (value INTEGER)"))))
+      (is (nil? (err (.execute h2 "INSERT INTO session_tmp VALUES (3)"))))
+      (is (nil? (err (.execute h2 "ROLLBACK"))))
+      (is (= [["2"]] (rows (.execute h2 "SELECT value FROM session_tmp")))
+          "rolling back drop-and-recreate restores the original table")
+
+      (is (nil? (err (.execute h2 "DROP TABLE session_tmp"))))
+      (is (nil? (err (.execute h2 "CREATE TEMP TABLE session_tmp (value INTEGER)"))))
+      (is (nil? (err (.execute h2 "INSERT INTO session_tmp VALUES (4)"))))
+      (is (= [["4"]] (rows (.execute h2 "SELECT value FROM session_tmp")))
+          "a committed temp table can be dropped and recreated in-session")
+
+      (.close h1)
+      (is (= [["4"]] (rows (.execute h2 "SELECT value FROM session_tmp")))
+          "closing one owner must not affect the other session's table")
+      (is (= 1
+             (->> (keys (:schema (d/db *conn*)))
+                  (keep #(when (keyword? %) (namespace %)))
+                  (filter #(str/starts-with? % "__dh_pg_temp_"))
+                  distinct
+                  count))
+          "closing a session retracts its physical temp schema")
+      (finally
+        (.close h1)
+        (.close h2)))))
 
 (deftest test-pg-format-type
   (testing "format_type maps OIDs to canonical type names"

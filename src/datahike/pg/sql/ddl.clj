@@ -447,13 +447,8 @@
         ns table-name
         ;; CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE — JSqlParser keeps the
         ;; leading keywords in getCreateOptionsStrings. We track temp
-        ;; tables per session and drop them when the connection closes
-        ;; (see make-query-handler's :temp-tables / close). Not full
-        ;; per-session isolation — Datahike has one shared schema, so a
-        ;; temp table is visible to other live connections and concurrent
-        ;; CREATEs of the same name still collide — but it matches PG's
-        ;; default session lifetime for the sequential single-connection
-        ;; usage the conformance suites exercise.
+        ;; tables in session-specific physical namespaces and drop them when
+        ;; the connection closes (see make-query-handler's :temp-tables).
         temp? (boolean (some #(#{"temp" "temporary"} (str/lower-case %))
                              (.getCreateOptionsStrings ct)))
         columns (.getColumnDefinitions ct)
@@ -462,13 +457,14 @@
         ;; TABLE twice: once with INHERITS, then again with the full column
         ;; list without INHERITS — both refer to the same child table).
         parent-from-sql (extract-inherits ct)
+        db-table-name (get params/*temp-table-map* table-name table-name)
         parent-from-db (when db
                          (ffirst (d/q
                                   '{:find [?p]
                                     :where [[?e :__inherit__/child ?c]
                                             [?e :__inherit__/parent ?p]]
                                     :in [$ ?c]}
-                                  db table-name)))
+                                  db db-table-name)))
         parent-table (or parent-from-sql parent-from-db)
         ;; JSqlParser exposes the whole `INHERITS (p1, p2)` list as one
         ;; option string. pg-datahike's inheritance model remains
@@ -478,9 +474,11 @@
         ;; one relation.
         missing-parent (when (and parent-from-sql db)
                          (some (fn [parent]
-                                 (let [parent (str/trim parent)]
+                                 (let [parent (str/trim parent)
+                                       db-parent (get params/*temp-table-map*
+                                                      parent parent)]
                                    (when (nil? (pgs/column-info
-                                                (:schema db) parent db))
+                                                (:schema db) db-parent db))
                                      parent)))
                                (str/split parent-from-sql #",")))
         _ (when missing-parent
