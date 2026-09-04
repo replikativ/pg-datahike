@@ -115,6 +115,15 @@ certificate lifecycle can pass a configured `javax.net.ssl.SSLContext` as
 password char array. PostgreSQL users are currently a node-level access gate;
 they are not yet mapped to per-database Datahike principals.
 
+Every `start-server` listener limits a single SELECT result to 100,000 rows by
+default. Results over the limit fail with SQLSTATE `54000` before pg-datahike
+allocates the pgwire row array; set-shaped queries also push `limit + 1`
+into Datahike so their result relation stays bounded. Tune the ceiling for the
+deployment with `:max-result-rows 250000`, or set it to `false` only when the
+host process provides its own memory controls. PostgreSQL cursor paging and
+driver fetch sizes remain useful for network backpressure, but Datahike queries
+are not generally lazy.
+
 Clients use ordinary PostgreSQL TLS settings:
 
 ```bash
