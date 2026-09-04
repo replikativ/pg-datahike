@@ -27,7 +27,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -65,11 +65,44 @@
           (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
           acc)))))
 
+(defn- sqlstate [^Connection c sql]
+  (try
+    (col c 1 sql)
+    nil
+    (catch SQLException e (.getSQLState e))))
+
 (defn- seed! [^Connection c]
   (exec! c "CREATE TABLE ae (id int, dept text, n int, m numeric(8,2), s text)")
   (exec! c (str "INSERT INTO ae VALUES "
                 "(1,'a',10,1.50,'x'),(2,'a',20,2.25,'y'),"
                 "(3,'b',30,NULL,NULL),(4,'b',NULL,4.00,'w')")))
+
+(deftest ordered-set-capability-errors-are-explicit
+  (with-open [c (jdbc)]
+    (testing "the implemented scalar-fraction percentile remains available"
+      (is (= ["3"]
+             (col c 1 (str "SELECT percentile_disc(0.5) WITHIN GROUP "
+                           "(ORDER BY x) FROM generate_series(1,5) x")))))
+    (testing "hypothetical-set aggregates are an explicit capability boundary"
+      (doseq [fname ["rank" "dense_rank" "percent_rank" "cume_dist"]]
+        (is (= "0A000"
+               (sqlstate c
+                         (str "SELECT " fname "(3) WITHIN GROUP (ORDER BY x) "
+                              "FROM generate_series(1,5) x"))))))
+    (testing "array fractions do not leak a PgArray-to-Number cast"
+      (doseq [fname ["percentile_cont" "percentile_disc"]]
+        (is (= "0A000"
+               (sqlstate c
+                         (str "SELECT " fname "(ARRAY[0,0.5,1]) WITHIN GROUP "
+                              "(ORDER BY x) FROM generate_series(1,5) x"))))))
+    (testing "ordered-set names outside WITHIN GROUP use function resolution"
+      (is (= "42883"
+             (sqlstate c "SELECT percentile_cont(0.5, 0.5)"))))
+    (testing "an unknown custom ordered-set aggregate is undefined"
+      (is (= "42883"
+             (sqlstate c
+                       (str "SELECT test_rank(3) WITHIN GROUP (ORDER BY x) "
+                            "FROM generate_series(1,5) x")))))))
 
 (deftest scalar-functions-over-aggregates
   (with-open [c (jdbc)]
