@@ -2822,6 +2822,9 @@
         _ (when-not (pgs/sql-type-exists? (:db ctx) type-str)
             (throw (errors/pg-error :undefined-object
                                     {:kind "type" :name type-str})))
+        composite-type (when-let [db (:db ctx)]
+                         (some #(when (= type-str (:name %)) %)
+                               (pgs/composite-types db)))
         inner-raw (translate-expr ctx inner)
         ;; Type classification from centralized registry
         cast-cat (types/cast-category type-str)
@@ -3229,7 +3232,12 @@
                              (cond
                                (nil? v)           nil
                                (= :__null__ v)    :__null__
-                               (pg-rec/record? v) v
+                               (pg-rec/record? v)
+                               (if composite-type
+                                 (pg-rec/with-layout
+                                   v (:oid composite-type)
+                                   (mapv :oid (:fields composite-type)))
+                                 v)
                                ;; bytea: keep the byte[] so value->string emits
                                ;; PG hex `\x…` rather than the Java array toString.
                                (bytes? v)         v

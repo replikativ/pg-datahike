@@ -31,6 +31,7 @@
 (def oid-oid        26)
 (def oid-tid        27)
 (def oid-json      114)
+(def oid-point     600)
 (def oid-money     790)
 (def oid-float4    700)
 (def oid-float8    701)
@@ -408,6 +409,7 @@
     "uuid"        oid-uuid
     "json"        oid-json
     "jsonb"       oid-jsonb
+    "point"       oid-point
     "tsvector"    oid-tsvector
     "tsquery"     oid-tsquery
     "vector"      oid-vector
@@ -516,6 +518,7 @@
    oid-uuid       "uuid"
    oid-json       "json"
    oid-jsonb      "jsonb"
+   oid-point      "point"
    oid-tsvector   "tsvector"
    oid-tsquery    "tsquery"
    oid-pg-lsn     "pg_lsn"
@@ -826,7 +829,8 @@
    oid-timestamp   :D  oid-timestamptz :D
    oid-interval    :T
    oid-bit         :V  oid-varbit  :V
-   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-tid :U
+   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-point :G
+   oid-tid         :U
    oid-pg-lsn      :U  oid-tsvector :U  oid-tsquery :U  oid-vector :U})
 
 (def preferred-oids
