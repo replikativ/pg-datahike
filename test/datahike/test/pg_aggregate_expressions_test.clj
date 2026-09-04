@@ -122,6 +122,18 @@
                        (str "SELECT max(n) FILTER (WHERE sum(n) > 0) "
                             "FROM filter_outer")))))))
 
+(deftest nested-outer-join-groups-do-not-reach-datalog
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE join_group_l (f1 int, f2 int)")
+    (exec! c "CREATE TABLE join_group_r (f1 bigint, f2 oid)")
+    (doseq [column ["f1" "f2"]]
+      (is (= "0A000"
+             (sqlstate
+              c
+              (str "SELECT " column ", count(*) FROM join_group_l x(x0,x1) "
+                   "LEFT JOIN (join_group_l LEFT JOIN join_group_r USING(" column ")) "
+                   "ON (x0 = 0) GROUP BY " column)))))))
+
 (deftest scalar-functions-over-aggregates
   (with-open [c (jdbc)]
     (seed! c)

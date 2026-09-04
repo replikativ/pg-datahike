@@ -14,7 +14,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures testing]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
-  (:import [java.sql Connection DriverManager]))
+  (:import [java.sql Connection DriverManager SQLException]))
 
 (def ^:dynamic *port* nil)
 
@@ -47,6 +47,12 @@
 (defn- col [^Connection c n sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
     (loop [acc []] (if (.next rs) (recur (conj acc (.getString rs (int n)))) acc))))
+
+(defn- sqlstate [^Connection c sql]
+  (try
+    (col c 1 sql)
+    nil
+    (catch SQLException e (.getSQLState e))))
 
 (defn- seed! [^Connection c]
   (exec! c "CREATE TABLE ft (id int, i int, j int, s text, b boolean, f float8, n numeric, d date)")
@@ -106,6 +112,16 @@
   (with-open [c (jdbc)]
     (is (= [] (col c 1 "SELECT 1 INTERSECT ALL SELECT 2")))
     (is (= ["1"] (col c 1 "SELECT 1 EXCEPT ALL SELECT 2")))))
+
+(deftest unsupported-set-operation-plans-do-not-reach-datalog
+  (with-open [c (jdbc)]
+    (testing "a parenthesized set-operation member is an explicit boundary"
+      (is (= "0A000"
+             (sqlstate c (str "(SELECT 1 EXCEPT SELECT 1) UNION ALL "
+                              "(SELECT 1 EXCEPT SELECT 2)")))))
+    (testing "mixed flat operations cannot silently use the first operator"
+      (is (= "0A000"
+             (sqlstate c "SELECT 1 UNION ALL SELECT 2 EXCEPT SELECT 2"))))))
 
 (deftest window-functions-see-the-whole-result-not-the-limited-one
   (with-open [c (jdbc)]

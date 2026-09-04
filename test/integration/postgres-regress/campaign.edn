@@ -514,7 +514,15 @@
       {:id :aggregate-filter-planning
        :source-lines [890 895]
        :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
-       :test-var "aggregate-filter-planning-errors-do-not-reach-datalog"}]}
+       :test-var "aggregate-filter-planning-errors-do-not-reach-datalog"}
+      {:id :aggregate-nested-join-boundary
+       :source-lines [522 530]
+       :gate "test/datahike/test/pg_aggregate_expressions_test.clj"
+       :test-var "nested-outer-join-groups-do-not-reach-datalog"}
+      {:id :aggregate-nested-setop-boundary
+       :source-lines [1574 1590]
+       :gate "test/datahike/test/pg_setops_windows_test.clj"
+       :test-var "unsupported-set-operation-plans-do-not-reach-datalog"}]}
     {:name "window" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:windows :aggregates :expressions}
