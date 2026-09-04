@@ -24,7 +24,7 @@ statement_timeout="${PG_REGRESS_STATEMENT_TIMEOUT:-10s}"
 # These messages expose implementation exceptions or malformed generated
 # Datalog rather than a PostgreSQL-facing diagnostic. Keep the expression in
 # one place so the summary count and printed examples cannot drift apart.
-internal_failure_pattern='class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|No implementation of method:|not supported on this type:|Cannot parse (rule-vars|:[a-z-]+)|Cannot resolve any more clauses|Character array is missing "e" notation exponential mark|Query for unknown vars|Query should be a vector or a map|Unknown parse result type|Update not supported for these schema attributes|Bad entity attribute|SQLSTATE XX000|server closed the connection'
+internal_failure_pattern='class .* cannot be cast|ClassCastException|NullPointerException|Cannot invoke .* because .* is null|No implementation of method:|not supported on this type:|Cannot parse (rule-vars|:[a-z-]+)|Cannot resolve any more clauses|Character array is missing "e" notation exponential mark|Query for unknown vars|Query should be a vector or a map|Unknown parse result type|Update not supported for these schema attributes|Bad entity attribute|invalid input syntax for type .*: (CREATE|ALTER|DROP|SELECT|INSERT|UPDATE|DELETE|COPY)|SQLSTATE XX000|server closed the connection'
 admin_db="${target_db}"
 isolated_db=""
 database_created=0

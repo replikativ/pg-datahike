@@ -732,6 +732,9 @@
       (into base (concat composites enums)))
     "pg_attribute"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          identity-sequences (into {}
+                                   (map (juxt :__seq__/name identity))
+                                   (sequence-entities cte-db))
           ;; Bulk-fetch :pg/typmod from the db so we don't N+1 per
           ;; column. Returns {attr-ident → typmod-int}.
           q-fn d/q
@@ -775,6 +778,15 @@
                                    ;; data still has a stable attrelid.
                                 (Math/abs (.hashCode ^String tname)))
                     pk? (= :db.unique/identity (:unique col))
+                    identity-seq (get identity-sequences
+                                      (str tname "_" (:name col) "_seq"))
+                    identity-code (cond
+                                    identity-seq
+                                    (if (= "ALWAYS"
+                                           (:__seq__/identity-generation identity-seq))
+                                      "a" "d")
+                                    (= "db_id" (:name col)) "d"
+                                    :else "")
                        ;; -1 = unconstrained (real PG's default for
                        ;; plain NUMERIC / TEXT). Defined NUMERIC(p, s)
                        ;; columns get a positive value via DDL.
@@ -807,7 +819,7 @@
            :pg_attribute/attrelid (long tbl-oid)
            :pg_attribute/attnotnull pk?
            :pg_attribute/atthasdef (contains? default-idents (:attr col))
-           :pg_attribute/attidentity ""
+           :pg_attribute/attidentity identity-code
            :pg_attribute/attstorage (attribute-storage (:oid col))
            :pg_attribute/atttypmod typmod
            :pg_attribute/attisdropped false
@@ -1018,6 +1030,9 @@
           (view-entities cte-db))
     "information_schema_columns"
     (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
+          identity-sequences (into {}
+                                   (map (juxt :__seq__/name identity))
+                                   (sequence-entities cte-db))
           ;; udt_name in PG follows the underlying base-type convention from
           ;; pg_type — `int4` / `int8` / `varchar` / `timestamp`, NOT the
           ;; SQL-spelled `data_type` ("integer" / "bigint" / …). Metabase
@@ -1092,7 +1107,12 @@
                                         (cons {:name "db_id" :valuetype :db.type/long :unique :db.unique/identity} columns))
                  :let [vtype     (:valuetype col)
                        pos       (long (inc idx))
-                       identity? (and (= "db_id" (:name col)) (zero? idx))]]
+                       identity-seq (get identity-sequences
+                                         (str tname "_" (:name col) "_seq"))
+                       identity? (or identity-seq
+                                     (and (= "db_id" (:name col)) (zero? idx)))
+                       identity-generation (or (:__seq__/identity-generation identity-seq)
+                                               (when identity? "BY DEFAULT"))]]
              (drop-nils
               {:information_schema_columns/table_catalog          "datahike"
                :information_schema_columns/table_schema           "public"
@@ -1120,7 +1140,7 @@
                :information_schema_columns/dtd_identifier         (str pos)
                :information_schema_columns/is_self_referencing    "NO"
                :information_schema_columns/is_identity            (if identity? "YES" "NO")
-               :information_schema_columns/identity_generation    (if identity? "BY DEFAULT" nil)
+               :information_schema_columns/identity_generation    identity-generation
                :information_schema_columns/is_generated           "NEVER"
                :information_schema_columns/is_updatable           "YES"
                (pgs/row-marker-attr "information_schema_columns") true}))))

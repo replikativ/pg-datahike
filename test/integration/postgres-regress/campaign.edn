@@ -768,4 +768,43 @@
      :boundaries #{:client-tooling :catalogs :copy :prepared-statements}
      :blockers #{:psql-meta-command-catalogs :non-equality-outer-joins
                  :server-side-copy :cursor-holdability :create-function
-                 :postgres-internal-catalog-completeness}}]}]}
+                 :postgres-internal-catalog-completeness}}]}
+
+  {:id 6
+   :name "application DDL lifecycle"
+   :tests
+   [{:name "create_index" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:ddl :indexes :constraints :catalogs}
+     :blockers #{:access-methods :operator-classes :expression-indexes
+                 :partial-indexes :collations :geometric-types :reindex
+                 :partitioning :postgres-internal-catalog-completeness}}
+    {:name "generated" :mode :discovery
+     :boundaries #{:ddl :generated-columns :dml :copy}
+     :blockers #{:stored-generated-columns :generated-column-inheritance
+                 :generated-column-alter-table :copy-to :partitioning
+                 :triggers :views :postgres-internal-catalog-completeness}}
+    {:name "identity" :mode :discovery
+     :boundaries #{:ddl :identity-columns :sequences :dml}
+     :blockers #{:identity-alter-table :identity-options :system-columns
+                 :inheritance :partitioning :views
+                 :postgres-internal-catalog-completeness}}
+    {:name "sequence" :mode :discovery
+     :boundaries #{:ddl :sequences :transactions :privileges}
+     :blockers #{:sequence-alter-table :sequence-ownership :privileges
+                 :regclass-coverage :postgres-internal-catalog-completeness}}
+    {:name "create_schema" :mode :discovery
+     :boundaries #{:ddl :schemas :name-resolution}
+     :blockers #{:schema-elements :authorization :privileges}}
+    {:name "drop_if_exists" :mode :discovery
+     :boundaries #{:ddl :conditional-ddl :errors}
+     :blockers #{:function-ddl :operator-ddl :aggregate-ddl :trigger-ddl
+                 :rule-ddl :cast-ddl :procedure-ddl :privileges}}
+    {:name "create_table_like" :mode :discovery
+     :boundaries #{:ddl :schema-copy :constraints}
+     :blockers #{:table-like-options :generated-columns :identity-options
+                 :inheritance :partitioning :collations
+                 :postgres-internal-catalog-completeness}}
+    {:name "comments" :mode :discovery
+     :boundaries #{:ddl :comments :string-literals}
+     :blockers #{:comment-ddl :escape-string-grammar}}]}]}

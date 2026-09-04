@@ -1802,11 +1802,11 @@
     (vec (mapcat
           (fn [tbl]
             (let [seq-prefix (str tbl "_")
-                  seq-results (d/q '{:find [?name]
+                  seq-results (d/q '{:find [?e ?name]
                                      :where [[?e :__seq__/name ?name]]
                                      :in [$ ?prefix]}
                                    db seq-prefix)]
-              (keep (fn [[sname]]
+              (keep (fn [[seq-eid sname]]
                       (let [pref-len (count seq-prefix)
                             tail-end (- (count sname) 4)]
                         (when (and (str/starts-with? sname seq-prefix)
@@ -1815,9 +1815,29 @@
                           (let [col-name (subs sname pref-len tail-end)
                                 attr (keyword tbl col-name)]
                             (when (get schema attr)
-                              {:col col-name :ns tbl :seq-name sname})))))
+                              {:col col-name
+                               :ns tbl
+                               :seq-name sname
+                               :generation (or (:__seq__/identity-generation
+                                                (d/entity db seq-eid))
+                                               "BY DEFAULT")})))))
                     seq-results)))
           tables-to-check))))
+
+(defn- reject-explicit-always-identities!
+  "Reject explicit INSERT values for GENERATED ALWAYS identity columns.
+   COPY intentionally does not use this check: PostgreSQL treats COPY like
+   OVERRIDING SYSTEM VALUE."
+  [tx-data table-name db]
+  (doseq [{:keys [col ns generation]} (compute-identity-cols db table-name)
+          :when (= "ALWAYS" generation)
+          :let [attr (keyword ns col)]
+          :when (some #(and (map? %) (contains? % attr))
+                      (tree-seq coll? seq tx-data))]
+    (throw (errors/pg-error
+            :generated-always
+            {:message (str "cannot insert a non-DEFAULT value into identity column \""
+                           col "\"")}))))
 
 (defn- auto-populate-identity
   "If the table has IDENTITY columns (backed by __seq__ sequences), populate
@@ -2610,6 +2630,7 @@
   (try
     (let [table-name (:table parsed)
           db (d/db conn)
+          _ (reject-explicit-always-identities! (:tx-data parsed) table-name db)
           tx-data (-> (:tx-data parsed)
                       (auto-populate-identity table-name db)
                       (apply-column-constraints table-name (:ns parsed) db)
@@ -6515,6 +6536,8 @@
       (try
         (let [table-name (:table parsed)
               spec-db (:speculative-db @tx-state)
+              _ (reject-explicit-always-identities! (:tx-data parsed)
+                                                    table-name spec-db)
               tx-data (-> (:tx-data parsed)
                           (auto-populate-identity table-name spec-db)
                           (apply-column-constraints table-name
