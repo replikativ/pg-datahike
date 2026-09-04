@@ -123,6 +123,35 @@
   (is (= [["3" "r" "30" "e"]]
          (rows "SELECT id, pname, pnum, cname FROM chi WHERE id = 3"))))
 
+(deftest transitive-inheritance-preserves-columns-and-markers
+  (.execute *handler* "CREATE TABLE grand (gname text) INHERITS (chi)")
+  (.execute *handler* "INSERT INTO grand VALUES (4, 's', 40, 'f', 'g')")
+  (is (= [["4" "s" "40" "f" "g"]]
+         (rows "SELECT id, pname, pnum, cname, gname FROM grand WHERE id = 4")))
+  (is (= [["4" "s" "f"]]
+         (rows "SELECT id, pname, cname FROM chi WHERE id = 4"))
+      "the immediate parent sees descendant rows")
+  (is (= [["4" "s"]]
+         (rows "SELECT id, pname FROM par WHERE id = 4"))
+      "the root parent sees transitive descendant rows"))
+
+(deftest empty-inheritance-chain-after-ctas-accepts-an-implicit-insert
+  ;; PostgreSQL rowtypes.sql:463-470. Empty children contribute no columns;
+  ;; the implicit INSERT order still walks through them to the CTAS root.
+  (.execute *handler* "CREATE TEMP TABLE ct_root AS SELECT id, pnum FROM par")
+  ;; Keep the lowercase spelling used by PostgreSQL's rowtypes.sql: SQL
+  ;; keywords are case-insensitive, including parser option tokens.
+  (.execute *handler* "CREATE TEMP TABLE ct_child () inherits (ct_root)")
+  (is (= "INSERT 0 1"
+         (.-commandTag ^PgWireServer$QueryResult
+          (.execute *handler* "INSERT INTO ct_child VALUES (8, 80)"))))
+  (.execute *handler* "CREATE TEMP TABLE ct_grandchild () inherits (ct_child)")
+  (is (= "INSERT 0 1"
+         (.-commandTag ^PgWireServer$QueryResult
+          (.execute *handler* "INSERT INTO ct_grandchild VALUES (9, 90)"))))
+  (is (= [["8" "80"] ["9" "90"]]
+         (rows "SELECT id, pnum FROM ct_root WHERE id IN (8, 9) ORDER BY id"))))
+
 (deftest the-parent-table-is-unaffected
   (.execute *handler* "INSERT INTO par (id, pname, pnum) VALUES (9, 'z', 90)")
   (is (= "z" (v "SELECT p.pname FROM par p WHERE p.id = 9")))
