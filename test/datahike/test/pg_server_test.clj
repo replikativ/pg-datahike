@@ -81,6 +81,42 @@
 
 (defn- sqlstate [^PgWireServer$QueryResult r] (.sqlstate r))
 
+(deftest result-row-cap-is-enforced-before-wire-encoding
+  (let [handler (pg/make-query-handler *conn* {:max-result-rows 2})]
+    (testing "an oversized ordinary SELECT fails with program_limit_exceeded"
+      (let [r (.execute handler "SELECT name FROM person")]
+        (is (= "54000" (sqlstate r)))
+        (is (re-find #"configured limit of 2 rows" (err r)))))
+    (testing "the compiled prepared-SELECT lane applies the same cap"
+      (let [parsed (.parse handler "SELECT name FROM person" (int-array 0))
+            r (.executePrepared handler parsed (object-array [nil]))]
+        (is (= "54000" (sqlstate r)))))
+    (testing "a SQL LIMIT at or below the server cap succeeds"
+      (is (= 2 (count (rows (.execute handler
+                                      "SELECT name FROM person ORDER BY name LIMIT 2"))))))
+    (testing "row-reducing shapes are checked after reduction"
+      (is (= 2 (count (rows (.execute handler
+                                      "SELECT DISTINCT department FROM person"))))))
+    (testing "set-operation output cannot bypass the final guard"
+      (is (= "54000"
+             (sqlstate (.execute handler
+                                 "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")))))
+    (testing "false explicitly disables the deployment guard"
+      (let [unbounded (pg/make-query-handler *conn* {:max-result-rows false})]
+        (is (= 3 (count (rows (.execute unbounded "SELECT name FROM person")))))))))
+
+(deftest result-row-cap-preserves-sql-bag-multiplicity
+  (let [handler (pg/make-query-handler *conn* {:max-result-rows 5})]
+    (is (= 3
+           (count (rows (.execute handler
+                                  "SELECT department FROM person ORDER BY department"))))
+        "a cap above the result size must not collapse duplicate projections")))
+
+(deftest result-row-cap-option-is-validated-at-handler-construction
+  (is (thrown-with-msg? IllegalArgumentException
+                        #"positive integer or false"
+                        (pg/make-query-handler *conn* {:max-result-rows 0}))))
+
 (deftest scalar-wire-values-skip-structured-dispatch
   ;; Keep this structural rather than timing-based: a scalar result must not
   ;; consult any of the comparatively expensive structured-value predicates.

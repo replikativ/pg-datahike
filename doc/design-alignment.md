@@ -129,12 +129,16 @@ These need execution beyond one `d/q` over one snapshot:
   through that same binding, with `*from-bindings*` holding the outer values.
   That is why they keep the parse cache and fast-select lanes a
   materialisation approach would forfeit.
-- **Bounded query-result streaming**. Extended-protocol `Execute` now honors a
-  row cap, emits `PortalSuspended`, and resumes the same portal without
-  rerunning the statement, so driver `fetchSize` and asyncpg iterable cursors
-  are protocol-correct. The backing `d/q` relation and its `String[][]` wire
-  representation are still materialised eagerly, however; portal paging does
-  not yet bound server heap or improve first-row latency for large results.
+- **Query-result streaming**. Extended-protocol `Execute` honors a row cap,
+  emits `PortalSuspended`, and resumes the same portal without rerunning the
+  statement, so driver `fetchSize` and asyncpg iterable cursors are
+  protocol-correct. Datahike queries are not generally lazy, so pg-datahike
+  also enforces a deployment ceiling of 100,000 result rows by default and
+  fails larger results with SQLSTATE `54000` before allocating the pgwire
+  `String[][]`. Set-shaped SELECTs push ceiling+1 into `d/q`; shapes that
+  must first reduce or expand rows are checked after their semantic pipeline.
+  This bounds returned result materialisation, not every query's intermediate
+  working set or first-row latency.
 - **ProjectSet around grouping, windows, and `DISTINCT ON`**. Target-list SRFs
   now expand into rows, zip same-level SRFs with NULL padding, preserve nested
   levels, and feed derived tables, CTAS, INSERT…SELECT, set operations, sorting,

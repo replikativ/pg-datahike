@@ -135,8 +135,10 @@
    :exit "CancelRequest reliably stops in-flight work and leaves the connection protocol-synchronized."}
   {:id :bounded-results
    :wave 2
-   :status :open
-   :evidence ["doc/design-alignment.md"]
+   :status :closed
+   :evidence ["test/datahike/test/pg_server_test.clj"
+              "README.md"
+              "doc/design-alignment.md"]
    :exit "The supported server deployment has a tested bound on query-result heap use or a documented enforced result cap."}
   {:id :asyncpg-baseline
    :wave 3

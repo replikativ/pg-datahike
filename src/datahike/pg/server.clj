@@ -60,6 +60,37 @@
 
 (set! *warn-on-reflection* true)
 
+(def ^:private default-max-result-rows 100000)
+
+(def ^:dynamic *max-result-rows*
+  "Maximum rows a SELECT may return before it fails with SQLSTATE 54000.
+   Dynamically bound per handler so every result-formatting path, including
+   set operations and the compiled prepared-statement lane, shares one guard."
+  default-max-result-rows)
+
+(defn- normalize-max-result-rows [value]
+  (cond
+    (or (nil? value) (= ::default value)) default-max-result-rows
+    (false? value) nil
+    (and (integer? value) (pos? value)) (long value)
+    :else (throw (IllegalArgumentException.
+                  ":max-result-rows must be a positive integer or false"))))
+
+(defn- enforce-result-row-cap
+  "Realise at most cap+1 rows and reject an oversized SELECT before the wire
+   layer allocates its String[][]. A false handler option binds cap to nil."
+  [results]
+  (if-let [cap *max-result-rows*]
+    (let [bounded (vec (take (inc cap) results))]
+      (when (> (count bounded) cap)
+        (throw (ex-info
+                (str "query result exceeds the configured limit of " cap " rows")
+                {:error :program-limit-exceeded
+                 :sqlstate "54000"
+                 :max-result-rows cap})))
+      bounded)
+    results))
+
 ;; ============================================================================
 ;; Cancel flag bridge
 ;; ============================================================================
@@ -691,7 +722,8 @@
   ([results find-aliases schema-oids]
    (format-query-result results find-aliases schema-oids nil))
   ([results find-aliases schema-oids typmods]
-   (let [col-names (into-array String find-aliases)
+   (let [results (enforce-result-row-cap results)
+         col-names (into-array String find-aliases)
          result-seq (seq results)
         ;; Determine OIDs: prefer schema-oids, refine unknowns with value inference
          first-row (first result-seq)
@@ -5551,7 +5583,10 @@
                                       (sql/resolve-param-ref a #(nth bound %))
                                       a))
                             in-args)
-                 res (run-param-query query #(apply d/q query db args))
+                 q-input (cond-> query
+                           (and *max-result-rows* (empty? (:with query)))
+                           (assoc :limit (inc *max-result-rows*)))
+                 res (run-param-query q-input #(apply d/q q-input db args))
                  rows (if (pos? hidden)
                         (mapv #(subvec (vec %) 0 keep-n) res)
                         res)
@@ -5981,8 +6016,22 @@
                (assoc :ef (or (:hnsw-ef-search @session-state) 40))))
             run-query
             (fn [datalog args]
-              (let [q-input (cond-> datalog
-                              limit  (assoc :limit limit)
+              (let [safe-cap? (not (or having has-distinct? project-set for-update
+                                       ;; Datahike's :with is how the SQL
+                                       ;; lowering retains bag multiplicity.
+                                       ;; Attaching :limit changes that shape
+                                       ;; to set semantics even when the limit
+                                       ;; is not reached, so bag queries rely
+                                       ;; on the final pre-wire guard instead.
+                                       (seq (:with datalog))))
+                    cap-limit (when (and safe-cap? *max-result-rows*)
+                                (inc *max-result-rows*))
+                    query-limit (cond
+                                  (and limit cap-limit) (min (long limit) cap-limit)
+                                  limit limit
+                                  :else cap-limit)
+                    q-input (cond-> datalog
+                              (some? query-limit) (assoc :limit query-limit)
                               offset (assoc :offset offset)
                               :always (assoc :cancel (current-cancel)))]
                 ;; Runtime subquery closures execute inside d/q. Bind the
@@ -8169,6 +8218,10 @@
                        and observability tooling to detect when an
                        upgrade silently demotes a probe to the slow
                        path.
+     :max-result-rows positive integer — maximum rows returned by one SELECT
+                       before SQLSTATE 54000 (default 100000). Set false to
+                       disable the guard. Safe query shapes push cap+1 into
+                       Datahike; every shape is checked before wire encoding.
 
    Supports temporal session variables:
      SET datahike.as_of = '2024-01-15T00:00:00Z'
@@ -8187,6 +8240,8 @@
                                        :as opts}]]
   (ensure-pg-schema! conn)
   (let [silently-accept (resolve-silently-accept opts)
+        max-result-rows (normalize-max-result-rows
+                         (get opts :max-result-rows ::default))
         ;; Closure that bumps the caller-supplied stats atom by parse
         ;; result :type. Centralises the rule so the two parse-sql
         ;; call sites (parse + execute's non-cached branch) stay in
@@ -8775,7 +8830,8 @@
                                   :declared-param-oids (:declared-param-oids parsed))))
                        parsed)]
           (binding [params/*statement-time* (java.util.Date.)
-                    params/*scalar-subquery-cache* (atom {})]
+                    params/*scalar-subquery-cache* (atom {})
+                    *max-result-rows* max-result-rows]
             (or
              ;; Tier-1 compiled lane: plain autocommit SELECT with no
              ;; session modifiers runs its compiled executor directly.
@@ -8806,6 +8862,7 @@
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
                   params/*cancel* (current-cancel)
+                  *max-result-rows* max-result-rows
                   datahike.query/*disable-planner* false]
           (with-stmt-timeout (:statement-timeout @session-state)
         ;; If aborted, reject everything except ROLLBACK / ROLLBACK TO /
@@ -9445,6 +9502,9 @@
                 — Reject plaintext startup before requesting a password.
                   Automatically true for every non-loopback bind.
      :on-query  — Callback (fn [sql-string]) for logging
+     :max-result-rows
+                — Maximum rows returned by one SELECT before SQLSTATE 54000
+                  (default 100000). Set false to disable the guard.
      :default   — Database name used when `conn-or-registry` is a bare
                   conn (default \"datahike\"). Ignored when a map is
                   supplied.
@@ -9514,6 +9574,7 @@
                          database-template)))
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
                                             :dispatch-stats :tx-wrap
+                                            :max-result-rows
                                             :secondary-index-config
                                             :secondary-index-build-timeout-ms])
                          (cond-> on-create (assoc :on-create-database on-create)
