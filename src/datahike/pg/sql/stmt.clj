@@ -3010,6 +3010,16 @@
    which is what `count(x)` means; the previous COUNT-FILTER shape emitted
    1 for every passing row and counted those in."
   [ctx filter-expr inner-expr default-table count-star? arg2-expr excluded]
+  ;; JSqlParser nodes retain parent links. The generic reflective walker
+  ;; therefore reaches the enclosing aggregate when started at its FILTER
+  ;; predicate (`n > 10` appeared to contain `sum`). Reparse only the
+  ;; predicate text to get a detached tree for this structural check.
+  (when (some fns/aggregate-function?
+              (params/ast-function-names
+               (CCJSqlParserUtil/parseCondExpression (str filter-expr))))
+    (throw (errors/pg-error
+            :grouping-error
+            {:message "aggregate functions are not allowed in FILTER"})))
   (let [cond-form (expr/translate-predicate-expr ctx filter-expr)
         inner-val (cond
                     count-star? 1
@@ -3044,7 +3054,12 @@
     (swap! (:in-params ctx) conj fn-param)
     (swap! (:in-args ctx) conj compiled-fn)
     (ctx/add-clause! ctx [(apply list fn-param param-vars) case-var])
-    (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table))
+    ;; A table-free correlated scalar subquery has one implicit input row.
+    ;; Its FILTER predicate can reference an outer binding, but there is no
+    ;; local entity var to preserve. Adding one manufactured an unbound
+    ;; `?_eid` and made Datahike reject the otherwise valid query.
+    (when default-table
+      (swap! (:with-vars ctx) conj (ctx/entity-var! ctx default-table)))
     case-var))
 
 (defn translate-select

@@ -104,6 +104,24 @@
                        (str "SELECT test_rank(3) WITHIN GROUP (ORDER BY x) "
                             "FROM generate_series(1,5) x")))))))
 
+(deftest aggregate-filter-planning-errors-do-not-reach-datalog
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE filter_outer (b1 boolean, n int)")
+    (exec! c "INSERT INTO filter_outer VALUES (true, 1)")
+    (testing "a bare boolean FILTER predicate admits only true rows"
+      (is (= ["0"]
+             (col c 1 "SELECT max(0) FILTER (WHERE b1) FROM filter_outer"))))
+    (testing "a table-free scalar aggregate can filter on an outer binding"
+      (is (= ["0"]
+             (col c 1
+                  (str "SELECT (SELECT max(0) FILTER (WHERE b1)) "
+                       "FROM filter_outer")))))
+    (testing "an aggregate nested in FILTER is a grouping error"
+      (is (= "42803"
+             (sqlstate c
+                       (str "SELECT max(n) FILTER (WHERE sum(n) > 0) "
+                            "FROM filter_outer")))))))
+
 (deftest scalar-functions-over-aggregates
   (with-open [c (jdbc)]
     (seed! c)
