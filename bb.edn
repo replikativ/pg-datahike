@@ -6,7 +6,11 @@
              [pod.borkdude.clj-kondo :as clj-kondo])
 
   prep {:doc "Compile Java sources to target/classes (prerequisite for loading pgwire ns)."
-        :task (shell "clojure -T:build compile-java")}
+        ;; tools.deps expands Maven descriptors concurrently by default. On
+        ;; JDK 21 that has intermittently corrupted Maven's shared model-
+        ;; validation HashMap in CI (HashMap$Node -> HashMap$TreeNode). The
+        ;; compile itself is unchanged; only dependency resolution is serial.
+        :task (shell "clojure -Sthreads 1 -T:build compile-java")}
 
   test {:doc "Run unit test suite via kaocha."
         :depends [prep]

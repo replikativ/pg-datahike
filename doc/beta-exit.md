@@ -29,6 +29,7 @@ bb beta-exit
 | `pg_dump` | default COPY-format Pagila round-trip, per commit | Every compared table restores with the same row count and no COPY data failure. |
 | PostgreSQL regression corpus | complete pinned 17.7 inventory plus admitted strict slices | Every scheduled upstream file is classified, and every strict slice points to a real focused regression test. |
 | Odoo and Metabase | manual release gates | Their documented end-to-end application probes pass before a release candidate is promoted. |
+| Datahike Server | version-pinned JAR and non-root container, per release | TLS/password authentication, abrupt client drops, graceful restart, durable catalog/data and post-restart writes work through the packaged server. |
 
 This is behavioral coverage. We do not use source-line coverage as a release
 percentage: a SQL translator can execute every branch and still return the
@@ -51,6 +52,9 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   and 69 deliberate non-goals. The campaign contains 100 admitted strict
   slices across 24 upstream files and 28 local gate files; 3 complete files
   are strict and 54 are measured discovery files.
+- Datahike Server: the `0.8.1870` candidate embeds pg-datahike `0.1.189`.
+  Its standalone JAR and non-root Podman image pass the restart, file
+  persistence, TLS/password authentication and abrupt-client-drop soak.
 
 ## Where coverage is still weak
 
@@ -68,9 +72,10 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   raw upstream diff is not itself a pass/fail score.
 - Odoo and Metabase are not yet per-commit jobs. They remain release gates
   until their runtime and setup costs are made reliable enough for CI.
-- The repository tests the standalone adapter well. The version-pinned
-  Datahike Server Docker/JAR still needs a separate restart, persistence,
-  TLS/authentication and connection-drop soak before beta exit.
+- The Datahike Server JAR/container lifecycle gate is intentionally manual
+  because it builds two large release artifacts and needs a container engine.
+  Run both version-pinned scripts for every server release that updates the
+  bundled adapter.
 
 ## Campaign waves
 
