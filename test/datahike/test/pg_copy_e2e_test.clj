@@ -197,6 +197,16 @@
 ;; Error paths
 ;; ============================================================================
 
+(deftest copy-unknown-column-fails-before-copy-mode
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [e (try
+              (copy-in-text c "COPY users (missing) FROM stdin" "value\n")
+              nil
+              (catch java.sql.SQLException e e))]
+      (is (instance? java.sql.SQLException e))
+      (is (= "42703" (.getSQLState ^java.sql.SQLException e)))
+      (is (re-find #"column.*missing.*does not exist" (.getMessage e))))))
+
 (deftest copy-binary-rejected-cleanly
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (is (thrown-with-msg? java.sql.SQLException #"BINARY"

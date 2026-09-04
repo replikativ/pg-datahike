@@ -616,7 +616,20 @@
               (let [preds (binding [expr/*conjunctive-where* true]
                             (expr/translate-predicate ctx expr))]
                 (swap! (:where-clauses ctx) into preds)))))))
-    {:name name :alias right-alias :join-type jtype :ref-info @ref-info}))
+    (let [info @ref-info]
+      ;; A predicate-only outer join previously fell into the ref-join
+      ;; post-processor with nil join variables and emitted a malformed
+      ;; `(or-join [nil ...])`. Refuse that still-unsupported shape before
+      ;; Datahike's rule parser sees it. Equijoins and the separately
+      ;; materialized LATERAL ON TRUE path remain supported.
+      (when (and (#{:left :right :full} jtype)
+                 (contains? info :matched-only-preds)
+                 (not (:value-join? info))
+                 (nil? (:ref-attr info)))
+        (throw (errors/pg-error
+                :feature-not-supported
+                {:message "non-equality outer join conditions are not supported"})))
+      {:name name :alias right-alias :join-type jtype :ref-info info})))
 
 (defn select-item-alias
   "The explicit `AS` label of a select item, or nil.
@@ -2396,6 +2409,18 @@
         ;; array_agg(atttypid)); use it to type array columns instead of the
         ;; runtime value class. Visible columns stay nil (value-sampled).
          sub-oids    (if corr-resolved (nth corr-resolved 2) sub-oids)
+         duplicate-aliases (->> sub-aliases frequencies
+                                (keep (fn [[column n]] (when (> n 1) column)))
+                                seq)
+         _ (when duplicate-aliases
+             ;; Using one Datahike ident for two projected columns used to
+             ;; make db-with attempt an incompatible schema update and leak
+             ;; its internal error. Preserve neither that leak nor a silently
+             ;; collapsed row shape while duplicate derived columns await a
+             ;; distinct physical-column representation.
+             (throw (errors/pg-error
+                     :feature-not-supported
+                     {:message "duplicate columns in a derived table are not supported"})))
         ;; Walk every row rather than just the first — UNION across
         ;; tables of different shapes (or first-row-all-NULL cases) can
         ;; otherwise mis-type a column as :string when later rows have

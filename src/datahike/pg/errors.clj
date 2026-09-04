@@ -249,6 +249,10 @@
    {:sqlstate "42601"
     :format (fn [{:keys [message detail]}] (or message detail))}
 
+   :invalid-table-definition
+   {:sqlstate "42P16"
+    :format (fn [{:keys [message detail]}] (or message detail))}
+
    :feature-not-supported
    {:sqlstate "0A000"
     :format (fn [{:keys [feature message detail]}]

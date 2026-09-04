@@ -692,4 +692,80 @@
        :test-var "sql-match-operator-slice"}]}
     {:name "tsdicts" :mode :discovery :boundaries #{:full-text}
      :blockers #{:text-search-dictionary-ddl :dictionary-files
-                 :catalog-configurations}}]}]}
+                 :catalog-configurations}}]}
+
+  {:id 4
+   :name "core relational and schema backlog"
+   :tests
+   [{:name "select" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:relational :derived-tables :values}
+     :blockers #{:system-columns :inheritance :create-function
+                 :set-operation-members :standalone-values
+                 :duplicate-derived-columns}}
+    {:name "select_distinct" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:relational :distinct :aggregates}
+     :blockers #{:planner-explain :duplicate-derived-columns
+                 :set-returning-functions :planner-spill-controls}}
+    {:name "select_distinct_on" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:relational :distinct-on :ordering}
+     :blockers #{:nulls-order-grammar :set-returning-functions
+                 :planner-explain}}
+    {:name "foreign_key" :mode :discovery
+     :boundaries #{:ddl :constraints :dml :transactions}
+     :blockers #{:deferrable-constraints :partitioning :triggers
+                 :inheritance :alter-type
+                 :postgres-internal-catalog-completeness}}
+    {:name "create_view" :mode :discovery
+     :boundaries #{:ddl :views :relational}
+     :blockers #{:recursive-views :view-check-options :temporary-views
+                 :create-function :privileges
+                 :postgres-internal-catalog-completeness}}
+    {:name "alter_table" :mode :discovery
+     :boundaries #{:ddl :constraints :schema-evolution}
+     :blockers #{:partitioning :typed-tables :alter-type :triggers
+                 :views :postgres-internal-catalog-completeness}}]}
+
+  {:id 5
+   :name "bulk I/O, temporary relations, and client tooling"
+   :tests
+   [{:name "copy" :mode :discovery
+     :boundaries #{:copy :text-codec :errors}
+     :blockers #{:copy-to :server-side-copy :copy-query
+                 :copy-option-coverage :partitioning}}
+    {:name "copy2" :mode :discovery
+     :boundaries #{:copy :text-codec :csv-codec :errors}
+     :blockers #{:server-side-copy :copy-option-coverage :triggers
+                 :rules :partitioning}}
+    {:name "copydml" :mode :discovery
+     :boundaries #{:copy :dml :returning}
+     :blockers #{:copy-query :rules :triggers :views}}
+    {:name "copyselect" :mode :discovery
+     :boundaries #{:copy :relational :ordering}
+     :blockers #{:copy-query :copy-to :server-side-copy}}
+    {:name "temp" :mode :discovery
+     :boundaries #{:temporary-tables :name-resolution :ddl :transactions}
+     :blockers #{:temporary-index-namespaces :on-commit-actions
+                 :explicit-temp-search-path-order :create-function
+                 :partitioning :prepared-transactions}}
+    {:name "truncate" :mode :discovery
+     :boundaries #{:ddl :dml :constraints :transactions}
+     :blockers #{:truncate-cascade :foreign-key-truncate-checks
+                 :partitioning :triggers :create-function}}
+    {:name "portals" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:cursors :prepared-statements :transactions}
+     :blockers #{:cursor-holdability :scrollable-cursors :create-function
+                 :postgres-internal-catalog-completeness}}
+    {:name "portals_p2" :mode :discovery
+     :requires ["portals"]
+     :boundaries #{:cursors :transactions}
+     :blockers #{:portal-lifecycle :cursor-holdability}}
+    {:name "psql" :mode :discovery
+     :requires ["test_setup"]
+     :boundaries #{:client-tooling :catalogs :copy :prepared-statements}
+     :blockers #{:psql-meta-command-catalogs :non-equality-outer-joins
+                 :server-side-copy :cursor-holdability :create-function
+                 :postgres-internal-catalog-completeness}}]}]}

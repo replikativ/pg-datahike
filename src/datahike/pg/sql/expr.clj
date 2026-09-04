@@ -852,6 +852,12 @@
       (= fname "pg_get_indexdef")
       (let [arg-oid (or (first args) :__null__)
             idx-eid (ctx/fresh-var! ctx)]
+        ;; Keep the lookup entity bound even when the NULL-synthesis pass
+        ;; turns its projected attributes into get-else clauses. Without an
+        ;; anchor, pg_get_indexdef(indexrelid) leaked an unbound Datahike
+        ;; variable while the surrounding pg_index scan was otherwise valid.
+        (swap! (:where-clauses ctx) conj
+               [idx-eid :pg_index/db-row-exists true])
         (swap! (:where-clauses ctx) conj
                [idx-eid :pg_index/indexrelid arg-oid])
         (swap! (:where-clauses ctx) conj
@@ -863,6 +869,8 @@
       (= fname "pg_get_constraintdef")
       (let [arg-oid (or (first args) :__null__)
             con-eid (ctx/fresh-var! ctx)]
+        (swap! (:where-clauses ctx) conj
+               [con-eid :pg_constraint/db-row-exists true])
         (swap! (:where-clauses ctx) conj
                [con-eid :pg_constraint/oid arg-oid])
         (swap! (:where-clauses ctx) conj

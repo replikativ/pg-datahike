@@ -451,6 +451,20 @@
         ;; the connection closes (see make-query-handler's :temp-tables).
         temp? (boolean (some #(#{"temp" "temporary"} (str/lower-case %))
                              (.getCreateOptionsStrings ct)))
+        table-options (->> (.getTableOptionsStrings ct)
+                           (map str/lower-case)
+                           (str/join " "))
+        on-commit-action (some-> (re-find #"\bon\s+commit\s+(drop|delete\s+rows|preserve\s+rows)\b"
+                                          table-options)
+                                 second)
+        _ (when (and on-commit-action (not temp?))
+            (throw (errors/pg-error
+                    :invalid-table-definition
+                    {:message "ON COMMIT can only be used on temporary tables"})))
+        _ (when (#{"drop" "delete rows"} on-commit-action)
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:feature (str "ON COMMIT " (str/upper-case on-commit-action))})))
         columns (.getColumnDefinitions ct)
         ;; Detect INHERITS (parent_table) — either from this CREATE TABLE
         ;; directly, or from prior registration (some clients issue CREATE

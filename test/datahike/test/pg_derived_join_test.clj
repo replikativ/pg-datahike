@@ -88,3 +88,15 @@
   (is (= [["1" "2"]]
          (rows (str "SELECT * FROM ((SELECT 1 AS x)), "
                     "((SELECT * FROM ((SELECT 2 AS y))))")))))
+
+(deftest unsupported-derived-and-outer-join-shapes-fail-before-datalog
+  (testing "duplicate projected names do not leak a Datahike schema update"
+    (let [r (run "SELECT count(*) FROM (SELECT 1 AS x, 2 AS x) s")]
+      (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult r)))
+      (is (re-find #"duplicate columns" (.-error ^PgWireServer$QueryResult r)))))
+  (testing "a predicate-only outer join does not construct nil rule variables"
+    (seed!)
+    (let [r (run "SELECT t.id, c.v FROM t LEFT JOIN c ON true")]
+      (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult r)))
+      (is (re-find #"non-equality outer join"
+                   (.-error ^PgWireServer$QueryResult r))))))

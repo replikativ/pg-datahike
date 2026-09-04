@@ -84,6 +84,9 @@ prerequisites or differences, and `:strict` means its complete normalized API
 output must match whenever that mode is run. Promote coherent
 application-facing statement groups into focused differential tests before
 marking a dependency-heavy file strict.
+The inventory's classified-file percentage combines `:discovery` and
+`:strict`: it measures how much of the application-facing schedule has been
+run and explained, not how much PostgreSQL pg-datahike implements.
 Such admitted statement groups are recorded as `:strict-slices` with their
 exact upstream line range and executable Clojure test var; campaign validation
 fails if either provenance or gate goes stale.
