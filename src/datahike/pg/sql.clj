@@ -2031,6 +2031,16 @@
                                        :message (str "Unsupported set operation member: "
                                                      (type s))})))
                                 selects)
+                          ;; Parenthesized set-operation members are nested
+                          ;; SetOperationLists. They are not executable
+                          ;; leaves yet: retaining an :error placeholder here
+                          ;; lets exec-set-operation pass a nil query to
+                          ;; Datahike, which leaks as an XX000 parse failure.
+                          _ (when-let [error (some #(when (= :error (:type %)) %)
+                                                   sub-results-raw)]
+                              (throw (errors/pg-error
+                                      :feature-not-supported
+                                      {:message (:message error)})))
                           ;; Do not mutate the AST: it is shared by the AST
                           ;; cache, and removing its tail made a later prepared
                           ;; execution silently lose LIMIT/OFFSET. Translate
@@ -2053,6 +2063,15 @@
                                       (if (.isAll ^ExceptOp op) :except-all :except)
                                       :else :unknown))
                           operation-kinds (mapv op-kind operations)
+                          ;; The executor historically combines every branch
+                          ;; using the first operation. A mixed flat chain
+                          ;; would therefore return plausible but incorrect
+                          ;; rows.
+                          _ (when (and (seq operation-kinds)
+                                       (not (apply = operation-kinds)))
+                              (throw (errors/pg-error
+                                      :feature-not-supported
+                                      {:message "mixed set operations are not implemented"})))
                           _ (when (and (some #(not= :union-all %) operation-kinds)
                                        (some #{types/oid-vector}
                                              (mapcat :select-item-oids

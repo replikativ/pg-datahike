@@ -3072,9 +3072,20 @@
 
 (defn translate-select*
   "Translate a PlainSelect into a Datalog query map + metadata.
-   Returns {:query map :find-aliases [...] :has-aggregates? bool}"
+  Returns {:query map :find-aliases [...] :has-aggregates? bool}"
   [^PlainSelect select schema & [db]]
   (let [_ (validate-srf-row-count! select)
+        ;; A parenthesized join group is a relation tree, not a single
+        ;; right-hand relation. The current outer-join lowering expects a
+        ;; concrete right alias and otherwise constructs a malformed or-join
+        ;; rule whose empty variable vector Datahike rejects as XX000.
+        _ (doseq [^Join join (.getJoins select)
+                  :let [right (.getRightItem join)]
+                  :when (and (instance? ParenthesedFromItem right)
+                             (seq (.getJoins ^ParenthesedFromItem right)))]
+            (throw (errors/pg-error
+                    :feature-not-supported
+                    {:message "parenthesized join groups are not implemented"})))
         name-anonymous-derived
         (fn [item]
           (when (and (instance? ParenthesedSelect item)
