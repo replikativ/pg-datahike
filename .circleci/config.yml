@@ -52,7 +52,9 @@ commands:
     steps:
       - run:
           name: Start pgwire server (background)
-          command: clojure -M:server 2>&1 | tee /tmp/pgwire.log
+          # Avoid tools.deps/Maven model validation races while this alias
+          # computes its job-local classpath. See the matching bb prep guard.
+          command: clojure -Sthreads 1 -M:server 2>&1 | tee /tmp/pgwire.log
           background: true
       - run:
           name: Wait for pgwire on :15432
@@ -95,7 +97,7 @@ jobs:
           # integration jobs run `clojure -M:server` in the background,
           # and a cold Clojars fetch for nrepl-1.0.0 pushes their
           # "Wait for server" poll past its deadline.
-          command: clojure -A:dev:test:build:format:server -P
+          command: clojure -Sthreads 1 -A:dev:test:build:format:server -P
       - save_cache:
           key: deps-{{ checksum "deps.edn" }}
           paths:
