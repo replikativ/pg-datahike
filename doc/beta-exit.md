@@ -48,7 +48,7 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   confirms that reconciling the environment-dependent baseline is a blocker;
   the manifest was not weakened to make the local run green.
 - PostgreSQL 17.7: all 222 scheduled files classified—57 campaign, 96 backlog
-  and 69 deliberate non-goals. The campaign contains 92 admitted strict
+  and 69 deliberate non-goals. The campaign contains 93 admitted strict
   slices; 3 complete files are strict and 54 are measured discovery files.
 
 ## Where coverage is still weak

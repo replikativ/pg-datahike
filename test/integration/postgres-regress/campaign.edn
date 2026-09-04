@@ -201,8 +201,12 @@
     {:name "arrays" :mode :discovery
      :requires ["test_setup"]
      :boundaries #{:array-codec :array-expressions :polymorphism}
-     :blockers #{:postgres-vector-types :create-function
-                 :array-null-coercion-internal-error}}
+     :blockers #{:postgres-vector-types :create-function}
+     :strict-slices
+     [{:id :array-fill-dimension-validation
+       :source-lines [608 613]
+       :gate "test/datahike/test/pg_array_sql_test.clj"
+       :test-var "postgres-array-fill-validation-slice"}]}
     {:name "uuid" :mode :discovery
      :boundaries #{:scalar-type :input-codec :operators :volatile-functions
                    :type-inference :temporal-extraction}

@@ -87,6 +87,10 @@
   (let [^PgWireServer$QueryResult r (.execute *handler* sql)]
     (vec (.-columnOids r))))
 
+(defn- error-info [sql]
+  (let [^PgWireServer$QueryResult r (.execute *handler* sql)]
+    [(.-sqlstate r) (.-error r) (get (.-errorFields r) "D")]))
+
 (defn- describe-oids [sql]
   (let [parsed (.parse *handler* sql (int-array 0))
         ^PgWireServer$QueryResult r (.describeResult *handler* parsed)]
@@ -143,6 +147,29 @@
 ;; ---------------------------------------------------------------------------
 ;; Array-returning functions — the pgjdbc/Metabase blocker
 ;; ---------------------------------------------------------------------------
+
+(deftest postgres-array-fill-validation-slice
+  (testing "empty dimensions produce an empty array"
+    (is (= [["{}"]] (rows "SELECT array_fill(42, '{}')")))
+    (is (= [["{}"]] (rows "SELECT array_fill(42, '{}', '{}')"))))
+  (testing "a NULL fill value produces NULL elements"
+    (is (= [["{NULL,NULL}"]] (rows "SELECT array_fill(NULL, array[2])"))))
+  (testing "NULL dimension arrays are errors, not a NULL result"
+    (is (= ["2202E" "dimension array or low bound array cannot be null" nil]
+           (error-info "SELECT array_fill(1, NULL, array[2,2])")))
+    (is (= ["2202E" "dimension array or low bound array cannot be null" nil]
+           (error-info "SELECT array_fill(1, array[2,2], NULL)"))))
+  (testing "NULL dimension values are classified before numeric coercion"
+    (is (= ["2202E" "dimension values cannot be null" nil]
+           (error-info "SELECT array_fill(1, array[1,2,NULL])"))))
+  (testing "the dimension vector itself must be one-dimensional"
+    (is (= ["2202E" "wrong number of array subscripts"
+            "Dimension array must be one dimensional."]
+           (error-info "SELECT array_fill(1, array[[1,2],[3,4]])"))))
+  (testing "lower bounds must match the dimension count"
+    (is (= ["2202E" "wrong number of array subscripts"
+            "Low bound array has different size than dimensions array."]
+           (error-info "SELECT array_fill(1, array[2,2], '{}')")))))
 
 (deftest current-schemas-true
   (testing "current_schemas(true) returns {public}"

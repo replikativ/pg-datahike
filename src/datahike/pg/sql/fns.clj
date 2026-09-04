@@ -3686,29 +3686,53 @@
 (defn sql-array-fill
   "PostgreSQL array_fill(value, dimensions [, lower_bounds])."
   ([value dimensions]
-   (sql-array-fill value dimensions nil))
+   (sql-array-fill value dimensions ::no-lower-bounds))
   ([value dimensions lower-bounds]
-   (let [array-values (fn [v]
+   (let [lower-bounds? (not= ::no-lower-bounds lower-bounds)
+         _ (when (or (sql-null? dimensions)
+                     (and lower-bounds? (sql-null? lower-bounds)))
+             (throw (errors/pg-error
+                     :array-element-error
+                     {:message "dimension array or low bound array cannot be null"})))
+         array-values (fn [v]
                         (cond
                           (pg-arr/array? v) (pg-arr/flat-elements v)
                           (sequential? v) v
                           :else nil))
-         dims (mapv long (or (array-values dimensions) []))
-         lbounds (when lower-bounds
-                   (mapv long (or (array-values lower-bounds) [])))
-         _ (when (or (empty? dims) (some neg? dims))
+         _ (when (and (pg-arr/array? dimensions)
+                      (> (count (:dims dimensions)) 1))
              (throw (errors/pg-error
                      :array-element-error
-                     {:detail "array dimensions must be non-negative"})))
+                     {:message "wrong number of array subscripts"
+                      :detail "Dimension array must be one dimensional."})))
+         raw-dims (vec (or (array-values dimensions) []))
+         _ (when (some sql-null? raw-dims)
+             (throw (errors/pg-error
+                     :array-element-error
+                     {:message "dimension values cannot be null"})))
+         raw-lbounds (when lower-bounds?
+                       (vec (or (array-values lower-bounds) [])))
+         _ (when (some sql-null? raw-lbounds)
+             (throw (errors/pg-error
+                     :array-element-error
+                     {:message "dimension values cannot be null"})))
+         dims (mapv long raw-dims)
+         lbounds (when lower-bounds? (mapv long raw-lbounds))
+         _ (when (some neg? dims)
+             (throw (errors/pg-error
+                     :array-element-error
+                     {:message "array dimensions must be non-negative"})))
          _ (when (and lbounds (not= (count dims) (count lbounds)))
              (throw (errors/pg-error
                      :array-element-error
-                     {:detail "wrong number of array subscripts"})))
+                     {:message "wrong number of array subscripts"
+                      :detail "Low bound array has different size than dimensions array."})))
+         value (when-not (sql-null? value) value)
          filled (reduce (fn [inner n]
                           (vec (repeat n inner)))
                         value
-                        (reverse dims))
-         elements (if (= 1 (count dims)) filled (vec filled))
+                        (reverse (if (empty? dims) [0] dims)))
+         elements (if (<= (count dims) 1) filled (vec filled))
          elem-type (cond
                      (instance? Integer value) :int4
                      (integer? value) :int8
@@ -3721,7 +3745,7 @@
                      (instance? java.time.LocalDateTime value) :timestamp
                      (inst? value) :timestamptz
                      :else :text)]
-     (pg-arr/array elem-type elements dims lbounds))))
+     (pg-arr/array elem-type elements (if (empty? dims) [0] dims) lbounds))))
 
 (def sql-function-specs
   "Function metadata shared by lowering, UPDATE evaluation, arity checking,
@@ -3742,7 +3766,7 @@
    "lcm"              {:unknown-args :homogeneous}
    ;; The first three arguments share a numeric overload; count is int4.
    "width_bucket"     {:unknown-args {:homogeneous-prefix 3}}
-   "array_fill"       {:impl sql-array-fill :arities #{2 3}}
+   "array_fill"       {:impl sql-array-fill :arities #{2 3} :strict? false}
    "vector_dims"      {:impl (comp pg-vector/vector-dims pg-vector/coerce)
                        :arities #{1} :arg-oids [types/oid-vector]
                        :strict? true :return-oid types/oid-int4}

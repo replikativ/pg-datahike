@@ -57,6 +57,15 @@
 ;; The regression: aliased access
 ;; ---------------------------------------------------------------------------
 
+(deftest missing-inheritance-parent-is-rejected
+  (let [create-result (.execute *handler*
+                                "CREATE TABLE orphan (note text) INHERITS (missing_parent)")]
+    (is (= "42P01" (.-sqlstate ^PgWireServer$QueryResult create-result)))
+    (is (= "relation \"missing_parent\" does not exist" (.-error create-result)))
+    (is (= "42P01"
+           (.-sqlstate ^PgWireServer$QueryResult
+            (.execute *handler* "SELECT * FROM orphan"))))))
+
 (deftest inherited-column-through-an-alias
   (testing "projection — returned NULL"
     (is (= "p" (v "SELECT c.pname FROM chi c")))
