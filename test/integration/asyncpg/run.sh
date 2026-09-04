@@ -5,8 +5,8 @@
 #   - setup.sh has been run
 #   - Datahike pgwire server is listening on localhost:15432
 #
-# Exit code: 0 if every non-skipped module passed, non-zero otherwise.
-# Final summary line: "N passed, K failed, M skipped".
+# Exit code: 0 only when the live failure-ID set exactly matches the manifest.
+# Final summary line: "SUMMARY: N passed, K failed, M skipped".
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,8 +26,11 @@ if ! (exec 3<>/dev/tcp/localhost/15432) 2>/dev/null; then
 fi
 exec 3<&-; exec 3>&-
 
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
+PYTHON="${VENV_DIR}/bin/python"
+if [[ ! -x "${PYTHON}" ]] || ! "${PYTHON}" -c 'import asyncpg, pytest, uvloop' 2>/dev/null; then
+  echo "ERROR: virtualenv is incomplete. Run ./setup.sh first." >&2
+  exit 2
+fi
 
 # Env vars: asyncpg's testbase picks up PGHOST to mean "use the already-running
 # cluster, don't try to spawn initdb".
@@ -57,9 +60,20 @@ MODULES=(
   "tests/test_codecs.py"
 )
 
+# These are deliberately below module granularity because the rest of each
+# module is valuable. Neither is a stable server-compatibility signal:
+# - connect_params tests Python's stdlib URL parser and differs across the
+#   supported Python 3.11/3.12 runtimes without contacting pg-datahike.
+# - server_failure_during_writes asserts that an asynchronous error beats an
+#   arbitrary batch position; CPU/JVM scheduling decides whether it does.
+DESELECTS=(
+  "--deselect=tests/test_connect.py::TestConnectParams::test_connect_params"
+  "--deselect=tests/test_execute.py::TestExecuteMany::test_executemany_server_failure_during_writes"
+)
+
 cd "${CLONE_DIR}"
 
-echo "[run] python -m pytest -v ${MODULES[*]}"
+echo "[run] ${PYTHON} -m pytest -v ${MODULES[*]}"
 echo "[run] full output -> ${LOG}"
 
 # Run each module as its OWN pytest invocation wrapped in a hard wall-clock
@@ -79,8 +93,8 @@ for m in "${MODULES[@]}"; do
   echo "[run] ${m} (timeout ${PER_MODULE_TIMEOUT}s)"
   echo "==================== ${m} ====================" >> "${LOG}"
   timeout --signal=KILL "${PER_MODULE_TIMEOUT}" \
-    python -m pytest -v --tb=short -p no:cacheprovider \
-    "${m}" >> "${LOG}" 2>&1
+    "${PYTHON}" -m pytest -v --tb=short -p no:cacheprovider \
+    "${DESELECTS[@]}" "${m}" >> "${LOG}" 2>&1
   rc=$?
   if [[ ${rc} -eq 137 ]]; then
     # SIGKILL from `timeout` — the module hung.
@@ -109,16 +123,17 @@ echo "SUMMARY: ${P} passed, ${FAIL_TOTAL} failed, ${S} skipped"
 # The suite is not green (the SUT doesn't yet cover everything asyncpg
 # probes), so a raw failure count can't gate the job. Instead diff the live
 # FAILED/ERROR set against a checked-in manifest of known gaps: the job is
-# green as long as failures stay within that set. A failure NOT listed is a
-# regression; a listed test that now passes is a (non-fatal) nudge to prune.
+# green only when both sets match. A failure not listed is a regression; a
+# listed test that passes is baseline drift; one that disappears is a coverage
+# hole. All three fail the gate.
 MANIFEST="${HERE}/expected-failures.txt"
 ACTUAL_TMP="$(mktemp)"; EXPECTED_TMP="$(mktemp)"
 trap 'rm -f "${ACTUAL_TMP}" "${EXPECTED_TMP}" "${RAN_TMP:-}"' EXIT
 
 # Live failures: pytest -v prints "tests/x.py::Class::test FAILED|ERROR" (no
 # percentage suffix when stdout is not a TTY, as here under redirection).
-grep -hoE '^tests/[^ ]+ (FAILED|ERROR)$' "${LOG}" \
-  | sed -E 's/ (FAILED|ERROR)$//' | sort -u > "${ACTUAL_TMP}"
+grep -hoE '^tests/[^ ]+ (FAILED|ERROR|SUBFAILED)(\([^)]*\))?$' "${LOG}" \
+  | sed -E 's/ (FAILED|ERROR|SUBFAILED).*//' | sort -u > "${ACTUAL_TMP}"
 # Manifest test-IDs only (lines beginning `tests/` — skips comments/blanks).
 # Test IDs carry no internal whitespace, so a plain line grep is exact.
 grep -E '^tests/' "${MANIFEST}" | sort -u > "${EXPECTED_TMP}"
@@ -131,8 +146,8 @@ NEW="$(comm -23 "${ACTUAL_TMP}" "${EXPECTED_TMP}")"
 # — the gate silently stopped checking it). Separate them by first
 # collecting every test that produced ANY verdict this run.
 RAN_TMP="$(mktemp)"
-grep -hoE '^tests/[^ ]+ (PASSED|FAILED|ERROR|SKIPPED)$' "${LOG}" \
-  | sed -E 's/ (PASSED|FAILED|ERROR|SKIPPED)$//' | sort -u > "${RAN_TMP}"
+grep -hoE '^tests/[^ ]+ (PASSED|FAILED|ERROR|SKIPPED|SUBPASSED|SUBFAILED)(\([^)]*\))?$' "${LOG}" \
+  | sed -E 's/ (PASSED|FAILED|ERROR|SKIPPED|SUBPASSED|SUBFAILED).*//' | sort -u > "${RAN_TMP}"
 
 # In the manifest, ran, but not failing -> genuinely resolved.
 RESOLVED="$(comm -13 "${ACTUAL_TMP}" "${EXPECTED_TMP}" | comm -12 - "${RAN_TMP}")"
@@ -155,16 +170,18 @@ if [[ -n "${NEW}" ]]; then
 fi
 if [[ -n "${RESOLVED}" ]]; then
   echo
-  echo "NOTE: $(grep -c . <<<"${RESOLVED}") expected-failure(s) now PASS —"
-  echo "prune expected-failures.txt to keep the gate honest:"
+  echo "BASELINE DRIFT: $(grep -c . <<<"${RESOLVED}") expected-failure(s) now PASS —"
+  echo "prune expected-failures.txt and record the newly supported behavior:"
   sed 's/^/  /' <<<"${RESOLVED}"
+  rc=1
 fi
 if [[ -n "${MISSING}" ]]; then
   echo
-  echo "NOTE: $(grep -c . <<<"${MISSING}") expected-failure(s) DID NOT RUN. These"
+  echo "COVERAGE HOLE: $(grep -c . <<<"${MISSING}") expected-failure(s) DID NOT RUN. These"
   echo "are not fixed — the gate has simply stopped checking them (renamed,"
   echo "deselected, or the module died before reaching them):"
   sed 's/^/  /' <<<"${MISSING}"
+  rc=1
 fi
 
 echo

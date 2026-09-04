@@ -142,8 +142,11 @@
    :exit "The supported server deployment has a tested bound on query-result heap use or a documented enforced result cap."}
   {:id :asyncpg-baseline
    :wave 3
-   :status :open
-   :evidence ["test/integration/asyncpg/expected-failures.txt"]
+   :status :closed
+   :evidence ["test/integration/asyncpg/run.sh"
+              "test/integration/asyncpg/setup.sh"
+              "test/integration/asyncpg/expected-failures.txt"
+              "test/integration/asyncpg/expected-skips.md"]
    :exit "Local and CI baselines agree, every manifest entry runs, and every expected failure has a current rationale."}
   {:id :pgjdbc-breadth
    :wave 3

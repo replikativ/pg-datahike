@@ -3,25 +3,23 @@
 # One pytest test-ID per line; blank lines and `#` comments ignored.
 # run.sh diffs the live FAILED/ERROR set against this file:
 #   - a failing test NOT listed here  -> regression -> job fails
-#   - a listed test that now PASSES    -> warning ("resolved"; prune this file)
-#   - a listed test that never RAN     -> warning (the gate stopped checking it)
+#   - a listed test that now PASSES    -> baseline drift -> job fails
+#   - a listed test that never RAN     -> coverage hole -> job fails
 #
 # Granularity is per-test (not per-module) on purpose: every module below
 # also has PASSING tests, and a module-level allowance would hide a
 # regression in those. Root-cause taxonomy lives in the triage notes
 # (.internal/triage/) and doc/design-alignment.md "Coverage tail".
 #
-# THIS MANIFEST TRACKS CI, NOT YOUR LAPTOP. A local `bash run.sh` and the
-# CircleCI job disagree substantially — as of this writing 95 passed / 74
-# failed locally against 45 / 127 in CI, on the same commit and a freshly
-# restarted server. The gate is a CI gate, so entries are added and pruned
-# from CI's results; expect a local run to report both regressions and
-# resolved tests that CI does not. Why the two environments diverge is not
-# yet understood and is worth running down — until then, trust the job.
+# The harness pins its Python test dependencies and invokes the virtualenv's
+# interpreter directly. This avoids silently falling back to a global Python
+# after the checkout moves. Two unstable upstream tests are explicitly
+# deselected in run.sh; local and CI runs must otherwise report exactly this
+# failure-ID set.
 #
-# Regenerate the candidate list (matches run.sh's per-module execution):
-#   bash run.sh ; grep -hoE '^tests/.* (FAILED|ERROR)$' last-run.log \
-#     | sed -E 's/ (FAILED|ERROR)$//' | sort -u
+# To update the manifest, run `bash run.sh` and inspect ordinary FAILED/ERROR
+# lines as well as unittest SUBFAILED lines. run.sh normalizes parameterized
+# subtests to the owning pytest test ID before comparing the sets.
 
 # --- tests/test_cache_invalidation.py ---
 tests/test_cache_invalidation.py::TestCacheInvalidation::test_prepare_cache_invalidation_in_pool
@@ -46,6 +44,9 @@ tests/test_codecs.py::TestCodecs::test_custom_codec_on_domain
 tests/test_codecs.py::TestCodecs::test_custom_codec_on_enum
 tests/test_codecs.py::TestCodecs::test_custom_codec_on_enum_array
 tests/test_codecs.py::TestCodecs::test_custom_codec_override_text
+# Tuple-codec subtests reuse a temporary relation; pg_temp isolation remains
+# an explicit beta gap and the later cases see the earlier physical table.
+tests/test_codecs.py::TestCodecs::test_custom_codec_override_tuple
 tests/test_codecs.py::TestCodecs::test_custom_codec_text
 tests/test_codecs.py::TestCodecs::test_domains
 tests/test_codecs.py::TestCodecs::test_enum
@@ -70,7 +71,6 @@ tests/test_codecs.py::TestCodecs::test_void
 # Environment-dependent: passes locally but fails under CI's connection setup
 # (DSN / env-var / pgpass resolution differs from a developer box). Listed so
 # the gate stays green; revisit if it starts failing locally too.
-tests/test_connect.py::TestConnectParams::test_connect_params
 tests/test_connect.py::TestConnectionAttributes::test_prefer_standby_picks_master_when_standby_is_down
 tests/test_connect.py::TestConnectionAttributes::test_prefer_standby_when_standby_is_up
 tests/test_connect.py::TestConnectionAttributes::test_target_attribute_not_matched
@@ -98,7 +98,9 @@ tests/test_introspection.py::TestIntrospection::test_introspection_retries_after
 
 # --- tests/test_prepare.py ---
 tests/test_prepare.py::TestPrepare::test_prepare_02
-tests/test_prepare.py::TestPrepare::test_prepare_04
+# Decimal cases are advertised through the text fallback, so asyncpg selects
+# its text encoder and rejects Python int/float values before Bind.
+tests/test_prepare.py::TestPrepare::test_prepare_03
 tests/test_prepare.py::TestPrepare::test_prepare_06_interrupted_close
 tests/test_prepare.py::TestPrepare::test_prepare_09_raise_error
 tests/test_prepare.py::TestPrepare::test_prepare_14_explain

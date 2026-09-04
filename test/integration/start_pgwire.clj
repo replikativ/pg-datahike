@@ -66,7 +66,10 @@
   (intern 'user 'cfg cfg)
   (intern 'user 'registry-atom registry-atom)
   (intern 'user 'srv srv)
-  (let [nrepl-server (nrepl/start-server :port nrepl-port :bind "0.0.0.0")]
+  ;; This is a developer convenience endpoint with no authentication. Keep it
+  ;; on loopback just like pgwire; exposing it on every interface would grant
+  ;; arbitrary code execution to the surrounding network.
+  (let [nrepl-server (nrepl/start-server :port nrepl-port :bind "127.0.0.1")]
     (println (str "nREPL server listening on port " nrepl-port))
     (println "  Connect: clj-nrepl-eval -p" nrepl-port "\"(d/q '{:find [?e ?a ?v] :where [[?e ?a ?v]]} (d/db conn))\"")
     (println "Press Ctrl+C to stop")

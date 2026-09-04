@@ -4,11 +4,10 @@ This directory drives a curated subset of the upstream
 [asyncpg](https://github.com/MagicStack/asyncpg) test suite against the
 Datahike pgwire server.
 
-asyncpg is the cleanest low-level wire-protocol regression target available:
-it is a pure-Python protocol implementation with no libpq dependency, so its
-tests exercise the actual bytes on the wire rather than libpq's compatibility
-layer. When asyncpg's `test_prepare.py` fails, our Parse/Bind/Describe path
-has a bug, full stop.
+asyncpg is a useful low-level wire-protocol regression target. It implements
+the protocol without libpq, so the tests exercise the bytes on the wire rather
+than libpq's compatibility layer. Its prepared-statement tests give us direct
+coverage of the Parse, Bind, Describe, and Execute paths.
 
 ## Layout
 
@@ -32,34 +31,37 @@ asyncpg/
 - Internet access the first time `setup.sh` runs.
 - A running Datahike pgwire server on `localhost:15432`.
 
-`setup.sh` pins asyncpg to `v0.30.0`.
+`setup.sh` pins asyncpg to `v0.30.0` and pins pytest, pytest-timeout, uvloop,
+and distro. It invokes the virtualenv interpreter directly, so moving the
+checkout cannot silently fall back to a global Python installation.
 
 ## Running
 
 ```
 ./setup.sh     # idempotent: clone + venv + compile C extensions
-./run.sh       # run focused modules, ~1-3 min
+./run.sh       # run focused modules, ~2-4 min
 ```
 
-`run.sh` exits 0 when every live failure is present in the checked-in
+`run.sh` exits 0 when the live failure-ID set exactly matches the checked-in
 `expected-failures.txt` manifest. Summary line:
 
 ```
-SUMMARY: 99 passed, 70 failed, 32 skipped
+SUMMARY: N passed, K failed, M skipped
 ```
 
-The raw failure count therefore does not determine the exit status. A failure
-outside the manifest is a regression and fails the job; a manifest entry that
-now passes is reported as resolved and should be removed. `last-run.log` has
-the full pytest output.
+The raw failure count therefore does not determine the exit status. The job
+fails if it finds a new failure, a resolved manifest entry, or a manifest entry
+that did not run. Parameterized unittest `SUBFAILED` cases are normalized to
+their owning pytest test ID before comparison. `last-run.log` has the full
+pytest output.
 
 ## What is covered
 
 See `expected-skips.md`. In short: extended-query protocol
 (Parse/Bind/Describe/Execute/Sync), connection startup, prepared statement
 caching, cursor/portal management, transactions, error mapping, per-type
-codecs. Explicitly excluded: COPY, LISTEN/NOTIFY, pool-with-cancel,
-logical-replication adjacent tests.
+codecs. COPY, LISTEN/NOTIFY, connection-pool lifecycle, timeout races, and
+chaos tests remain separate compatibility tranches.
 
 ## Environment variables used
 
@@ -78,16 +80,19 @@ trying to spawn `initdb`.
 
 ## Interpreting output
 
-- no `REGRESSION` section: the live failures exactly match the manifest.
+- no drift section: the live failures exactly match the manifest.
 - `REGRESSION: ... failing that are NOT in expected-failures.txt`: a new
   compatibility failure; `last-run.log` has the full stack.
-- `expected-failure(s) now PASS`: coverage improved; prune the manifest.
-- `expected-failure(s) DID NOT RUN`: the test was renamed, deselected, or its
-  module stopped early; this is a coverage hole, not a fix.
+- `BASELINE DRIFT: ... now PASS`: coverage improved; prune the manifest. The
+  job fails until the checked-in baseline is updated deliberately.
+- `COVERAGE HOLE: ... DID NOT RUN`: the test was renamed, deselected, or its
+  module stopped early. The job fails because this is not evidence of a fix.
 - pytest rc != 0 with zero failures reported: likely a collection/import
   error in asyncpg itself. Look for `ERROR` lines early in the log.
 
 ## Timing
 
-Single focused run is ~1-3 minutes. The full upstream suite takes ~10 minutes
-and exercises features we do not implement - don't run it.
+A focused run takes about 2-4 minutes and needs a freshly started in-memory
+server. Failed cleanup can otherwise create misleading cascades in later
+modules. The full upstream suite takes about 10 minutes and remains outside
+this gate's scope.
