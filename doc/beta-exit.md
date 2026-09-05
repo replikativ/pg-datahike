@@ -56,6 +56,20 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   Its standalone JAR and non-root Podman image pass the restart, file
   persistence, TLS/password authentication and abrupt-client-drop soak.
 
+### Writer-foundations candidate — 2026-09-05
+
+The catalog and row-constraint changes are being revalidated against Datahike
+PR #1074, using its tested worktree as a local dependency override. This is
+pre-release evidence, not validation of the version currently pinned in
+`deps.edn`. The published dependency will be updated only after the squash
+merge has produced a release, followed by validation against that artifact.
+
+The NaN comparator/index-format change is deferred to Datahike's 1.0 upgrade
+discussion (draft #1075). Native scalar NaN writes therefore remain a separate
+open blocker, with their regression retained. Landing the writer foundations
+does not by itself close the beta. Exact per-row sequence evaluation order
+also remains open; see `beta-exit.edn` for all four current blockers.
+
 ## Where coverage is still weak
 
 - pgjdbc breadth has been rerun and classified. Eight stable classes gate each

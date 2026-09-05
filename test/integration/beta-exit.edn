@@ -103,7 +103,12 @@
    :status :open
    :evidence ["test/datahike/test/pg_unique_index_test.clj"
               "test/datahike/test/pg_catalog_objects_test.clj"]
-   :exit "Durable index migration and writer enforcement pass native NaN updates, reconnect, rollback, concurrent writes, and the complete release gates with the released Datahike dependency."}
+   :exit "Durable index migration and writer enforcement pass reconnect, rollback, concurrent writes, and the complete release gates with the released Datahike writer foundations. Native scalar NaN correctness is tracked separately."}
+  {:id :native-scalar-nan-writes
+   :wave 5
+   :status :open
+   :evidence ["test/datahike/test/pg_unique_index_test.clj"]
+   :exit "A released Datahike implementation preserves finite-to-NaN native transaction effects and enforces PostgreSQL float4/float8 uniqueness. The comparator and persisted-index migration decision is deferred to the Datahike 1.0 upgrade review (draft PR #1075); preserve the failing native-NaN regression until resolved."}
   {:id :insert-sequence-constraint-completion
    :wave 5
    :status :open
