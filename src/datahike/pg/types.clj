@@ -62,6 +62,11 @@
 ;; user relations and types, which starts at 16384.
 (def oid-vector  16383)
 
+(defn oid->wire-int
+  "Preserve an unsigned PostgreSQL OID's low 32 bits at Java int boundaries."
+  [oid]
+  (unchecked-int (long oid)))
+
 ;; Array OIDs — every scalar type has a paired `T[]` OID. PG catalog
 ;; rows: `SELECT typname, oid, typelem FROM pg_type WHERE typelem <> 0`.
 ;; We only materialise the types we actually emit; others can follow.

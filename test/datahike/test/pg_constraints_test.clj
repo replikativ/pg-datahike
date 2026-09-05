@@ -11,6 +11,7 @@
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
 
@@ -135,6 +136,45 @@
   (is (err-contains? (run "INSERT INTO c1 VALUES (11, 999)") "foreign key"))
   (testing "MATCH SIMPLE — null child col allowed"
     (is (ok? (run "INSERT INTO c1 (id) VALUES (12)")))))
+
+(deftest fk-parent-must-be-a-row-of-the-referenced-table
+  (is (ok? (run "CREATE TABLE marker_parent (id INT PRIMARY KEY)")))
+  (is (ok? (run (str "CREATE TABLE marker_child (id INT PRIMARY KEY, pid INT, "
+                     "FOREIGN KEY (pid) REFERENCES marker_parent (id))"))))
+  ;; Datahike permits a native entity to carry a table's namespaced column
+  ;; attribute. It is not a SQL row until it also carries the table marker.
+  (d/transact *conn* [{:marker_parent/id 42}])
+  (let [r (run "INSERT INTO marker_child VALUES (1, 42)")]
+    (is (= "23503" (.sqlstate ^PgWireServer$QueryResult r)))
+    (is (err-contains? r "foreign key"))))
+
+(deftest self-referencing-fk-sees-pending-parent-row
+  (is (ok? (run (str "CREATE TABLE self_parent (id INT PRIMARY KEY, parent_id INT, "
+                     "FOREIGN KEY (parent_id) REFERENCES self_parent (id))"))))
+  (is (ok? (run "INSERT INTO self_parent VALUES (1, NULL), (2, 1)")))
+  (is (= [["1" nil] ["2" "1"]]
+         (rows (run "SELECT * FROM self_parent ORDER BY id")))))
+
+(deftest ordinary-insert-compiles-and-caches-one-row-plan
+  (is (ok? (run "CREATE TABLE plan_plain (id INT, note TEXT)")))
+  (let [calls (atom 0)
+        preparations (atom 0)
+        original-columns row-constraints/column-specs
+        original-prepare row-constraints/prepare-candidate]
+    (with-redefs [row-constraints/column-specs
+                  (fn [db table-name]
+                    (swap! calls inc)
+                    (original-columns db table-name))
+                  row-constraints/prepare-candidate
+                  (fn [& args]
+                    (swap! preparations inc)
+                    (apply original-prepare args))]
+      (is (ok? (run "INSERT INTO plan_plain VALUES (1, 'a')")))
+      (is (ok? (run "INSERT INTO plan_plain VALUES (2, 'b')")))
+      (is (= 1 @calls)
+          "the cached row plan does not query columns again in the tx-fn or next INSERT")
+      (is (zero? @preparations)
+          "an unconstrained ordinary INSERT bypasses row preparation entirely"))))
 
 ;; ============================================================================
 ;; FOREIGN KEY — parent-side RESTRICT (23503 on DELETE and on key UPDATE)

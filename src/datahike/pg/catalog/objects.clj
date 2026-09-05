@@ -6,11 +6,33 @@
    lets routines, triggers, dependencies, and future catalog work share one
    transactional identity model instead of inventing per-feature IDs."
   (:require [datahike.api :as d]
+            [datahike.db]
             [datahike.db.interface :as dbi]))
 
 (set! *warn-on-reflection* true)
 
 (def ^:const first-user-oid 16384)
+(def ^:const max-oid 4294967295)
+
+(defn valid-user-oid?
+  "True for an allocatable PostgreSQL user OID. OID is uint32, while values
+   below FirstNormalObjectId belong to PostgreSQL's bootstrap catalogs."
+  [oid]
+  (and (integer? oid)
+       (<= first-user-oid (long oid) max-oid)))
+
+(defn- validate-allocation-cursor [cursor]
+  (let [cursor (long cursor)]
+    (when-not (<= first-user-oid cursor (inc max-oid))
+      (throw (ex-info "invalid PostgreSQL OID allocation cursor"
+                      {:error :invalid-catalog-state :cursor cursor})))
+    cursor))
+
+(defn- ensure-allocatable-oid [oid]
+  (when (> (long oid) max-oid)
+    (throw (ex-info "PostgreSQL OID space is exhausted"
+                    {:error :program-limit-exceeded :sqlstate "54000"})))
+  (long oid))
 
 (def ^:const pg-class-oid 1259)
 (def ^:const pg-type-oid 1247)
@@ -21,7 +43,7 @@
 (def ^:const pg-catalog-namespace-oid 11)
 (def ^:const public-namespace-oid 2200)
 
-(def ^:const catalog-version 1)
+(def ^:const catalog-version 3)
 (def catalog-key :user-catalog)
 
 (def schema
@@ -73,6 +95,47 @@
     :db/cardinality :db.cardinality/one}
    {:db/ident :datahike.pg.object/legacy-oid?
     :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/address-key
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/value}
+   {:db/ident :datahike.pg.column/name-key
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/value}
+   {:db/ident :datahike.pg.column/relation
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :datahike.pg.column/attnum
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :datahike.pg.column/name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/storage-ident
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :datahike.pg.column/type-oid
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/typmod
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/dropped?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/local?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/inherit-count
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :datahike.pg.column/inherited-from-address
+    :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}])
 
 (defn address
@@ -98,6 +161,12 @@
             (str name)
             tail])))
 
+(defn column-address-key [relation-oid attnum]
+  (pr-str [pg-class-oid (long relation-oid) (long attnum)]))
+
+(defn column-name-key [relation-oid name]
+  (pr-str [(long relation-oid) (str name)]))
+
 (defn- object-map [entity]
   (when entity
     (select-keys entity
@@ -117,12 +186,22 @@
   ;; FilteredDB (valid-at/as-of) supports Datalog and numeric entity lookup,
   ;; but deliberately has no lookup-ref thunk. Resolve the unique key through
   ;; Datalog first so temporal catalog enrichment remains usable.
-  (when-let [eid (ffirst
-                  (d/q {:find '[?entity]
-                        :in '[$ ?value]
-                        :where [['?entity attr '?value]]}
-                       db value))]
-    (d/entity db eid)))
+  (let [db (loop [db db]
+             (if (instance? datahike.db.FilteredDB db)
+               (recur (.-unfiltered-db ^datahike.db.FilteredDB db))
+               db))]
+    (when-let [eid (ffirst
+                    (d/q {:find '[?entity]
+                          :in '[$ ?value]
+                          :where [['?entity attr '?value]]}
+                         db value))]
+      (d/pull db '[*] eid))))
+
+(defn- catalog-metadata-db [db]
+  (loop [db db]
+    (if (instance? datahike.db.FilteredDB db)
+      (recur (.-unfiltered-db ^datahike.db.FilteredDB db))
+      db)))
 
 (defn object-by-address [db class-oid object-oid]
   (when (get (dbi/-schema db) :datahike.pg.object/address-key)
@@ -146,22 +225,142 @@
   (object-by-address db pg-namespace-oid oid))
 
 (defn objects-in-namespace [db namespace-oid]
-  (when-let [namespace-eid (:db/id (namespace-by-oid db namespace-oid))]
-    (mapv (comp object-map #(d/entity db %))
-          (map first
-               (d/q '{:find [?object]
-                      :in [$ ?namespace]
-                      :where [[?object :datahike.pg.object/namespace ?namespace]]}
-                    db namespace-eid)))))
+  (let [db (catalog-metadata-db db)]
+    (when-let [namespace-eid (:db/id (namespace-by-oid db namespace-oid))]
+      (mapv (comp object-map #(d/pull db '[*] %))
+            (map first
+                 (d/q '{:find [?object]
+                        :in [$ ?namespace]
+                        :where [[?object :datahike.pg.object/namespace ?namespace]]}
+                      db namespace-eid))))))
 
 (defn objects-by-kind [db kind]
-  (when (get (dbi/-schema db) :datahike.pg.object/kind)
-    (mapv (comp object-map #(d/entity db %))
-          (map first
-               (d/q '{:find [?object]
-                      :in [$ ?kind]
-                      :where [[?object :datahike.pg.object/kind ?kind]]}
-                    db kind)))))
+  (let [db (catalog-metadata-db db)]
+    (when (get (dbi/-schema db) :datahike.pg.object/kind)
+      (mapv (comp object-map #(d/pull db '[*] %))
+            (map first
+                 (d/q '{:find [?object]
+                        :in [$ ?kind]
+                        :where [[?object :datahike.pg.object/kind ?kind]]}
+                      db kind))))))
+
+(def ^:private column-keys
+  [:db/id
+   :datahike.pg.column/address-key
+   :datahike.pg.column/name-key
+   :datahike.pg.column/relation
+   :datahike.pg.column/attnum
+   :datahike.pg.column/name
+   :datahike.pg.column/storage-ident
+   :datahike.pg.column/type-oid
+   :datahike.pg.column/typmod
+   :datahike.pg.column/dropped?
+   :datahike.pg.column/local?
+   :datahike.pg.column/inherit-count
+   :datahike.pg.column/inherited-from-address])
+
+(defn- column-map [entity]
+  (when entity (select-keys entity column-keys)))
+
+(defn column-by-attnum [db relation-oid attnum]
+  (when (get (dbi/-schema db) :datahike.pg.column/address-key)
+    (some-> (entity-by-unique db :datahike.pg.column/address-key
+                              (column-address-key relation-oid attnum))
+            column-map)))
+
+(defn column-by-name [db relation-oid name]
+  (when (get (dbi/-schema db) :datahike.pg.column/name-key)
+    (some-> (entity-by-unique db :datahike.pg.column/name-key
+                              (column-name-key relation-oid name))
+            column-map)))
+
+(defn columns-by-relation
+  "All persisted column subobjects for a relation in attnum order. Dropped
+   tombstones are included unless `live-only?` is true."
+  ([db relation-oid] (columns-by-relation db relation-oid false))
+  ([db relation-oid live-only?]
+   (let [db (catalog-metadata-db db)]
+     (when-let [relation-eid (:db/id (object-by-address db pg-class-oid relation-oid))]
+       (->> (d/q '{:find [?column]
+                   :in [$ ?relation]
+                   :where [[?column :datahike.pg.column/relation ?relation]]}
+                 db relation-eid)
+            (map (comp column-map #(d/pull db column-keys %) first))
+            (remove #(and live-only? (:datahike.pg.column/dropped? %)))
+            (sort-by :datahike.pg.column/attnum)
+            vec)))))
+
+(defn next-attnum [db relation-oid]
+  (let [maximum (reduce max 0
+                        (map :datahike.pg.column/attnum
+                             (columns-by-relation db relation-oid)))]
+    (when (>= maximum 1600)
+      (throw (ex-info "tables can have at most 1600 columns"
+                      {:error :too-many-columns :sqlstate "54011"})))
+    (inc maximum)))
+
+(defn create-columns-tx
+  "Create durable column subobject rows. The relation may be created in the
+   same transaction, so its lookup ref need not resolve in `db` yet."
+  [relation-oid columns]
+  (mapv
+   (fn [{:keys [attnum name storage-ident type-oid typmod local? inherit-count
+                inherited-from-address]
+         :or {local? true inherit-count 0}}]
+     (cond-> {:datahike.pg.column/address-key
+              (column-address-key relation-oid attnum)
+              :datahike.pg.column/name-key (column-name-key relation-oid name)
+              :datahike.pg.column/relation
+              [:datahike.pg.object/address-key
+               (address-key pg-class-oid relation-oid)]
+              :datahike.pg.column/attnum (long attnum)
+              :datahike.pg.column/name (str name)
+              :datahike.pg.column/storage-ident storage-ident
+              :datahike.pg.column/dropped? false
+              :datahike.pg.column/local? (boolean local?)
+              :datahike.pg.column/inherit-count (long inherit-count)}
+       inherited-from-address
+       (assoc :datahike.pg.column/inherited-from-address
+              inherited-from-address)
+       (some? type-oid) (assoc :datahike.pg.column/type-oid (long type-oid))
+       (some? typmod) (assoc :datahike.pg.column/typmod (long typmod))))
+   columns))
+
+(defn drop-relation-columns-tx [db relation-oid]
+  (mapv (fn [column]
+          [:db/retractEntity
+           [:datahike.pg.column/address-key
+            (:datahike.pg.column/address-key column)]])
+        (columns-by-relation db relation-oid)))
+
+(defn tombstone-column-tx
+  "Mark a column address dropped while retaining its attnum. The live name
+   key is released so a later column with the same SQL name receives a fresh
+   address. Revision guarding belongs to the surrounding relation mutation."
+  [db relation-oid attnum]
+  (when-let [column (column-by-attnum db relation-oid attnum)]
+    (let [column-ref [:datahike.pg.column/address-key
+                      (:datahike.pg.column/address-key column)]]
+      (when-not (:datahike.pg.column/dropped? column)
+        [[:db/retract column-ref :datahike.pg.column/name-key
+          (:datahike.pg.column/name-key column)]
+         [:db/add column-ref :datahike.pg.column/dropped? true]]))))
+
+(defn rename-column-tx
+  "Rename a live column without changing its relation-local address or
+   physical Datahike storage ident."
+  [db relation-oid attnum new-name new-storage-ident]
+  (when-let [column (column-by-attnum db relation-oid attnum)]
+    (when-not (:datahike.pg.column/dropped? column)
+      (let [column-ref [:datahike.pg.column/address-key
+                        (:datahike.pg.column/address-key column)]]
+        [[:db/retract column-ref :datahike.pg.column/name-key
+          (:datahike.pg.column/name-key column)]
+         [:db/add column-ref :datahike.pg.column/name-key
+          (column-name-key relation-oid new-name)]
+         [:db/add column-ref :datahike.pg.column/name (str new-name)]
+         [:db/add column-ref :datahike.pg.column/storage-ident
+          new-storage-ident]]))))
 
 (defn resolve-search-path
   "Resolve PostgreSQL search_path entries to existing namespace OIDs.
@@ -206,14 +405,42 @@
     (when-not catalog-eid
       (throw (ex-info "user-object catalog is not initialized"
                       {:error :catalog-not-initialized})))
-    (loop [candidate (long (or (:datahike.pg.catalog/next-oid catalog)
-                               first-user-oid))]
+    (loop [candidate (validate-allocation-cursor
+                      (or (:datahike.pg.catalog/next-oid catalog)
+                          first-user-oid))]
+      (ensure-allocatable-oid candidate)
       (if (oid-in-use? db candidate)
         (recur (inc candidate))
         {:oid candidate
          :tx-data [[:db/cas catalog-eid :datahike.pg.catalog/next-oid
                     (:datahike.pg.catalog/next-oid catalog)
                     (inc candidate)]]}))))
+
+(defn reserve-user-oids-tx
+  "Reserve `n` noncolliding OIDs with one allocator CAS. Used when PostgreSQL
+   creates coupled catalog objects, such as a relation and its row type."
+  [db n]
+  (when-not (pos-int? n)
+    (throw (ex-info "OID reservation count must be positive"
+                    {:error :invalid-oid-reservation :count n})))
+  (let [catalog (catalog-entity db)
+        catalog-eid (:db/id catalog)
+        start (validate-allocation-cursor
+               (or (:datahike.pg.catalog/next-oid catalog) first-user-oid))]
+    (when-not catalog-eid
+      (throw (ex-info "user-object catalog is not initialized"
+                      {:error :catalog-not-initialized})))
+    (loop [candidate (long (or start first-user-oid))
+           oids []]
+      (if (= n (count oids))
+        {:oids oids
+         :tx-data [[:db/cas catalog-eid :datahike.pg.catalog/next-oid
+                    start candidate]]}
+        (do
+          (ensure-allocatable-oid candidate)
+          (if (oid-in-use? db candidate)
+            (recur (inc candidate) oids)
+            (recur (inc candidate) (conj oids candidate))))))))
 
 (defn create-object-tx
   "Build an object-row transaction.  Namespace may be nil for cluster-global
@@ -297,9 +524,9 @@
                                (boolean legacy-oid?))))
 
 (defn initialize-catalog
-  "Transaction function for an atomic, idempotent version-1 migration.
+  "Transaction function for an atomic, idempotent initial migration.
    `legacy-objects` must already have deterministic, collision-free OIDs."
-  [txdb legacy-objects next-oid]
+  [txdb legacy-objects legacy-columns next-oid]
   (let [existing (catalog-entity txdb)
         version (:datahike.pg.catalog/version existing)]
     (cond
@@ -326,7 +553,67 @@
                 :datahike.pg.catalog/next-oid (long (max first-user-oid next-oid))}]
               (concat (map migration-object-map namespaces)
                       (map migration-object-map legacy-objects)
+                      (mapcat (fn [{:keys [relation-oid columns]}]
+                                (create-columns-tx relation-oid columns))
+                              legacy-columns)
                       (mapcat :legacy-tx-data legacy-objects)))))))
 
-(defn initialization-tx [legacy-objects next-oid]
-  [[:db.fn/call initialize-catalog (vec legacy-objects) (long next-oid)]])
+(defn initialization-tx
+  ([legacy-objects next-oid]
+   (initialization-tx legacy-objects [] next-oid))
+  ([legacy-objects legacy-columns next-oid]
+   [[:db.fn/call initialize-catalog
+     (vec legacy-objects) (vec legacy-columns) (long next-oid)]]))
+
+(defn migrate-v1-to-v2
+  "Atomic catalog-v1 upgrade that installs durable column subaddresses."
+  [txdb legacy-columns]
+  (let [catalog (catalog-entity txdb)
+        version (:datahike.pg.catalog/version catalog)]
+    (cond
+      (and version (>= (long version) 2)) []
+      (= 1 version)
+      (into [[:db/cas (:db/id catalog) :datahike.pg.catalog/version
+              1 2]]
+            (mapcat (fn [{:keys [relation-oid columns]}]
+                      (create-columns-tx relation-oid columns))
+                    legacy-columns))
+      (and version (> (long version) catalog-version))
+      (throw (ex-info "object catalog was written by a newer pg-datahike"
+                      {:error :catalog-version-too-new
+                       :supported catalog-version :found version}))
+      :else
+      (throw (ex-info "unsupported partial or older object catalog"
+                      {:error :catalog-migration-required
+                       :supported catalog-version :found version})))))
+
+(defn v1-to-v2-tx [legacy-columns]
+  [[:db.fn/call migrate-v1-to-v2 (vec legacy-columns)]])
+
+(defn migrate-v2-to-v3
+  "Atomic address-completeness migration. `tx-data` contains preplanned
+   generic object and column rows; allocator/version CAS operations make a
+   stale or concurrent plan fail instead of partially merging."
+  [txdb tx-data expected-next next-oid]
+  (let [catalog (catalog-entity txdb)
+        version (:datahike.pg.catalog/version catalog)]
+    (cond
+      (= catalog-version version) []
+      (= 2 version)
+      (into [[:db/cas (:db/id catalog) :datahike.pg.catalog/version
+              2 catalog-version]
+             [:db/cas (:db/id catalog) :datahike.pg.catalog/next-oid
+              expected-next next-oid]]
+            tx-data)
+      (and version (> (long version) catalog-version))
+      (throw (ex-info "object catalog was written by a newer pg-datahike"
+                      {:error :catalog-version-too-new
+                       :supported catalog-version :found version}))
+      :else
+      (throw (ex-info "catalog v2-to-v3 migration requires version 2"
+                      {:error :catalog-migration-required
+                       :supported catalog-version :found version})))))
+
+(defn v2-to-v3-tx [tx-data expected-next next-oid]
+  [[:db.fn/call migrate-v2-to-v3 (vec tx-data)
+    (long expected-next) (long next-oid)]])

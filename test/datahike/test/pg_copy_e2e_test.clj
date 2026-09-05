@@ -72,6 +72,19 @@
 ;; Text format
 ;; ============================================================================
 
+(deftest copy-sequence-default-survives-failed-row
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE copy_ids (id int GENERATED ALWAYS AS IDENTITY, v int NOT NULL)"))
+    (is (thrown? java.sql.SQLException
+                 (copy-in-text c "COPY copy_ids(v) FROM STDIN" "\\N\n")))
+    (is (thrown? java.sql.SQLException
+                 (copy-in-text c "COPY copy_ids(id,v) FROM STDIN" "\\N\t6\n")))
+    (is (= 1 (copy-in-text c "COPY copy_ids(v) FROM STDIN" "7\n")))
+    (is (= [[2 7]] (query-rows c "SELECT id,v FROM copy_ids")))
+    (is (= 1 (copy-in-text c "COPY copy_ids(id,v) FROM STDIN" "99\t8\n")))
+    (is (= [[2 7] [99 8]] (query-rows c "SELECT id,v FROM copy_ids ORDER BY id")))))
+
 (deftest copy-text-format-basic
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
     (let [n (copy-in-text c "COPY users (id, name, email, active) FROM stdin"

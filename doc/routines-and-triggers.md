@@ -64,6 +64,30 @@ faithfully.
 
 ### One statement executor
 
+The next foundation milestone is the dependency graph, before extracting this
+executor. It must replace the existing object-specific deletion scans:
+
+- Persist dependent and referenced `(classid, objid, objsubid)` addresses with
+  PostgreSQL `NORMAL`, `AUTO`, and `INTERNAL` dependency types.
+- Plan `RESTRICT` and `CASCADE` deletion as a pure operation over all explicit
+  roots together. Handle column addresses, internal ownership, cycles, and
+  multiple paths; use deterministic traversal and error ordering.
+- Keep payload teardown in object-specific handlers. The graph decides which
+  objects must disappear; handlers produce their primitive retractions.
+- Migrate indexes, inheritance, relation row types, and views atomically.
+  Views acquire a persistent `_RETURN` rewrite-rule object with internal
+  ownership by the view and normal dependencies on analyzed references.
+- Validate endpoints and required ownership edges at the writer boundary so
+  concurrent object creation and deletion cannot commit dangling references.
+- Verify migration idempotence, rollback, reconnect, column drops, nested view
+  cascades, and concurrent DDL against PostgreSQL 17.7 behavior and catalog
+  rows. Add routine/trigger fixtures to prove the graph's forward contract.
+
+Partition and extension dependency types, shared role dependencies, and the
+durable constraint catalog remain separate milestones. SQL function string
+bodies and parsed bodies must retain their distinct dependency timing when
+routine analysis is added.
+
 The pgwire adapter is a protocol boundary, not an internal API. Nested SQL from
 a function or trigger enters a shared statement executor directly. An execution
 context carries at least:

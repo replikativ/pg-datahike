@@ -87,8 +87,11 @@
     (is (= ["1"] (col c 1 "SELECT stddev(f) FROM sv")))
     (is (= ["0.6666666666666666"] (col c 1 "SELECT var_pop(f) FROM sv")))
     (is (= ["0.816496580927726"] (col c 1 "SELECT stddev_pop(f) FROM sv")))
-    (is (= ["1.0999999642372138"] (col c 1 "SELECT stddev(r) FROM sv"))
-        "real widens to float8, as PG's aggregate does")
+    ;; Floating accumulation depends on input order. Fix the oracle's order
+    ;; explicitly; an unordered relation may differ in the final bit.
+    (is (= ["1.0999999642372138"]
+           (col c 1 "SELECT stddev(r) FROM (SELECT r FROM sv ORDER BY i) ordered"))
+        "real widens to float8, with the same input order as the PG oracle")
     (is (= ["double precision"] (col c 1 "SELECT pg_typeof(stddev(f)) FROM sv LIMIT 1")))))
 
 (deftest nulls-and-small-groups

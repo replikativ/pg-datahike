@@ -102,9 +102,11 @@
          (not (identity-column? col)))))
 
 (defn identity-generation
-  "Return PostgreSQL's generation mode for an identity/SERIAL column."
+  "Return PostgreSQL's generation mode for an identity column."
   [^ColumnDefinition col]
-  (when (identity-column? col)
+  (when (and (identity-column? col)
+             (not (contains? serial-types
+                             (str/lower-case (str (.getDataType (.getColDataType col)))))))
     (let [spec (->> (.getColumnSpecs col)
                     (map str)
                     (str/join " ")
@@ -570,6 +572,13 @@
                                (let [cn (params/unquote-ident (.getColumnName col))]
                                  (when-not (skip-col? cn) cn)))
                              columns))
+        column-types
+        (into {}
+              (keep (fn [^ColumnDefinition col]
+                      (let [cn (params/unquote-ident (.getColumnName col))]
+                        (when-not (skip-col? cn)
+                          [cn (str (.getColDataType col))]))))
+              columns)
         ;; Detect IDENTITY columns and create implicit sequences
         identity-cols (vec (keep (fn [^ColumnDefinition col]
                                    (let [cn (params/unquote-ident (.getColumnName col))]
@@ -790,8 +799,12 @@
                                ;; :db.unique/identity cannot represent that
                                ;; half of the PostgreSQL constraint by itself.
                                not-null-here? (or pk-here?
+                                                  (identity-column? col)
                                                   (column-is-not-null? col))
-                               default-spec (let [spec (column-default-spec col)
+                               default-spec (let [spec (or (column-default-spec col)
+                                                           (when (contains? serial-types base-type)
+                                                             {:kind :nextval
+                                                              :value (str table-name "_" col-name "_seq")}))
                                                   bit-type? (contains?
                                                              #{"bit" "varbit" "bit varying"}
                                                              (types/base-type-name-of raw-type))]
@@ -1103,23 +1116,25 @@
                                   :db/cardinality :db.cardinality/one}
                                  {:db/ident :__seq__/identity-generation :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
-                                 {:__seq__/name seq-name
-                                  :__seq__/value 0
-                                  :__seq__/increment 1
-                                  :__seq__/minvalue 1
-                                  :__seq__/maxvalue max-value
-                                  :__seq__/cache 1
-                                  :__seq__/cycle false
-                                  :__seq__/start 1
-                                  :__seq__/type seq-type
-                                  :__seq__/identity-generation (get identity-generations col-name
-                                                                    "BY DEFAULT")}]))
+                                 (cond-> {:__seq__/name seq-name
+                                          :__seq__/value 0
+                                          :__seq__/increment 1
+                                          :__seq__/minvalue 1
+                                          :__seq__/maxvalue max-value
+                                          :__seq__/cache 1
+                                          :__seq__/cycle false
+                                          :__seq__/start 1
+                                          :__seq__/type seq-type}
+                                   (get identity-generations col-name)
+                                   (assoc :__seq__/identity-generation
+                                          (get identity-generations col-name)))]))
                             identity-cols))]
     (cond-> {:type :ddl-create
              :table-name table-name
              :temp? temp?
              :if-not-exists? (.isIfNotExists ct)
              :column-order col-names
+             :column-types column-types
              :identity-cols identity-cols
              :pk-cols pk-cols
              :pk-name (or (:pk-name constraints)

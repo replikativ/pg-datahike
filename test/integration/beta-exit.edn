@@ -98,7 +98,26 @@
    :claim "version-pinned Datahike Server JAR and non-root container lifecycle"}]
 
  :blockers
-  [{:id :three-valued-null
+  [{:id :catalog-unique-writer-completion
+   :wave 5
+   :status :open
+   :evidence ["test/datahike/test/pg_unique_index_test.clj"
+              "test/datahike/test/pg_catalog_objects_test.clj"]
+   :exit "Durable index migration and writer enforcement pass native NaN updates, reconnect, rollback, concurrent writes, and the complete release gates with the released Datahike dependency."}
+  {:id :insert-sequence-constraint-completion
+   :wave 5
+   :status :open
+   :evidence ["test/datahike/test/pg_on_conflict_semantics_test.clj"
+              "test/datahike/test/pg_constraints_test.clj"]
+   :exit "INSERT and COPY preserve reserved sequence advances across row failure and rollback without reusing values; generated identity provenance, prepared NULLs, inheritance, defaults, and conflict constraints pass independent review and integration gates. Exact per-row evaluation order is tracked separately."}
+  {:id :sequence-row-evaluation-order
+   :wave 5
+   :status :open
+   :evidence ["test/datahike/test/pg_on_conflict_semantics_test.clj"
+              "doc/postgres-compatibility.md"
+              "doc/routines-and-triggers.md"]
+   :exit "A shared statement executor reserves and validates each candidate before advancing to the next, including INSERT, ON CONFLICT and COPY; commit/rebase applies recorded effects without rerunning defaults. Differential early-row failure tests match PostgreSQL 17 (nextval 2 rather than the current 3 for a two-row insert failing on its first row)."}
+  {:id :three-valued-null
    :wave 1
    :status :closed
    :evidence ["test/datahike/test/pg_null_value_test.clj"

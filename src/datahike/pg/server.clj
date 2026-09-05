@@ -13,17 +13,21 @@
      (def server (pg/start-server conn {:port 5432}))
      ;; ... use any PostgreSQL client ...
      (pg/stop-server server)"
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.set]
             [clojure.walk :as walk]
             [datahike.api :as d]
             [datahike.core :as dc]
             [datahike.db.interface :as dbi]
             [datahike.writer :as writer]
+            [datahike.tx-preds :as tx-preds]
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.cache :as pg-cache]
             [datahike.pg.catalog.objects :as catalog-objects]
+            [datahike.pg.constraints.row :as row-constraints]
+            [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
@@ -566,7 +570,7 @@
               tm (when attr (get typmod-map attr))]
           (when (and toid anum)
             (reset! any? true)
-            (aset-int toids i (int toid))
+            (aset-int toids i (types/oid->wire-int toid))
             (aset-short attnums i (short anum)))
           (when tm
             (reset! any? true)
@@ -745,7 +749,9 @@
                 schema-oids
                ;; Replace any -1 sentinels with OID_TEXT for empty results
                 (if (some #(= % -1) schema-oids)
-                  (int-array (map #(if (= % -1) PgWireServer/OID_TEXT %) schema-oids))
+                  (int-array (map #(types/oid->wire-int
+                                    (if (= % -1) PgWireServer/OID_TEXT %))
+                                  schema-oids))
                   schema-oids)
                 first-row
                 (int-array (map-indexed
@@ -1391,14 +1397,18 @@
    (or record manually): a commit missing from the ring makes any
    overlapping conflict window fall back to the attribute-level
    full-database scan — ~1s per COMMIT at 3M datoms."
-  [conn tx-data]
-  (let [db-before @conn
-        report (d/transact conn tx-data)
-        db-after (:db-after report)
-        eas (tx-buffer-eas tx-data db-before)]
-    (record-commit-writes! (db-ring-key db-after) (:max-tx db-after)
-                           (if (= ::opaque eas) ::opaque eas))
-    report))
+  ([conn tx-data]
+   (transact-recorded! conn tx-data nil))
+  ([conn tx-data tx-options]
+   (let [db-before @conn
+         report (d/transact conn (cond-> {:tx-data tx-data}
+                                   (seq tx-options)
+                                   (assoc :tx-options tx-options)))
+         db-after (:db-after report)
+         eas (tx-buffer-eas tx-data db-before)]
+     (record-commit-writes! (db-ring-key db-after) (:max-tx db-after)
+                            (if (= ::opaque eas) ::opaque eas))
+     report)))
 
 (defn- transact-speculative-report!
   "Commit exactly the datoms produced by one prior `dc/with` evaluation.
@@ -1643,7 +1653,17 @@
              :default-table visible-name
              :table-aliases aliases
              :scalar-subquery-oid #(expr/scalar-subquery-output-oid return-ctx %)
-             :hints (pgs/schema-hints db)}]
+             :hints (pgs/schema-hints db)}
+        _ (doseq [{:keys [kind expr]} returning
+                  :when (= :expr kind)
+                  ^net.sf.jsqlparser.schema.Column column (params/ast-columns expr)
+                  :let [resolved (sql-ctx/resolve-column
+                                  column aliases visible-name
+                                  (:col-overrides return-ctx)
+                                  (:derived-aliases return-ctx)
+                                  (:ci-index return-ctx))
+                        attr (sql-ctx/attr-of return-ctx resolved)]]
+            (sql-ctx/validate-column! return-ctx attr))]
     (vec
      (mapcat
       (fn [{:keys [kind table expr name] :as item}]
@@ -1659,8 +1679,20 @@
                            (keyword table-name name) schema db)
                     :oid oid})
                  columns))
-          [(assoc item :name name :oid (or (oid/expr-oid expr env)
-                                           PgWireServer/OID_TEXT))]))
+          [(if (instance? Column expr)
+             (let [resolved (sql-ctx/resolve-column
+                             expr aliases visible-name
+                             (:col-overrides return-ctx)
+                             (:derived-aliases return-ctx)
+                             (:ci-index return-ctx))]
+               (assoc item
+                      :kind :column
+                      :name name
+                      :attr (sql-ctx/attr-of return-ctx resolved)
+                      :oid (or (oid/expr-oid expr env)
+                               PgWireServer/OID_TEXT)))
+             (assoc item :name name :oid (or (oid/expr-oid expr env)
+                                             PgWireServer/OID_TEXT)))]))
       returning))))
 
 (defn- build-returning-result
@@ -1694,7 +1726,8 @@
                                (for [row rows]
                                  (into-array String (map value->string row))))
         col-name-array (into-array String col-names)
-        oids (int-array (map #(int (or (:oid %) PgWireServer/OID_TEXT)) items))
+        oids (int-array (map #(types/oid->wire-int
+                               (or (:oid %) PgWireServer/OID_TEXT)) items))
         tag (case command
               :update (str "UPDATE " (count eids))
               :delete (str "DELETE " (count eids))
@@ -1804,16 +1837,10 @@
           v)))))
 
 (defn- compute-identity-cols
-  "Discover IDENTITY-backed columns of `table-name`. Two d/q calls —
-   INHERITS lookup + sequences-by-prefix. Pure function of the
-   schema; cached per (schema, table)."
+  "Discover local identity columns. Regular INHERITS does not inherit
+   identity generation (PostgreSQL tablecmds.c, MergeAttributes)."
   [db table-name]
-  (let [parent-table (ffirst (d/q '{:find [?p]
-                                    :where [[?e :__inherit__/child ?c]
-                                            [?e :__inherit__/parent ?p]]
-                                    :in [$ ?c]}
-                                  db table-name))
-        tables-to-check (if parent-table [table-name parent-table] [table-name])
+  (let [tables-to-check [table-name]
         schema (dbi/-schema db)]
     (vec (mapcat
           (fn [tbl]
@@ -1848,85 +1875,15 @@
   (doseq [{:keys [col ns generation]} (compute-identity-cols db table-name)
           :when (= "ALWAYS" generation)
           :let [attr (keyword ns col)]
-          :when (some #(and (map? %) (contains? % attr))
+          :when (some #(and (map? %)
+                            (contains? % attr)
+                            (not (and (sql/nextval-marker? (get % attr))
+                                      (:generated-default? (get % attr)))))
                       (tree-seq coll? seq tx-data))]
     (throw (errors/pg-error
             :generated-always
             {:message (str "cannot insert a non-DEFAULT value into identity column \""
                            col "\"")}))))
-
-(defn- auto-populate-identity
-  "If the table has IDENTITY columns (backed by __seq__ sequences), populate
-   any missing identity attributes in the INSERT tx-data using :db.fn/call
-   for atomic increment. Also checks parent table sequences for INHERITS.
-
-   The identity-cols set is memoised per (schema, table) — this used
-   to fire two d/q calls per INSERT even on tables without identity
-   columns."
-  [tx-data table-name db]
-  (let [identity-cols (schema-cached db [::identity table-name]
-                                     #(compute-identity-cols db table-name))
-        identity-cols (if (= ::nil identity-cols) [] identity-cols)]
-    (if (empty? identity-cols)
-      tx-data
-      ;; Wrap entire INSERT in :db.fn/call to atomically generate IDs.
-      ;; Uses a local atom to track running sequence values across rows
-      ;; within the same multi-row INSERT (txdb is immutable, can't see
-      ;; prior rows' sequence increments).
-      [[:db.fn/call
-        (fresh-insert-fn
-         (fn [txdb]
-           (let [q-fn d/q
-                ;; Pre-fetch sequence state for each identity column
-                 seq-state (atom
-                            (into {}
-                                  (for [{:keys [col ns seq-name]} identity-cols
-                                        :let [seq-eid (ffirst (q-fn '{:find [?e]
-                                                                      :where [[?e :__seq__/name ?n]]
-                                                                      :in [$ ?n]}
-                                                                    txdb seq-name))
-                                              curr-val (when seq-eid
-                                                         (or (ffirst (q-fn '{:find [?v]
-                                                                             :where [[?e :__seq__/value ?v]]
-                                                                             :in [$ ?e]}
-                                                                           txdb seq-eid))
-                                                             0))
-                                              increment (or (when seq-eid
-                                                              (ffirst (q-fn '{:find [?i]
-                                                                              :where [[?e :__seq__/increment ?i]]
-                                                                              :in [$ ?e]}
-                                                                            txdb seq-eid)))
-                                                            1)]
-                                        :when seq-eid]
-                                    [col {:eid seq-eid :val (or curr-val 0) :inc increment :ns ns}])))]
-             (vec (mapcat
-                   (fn [entity-map]
-                     (if-not (map? entity-map)
-                       [entity-map]
-                       (let [populated
-                             (reduce
-                              (fn [m {:keys [col ns]}]
-                               ;; Use the column's owning namespace (may be parent for inherited)
-                                (let [attr (keyword ns col)]
-                                  (if (contains? m attr)
-                                    m
-                                   ;; Auto-generate: increment local counter
-                                    (let [{:keys [val inc]} (get @seq-state col)
-                                          new-val (+ val inc)]
-                                      (swap! seq-state assoc-in [col :val] new-val)
-                                      (assoc m attr new-val)))))
-                              entity-map
-                              identity-cols)]
-                         (let [seq-updates
-                               (keep (fn [{:keys [col ns]}]
-                                       (let [attr (keyword ns col)]
-                                         (when-not (contains? entity-map attr)
-                                           (let [{:keys [eid val]} (get @seq-state col)]
-                                             (when eid
-                                               [:db/add eid :__seq__/value val])))))
-                                     identity-cols)]
-                           (into [populated] seq-updates)))))
-                   tx-data)))))]])))
 
 (defn- eval-default
   "Evaluate a :pg/default-* triple at INSERT time. Stateless defaults
@@ -2072,8 +2029,7 @@
                :check-name check-name
                :not-null? not-null
                :check-ast (when check-expr
-                            (try (parse-check-expression check-expr)
-                                 (catch Throwable _ nil)))})))
+                            (parse-check-expression check-expr))})))
     (let [enum-map (java.util.HashMap.)]
       (doseq [{:keys [ident enum-name values]} enum-rows]
         (let [col (name ident)
@@ -2116,7 +2072,9 @@
                       ;; Look up the value under either the schema-
                       ;; declared attr or the parsed ns-prefix; INSERT
                       ;; tx-data uses the latter.
-                      v (or (get em attr) (get em (keyword ns col-name)))]]
+                      v (if (contains? em attr)
+                          (get em attr)
+                          (get em (keyword ns col-name)))]]
           (cond
             ;; Domain :not-null lives on the domain itself, not the
             ;; column. Column-level :pg/not-null already fired above
@@ -2136,12 +2094,10 @@
             ;; conventional lower-case unqualified keyword so the existing
             ;; eval-check-predicate / eval-update-expr machinery
             ;; resolves it without a special case.
-            (and (= :domain (:kind spec)) (some? v) (:check-ast spec))
-            (let [r (try
-                      (sql/eval-check-predicate (:check-ast spec)
-                                                {(keyword "" "value") v}
-                                                "" schema)
-                      (catch Throwable _ ::error))]
+            (and (= :domain (:kind spec)) (:check-ast spec))
+            (let [r (sql/eval-check-predicate (:check-ast spec)
+                                              {(keyword "" "value") v}
+                                              "" schema)]
               (when (false? r)
                 (throw (ex-info "domain check constraint violation"
                                 {:error :check-violation
@@ -2416,7 +2372,13 @@
 
 (defn- read-column-constraints*
   [db table-name]
-  (let [not-null-idents (into #{}
+  (let [hidden-idents (into #{}
+                            (map first)
+                            (d/q '{:find [?ident]
+                                   :where [[?hint :datahike.pg/for-ident ?ident]
+                                           [?hint :datahike.pg/hidden true]]}
+                                 db))
+        not-null-idents (into #{}
                               (map first)
                               (d/q '{:find [?ident]
                                      :in [$ ?tbl]
@@ -2446,6 +2408,8 @@
                                                 [?e :pg/default-arg ?a]]}
                                       db ident))]
                   [ident [dk dv da]])))
+        not-null-idents (reduce disj not-null-idents hidden-idents)
+        ident->default (apply dissoc ident->default hidden-idents)
         all-idents (into not-null-idents (keys ident->default))]
     (into {}
           (for [ident all-idents]
@@ -2482,157 +2446,54 @@
    default.
 
    Non-map items (retract ops, prior :db.fn/call wrappers) pass
-   through unchanged. We run this AFTER auto-populate-identity so
-   IDENTITY sequences fire before the null check sees the entity —
-   otherwise an implicit SERIAL column would look null here."
+   through unchanged. Sequence defaults have already been reserved against
+   the live connection before this function checks their resulting values."
   [tx-data table-name ns db]
-  (let [cols (read-column-constraints db table-name)
-        has-checks? (seq (read-check-constraints db table-name))
-        has-fks? (seq (read-fk-constraints db table-name))
-        has-domain-enum? (seq (read-domain-enum-checks db table-name))
+  (let [constraint-plan
+        (schema-cached db [::row-constraint-plan table-name]
+                       #(row-constraints/constraint-plan db table-name))
         explicit-nulls? (some (fn [entry]
                                 (and (map? entry) (some nil? (vals entry))))
                               tx-data)]
-    (if (and (empty? cols) (not has-checks?) (not has-fks?)
-             (not has-domain-enum?) (not explicit-nulls?))
+    (if-not (row-constraints/plan-required? constraint-plan explicit-nulls?)
       tx-data
       [[:db.fn/call
         ;; fresh-insert-fn: conflict attribution treats this as writing no
-        ;; existing rows — it emits the payload as fresh entities (or
-        ;; raises); its only existing-entity writes are sequence-counter
-        ;; bumps, which follow PostgreSQL nextval semantics
-        ;; (non-transactional, never a serialization conflict).
+        ;; existing rows — it emits the payload as fresh entities (or raises).
+        ;; Sequence reservations have already committed independently through
+        ;; nextval markers, so this transaction never writes their counters.
         (fresh-insert-fn
          (fn [txdb]
-           (let [q-fn d/q
-                 bump-seq! (fn [seq-name]
-                            ;; Mirror the behavior in auto-populate-identity:
-                            ;; find the sequence entity, compute next value,
-                            ;; return [new-value [:db/add eid :__seq__/value v]].
-                             (let [eid (ffirst (q-fn '{:find [?e]
-                                                       :where [[?e :__seq__/name ?n]]
-                                                       :in [$ ?n]}
-                                                     txdb seq-name))
-                                   curr (when eid
-                                          (ffirst (q-fn '{:find [?v]
-                                                          :where [[?e :__seq__/value ?v]]
-                                                          :in [$ ?e]}
-                                                        txdb eid)))
-                                   incr (when eid
-                                          (or (ffirst (q-fn '{:find [?i]
-                                                              :where [[?e :__seq__/increment ?i]]
-                                                              :in [$ ?e]}
-                                                            txdb eid))
-                                              1))
-                                   nxt (when eid (+ (or curr 0) incr))]
-                               (when eid
-                                 [nxt [:db/add eid :__seq__/value nxt]])))
-                 ;; Identity generation and constraint/default application
-                 ;; are both transaction functions.  When a SERIAL column
-                 ;; is omitted, auto-populate-identity wraps the row maps
-                 ;; first; treating that wrapper as an opaque non-map meant
-                 ;; DEFAULT values on OTHER columns were never applied.
-                 ;; Expand only our tagged fresh-insert wrapper inside this
-                 ;; outer tx-fn, preserving arbitrary user/Datahike tx-fns.
-                 input-tx-data
-                 (vec (mapcat (fn [entry]
-                                (if (and (vector? entry)
-                                         (= :db.fn/call (first entry))
-                                         ;; The identity/default wrapper takes
-                                         ;; only txdb.  The uniqueness guard is
-                                         ;; tagged fresh too, but carries its row
-                                         ;; payload as a third item and must be
-                                         ;; left for Datahike to invoke with both
-                                         ;; arguments.
-                                         (= 2 (count entry))
-                                         (-> entry second meta :datahike.pg/fresh-insert))
-                                  ((second entry) txdb)
-                                  [entry]))
-                              tx-data))
-                 result
-                 (reduce
-                  (fn [acc entry]
-                    (if-not (map? entry)
-                      (conj acc entry)
-                      (let [{:keys [filled seq-ops]}
-                            (reduce-kv
-                             (fn [st col-name {:keys [attr not-null? default]}]
-                               (let [ns-attr (keyword ns col-name)
-                                     legacy (keyword (namespace attr) col-name)
-                                     present-key (some #(when (contains? (:filled st) %) %)
-                                                       [ns-attr attr legacy])]
-                                 (cond
-                                   present-key
-                                   (let [v (get-in st [:filled present-key])]
-                                     (if (and not-null? (nil? v))
-                                       (throw (ex-info "not-null violation"
-                                                       {:error  :not-null-violation
-                                                        :table  table-name
-                                                        :column col-name}))
-                                       st))
-
-                                   default
-                                   (let [[kind value arg] default
-                                         raw-v (eval-default kind value arg)
-                                         ;; DEFAULT expressions undergo the
-                                         ;; target column's assignment cast in
-                                         ;; PostgreSQL. This happens here,
-                                         ;; after volatile defaults such as
-                                         ;; now() are materialized inside the
-                                         ;; transaction function; parse-time
-                                         ;; coercion only saw an opaque marker.
-                                         v (when (some? raw-v)
-                                             (#'sql/coerce-insert-value
-                                              raw-v ns-attr (dbi/-schema txdb) txdb))]
-                                     (cond
-                                       (and (vector? v) (= ::nextval (first v)))
-                                       (let [[nxt seq-tx] (bump-seq! (second v))]
-                                         (if nxt
-                                           (-> st
-                                               (assoc-in [:filled ns-attr] nxt)
-                                               (update :seq-ops conj seq-tx))
-                                           (if not-null?
-                                             (throw (ex-info "not-null violation"
-                                                             {:error  :not-null-violation
-                                                              :table  table-name
-                                                              :column col-name}))
-                                             st)))
-
-                                       (nil? v)
-                                       (if not-null?
-                                         (throw (ex-info "not-null violation"
-                                                         {:error  :not-null-violation
-                                                          :table  table-name
-                                                          :column col-name}))
-                                         st)
-
-                                       :else
-                                       (assoc-in st [:filled ns-attr] v)))
-
-                                   not-null?
-                                   (throw (ex-info "not-null violation"
-                                                   {:error  :not-null-violation
-                                                    :table  table-name
-                                                    :column col-name}))
-
-                                   :else st)))
-                             {:filled entry :seq-ops []}
-                             cols)]
-                        (into (conj acc filled) seq-ops))))
-                  []
-                  input-tx-data)
+           (let [input-tx-data tx-data
+                 result (reduce
+                         (fn [acc entry]
+                           (if-not (map? entry)
+                             (conj acc entry)
+                             (let [{:keys [attrs]}
+                                   (row-constraints/prepare-candidate
+                                    entry constraint-plan
+                                    (fn [value attr]
+                                      (or (#'sql/coerce-insert-value
+                                           value attr (dbi/-schema txdb) txdb)
+                                          value)))]
+                               (conj acc attrs))))
+                         []
+                         input-tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
                 ;; bumps etc. don't.
-                 filled-entities (filterv map? result)]
-             (when has-checks?
-               (doseq [em filled-entities]
-                 (enforce-check-constraints! txdb table-name ns em)))
-             (when has-domain-enum?
-               (enforce-domain-enum-checks! txdb table-name ns filled-entities))
-             (when has-fks?
-               (enforce-fk-on-insert! txdb table-name ns filled-entities))
+                 filled-entities (filterv map? result)
+                 effective-rows (into {}
+                                      (keep (fn [row]
+                                              (when-let [id (:db/id row)] [id row])))
+                                      filled-entities)]
+             (doseq [em filled-entities]
+               (row-constraints/validate-mutation!
+                txdb table-name em constraint-plan effective-rows
+                (fn [ast row ns schema]
+                  (sql/eval-check-predicate ast row ns schema))
+                nil))
              ;; Datahike represents SQL NULL as an absent datom.  Nil map
              ;; entries existed only long enough to distinguish explicit
              ;; NULL from an omitted/defaulted column above.
@@ -2646,16 +2507,16 @@
   (try
     (let [table-name (:table parsed)
           db (d/db conn)
-          _ (reject-explicit-always-identities! (:tx-data parsed) table-name db)
           tx-data (-> (:tx-data parsed)
-                      (auto-populate-identity table-name db)
                       (apply-column-constraints table-name (:ns parsed) db)
                       tx-wrap)
           returning (:returning parsed)
           ;; RETURNING can itself fail (for example, a scalar subquery can
           ;; produce two rows). Evaluate it against a speculative post-write
           ;; db before committing so the statement remains atomic.
-          tx-report (if returning (dc/with db tx-data) (transact-recorded! conn tx-data))]
+          tx-report (if returning (dc/with db tx-data) (transact-recorded! conn tx-data))
+          _ (when returning
+              (unique-constraints/validate-report! tx-report))]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
@@ -2667,8 +2528,7 @@
                          (some (fn [^datahike.datom.Datom d]
                                  (let [a (.-a d)]
                                    (and (keyword? a)
-                                        (.startsWith (str (namespace a) "/") ns-prefix)
-                                        (not= (name a) "db-row-exists"))))
+                                        (.startsWith (str (namespace a) "/") ns-prefix))))
                                (d/datoms row-db :eavt eid)))
               ordered-refs (if-let [refs (:row-refs parsed)]
                              @refs
@@ -2778,7 +2638,9 @@
                   table-aliases (cond-> {table table}
                                   alias (assoc alias table))
                   ctx (#'sql/make-ctx query-schema table-aliases default-key
-                                      {:db query-db :parse-sql sql/parse-sql})
+                                      {:db query-db
+                                       :parse-sql sql/parse-sql
+                                       :hints (pgs/schema-hints query-db)})
                   _ (when where-expr
                       ;; Top-level DELETE WHERE = conjunctive context: enables the
                       ;; data-pattern fast paths. Params stay as ?pN vars (values
@@ -2868,7 +2730,9 @@
                   table-aliases (cond-> {table table}
                                   alias (assoc alias table))
                   ctx (#'sql/make-ctx query-schema table-aliases default-key
-                                      {:db query-db :parse-sql sql/parse-sql})
+                                      {:db query-db
+                                       :parse-sql sql/parse-sql
+                                       :hints (pgs/schema-hints query-db)})
                   _ (when where-expr
                       ;; Top-level UPDATE WHERE = conjunctive context: the value-bound
                       ;; data-pattern fast path makes the row-matching query indexed
@@ -2999,7 +2863,7 @@
                                 ;; SET col = NULL → retract the attribute.
                                 ;; Skip for tempid entities (no prior values to retract;
                                 ;; Datahike rejects tempids in :db/retract).
-                                    (when (and old-val (integer? eid))
+                                    (when (and (some? old-val) (integer? eid))
                                       [:db/retract eid attr old-val])
                                     [:db/add eid attr val]))))
                             eids)))]
@@ -3147,10 +3011,8 @@
 (defn- check-updates-against-row-constraints!
   "For every eid touched by an UPDATE's tx-data, reconstruct the
    post-state entity map (current row + pending :db/add / :db/retract
-   ops) and run it through enforce-check-constraints! and the child-
-   side FK check. Mirrors PG's AFTER-trigger timing: the full row is
-   validated once the UPDATE's assignments have been applied, not
-   per-op.
+   ops) and validate table CHECKs, domains/enums and child-side FKs.
+   Validate the full row once the UPDATE's assignments have been applied.
 
    Called from execute-update against the pre-transact db; the
    speculative change isn't committed yet, so lookups (FK parent
@@ -3158,8 +3020,9 @@
    same for non-deferred constraints."
   [db table-name ns tx-data]
   (let [checks? (seq (read-check-constraints db table-name))
+        domains? (seq (read-domain-enum-checks db table-name))
         fks?    (seq (read-fk-constraints db table-name))]
-    (when (or checks? fks?)
+    (when (or checks? domains? fks?)
       (let [;; Group ops by eid. Map form (for INSERT-in-UPDATE? rare)
             ;; pass through untouched.
             ops-by-eid (reduce (fn [acc op]
@@ -3182,6 +3045,8 @@
                                    base ops)]]
           (when checks?
             (enforce-check-constraints! db table-name ns post))
+          (when domains?
+            (enforce-domain-enum-checks! db table-name ns [post]))
           (when fks?
             (enforce-fk-on-insert! db table-name ns [post])))))))
 
@@ -3200,7 +3065,9 @@
           tx-report (when (seq tx-data)
                       (if returning
                         (dc/with db tx-data)
-                        (transact-recorded! conn tx-data)))]
+                        (transact-recorded! conn tx-data)))
+          _ (when (and returning tx-report)
+              (unique-constraints/validate-report! tx-report))]
       (if returning
         ;; RETURNING: read values from db-after
         (let [db-after (if tx-report (:db-after tx-report) db)
@@ -3290,7 +3157,394 @@
                         {:__inherit__/child child :__inherit__/parent parent}]))]
     (into (vec base-tx) inherit-tx)))
 
-(defn- ensure-pg-schema!
+(defn- catalog-column-specs
+  "Build deterministic column-subaddress rows for registry initialization or
+   v1 migration. Inherited columns receive addresses in the child relation
+   while retaining their parent's physical storage ident."
+  ([db table-objects] (catalog-column-specs db table-objects nil))
+  ([db table-objects planned-type-oids]
+   (let [tables (pgs/derive-virtual-tables (dbi/-schema db)
+                                           (pgs/schema-hints db))
+         declared-types
+         (merge
+          (into {} (d/q '{:find [?ident ?type]
+                          :where [[?e :db/ident ?ident]
+                                  [?e :pg/type ?type]]} db))
+          (into {} (d/q '{:find [?ident ?type]
+                          :where [[?e :db/ident ?ident]
+                                  [?e :datahike.pg/enum-of ?type]]} db))
+          (into {} (d/q '{:find [?ident ?type]
+                          :where [[?e :db/ident ?ident]
+                                  [?e :datahike.pg/domain-of ?type]]} db)))
+         typmods (into {} (d/q '{:find [?ident ?typmod]
+                                 :where [[?e :db/ident ?ident]
+                                         [?e :pg/typmod ?typmod]]} db))
+         oid-by-name (into {} (map (juxt :name :oid)) table-objects)
+         parent-by-child
+         (when (get (dbi/-schema db) :__inherit__/child)
+           (into {}
+                 (d/q '{:find [?child ?parent]
+                        :where [[?e :__inherit__/child ?child]
+                                [?e :__inherit__/parent ?parent]]}
+                      db)))
+         cache (atom {})]
+     (letfn [(effective-columns [table visiting]
+               (or (get @cache table)
+                   (let [local (mapv #(assoc % :local? true :inherit-count 0)
+                                     (get-in tables [table :columns]))
+                         parent (get parent-by-child table)
+                         inherited
+                         (if (and parent (not (contains? visiting table)))
+                           (mapv #(assoc % :local? false :inherit-count 1
+                                         :inherited-from-table parent)
+                                 (effective-columns parent (conj visiting table)))
+                           [])
+                        ;; A compatible local declaration merges with an
+                        ;; inherited column at the inherited position.
+                         local-by-name (into {} (map (juxt :name identity)) local)
+                         inherited-names (into #{} (map :name) inherited)
+                         merged (into
+                                 (mapv (fn [column]
+                                         (if-let [own (get local-by-name (:name column))]
+                                           (assoc own :local? true :inherit-count 1
+                                                  :inherited-from-table parent)
+                                           column))
+                                       inherited)
+                                 (remove #(contains? inherited-names (:name %)))
+                                 local)]
+                     (swap! cache assoc table merged)
+                     merged)))]
+       (mapv
+        (fn [{:keys [name oid]}]
+          {:relation-oid oid
+           :columns
+           (mapv
+            (fn [idx column]
+              (cond-> {:attnum (inc idx)
+                       :name (:name column)
+                       :storage-ident (:attr column)
+                       :type-oid (if-let [declared (get declared-types (:attr column))]
+                                   (pgs/resolve-type-oid db declared planned-type-oids)
+                                   (:oid column))
+                       :typmod (get typmods (:attr column))
+                       :local? (:local? column)
+                       :inherit-count (:inherit-count column)}
+                (:inherited-from-table column)
+                (assoc :inherited-from-address
+                       (when-let [parent-oid
+                                  (get oid-by-name (:inherited-from-table column))]
+                         (catalog-objects/column-address-key
+                          parent-oid
+                          (inc (.indexOf
+                                ^java.util.List
+                                (mapv :name
+                                      (effective-columns
+                                       (:inherited-from-table column) #{}))
+                                (:name column))))))))
+            (range) (effective-columns name #{}))})
+        table-objects)))))
+
+(defn- reconcile-catalog-columns-tx
+  "Create missing durable column rows and repair metadata that an older
+   catalog version derived without the complete user-type namespace."
+  [db {:keys [relation-oid columns]}]
+  (mapcat
+   (fn [{:keys [attnum type-oid typmod] :as column}]
+     (if-let [existing (catalog-objects/column-by-attnum db relation-oid attnum)]
+       (let [column-ref [:datahike.pg.column/address-key
+                         (:datahike.pg.column/address-key existing)]]
+         (cond-> []
+           (and (some? type-oid)
+                (not= (long type-oid)
+                      (:datahike.pg.column/type-oid existing)))
+           (conj [:db/add column-ref :datahike.pg.column/type-oid
+                  (long type-oid)])
+
+           (and (some? typmod)
+                (not= (long typmod)
+                      (:datahike.pg.column/typmod existing)))
+           (conj [:db/add column-ref :datahike.pg.column/typmod
+                  (long typmod)])))
+       (catalog-objects/create-columns-tx relation-oid [column])))
+   columns))
+
+(defn- catalog-v2-address-migration
+  "Plan the v2→v3 registration of every currently supported addressable
+   relation/type. Legacy hash OIDs are preserved when class-address-safe;
+   missing coupled objects draw from the persistent allocator."
+  [db]
+  (let [;; objects-by-kind cannot express all kinds at once; query their roots.
+        existing (mapv (fn [[eid]]
+                         (select-keys (d/entity db eid)
+                                      [:db/id
+                                       :datahike.pg.object/address-key
+                                       :datahike.pg.object/identity-key
+                                       :datahike.pg.object/class-oid
+                                       :datahike.pg.object/oid
+                                       :datahike.pg.object/name
+                                       :datahike.pg.object/kind]))
+                       (d/q '{:find [?e]
+                              :where [[?e :datahike.pg.object/address-key _]]}
+                            db))
+        addresses (atom (into #{} (map (juxt :datahike.pg.object/class-oid
+                                             :datahike.pg.object/oid)) existing))
+        identities (atom (into #{} (map (juxt :datahike.pg.object/class-oid
+                                              :datahike.pg.object/name)) existing))
+        used-numeric (atom (into #{} (map :datahike.pg.object/oid) existing))
+        initial-next (:datahike.pg.catalog/next-oid
+                      (catalog-objects/catalog-entity db))
+        cursor (atom (if (catalog-objects/valid-user-oid? initial-next)
+                       initial-next catalog-objects/first-user-oid))
+        next-free! (fn []
+                     (loop [candidate @cursor]
+                       (when (> candidate catalog-objects/max-oid)
+                         (throw (ex-info "PostgreSQL OID space is exhausted"
+                                         {:error :program-limit-exceeded
+                                          :sqlstate "54000"})))
+                       (if (contains? @used-numeric candidate)
+                         (do (swap! cursor inc) (recur @cursor))
+                         (do (swap! cursor inc)
+                             (swap! used-numeric conj candidate)
+                             candidate))))
+        planned (atom [])
+        repair-data (atom [])
+        repaired-existing
+        (mapv
+         (fn [object]
+           (let [oid (:datahike.pg.object/oid object)
+                 kind (:datahike.pg.object/kind object)]
+             (if (or (= :namespace kind)
+                     (catalog-objects/valid-user-oid? oid))
+               object
+               (let [new-oid (next-free!)
+                     eid (:db/id object)
+                     class-oid (:datahike.pg.object/class-oid object)]
+                 (swap! addresses disj [class-oid oid])
+                 (swap! addresses conj [class-oid new-oid])
+                 (swap! repair-data into
+                        [[:db/retract eid :datahike.pg.object/address-key
+                          (:datahike.pg.object/address-key object)]
+                         [:db/add eid :datahike.pg.object/address-key
+                          (catalog-objects/address-key class-oid new-oid)]
+                         [:db/add eid :datahike.pg.object/oid new-oid]
+                         [:db/add eid :datahike.pg.object/legacy-oid? true]])
+                 (when (#{:enum :composite-type} kind)
+                   (let [legacy-attr (if (= :enum kind)
+                                       :datahike.pg.enum/name
+                                       :datahike.pg.composite/name)
+                         oid-attr (if (= :enum kind)
+                                    :datahike.pg.enum/oid
+                                    :datahike.pg.composite/oid)
+                         legacy-eid (ffirst
+                                     (d/q {:find '[?entity]
+                                           :in '[$ ?name]
+                                           :where [['?entity legacy-attr '?name]]}
+                                          db (:datahike.pg.object/name object)))]
+                     (when legacy-eid
+                       (swap! repair-data conj
+                              [:db/add legacy-eid oid-attr new-oid]))))
+                 (assoc object
+                        :datahike.pg.object/oid new-oid
+                        :datahike.pg.object/address-key
+                        (catalog-objects/address-key class-oid new-oid))))))
+         existing)
+        relation-oid-remap
+        (into {}
+              (keep (fn [[before after]]
+                      (let [old-oid (:datahike.pg.object/oid before)
+                            new-oid (:datahike.pg.object/oid after)]
+                        (when (and (= catalog-objects/pg-class-oid
+                                      (:datahike.pg.object/class-oid before))
+                                   (not= old-oid new-oid))
+                          [old-oid new-oid]))))
+              (map vector existing repaired-existing))
+        column-repair-data
+        (mapcat
+         (fn [[column-eid address]]
+           (let [column-entity (d/entity db column-eid)
+                 name-key (:datahike.pg.column/name-key column-entity)
+                 inherited-from
+                 (:datahike.pg.column/inherited-from-address column-entity)
+                 [_ relation-oid attnum] (edn/read-string address)
+                 new-relation-oid (get relation-oid-remap relation-oid)
+                 inherited-address (when inherited-from
+                                     (edn/read-string inherited-from))
+                 [_ inherited-relation-oid inherited-attnum] inherited-address
+                 new-inherited-relation-oid
+                 (get relation-oid-remap inherited-relation-oid)]
+             (concat
+              (when new-relation-oid
+                (cond->
+                 [[:db/retract column-eid :datahike.pg.column/address-key address]
+                  [:db/add column-eid :datahike.pg.column/address-key
+                   (catalog-objects/column-address-key new-relation-oid attnum)]]
+                  name-key
+                  (conj
+                   [:db/retract column-eid :datahike.pg.column/name-key name-key]
+                   [:db/add column-eid :datahike.pg.column/name-key
+                    (catalog-objects/column-name-key
+                     new-relation-oid
+                     (:datahike.pg.column/name (d/entity db column-eid)))])))
+              (when new-inherited-relation-oid
+                [[:db/retract column-eid
+                  :datahike.pg.column/inherited-from-address inherited-from]
+                 [:db/add column-eid
+                  :datahike.pg.column/inherited-from-address
+                  (catalog-objects/column-address-key
+                   new-inherited-relation-oid inherited-attnum)]]))))
+         (d/q '{:find [?column ?address]
+                :where [[?column :datahike.pg.column/address-key ?address]]}
+              db))
+        marker-repair-data
+        (mapcat
+         (fn [[before after]]
+           (let [old-oid (:datahike.pg.object/oid before)
+                 new-oid (:datahike.pg.object/oid after)
+                 table-name (:datahike.pg.object/name before)]
+             (when (and (= :table (:datahike.pg.object/kind before))
+                        (not= old-oid new-oid))
+               (when-let [marker-eid
+                          (ffirst
+                           (d/q '{:find [?marker]
+                                  :in [$ ?ident ?oid]
+                                  :where [[?marker :db/ident ?ident]
+                                          [?marker :pg/table-oid ?oid]]}
+                                db (pgs/row-marker-attr table-name) old-oid))]
+                 [[:db/add marker-eid :pg/table-oid new-oid]]))))
+         (map vector existing repaired-existing))
+        repair-data (into (vec @repair-data)
+                          (concat column-repair-data marker-repair-data))]
+    (if (seq repair-data)
+      ;; txdb may contain transient indexes. Apply address repairs as the
+      ;; next in-transaction stage, then plan against that resolved state;
+      ;; nested db-with would require a persistent snapshot and is unsafe.
+      {:repair-tx repair-data :expected-next initial-next :next-oid @cursor}
+      (let [repaired-db db
+            add! (fn [class-oid kind name preferred-oid]
+                   (when-not (contains? @identities [class-oid name])
+                     (let [preferred (when preferred-oid (long preferred-oid))
+                           oid (if (and preferred
+                                        (catalog-objects/valid-user-oid? preferred)
+                                        (not (contains? @addresses [class-oid preferred])))
+                                 preferred (next-free!))]
+                       (swap! identities conj [class-oid name])
+                       (swap! addresses conj [class-oid oid])
+                       (swap! used-numeric conj oid)
+                       (swap! planned conj
+                              {:class-oid class-oid :oid oid :kind kind :name name
+                               :namespace-oid catalog-objects/public-namespace-oid
+                               :legacy-oid? (boolean preferred-oid)}))))
+            table-names (map :datahike.pg.object/name
+                             (catalog-objects/objects-by-kind db :table))
+            composites (pgs/composite-types db)
+            domains (when (get (dbi/-schema db) :datahike.pg.domain/name)
+                      (sort (map first
+                                 (d/q '{:find [?name]
+                                        :where [[?e :datahike.pg.domain/name ?name]]}
+                                      db))))
+            sequences (when (get (dbi/-schema db) :__seq__/name)
+                        (sort (map first
+                                   (d/q '{:find [?name]
+                                          :where [[?e :__seq__/name ?name]]}
+                                        db))))
+            views (when (get (dbi/-schema db) :datahike.pg/view-name)
+                    (sort (map first
+                               (d/q '{:find [?name]
+                                      :where [[?e :datahike.pg/view-name ?name]]}
+                                    db))))
+            indexes (sort (map (comp name first)
+                               (d/q '{:find [?ident]
+                                      :where [[?e :datahike.pg.index/table _]
+                                              [?e :db/ident ?ident]]}
+                                    db)))]
+        (doseq [name (sort table-names)]
+          (add! catalog-objects/pg-type-oid :row-type name nil))
+        (doseq [{:keys [name]} (sort-by :name composites)]
+          (add! catalog-objects/pg-class-oid :composite-relation name nil))
+        (doseq [name domains]
+          (add! catalog-objects/pg-type-oid :domain name nil))
+        (doseq [name sequences]
+          (add! catalog-objects/pg-class-oid :sequence name
+                (Math/abs (.hashCode ^String name))))
+        (doseq [name views]
+          (add! catalog-objects/pg-class-oid :view name
+                (Math/abs (.hashCode ^String name)))
+          (add! catalog-objects/pg-type-oid :row-type name nil))
+        (doseq [name indexes]
+          (add! catalog-objects/pg-class-oid :index name
+                (Math/abs (.hashCode ^String name))))
+        (let [all-objects (into repaired-existing @planned)
+              planned-type-oids
+              (into {}
+                    (map (fn [object]
+                           [(or (:datahike.pg.object/name object) (:name object))
+                            (or (:datahike.pg.object/oid object) (:oid object))]))
+                    (filter #(= catalog-objects/pg-type-oid
+                                (or (:datahike.pg.object/class-oid %) (:class-oid %)))
+                            all-objects))
+              table-objects
+              (mapv (fn [object]
+                      {:name (:datahike.pg.object/name object)
+                       :oid (:datahike.pg.object/oid object)})
+                    (filter #(= :table (:datahike.pg.object/kind %)) repaired-existing))
+              table-columns
+              (mapcat #(reconcile-catalog-columns-tx repaired-db %)
+                      (catalog-column-specs repaired-db table-objects planned-type-oids))
+              object-data
+              (into []
+                    (mapcat
+                     (fn [{:keys [kind name] :as object}]
+                       (let [legacy-eid (when (= :index kind)
+                                          (:db/id (d/entity db
+                                                            (keyword "datahike.pg.index" name))))]
+                         (cond->> (catalog-objects/create-object-tx db object)
+                           legacy-eid (map #(assoc % :db/id legacy-eid))))))
+                    @planned)
+              planned-by-kind-name (into {} (map (juxt (juxt :kind :name) identity)) @planned)
+              composite-columns
+              (mapcat
+               (fn [{:keys [name fields]}]
+                 (when-let [relation (get planned-by-kind-name [:composite-relation name])]
+                   (catalog-objects/create-columns-tx
+                    (:oid relation)
+                    (map-indexed
+                     (fn [idx field]
+                       {:attnum (inc idx) :name (:field-name field)
+                        :type-oid (pgs/resolve-type-oid
+                                   db (:pg-type field) planned-type-oids)
+                        :storage-ident
+                        (keyword (str "__composite__" name) (:field-name field))})
+                     fields))))
+               composites)
+              view-columns
+              (mapcat
+               (fn [name]
+                 (when-let [relation (get planned-by-kind-name [:view name])]
+                   (let [columns-str (ffirst
+                                      (d/q '{:find [?columns]
+                                             :in [$ ?name]
+                                             :where [[?e :datahike.pg/view-name ?name]
+                                                     [?e :datahike.pg/view-columns ?columns]]}
+                                           db name))
+                         columns (when columns-str (edn/read-string columns-str))]
+                     (catalog-objects/create-columns-tx
+                      (:oid relation)
+                      (map-indexed
+                       (fn [idx column]
+                         {:attnum (inc idx) :name (:name column)
+                          :type-oid (:oid column) :typmod (:typmod column)
+                          :storage-ident (keyword (str "__view__" name) (:name column))})
+                       columns)))))
+               views)]
+          {:tx-data (into repair-data
+                          (concat object-data table-columns
+                                  composite-columns view-columns))
+           :expected-next initial-next
+           :next-oid @cursor})))))
+
+(declare prepare-object-catalog-tx migrate-legacy-indexes-tx)
+
+(defn- prepare-pg-schema-tx
   "Install pgwire-internal schema attributes that describe PG-side facts
    attached to Datahike schema entities.
 
@@ -3322,9 +3576,8 @@
    ordered-collection schema machinery. Persists with the user schema
    (file/kv backends keep constraints across restarts; :memory dies
    with the db — matches PG's catalog semantics)."
-  [conn]
-  (let [db (d/db conn)
-        schema (dbi/-schema db)
+  [db]
+  (let [schema (dbi/-schema db)
         long1 {:db/valueType :db.type/long :db/cardinality :db.cardinality/one}
         str1  {:db/valueType :db.type/string :db/cardinality :db.cardinality/one}
         bool1 {:db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
@@ -3369,154 +3622,387 @@
               ;; lightweight catalog identity so CREATE/DROP/recreate and
               ;; DROP TABLE have a coherent lifecycle.
               [:datahike.pg.index/table str1]
-              [:datahike.pg.index/method str1]]
+              [:datahike.pg.index/method str1]
+              [:datahike.pg.index/relation
+               {:db/valueType :db.type/ref
+                :db/cardinality :db.cardinality/one
+                :db/index true}]
+              [:datahike.pg.index/keys str1]
+              [:datahike.pg.index/unique? bool1]
+              [:datahike.pg.index/legacy-incomplete? bool1]]
         missing (into []
                       (keep (fn [[ident tmpl]]
                               (when-not (get schema ident)
                                 (assoc tmpl :db/ident ident))))
-                      spec)]
-    (when (seq missing)
-      (transact-recorded! conn missing))
-    ;; The object catalog has its own entities rather than annotating Datahike
-    ;; schema entities.  Install its attribute definitions before running the
-    ;; atomic migration below.
-    (let [schema (dbi/-schema (d/db conn))
-          missing-objects (remove (fn [{:keys [db/ident]}]
-                                    (get schema ident))
-                                  catalog-objects/schema)]
-      (when (seq missing-objects)
-        (transact-recorded! conn (vec missing-objects))))
-    (let [db (d/db conn)
-          catalog (catalog-objects/catalog-entity db)
-          version (:datahike.pg.catalog/version catalog)]
-      (if catalog
-        ;; Existing catalogs need no write on every handler creation (that
-        ;; would create false concurrent-transaction windows).  Their version
-        ;; is immutable outside a future explicit migrator, so a read gate is
-        ;; sufficient here.
-        (cond
-          (= catalog-objects/catalog-version version) nil
-          (and version (> (long version) catalog-objects/catalog-version))
-          (throw (ex-info "object catalog was written by a newer pg-datahike"
-                          {:error :catalog-version-too-new
-                           :supported catalog-objects/catalog-version
-                           :found version}))
-          :else
-          (throw (ex-info "unsupported partial or older object catalog"
-                          {:error :catalog-migration-required
-                           :supported catalog-objects/catalog-version
-                           :found version})))
-        (let [stored-enum-oids
-              (into #{}
-                    (map first)
-                    (d/q '{:find [?name]
-                           :where [[?enum :datahike.pg.enum/name ?name]
-                                   [?enum :datahike.pg.enum/oid ?oid]]}
-                         db))
-              table-specs
-              (mapv (fn [table]
-                      (let [stored (pgs/table-oid db table)
-                            oid (long (or stored
-                                          (Math/abs (.hashCode ^String table))))]
-                        {:class-oid catalog-objects/pg-class-oid
-                         :oid oid :kind :table :name table
-                         :namespace-tempid "catalog-namespace-public"
-                         :legacy-oid? (nil? stored)
+                      spec)
+        missing (into missing
+                      (remove #(get schema (:db/ident %)))
+                      (concat pgs/hint-schema catalog-objects/schema))
+        catalog-old? (not= catalog-objects/catalog-version
+                           (:datahike.pg.catalog/version
+                            (catalog-objects/catalog-entity db)))
+        migrate-indexes? (or catalog-old?
+                             (not (get schema :datahike.pg.index/legacy-incomplete?)))]
+    ;; Sequential transaction functions see the writer's actual in-flight db
+    ;; and resolved EIDs. The store predicate sees only the finished migration.
+    (cond-> missing
+      catalog-old? (conj [:db.fn/call prepare-object-catalog-tx])
+      migrate-indexes? (conj [:db.fn/call migrate-legacy-indexes-tx]))))
+
+(defn- prepare-object-catalog-tx [db]
+  (let [catalog (catalog-objects/catalog-entity db)
+        version (:datahike.pg.catalog/version catalog)]
+    (if catalog
+      (cond
+        (= catalog-objects/catalog-version version) []
+        (= 1 version)
+        (let [table-objects
+              (mapv (fn [object]
+                      {:name (:datahike.pg.object/name object)
+                       :oid (:datahike.pg.object/oid object)})
+                    (catalog-objects/objects-by-kind db :table))]
+          (conj (catalog-objects/v1-to-v2-tx
+                 (catalog-column-specs db table-objects))
+                [:db.fn/call prepare-object-catalog-tx]))
+        (= 2 version)
+        (let [{:keys [tx-data repair-tx expected-next next-oid]}
+              (catalog-v2-address-migration db)]
+          (if (seq repair-tx)
+            (into [[:db/cas (:db/id catalog) :datahike.pg.catalog/next-oid
+                    expected-next next-oid]]
+                  (concat repair-tx [[:db.fn/call prepare-object-catalog-tx]]))
+            (conj (catalog-objects/v2-to-v3-tx
+                   tx-data expected-next next-oid)
+                  [:db.fn/call prepare-object-catalog-tx])))
+        (and version (> (long version) catalog-objects/catalog-version))
+        (throw (ex-info "object catalog was written by a newer pg-datahike"
+                        {:error :catalog-version-too-new
+                         :supported catalog-objects/catalog-version
+                         :found version}))
+        :else
+        (throw (ex-info "unsupported partial or older object catalog"
+                        {:error :catalog-migration-required
+                         :supported catalog-objects/catalog-version
+                         :found version})))
+      (let [stored-enum-oids
+            (into #{}
+                  (map first)
+                  (d/q '{:find [?name]
+                         :where [[?enum :datahike.pg.enum/name ?name]
+                                 [?enum :datahike.pg.enum/oid ?oid]]}
+                       db))
+            table-specs
+            (mapv (fn [table]
+                    (let [stored (pgs/table-oid db table)
+                          oid (long (or stored
+                                        (Math/abs (.hashCode ^String table))))]
+                      {:class-oid catalog-objects/pg-class-oid
+                       :oid oid :kind :table :name table
+                       :namespace-tempid "catalog-namespace-public"
+                       :legacy-oid? (nil? stored)
                          ;; Datahike does not permit adding custom metadata to
                          ;; an already-installed schema entity.  Old tables
                          ;; therefore keep their historical hash OID in this
                          ;; registry; all readers prefer it over :pg/table-oid.
-                         :legacy-tx-data nil}))
-                    (sort (pgs/table-names (dbi/-schema db))))
-              enum-specs
-              (mapv (fn [{:keys [name oid]}]
-                      (let [stored? (contains? stored-enum-oids name)
-                            eid (ffirst
-                                 (d/q '{:find [?enum]
-                                        :in [$ ?name]
-                                        :where [[?enum :datahike.pg.enum/name ?name]]}
-                                      db name))]
-                        {:class-oid catalog-objects/pg-type-oid
-                         :oid (long oid) :kind :enum :name name
-                         :namespace-tempid "catalog-namespace-public"
-                         :legacy-oid? (not stored?)
-                         :legacy-tx-data
-                         (when-not stored?
-                           [[:db/add eid :datahike.pg.enum/oid (long oid)]])}))
-                    (pgs/enum-types db))
-              composite-specs
-              (mapv (fn [{:keys [name oid]}]
+                       :legacy-tx-data nil}))
+                  (sort (pgs/table-names (dbi/-schema db))))
+            enum-specs
+            (mapv (fn [{:keys [name oid]}]
+                    (let [stored? (contains? stored-enum-oids name)
+                          eid (ffirst
+                               (d/q '{:find [?enum]
+                                      :in [$ ?name]
+                                      :where [[?enum :datahike.pg.enum/name ?name]]}
+                                    db name))]
                       {:class-oid catalog-objects/pg-type-oid
-                       :oid (long oid) :kind :composite-type :name name
-                       :namespace-tempid "catalog-namespace-public"})
-                    (sort-by :name (pgs/composite-types db)))
-              raw-specs (vec (concat table-specs enum-specs composite-specs))
+                       :oid (long oid) :kind :enum :name name
+                       :namespace-tempid "catalog-namespace-public"
+                       :legacy-oid? (not stored?)
+                       :legacy-tx-data
+                       (when-not stored?
+                         [[:db/add eid :datahike.pg.enum/oid (long oid)]])}))
+                  (pgs/enum-types db))
+            composite-specs
+            (mapv (fn [{:keys [name oid]}]
+                    {:class-oid catalog-objects/pg-type-oid
+                     :oid (long oid) :kind :composite-type :name name
+                     :namespace-tempid "catalog-namespace-public"})
+                  (sort-by :name (pgs/composite-types db)))
+            domain-names
+            (when (get (dbi/-schema db) :datahike.pg.domain/name)
+              (sort (map first
+                         (d/q '{:find [?name]
+                                :where [[?e :datahike.pg.domain/name ?name]]}
+                              db))))
+            sequence-names
+            (when (get (dbi/-schema db) :__seq__/name)
+              (sort (map first
+                         (d/q '{:find [?name]
+                                :where [[?e :__seq__/name ?name]]}
+                              db))))
+            view-names
+            (when (get (dbi/-schema db) :datahike.pg/view-name)
+              (sort (map first
+                         (d/q '{:find [?name]
+                                :where [[?e :datahike.pg/view-name ?name]]}
+                              db))))
+            index-names
+            (sort (map (comp name first)
+                       (d/q '{:find [?ident]
+                              :where [[?e :datahike.pg.index/table _]
+                                      [?e :db/ident ?ident]]}
+                            db)))
+            relation-specs
+            (concat
+             (map (fn [name]
+                    {:class-oid catalog-objects/pg-class-oid
+                     :oid (long (Math/abs (.hashCode ^String name)))
+                     :kind :sequence :name name
+                     :namespace-tempid "catalog-namespace-public"
+                     :legacy-oid? true})
+                  sequence-names)
+             (map (fn [name]
+                    {:class-oid catalog-objects/pg-class-oid
+                     :oid (long (Math/abs (.hashCode ^String name)))
+                     :kind :view :name name
+                     :namespace-tempid "catalog-namespace-public"
+                     :legacy-oid? true})
+                  view-names)
+             (map (fn [name]
+                    {:class-oid catalog-objects/pg-class-oid
+                     :oid (long (Math/abs (.hashCode ^String name)))
+                     :kind :index :name name
+                     :namespace-tempid "catalog-namespace-public"
+                     :legacy-oid? true})
+                  index-names)
+             (map (fn [{:keys [name]}]
+                    {:class-oid catalog-objects/pg-class-oid
+                     :needs-oid? true :kind :composite-relation :name name
+                     :namespace-tempid "catalog-namespace-public"})
+                  composite-specs))
+            generated-type-specs
+            (concat
+             (map (fn [{:keys [name]}]
+                    {:class-oid catalog-objects/pg-type-oid
+                     :needs-oid? true :kind :row-type :name name
+                     :namespace-tempid "catalog-namespace-public"})
+                  table-specs)
+             (map (fn [name]
+                    {:class-oid catalog-objects/pg-type-oid
+                     :needs-oid? true :kind :row-type :name name
+                     :namespace-tempid "catalog-namespace-public"})
+                  view-names)
+             (map (fn [name]
+                    {:class-oid catalog-objects/pg-type-oid
+                     :needs-oid? true :kind :domain :name name
+                     :namespace-tempid "catalog-namespace-public"})
+                  domain-names))
+            raw-specs (vec (concat table-specs enum-specs composite-specs
+                                   relation-specs generated-type-specs))
               ;; Hash fallbacks from old databases can collide within one
               ;; catalog class.  Preserve the first deterministic identity;
               ;; later collisions receive a real sequential OID and have
               ;; their legacy registry updated in the same migration tx.
-              explicit-oids (keep (fn [{:keys [oid legacy-oid?]}]
-                                    (when (and (not legacy-oid?)
-                                               (<= catalog-objects/first-user-oid oid)
-                                               (< oid 1000000000))
-                                      oid))
-                                  raw-specs)
-              initial-cursor (max catalog-objects/first-user-oid
-                                  (inc (reduce max
-                                               (dec catalog-objects/first-user-oid)
-                                               explicit-oids)))
-              used-numeric (atom (set (map :oid raw-specs)))
-              cursor (atom initial-cursor)
-              next-free! (fn []
-                           (loop [candidate @cursor]
-                             (if (contains? @used-numeric candidate)
-                               (do (swap! cursor inc) (recur @cursor))
-                               (do (swap! used-numeric conj candidate)
-                                   (reset! cursor (inc candidate))
-                                   candidate))))
-              seen-addresses (atom #{})
-              specs
-              (mapv
-               (fn [idx spec]
-                 (let [address [(:class-oid spec) (:oid spec)]
-                       collision? (contains? @seen-addresses address)
-                       oid (if collision? (next-free!) (:oid spec))
-                       legacy-tx
-                       (if-not collision?
-                         (:legacy-tx-data spec)
-                         (case (:kind spec)
-                           :table nil
-                           :enum (let [eid (ffirst
-                                            (d/q '{:find [?enum]
-                                                   :in [$ ?name]
-                                                   :where [[?enum :datahike.pg.enum/name ?name]]}
-                                                 db (:name spec)))]
-                                   [[:db/add eid :datahike.pg.enum/oid oid]])
-                           :composite-type
-                           (let [eid (ffirst
-                                      (d/q '{:find [?type]
-                                             :in [$ ?name]
-                                             :where [[?type :datahike.pg.composite/name ?name]]}
-                                           db (:name spec)))]
-                             [[:db/add eid :datahike.pg.composite/oid oid]])))]
-                   (swap! seen-addresses conj [(:class-oid spec) oid])
-                   (assoc spec :tempid (str "catalog-object-" idx)
-                          :oid oid :legacy-oid? (or collision?
-                                                    (:legacy-oid? spec))
-                          :legacy-tx-data legacy-tx)))
-               (range)
-               (sort-by (juxt :class-oid :name :kind) raw-specs))
-              next-oid (loop [candidate @cursor]
-                         (if (contains? @used-numeric candidate)
-                           (recur (inc candidate))
-                           candidate))]
-          (transact-recorded!
-           conn (catalog-objects/initialization-tx specs next-oid)))))
-    ;; User-facing hint attrs (:datahike.pg/*) installed via schema.clj's
-    ;; own helper — keeps the hint schema definition colocated with its
-    ;; consumers and lets bare-conn callers (no server) prime it by
-    ;; calling pgs/ensure-hint-schema! directly.
-    (pgs/ensure-hint-schema! conn)))
+            explicit-oids (keep (fn [{:keys [oid legacy-oid?]}]
+                                  (when (and (some? oid)
+                                             (not legacy-oid?)
+                                             (catalog-objects/valid-user-oid? oid))
+                                    oid))
+                                raw-specs)
+            initial-cursor (max catalog-objects/first-user-oid
+                                (inc (reduce max
+                                             (dec catalog-objects/first-user-oid)
+                                             explicit-oids)))
+            used-numeric (atom (set (filter catalog-objects/valid-user-oid?
+                                            (keep :oid raw-specs))))
+            cursor (atom initial-cursor)
+            next-free! (fn []
+                         (loop [candidate @cursor]
+                           (if (contains? @used-numeric candidate)
+                             (do (swap! cursor inc) (recur @cursor))
+                             (do (swap! used-numeric conj candidate)
+                                 (reset! cursor (inc candidate))
+                                 candidate))))
+            seen-addresses (atom #{})
+            specs
+            (mapv
+             (fn [idx spec]
+               (let [address [(:class-oid spec) (:oid spec)]
+                     collision? (and (not (:needs-oid? spec))
+                                     (contains? @seen-addresses address))
+                     invalid? (and (not (:needs-oid? spec))
+                                   (not (catalog-objects/valid-user-oid?
+                                         (:oid spec))))
+                     reassigned? (or (:needs-oid? spec) collision? invalid?)
+                     oid (if reassigned?
+                           (next-free!) (:oid spec))
+                     legacy-tx
+                     (if-not (or collision? invalid?)
+                       (:legacy-tx-data spec)
+                       (case (:kind spec)
+                         :table nil
+                         :enum (let [eid (ffirst
+                                          (d/q '{:find [?enum]
+                                                 :in [$ ?name]
+                                                 :where [[?enum :datahike.pg.enum/name ?name]]}
+                                               db (:name spec)))]
+                                 [[:db/add eid :datahike.pg.enum/oid oid]])
+                         :composite-type
+                         (let [eid (ffirst
+                                    (d/q '{:find [?type]
+                                           :in [$ ?name]
+                                           :where [[?type :datahike.pg.composite/name ?name]]}
+                                         db (:name spec)))]
+                           [[:db/add eid :datahike.pg.composite/oid oid]])
+                         nil))]
+                 (swap! seen-addresses conj [(:class-oid spec) oid])
+                 (assoc spec :tempid (or (when (= :index (:kind spec))
+                                           (:db/id (d/entity db
+                                                             (keyword "datahike.pg.index"
+                                                                      (:name spec)))))
+                                         (str "catalog-object-" idx))
+                        :oid oid :legacy-oid? (or collision? invalid?
+                                                  (:legacy-oid? spec))
+                        :legacy-tx-data legacy-tx)))
+             (range)
+             (sort-by (juxt :class-oid :name :kind) raw-specs))
+            next-oid (loop [candidate @cursor]
+                       (if (contains? @used-numeric candidate)
+                         (recur (inc candidate))
+                         candidate))
+            table-objects (mapv #(select-keys % [:name :oid])
+                                (filter #(= :table (:kind %)) specs))
+            planned-type-oids
+            (into {}
+                  (map (juxt :name :oid))
+                  (filter #(= catalog-objects/pg-type-oid (:class-oid %))
+                          specs))
+            composite-column-specs
+            (mapv
+             (fn [{:keys [name fields]}]
+               (let [relation (some #(when (and (= :composite-relation (:kind %))
+                                                (= name (:name %))) %)
+                                    specs)]
+                 {:relation-oid (:oid relation)
+                  :columns
+                  (mapv (fn [idx field]
+                          {:attnum (inc idx) :name (:field-name field)
+                           :type-oid (pgs/resolve-type-oid
+                                      db (:pg-type field) planned-type-oids)
+                           :storage-ident
+                           (keyword (str "__composite__" name)
+                                    (:field-name field))})
+                        (range) fields)}))
+             (pgs/composite-types db))
+            view-column-specs
+            (mapv
+             (fn [name]
+               (let [relation (some #(when (and (= :view (:kind %))
+                                                (= name (:name %))) %)
+                                    specs)
+                     columns-str (ffirst
+                                  (d/q '{:find [?columns]
+                                         :in [$ ?name]
+                                         :where [[?e :datahike.pg/view-name ?name]
+                                                 [?e :datahike.pg/view-columns ?columns]]}
+                                       db name))
+                     columns (when columns-str (edn/read-string columns-str))]
+                 {:relation-oid (:oid relation)
+                  :columns
+                  (mapv (fn [idx column]
+                          {:attnum (inc idx) :name (:name column)
+                           :type-oid (:oid column) :typmod (:typmod column)
+                           :storage-ident
+                           (keyword (str "__view__" name) (:name column))})
+                        (range) columns)}))
+             view-names)
+            column-specs (into (catalog-column-specs
+                                db table-objects planned-type-oids)
+                               (concat composite-column-specs
+                                       view-column-specs))]
+        (catalog-objects/initialization-tx
+         specs column-specs next-oid)))))
+
+(defn- recovered-legacy-index-keys [db payload relation]
+  (let [entry (get (dbi/-schema db) (:db/ident payload))
+        attrs (or (:db.secondary/attrs payload) (:db.secondary/attrs entry))
+        config (or (:db.secondary/config payload) (:db.secondary/config entry))
+        columns (into {}
+                      (map (juxt :datahike.pg.column/storage-ident identity))
+                      (catalog-objects/columns-by-relation
+                       db (:datahike.pg.object/oid relation) true))]
+    ;; Ordinary released compatibility declarations did not store their keys.
+    ;; Native secondary declarations did; preserve their order only when every
+    ;; stored attribute still identifies a live column of the declared table.
+    (when (and (sequential? attrs) (seq attrs)
+               (every? keyword? attrs) (every? columns attrs)
+               (or (nil? (:pg/table config))
+                   (= (:pg/table config) (:datahike.pg.index/table payload)))
+               (or (nil? (:pg/method config))
+                   (= (:pg/method config) (:datahike.pg.index/method payload))))
+      (mapv (fn [attr]
+              (let [column (columns attr)]
+                {:name (:datahike.pg.column/name column)
+                 :attnum (:datahike.pg.column/attnum column)
+                 :storage-ident attr}))
+            attrs))))
+
+(defn- migrate-legacy-indexes-tx [db]
+  (into []
+        (mapcat
+         (fn [[eid table method ident]]
+           (let [payload (d/pull db '[*] eid)]
+             ;; Only the exact released payload-only shape is migratable.
+             ;; Partial modern/unique descriptors must remain corruption, not
+             ;; silently turn into an unenforced legacy declaration.
+             (when (and (nil? (:datahike.pg.index/keys payload))
+                        (nil? (:datahike.pg.index/unique? payload))
+                        (nil? (:datahike.pg.index/relation payload))
+                        (nil? (:datahike.pg.index/legacy-incomplete? payload)))
+               (let [name (name ident)
+                     object (catalog-objects/object-by-identity
+                             db catalog-objects/pg-class-oid
+                             catalog-objects/public-namespace-oid name)
+                     relation (catalog-objects/object-by-identity
+                               db catalog-objects/pg-class-oid
+                               catalog-objects/public-namespace-oid table)]
+                 (when-not (and (= "datahike.pg.index" (namespace ident))
+                                (= :index (:datahike.pg.object/kind object))
+                                (= :table (:datahike.pg.object/kind relation)))
+                   (throw (ex-info "legacy index has no coherent table/catalog identity"
+                                   {:error :invalid-catalog-state :sqlstate "XX000"
+                                    :index name :table table})))
+                 (let [keys (recovered-legacy-index-keys db payload relation)
+                       separate? (not= eid (:db/id object))
+                       namespace (:datahike.pg.object/namespace object)]
+                   (concat
+                    ;; Old intermediate catalog migrations may have made a
+                    ;; second object row. Retain the original declaration EID
+                    ;; and ident, moving its unique address only after retract.
+                    (when separate?
+                      [[:db/retractEntity (:db/id object)]
+                       (assoc (dissoc object :db/id)
+                              :db/id eid
+                              :datahike.pg.object/namespace
+                              (if (map? namespace) (:db/id namespace) namespace))])
+                    [{:db/id eid
+                      :datahike.pg.index/table table
+                      :datahike.pg.index/method method
+                      :datahike.pg.index/relation (:db/id relation)
+                      :datahike.pg.index/keys (pr-str (or keys []))
+                      :datahike.pg.index/unique? false
+                      :datahike.pg.index/legacy-incomplete? (nil? keys)}])))))))
+        (d/q '{:find [?index ?table ?method ?ident]
+               :where [[?index :datahike.pg.index/table ?table]
+                       [?index :datahike.pg.index/method ?method]
+                       [?index :db/ident ?ident]]}
+             db)))
+
+(defn- ensure-pg-schema!
+  "Publish schema installation and all legacy catalog migration atomically."
+  [conn]
+  (when (seq (prepare-pg-schema-tx (d/db conn)))
+    (transact-recorded! conn [[:db.fn/call prepare-pg-schema-tx]])))
 
 (defn- table-exists?
   "True when the given table name is already known to `db` — detected
@@ -3554,31 +4040,36 @@
    DML data that would be lost if we committed directly.
    Filters out schema attributes that already exist — ALTER TABLE ADD
    COLUMN and CREATE TABLE IF NOT EXISTS both rely on this."
-  [tx-state tx-data command-tag]
-  (try
-    (let [spec-db (:speculative-db @tx-state)
-          schema (:schema spec-db)
+  ([tx-state tx-data command-tag]
+   (execute-ddl-in-tx tx-state tx-data command-tag nil))
+  ([tx-state tx-data command-tag tx-options]
+   (try
+     (let [spec-db (:speculative-db @tx-state)
+           schema (:schema spec-db)
           ;; Filter out full attribute DECLARATIONS that already exist
           ;; (CREATE TABLE on an existing table should be idempotent).
           ;; Schema UPDATES — {:db/ident X :db/unique …} / :db/index from
           ;; ALTER TABLE ADD PRIMARY KEY/UNIQUE — carry no :db/valueType
           ;; and must pass through; the old ident-only filter silently
           ;; swallowed them (statement reported success, nothing applied).
-          new-tx-data (vec (remove (fn [datum]
-                                     (and (map? datum)
-                                          (:db/ident datum)
-                                          (:db/valueType datum)
-                                          (get schema (:db/ident datum))))
-                                   tx-data))]
-      (when (seq new-tx-data)
-        (let [spec-report (dc/with spec-db new-tx-data)]
-          (swap! tx-state (fn [st]
-                            (-> st
-                                (assoc :speculative-db (:db-after spec-report))
-                                (update :tx-buffer into new-tx-data)))))))
-    (empty-result command-tag)
-    (catch Exception e
-      (classified-error (str command-tag " error: ") e))))
+           new-tx-data (vec (remove (fn [datum]
+                                      (and (map? datum)
+                                           (:db/ident datum)
+                                           (:db/valueType datum)
+                                           (get schema (:db/ident datum))))
+                                    tx-data))]
+       (when (seq new-tx-data)
+         (let [spec-report (dc/with spec-db new-tx-data nil tx-options)]
+           (unique-constraints/validate-report! spec-report)
+           (swap! tx-state (fn [st]
+                             (-> st
+                                 (assoc :speculative-db (:db-after spec-report))
+                                 (update :tx-buffer into new-tx-data)
+                                 (update :tx-options merge tx-options)))))))
+     (empty-result command-tag)
+     (catch Exception e
+       (swap! tx-state assoc :aborted? true)
+       (classified-error (str command-tag " error: ") e)))))
 
 (defn- catalog-cas-failure? [^Throwable error]
   (loop [cause error]
@@ -3637,18 +4128,76 @@
 
 (defn- table-create-tx-data [db parsed]
   (let [table-name (:table-name parsed)
-        {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+        {:keys [oids tx-data]} (catalog-objects/reserve-user-oids-tx db 2)
+        [oid row-type-oid] oids
         marker (pgs/row-marker-attr table-name)
         ddl-data (mapv (fn [datum]
                          (if (and (map? datum) (= marker (:db/ident datum)))
                            (assoc datum :pg/table-oid oid)
                            datum))
                        (ddl-tx-data parsed))
+        ddl-by-ident (into {}
+                           (keep (fn [datum]
+                                   (when (and (map? datum) (:db/ident datum))
+                                     [(:db/ident datum) datum])))
+                           ddl-data)
         object-data (catalog-objects/create-object-tx
                      db {:class-oid catalog-objects/pg-class-oid
                          :oid oid :kind :table :name table-name
-                         :namespace-oid catalog-objects/public-namespace-oid})]
-    (into (vec tx-data) (concat ddl-data object-data))))
+                         :namespace-oid catalog-objects/public-namespace-oid})
+        row-type-data (catalog-objects/create-object-tx
+                       db {:class-oid catalog-objects/pg-type-oid
+                           :oid row-type-oid :kind :row-type :name table-name
+                           :namespace-oid catalog-objects/public-namespace-oid})
+        local-names (vec (:column-order parsed))
+        local-name-set (set local-names)
+        parent (when-let [parent-name (:inherits parsed)]
+                 (catalog-objects/object-by-identity
+                  db catalog-objects/pg-class-oid
+                  catalog-objects/public-namespace-oid parent-name))
+        parent-columns
+        (when (= :table (:datahike.pg.object/kind parent))
+          (catalog-objects/columns-by-relation
+           db (:datahike.pg.object/oid parent) true))
+        inherited-specs
+        (mapv (fn [column]
+                (let [name (:datahike.pg.column/name column)]
+                  {:name name
+                   :storage-ident
+                   (if (contains? local-name-set name)
+                     (keyword table-name name)
+                     (:datahike.pg.column/storage-ident column))
+                   :local? (contains? local-name-set name)
+                   :inherit-count 1
+                   :type-oid
+                   (if (contains? local-name-set name)
+                     (or (get-in parsed [:column-type-oids name])
+                         (some->> (get-in parsed [:column-types name])
+                                  (pgs/resolve-type-oid db)))
+                     (:datahike.pg.column/type-oid column))
+                   :typmod
+                   (if (contains? local-name-set name)
+                     (:pg/typmod (get ddl-by-ident (keyword table-name name)))
+                     (:datahike.pg.column/typmod column))
+                   :inherited-from-address
+                   (:datahike.pg.column/address-key column)}))
+              parent-columns)
+        inherited-names (into #{} (map :name) inherited-specs)
+        effective-columns
+        (into inherited-specs
+              (map (fn [name]
+                     (let [ident (keyword table-name name)]
+                       {:name name :storage-ident ident
+                        :type-oid (or (get-in parsed [:column-type-oids name])
+                                      (some->> (get-in parsed [:column-types name])
+                                               (pgs/resolve-type-oid db)))
+                        :typmod (:pg/typmod (get ddl-by-ident ident))})))
+              (remove inherited-names local-names))
+        column-data
+        (catalog-objects/create-columns-tx
+         oid (map-indexed #(assoc %2 :attnum (inc %1)) effective-columns))]
+    (into (vec tx-data)
+          (concat ddl-data object-data row-type-data column-data))))
 
 (defn- execute-ddl-create [conn parsed tx-state session-id]
   (let [table-name (:table-name parsed)
@@ -3657,14 +4206,24 @@
     (loop [attempt 0]
       (let [current-db (if (:in-tx? @tx-state)
                          (:speculative-db @tx-state)
-                         (d/db conn))]
+                         (d/db conn))
+            existing-relation
+            (catalog-objects/object-by-identity
+             current-db catalog-objects/pg-class-oid
+             catalog-objects/public-namespace-oid table-name)
+            existing-type
+            (catalog-objects/object-by-identity
+             current-db catalog-objects/pg-type-oid
+             catalog-objects/public-namespace-oid table-name)
+            name-conflict? (or existing-relation existing-type
+                               (table-exists? current-db table-name))]
         (cond
       ;; CREATE TABLE on an existing table. PG raises 42P07
       ;; duplicate_table; IF NOT EXISTS downgrades it to a notice +
       ;; success. Before this check, collisions were silently
       ;; idempotent, which masked Hibernate/Flyway schema-drift bugs
       ;; (postgres.c: commands/tablecmds.c heap_create_with_catalog).
-          (and table-name (table-exists? current-db table-name) (not if-not-exists?))
+          (and table-name name-conflict? (not if-not-exists?))
           (classified-error ""
                             (ex-info (str "relation \"" table-name "\" already exists")
                                      {:sqlstate "42P07"
@@ -3678,7 +4237,7 @@
       ;; Datahike's schema-update guard ("Update not supported … :pg/type
       ;; [nil int4]"), because the guard compares against the schema view,
       ;; which doesn't surface custom :pg/* attrs.
-          (and table-name (table-exists? current-db table-name) if-not-exists?)
+          (and table-name name-conflict? if-not-exists?)
           (empty-result "CREATE TABLE")
 
           (:in-tx? @tx-state)
@@ -3700,17 +4259,123 @@
               (recur (inc attempt))
               :else (classified-error "CREATE TABLE error: " outcome))))))))
 
-(defn- execute-ddl-create-view [conn parsed tx-state]
-  (cond
-    (:noop? parsed) (empty-result "CREATE VIEW")
-    (:in-tx? @tx-state)
-    (execute-ddl-in-tx tx-state (:tx-data parsed) "CREATE VIEW")
-    :else
-    (try
-      (transact-recorded! conn (:tx-data parsed))
+(defn- execute-ddl-create-view [ctx parsed]
+  (let [{:keys [conn tx-state session-id]} ctx
+        view-name (:view-name parsed)]
+    (if (:noop? parsed)
       (empty-result "CREATE VIEW")
-      (catch Exception e
-        (classified-error "CREATE VIEW error: " e)))))
+      (do
+        (acquire-catalog-allocation-lock! conn tx-state session-id)
+        (loop [attempt 0]
+          (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+                relation (catalog-objects/object-by-identity
+                          db catalog-objects/pg-class-oid
+                          catalog-objects/public-namespace-oid view-name)
+                row-type (catalog-objects/object-by-identity
+                          db catalog-objects/pg-type-oid
+                          catalog-objects/public-namespace-oid view-name)
+                _ (when (and relation
+                             (not= :view (:datahike.pg.object/kind relation)))
+                    (throw
+                     (if (:replace? parsed)
+                       (ex-info (str "\"" view-name "\" is not a view")
+                                {:error :wrong-object-type :sqlstate "42809"})
+                       (ex-info (str "relation \"" view-name
+                                     "\" already exists")
+                                {:error :duplicate-table :sqlstate "42P07"}))))
+                replacing? (= :view (:datahike.pg.object/kind relation))
+                allocation (when-not replacing?
+                             (catalog-objects/reserve-user-oids-tx db 2))
+                [relation-oid row-type-oid]
+                (if replacing?
+                  [(:datahike.pg.object/oid relation)
+                   (:datahike.pg.object/oid row-type)]
+                  (:oids allocation))
+                existing-columns
+                (when replacing?
+                  (catalog-objects/columns-by-relation db relation-oid true))
+                new-columns (vec (:columns parsed))
+                _ (when (and replacing?
+                             (< (count new-columns) (count existing-columns)))
+                    (throw (errors/pg-error
+                            :invalid-table-definition
+                            {:message "cannot drop columns from view"})))
+                _ (when replacing?
+                    (doseq [[old-column new-column]
+                            (map vector existing-columns new-columns)]
+                      (let [old-name (:datahike.pg.column/name old-column)
+                            new-name (:name new-column)
+                            old-type (long (or (:datahike.pg.column/type-oid old-column)
+                                               types/oid-text))
+                            new-type (long (or (:oid new-column) types/oid-text))
+                            old-typmod (long (or (:datahike.pg.column/typmod old-column) -1))
+                            new-typmod (long (or (:typmod new-column) -1))]
+                        (when (not= old-name new-name)
+                          (throw (errors/pg-error
+                                  :invalid-table-definition
+                                  {:message
+                                   (str "cannot change name of view column \""
+                                        old-name "\" to \"" new-name "\"")})))
+                        (when (or (not= old-type new-type)
+                                  (not= old-typmod new-typmod))
+                          (throw (errors/pg-error
+                                  :invalid-table-definition
+                                  {:message
+                                   (str "cannot change data type of view column \""
+                                        old-name "\"")}))))))
+                added-columns (when replacing?
+                                (subvec new-columns (count existing-columns)))
+                added-start (when (seq added-columns)
+                              (catalog-objects/next-attnum db relation-oid))
+                create-data
+                (if replacing?
+                  (into (vec (:tx-data parsed))
+                        (concat
+                         (catalog-objects/bump-revision-tx
+                          db catalog-objects/pg-class-oid relation-oid)
+                         (catalog-objects/bump-revision-tx
+                          db catalog-objects/pg-type-oid row-type-oid)
+                         (when added-start
+                           (catalog-objects/create-columns-tx
+                            relation-oid
+                            (map-indexed
+                             (fn [idx column]
+                               {:attnum (+ added-start idx) :name (:name column)
+                                :type-oid (:oid column) :typmod (:typmod column)
+                                :storage-ident
+                                (keyword (str "__view__" view-name) (:name column))})
+                             added-columns)))))
+                  (into (vec (:tx-data allocation))
+                        (concat
+                         (:tx-data parsed)
+                         (catalog-objects/create-object-tx
+                          db {:class-oid catalog-objects/pg-class-oid
+                              :oid relation-oid :kind :view :name view-name
+                              :namespace-oid catalog-objects/public-namespace-oid})
+                         (catalog-objects/create-object-tx
+                          db {:class-oid catalog-objects/pg-type-oid
+                              :oid row-type-oid :kind :row-type :name view-name
+                              :namespace-oid catalog-objects/public-namespace-oid})
+                         (catalog-objects/create-columns-tx
+                          relation-oid
+                          (map-indexed
+                           (fn [idx column]
+                             {:attnum (inc idx) :name (:name column)
+                              :type-oid (:oid column) :typmod (:typmod column)
+                              :storage-ident
+                              (keyword (str "__view__" view-name) (:name column))})
+                           (:columns parsed))))))]
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state create-data "CREATE VIEW")
+              (let [outcome (try (transact-recorded! conn create-data)
+                                 :committed
+                                 (catch Exception e e))]
+                (cond
+                  (= :committed outcome) (empty-result "CREATE VIEW")
+                  (and (catalog-cas-failure? outcome)
+                       (< attempt catalog-allocation-max-retries))
+                  (recur (inc attempt))
+                  :else (classified-error "CREATE VIEW error: " outcome))))))))))
 
 (defn- execute-ddl-drop-view [conn parsed tx-state]
   (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
@@ -3718,7 +4383,30 @@
         eid (ffirst (d/q '{:find [?e]
                            :in [$ ?view-name]
                            :where [[?e :datahike.pg/view-name ?view-name]]}
-                         db view-name))]
+                         db view-name))
+        relation (catalog-objects/object-by-identity
+                  db catalog-objects/pg-class-oid
+                  catalog-objects/public-namespace-oid view-name)
+        row-type (catalog-objects/object-by-identity
+                  db catalog-objects/pg-type-oid
+                  catalog-objects/public-namespace-oid view-name)
+        _ (when (and relation
+                     (not= :view (:datahike.pg.object/kind relation)))
+            (throw (ex-info (str "\"" view-name "\" is not a view")
+                            {:error :wrong-object-type :sqlstate "42809"})))
+        tx-data (into (cond-> [] eid (conj [:db/retractEntity eid]))
+                      (concat
+                       (when (= :view (:datahike.pg.object/kind relation))
+                         (concat
+                          (catalog-objects/drop-relation-columns-tx
+                           db (:datahike.pg.object/oid relation))
+                          (catalog-objects/drop-object-tx
+                           db catalog-objects/pg-class-oid
+                           (:datahike.pg.object/oid relation))))
+                       (when (= :row-type (:datahike.pg.object/kind row-type))
+                         (catalog-objects/drop-object-tx
+                          db catalog-objects/pg-type-oid
+                          (:datahike.pg.object/oid row-type)))))]
     (cond
       (and (nil? eid) (:if-exists? parsed)) (empty-result "DROP VIEW")
       (nil? eid) (classified-error
@@ -3726,10 +4414,10 @@
                   (ex-info (str "view \"" view-name "\" does not exist")
                            {:error :undefined-table :table view-name :sqlstate "42P01"}))
       (:in-tx? @tx-state)
-      (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP VIEW")
+      (execute-ddl-in-tx tx-state tx-data "DROP VIEW")
       :else
       (try
-        (transact-recorded! conn [[:db/retractEntity eid]])
+        (transact-recorded! conn tx-data)
         (empty-result "DROP VIEW")
         (catch Exception e
           (classified-error "DROP VIEW error: " e))))))
@@ -4008,9 +4696,10 @@
 
    coerce-insert-value is idempotent on already-typed values (literals
    coerced at parse time stay put), so this is safe to apply to every
-   attribute. A parameter that resolved to SQL NULL drops out of the
-   entity map — matching translate-insert's own `keep` semantics, where a
-   nil column value means \"don't assert this attribute\" (EAV null).
+   attribute.
+
+   NULL keys stay present until row validation distinguishes explicit NULL
+   from omitted/defaulted columns and removes them before storage.
 
    Row maps handed to a `:db.fn/call` tx-fn as ARGUMENTS get the same
    treatment: translate-insert passes its payload that way (the ON
@@ -4027,13 +4716,10 @@
                  (cond
                    (= :db/id attr)   (assoc m attr v)
                    (not (keyword? attr)) (assoc m attr v)
-                   (nil? v)          m
-                   ;; Only a nil coercion means "SQL NULL → omit";
-                   ;; a coerced `false`/`0`/empty is a real value.
-                   ;; (if-let here would wrongly drop a boolean
-                   ;; false, reading back as NULL.)
+                   (nil? v)          (assoc m attr nil)
+                   ;; Preserve false and explicit NULL through row validation.
                    :else (let [c (#'sql/coerce-insert-value v attr schema db)]
-                           (if (nil? c) m (assoc m attr c)))))
+                           (assoc m attr c))))
                {} entry)
               entry))
           coerce-entry
@@ -4141,7 +4827,7 @@
   [col-name ^long oid ^String value]
   (PgWireServer$QueryResult.
    (into-array String [col-name])
-   (int-array [oid])
+   (int-array [(types/oid->wire-int oid)])
    (into-array (Class/forName "[Ljava.lang.String;")
                [(into-array String [value])])
    "SELECT 1"))
@@ -4244,7 +4930,7 @@
   [{:keys [names oids]}]
   (PgWireServer$QueryResult.
    (into-array String names)
-   (int-array oids)
+   (int-array (map types/oid->wire-int oids))
    (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
    "SELECT 0"))
 
@@ -4408,11 +5094,12 @@
         (if @done-atom
           (PgWireServer$QueryResult.
            (into-array String (:columns rec))
-           (int-array (:oids rec))
+           (int-array (map types/oid->wire-int (:oids rec)))
            (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
            "FETCH 0")
           (let [page-parsed (.parse ^PgWireServer$QueryHandler handler
-                                    query-sql (int-array (:param-oids rec)))
+                                    query-sql (int-array (map types/oid->wire-int
+                                                              (:param-oids rec))))
                 result (binding [*snapshot-db* (:snap rec)]
                          (.executePrepared ^PgWireServer$QueryHandler handler
                                            page-parsed
@@ -4426,7 +5113,7 @@
                   (reset! done-atom true))
                 (PgWireServer$QueryResult.
                  (into-array String (:columns rec))
-                 (int-array (:oids rec))
+                 (int-array (map types/oid->wire-int (:oids rec)))
                  rows
                  (str "FETCH " nret))))))))))
 
@@ -4489,6 +5176,7 @@
     (let [real-db (d/db conn)]
       (swap! tx-state assoc
              :in-tx? true :aborted? false :tx-buffer []
+             :tx-options {}
              :ddl-version 0
              ;; `BEGIN ISOLATION LEVEL X` pins the tx's level (classify
              ;; supplies :isolation); nil means inherit the session
@@ -4517,6 +5205,7 @@
   (let [real-db (d/db conn)]
     (swap! tx-state assoc
            :in-tx? true :implicit? true :aborted? false :tx-buffer []
+           :tx-options {}
            :ddl-version 0
            :read-only? (boolean (:read-only? @session-state))
            :speculative-db (apply-temporal real-db session-state)
@@ -4535,6 +5224,7 @@
                  {:name name
                   :speculative-db (:speculative-db @tx-state)
                   :tx-buffer (:tx-buffer @tx-state)
+                  :tx-options (:tx-options @tx-state)
                   :eid->tempid (:eid->tempid @tx-state)
                   :owned-locks (:owned-locks @tx-state)
                   :ddl-version (:ddl-version @tx-state)
@@ -4612,7 +5302,8 @@
                     (throw (ex-info "could not serialize access due to concurrent update"
                                     {:error :serialization-failure
                                      :detail (str "rebase base=" begin ", current=" cur)})))
-                  (let [rep (dc/with base buf)]
+                  (let [rep (dc/with base buf nil (:tx-options ts))]
+                    (unique-constraints/validate-report! rep)
                     (swap! tx-state assoc
                            :speculative-db (:db-after rep)
                            :begin-max-tx cur)))))))))))
@@ -4671,7 +5362,7 @@
                              :detail (str "base=" begin-max-tx
                                           ", current=" current-max-tx)})))))
       (when (seq buf)
-        (transact-recorded! conn buf))
+        (transact-recorded! conn buf (:tx-options @tx-state)))
       ;; A successful DDL commit publishes schema/catalog changes after the
       ;; statement-level cache bust. Advance once more now so a concurrent
       ;; session that revalidated against the pre-commit DB cannot retain a
@@ -4694,6 +5385,7 @@
            (-> state
                (assoc :in-tx? false :implicit? false :aborted? false
                       :read-only? false
+                      :tx-options {}
                       :ddl-version 0
                       :owned-locks #{})
                (dissoc :temp-tables-before)))))
@@ -4809,7 +5501,7 @@
           (error-result (str "savepoint \"" name "\" does not exist") "3B001"))
       :else
       (let [target (nth sp-stack target-idx)
-            {:keys [speculative-db tx-buffer eid->tempid
+            {:keys [speculative-db tx-buffer tx-options eid->tempid
                     owned-locks begin-max-tx ddl-version]} target
             target-temp-tables (:temp-tables target)
             current-ddl-version (long (or (:ddl-version @tx-state) 0))
@@ -4829,6 +5521,7 @@
                :aborted? false
                :speculative-db speculative-db
                :tx-buffer tx-buffer
+               :tx-options (or tx-options {})
                :eid->tempid eid->tempid
                :owned-locks (or owned-locks #{})
                ;; Restore the conflict watermark alongside the snapshot —
@@ -5025,35 +5718,52 @@
                  (str "SELECT " (count parents))
                  (map str parents))))
 
+(declare forget-unique-admissions!)
+
 (defn- handle-dh-create-branch
   "SELECT datahike.create_branch('new', 'from') → creates `:new` from
    the branch-keyword `:from` (or a commit UUID string). O(1) konserve
    write; does not go through the transaction writer."
-  [conn parsed]
+  [{:keys [conn]} parsed]
   (let [[new-name from] (:args parsed)]
     (when-not (and new-name from)
       (throw (ex-info "datahike.create_branch arity"
                       {:error :syntax-error
                        :detail "datahike.create_branch requires (new-name, from-branch-or-commit)"
                        :args (:args parsed)})))
-    (let [from-ref (if (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-                                   from)
+    (let [commit-ref? (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                                  from)
+          from-ref (if commit-ref?
                      (java.util.UUID/fromString from)
-                     (keyword from))]
-      (versioning/branch! conn from-ref (keyword new-name))
+                     (keyword from))
+          source-db (if commit-ref?
+                      (versioning/commit-as-db conn from-ref)
+                      (versioning/branch-as-db conn from-ref))
+          new-branch (keyword new-name)]
+      (when-not source-db
+        (throw (ex-info "branch source does not exist"
+                        {:error :undefined-object :sqlstate "42704"
+                         :source from})))
+      (unique-constraints/validate-db! source-db)
+      (versioning/branch! conn from-ref new-branch)
+      ;; A branch keyword can advance between the source check and branch!.
+      ;; Admit the actual target writer on connection, never this earlier read.
       (single-row-result "create_branch" PgWireServer/OID_TEXT new-name))))
 
 (defn- handle-dh-delete-branch
   "SELECT datahike.delete_branch('name') → marks the branch unreachable;
    GC reclaims the underlying commits on the next sweep."
-  [conn parsed]
+  [{:keys [conn unique-admissions]} parsed]
   (let [[bname] (:args parsed)]
     (when-not bname
       (throw (ex-info "datahike.delete_branch arity"
                       {:error :syntax-error
                        :detail "datahike.delete_branch requires (branch-name)"
                        :args (:args parsed)})))
-    (versioning/delete-branch! conn (keyword bname))
+    (let [branch (keyword bname)
+          store-id (get-in (dbi/-config (d/db conn)) [:store :id])]
+      (versioning/delete-branch! conn branch)
+      (forget-unique-admissions! unique-admissions store-id branch))
     (single-row-result "delete_branch" PgWireServer/OID_TEXT bname)))
 
 ;; --- Catalog probes ---------------------------------------------------------
@@ -5069,7 +5779,7 @@
   (if-let [{:keys [names oids]} (sql/extract-empty-catalog-shape sql)]
     (PgWireServer$QueryResult.
      (into-array String names)
-     (int-array oids)
+     (int-array (map types/oid->wire-int oids))
      (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
      "SELECT 0")
     (PgWireServer$QueryResult.
@@ -5155,7 +5865,12 @@
                    (for [[toid anum] pairs
                          :let [tname (get tbl-by-oid toid)
                                cols (get-in virtual [tname :columns])
-                               col (nth cols (dec anum) nil)]
+                               col (some (fn [[idx candidate]]
+                                           (when (= anum
+                                                    (long (or (:attnum candidate)
+                                                              (inc idx))))
+                                             candidate))
+                                         (map-indexed vector cols))]
                          :when col]
                      (into-array String
                                  [(str toid)
@@ -5463,7 +6178,7 @@
 ;; for `:copy-from-stdin`, but exec-copy-from-stdin (which depends on
 ;; helpers like columns-from-schema, copy-flush-batch!) is defined further
 ;; below to keep related code contiguous.
-(declare exec-copy-from-stdin)
+(declare exec-copy-from-stdin admit-unique-index-enforcement!)
 
 (defn- exec-system
   "Dispatch on (:system-type parsed). System-types are recognised by
@@ -5473,7 +6188,8 @@
    COMMENT ON, LOCK TABLE, …)."
   [ctx parsed]
   (let [{:keys [conn session-state schema tx-state
-                on-create-database on-delete-database registry-atom]} ctx]
+                on-create-database on-delete-database registry-atom
+                unique-admissions]} ctx]
     (case (:system-type parsed)
       :set
       (do
@@ -5595,6 +6311,7 @@
           :else
           (try
             (let [new-conn (on-create-database db-name options)]
+              (admit-unique-index-enforcement! new-conn unique-admissions)
               (when registry-atom
                 (swap! registry-atom assoc db-name new-conn))
               (empty-result "CREATE DATABASE"))
@@ -5637,7 +6354,9 @@
 
           :else
           (try
-            (on-delete-database db-name existing nil)
+            (let [store-id (get-in (dbi/-config (d/db existing)) [:store :id])]
+              (on-delete-database db-name existing nil)
+              (forget-unique-admissions! unique-admissions store-id nil))
             (when registry-atom
               (swap! registry-atom dissoc db-name))
             (empty-result "DROP DATABASE")
@@ -5711,8 +6430,8 @@
       :dh-current-branch (handle-dh-current-branch conn session-state)
       :dh-commit-id      (handle-dh-commit-id conn session-state)
       :dh-parent-commits (handle-dh-parent-commits conn session-state)
-      :dh-create-branch  (handle-dh-create-branch conn parsed)
-      :dh-delete-branch  (handle-dh-delete-branch conn parsed)
+      :dh-create-branch  (handle-dh-create-branch ctx parsed)
+      :dh-delete-branch  (handle-dh-delete-branch ctx parsed)
       (empty-result "OK"))))
 
 (defn- null-safe-order-cmp
@@ -6284,7 +7003,7 @@
       (let [item-oids (effective-item-oids parsed)
             schema-oids (when item-oids
                           (int-array
-                           (map #(int (or % -1)) item-oids)))]
+                           (map #(types/oid->wire-int (or % -1)) item-oids)))]
         (format-query-result (or literal-rows [literal-row])
                              find-aliases
                              schema-oids))
@@ -6691,7 +7410,8 @@
                                 (let [out (aclone ^ints schema-oids)]
                                   (doseq [{:keys [out-pos oid]} (:subqueries cs)]
                                     (when (< out-pos (alength out))
-                                      (aset out out-pos (int (or oid PgWireServer/OID_TEXT)))))
+                                      (aset out out-pos (types/oid->wire-int
+                                                         (or oid PgWireServer/OID_TEXT)))))
                                   out)
                                 schema-oids)
                   sources (compute-column-sources parsed-with-shape db)
@@ -6769,14 +7489,12 @@
       (try
         (let [table-name (:table parsed)
               spec-db (:speculative-db @tx-state)
-              _ (reject-explicit-always-identities! (:tx-data parsed)
-                                                    table-name spec-db)
               tx-data (-> (:tx-data parsed)
-                          (auto-populate-identity table-name spec-db)
                           (apply-column-constraints table-name
                                                     (:ns parsed)
                                                     spec-db))
               spec-report (dc/with spec-db tx-data)
+              _ (unique-constraints/validate-report! spec-report)
               new-tempids (into {} (keep (fn [[tid eid]] (when (string? tid) [eid tid])))
                                 (:tempids spec-report))
               db-after (:db-after spec-report)
@@ -6794,8 +7512,7 @@
                                  (some (fn [^datahike.datom.Datom d]
                                          (let [a (.-a d)]
                                            (and (keyword? a)
-                                                (.startsWith (str (namespace a) "/") ns-prefix)
-                                                (not= (name a) "db-row-exists"))))
+                                                (.startsWith (str (namespace a) "/") ns-prefix))))
                                        (d/datoms db-after :eavt eid)))
                   ;; ON CONFLICT path records row-positional eids/tempids
                   ;; via :row-refs atom set in translate-insert.
@@ -6848,6 +7565,8 @@
               eid->tempid (:eid->tempid @tx-state)
               {:keys [eids tx-data]} (build-update-with-recursive-tx spec-db parsed)
               spec-report (when (seq tx-data) (dc/with spec-db tx-data))
+              _ (when spec-report
+                  (unique-constraints/validate-report! spec-report))
               commit-tx-data (mapv (fn [[op eid attr val]]
                                      [op (get eid->tempid eid eid) attr val])
                                    tx-data)]
@@ -6910,6 +7629,7 @@
               _ (enforce-fk-restrict-on-update! spec-db (:table parsed) tx-data)
               ;; Apply to speculative-db with ORIGINAL entity IDs
               spec-report (dc/with spec-db tx-data)
+              _ (unique-constraints/validate-report! spec-report)
               ;; For the commit buffer, remap real eids to tempids.
               ;; Drop :db/retract ops that would remap onto a tempid —
               ;; the entity is new in this tx, so there's no prior
@@ -7185,40 +7905,61 @@
 
 (defn- exec-ddl-create-sequence
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx
-        {:keys [seq-name if-not-exists? tx-data]} parsed
-        current-db (if (:in-tx? @tx-state)
-                     (:speculative-db @tx-state)
-                     (d/db conn))]
-    (cond
+  (let [{:keys [conn tx-state session-id]} ctx
+        {:keys [seq-name if-not-exists? tx-data]} parsed]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (loop [attempt 0]
+      (let [current-db (if (:in-tx? @tx-state)
+                         (:speculative-db @tx-state)
+                         (d/db conn))
+            existing-relation
+            (catalog-objects/object-by-identity
+             current-db catalog-objects/pg-class-oid
+             catalog-objects/public-namespace-oid seq-name)]
+        (cond
       ;; CREATE SEQUENCE on an existing sequence. PG raises 42P07
       ;; duplicate_table (sequences are relations — commands/sequence.c
       ;; goes through heap_create_with_catalog like tables do); IF NOT
       ;; EXISTS downgrades it to a notice + success. Before this check,
       ;; collisions silently re-transacted the init entity, RESETTING
       ;; the counter of a live sequence.
-      (and (sequence-exists? current-db seq-name) (not if-not-exists?))
-      (classified-error ""
-                        (ex-info (str "relation \"" seq-name "\" already exists")
-                                 {:sqlstate "42P07"
-                                  :table seq-name
-                                  :constraint seq-name}))
+          (and (or existing-relation (sequence-exists? current-db seq-name))
+               (not if-not-exists?))
+          (classified-error ""
+                            (ex-info (str "relation \"" seq-name "\" already exists")
+                                     {:sqlstate "42P07"
+                                      :table seq-name
+                                      :constraint seq-name}))
 
       ;; IF NOT EXISTS on an existing sequence: PG emits a notice and
       ;; makes no change. Skipping the transact keeps the live counter
       ;; untouched (re-transacting the init entity would reset it).
-      (sequence-exists? current-db seq-name)
-      (empty-result "CREATE SEQUENCE")
+          (or existing-relation (sequence-exists? current-db seq-name))
+          (empty-result "CREATE SEQUENCE")
 
-      (:in-tx? @tx-state)
-      (execute-ddl-in-tx tx-state tx-data "CREATE SEQUENCE")
-
-      :else
-      (try
-        (transact-recorded! conn tx-data)
-        (empty-result "CREATE SEQUENCE")
-        (catch Exception e
-          (classified-error "CREATE SEQUENCE error: " e))))))
+          :else
+          (let [{:keys [oid] allocation-tx :tx-data}
+                (catalog-objects/reserve-user-oid-tx current-db)
+                create-data
+                (into (vec allocation-tx)
+                      (concat
+                       tx-data
+                       (catalog-objects/create-object-tx
+                        current-db
+                        {:class-oid catalog-objects/pg-class-oid
+                         :oid oid :kind :sequence :name seq-name
+                         :namespace-oid catalog-objects/public-namespace-oid})))]
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state create-data "CREATE SEQUENCE")
+              (let [outcome (try (transact-recorded! conn create-data)
+                                 :committed
+                                 (catch Exception e e))]
+                (cond
+                  (= :committed outcome) (empty-result "CREATE SEQUENCE")
+                  (and (catalog-cas-failure? outcome)
+                       (< attempt catalog-allocation-max-retries))
+                  (recur (inc attempt))
+                  :else (classified-error "CREATE SEQUENCE error: " outcome))))))))))
 
 (defn- enum-tx-data
   "Build the registry tx-data for a CREATE TYPE … AS ENUM. Stored as a
@@ -7411,6 +8152,12 @@
                  :where [[?e :datahike.pg.enum/name ?name]]}
                db type-name)))
 
+(defn- composite-registry-eid [db type-name]
+  (ffirst (d/q '{:find [?e]
+                 :in [$ ?name]
+                 :where [[?e :datahike.pg.composite/name ?name]]}
+               db type-name)))
+
 (defn- exec-ddl-rename-enum
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx
@@ -7455,8 +8202,13 @@
         db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
         {:keys [type-name if-exists? cascade?]} parsed]
     (try
-      (let [eid (enum-registry-eid db type-name)
-            dependents (when eid
+      (let [enum-eid (enum-registry-eid db type-name)
+            composite-eid (composite-registry-eid db type-name)
+            eid (or enum-eid composite-eid)
+            type-object (catalog-objects/object-by-identity
+                         db catalog-objects/pg-type-oid
+                         catalog-objects/public-namespace-oid type-name)
+            dependents (when enum-eid
                          (map first
                               (d/q '{:find [?col]
                                      :in [$ ?name]
@@ -7475,13 +8227,25 @@
                                " because other objects depend on it")
                           {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
           :else
-          (let [oid (:datahike.pg.object/oid
-                     (catalog-objects/object-by-identity
-                      db catalog-objects/pg-type-oid
-                      catalog-objects/public-namespace-oid type-name))
-                tx-data (into [[:db/retractEntity eid]]
-                              (catalog-objects/drop-object-tx
-                               db catalog-objects/pg-type-oid oid))]
+          (let [oid (:datahike.pg.object/oid type-object)
+                relation (when composite-eid
+                           (catalog-objects/object-by-identity
+                            db catalog-objects/pg-class-oid
+                            catalog-objects/public-namespace-oid type-name))
+                tx-data
+                (into [[:db/retractEntity eid]]
+                      (concat
+                       (when (= :composite-relation
+                                (:datahike.pg.object/kind relation))
+                         (concat
+                          (catalog-objects/drop-relation-columns-tx
+                           db (:datahike.pg.object/oid relation))
+                          (catalog-objects/drop-object-tx
+                           db catalog-objects/pg-class-oid
+                           (:datahike.pg.object/oid relation))))
+                       (when type-object
+                         (catalog-objects/drop-object-tx
+                          db catalog-objects/pg-type-oid oid))))]
             (if (:in-tx? @tx-state)
               (execute-ddl-in-tx tx-state tx-data "DROP TYPE")
               (do (transact-recorded! conn tx-data)
@@ -7520,7 +8284,9 @@
    query's result/params reference a composite OID."
   [db]
   (doseq [{:keys [oid fields]} (pgs/composite-types db)]
-    (PgParamCodec/registerComposite (int oid) (int-array (map :oid fields)))))
+    (PgParamCodec/registerComposite
+     (types/oid->wire-int oid)
+     (int-array (map (comp types/oid->wire-int :oid) fields)))))
 
 (defn- exec-ddl-create-composite
   [ctx parsed]
@@ -7537,17 +8303,35 @@
                                           " already exists")
                                      {:error :duplicate-object
                                       :sqlstate "42710"}))
-          (let [{:keys [oid tx-data]}
-                (catalog-objects/reserve-user-oid-tx current-db)
+          (let [{:keys [oids tx-data]}
+                (catalog-objects/reserve-user-oids-tx current-db 2)
+                [type-oid relation-oid] oids
                 create-data
                 (into (vec tx-data)
                       (concat
-                       (composite-tx-data type-name oid (:fields parsed))
+                       (composite-tx-data type-name type-oid (:fields parsed))
                        (catalog-objects/create-object-tx
                         current-db
                         {:class-oid catalog-objects/pg-type-oid
-                         :oid oid :kind :composite-type :name type-name
-                         :namespace-oid catalog-objects/public-namespace-oid})))]
+                         :oid type-oid :kind :composite-type :name type-name
+                         :namespace-oid catalog-objects/public-namespace-oid})
+                       (catalog-objects/create-object-tx
+                        current-db
+                        {:class-oid catalog-objects/pg-class-oid
+                         :oid relation-oid :kind :composite-relation :name type-name
+                         :namespace-oid catalog-objects/public-namespace-oid})
+                       (catalog-objects/create-columns-tx
+                        relation-oid
+                        (map-indexed
+                         (fn [idx field]
+                           {:attnum (inc idx)
+                            :name (:field-name field)
+                            :type-oid (pgs/resolve-type-oid
+                                       current-db (:pg-type field))
+                            :storage-ident
+                            (keyword (str "__composite__" type-name)
+                                     (:field-name field))})
+                         (:fields parsed)))))]
             (if (:in-tx? @tx-state)
               (execute-ddl-in-tx tx-state create-data "CREATE TYPE")
               (let [outcome (try
@@ -7595,15 +8379,39 @@
 
 (defn- exec-ddl-create-domain
   [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx
-        tx-data (domain-tx-data (:domain parsed))]
-    (if (:in-tx? @tx-state)
-      (execute-ddl-in-tx tx-state tx-data "CREATE DOMAIN")
-      (try
-        (transact-recorded! conn tx-data)
-        (empty-result "CREATE DOMAIN")
-        (catch Exception e
-          (classified-error "CREATE DOMAIN error: " e))))))
+  (let [{:keys [conn tx-state session-id]} ctx
+        domain (:domain parsed)
+        domain-name (:domain-name domain)]
+    (acquire-catalog-allocation-lock! conn tx-state session-id)
+    (loop [attempt 0]
+      (let [db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
+            existing (catalog-objects/object-by-identity
+                      db catalog-objects/pg-type-oid
+                      catalog-objects/public-namespace-oid domain-name)]
+        (if existing
+          (classified-error ""
+                            (ex-info (str "type " (pr-str domain-name) " already exists")
+                                     {:error :duplicate-object :sqlstate "42710"}))
+          (let [{:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+                create-data
+                (into (vec tx-data)
+                      (concat
+                       (domain-tx-data domain)
+                       (catalog-objects/create-object-tx
+                        db {:class-oid catalog-objects/pg-type-oid
+                            :oid oid :kind :domain :name domain-name
+                            :namespace-oid catalog-objects/public-namespace-oid})))]
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state create-data "CREATE DOMAIN")
+              (let [outcome (try (transact-recorded! conn create-data)
+                                 :committed
+                                 (catch Exception e e))]
+                (cond
+                  (= :committed outcome) (empty-result "CREATE DOMAIN")
+                  (and (catalog-cas-failure? outcome)
+                       (< attempt catalog-allocation-max-retries))
+                  (recur (inc attempt))
+                  :else (classified-error "CREATE DOMAIN error: " outcome))))))))))
 
 (defn- exec-ddl-drop-domain
   [ctx parsed]
@@ -7635,10 +8443,18 @@
                                " because other objects depend on it")
                           {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
           :else
-          (if (:in-tx? @tx-state)
-            (execute-ddl-in-tx tx-state [[:db/retractEntity eid]] "DROP DOMAIN")
-            (do (transact-recorded! conn [[:db/retractEntity eid]])
-                (empty-result "DROP DOMAIN")))))
+          (let [object (catalog-objects/object-by-identity
+                        db catalog-objects/pg-type-oid
+                        catalog-objects/public-namespace-oid domain-name)
+                tx-data (into [[:db/retractEntity eid]]
+                              (when (= :domain (:datahike.pg.object/kind object))
+                                (catalog-objects/drop-object-tx
+                                 db catalog-objects/pg-type-oid
+                                 (:datahike.pg.object/oid object))))]
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state tx-data "DROP DOMAIN")
+              (do (transact-recorded! conn tx-data)
+                  (empty-result "DROP DOMAIN"))))))
       (catch Exception e
         (classified-error "DROP DOMAIN error: " e)))))
 
@@ -7836,18 +8652,17 @@
    appears on the classpath. Keeping lightweight metadata makes duplicate
    CREATE, DROP INDEX, and DROP TABLE deterministic without pretending that a
    physical secondary generation exists."
-  [conn tx-state parsed]
-  (let [tx-data [{:db/ident (secondary-index-ident (:name parsed))
-                  :datahike.pg.index/table (:table parsed)
-                  :datahike.pg.index/method (or (:method parsed) "btree")}]]
-    (if (:in-tx? @tx-state)
-      (execute-ddl-in-tx tx-state tx-data "CREATE INDEX")
-      (do
-        (transact-recorded! conn tx-data)
-        (empty-result "CREATE INDEX")))))
+  ([conn tx-state parsed catalog-tx]
+   (record-compatibility-index! conn tx-state parsed catalog-tx nil))
+  ([conn tx-state _parsed catalog-tx tx-options]
+   (if (:in-tx? @tx-state)
+     (execute-ddl-in-tx tx-state catalog-tx "CREATE INDEX" tx-options)
+     (do
+       (transact-recorded! conn catalog-tx tx-options)
+       (empty-result "CREATE INDEX")))))
 
 (defn- materialize-secondary-index!
-  [ctx parsed index-type attr config]
+  [ctx parsed index-type attr config catalog-tx index-oid]
   (let [{:keys [conn tx-state secondary-index-build-timeout-ms]} ctx
         tx @tx-state
         index-ident (secondary-index-ident (:name parsed))]
@@ -7867,16 +8682,19 @@
     (load-secondary-adapter! index-type)
     (transact-recorded!
      conn
-     [{:db/ident index-ident
-       :datahike.pg.index/table (:table parsed)
-       :datahike.pg.index/method (or (:method parsed) "btree")
-       :db.secondary/type index-type
-       :db.secondary/attrs [attr]
-       :db.secondary/config
-       (merge config
-              {:pg/index-name (:name parsed)
-               :pg/table (:table parsed)
-               :pg/method (:method parsed)})}])
+     (into (vec catalog-tx)
+           [{:db/id [:datahike.pg.object/address-key
+                     (catalog-objects/address-key
+                      catalog-objects/pg-class-oid index-oid)]
+             :db.secondary/type index-type
+             :db.secondary/attrs [attr]
+             :db.secondary/config
+             (merge config
+                    {:pg/index-name (:name parsed)
+                     :pg/table (:table parsed)
+                     :pg/method (:method parsed)})}])
+     (when (= "btree" (:method parsed))
+       {:allow-index-backfill? true}))
     ;; PostgreSQL's non-CONCURRENT CREATE INDEX does not return while the
     ;; index is still being built. Datahike's writer remains available during
     ;; the asynchronous backfill; only this SQL request waits for publication.
@@ -7893,30 +8711,110 @@
 (defn- exec-ddl-create-index
   [ctx parsed]
   (try
-    (let [{:keys [conn tx-state secondary-index-config]} ctx
+    (let [{:keys [conn tx-state session-id secondary-index-config]} ctx
+          _ (acquire-catalog-allocation-lock! conn tx-state session-id)
           db (or (:speculative-db @tx-state) (d/db conn))
           schema (dbi/-schema db)
           index-ident (secondary-index-ident (:name parsed))
           method (or (:method parsed) "btree")
+          _ (when (:unique? parsed)
+              (when-not (= "btree" method)
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:message (str method " does not support unique indexes")})))
+              (when-let [unsupported
+                         (first
+                          (for [{:keys [params]} (:column-specs parsed)
+                                param params
+                                :when (not (contains? #{"asc" "desc"} param))]
+                            param))]
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:message (str "unique index operator class or column option "
+                                       unsupported " is not supported")})))
+              (let [tail (:tail-parameters parsed)]
+                (when (and (seq tail)
+                           (not= "WITH" (some-> (first tail) str/upper-case)))
+                  (throw (errors/pg-error
+                          :feature-not-supported
+                          {:message "partial and extended unique indexes are not supported"})))))
+          table-object (catalog-objects/object-by-identity
+                        db catalog-objects/pg-class-oid
+                        catalog-objects/public-namespace-oid (:table parsed))
+          _ (when-not (= :table (:datahike.pg.object/kind table-object))
+              (throw (errors/pg-error :undefined-table
+                                      {:table (:table parsed)})))
+          existing-object (catalog-objects/object-by-identity
+                           db catalog-objects/pg-class-oid
+                           catalog-objects/public-namespace-oid (:name parsed))
+          _ (when existing-object
+              (if (:if-not-exists? parsed)
+                (throw (ex-info "index already exists"
+                                {:index-noop? true}))
+                (throw (ex-info (str "relation \"" (:name parsed)
+                                     "\" already exists")
+                                {:sqlstate "42P07" :index (:name parsed)}))))
+          relation-oid (:datahike.pg.object/oid table-object)
+          key-columns
+          (mapv
+           (fn [column]
+             (let [registered (catalog-objects/column-by-name
+                               db relation-oid column)
+                   attr (:datahike.pg.column/storage-ident registered)]
+               (when-not (and registered (get schema attr))
+                 (throw (errors/pg-error :undefined-column
+                                         {:column column :table (:table parsed)})))
+               {:name column
+                :attnum (or (:datahike.pg.column/attnum registered)
+                            (pgs/column-attnum schema (:table parsed) column
+                                               (pgs/schema-hints db)))
+                :storage-ident attr}))
+           (:columns parsed))
           column (first (:columns parsed))
-          attr (when column (keyword (:table parsed) column))
+          attr (:storage-ident (first key-columns))
           attr-schema (get schema attr)
           pg-hints (pgs/schema-hints db)
-          pg-type (get-in pg-hints [attr :pg-type])]
+          pg-type (get-in pg-hints [attr :pg-type])
+          {:keys [oid tx-data]} (catalog-objects/reserve-user-oid-tx db)
+          catalog-tx
+          (into (vec tx-data)
+                (concat
+                 (catalog-objects/create-object-tx
+                  db {:class-oid catalog-objects/pg-class-oid
+                      :oid oid :kind :index :name (:name parsed)
+                      :namespace-oid catalog-objects/public-namespace-oid})
+                 [{:db/id [:datahike.pg.object/address-key
+                           (catalog-objects/address-key
+                            catalog-objects/pg-class-oid oid)]
+                   :db/ident index-ident
+                   :datahike.pg.index/table (:table parsed)
+                   :datahike.pg.index/relation
+                   [:datahike.pg.object/address-key
+                    (catalog-objects/address-key
+                     catalog-objects/pg-class-oid relation-oid)]
+                   :datahike.pg.index/method method
+                   :datahike.pg.index/keys (pr-str key-columns)
+                   :datahike.pg.index/unique? (boolean (:unique? parsed))}]
+                 (when (= "btree" method)
+                   (mapcat
+                    (fn [{:keys [storage-ident]}]
+                      (let [entry (get schema storage-ident)
+                            already-indexed?
+                            (or (:db/index entry) (:db/unique entry))]
+                        (cond-> [{:db/ident storage-ident :db/index true}]
+                          (not already-indexed?)
+                          (conj {:datahike.pg/for-ident storage-ident
+                                 :datahike.pg/internal-index true}))))
+                    key-columns))))]
       (cond
-        (get schema index-ident)
-        (if (:if-not-exists? parsed)
-          (empty-result "CREATE INDEX")
-          (throw (ex-info (str "relation \"" (:name parsed) "\" already exists")
-                          {:sqlstate "42P07" :index (:name parsed)})))
-
-        (not= 1 (count (:columns parsed)))
+        (not= 1 (count key-columns))
         (if (contains? #{"hnsw" "ivfflat" "gin" "gist"} method)
           (throw
            (errors/pg-error
             :feature-not-supported
             {:message (str method " secondary indexes currently require exactly one column")}))
-          (record-compatibility-index! conn tx-state parsed))
+          (record-compatibility-index!
+           conn tx-state parsed catalog-tx {:allow-index-backfill? true}))
 
         (nil? attr-schema)
         (throw (errors/pg-error :undefined-column
@@ -7972,7 +8870,8 @@
                (assoc :m (get-in parsed [:options :m]))
                (get-in parsed [:options :ef_construction])
                (assoc :ef-construction
-                      (get-in parsed [:options :ef_construction]))))))
+                      (get-in parsed [:options :ef_construction])))
+             catalog-tx oid)))
 
         (and (contains? #{"gin" "gist"} method) (= "tsvector" pg-type))
         (if (:unique? parsed)
@@ -7983,8 +8882,8 @@
           (let [config (configured-secondary-options
                         secondary-index-config :scriptum parsed)]
             (if config
-              (materialize-secondary-index! ctx parsed :scriptum attr config)
-              (record-compatibility-index! conn tx-state parsed))))
+              (materialize-secondary-index! ctx parsed :scriptum attr config catalog-tx oid)
+              (record-compatibility-index! conn tx-state parsed catalog-tx))))
 
         ;; Datahike's native AVET/AEVT indices already serve ordinary scalar
         ;; equality and range predicates. Keep accepting their PostgreSQL
@@ -7998,15 +8897,10 @@
             {:message "btree indexes on vector columns are not supported"}))
           (if-let [config (configured-secondary-options
                            secondary-index-config :stratum parsed)]
-            (if (:unique? parsed)
-              (throw
-               (errors/pg-error
-                :feature-not-supported
-                {:message (str "materialized Stratum btree indexes do not yet "
-                               "enforce uniqueness")}))
-              (materialize-secondary-index!
-               ctx parsed :stratum attr config))
-            (record-compatibility-index! conn tx-state parsed)))
+            (materialize-secondary-index!
+             ctx parsed :stratum attr config catalog-tx oid)
+            (record-compatibility-index!
+             conn tx-state parsed catalog-tx {:allow-index-backfill? true})))
 
         :else
         (throw
@@ -8014,17 +8908,19 @@
           :feature-not-supported
           {:message (str "index method " method " is not supported for this column")}))))
     (catch Exception failure
-      (if (some #(= :secondary-index-backfill-unsupported-writer
-                    (:type (ex-data %)))
-                (take-while some? (iterate ex-cause failure)))
-        (classified-error
-         ""
-         (errors/pg-error
-          :object-not-in-prerequisite-state
-          {:message (str "online secondary-index backfill requires Datahike "
-                         ":writer-ownership :exclusive; empty-table index "
-                         "creation remains available with a shared writer")}))
-        (classified-error "CREATE INDEX error: " failure)))))
+      (if (:index-noop? (ex-data failure))
+        (empty-result "CREATE INDEX")
+        (if (some #(= :secondary-index-backfill-unsupported-writer
+                      (:type (ex-data %)))
+                  (take-while some? (iterate ex-cause failure)))
+          (classified-error
+           ""
+           (errors/pg-error
+            :object-not-in-prerequisite-state
+            {:message (str "online secondary-index backfill requires Datahike "
+                           ":writer-ownership :exclusive; empty-table index "
+                           "creation remains available with a shared writer")}))
+          (classified-error "CREATE INDEX error: " failure))))))
 
 (defn- exec-ddl-drop-index
   "Remove a materialized secondary declaration from the Datahike root.
@@ -8036,22 +8932,43 @@
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx]
     (try
-      (when (and (:in-tx? @tx-state) (not (:implicit? @tx-state)))
-        (throw
-         (errors/pg-error
-          :feature-not-supported
-          {:message "secondary DROP INDEX inside a transaction is not yet supported"})))
       (let [index-ident (secondary-index-ident (:name parsed))
-            db (d/db conn)
+            db (or (:speculative-db @tx-state) (d/db conn))
+            schema (dbi/-schema db)
             entity-id (d/q '{:find [?entity .]
                              :in [$ ?ident]
                              :where [[?entity :db/ident ?ident]]}
-                           db index-ident)]
+                           db index-ident)
+            object (catalog-objects/object-by-identity
+                    db catalog-objects/pg-class-oid
+                    catalog-objects/public-namespace-oid (:name parsed))]
+        (when (and object
+                   (not= :index (:datahike.pg.object/kind object)))
+          (throw (ex-info (str "\"" (:name parsed) "\" is not an index")
+                          {:error :wrong-object-type :sqlstate "42809"})))
         (cond
           entity-id
-          (do
-            (transact-recorded! conn [[:db/retractEntity entity-id]])
-            (empty-result "DROP INDEX"))
+          (let [materialized? (some? (:db.secondary/type (get schema index-ident)))
+                _ (when (and materialized?
+                             (:in-tx? @tx-state)
+                             (not (:implicit? @tx-state)))
+                    (throw
+                     (errors/pg-error
+                      :feature-not-supported
+                      {:message (str "materialized secondary DROP INDEX inside a "
+                                     "transaction is not yet supported")})))
+                unified? (= entity-id (:db/id object))
+                tx-data (if (= :index (:datahike.pg.object/kind object))
+                          (into (vec (catalog-objects/drop-object-tx
+                                      db catalog-objects/pg-class-oid
+                                      (:datahike.pg.object/oid object)))
+                                (when-not unified?
+                                  [[:db/retractEntity entity-id]]))
+                          [[:db/retractEntity entity-id]])]
+            (if (:in-tx? @tx-state)
+              (execute-ddl-in-tx tx-state tx-data "DROP INDEX")
+              (do (transact-recorded! conn tx-data)
+                  (empty-result "DROP INDEX"))))
 
           (:if-exists? parsed)
           (empty-result "DROP INDEX")
@@ -8064,6 +8981,236 @@
       (catch Exception failure
         (classified-error "DROP INDEX error: " failure)))))
 
+(defn- inherited-column-dependents [db column-address-key]
+  (mapv (comp #(into {} %) #(d/entity db %) first)
+        (d/q '{:find [?column]
+               :in [$ ?address]
+               :where [[?column :datahike.pg.column/inherited-from-address
+                        ?address]]}
+             db column-address-key)))
+
+(defn- column-data-retractions [db attr]
+  (mapv (fn [[entity value]] [:db/retract entity attr value])
+        (d/q '{:find [?entity ?value]
+               :in [$ ?attr]
+               :where [[?entity ?attr ?value]]}
+             db attr)))
+
+(defn- column-hint-eid [db attr]
+  (ffirst (d/q '{:find [?hint]
+                 :in [$ ?attr]
+                 :where [[?hint :datahike.pg/for-ident ?attr]]}
+               db attr)))
+
+(defn- column-index-dependents
+  "Return explicit index declarations that address `column` on `table`."
+  [db table column]
+  (into []
+        (keep (fn [[entity index-name keys-edn]]
+                (let [keys (try
+                             (edn/read-string keys-edn)
+                             (catch Exception _ []))]
+                  (when (some #(or (= column (:name %))
+                                   (= (:datahike.pg.column/storage-ident column)
+                                      (:storage-ident %)))
+                              keys)
+                    {:entity entity :name index-name :keys keys}))))
+        (d/q '{:find [?index ?name ?keys]
+               :in [$ ?table]
+               :where [[?index :datahike.pg.index/table ?table]
+                       [?index :datahike.pg.index/keys ?keys]
+                       [?index :datahike.pg.object/name ?name]]}
+             db table)))
+
+(defn- drop-column-tx-data [db table relation-oid {:keys [name if-exists?]}]
+  (let [column (catalog-objects/column-by-name db relation-oid name)
+        index-dependents (when column
+                           (column-index-dependents db table column))]
+    (cond
+      (and (nil? column) if-exists?) []
+      (nil? column)
+      (throw (errors/pg-error :undefined-column {:column name :table table}))
+      (not (:datahike.pg.column/local? column))
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "cannot drop inherited column \"" name "\"")}))
+      (seq (inherited-column-dependents
+            db (:datahike.pg.column/address-key column)))
+      (throw (ex-info
+              (str "cannot drop column " name " of table " table
+                   " because child tables inherit it")
+              {:error :dependent-objects-still-exist :sqlstate "2BP01"}))
+      :else
+      (let [attr (:datahike.pg.column/storage-ident column)
+            hint-eid (column-hint-eid db attr)]
+        (into (column-data-retractions db attr)
+              (concat
+               (mapcat
+                (fn [{:keys [name]}]
+                  (when-let [index-object
+                             (catalog-objects/object-by-identity
+                              db catalog-objects/pg-class-oid
+                              catalog-objects/public-namespace-oid name)]
+                    (catalog-objects/drop-object-tx
+                     db catalog-objects/pg-class-oid
+                     (:datahike.pg.object/oid index-object))))
+                index-dependents)
+               [(if hint-eid
+                  [:db/add hint-eid :datahike.pg/hidden true]
+                  {:datahike.pg/for-ident attr :datahike.pg/hidden true})]
+               (catalog-objects/tombstone-column-tx
+                db relation-oid (:datahike.pg.column/attnum column))))))))
+
+(defn- rename-column-tx-data [db table relation-oid {:keys [old-name new-name]}]
+  (let [column (catalog-objects/column-by-name db relation-oid old-name)]
+    (when-not column
+      (throw (errors/pg-error :undefined-column
+                              {:column old-name :table table})))
+    (when (catalog-objects/column-by-name db relation-oid new-name)
+      (throw (ex-info (str "column \"" new-name "\" of relation \""
+                           table "\" already exists")
+                      {:error :duplicate-column :sqlstate "42701"})))
+    (when-not (:datahike.pg.column/local? column)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "cannot rename inherited column \"" old-name "\"")})))
+    (when (seq (inherited-column-dependents
+                db (:datahike.pg.column/address-key column)))
+      (throw (ex-info
+              (str "cannot rename column " old-name " of table " table
+                   " because child tables inherit it")
+              {:error :dependent-objects-still-exist :sqlstate "2BP01"})))
+    (let [old-ident (:datahike.pg.column/storage-ident column)
+          new-ident old-ident
+          hint-eid (column-hint-eid db old-ident)]
+      (into []
+            (concat
+             [(if hint-eid
+                [:db/add hint-eid :datahike.pg/column new-name]
+                {:datahike.pg/for-ident old-ident
+                 :datahike.pg/column new-name})]
+             (catalog-objects/rename-column-tx
+              db relation-oid (:datahike.pg.column/attnum column)
+              new-name new-ident)
+             (map (fn [{:keys [entity keys]}]
+                    [:db/add entity :datahike.pg.index/keys
+                     (pr-str (mapv #(if (= old-name (:name %))
+                                      (assoc % :name new-name)
+                                      %)
+                                   keys))])
+                  (column-index-dependents db table column)))))))
+
+(defn- inherited-add-column-tx-data
+  "Propagate newly added parent columns through the inheritance tree.
+
+   Each descendant receives its own durable attnum/address while sharing the
+   inherited physical attribute. A same-named local column is merged when its
+   PostgreSQL type and typmod agree, matching PostgreSQL's inheritance rule."
+  [db table added-columns]
+  (let [columns-by-relation
+        (atom {})
+        touched-relations (atom #{})
+        tx-data (atom [])
+        child-names
+        (fn [parent]
+          (if (get (dbi/-schema db) :__inherit__/child)
+            (mapv first
+                  (d/q '{:find [?child]
+                         :in [$ ?parent]
+                         :where [[?inheritance :__inherit__/parent ?parent]
+                                 [?inheritance :__inherit__/child ?child]]}
+                       db parent))
+            []))
+        relation-columns
+        (fn [relation-oid]
+          (or (get @columns-by-relation relation-oid)
+              (let [columns (catalog-objects/columns-by-relation db relation-oid)]
+                (swap! columns-by-relation assoc relation-oid columns)
+                columns)))]
+    (letfn [(propagate! [parent-name parent-column]
+              (doseq [child-name (child-names parent-name)]
+                (let [child (catalog-objects/object-by-identity
+                             db catalog-objects/pg-class-oid
+                             catalog-objects/public-namespace-oid child-name)
+                      child-oid (:datahike.pg.object/oid child)
+                      columns (relation-columns child-oid)
+                      live-column (some #(when (and (not (:datahike.pg.column/dropped? %))
+                                                    (= (:name parent-column)
+                                                       (:datahike.pg.column/name %)))
+                                           %)
+                                        columns)
+                      child-column
+                      (if live-column
+                        (do
+                          (when (or (not= (:type-oid parent-column)
+                                          (:datahike.pg.column/type-oid live-column))
+                                    (not= (:typmod parent-column)
+                                          (:datahike.pg.column/typmod live-column)))
+                            (throw (ex-info
+                                    (str "inherited column \"" (:name parent-column)
+                                         "\" has a type conflict in table \""
+                                         child-name "\"")
+                                    {:error :datatype-mismatch :sqlstate "42804"
+                                     :table child-name :column (:name parent-column)})))
+                          (let [column-ref
+                                [:datahike.pg.column/address-key
+                                 (:datahike.pg.column/address-key live-column)]
+                                next-count
+                                (inc (long (or (:datahike.pg.column/inherit-count
+                                                live-column) 0)))]
+                            (swap! tx-data into
+                                   [[:db/add column-ref
+                                     :datahike.pg.column/inherit-count next-count]
+                                    [:db/add column-ref
+                                     :datahike.pg.column/inherited-from-address
+                                     (:address parent-column)]])
+                            (assoc live-column
+                                   :name (:datahike.pg.column/name live-column)
+                                   :type-oid (:datahike.pg.column/type-oid live-column)
+                                   :typmod (:datahike.pg.column/typmod live-column)
+                                   :storage-ident
+                                   (:datahike.pg.column/storage-ident live-column)
+                                   :address
+                                   (:datahike.pg.column/address-key live-column))))
+                        (let [attnum (inc (reduce max 0
+                                                  (map :datahike.pg.column/attnum
+                                                       columns)))
+                              spec {:attnum attnum
+                                    :name (:name parent-column)
+                                    :type-oid (:type-oid parent-column)
+                                    :typmod (:typmod parent-column)
+                                    :storage-ident (:storage-ident parent-column)
+                                    :local? false
+                                    :inherit-count 1
+                                    :inherited-from-address
+                                    (:address parent-column)}]
+                          (swap! tx-data into
+                                 (catalog-objects/create-columns-tx child-oid [spec]))
+                          (swap! columns-by-relation update child-oid conj
+                                 (assoc spec
+                                        :datahike.pg.column/attnum attnum
+                                        :datahike.pg.column/name (:name spec)
+                                        :datahike.pg.column/type-oid (:type-oid spec)
+                                        :datahike.pg.column/typmod (:typmod spec)
+                                        :datahike.pg.column/storage-ident
+                                        (:storage-ident spec)
+                                        :datahike.pg.column/address-key
+                                        (catalog-objects/column-address-key
+                                         child-oid attnum)))
+                          (assoc spec :address
+                                 (catalog-objects/column-address-key child-oid attnum))))]
+                  (swap! touched-relations conj child-oid)
+                  (propagate! child-name child-column))))]
+      (doseq [column added-columns]
+        (propagate! table
+                    (assoc column :address
+                           (catalog-objects/column-address-key
+                            (:relation-oid column) (:attnum column)))))
+      (into @tx-data
+            (mapcat #(catalog-objects/bump-revision-tx
+                      db catalog-objects/pg-class-oid %)
+                    @touched-relations)))))
+
 (defn- exec-ddl-alter
   [ctx parsed]
   (let [{:keys [conn tx-state]} ctx]
@@ -8071,6 +9218,77 @@
       (let [{:keys [table operations]} parsed
             db (or (:speculative-db @tx-state) (d/db conn))
             schema (dbi/-schema db)
+            relation-oid (pgs/table-oid db table)
+            _ (when-not relation-oid
+                (throw (errors/pg-error :undefined-table {:table table})))
+            added-columns
+            (into []
+                  (comp (filter #(= :add-column (:op %)))
+                        (mapcat :columns))
+                  operations)
+            _ (when-let [duplicate
+                         (some (fn [[name count]] (when (> count 1) name))
+                               (frequencies (map :name added-columns)))]
+                (throw (ex-info (str "column \"" duplicate
+                                     "\" specified more than once")
+                                {:error :duplicate-column :sqlstate "42701"})))
+            first-attnum (when (and relation-oid (seq added-columns))
+                           (catalog-objects/next-attnum db relation-oid))
+            known-columns (when relation-oid
+                            (catalog-objects/columns-by-relation db relation-oid))
+            occupied-storage
+            (atom (into (set (keys schema))
+                        (keep :datahike.pg.column/storage-ident)
+                        known-columns))
+            fresh-storage-ident!
+            (fn [name attnum]
+              (let [logical-ident (keyword table name)
+                    ident (if-not (contains? @occupied-storage logical-ident)
+                            logical-ident
+                            (loop [suffix 0]
+                              (let [candidate
+                                    (keyword table
+                                             (str "pg$att" attnum
+                                                  (when (pos? suffix)
+                                                    (str "_" suffix))))]
+                                (if (contains? @occupied-storage candidate)
+                                  (recur (inc suffix))
+                                  candidate))))]
+                (swap! occupied-storage conj ident)
+                ident))
+            added-column-specs
+            (mapv
+             (fn [idx {:keys [name type] :as column}]
+               (when (catalog-objects/column-by-name db relation-oid name)
+                 (throw (ex-info (str "column \"" name "\" of relation \""
+                                      table "\" already exists")
+                                 {:error :duplicate-column :sqlstate "42701"})))
+               (let [attnum (+ first-attnum idx)
+                     storage-ident (fresh-storage-ident! name attnum)
+                     normalized (types/normalize-sql-type-name type)
+                     base-type (str/replace normalized #"\s*\([^)]*\)" "")
+                     user-type (pgs/user-type-object db type)
+                     vector-typmod (when (= "vector" base-type)
+                                     (pg-vector/parse-typmod normalized))
+                     numeric-typmod
+                     (when (= :numeric (types/cast-category base-type))
+                       (let [[precision scale] (types/parse-numeric-args normalized)]
+                         (when (or precision scale)
+                           (types/encode-numeric-typmod precision scale))))
+                     char-typmod (when-let [length (types/parse-char-length normalized)]
+                                   (+ length 4))
+                     bit-typmod (some-> (types/parse-bit-length normalized) long)]
+                 (assoc column
+                        :attnum attnum
+                        :storage-ident storage-ident
+                        :normalized-type normalized
+                        :base-type base-type
+                        :type-object user-type
+                        :type-oid (pgs/resolve-type-oid db type)
+                        :typmod (or vector-typmod numeric-typmod
+                                    char-typmod bit-typmod))))
+             (range) added-columns)
+            add-spec-by-name (into {} (map (juxt :name identity)) added-column-specs)
             _ (doseq [{:keys [op columns]} operations]
                 (case op
                   :add-column
@@ -8106,39 +9324,46 @@
                             {:message (str "UNIQUE and PRIMARY KEY constraints on "
                                            "vector columns are not supported")})))
                   nil))
-            tx-data (vec (mapcat
-                          (fn [{:keys [op columns]}]
-                            (case op
-                              :add-column
-                              (for [{:keys [name type]} columns
-                                    :let [raw-type type
-                                          unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")
-                                          _ (when (types/unsupported-input-type? unsupported-base)
-                                              (throw (ex-info
-                                                      (str "type \"" unsupported-base
-                                                           "\" is not supported until its PostgreSQL input parser is implemented")
-                                                      {:error :feature-not-supported
-                                                       :sqlstate "0A000"
-                                                       :type unsupported-base})))
-                                          type (types/normalize-sql-type-name raw-type)
-                                          base-type (str/replace type #"\s*\([^)]*\)" "")
-                                          dh-type (or (get types/sql-name->dh-type type)
-                                                      (get types/sql-name->dh-type base-type)
-                                                      :db.type/string)
-                                          vector-typmod (when (= "vector" base-type)
-                                                          (pg-vector/parse-typmod type))]]
-                                (cond-> {:db/ident (keyword table name)
-                                         :db/valueType dh-type
-                                         :db/cardinality :db.cardinality/one}
+            schema-and-constraint-data (vec (mapcat
+                                             (fn [{:keys [op columns]}]
+                                               (case op
+                                                 :add-column
+                                                 (for [{:keys [name]} columns
+                                                       :let [{:keys [type storage-ident base-type typmod
+                                                                     type-object normalized-type]}
+                                                             (get add-spec-by-name name)
+                                                             raw-type type
+                                                             unsupported-base (str/replace raw-type #"\s*\([^)]*\)" "")
+                                                             _ (when (types/unsupported-input-type? unsupported-base)
+                                                                 (throw (ex-info
+                                                                         (str "type \"" unsupported-base
+                                                                              "\" is not supported until its PostgreSQL input parser is implemented")
+                                                                         {:error :feature-not-supported
+                                                                          :sqlstate "0A000"
+                                                                          :type unsupported-base})))
+                                                             dh-type (or (get types/sql-name->dh-type normalized-type)
+                                                                         (get types/sql-name->dh-type base-type)
+                                                                         :db.type/string)
+                                                             type-kind (:datahike.pg.object/kind type-object)
+                                                             type-name (:datahike.pg.object/name type-object)]]
+                                                   (cond-> {:db/ident storage-ident
+                                                            :db/valueType dh-type
+                                                            :db/cardinality :db.cardinality/one}
                                   ;; The SAME hint CREATE TABLE records.
                                   ;; This used to cover json/jsonb only,
                                   ;; so a column added by ALTER as `date`
                                   ;; or `smallint` reported its storage
                                   ;; type (timestamp / int8) forever.
-                                  (ddl/pg-type-hint base-type false)
-                                  (assoc :pg/type
-                                         (ddl/pg-type-hint base-type false))
-                                  vector-typmod (assoc :pg/typmod vector-typmod)))
+                                                     (ddl/pg-type-hint base-type false)
+                                                     (assoc :pg/type
+                                                            (ddl/pg-type-hint base-type false))
+                                                     (= :enum type-kind)
+                                                     (assoc :datahike.pg/enum-of type-name)
+                                                     (= :domain type-kind)
+                                                     (assoc :datahike.pg/domain-of type-name)
+                                                     (= :composite-type type-kind)
+                                                     (assoc :pg/type type-name)
+                                                     typmod (assoc :pg/typmod typmod)))
                               ;; PK/UNIQUE on an existing column: upgrade the
                               ;; attribute — datahike's index-backfill migration
                               ;; populates AVET for pre-existing datoms and
@@ -8146,24 +9371,56 @@
                               ;; A composite key can't map to per-attr
                               ;; uniqueness (that would over-constrain), so its
                               ;; members get :db/index only.
-                              (:add-primary-key :add-unique)
-                              (let [single? (= 1 (count columns))
-                                    unique-kw (if (= op :add-primary-key)
-                                                :db.unique/identity
-                                                :db.unique/value)]
-                                (for [col columns
-                                      :let [attr (keyword table col)]
-                                      :when (contains? schema attr)]
-                                  (if single?
-                                    {:db/ident attr :db/unique unique-kw}
-                                    {:db/ident attr :db/index true})))
-                              nil))
-                          operations))
-            tx-data (if (seq tx-data)
+                                                 (:add-primary-key :add-unique)
+                                                 (let [single? (= 1 (count columns))
+                                                       unique-kw (if (= op :add-primary-key)
+                                                                   :db.unique/identity
+                                                                   :db.unique/value)]
+                                                   (for [col columns
+                                                         :let [attr (or (:datahike.pg.column/storage-ident
+                                                                         (catalog-objects/column-by-name
+                                                                          db relation-oid col))
+                                                                        (keyword table col))]
+                                                         :when (contains? schema attr)]
+                                                     (if single?
+                                                       {:db/ident attr :db/unique unique-kw}
+                                                       {:db/ident attr :db/index true})))
+                                                 nil))
+                                             operations))
+            attnum-data
+            (when first-attnum
+              (catalog-objects/create-columns-tx
+               relation-oid
+               (map #(select-keys % [:attnum :name :storage-ident
+                                     :type-oid :typmod])
+                    added-column-specs)))
+            inherited-column-data
+            (inherited-add-column-tx-data
+             db table
+             (map #(assoc % :relation-oid relation-oid)
+                  added-column-specs))
+            hint-data
+            (keep (fn [{:keys [name storage-ident]}]
+                    (when (not= storage-ident (keyword table name))
+                      {:datahike.pg/for-ident storage-ident
+                       :datahike.pg/column name}))
+                  added-column-specs)
+            lifecycle-data
+            (mapcat (fn [{:keys [op] :as operation}]
+                      (case op
+                        :drop-column
+                        (drop-column-tx-data db table relation-oid operation)
+                        :rename-column
+                        (rename-column-tx-data db table relation-oid operation)
+                        nil))
+                    operations)
+            tx-data (into schema-and-constraint-data
+                          (concat attnum-data inherited-column-data
+                                  hint-data lifecycle-data))
+            tx-data (if (and relation-oid (seq tx-data))
                       (into tx-data
-                            (when-let [oid (pgs/table-oid db table)]
-                              (catalog-objects/bump-revision-tx
-                               db catalog-objects/pg-class-oid oid)))
+                            (catalog-objects/bump-revision-tx
+                             db catalog-objects/pg-class-oid relation-oid))
                       tx-data)]
         (if (seq tx-data)
           (try
@@ -8203,6 +9460,13 @@
         ;; attr (see table-row-eids for the NULL-first-column history).
         data-eids (when (seq table-attrs)
                     (table-row-eids db table))
+        inheritance-eids
+        (when (get db-schema :__inherit__/child)
+          (mapv first
+                (d/q '{:find [?inheritance]
+                       :in [$ ?child]
+                       :where [[?inheritance :__inherit__/child ?child]]}
+                     db table)))
         ;; Retract all data entities
         data-tx-data (mapv (fn [eid] [:db/retractEntity eid]) (or data-eids []))
         ;; Retract the schema attribute definitions themselves
@@ -8238,15 +9502,47 @@
                              db ident))))
               db-schema)
         secondary-tx-data
-        (mapv (fn [entity-id] [:db/retractEntity entity-id])
+        (keep (fn [entity-id]
+                (let [ident (:db/ident (d/entity db entity-id))
+                      object (when ident
+                               (catalog-objects/object-by-identity
+                                db catalog-objects/pg-class-oid
+                                catalog-objects/public-namespace-oid (name ident)))]
+                  (when (not= entity-id (:db/id object))
+                    [:db/retractEntity entity-id])))
               (into declared-index-eids legacy-secondary-eids))
+        index-object-tx-data
+        (mapcat
+         (fn [entity-id]
+           (when-let [ident (:db/ident (d/entity db entity-id))]
+             (let [object (catalog-objects/object-by-identity
+                           db catalog-objects/pg-class-oid
+                           catalog-objects/public-namespace-oid (name ident))]
+               (when (= :index (:datahike.pg.object/kind object))
+                 (catalog-objects/drop-object-tx
+                  db catalog-objects/pg-class-oid
+                  (:datahike.pg.object/oid object))))))
+         (into declared-index-eids legacy-secondary-eids))
         object-tx-data
         (when-let [oid (pgs/table-oid db table)]
-          (catalog-objects/drop-object-tx
-           db catalog-objects/pg-class-oid oid))
+          (let [row-type
+                (catalog-objects/object-by-identity
+                 db catalog-objects/pg-type-oid
+                 catalog-objects/public-namespace-oid table)]
+            (concat
+             (catalog-objects/drop-relation-columns-tx db oid)
+             (when (= :row-type (:datahike.pg.object/kind row-type))
+               (catalog-objects/drop-object-tx
+                db catalog-objects/pg-type-oid
+                (:datahike.pg.object/oid row-type)))
+             (catalog-objects/drop-object-tx
+              db catalog-objects/pg-class-oid oid))))
         all-tx-data (into data-tx-data
-                          (concat (filter some? schema-tx-data)
+                          (concat (map #(vector :db/retractEntity %)
+                                       inheritance-eids)
+                                  (filter some? schema-tx-data)
                                   secondary-tx-data
+                                  index-object-tx-data
                                   object-tx-data))]
     all-tx-data))
 
@@ -8272,6 +9568,29 @@
             db (if (:in-tx? @tx-state)
                  (:speculative-db @tx-state)
                  (d/db conn))
+            table-set (set tables)
+            _ (doseq [table tables
+                      :let [object (catalog-objects/object-by-identity
+                                    db catalog-objects/pg-class-oid
+                                    catalog-objects/public-namespace-oid table)]
+                      :when (and object
+                                 (not= :table (:datahike.pg.object/kind object)))]
+                (throw (ex-info (str "\"" table "\" is not a table")
+                                {:error :wrong-object-type :sqlstate "42809"})))
+            _ (doseq [table tables
+                      child (map first
+                                 (d/q '{:find [?child]
+                                        :in [$ ?parent]
+                                        :where [[?inheritance :__inherit__/parent ?parent]
+                                                [?inheritance :__inherit__/child ?child]]}
+                                      db table))
+                      :when (not (contains? table-set child))]
+                (throw (ex-info
+                        (str "cannot drop table " table
+                             " because table " child " depends on it")
+                        {:error :dependent-objects-still-exist
+                         :sqlstate "2BP01"
+                         :table table :dependent-table child})))
             tx-data (into [] (mapcat #(drop-table-tx-data db %)) tables)
             result (if (:in-tx? @tx-state)
                      (execute-ddl-in-tx tx-state tx-data "DROP TABLE")
@@ -8292,17 +9611,40 @@
 
 (defn- exec-ddl-drop-sequence
   [ctx parsed]
-  (let [{:keys [conn]} ctx]
+  (let [{:keys [conn tx-state]} ctx]
     (try
       (let [seq-name (:seq-name parsed)
-            db (d/db conn)
+            db (if (:in-tx? @tx-state) (:speculative-db @tx-state) (d/db conn))
             seq-eid (ffirst (d/q '{:find [?e]
                                    :where [[?e :__seq__/name ?n]]
                                    :in [$ ?n]}
-                                 db seq-name))]
-        (when seq-eid
-          (transact-recorded! conn [[:db/retractEntity seq-eid]]))
-        (empty-result "DROP SEQUENCE"))
+                                 db seq-name))
+            object (catalog-objects/object-by-identity
+                    db catalog-objects/pg-class-oid
+                    catalog-objects/public-namespace-oid seq-name)
+            tx-data (into (cond-> [] seq-eid (conj [:db/retractEntity seq-eid]))
+                          (when (= :sequence (:datahike.pg.object/kind object))
+                            (catalog-objects/drop-object-tx
+                             db catalog-objects/pg-class-oid
+                             (:datahike.pg.object/oid object))))]
+        (cond
+          (and (nil? seq-eid) (nil? object) (:if-exists? parsed))
+          (empty-result "DROP SEQUENCE")
+
+          (and object (not= :sequence (:datahike.pg.object/kind object)))
+          (throw (ex-info (str "\"" seq-name "\" is not a sequence")
+                          {:error :wrong-object-type :sqlstate "42809"}))
+
+          (and (nil? seq-eid) (nil? object))
+          (throw (ex-info (str "sequence \"" seq-name "\" does not exist")
+                          {:error :undefined-table :sqlstate "42P01"}))
+
+          (:in-tx? @tx-state)
+          (execute-ddl-in-tx tx-state tx-data "DROP SEQUENCE")
+
+          :else
+          (do (when (seq tx-data) (transact-recorded! conn tx-data))
+              (empty-result "DROP SEQUENCE"))))
       (catch Exception e
         (classified-error "DROP SEQUENCE error: " e)))))
 
@@ -8358,7 +9700,7 @@
                       :find-aliases find-aliases}))
         executed (mapv exec-sub sub-results)
         find-aliases (vec (:find-aliases (first executed)))
-        wire-oids (int-array (map int result-oids))
+        wire-oids (int-array (map types/oid->wire-int result-oids))
         ;; Combine results based on operation type
         combined (case op
                    :union-all (mapcat :results executed)
@@ -8571,8 +9913,19 @@
                   ;; explicitly rather than leaking Datahike schema internals.
                   (throw (errors/pg-error :undefined-table
                                           {:table (:table s)})))
+              defaults (stmt/insert-sequence-defaults db-now (:table s))
+              rows (mapv (fn [row]
+                           (reduce-kv
+                            (fn [row attr sequence-name]
+                              (if (contains? row attr)
+                                row
+                                (assoc row attr
+                                       {:fn :nextval :seq-name sequence-name
+                                        :generated-default? true})))
+                            row defaults))
+                         rows)
+              rows (sql/resolve-nextvals! rows #(nextval! conn %))
               tx-data' (-> rows
-                           (auto-populate-identity (:table s) db-now)
                            (apply-column-constraints (:table s) (:ns s) db-now))]
           (transact-recorded! conn tx-data')
           (swap! copy-state #(-> %
@@ -8647,7 +10000,7 @@
   "Rewrite a SQL parse from session-visible temp names to the unique physical
    namespaces stored in Datahike. Literal strings are left alone; only schema
    keywords and structural table-name fields are rewritten."
-  [parsed temp-tables session-id]
+  [parsed temp-tables session-id db]
   (let [logical (:table-name parsed)
         new-temp? (and (:temp? parsed)
                        logical
@@ -8658,6 +10011,25 @@
                             new-temp? (assoc logical
                                              (temp-storage-name session-id logical)))
         rewrite-name #(get logical->physical % %)
+        new-sequences (set (map #(str logical "_" % "_seq") (:identity-cols parsed)))
+        sequence-names (concat
+                        new-sequences
+                        (when (get (:schema db) :__seq__/name)
+                          (map first (d/q '{:find [?name]
+                                            :where [[?e :__seq__/name ?name]]} db))))
+        sequence-mapping
+        (into {}
+              (for [[logical physical] logical->physical
+                    sequence-name sequence-names
+                    :let [physical-prefix (str physical "_")
+                          logical-prefix (str logical "_")]
+                    :when (or (str/starts-with? sequence-name physical-prefix)
+                              (and new-temp? (contains? new-sequences sequence-name)
+                                   (str/starts-with? sequence-name logical-prefix)))]
+                (if (str/starts-with? sequence-name physical-prefix)
+                  [(str logical-prefix (subs sequence-name (count physical-prefix))) sequence-name]
+                  [sequence-name (str physical-prefix (subs sequence-name (count logical-prefix)))])))
+        rewritten-maps (java.util.IdentityHashMap.)
         rewritten
         (letfn [(rewrite [x]
                   (cond
@@ -8670,22 +10042,31 @@
                     (keyword (rewrite-name (namespace x)) (name x))
 
                     (map? x)
-                    (reduce-kv
-                     (fn [m k v]
-                       (let [v (rewrite v)]
-                         (assoc m (rewrite k)
-                                (cond
-                                  (and (string? v) (table-reference-key? k))
-                                  (rewrite-name v)
+                    (if (.containsKey rewritten-maps x)
+                      (.get rewritten-maps x)
+                      (let [result (reduce-kv
+                                    (fn [m k v]
+                                      (let [v (rewrite v)]
+                                        (assoc m (rewrite k)
+                                               (cond
+                                                 (and (string? v)
+                                                      (contains? #{:seq-name :__seq__/name :pg/default-arg :pg/default-value} k)
+                                                      (contains? sequence-mapping v))
+                                                 (get sequence-mapping v)
 
-                                  (and (sequential? v) (table-reference-key? k))
-                                  (mapv #(if (string? %) (rewrite-name %) %) v)
+                                                 (and (string? v) (table-reference-key? k))
+                                                 (rewrite-name v)
 
-                                  (= k :table-aliases)
-                                  (update-vals v rewrite-name)
+                                                 (and (sequential? v) (table-reference-key? k))
+                                                 (mapv #(if (string? %) (rewrite-name %) %) v)
 
-                                  :else v))))
-                     (empty x) x)
+                                                 (= k :table-aliases)
+                                                 (update-vals v rewrite-name)
+
+                                                 :else v))))
+                                    (empty x) x)]
+                        (.put rewritten-maps x result)
+                        result))
 
                     (vector? x) (mapv rewrite x)
                     (set? x) (into (empty x) (map rewrite) x)
@@ -8732,8 +10113,78 @@
     ;; sessions with no temp namespace. Rewriting is only needed once a temp
     ;; table exists or for the CREATE that introduces one.
     (if (or (seq mapping) (:temp? parsed))
-      (physicalize-temp-parse parsed temp-tables session-id)
+      (physicalize-temp-parse parsed temp-tables session-id db)
       parsed)))
+
+(defonce ^:private fallback-unique-admissions (atom {}))
+
+(defn- unique-admission-key [conn]
+  (let [config (dbi/-config (d/db conn))]
+    [(get-in config [:store :id]) (:branch config)]))
+
+(defn- forget-unique-admissions! [admissions store-id branch]
+  (swap! admissions
+         (fn [entries]
+           (into {}
+                 (remove (fn [[[sid b] _]]
+                           (and (= sid store-id)
+                                (or (nil? branch) (= b branch)))))
+                 entries))))
+
+(defn- admit-unique-index-enforcement!
+  "Install and order the durable UNIQUE guard before exposing a store/branch.
+
+   Promise entries make concurrent first clients share one barrier and one
+   descriptor scan. Failed admissions are evicted so an operator can repair
+   the store and retry. A remote Kabel reader cannot install a process-local
+   predicate in its writer and is rejected until writer-side guard deployment
+   exists."
+  [conn admissions]
+  (let [db (d/db conn)
+        config (dbi/-config db)
+        store-id (get-in config [:store :id])
+        writer-backend (get-in config [:writer :backend])
+        _store-id (when-not store-id
+                    (throw (ex-info "UNIQUE enforcement needs a durable Datahike store id"
+                                    {:error :object-not-in-prerequisite-state
+                                     :sqlstate "55000"})))
+        _writer-backend (when-not (= :self writer-backend)
+                          (throw (ex-info
+                                  "UNIQUE enforcement cannot install its guard in a remote writer"
+                                  {:error :object-not-in-prerequisite-state
+                                   :sqlstate "55000"
+                                   :writer-backend writer-backend})))
+        ;; Check the guard even on a cache hit. The cache only avoids repeated
+        ;; scans; it is not evidence that a process-local hook remains present.
+        guard-state (tx-preds/ensure-tx-pred!
+                     store-id unique-constraints/predicate-id
+                     unique-constraints/validate-report!)
+        key (unique-admission-key conn)
+        candidate {:writer (:writer db) :result (promise)}
+        selected (get (swap! admissions
+                             #(if (and (= :present guard-state)
+                                       (contains? % key)
+                                       (identical? (:writer db) (:writer (get % key))))
+                                % (assoc % key candidate)))
+                      key)]
+    (if (identical? candidate selected)
+      (try
+        ;; The guard sees one fully migrated report, including when a sibling
+        ;; branch installed the store-scoped predicate before this admission.
+        (ensure-pg-schema! conn)
+        (let [barrier-db (d/writer-barrier conn)]
+          (unique-constraints/validate-db! barrier-db))
+        (deliver (:result candidate) {:ok true})
+        true
+        (catch Throwable e
+          (deliver (:result candidate) {:error e})
+          (swap! admissions #(if (identical? candidate (get % key))
+                               (dissoc % key)
+                               %))
+          (throw e)))
+      (let [{:keys [error]} @(:result selected)]
+        (when error (throw error))
+        true))))
 
 (defn make-query-handler
   "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
@@ -8785,7 +10236,8 @@
                                               secondary-index-build-timeout-ms
                                               tx-wrap]
                                        :as opts}]]
-  (ensure-pg-schema! conn)
+  (admit-unique-index-enforcement!
+   conn (or (:unique-admissions opts) fallback-unique-admissions))
   (let [silently-accept (resolve-silently-accept opts)
         max-result-rows (normalize-max-result-rows
                          (get opts :max-result-rows ::default))
@@ -9179,7 +10631,8 @@
                 items (returning-items (:returning parsed) db table-ns
                                        (:alias parsed) schema)
                 names (mapv :name items)
-                oids (int-array (map #(int (or (:oid %) PgWireServer/OID_TEXT)) items))]
+                oids (int-array (map #(types/oid->wire-int
+                                       (or (:oid %) PgWireServer/OID_TEXT)) items))]
             (PgWireServer$QueryResult.
              (into-array String names)
              oids
@@ -9274,7 +10727,7 @@
                         all-oids (into (vec oids) (map win-oid) wspecs)
                         vis (window-projection-indices aliases wspecs)]
                     [(mapv #(nth all-aliases %) vis)
-                     (int-array (map #(int (nth all-oids %)) vis))])
+                     (int-array (map #(types/oid->wire-int (nth all-oids %)) vis))])
                   [aliases oids])
                 [aliases oids]
                 (if-let [ces (:compound-exprs parsed)]
@@ -9283,7 +10736,7 @@
                                        (repeat (count ces) PgWireServer/OID_TEXT))
                         vis (stmt/compound-projection-indices all-aliases ces)]
                     [(mapv #(nth all-aliases %) vis)
-                     (int-array (map #(int (nth all-oids %)) vis))])
+                     (int-array (map #(types/oid->wire-int (nth all-oids %)) vis))])
                   [aliases oids])
                 [aliases oids]
                 (if-let [cs (:correlated-subqueries parsed)]
@@ -9297,7 +10750,8 @@
                                                   n-output)
                         o (stmt/correlated-splice vis-oids
                                                   (into {} (map (fn [s] [(:out-pos s)
-                                                                         (int (or (:oid s) PgWireServer/OID_TEXT))]))
+                                                                         (types/oid->wire-int
+                                                                          (or (:oid s) PgWireServer/OID_TEXT))]))
                                                         subqueries)
                                                   n-output)]
                     [a (int-array (map int o))])
@@ -9620,6 +11074,14 @@
                             parsed (retain-select-shape-plan
                                     parsed
                                     (or (::select-shape-plan parsed) parsed))
+                            ;; Validate GENERATED ALWAYS against the translated
+                            ;; row shape while implicit identity values are still
+                            ;; distinguishable nextval markers. Once markers are
+                            ;; resolved they are ordinary longs and provenance is
+                            ;; intentionally gone.
+                            _ (when (= :insert (:type parsed))
+                                (reject-explicit-always-identities!
+                                 (:tx-data parsed) (:table parsed) db))
                             ;; Sibling pass to ParamRef substitution: any
                             ;; `nextval('s')` markers left in tx-data/in-args
                             ;; resolve here against the live conn (PG's
@@ -9683,6 +11145,9 @@
                                    :on-create-database on-create-database
                                    :on-delete-database on-delete-database
                                    :registry-atom registry-atom
+                                   :unique-admissions
+                                   (or (:unique-admissions opts)
+                                       fallback-unique-admissions)
                                    :secondary-index-config secondary-index-config
                                    :secondary-index-build-timeout-ms
                                    secondary-index-build-timeout-ms
@@ -9746,8 +11211,7 @@
                               :ddl-create            (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create ctx parsed))
                               :ddl-create-view       (execute-ddl-invalidating
-                                                      tx-state #(execute-ddl-create-view
-                                                                 (:conn ctx) parsed (:tx-state ctx)))
+                                                      tx-state #(execute-ddl-create-view ctx parsed))
                               :ddl-create-sequence   (execute-ddl-invalidating
                                                       tx-state #(exec-ddl-create-sequence ctx parsed))
                               :ddl-alter-sequence    (execute-ddl-invalidating
@@ -9872,7 +11336,10 @@
   (let [registry-atom (if (instance? clojure.lang.Atom registry-or-atom)
                         registry-or-atom
                         (atom registry-or-atom))
-        opts (assoc opts :registry-atom registry-atom)]
+        unique-admissions (or (:unique-admissions opts) (atom {}))
+        opts (assoc opts
+                    :registry-atom registry-atom
+                    :unique-admissions unique-admissions)]
     (reify PgWireServer$QueryHandlerFactory
       (validateStartup [_ startup-params]
         (let [registry @registry-atom
@@ -9909,6 +11376,7 @@
             (if branch
               (let [branch-conn (connect-branch conn branch)]
                 (try
+                  (admit-unique-index-enforcement! branch-conn unique-admissions)
                   (make-query-handler branch-conn
                                       (assoc handler-opts
                                              :release-conn-on-close? true))
@@ -10120,13 +11588,17 @@
                         (require 'datahike.pg.sql.database)
                         ((resolve 'datahike.pg.sql.database/db-delete-from-template)
                          database-template)))
+        unique-admissions (atom {})
         factory-opts (-> (select-keys opts [:on-query :compat :silently-accept
                                             :dispatch-stats :tx-wrap
                                             :max-result-rows
                                             :secondary-index-config
                                             :secondary-index-build-timeout-ms])
+                         (assoc :unique-admissions unique-admissions)
                          (cond-> on-create (assoc :on-create-database on-create)
                                  on-delete (assoc :on-delete-database on-delete)))
+        _ (doseq [[_ conn] registry]
+            (admit-unique-index-enforcement! conn unique-admissions))
         factory  (make-query-handler-factory registry-atom factory-opts)
         [auth ssl require-tls?] (resolve-wire-security (assoc opts :host host))
         server   (PgWireServer. (int port) ^String host factory auth ssl
@@ -10134,7 +11606,8 @@
     (.start server)
     (println (str "Datahike PgWire server listening on " host ":" port
                   " — databases: " (vec (keys registry))))
-    {:server server :registry-atom registry-atom :port port :host host}))
+    {:server server :registry-atom registry-atom
+     :unique-admissions unique-admissions :port port :host host}))
 
 (defn add-database!
   "Add a Datahike conn to a running pg-datahike server's registry under
@@ -10146,6 +11619,8 @@
    knob, and they share the same atom so either source is visible
    to both."
   [server-result name conn]
+  (admit-unique-index-enforcement!
+   conn (or (:unique-admissions server-result) fallback-unique-admissions))
   (swap! (:registry-atom server-result) assoc name conn))
 
 (defn remove-database!
@@ -10153,6 +11628,10 @@
    Does NOT release the conn or delete the backing store — that's
    the operator's call. Returns the new registry contents."
   [server-result name]
+  (when-let [conn (get @(:registry-atom server-result) name)]
+    (forget-unique-admissions!
+     (or (:unique-admissions server-result) fallback-unique-admissions)
+     (get-in (dbi/-config (d/db conn)) [:store :id]) nil))
   (swap! (:registry-atom server-result) dissoc name))
 
 (defn databases

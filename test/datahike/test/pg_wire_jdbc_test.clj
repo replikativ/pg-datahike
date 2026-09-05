@@ -719,7 +719,10 @@
                        (recur (conj acc [(.getString rs 1) (.getLong rs 2)]))
                        acc))]
           (is (= ["before_savepoint" "after_savepoint"] (mapv first rows)))
-          (is (= 1 (- (second (second rows))
+          ;; CREATE TABLE reserves both the relation OID and its row-type OID.
+          ;; Rolling back to the savepoint must reuse the pair, leaving the
+          ;; next relation two OIDs after the first.
+          (is (= 2 (- (second (second rows))
                       (second (first rows))))))))))
 
 (deftest concurrent-explicit-ddl-gets-40001-and-can-retry

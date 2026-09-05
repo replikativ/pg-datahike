@@ -87,6 +87,35 @@
           (recur (conj acc (mapv #(.getObject rs (int %)) (range 1 (inc n)))))
           acc)))))
 
+(deftest prepared-null-suppresses-column-default
+  (with-open [c (open "&prepareThreshold=1")]
+    (ddl! c "CREATE TABLE nullable_defaults (id int PRIMARY KEY, v int DEFAULT 42)")
+    (with-open [ps (.prepareStatement c "INSERT INTO nullable_defaults VALUES (?,?) ON CONFLICT(id) DO UPDATE SET v=EXCLUDED.v RETURNING v")]
+      (.setInt ps 1 1)
+      (.setNull ps 2 java.sql.Types/INTEGER)
+      (is (= [[nil]] (returned ps)))
+      (.setInt ps 2 7)
+      (is (= [[7]] (returned ps)))
+      (.setNull ps 2 java.sql.Types/INTEGER)
+      (is (= [[nil]] (returned ps))))))
+
+(deftest prepared-identity-defaults-and-explicit-null
+  (with-open [c (open "&prepareThreshold=1")]
+    (ddl! c "CREATE TABLE prepared_ids (id int GENERATED ALWAYS AS IDENTITY, v int)")
+    (with-open [ps (.prepareStatement c "INSERT INTO prepared_ids(v) VALUES (?) RETURNING id")]
+      (.setInt ps 1 7)
+      (is (= [[1]] (returned ps)))
+      (.setInt ps 1 8)
+      (is (= [[2]] (returned ps))))
+    (ddl! c "CREATE TABLE prepared_serial (id serial, v int)")
+    (with-open [ps (.prepareStatement c "INSERT INTO prepared_serial(id,v) VALUES (?,?)")]
+      (.setNull ps 1 java.sql.Types/INTEGER)
+      (.setInt ps 2 9)
+      (let [failure (try (.executeUpdate ps) nil
+                         (catch java.sql.SQLException e e))]
+        (is (= "23502" (some-> failure .getSQLState)))))
+    (is (= [[1]] (rows c "INSERT INTO prepared_serial(v) VALUES (10) RETURNING id")))))
+
 (deftest self-conflicts-follow-postgres-command-cardinality
   (with-open [c (open)]
     (ddl! c "CREATE TABLE selfconflict (id INT PRIMARY KEY, v INT)")
@@ -255,11 +284,9 @@
 
 (deftest param-insert-select-on-conflict
   (testing "INSERT … SELECT $1, $2 … ON CONFLICT (the FROM-less SELECT row)"
-    ;; The INSERT … SELECT arm of translate-insert has its own ON CONFLICT
-    ;; tx-fn, with the same closure problem. Replaying an identical row is
-    ;; what this pins — that arm matches conflicts on ALL inserted columns
-    ;; and ignores the conflict target, a separate pre-existing limitation
-    ;; this change does not address.
+    ;; INSERT … SELECT and VALUES share one ON CONFLICT tx-fn. Replaying an
+    ;; identical row pins parameter substitution in the SELECT payload and
+    ;; arbitration on the explicit target.
     (with-open [c (open)]
       (ddl! c "CREATE TABLE note (id BIGINT PRIMARY KEY, title TEXT)")
       (with-open [ps (.prepareStatement
@@ -269,6 +296,26 @@
         (.setLong ps 1 2) (.setString ps 2 "other") (.executeUpdate ps))
       (is (= [[1 "keep"] [2 "other"]]
              (rows c "SELECT id, title FROM note ORDER BY id"))))))
+
+(deftest param-insert-select-update-set-and-where
+  (testing "INSERT SELECT carries parameters from the conflict action into its tx-fn"
+    (with-open [c (open)]
+      (ddl! c "CREATE TABLE note (id BIGINT PRIMARY KEY, title TEXT)"
+            "INSERT INTO note VALUES (1, 'old')")
+      (with-open [ps (.prepareStatement
+                      c (str "INSERT INTO note (id, title) SELECT ?, ? "
+                             "ON CONFLICT (id) DO UPDATE SET title = ? "
+                             "WHERE note.title = ? RETURNING id, title"))]
+        (.setLong ps 1 1)
+        (.setString ps 2 "excluded")
+        (.setString ps 3 "updated")
+        (.setString ps 4 "old")
+        (is (= [[1 "updated"]] (returned ps)))
+        (.setString ps 3 "must-not-apply")
+        (.setString ps 4 "old")
+        (is (= [] (returned ps))))
+      (is (= [[1 "updated"]]
+             (rows c "SELECT id, title FROM note"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Reuse of one server-side prepared statement

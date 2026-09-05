@@ -9,7 +9,8 @@
    clients. Mirrors the role `datahike.pg.arrays/PgArray` plays for arrays."
   (:refer-clojure :exclude [record?])
   (:require [clojure.string :as str]
-            [datahike.pg.arrays :as arr]))
+            [datahike.pg.arrays :as arr]
+            [datahike.pg.types :as types]))
 
 ;; type-oid : the record's own OID (2249 anonymous, else a composite OID)
 ;; fields   : vector of {:oid <field-oid> :value <scalar|nil|PgArray|PgRecord>}
@@ -79,6 +80,7 @@
    keyed by its canonical record_out text. Lets the anonymous-record binary
    encoder recover the per-field OIDs the text alone can't carry."
   [reg-fn ^PgRecord r]
-  (reg-fn (to-pg-text r) (int-array (map :oid (:fields r))))
+  (reg-fn (to-pg-text r)
+          (int-array (map (comp types/oid->wire-int :oid) (:fields r))))
   (doseq [f (:fields r) :when (record? (:value f))]
     (register-layouts! reg-fn (:value f))))

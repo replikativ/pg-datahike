@@ -158,27 +158,34 @@
                       :db/cardinality :db.cardinality/one}
                      {:db/ident :BB/db-row-exists
                       :db/valueType :db.type/boolean
+                      :db/cardinality :db.cardinality/one}
+                     ;; Its Java hash is Integer/MIN_VALUE; Math/abs remains
+                     ;; negative and used to leak that value into pg_class.
+                     {:db/ident :polygenelubricants/db-row-exists
+                      :db/valueType :db.type/boolean
                       :db/cardinality :db.cardinality/one}])
         ((deref (ns-resolve 'datahike.pg.server 'ensure-pg-schema!)) conn)
         (let [db (d/db conn)
               aa (schema/table-oid db "Aa")
               bb (schema/table-oid db "BB")
+              minimum-hash (schema/table-oid db "polygenelubricants")
               next-before (:datahike.pg.catalog/next-oid
                            (objects/catalog-entity db))]
           (is (not= aa bb))
-          (is (some #{objects/first-user-oid} [aa bb]))
+          (is (every? objects/valid-user-oid? [aa bb minimum-hash]))
           (is (true? (:datahike.pg.object/legacy-oid?
                       (objects/object-by-identity
                        db objects/pg-class-oid
                        objects/public-namespace-oid "Aa"))))
           ;; A second startup is a version-checked no-op, not a reseed.
           ((deref (ns-resolve 'datahike.pg.server 'ensure-pg-schema!)) conn)
-          (is (= [aa bb next-before]
+          (is (= [aa bb minimum-hash next-before]
                  [(schema/table-oid (d/db conn) "Aa")
                   (schema/table-oid (d/db conn) "BB")
+                  (schema/table-oid (d/db conn) "polygenelubricants")
                   (:datahike.pg.catalog/next-oid
                    (objects/catalog-entity (d/db conn)))]))
-          (is (= #{"Aa" "BB"}
+          (is (= #{"Aa" "BB" "polygenelubricants"}
                  (set (schema/table-names (:schema (d/db conn)))))))
         (finally
           (d/release conn)
@@ -215,6 +222,95 @@
           (is (= (:oid enum) stored-oid
                  (:datahike.pg.object/oid object)))
           (is (true? (:datahike.pg.object/legacy-oid? object))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest catalog-v1-upgrade-backfills-column-subaddresses-atomically
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+             :schema-flexibility :write :keep-history? false}]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)]
+      (try
+        (let [handler (server/make-query-handler conn)]
+          (.execute handler "CREATE TABLE v1_columns (first integer, second text)")
+          (let [db (d/db conn)
+                oid (schema/table-oid db "v1_columns")
+                column-rows (objects/columns-by-relation db oid)]
+            ;; Construct the exact durable shape of catalog v1: object rows
+            ;; and allocator exist, but no column-subaddress rows do.
+            (d/transact conn
+                        (into [[:db/add (:db/id (objects/catalog-entity db))
+                                :datahike.pg.catalog/version 1]]
+                              (map (fn [column]
+                                     [:db/retractEntity (:db/id column)]))
+                              column-rows))
+            ((deref (ns-resolve 'datahike.pg.server 'ensure-pg-schema!)) conn)
+            (is (= objects/catalog-version
+                   (:datahike.pg.catalog/version
+                    (objects/catalog-entity (d/db conn)))))
+            (is (= [["first" 1] ["second" 2]]
+                   (mapv (juxt :datahike.pg.column/name
+                               :datahike.pg.column/attnum)
+                         (objects/columns-by-relation (d/db conn) oid true))))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest catalog-v1-upgrade-rekeys-columns-when-a-relation-oid-is-invalid
+  (let [cfg {:store {:backend :memory :id (java.util.UUID/randomUUID)}
+             :schema-flexibility :write :keep-history? false}]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)]
+      (try
+        (let [handler (server/make-query-handler conn)]
+          (.execute handler "CREATE TABLE invalid_oid(first integer, second text)")
+          (let [db (d/db conn)
+                relation (objects/object-by-identity
+                          db objects/pg-class-oid objects/public-namespace-oid
+                          "invalid_oid")
+                old-oid (:datahike.pg.object/oid relation)
+                old-address (:datahike.pg.object/address-key relation)
+                marker-eid (ffirst
+                            (d/q '{:find [?marker]
+                                   :where [[?marker :db/ident
+                                            :invalid_oid/db-row-exists]]}
+                                 db))
+                columns (objects/columns-by-relation db old-oid)]
+            ;; Exact v1 shape plus an address-unsafe legacy table OID. v1 has
+            ;; no durable column rows; v1→v2 first creates them at OID 42 and
+            ;; v2→v3 must then move, rather than duplicate, those entities.
+            (d/transact
+             conn
+             (into [[:db/retract (:db/id relation)
+                     :datahike.pg.object/address-key old-address]
+                    [:db/add (:db/id relation)
+                     :datahike.pg.object/address-key
+                     (objects/address-key objects/pg-class-oid 42)]
+                    [:db/add (:db/id relation) :datahike.pg.object/oid 42]
+                    [:db/add marker-eid :pg/table-oid 42]
+                    [:db/add (:db/id (objects/catalog-entity db))
+                     :datahike.pg.catalog/version 1]]
+                   (map (fn [column] [:db/retractEntity (:db/id column)]))
+                   columns))
+            ((deref (ns-resolve 'datahike.pg.server 'ensure-pg-schema!)) conn)
+            (let [upgraded (d/db conn)
+                  new-oid (schema/table-oid upgraded "invalid_oid")
+                  upgraded-columns (objects/columns-by-relation upgraded new-oid)]
+              (is (objects/valid-user-oid? new-oid))
+              (is (not= 42 new-oid))
+              (is (= [["first" 1] ["second" 2]]
+                     (mapv (juxt :datahike.pg.column/name
+                                 :datahike.pg.column/attnum)
+                           upgraded-columns)))
+              (is (nil? (objects/column-by-attnum upgraded 42 1)))
+              (is (= new-oid
+                     (ffirst
+                      (d/q '{:find [?oid]
+                             :where [[?marker :db/ident
+                                      :invalid_oid/db-row-exists]
+                                     [?marker :pg/table-oid ?oid]]}
+                           upgraded)))))))
         (finally
           (d/release conn)
           (d/delete-database cfg))))))
