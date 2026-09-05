@@ -655,22 +655,11 @@
                         (:uniques constraints)))
         tuple-attrs (into (if multi-pk-tuple [multi-pk-tuple] [])
                           multi-uniques)
-        ;; Allocate a stable PG OID for this table and attach it to the
-        ;; row-marker entity. Used by pg_class.oid / pg_attribute.attrelid
-        ;; so pgjdbc's field-metadata JOIN can resolve column names.
-        ;; Persists with the schema (file-backed databases keep OIDs
-        ;; across restarts; :memory dies with the db). Skip when the
-        ;; row-marker already carries one — CREATE TABLE IF NOT EXISTS
-        ;; re-runs the schema tx, and Datahike rejects changing a
-        ;; cardinality/one attr that's already set on an entity.
-        table-oid-val (when (and db (nil? (pgs/table-oid db table-name)))
-                        (pgs/next-table-oid db))
         ;; Schema tx-data for columns
         schema-tx (into
-                   [(cond-> {:db/ident       (pgs/row-marker-attr table-name)
-                             :db/valueType   :db.type/boolean
-                             :db/cardinality :db.cardinality/one}
-                      table-oid-val (assoc :pg/table-oid table-oid-val))]
+                   [{:db/ident       (pgs/row-marker-attr table-name)
+                     :db/valueType   :db.type/boolean
+                     :db/cardinality :db.cardinality/one}]
                    (for [^ColumnDefinition col columns
                          :let [col-name (params/unquote-ident (.getColumnName col))
                                ^ColDataType cdt (.getColDataType col)

@@ -24,7 +24,8 @@
   (:import [datahike.pg PgParamCodec PgWireServer PgWireServer$PgProtocolException
             PgWireServer$QueryHandlerFactory]
            [java.sql Connection DriverManager PreparedStatement ResultSet
-            SQLException Statement Types]))
+            SQLException Statement Types]
+           [java.util.concurrent CountDownLatch TimeUnit]))
 
 (def jdbc-schema
   [{:db/ident :t/id   :db/valueType :db.type/long   :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
@@ -648,6 +649,103 @@
                (is (= "40001" (.getSQLState e))
                    (str "got " (.getSQLState e) ": " (.getMessage e)))))
         (.rollback a)))))
+
+(deftest concurrent-ddl-allocates-distinct-object-oids
+  (let [ready (CountDownLatch. 2)
+        start (CountDownLatch. 1)
+        create! (fn [table]
+                  (future
+                    (with-conn [c {:preferQueryMode "simple"}]
+                      (.countDown ready)
+                      (.await start)
+                      (with-open [st (.createStatement c)]
+                        (.execute st (str "CREATE TABLE " table " (id integer)"))
+                        :created))))
+        a (create! "concurrent_a")
+        b (create! "concurrent_b")]
+    (is (.await ready 5 TimeUnit/SECONDS))
+    (.countDown start)
+    (is (= :created @a))
+    (is (= :created @b))
+    (with-conn [c {:preferQueryMode "simple"}]
+      (with-open [st (.createStatement c)
+                  rs (.executeQuery
+                      st (str "SELECT COUNT(DISTINCT oid) FROM pg_class "
+                              "WHERE relname IN ('concurrent_a','concurrent_b')"))]
+        (is (.next rs))
+        (is (= 2 (.getInt rs 1)))))))
+
+(deftest concurrent-same-name-ddl-never-merges
+  (let [ready (CountDownLatch. 2)
+        start (CountDownLatch. 1)
+        create! (fn []
+                  (future
+                    (with-conn [c {:preferQueryMode "simple"}]
+                      (.countDown ready)
+                      (.await start)
+                      (try
+                        (with-open [st (.createStatement c)]
+                          (.execute st "CREATE TABLE one_identity (id integer)")
+                          :created)
+                        (catch SQLException e (.getSQLState e))))))
+        a (create!)
+        b (create!)]
+    (is (.await ready 5 TimeUnit/SECONDS))
+    (.countDown start)
+    (is (= #{:created "42P07"} #{@a @b}))
+    (with-conn [c {:preferQueryMode "simple"}]
+      (with-open [st (.createStatement c)
+                  rs (.executeQuery st (str "SELECT COUNT(*) FROM pg_class "
+                                            "WHERE relname = 'one_identity'"))]
+        (is (.next rs))
+        (is (= 1 (.getInt rs 1)))))))
+
+(deftest savepoint-rollback-restores-object-allocator
+  (with-conn [c {:preferQueryMode "simple"}]
+    (.setAutoCommit c false)
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE before_savepoint (id integer)")
+      (let [savepoint (.setSavepoint c)]
+        (.execute st "CREATE TABLE rolled_back_object (id integer)")
+        (.rollback c savepoint))
+      (.execute st "CREATE TABLE after_savepoint (id integer)")
+      (.commit c)
+      (with-open [rs (.executeQuery
+                      st (str "SELECT relname, oid FROM pg_class WHERE relname IN "
+                              "('before_savepoint','rolled_back_object','after_savepoint') "
+                              "ORDER BY oid"))]
+        (let [rows (loop [acc []]
+                     (if (.next rs)
+                       (recur (conj acc [(.getString rs 1) (.getLong rs 2)]))
+                       acc))]
+          (is (= ["before_savepoint" "after_savepoint"] (mapv first rows)))
+          (is (= 1 (- (second (second rows))
+                      (second (first rows))))))))))
+
+(deftest concurrent-explicit-ddl-gets-40001-and-can-retry
+  (with-conn [a {:preferQueryMode "simple"}]
+    (with-conn [b {:preferQueryMode "simple"}]
+      (.setAutoCommit a false)
+      (.setAutoCommit b false)
+      (with-open [sa (.createStatement a)
+                  sb (.createStatement b)]
+        ;; Both speculative transactions initially reserve the same catalog
+        ;; counter slot. PostgreSQL-style explicit transactions do not get the
+        ;; implicit/autocommit retry; one commit must ask the client to retry.
+        (.execute sa "CREATE TABLE explicit_ddl_a (id integer)")
+        (.execute sb "CREATE TABLE explicit_ddl_b (id integer)")
+        (.commit a)
+        (let [failure (try (.commit b) nil (catch SQLException e e))]
+          (is (some? failure))
+          (is (= "40001" (.getSQLState ^SQLException failure))))
+        (.rollback b)
+        (.setAutoCommit b true)
+        (.execute sb "CREATE TABLE explicit_ddl_b (id integer)")
+        (with-open [rs (.executeQuery
+                        sb (str "SELECT COUNT(DISTINCT oid) FROM pg_class "
+                                "WHERE relname IN ('explicit_ddl_a','explicit_ddl_b')"))]
+          (is (.next rs))
+          (is (= 2 (.getInt rs 1))))))))
 
 (deftest test-unique-violation-constraint-fields
   (testing "Primary-key collision raises 23505 and populates constraint fields"

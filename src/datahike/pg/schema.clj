@@ -9,6 +9,7 @@
    Every virtual table gets an implicit 'db_id' column (the entity ID)."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.types :as types]))
 
 (set! *warn-on-reflection* true)
@@ -78,6 +79,11 @@
     ;; on ident entities to tune the SQL-side view; they must not
     ;; themselves appear as virtual tables.
     "datahike.pg" "datahike.pg.index" "pg"})
+
+(defn- internal-namespace? [ns]
+  (or (contains? internal-ns-prefixes ns)
+      (str/starts-with? ns "db.")
+      (str/starts-with? ns "datahike.pg.")))
 
 ;; ============================================================================
 ;; User-facing schema hints
@@ -179,7 +185,7 @@
   (keep (fn [[k v]]
           (when (and (keyword? k)
                      (namespace k)
-                     (not (contains? internal-ns-prefixes (namespace k)))
+                     (not (internal-namespace? (namespace k)))
                      (= :db.type/ref (:db/valueType v))
                      (= :db.cardinality/one (:db/cardinality v)))
             k))
@@ -197,7 +203,7 @@
         (keep (fn [[k v]]
                 (when (and (keyword? k)
                            (namespace k)
-                           (not (contains? internal-ns-prefixes (namespace k)))
+                           (not (internal-namespace? (namespace k)))
                            (= :db.type/ref (:db/valueType v)))
                   [k (:db/cardinality v)])))
         schema))
@@ -400,7 +406,7 @@
       (reduce (fn [acc [ref-attr attr]]
                 (if (and (keyword? attr)
                          (some? (namespace attr))
-                         (not (contains? internal-ns-prefixes (namespace attr))))
+                         (not (internal-namespace? (namespace attr))))
                   (update acc ref-attr (fnil conj #{}) (namespace attr))
                   acc))
               ;; Initialise every ref to empty set so the caller can
@@ -626,42 +632,34 @@
 ;; PG OID allocation starts here. Values below this are PG's
 ;; pre-assigned system OIDs (pg_type built-ins, etc.), which clients may
 ;; assume are stable. User tables get 16384+ to avoid any collision.
-(def ^:const first-user-oid 16384)
+(def ^:const first-user-oid catalog-objects/first-user-oid)
 
 (defn table-oid
-  "The :pg/table-oid attached to this table's row-marker entity, or nil
-   if the table doesn't exist yet or was created before we started
-   allocating OIDs. Datahike's `(:schema db)` only surfaces schema-level
-   attrs (:db/valueType etc.); custom attrs on the ident entity require
-   a Datalog lookup against the db."
+  "The table's authoritative persistent PostgreSQL OID. Prefer the shared
+   object registry and fall back to :pg/table-oid on the row-marker for bare
+   or pre-migration databases. Datahike's schema map only surfaces schema-
+   level attrs; custom attrs on the ident entity require a Datalog lookup."
   [db table-name]
-  (let [q-fn d/q]
-    (ffirst (q-fn '{:find [?oid]
-                    :in [$ ?ident]
-                    :where [[?e :db/ident ?ident]
-                            [?e :pg/table-oid ?oid]]}
-                  db (row-marker-attr table-name)))))
-
-(declare next-user-oid)
-
-(defn next-table-oid
-  "Pick the next unused OID for a table from the shared user-object space."
-  [db]
-  (next-user-oid db))
+  (or (:datahike.pg.object/oid
+       (catalog-objects/object-by-identity
+        db catalog-objects/pg-class-oid
+        catalog-objects/public-namespace-oid table-name))
+      (let [q-fn d/q]
+        (ffirst (q-fn '{:find [?oid]
+                        :in [$ ?ident]
+                        :where [[?e :db/ident ?ident]
+                                [?e :pg/table-oid ?oid]]}
+                      db (row-marker-attr table-name))))))
 
 (defn next-user-oid
-  "Next unused OID in the shared PostgreSQL user-object space. Tables,
-   composite types, and enum types all draw from this allocator because
-   PostgreSQL OIDs are catalog-global, not per object kind."
+  "Deprecated read-only view of the next shared user OID.  DDL must transact
+   the CAS returned by catalog-objects/reserve-user-oid-tx instead of using
+   this value directly."
   [db]
-  (let [used (into #{}
-                   (map first)
-                   (concat
-                    (d/q '{:find [?o] :where [[?e :datahike.pg.composite/oid ?o]]} db)
-                    (d/q '{:find [?o] :where [[?e :datahike.pg.enum/oid ?o]]} db)
-                    (d/q '{:find [?o] :where [[?e :pg/table-oid ?o]]} db)))
-        mx (if (seq used) (apply max used) (dec first-user-oid))]
-    (inc mx)))
+  (:oid (catalog-objects/reserve-user-oid-tx db)))
+
+(defn next-table-oid [db]
+  (next-user-oid db))
 
 (defn next-composite-oid
   "Backward-compatible name for the shared user OID allocator."
@@ -691,7 +689,12 @@
                 db)
            (map (fn [[name values]]
                   {:name name
-                   :oid (long (get oids name (legacy-enum-oid name)))
+                   :oid (long
+                         (or (:datahike.pg.object/oid
+                              (catalog-objects/object-by-identity
+                               db catalog-objects/pg-type-oid
+                               catalog-objects/public-namespace-oid name))
+                             (get oids name (legacy-enum-oid name))))
                    :values (->> (clojure.string/split-lines values)
                                 (remove clojure.string/blank?)
                                 vec)}))
@@ -740,7 +743,13 @@
                         [?e :datahike.pg.composite/fields ?f]]}
               db)
          (mapv (fn [[n oid fields-str]]
-                 {:name n :oid (long oid)
+                 {:name n
+                  :oid (long
+                        (or (:datahike.pg.object/oid
+                             (catalog-objects/object-by-identity
+                              db catalog-objects/pg-type-oid
+                              catalog-objects/public-namespace-oid n))
+                            oid))
                   :fields (->> (clojure.string/split-lines fields-str)
                                (remove clojure.string/blank?)
                                (mapv (fn [line]
@@ -778,8 +787,7 @@
    or is a SQL row-existence marker."
   [ident]
   (when-let [ns (namespace ident)]
-    (or (contains? internal-ns-prefixes ns)
-        (str/starts-with? ns "db.")
+    (or (internal-namespace? ns)
         (= (name ident) row-marker-col))))
 
 ;; ============================================================================

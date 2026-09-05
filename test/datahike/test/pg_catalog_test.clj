@@ -13,6 +13,7 @@
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.server :as pg]
             [datahike.pg.sql :as sql])
   (:import [datahike.pg PgWireServer$QueryResult]))
@@ -50,6 +51,35 @@
      :rows (mapv vec (.rows r))}))
 
 (defn- rows [sql] (:rows (ex sql)))
+
+(deftest object-registry-backs-table-catalog-lifecycle
+  (is (nil? (:err (ex "CREATE TABLE catalog_identity (id integer)"))))
+  (let [db (d/db *conn*)
+        object (catalog-objects/object-by-identity
+                db catalog-objects/pg-class-oid
+                catalog-objects/public-namespace-oid "catalog_identity")
+        oid (:datahike.pg.object/oid object)]
+    (is (<= catalog-objects/first-user-oid oid))
+    (is (= [[(str oid)]]
+           (rows "SELECT oid FROM pg_class WHERE relname = 'catalog_identity'")))
+    (is (nil? (:err (ex "DROP TABLE catalog_identity"))))
+    (is (nil? (catalog-objects/object-by-address
+               (d/db *conn*) catalog-objects/pg-class-oid oid)))))
+
+(deftest namespace-catalog-comes-from-persistent-registry
+  (is (= #{["11" "pg_catalog"] ["2200" "public"]}
+         (set (rows "SELECT oid, nspname FROM pg_namespace")))))
+
+(deftest create-table-if-not-exists-does-not-consume-an-oid
+  (is (nil? (:err (ex "CREATE TABLE oid_once (id integer)"))))
+  (let [oid (Long/parseLong
+             (ffirst (rows "SELECT oid FROM pg_class WHERE relname = 'oid_once'")))]
+    (is (nil? (:err (ex "CREATE TABLE IF NOT EXISTS oid_once (id integer)"))))
+    (is (nil? (:err (ex "CREATE TABLE oid_after_noop (id integer)"))))
+    (is (= (inc oid)
+           (Long/parseLong
+            (ffirst (rows (str "SELECT oid FROM pg_class "
+                               "WHERE relname = 'oid_after_noop'"))))))))
 
 ;; ============================================================================
 ;; pg_type — type name → OID probes
