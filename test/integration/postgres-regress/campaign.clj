@@ -11,6 +11,9 @@
 (def repo-root (-> here fs/parent fs/parent fs/parent))
 (def campaign (edn/read-string (slurp (fs/file here "campaign.edn"))))
 (def scope (edn/read-string (slurp (fs/file here "scope.edn"))))
+(def routine-trigger-ledger
+  (edn/read-string
+   (slurp (fs/file here "routine-trigger-capabilities.edn"))))
 (def pinned-postgres-source
   (fs/file repo-root ".internal" (str "postgres-" (:postgres-ref campaign))))
 (def postgres-source
@@ -66,6 +69,140 @@
      :unique-line-count (count unique-lines)
      :duplicate-line-claims (- (count line-claims) (count unique-lines))}))
 
+(defn routine-trigger-metrics []
+  (let [capabilities (:capabilities routine-trigger-ledger)
+        evidence (:evidence routine-trigger-ledger)
+        line-claims (for [{:keys [file source-lines status]} evidence
+                          line (range (first source-lines)
+                                      (inc (second source-lines)))]
+                      [status file line])
+        unique-claims (set line-claims)
+        unique-source-lines (set (map rest line-claims))]
+    {:capability-statuses (frequencies (map (comp :status val) capabilities))
+     :evidence-statuses (frequencies (map :status evidence))
+     :evidence-lines-by-status
+     (frequencies (map first unique-claims))
+     :evidence-lines (count unique-source-lines)
+     :duplicate-evidence-line-claims (- (count line-claims)
+                                        (count unique-source-lines))}))
+
+(defn dependency-cycle [capabilities]
+  (loop [remaining (set (keys capabilities))
+         resolved #{}]
+    (if (empty? remaining)
+      nil
+      (let [ready (set (filter #(set/subset? (get-in capabilities [% :requires])
+                                             resolved)
+                               remaining))]
+        (if (empty? ready)
+          remaining
+          (recur (set/difference remaining ready) (into resolved ready)))))))
+
+(defn validate-routine-trigger-ledger! []
+  (let [capabilities (:capabilities routine-trigger-ledger)
+        evidence (:evidence routine-trigger-ledger)
+        capability-ids (set (keys capabilities))
+        capability-statuses #{:target :later :excluded}
+        evidence-statuses #{:target :later :reference-only :admitted}
+        evidence-ids (map :id evidence)
+        duplicate-evidence (->> evidence-ids frequencies
+                                (keep (fn [[id c]] (when (> c 1) id))))]
+    (when-not (= (:postgres-ref campaign)
+                 (:postgres-ref routine-trigger-ledger))
+      (fail! "routine/trigger ledger and campaign must use the same PostgreSQL ref"))
+    (when-not (and (map? capabilities) (seq capabilities)
+                   (every? keyword? (keys capabilities)))
+      (fail! "routine/trigger capabilities must be a nonempty keyword map"))
+    (doseq [[id {:keys [status requires summary]}] capabilities]
+      (when-not (capability-statuses status)
+        (fail! (str "invalid status for capability " id ": " status)))
+      (when-not (and (set? requires) (every? keyword? requires)
+                     (set/subset? requires capability-ids)
+                     (not (requires id)))
+        (fail! (str "invalid dependencies for capability " id ": "
+                    (pr-str requires))))
+      (when-not (and (string? summary) (not (str/blank? summary)))
+        (fail! (str "capability summary must be nonblank for " id)))
+      (let [required-statuses
+            (set (map #(get-in routine-trigger-ledger
+                               [:capabilities % :status])
+                      requires))]
+        (when (and (= :target status)
+                   (not (set/subset? required-statuses #{:target})))
+          (fail! (str "target capability depends on non-target capability: " id)))
+        (when (and (= :later status) (required-statuses :excluded))
+          (fail! (str "later capability depends on excluded capability: " id)))))
+    (when-let [cycle (dependency-cycle capabilities)]
+      (fail! (str "cyclic routine/trigger capability dependencies: "
+                  (pr-str cycle))))
+    (when-not (vector? evidence)
+      (fail! "routine/trigger evidence must be a vector"))
+    (when (seq duplicate-evidence)
+      (fail! (str "duplicate routine/trigger evidence IDs: "
+                  (pr-str duplicate-evidence))))
+    (doseq [{:keys [id file source-lines status capabilities gate test-var] :as item}
+            evidence]
+      (when-not (keyword? id)
+        (fail! (str "routine/trigger evidence ID must be a keyword: "
+                    (pr-str item))))
+      (when-not (evidence-statuses status)
+        (fail! (str "invalid routine/trigger evidence status for " id ": " status)))
+      (when-not (and (set? capabilities) (seq capabilities)
+                     (set/subset? capabilities capability-ids))
+        (fail! (str "unknown or empty capabilities for evidence " id ": "
+                    (pr-str capabilities))))
+      (let [statuses (set (map #(get-in routine-trigger-ledger
+                                        [:capabilities % :status])
+                               capabilities))]
+        (cond
+          (#{:target :admitted} status)
+          (when-not (= #{:target} statuses)
+            (fail! (str status " evidence may use only target capabilities: " id)))
+
+          (= :later status)
+          (when-not (and (statuses :later) (not (statuses :excluded)))
+            (fail! (str "later evidence must name a later and no excluded capability: " id)))
+
+          (= :reference-only status)
+          (when-not (statuses :excluded)
+            (fail! (str "reference-only evidence must name an excluded capability: " id)))))
+      (when-not (and (string? file) (str/ends-with? file ".sql")
+                     (vector? source-lines) (= 2 (count source-lines)))
+        (fail! (str "invalid source declaration for evidence " id)))
+      (let [source (fs/file postgres-source "src" "test" "regress" "sql" file)
+            [start end] source-lines]
+        (when-not (fs/regular-file? source)
+          (fail! (str "missing upstream evidence source: " source)))
+        (let [line-count (count (str/split-lines (slurp source)))]
+          (when-not (and (integer? start) (integer? end)
+                         (pos? start) (<= start end line-count))
+            (fail! (str "invalid source range for evidence " id ": "
+                        source-lines)))))
+      (if (= :admitted status)
+        (let [gate-file (fs/file repo-root gate)
+              normalized-gate (when (string? gate)
+                                (str (fs/normalize gate)))
+              ;; Admission uses an explicit one-evidence-per-test metadata
+              ;; convention, not merely a coincidental deftest name:
+              ;; (deftest ^{:postgres-evidence :evidence-id} test-name ...)
+              test-pattern
+              (when (and (keyword? id) (string? test-var))
+                (re-pattern
+                 (str "(?m)^\\s*\\(deftest\\s+\\^\\{:postgres-evidence\\s+"
+                      (java.util.regex.Pattern/quote (str id))
+                      "\\}\\s+"
+                      (java.util.regex.Pattern/quote test-var)
+                      "(?=\\s|\\[)")))]
+          (when-not (and (string? gate) (not (str/blank? gate))
+                         (str/starts-with? normalized-gate "test/datahike/test/")
+                         (str/ends-with? normalized-gate "_test.clj")
+                         (string? test-var) (not (str/blank? test-var))
+                         (fs/regular-file? gate-file)
+                         (re-find test-pattern (slurp gate-file)))
+            (fail! (str "admitted evidence requires a live gate/test-var: " id))))
+        (when (or gate test-var)
+          (fail! (str "only admitted evidence may declare gate/test-var: " id)))))))
+
 (defn validate-postgres-ref! []
   (let [expected (:postgres-ref campaign)
         allow-unpinned? (= "1" (System/getenv "PG_REGRESS_ALLOW_UNPINNED"))
@@ -99,6 +236,7 @@
 
 (defn validate! []
   (validate-postgres-ref!)
+  (validate-routine-trigger-ledger!)
   (let [_ (when-not (and (map? scope) (every? map? (vals scope)))
             (fail! "scope.edn must map statuses to reason maps"))
         scope-statuses (set (keys scope))
@@ -241,7 +379,10 @@
         application-count (+ campaign-count backlog-count)
         {:keys [mode-counts slice-count slice-file-count gate-file-count
                 claimed-line-count unique-line-count duplicate-line-claims]}
-        (campaign-metrics)]
+        (campaign-metrics)
+        {:keys [capability-statuses evidence-statuses evidence-lines
+                evidence-lines-by-status duplicate-evidence-line-claims]}
+        (routine-trigger-metrics)]
     (println (format "PostgreSQL %d schedule: %d tests"
                      (:postgres-major campaign) scheduled-count))
     (println (format "  campaign     %d" campaign-count))
@@ -258,6 +399,26 @@
                           "%d claimed source lines, %d unique (%d overlapping claims)")
                      slice-count slice-file-count gate-file-count claimed-line-count
                      unique-line-count duplicate-line-claims))
+    (println (format (str "  routines/triggers %d capabilities "
+                          "(target %d, later %d, excluded %d); "
+                          "%d unique upstream provenance lines")
+                     (count (:capabilities routine-trigger-ledger))
+                     (get capability-statuses :target 0)
+                     (get capability-statuses :later 0)
+                     (get capability-statuses :excluded 0)
+                     evidence-lines))
+    (println (format (str "    evidence target %d (%d lines), later %d (%d lines), "
+                          "reference-only %d (%d lines), admitted %d (%d lines); "
+                          "%d duplicate claims")
+                     (get evidence-statuses :target 0)
+                     (get evidence-lines-by-status :target 0)
+                     (get evidence-statuses :later 0)
+                     (get evidence-lines-by-status :later 0)
+                     (get evidence-statuses :reference-only 0)
+                     (get evidence-lines-by-status :reference-only 0)
+                     (get evidence-statuses :admitted 0)
+                     (get evidence-lines-by-status :admitted 0)
+                     duplicate-evidence-line-claims))
     (doseq [status [:backlog :out-of-scope]]
       (let [selected (filter #(= status (:status %)) entries)]
         (println (format "  %-12s %d" (name status) (count selected)))

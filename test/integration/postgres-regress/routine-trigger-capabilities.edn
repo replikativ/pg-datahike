@@ -1,0 +1,166 @@
+{:postgres-ref "REL_17_7"
+
+ ;; A capability is admitted only after its focused gate is recorded here.
+ ;; :target is intended for this campaign, :later is a coherent follow-up
+ ;; category, and :excluded is a PostgreSQL server-extension boundary rather
+ ;; than an implementation shortcut.
+ :capabilities
+ {:object-registry
+  {:status :target :requires #{}
+   :summary "Transactional, class-qualified object identity, namespaces, ownership, revision, and dependencies."}
+  :nested-executor
+  {:status :target :requires #{:object-registry}
+   :summary "A protocol-independent statement executor with one execution context and deterministic effects."}
+  :routine-ddl
+  {:status :target :requires #{:object-registry}
+   :summary "CREATE, ALTER, DROP, replace, overload identity, defaults, and ordered arguments."}
+  :routine-catalogs
+  {:status :target :requires #{:routine-ddl}
+   :summary "Persistent pg_proc/pg_namespace/pg_language and information_schema projections."}
+  :routine-resolution
+  {:status :target :requires #{:routine-ddl}
+   :summary "PostgreSQL-compatible name, search_path, overload, polymorphic, default, and coercion resolution."}
+  :sql-language
+  {:status :target :requires #{:nested-executor :routine-resolution}
+   :summary "String and SQL-standard bodies, scalar/set/table/composite results, multi-statement bodies, and writes."}
+  :plpgsql-core
+  {:status :target :requires #{:nested-executor :routine-resolution}
+   :summary "Blocks, declarations, assignment, conditions, loops, return forms, static SQL, PERFORM, SELECT INTO, RAISE, FOUND, and trigger variables."}
+  :table-trigger-ddl
+  {:status :target :requires #{:routine-ddl}
+   :summary "Persistent trigger identity, dependencies, catalog projection, rename/drop, WHEN, UPDATE OF, and enable state."}
+  :table-row-triggers
+  {:status :target :requires #{:plpgsql-core :table-trigger-ddl}
+   :summary "BEFORE and AFTER row triggers for INSERT, UPDATE, DELETE, COPY, and ON CONFLICT, including row replacement/suppression."}
+  :table-statement-triggers
+  {:status :target :requires #{:plpgsql-core :table-trigger-ddl}
+   :summary "BEFORE and AFTER statement triggers for INSERT, UPDATE, DELETE, and TRUNCATE, including zero-row statements."}
+  :routine-backed-operators
+  {:status :target :requires #{:sql-language}
+   :summary "User-defined operators resolved through the same routine and cast machinery."}
+  :routine-backed-casts
+  {:status :target :requires #{:sql-language}
+   :summary "Function-backed casts with explicit, assignment, and implicit contexts."}
+  :routine-backed-aggregates
+  {:status :target :requires #{:sql-language}
+   :summary "User-defined aggregate transition/final routines over the supported aggregate executor."}
+
+  :view-instead-triggers
+  {:status :later :requires #{:table-row-triggers}
+   :summary "INSTEAD OF row triggers and statement triggers on views."}
+  :transition-tables
+  {:status :later :requires #{:table-statement-triggers}
+   :summary "OLD TABLE and NEW TABLE transition relations."}
+  :constraint-triggers
+  {:status :later :requires #{:table-row-triggers}
+   :summary "Constraint triggers, deferrability, and SET CONSTRAINTS interaction."}
+  :partition-triggers
+  {:status :later :requires #{:table-row-triggers}
+   :summary "Trigger inheritance/cloning and row movement across PostgreSQL partitions."}
+  :event-triggers
+  {:status :later :requires #{:plpgsql-core}
+   :summary "DDL event triggers and their catalog/event-data surface."}
+  :plpgsql-advanced
+  {:status :later :requires #{:plpgsql-core}
+   :summary "Dynamic EXECUTE, cursors, exception subtransactions, diagnostics, and advanced polymorphism."}
+  :routine-security
+  {:status :later :requires #{:routine-ddl :sql-language}
+   :summary "SECURITY DEFINER execution identity, ownership/privilege checks, and leakproof administration."}
+  :replication-trigger-state
+  {:status :later :requires #{:table-trigger-ddl}
+   :summary "ENABLE REPLICA/ALWAYS and session_replication_role firing rules."}
+  :merge-trigger-integration
+  {:status :later :requires #{:table-row-triggers :table-statement-triggers}
+   :summary "MERGE action selection, trigger firing, nested-row conflict detection, and affected-row rules."}
+
+  :native-language-handlers
+  {:status :excluded :requires #{:routine-ddl}
+   :summary "Loading PostgreSQL C/internal language handlers and server shared libraries."}}
+
+ ;; These are provenance claims, not assertions that whole files pass. Each
+ ;; range is validated against the pinned source. :target ranges guide this
+ ;; campaign, :later ranges exercise a coherent later category, and
+ ;; :reference-only ranges establish semantics without entering the product
+ ;; boundary. Add :gate and :test-var only when a range becomes :admitted.
+ :evidence
+ [{:id :sql-basic-catalog-and-calls
+   :file "create_function_sql.sql" :source-lines [23 61]
+   :status :target
+   :capabilities #{:routine-ddl :routine-catalogs :routine-resolution :sql-language}}
+  {:id :sql-null-input-and-deparse
+   :file "create_function_sql.sql" :source-lines [122 153]
+   :status :target
+   :capabilities #{:routine-ddl :routine-catalogs :sql-language}}
+  {:id :sql-standard-bodies-and-writes
+   :file "create_function_sql.sql" :source-lines [157 242]
+   :status :target
+   :capabilities #{:nested-executor :routine-ddl :routine-catalogs :sql-language}}
+  {:id :sql-parameters-defaults-and-dependencies
+   :file "create_function_sql.sql" :source-lines [245 311]
+   :status :target
+   :capabilities #{:object-registry :routine-ddl :routine-catalogs :routine-resolution :sql-language}}
+  {:id :sql-overloads-and-replacement
+   :file "create_function_sql.sql" :source-lines [314 328]
+   :status :target
+   :capabilities #{:routine-ddl :routine-resolution}}
+  {:id :sql-set-void-write-and-validation
+   :file "create_function_sql.sql" :source-lines [331 416]
+   :status :target
+   :capabilities #{:nested-executor :routine-ddl :routine-resolution :sql-language}}
+  {:id :sql-security-and-leakproof
+   :file "create_function_sql.sql" :source-lines [64 119]
+   :status :later
+   :capabilities #{:routine-ddl :routine-catalogs :routine-security}}
+
+  {:id :trigger-native-language-fixture
+   :file "triggers.sql" :source-lines [13 36]
+   :status :reference-only
+   :capabilities #{:native-language-handlers}}
+  {:id :trigger-core-row-events
+   :file "triggers.sql" :source-lines [153 288]
+   :status :reference-only
+   :capabilities #{:native-language-handlers :plpgsql-core :table-trigger-ddl :table-row-triggers}}
+  {:id :trigger-statement-copy-when-and-catalogs
+   :file "triggers.sql" :source-lines [289 404]
+   :status :target
+   :capabilities #{:nested-executor :table-trigger-ddl :table-row-triggers :table-statement-triggers}}
+  {:id :trigger-update-of-order-and-dependencies
+   :file "triggers.sql" :source-lines [405 479]
+   :status :target
+   :capabilities #{:object-registry :plpgsql-core :table-trigger-ddl :table-row-triggers :table-statement-triggers}}
+  {:id :trigger-enable-state
+   :file "triggers.sql" :source-lines [487 508]
+   :status :target
+   :capabilities #{:table-trigger-ddl :table-row-triggers :table-statement-triggers}}
+  {:id :trigger-replication-and-ri-enable-state
+   :file "triggers.sql" :source-lines [509 525]
+   :status :later
+   :capabilities #{:constraint-triggers :replication-trigger-state}}
+  {:id :trigger-data-and-tg-variables
+   :file "triggers.sql" :source-lines [528 599]
+   :status :target
+   :capabilities #{:plpgsql-core :table-trigger-ddl :table-row-triggers}}
+  {:id :trigger-row-values-and-snapshot
+   :file "triggers.sql" :source-lines [601 704]
+   :status :target
+   :capabilities #{:nested-executor :plpgsql-core :table-trigger-ddl :table-row-triggers}}
+  {:id :trigger-views
+   :file "triggers.sql" :source-lines [707 864]
+   :status :later
+   :capabilities #{:view-instead-triggers}}
+  {:id :trigger-recursion
+   :file "triggers.sql" :source-lines [1057 1119]
+   :status :later
+   :capabilities #{:nested-executor :plpgsql-core :plpgsql-advanced :table-row-triggers}}
+  {:id :trigger-nested-dml
+   :file "triggers.sql" :source-lines [1121 1188]
+   :status :target
+   :capabilities #{:nested-executor :plpgsql-core :table-row-triggers :table-statement-triggers}}
+  {:id :trigger-merge-nested-row-conflicts
+   :file "triggers.sql" :source-lines [1189 1196]
+   :status :later
+   :capabilities #{:merge-trigger-integration}}
+  {:id :trigger-nested-delete-and-self-reference
+   :file "triggers.sql" :source-lines [1197 1278]
+   :status :target
+   :capabilities #{:nested-executor :plpgsql-core :table-row-triggers :table-statement-triggers}}]}

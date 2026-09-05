@@ -91,6 +91,15 @@ Such admitted statement groups are recorded as `:strict-slices` with their
 exact upstream line range and executable Clojure test var; campaign validation
 fails if either provenance or gate goes stale.
 
+The routine/trigger expansion has a second validated ledger in
+`routine-trigger-capabilities.edn`. It records category dependencies and exact
+PostgreSQL 17 evidence ranges without treating an entire regression file as a
+coverage claim. A range becomes `:admitted` only when it names a live focused
+gate under `test/datahike/test/`, whose `deftest` explicitly declares
+`^{:postgres-evidence :evidence-id}` metadata. The implementation invariants
+and product boundary are documented in
+[`doc/routines-and-triggers.md`](../../../doc/routines-and-triggers.md).
+
 Tests that consume relations created by another upstream file declare it with
 `:requires`. The wave runner schedules each prerequisite once, before its first
 consumer. For example, selecting the integer suites also runs PostgreSQL's
@@ -207,6 +216,10 @@ have admitted.
 Do not reduce the diff count by merely matching diagnostic wording. Promote
 high-value behavior into focused unit or SQLLogic tests, and treat silent wrong
 answers and internal failures ahead of explicitly unsupported surface.
+
+The JDBC differential runner also compares update counts, result-set labels
+and types, SQLSTATE, and stable structured error fields. Equal row text or the
+fact that both engines failed is not sufficient evidence of compatibility.
 
 ## PostgreSQL source map
 
