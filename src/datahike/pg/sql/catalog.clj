@@ -23,6 +23,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
@@ -838,9 +839,26 @@
            :pg_attribute/attisdropped false
            (pgs/row-marker-attr "pg_attribute") true}))))
     "pg_namespace"
-    [{:pg_namespace/oid 2200 :pg_namespace/nspname "public"
-      :pg_namespace/nspowner pg-role-oid
-      (pgs/row-marker-attr "pg_namespace") true}]
+    (let [namespaces (catalog-objects/objects-by-kind cte-db :namespace)]
+      (if (seq namespaces)
+        (mapv (fn [namespace]
+                {:pg_namespace/oid (:datahike.pg.object/oid namespace)
+                 :pg_namespace/nspname (:datahike.pg.object/name namespace)
+                 :pg_namespace/nspowner
+                 (:datahike.pg.object/owner-oid namespace)
+                 (pgs/row-marker-attr "pg_namespace") true})
+              (sort-by (fn [namespace]
+                         [(if (= "public"
+                                 (:datahike.pg.object/name namespace))
+                            0 1)
+                          (:datahike.pg.object/oid namespace)])
+                       namespaces))
+        ;; Bare translator callers can supply a DB that has not passed through
+        ;; make-query-handler/ensure-pg-schema! yet.
+        [{:pg_namespace/oid catalog-objects/public-namespace-oid
+          :pg_namespace/nspname "public"
+          :pg_namespace/nspowner pg-role-oid
+          (pgs/row-marker-attr "pg_namespace") true}]))
     "pg_roles"
     [{:pg_roles/oid pg-role-oid :pg_roles/rolname pg-role-name
       :pg_roles/rolsuper true :pg_roles/rolinherit true
