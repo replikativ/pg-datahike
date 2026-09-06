@@ -64,8 +64,28 @@ The narrowed Datahike dependency passed its complete non-spec JVM matrix
 (2,886 tests / 30,867 assertions), specification-instrumented suite
 (1,284 / 14,625), and CLJS suite (294 / 1,839), all with zero failures.
 Java binding compilation and the TypeScript thin-client build also passed.
-All 18 dependency CI checks passed. PR #1077 is ready for review; the larger
-barrier proposal #1074 is closed as superseded, with its branch preserved.
+All 18 dependency CI checks passed on the initial candidate `657375c8`.
+The larger barrier proposal #1074 is closed as superseded, with its branch
+preserved.
+
+Follow-up `8919431e` replaces the all-values uniqueness set with an ordered
+scan of the completed candidate AVET. Already indexed attributes reuse their
+index; newly indexed attributes are built before validation. The scan retains
+only the previous datom and uses index value comparison, including arrays.
+This removes the O(distinct values) validation set, but does not make the
+whole synchronous index build bounded-heap or asynchronous.
+
+The follow-up passed its full non-spec JVM matrix (2,890 tests / 30,953
+assertions), instrumented suite (1,286 / 14,668), and CLJS suite
+(295 / 1,847), all with zero failures. The final test-only addition `b8b846f9`
+adds real byte-array and tuple-with-byte-array upgrade regressions; the
+focused namespace passed 12 tests / 312 assertions on each JVM backend.
+The old hash-set implementation accepted duplicate tuples containing byte
+arrays; ordered validation rejects them correctly.
+
+The pg-datahike unique-index and admission namespaces passed all but the two
+tracked scalar NaN assertions (38 tests / 232 assertions, zero errors).
+PR #1077 remains draft while fresh CI completes on the final test-only commit.
 
 ## Smaller Datahike dependency
 
