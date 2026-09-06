@@ -3999,7 +3999,8 @@
              db)))
 
 (defn- ensure-pg-schema!
-  "Publish schema installation and all legacy catalog migration atomically."
+  "Publish schema installation and all legacy catalog migration atomically.
+   This migration primitive alone does not establish constraint admission."
   [conn]
   (when (seq (prepare-pg-schema-tx (d/db conn)))
     (transact-recorded! conn [[:db.fn/call prepare-pg-schema-tx]])))
@@ -10134,8 +10135,8 @@
 (defn- admit-unique-index-enforcement!
   "Install and order the durable UNIQUE guard before exposing a store/branch.
 
-   Promise entries make concurrent first clients share one barrier and one
-   descriptor scan. Failed admissions are evicted so an operator can repair
+   Promise entries make concurrent first clients share one transaction and one
+   full admission validation. Failed admissions are evicted so an operator can repair
    the store and retry. A remote Kabel reader cannot install a process-local
    predicate in its writer and is rejected until writer-side guard deployment
    exists."
@@ -10169,11 +10170,16 @@
                       key)]
     (if (identical? candidate selected)
       (try
-        ;; The guard sees one fully migrated report, including when a sibling
-        ;; branch installed the store-scoped predicate before this admission.
-        (ensure-pg-schema! conn)
-        (let [barrier-db (d/writer-barrier conn)]
-          (unique-constraints/validate-db! barrier-db))
+        ;; Both functions execute against the writer's candidate, not a
+        ;; snapshot captured by this caller. Nested migration functions finish
+        ;; before the full validation runs. Head-conflict replay executes the
+        ;; validation again; registry installation itself stays outside replay.
+        ;; Even an already-migrated branch receives an admission transaction.
+        (transact-recorded!
+         conn [[:db.fn/call prepare-pg-schema-tx]
+               [:db.fn/call (fn [db]
+                              (unique-constraints/validate-db! db)
+                              [])]])
         (deliver (:result candidate) {:ok true})
         true
         (catch Throwable e

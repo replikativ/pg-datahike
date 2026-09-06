@@ -58,8 +58,11 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
 
 ### Writer-foundations candidate — 2026-09-05
 
-The catalog and row-constraint changes are being revalidated against Datahike
-PR #1074, using its tested worktree as a local dependency override. This is
+The catalog and row-constraint changes were validated against Datahike PR
+#1074. A narrower candidate now replaces barrier-based admission with one
+atomic migration/validation transaction; see [Atomic admission](atomic-admission.md).
+It retains predicate registration and scoped backfill but no barrier API or
+writer-loop changes. Validation uses a local dependency override. This is
 pre-release evidence, not validation of the version currently pinned in
 `deps.edn`. The published dependency will be updated only after the squash
 merge has produced a release, followed by validation against that artifact.

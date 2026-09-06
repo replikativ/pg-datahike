@@ -286,6 +286,23 @@
         (is (every? true? (map deref attempts)))
         (is (= 1 @scans))))))
 
+(deftest admission-uses-one-transaction-and-cache-hits-do-not-write
+  (let [admissions (atom {})
+        commits (atom [])]
+    (d/listen-commits *conn* ::admission-commits #(swap! commits conj %))
+    (try
+      (with-redefs-fn
+        (if-let [barrier (ns-resolve 'datahike.api 'writer-barrier)]
+          {barrier (fn [& _]
+                     (throw (ex-info "admission must not use a barrier" {})))}
+          {})
+        (fn []
+          (is (true? (#'pg/admit-unique-index-enforcement! *conn* admissions)))
+          (is (= 1 (count @commits)))
+          (is (true? (#'pg/admit-unique-index-enforcement! *conn* admissions)))
+          (is (= 1 (count @commits)))))
+      (finally (d/unlisten-commits *conn* ::admission-commits)))))
+
 (deftest remote-writer-admission-is-rejected-before-caching
   (let [admissions (atom {})
         remote-conn (atom (assoc-in (d/db *conn*)
@@ -396,6 +413,23 @@
                    (d/entity (d/db conn) :datahike.pg.index/legacy_ab))))
          (is (nil? (state "DROP INDEX legacy_ab")))
          (is (= "23505" (state "CREATE UNIQUE INDEX legacy_ab ON legacy(a,b)"))))))))
+
+(deftest failed-admission-does-not-publish-legacy-migration
+  (legacy-database
+   (fn [conn _]
+     (let [before (d/db conn)
+           admissions (atom {})]
+       (with-redefs [unique/validate-db! (fn [_]
+                                           (throw (ex-info "reject migrated candidate" {})))]
+         (is (thrown-with-msg?
+              clojure.lang.ExceptionInfo #"reject migrated candidate"
+              (#'pg/admit-unique-index-enforcement! conn admissions))))
+       (is (empty? @admissions))
+       (is (= (get-in before [:meta :datahike/commit-id])
+              (get-in (d/db conn) [:meta :datahike/commit-id])))
+       (is (= (objects/catalog-entity before)
+              (objects/catalog-entity (d/db conn)))))
+     (is (some? (pg/make-query-handler conn))))))
 
 (deftest historical-legacy-branch-migrates-under-an-installed-store-predicate
   (legacy-database
