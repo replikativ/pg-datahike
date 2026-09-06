@@ -2,6 +2,9 @@
 
 ## Decision under validation
 
+The smaller Datahike dependency is proposed in
+[PR #1077](https://github.com/replikativ/datahike/pull/1077), replacing #1074.
+
 Use one ordinary Datahike transaction to migrate the PostgreSQL catalog and
 validate the resulting candidate before exposing a SQL handler. A separate
 writer barrier is unnecessary for this workflow. Predicate registration stays
@@ -52,7 +55,11 @@ on that writer is supported.
   Therefore existing connection-level configuration is not by itself a safe
   replacement for all of the proposed backfill changes.
 
-Full candidate matrices remain required before publishing the replacement PR.
+Full pg-datahike validation: 1,737 tests / 7,625 assertions, with only the two
+known native NaN failures. SQLLogic's 61 assertions and SQLAlchemy's 16 tests
+pass against the no-barrier candidate; lint has zero errors after refreshing
+dependency analysis. The dependency PR remains draft until its final matrix
+and CI checks complete.
 
 ## Smaller Datahike dependency
 
