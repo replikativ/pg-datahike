@@ -1,6 +1,6 @@
 # Atomic constraint admission
 
-## Decision under validation
+## Decision
 
 The smaller Datahike dependency is proposed in
 [PR #1077](https://github.com/replikativ/datahike/pull/1077), replacing #1074.
@@ -58,8 +58,14 @@ on that writer is supported.
 Full pg-datahike validation: 1,737 tests / 7,625 assertions, with only the two
 known native NaN failures. SQLLogic's 61 assertions and SQLAlchemy's 16 tests
 pass against the no-barrier candidate; lint has zero errors after refreshing
-dependency analysis. The dependency PR remains draft until its final matrix
-and CI checks complete.
+dependency analysis.
+
+The narrowed Datahike dependency passed its complete non-spec JVM matrix
+(2,886 tests / 30,867 assertions), specification-instrumented suite
+(1,284 / 14,625), and CLJS suite (294 / 1,839), all with zero failures.
+Java binding compilation and the TypeScript thin-client build also passed.
+All 18 dependency CI checks passed. PR #1077 is ready for review; the larger
+barrier proposal #1074 is closed as superseded, with its branch preserved.
 
 ## Smaller Datahike dependency
 
