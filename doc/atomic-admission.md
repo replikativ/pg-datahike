@@ -85,7 +85,9 @@ arrays; ordered validation rejects them correctly.
 
 The pg-datahike unique-index and admission namespaces passed all but the two
 tracked scalar NaN assertions (38 tests / 232 assertions, zero errors).
-PR #1077 remains draft while fresh CI completes on the final test-only commit.
+PR #1077 passed all 18 final CI checks and was squash-merged as `bbbf4569`.
+The expected release is `0.8.1882` (the merge commit's revision count);
+publication is pending, so the released dependency pin is not updated yet.
 
 ## Smaller Datahike dependency
 
