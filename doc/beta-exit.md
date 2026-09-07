@@ -56,22 +56,21 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   Its standalone JAR and non-root Podman image pass the restart, file
   persistence, TLS/password authentication and abrupt-client-drop soak.
 
-### Writer-foundations candidate — 2026-09-05
+### Index and constraint behavior
 
-The catalog and row-constraint changes were validated against Datahike PR
-#1074. A narrower candidate now replaces barrier-based admission with one
-atomic migration/validation transaction; see [Atomic admission](atomic-admission.md).
-It retains predicate registration and scoped backfill but no barrier API or
-writer-loop changes. Validation uses a local dependency override. This is
-pre-release evidence, not validation of the version currently pinned in
-`deps.edn`. The published dependency will be updated only after the squash
-merge has produced a release, followed by validation against that artifact.
+Catalog migration and initial constraint validation commit atomically before
+a SQL handler becomes available. A failed validation leaves the database
+unchanged. Independent transaction predicates can enforce constraints without
+replacing one another.
 
-The NaN comparator/index-format change is deferred to Datahike's 1.0 upgrade
-discussion (draft #1075). Native scalar NaN writes therefore remain a separate
-open blocker, with their regression retained. Landing the writer foundations
-does not by itself close the beta. Exact per-row sequence evaluation order
-also remains open; see `beta-exit.edn` for all four current blockers.
+Index backfill is synchronous and may require substantial memory for large
+attributes. Transaction-local permission to backfill does not change the
+database's persistent configuration. Uniqueness upgrades validate existing
+current values, including attributes that already have an index.
+
+Native scalar NaN writes and exact per-row sequence evaluation order remain
+compatibility limitations. These features do not yet satisfy the beta-exit
+criteria.
 
 ## Where coverage is still weak
 
