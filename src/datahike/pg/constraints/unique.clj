@@ -342,7 +342,16 @@
   "Writer-side invariant gate over a fully resolved Datahike tx report."
   [{:keys [db-before db-after] :as report}]
   (let [datoms (vec (report-datoms report))
-        touched-attrs (into #{} (map #(.-a ^datahike.datom.Datom %)) datoms)
+        touched-attrs (into #{}
+                            (map (fn [^datahike.datom.Datom datom]
+                                   (let [attr (.-a datom)]
+                                     ;; Reports contain numeric attribute refs
+                                     ;; when enabled; descriptors use idents.
+                                     ;; Retractions may need the old mapping.
+                                     (or (dbi/-ident-for db-after attr)
+                                         (dbi/-ident-for db-before attr)
+                                         attr))))
+                            datoms)
         touched-eids (into #{} (map #(.-e ^datahike.datom.Datom %)) datoms)
         catalog-change? (some descriptor-attrs touched-attrs)
         wholesale-change? (and (empty? datoms) (not (identical? db-before db-after)))]
