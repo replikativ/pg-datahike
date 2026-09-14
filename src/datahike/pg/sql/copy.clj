@@ -559,29 +559,41 @@
                     them, matching the convention pg-datahike's INSERT
                     translator uses (stmt.clj:856).
      schema      — Datahike :schema map
-     row-idx     — sequential row index (used to mint a fresh
-                    `:db/id \"copy-row-<n>\"` tempid)
+     row-idx     — sequential row index
+     tempid-prefix — statement-unique prefix; two COPY commands buffered in
+                    one transaction must never share Datahike tempids
 
    Explicit NULL values remain nil until row validation, so they suppress
    column defaults. The validator removes nil keys before storage.
-   Empty fields are kept as empty strings; not-null enforcement
-   happens later via `apply-column-constraints`."
-  [row columns ns row-marker schema row-idx]
-  (let [tempid (str "copy-row-" row-idx)
-        base   (cond-> {:db/id tempid}
-                 row-marker (assoc row-marker true))]
-    (reduce
-     (fn [acc i]
-       (let [col (nth columns i)
-             raw (nth row i nil)
-             attr (keyword ns col)]
-         (cond
-           (nil? raw)             acc      ;; row shorter than columns — drop
-           (null-sentinel? raw)   (assoc acc attr nil)
-           :else
-           (assoc acc attr (coerce-string-to-attr-type raw attr schema)))))
-     base
-     (range (count columns)))))
+   Empty fields are kept as empty strings; ordered candidate preparation
+   performs not-null and CHECK enforcement before the next source row."
+  ([row columns ns row-marker schema row-idx]
+   (row->entity-map row columns ns row-marker schema row-idx "copy-row-"))
+  ([row columns ns row-marker schema row-idx tempid-prefix]
+   (when-not (= (count row) (count columns))
+     (throw (ex-info
+             (if (> (count row) (count columns))
+               "extra data after last expected column"
+               (str "missing data for column \"" (nth columns (count row)) "\""))
+             {:error :bad-copy-format
+              :sqlstate "22P04"
+              :row (inc row-idx)
+              :expected-columns (count columns)
+              :actual-columns (count row)})))
+   (let [tempid (str tempid-prefix row-idx)
+         base   (cond-> {:db/id tempid}
+                  row-marker (assoc row-marker true))]
+     (reduce
+      (fn [acc i]
+        (let [col (nth columns i)
+              raw (nth row i)
+              attr (keyword ns col)]
+          (cond
+            (null-sentinel? raw) (assoc acc attr nil)
+            :else
+            (assoc acc attr (coerce-string-to-attr-type raw attr schema)))))
+      base
+      (range (count columns))))))
 
 ;; ----------------------------------------------------------------------------
 ;; Top-level parser

@@ -243,17 +243,21 @@
     (is (= (inc before) (sequence-value)) "One attempted nextval consumes one value")
     (is (= [] (rows (execute "SELECT a,b FROM drift_rows"))))))
 
-(defn- start-copy! []
+(defn- start-copy-mode! []
   (let [result (execute "COPY drift_rows(b) FROM STDIN")]
     (is (nil? (state result)))
-    (is (.copyInMode ^PgWireServer$QueryResult result)))
+    (is (.copyInMode ^PgWireServer$QueryResult result))))
+
+(defn- start-copy! []
+  (start-copy-mode!)
   (.copyChunk ^PgWireServer$QueryHandler *handler* (.getBytes "1\n" "UTF-8")))
 
 (deftest copy-start-basis-is-checked-before-reserving-defaults
   (create-sequence-table!)
   (let [before (sequence-value)]
-    (start-copy!)
+    (start-copy-mode!)
     (require-b!)
+    (.copyChunk ^PgWireServer$QueryHandler *handler* (.getBytes "1\n" "UTF-8"))
     (let [result (.copyComplete ^PgWireServer$QueryHandler *handler*)]
       (is (= "40001" (state result)))
       (is (= before (sequence-value)) "Already-stale COPY must not reserve a default")
