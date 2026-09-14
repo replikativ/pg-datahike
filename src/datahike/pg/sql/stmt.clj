@@ -2958,12 +2958,16 @@
      datahike.pg.sql/sql-money-div
      datahike.pg.sql/sql-money-div-money})
 
+(defn- deferred-projection-op? [x]
+  (and (symbol? x)
+       (or (contains? throwing-projection-ops x)
+           (str/starts-with? (name x) "?nextval-marker-"))))
+
 (defn- throwing-projection?
   [form clauses]
   (boolean
-   (some throwing-projection-ops
-         (filter symbol?
-                 (tree-seq coll? seq (cons form (map first clauses)))))))
+   (some deferred-projection-op?
+         (tree-seq coll? seq (cons form (map first clauses))))))
 
 (defn- inline-projection-bindings
   "Inline THROWING SSA-style function bindings emitted for one SELECT item.
@@ -2978,10 +2982,9 @@
                   (into #{}
                         (keep (fn [clause]
                                 (when (and (binding? clause)
-                                           (some throwing-projection-ops
-                                                 (filter symbol?
-                                                         (tree-seq coll? seq
-                                                                   (first clause)))))
+                                           (some deferred-projection-op?
+                                                 (tree-seq coll? seq
+                                                           (first clause))))
                                   (second clause))))
                         clauses))
         above? (fn [clause]
@@ -3010,6 +3013,32 @@
                    (seq? x) (apply list (map inline x))
                    :else x))]
     [keep-clauses (inline form)]))
+
+(defn- inline-all-projection-bindings
+  "Inline every scalar binding emitted for one INSERT SELECT item.
+
+   Data-pattern clauses remain in the source query to fetch leaf values. The
+   scalar expression itself is carried to candidate preparation so target-list
+   items run left-to-right for one row before the next row is requested."
+  [form clauses]
+  (let [binding? #(and (vector? %) (= 2 (count %))
+                       (seq? (first %)) (symbol? (second %))
+                       ;; get-else is the nullable column fetch itself, not a
+                       ;; SELECT-list computation. It must stay in Datalog so
+                       ;; the deferred form has a concrete leaf value.
+                       (not= 'get-else (ffirst %)))
+        by-out (into {} (keep (fn [clause]
+                                (when (binding? clause)
+                                  [(second clause) (first clause)])))
+                     clauses)
+        inline (fn inline [x]
+                 (cond
+                   (and (symbol? x) (contains? by-out x))
+                   (inline (get by-out x))
+
+                   (seq? x) (apply list (map inline x))
+                   :else x))]
+    [(vec (remove binding? clauses)) (inline form)]))
 
 (defn compound-projection-indices
   "Indices that turn the physical compound-projection shape into its SQL
@@ -3069,6 +3098,43 @@
                                               binds slots)
                                     val (expr/interpret-form form b)]
                                 (conj r (if (= :__null__ val) nil val))))
+                            rv compound-exprs)))
+                results)
+          new-aliases (into (vec aliases) (map :alias compound-exprs))
+          visible-indices (compound-projection-indices new-aliases compound-exprs)]
+      [(mapv (fn [row] (mapv #(nth row %) visible-indices)) new-results)
+       (mapv #(nth new-aliases %) visible-indices)])
+    [results aliases]))
+
+(defn- defer-compound-projections
+  "Build inert per-row projection markers and remove their hidden inputs.
+
+   INSERT SELECT uses this sibling of `apply-compound-projections`: candidate
+   preparation resolves the markers in SELECT-list order, so a later cast or
+   scalar error cannot run before an earlier volatile item on the same row or
+   cause any later source row to be evaluated."
+  [results aliases query in-args compound-exprs]
+  (if (seq compound-exprs)
+    (let [row-bindings
+          (fn [row]
+            (let [rv (if (sequential? row) (vec row) [row])]
+              (into (into {} (keep-indexed (fn [i e]
+                                             (when (symbol? e)
+                                               [e (nth rv i nil)])))
+                          (:find query))
+                    (zipmap (rest (:in query)) in-args))))
+          new-results
+          (mapv (fn [row]
+                  (let [rv (if (sequential? row) (vec row) [row])
+                        binds (row-bindings row)]
+                    (reduce (fn [r {:keys [form slots]}]
+                              (let [b (reduce (fn [m [sym idx]]
+                                                (assoc m sym (nth r idx nil)))
+                                              binds slots)]
+                                (conj r {:fn :projection
+                                         :projection-fn
+                                         (fn [] (expr/interpret-form form b))
+                                         :args []})))
                             rv compound-exprs)))
                 results)
           new-aliases (into (vec aliases) (map :alias compound-exprs))
@@ -4609,10 +4675,11 @@
                       aggregate-projection?
                       (boolean (some fns/aggregate-function?
                                      (params/ast-function-names expr)))
-                      v (expr/translate-expr (assoc ctx
-                                                    :hoisted-aggs sink
-                                                    :aggregate-projection?
-                                                    aggregate-projection?) expr)
+                      v (binding [expr/*defer-stateful-projection?* true]
+                          (expr/translate-expr (assoc ctx
+                                                      :hoisted-aggs sink
+                                                      :aggregate-projection?
+                                                      aggregate-projection?) expr))
                       hoisted @sink]
                   (if (seq hoisted)
                     (let [all (vec @(:where-clauses ctx))
@@ -4642,13 +4709,48 @@
                     ;; Regular non-aggregate expression
                     (let [all-clauses (vec @(:where-clauses ctx))
                           emitted (subvec all-clauses before)
-                          defer? (and where-expr
-                                      (nil? group-by-element)
-                                      (not has-distinct?)
-                                      (empty? (.getOrderByElements select))
-                                      (throwing-projection? v emitted))]
+                          effectful? (some #(and (symbol? %)
+                                                 (str/starts-with?
+                                                  (clojure.core/name %)
+                                                  "?nextval-marker-"))
+                                           (tree-seq coll? seq
+                                                     (cons v (map first emitted))))
+                          scalar-binding? (some #(and (vector? %)
+                                                      (= 2 (count %))
+                                                      (seq? (first %))
+                                                      (symbol? (second %))
+                                                      (not= 'get-else (ffirst %)))
+                                                emitted)
+                          ordered-expression?
+                          (some (fn [^OrderByElement obe]
+                                  (let [order-expr (.getExpression obe)]
+                                    (or (= (str expr) (str order-expr))
+                                        (and alias-str
+                                             (instance? Column order-expr)
+                                             (nil? (.getTable ^Column order-expr))
+                                             (= alias-str
+                                                (.getColumnName ^Column order-expr)))
+                                        (and (instance? LongValue order-expr)
+                                             (= (inc (.indexOf ^java.util.List
+                                                      select-items item))
+                                                (.getValue ^LongValue order-expr))))))
+                                (.getOrderByElements select))
+                          defer? (and (nil? group-by-element)
+                                      (or (and expr/*defer-all-projection-computations?*
+                                               scalar-binding?
+                                               (not ordered-expression?))
+                                          (and (not has-distinct?)
+                                               (or (and effectful?
+                                                        (empty? (.getOrderByElements select)))
+                                                   (and where-expr
+                                                        (empty? (.getOrderByElements select))
+                                                        (throwing-projection? v emitted))))))]
                       (if defer?
-                        (let [[keep-cs form] (inline-projection-bindings v emitted)
+                        (let [[keep-cs form]
+                              ((if expr/*defer-all-projection-computations?*
+                                 inline-all-projection-bindings
+                                 inline-projection-bindings)
+                               v emitted)
                               _ (reset! (:where-clauses ctx)
                                         (into (subvec all-clauses 0 before) keep-cs))
                               in-vars (set @(:in-params ctx))
@@ -4986,6 +5088,12 @@
                                               expr))
 
                                           :else expr)
+                                        matching-select-idx
+                                        (some (fn [[i ^SelectItem selected]]
+                                                (when (= (str expr)
+                                                         (str (.getExpression selected)))
+                                                  i))
+                                              (map-indexed vector select-items))
                                         ;; Check if ORDER BY references a SELECT alias
                                         v (cond
                                             ;; A bare integer constant is a 1-based
@@ -5028,6 +5136,9 @@
                                               (if alias-idx
                                                 (nth fe-snap alias-idx)
                                                 (expr/translate-expr ctx expr)))
+
+                                            (some? matching-select-idx)
+                                            (nth fe-snap matching-select-idx)
 
                                             (target-list-srf? expr)
                                             (or (some (fn [{:keys [function out-var]}]
@@ -5824,8 +5935,36 @@
                                      (and nulls
                                           (not= nulls (if (= dir :asc) :last :first))))
                                    order-by-spec))
+        effectful-order-vars
+        (let [bindings (filterv #(and (vector? %)
+                                      (= 2 (count %))
+                                      (seq? (first %))
+                                      (symbol? (second %)))
+                                @(:where-clauses ctx))
+              direct (into #{}
+                           (keep (fn [clause]
+                                   (when (some deferred-projection-op?
+                                               (tree-seq coll? seq (first clause)))
+                                     (second clause))))
+                           bindings)]
+          (loop [tainted direct]
+            (let [next-tainted
+                  (into tainted
+                        (keep (fn [clause]
+                                (when (some tainted
+                                            (filter symbol?
+                                                    (tree-seq coll? seq
+                                                              (first clause))))
+                                  (second clause))))
+                        bindings)]
+              (if (= tainted next-tainted)
+                tainted
+                (recur next-tainted)))))
+        effectful-order? (some #(contains? effectful-order-vars (first %))
+                               order-by-spec)
         has-nullable-order? (and order-by-spec
                                  (or fetch-with-ties?
+                                     effectful-order?
                                      explicit-nulls?
                                      ;; DISTINCT ON keeps the FIRST row per
                                      ;; ON-key, so it needs the rows in a
@@ -8408,9 +8547,27 @@
             (if (zero? c) (recur (rest specs)) c))
           0)))))
 
-(defn- shape-insert-select-results [results parsed]
+(defn- resolve-order-keys
+  [results order-spec resolve-value]
+  (if (and resolve-value (seq order-spec))
+    (let [idxs (mapv first (partition 3 order-spec))]
+      (map (fn [row]
+             (let [rv (if (sequential? row) (vec row) [row])]
+               (reduce (fn [r idx]
+                         (if (< idx (count r))
+                           (update r idx resolve-value)
+                           r))
+                       rv idxs)))
+           results))
+    results))
+
+(defn- shape-insert-select-results [results parsed resolve-value]
   (let [sql-cmp (when (seq (:sql-order-by parsed))
                   (insert-select-order-cmp (:sql-order-by parsed)))
+        ;; An ORDER BY key is evaluated for every input row before LIMIT. Only
+        ;; resolve those key cells here; non-key volatile projections remain
+        ;; deferred until their candidate survives shaping.
+        results (resolve-order-keys results (:sql-order-by parsed) resolve-value)
         results (if sql-cmp (sort sql-cmp results) results)
         results (if sql-cmp
                   (cond->> results
@@ -8420,6 +8577,7 @@
         results (if-let [specs (seq (:project-set parsed))]
                   (apply-project-set results specs)
                   results)
+        results (resolve-order-keys results (:project-order-by parsed) resolve-value)
         project-cmp (when (seq (:project-order-by parsed))
                       (insert-select-order-cmp (:project-order-by parsed)))
         results (if project-cmp (sort project-cmp results) results)]
@@ -8502,6 +8660,89 @@
                        :target-count target-count
                        :value-count value-count}))))
   rows)
+
+(defn materialize-insert-select
+  "Execute a translated INSERT ... SELECT source against `db` and build the
+   ordinary ordered INSERT candidate plan.
+
+   Translation deliberately stores this description instead of source rows:
+   PostgreSQL runs the source at Execute, and prepared statements must observe
+   the current statement snapshot. Stateful projection calls remain inert
+   markers here and are resolved candidate-by-candidate by the server."
+  [{:keys [source col-names source-attrs table-name ns ancestor-tables
+           sequence-defaults conflict-plan returning]}
+   db resolve-value]
+  (let [source-db db
+        query (:query source)
+        in-args (:in-args source)
+        raw-results (cond
+                      (:literal-rows source) (:literal-rows source)
+                      (:literal-row source) [(:literal-row source)]
+                      (seq in-args) (apply d/q query source-db in-args)
+                      :else (d/q query source-db))
+        results (shape-insert-select-results raw-results source resolve-value)
+        hidden-count (long (or (:hidden-count source) 0))
+        results (if (pos? hidden-count)
+                  (map (fn [row]
+                         (let [v (if (sequential? row) (vec row) [row])]
+                           (subvec v 0 (- (count v) hidden-count))))
+                       results)
+                  results)
+        [results _] (defer-compound-projections results
+                                                (:find-aliases source)
+                                                query in-args
+                                                (:compound-exprs source))
+        ;; Plain DISTINCT is above projection: non-injective expressions such
+        ;; as CAST('01' AS int) must deduplicate their concrete output, not the
+        ;; raw leaf values carried through Datalog. This stage necessarily
+        ;; evaluates every source row before ModifyTable sees a candidate.
+        results (if (and (:has-distinct? source)
+                         (nil? (:distinct-on-n source)))
+                  (distinct (map resolve-value results))
+                  results)
+        rows (validate-insert-row-widths!
+              col-names
+              (mapv (fn [row]
+                      (if (sequential? row) (vec row) [row]))
+                    results))
+        row-attrs
+        (mapv (fn [row]
+                (into {}
+                      (keep (fn [[attr val]]
+                              (let [value (when-not (= :__null__ val) val)]
+                                (when (or (some? value)
+                                          (nil? val)
+                                          (= :__null__ val))
+                                  [attr value]))))
+                      (map vector source-attrs row)))
+              rows)
+        marker-attrs (into [(pgs/row-marker-attr table-name)]
+                           (map pgs/row-marker-attr ancestor-tables))
+        row-attrs (mapv (fn [row]
+                          (reduce (fn [r marker]
+                                    (if (get (:schema db) marker)
+                                      (assoc r marker true)
+                                      r))
+                                  row marker-attrs))
+                        row-attrs)
+        row-attrs (mapv #(populate-insert-sequence-defaults
+                          % sequence-defaults)
+                        row-attrs)
+        result (if conflict-plan
+                 (on-conflict-result row-attrs (count row-attrs)
+                                     returning conflict-plan)
+                 (let [entities (mapv (fn [attrs]
+                                        (assoc attrs :db/id
+                                               (str (gensym "insert-select-"))))
+                                      row-attrs)]
+                   (cond-> {:type :insert
+                            :insert-mode :plain
+                            :insert-candidates entities
+                            :tx-data entities
+                            :count (count entities)
+                            :table table-name :ns ns}
+                     returning (assoc :returning returning))))]
+    (assoc result :insert-source-order source-attrs)))
 
 (defn- expand-insert-values-srfs
   "Expand top-level SRFs in one INSERT ... VALUES row.
@@ -8765,7 +9006,8 @@
       (let [inner-select (if (instance? ParenthesedSelect select)
                            (.getSelect ^ParenthesedSelect select)
                            select)
-            inner-parsed (params/*parse-sql* (str inner-select) schema db)
+            inner-parsed (binding [expr/*defer-all-projection-computations?* true]
+                           (params/*parse-sql* (str inner-select) schema db))
             ;; parse-sql CATCHES: a source SELECT that failed to
             ;; translate comes back as {:type :error}, not as a throw.
             ;; Ignoring that carried a nil :query into d/q, whose
@@ -8775,136 +9017,33 @@
             _ (when (= :error (:type inner-parsed))
                 (throw (ex-info (str (:message inner-parsed))
                                 {:sqlstate (or (:sqlstate inner-parsed) "XX000")})))
-            inner-query (:query inner-parsed)
-            inner-in-args (:in-args inner-parsed)
-            q-fn d/q
-            ;; Table-free SELECT (`SELECT 1, 2, 3` — no FROM clause) is
-            ;; produced by translate-select with `:literal-row` /
-            ;; `:literal-rows` set and `:query {:find [] :where []}`.
-            ;; The execute-select path handles this via a literal-row
-            ;; short-circuit; we mirror it here so INSERT … SELECT
-            ;; routes the same data, otherwise running d/q on the
-            ;; empty query returns `[[]]` and silently drops the row.
-            ;; A set-returning function in the source FROM is
-            ;; materialised into a SPECULATIVE db, handed back as
-            ;; `:enriched-db`. Running the inner query against the plain
-            ;; `db` scans a database where that virtual table does not
-            ;; exist, so `INSERT INTO t SELECT … FROM generate_series(…)`
-            ;; answered `INSERT 0 0` — the standard bulk-load idiom,
-            ;; silently a no-op, while the same SELECT run on its own
-            ;; returned its rows. Same `(or (:enriched-db …) …)` the
-            ;; correlated-scalar path already uses.
-            inner-db (or (:enriched-db inner-parsed) db)
-            inner-results (cond
-                            (:literal-rows inner-parsed) (:literal-rows inner-parsed)
-                            (:literal-row  inner-parsed) [(:literal-row inner-parsed)]
-                            (seq inner-in-args)
-                            (apply q-fn inner-query inner-db inner-in-args)
-                            :else (q-fn inner-query inner-db))
-            inner-results (shape-insert-select-results inner-results inner-parsed)
-            ;; The normal SELECT executor removes trailing helper find
-            ;; elements (usually the entity id used for stable default
-            ;; ordering) before projection post-processing. INSERT-SELECT
-            ;; runs the query directly and must mirror that row shape.
-            hidden-count (long (or (:hidden-count inner-parsed) 0))
-            inner-results (if (pos? hidden-count)
-                            (mapv (fn [row]
-                                    (let [v (if (sequential? row) (vec row) [row])]
-                                      (subvec v 0 (- (count v) hidden-count))))
-                                  inner-results)
-                            inner-results)
-            [inner-results _]
-            (apply-compound-projections inner-results
-                                        (:find-aliases inner-parsed)
-                                        inner-query inner-in-args
-                                        (:compound-exprs inner-parsed))
-            rows (validate-insert-row-widths!
-                  col-names
-                  (mapv (fn [row]
-                          (if (sequential? row) (vec row) [row]))
-                        inner-results))
-            ;; Build row-attrs the same way the VALUES branch does below.
-            row-attrs
-            (mapv (fn [row]
-                    (into {}
-                          (keep (fn [[col-name val]]
-                                  (let [attr (resolve-target-attr col-name)
-                                        ;; A row coming FROM A SELECT carries SQL
-                                        ;; NULL as the `:__null__` sentinel, not
-                                        ;; nil, and the sentinel reached the
-                                        ;; coercion as a value: `INSERT INTO t
-                                        ;; SELECT …` raised "invalid input syntax
-                                        ;; for column" the moment any selected
-                                        ;; value was NULL. A NULL column is simply
-                                        ;; an absent datom.
-                                        coerced (when-not (= :__null__ val)
-                                                  (coerce-insert-value val attr schema db))]
-                                    ;; INSERT SELECT has no DEFAULT token: a
-                                    ;; SQL NULL is explicit and must suppress a
-                                    ;; column default.  Preserve a nil entry for
-                                    ;; the constraint/default wrapper, which
-                                    ;; validates it and removes it before the
-                                    ;; Datahike transaction is returned.
-                                    (when (or (some? coerced)
-                                              (nil? val)
-                                              (= :__null__ val))
-                                      [attr coerced])))
-                                (map vector col-names row))))
-                  rows)
-            marker (pgs/row-marker-attr table-name)
-            has-marker? (boolean (get schema marker))
-            row-attrs (if has-marker?
-                        (mapv #(assoc % marker true) row-attrs)
-                        row-attrs)
-            row-attrs (reduce
-                       (fn [rows ancestor]
-                         (let [marker (pgs/row-marker-attr ancestor)]
-                           (if (get schema marker)
-                             (mapv #(assoc % marker true) rows)
-                             rows)))
-                       row-attrs ancestor-tables)
-            row-attrs (mapv #(populate-insert-sequence-defaults
-                              % sequence-defaults)
-                            row-attrs)
-            conflict-action (.getConflictAction insert)
-            returning (extract-returning (.getReturningClause insert))]
-        (cond
-          ;; Empty result set — nothing to insert.
-          (empty? row-attrs)
-          (cond-> {:type :insert :insert-mode :plain :insert-candidates []
-                   :tx-data [] :count 0
-                   :table table-name :ns ns}
-            returning (assoc :returning returning))
-          ;; Non-empty with ON CONFLICT — delegate via :db.fn/call so the
-          ;; conflict lookup and the write are one atomic transaction.
-          ;;
-          ;; This arm used to ignore the conflict target entirely and
-          ;; arbitrate on ALL inserted columns, which silently destroyed
-          ;; data: `INSERT INTO t (id,title) SELECT 1,'discard' ON
-          ;; CONFLICT (id) DO NOTHING` found no row matching BOTH id=1
-          ;; and title='discard', inserted, and Datahike's
-          ;; :db.unique/identity upsert then overwrote the existing
-          ;; title. DO UPDATE was likewise unimplemented and behaved as
-          ;; DO NOTHING — with the same overwrite as a consolation
-          ;; prize. Both now share the VALUES arm's semantics.
-          conflict-action
-          (on-conflict-result
-           row-attrs (count row-attrs) returning
-           (conflict-plan conflict-action conflict-target table-name ns
-                          schema db target-alias))
-          :else
-          (let [entities (vec (mapcat
-                               (fn [attrs]
-                                 (when (seq attrs)
-                                   [(assoc attrs :db/id (str (gensym "insert-select-")))]))
-                               row-attrs))]
-            (cond-> {:type :insert
-                     :insert-mode :plain
-                     :insert-candidates entities
-                     :tx-data entities
-                     :count (count row-attrs)
-                     :table table-name :ns ns}
-              returning (assoc :returning returning)))))
+            source-plan
+            {:source inner-parsed
+             :col-names col-names
+             :source-attrs (mapv resolve-target-attr col-names)
+             :table-name table-name
+             :ns ns
+             :ancestor-tables ancestor-tables
+             :sequence-defaults sequence-defaults
+             :conflict-plan (when conflict-action
+                              (conflict-plan conflict-action conflict-target
+                                             table-name ns schema db target-alias))
+             :returning (extract-returning (.getReturningClause insert))}]
+        ;; Source rows belong to execution, not parsing. Besides prepared
+        ;; statements observing the current snapshot, this keeps volatile
+        ;; source projections out of Parse and lets the server interleave one
+        ;; projected candidate with target defaults and validation.
+        {:type :insert
+         :insert-mode :deferred-select
+         :insert-candidates []
+         :tx-data []
+         :count 0
+         :table table-name
+         :ns ns
+         :insert-source source-plan
+         ;; Describe runs before deferred source materialization, but must
+         ;; advertise the same RETURNING row shape Execute will produce.
+         :returning (:returning source-plan)})
 
       ;; Normal INSERT with VALUES
       (and (instance? Values select) (seq col-names))

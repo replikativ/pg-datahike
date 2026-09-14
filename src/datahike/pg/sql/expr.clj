@@ -84,6 +84,14 @@
             PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
             Select SetOperationList FromItem OrderByElement WithItem]))
 
+(def ^:dynamic *defer-stateful-projection?*
+  "True only while translating an ordinary SELECT-list expression."
+  false)
+
+(def ^:dynamic *defer-all-projection-computations?*
+  "True while lowering an INSERT SELECT source for row-wise evaluation."
+  false)
+
 (set! *warn-on-reflection* true)
 
 ;; Unqualified alias so the copied body's `unquote-ident` reads from
@@ -717,6 +725,40 @@
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj now-fn)
         (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+        result-var)
+
+      ;; nextval() inside an ordinary SELECT projection cannot advance the
+      ;; sequence from inside Datahike's query engine: doing so would make a
+      ;; query retry repeat an external effect, and INSERT ... SELECT must be
+      ;; able to stop before evaluating source rows after a target error.
+      ;; Emit one inert marker per source row instead.  The SELECT executor
+      ;; resolves result markers after row shaping; INSERT candidate
+      ;; preparation resolves them one candidate at a time.
+      (= fname "nextval")
+      (let [_ (when-not *defer-stateful-projection?*
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:feature "nextval outside a SELECT-list projection"})))
+            _ (fns/check-arity! fname (count args))
+            fn-param (symbol (str "?nextval-marker-"
+                                  (swap! (:var-counter ctx) inc)))
+            row-token (when-let [table (:default-table ctx)]
+                        (ctx/entity-var! ctx table))
+            marker-fn (if row-token
+                        (fn [row sequence-name]
+                          {:fn :nextval :seq-name (str sequence-name)
+                           ;; Keep otherwise-identical volatile projections
+                           ;; distinct until the executor reaches the SQL
+                           ;; DISTINCT stage. The token is never exposed.
+                           :row-token row})
+                        (fn [sequence-name]
+                          {:fn :nextval :seq-name (str sequence-name)}))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj marker-fn)
+        (swap! (:where-clauses ctx) conj
+               [(apply list fn-param (cond-> [] row-token (conj row-token)
+                                             true (into args)))
+                result-var])
         result-var)
 
       ;; current_user() / session_user() / user() / system_user() —
@@ -1810,23 +1852,38 @@
     (seq? form)
     (let [[op & args] form]
       (case op
-        +   (let [[a b] (mapv #(interpret-form % bindings) args)]
-              (when (and (some? a) (some? b) (not= :__null__ a) (not= :__null__ b))
-                (+ a b)))
-        -   (let [[a b] (mapv #(interpret-form % bindings) args)]
-              (when (and (some? a) (some? b) (not= :__null__ a) (not= :__null__ b))
-                (- a b)))
-        *   (let [[a b] (mapv #(interpret-form % bindings) args)]
-              (when (and (some? a) (some? b) (not= :__null__ a) (not= :__null__ b))
-                (* a b)))
-        /   (let [[a b] (mapv #(interpret-form % bindings) args)]
-              (when (and (some? a) (some? b) (not= :__null__ a) (not= :__null__ b)
-                         (not (zero? b)))
-                (/ a b)))
-        rem (let [[a b] (mapv #(interpret-form % bindings) args)]
-              (when (and (some? a) (some? b) (not= :__null__ a) (not= :__null__ b)
-                         (not (zero? b)))
-                (rem a b)))
+        +   (let [[a b :as values] (mapv #(interpret-form % bindings) args)]
+              (if (some params/call-marker? values)
+                {:fn :projection :projection-fn + :args values}
+                (when (and (some? a) (some? b)
+                           (not= :__null__ a) (not= :__null__ b))
+                  (+ a b))))
+        -   (let [[a b :as values] (mapv #(interpret-form % bindings) args)]
+              (if (some params/call-marker? values)
+                {:fn :projection :projection-fn - :args values}
+                (when (and (some? a) (some? b)
+                           (not= :__null__ a) (not= :__null__ b))
+                  (- a b))))
+        *   (let [[a b :as values] (mapv #(interpret-form % bindings) args)]
+              (if (some params/call-marker? values)
+                {:fn :projection :projection-fn * :args values}
+                (when (and (some? a) (some? b)
+                           (not= :__null__ a) (not= :__null__ b))
+                  (* a b))))
+        /   (let [[a b :as values] (mapv #(interpret-form % bindings) args)]
+              (if (some params/call-marker? values)
+                {:fn :projection :projection-fn / :args values}
+                (when (and (some? a) (some? b)
+                           (not= :__null__ a) (not= :__null__ b)
+                           (not (zero? b)))
+                  (/ a b))))
+        rem (let [[a b :as values] (mapv #(interpret-form % bindings) args)]
+              (if (some params/call-marker? values)
+                {:fn :projection :projection-fn rem :args values}
+                (when (and (some? a) (some? b)
+                           (not= :__null__ a) (not= :__null__ b)
+                           (not (zero? b)))
+                  (rem a b))))
         (> >= < <=)
         (let [[a b] (mapv #(interpret-form % bindings) args)]
           (and (some? a) (some? b) (not= :__null__ a) (not= :__null__ b)
@@ -1860,7 +1917,10 @@
               f-from-bindings (when (symbol? op) (get bindings op))
               f (or (when (fn? f-from-bindings) f-from-bindings)
                     (resolve op))]
-          (when f (apply f evaluated-args)))))
+          (when f
+            (if (some params/call-marker? evaluated-args)
+              {:fn :projection :projection-fn f :args evaluated-args}
+              (apply f evaluated-args))))))
 
     :else form))
 

@@ -465,6 +465,7 @@
               (cond
                 (param-ref? v)   (resolve-param-ref v fetch)
                 (call-marker? v) v
+                (record? v)      v
                 (map? v)         (reduce-kv (fn [m k x]
                                               (assoc m k (walk x)))
                                             {} v)
@@ -489,15 +490,20 @@
   "Function markers translate-* may emit for SQL constructs that must
    be re-evaluated per execute (i.e. NOT cacheable as a parse-time
    value). Resolved by `resolve-nextvals!` against a per-fn resolver."
-  #{:nextval :now :eval :random-uuid :uuid-v7 :raise})
+  #{:nextval :now :eval :random-uuid :uuid-v7 :raise :projection})
 
 (defn call-marker?
   "True if v is a deferred function-call marker emitted by translate-*
    (`:nextval`, `:now`, and `:eval` — an arbitrary scalar expression in
-   INSERT VALUES). These must survive the result-cache intact and be
+  INSERT VALUES). These must survive the result-cache intact and be
    resolved per execute."
   [v]
-  (and (map? v) (contains? call-fns (:fn v))))
+  (and (map? v)
+       ;; Some parser maps are sorted by homogeneous key type (for example,
+       ;; parameter index -> variable). Looking up :fn in an integer-keyed
+       ;; tree map asks its comparator to compare Integer with Keyword.
+       (contains? call-fns
+                  (some (fn [[k value]] (when (= :fn k) value)) v))))
 
 (defn nextval-marker?
   "Back-compat alias: true only for the nextval flavour of call-marker."
@@ -520,6 +526,9 @@
    seqs."
   ([x nextval-fn] (resolve-nextvals! x nextval-fn nil))
   ([x nextval-fn eval-fn]
+   (resolve-nextvals! x nextval-fn eval-fn
+                      (java.util.IdentityHashMap.)))
+  ([x nextval-fn eval-fn ^java.util.IdentityHashMap seen]
   ;; Identity-track: the same marker object can appear in multiple
   ;; parts of tx-data (e.g. inside a `:db.fn/call` arg AND in an
   ;; outer entity-map via `assoc`). Resolving it twice would advance
@@ -532,10 +541,9 @@
   ;;
   ;; The function table here is intentionally minimal — extend by
   ;; adding to call-fns above and a clause here.
-   (let [seen (java.util.IdentityHashMap.)
-         resolve-marker
-         (fn [v]
-           (or (.get seen v)
+   (letfn [(resolve-marker [v]
+             (if (.containsKey seen v)
+               (.get seen v)
                (let [resolved
                      (case (:fn v)
                        :nextval (nextval-fn (:seq-name v))
@@ -543,25 +551,38 @@
                        :random-uuid (java.util.UUID/randomUUID)
                        :uuid-v7 (coerce/generate-uuid-v7)
                        :raise   (throw (ex-info (:message v) (:data v)))
-                      ;; An arbitrary scalar expression in INSERT
-                      ;; VALUES. Deferred rather than folded at parse
-                      ;; time for the same reason `now()` is: the parse
-                      ;; is cached, and a volatile function folded there
-                      ;; would freeze on the first execution.
+                           ;; A composed projection resolves its effectful
+                           ;; leaves first, then applies the already-compiled
+                           ;; scalar operation exactly once.
+                       :projection (let [projection-fn (:projection-fn v)]
+                                     (when-not (ifn? projection-fn)
+                                       (throw (ex-info
+                                               "invalid deferred projection"
+                                               {:projection v
+                                                :projection-fn-type
+                                                (some-> projection-fn class str)})))
+                                     (walk (apply projection-fn
+                                                  (mapv walk (:args v)))))
+                           ;; An arbitrary scalar expression in INSERT
+                           ;; VALUES. Deferred rather than folded at parse
+                           ;; time for the same reason `now()` is: the parse
+                           ;; is cached, and a volatile function folded there
+                           ;; would freeze on the first execution.
                        :eval    (if eval-fn
                                   (eval-fn (:sql v))
                                   (:sql v)))]
                  (.put seen v resolved)
-                 resolved)))]
-     (letfn [(walk [v]
-               (cond
-                 (call-marker? v) (resolve-marker v)
-                 (map? v)         (reduce-kv (fn [m k x] (assoc m k (walk x)))
-                                             {} v)
-                 (vector? v)      (mapv walk v)
-                 (seq? v)         (map walk v)
-                 :else            v))]
-       (walk x)))))
+                 resolved)))
+           (walk [v]
+             (cond
+               (call-marker? v) (resolve-marker v)
+               (record? v)      v
+               (map? v)         (reduce-kv (fn [m k x] (assoc m k (walk x)))
+                                           {} v)
+               (vector? v)      (mapv walk v)
+               (seq? v)         (map walk v)
+               :else            v))]
+     (walk x))))
 
 ;; ---------------------------------------------------------------------------
 ;; AST parameter-index walker

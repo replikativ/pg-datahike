@@ -921,6 +921,11 @@
 ;; Resolved by Datahike's `resolve-fn` at query time from fully-qualified
 ;; symbols emitted by translate-binary-arith.
 
+(defn- deferred-call-marker? [v]
+  (and (map? v)
+       (contains? #{:nextval :now :eval :random-uuid :uuid-v7 :raise :projection}
+                  (some (fn [[k value]] (when (= :fn k) value)) v))))
+
 (defn null-safe
   "Wrap a scalar function `f` to propagate SQL NULL: if any argument is the
    `:__null__` sentinel (or Clojure nil), return `:__null__` without calling
@@ -931,17 +936,41 @@
    = NULL`, `1 + NULL = NULL`. Without this guard, Clojure string/numeric
    functions throw on `:__null__` (a Keyword, not a String/Number)."
   [f]
-  (fn null-safe-call
-    ([]         (f))
-    ([a]        (if (or (nil? a) (= :__null__ a)) :__null__ (f a)))
-    ([a b]      (if (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b)) :__null__ (f a b)))
-    ([a b c]    (if (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b) (nil? c) (= :__null__ c))
-                  :__null__ (f a b c)))
-    ([a b c & more]
-     (if (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b) (nil? c) (= :__null__ c)
-             (some #(or (nil? %) (= :__null__ %)) more))
-       :__null__
-       (apply f a b c more)))))
+  (letfn [(concrete [args]
+            (if (some #(or (nil? %) (= :__null__ %)) args)
+              :__null__
+              (apply f args)))
+          (deferred [args]
+            {:fn :projection
+             :projection-fn (fn [& resolved] (concrete resolved))
+             :args (vec args)})]
+    (fn null-safe-call
+      ([] (f))
+      ([a]
+       (if (deferred-call-marker? a)
+         (deferred [a])
+         (if (or (nil? a) (= :__null__ a)) :__null__ (f a))))
+      ([a b]
+       (if (or (deferred-call-marker? a) (deferred-call-marker? b))
+         (deferred [a b])
+         (if (or (nil? a) (= :__null__ a) (nil? b) (= :__null__ b))
+           :__null__
+           (f a b))))
+      ([a b c]
+       (if (or (deferred-call-marker? a)
+               (deferred-call-marker? b)
+               (deferred-call-marker? c))
+         (deferred [a b c])
+         (if (or (nil? a) (= :__null__ a)
+                 (nil? b) (= :__null__ b)
+                 (nil? c) (= :__null__ c))
+           :__null__
+           (f a b c))))
+      ([a b c & more]
+       (let [args (into [a b c] more)]
+         (if (some deferred-call-marker? args)
+           (deferred args)
+           (concrete args)))))))
 
 (def seek-no-match
   "Sentinel for a comparison constant that cannot equal ANY value of the
@@ -4283,6 +4312,7 @@
    "asind" #{1} "acosd" #{1} "atand" #{1} "atan2d" #{2}
    "erf" #{1} "erfc" #{1}
    "random" #{0} "setseed" #{1} "random_normal" #{0 1 2}
+   "nextval" #{1}
    "gen_random_uuid" #{0} "uuidv4" #{0} "uuidv7" #{0 1}
    "uuid_extract_version" #{1} "uuid_extract_timestamp" #{1}
    "div" #{2} "factorial" #{1}

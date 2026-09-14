@@ -89,9 +89,8 @@
   (is (= [] (rows "SELECT id FROM ordered_select")))
   (is (= [["3"]] (rows "SELECT nextval('ordered_select_id_seq')"))))
 
-(deftest ^{:compatibility-gap :insert-select-volatile-projection-order
-           :postgres-major 17 :postgres-nextval 3}
-  known-gap-insert-select-volatile-projection-order
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  insert-select-volatile-projection-follows-the-source-prefix
   (run "CREATE SEQUENCE projected_seq")
   (run "CREATE TABLE projected_source (ord int, v int)")
   (run "INSERT INTO projected_source VALUES (1,1),(2,-1),(3,2)")
@@ -100,10 +99,179 @@
                        "SELECT nextval('projected_seq'),v "
                        "FROM projected_source ORDER BY ord"))))
   (is (= [] (rows "SELECT id FROM projected_target")))
-  ;; A non-trivial SELECT projection does not yet execute nextval. PostgreSQL
-  ;; consumes two values before the second target row fails; keep the current
-  ;; result explicit until INSERT SELECT uses a lazy source executor.
-  (is (= [["1"]] (rows "SELECT nextval('projected_seq')"))))
+  (is (= [["3"]] (rows "SELECT nextval('projected_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  insert-select-composes-a-volatile-source-expression
+  (run "CREATE SEQUENCE composed_projection_seq")
+  (run "CREATE TABLE composed_projection_source (ord int, v int)")
+  (run "INSERT INTO composed_projection_source VALUES (1,1),(2,-1),(3,2)")
+  (run "CREATE TABLE composed_projection_target (id bigint, v int CHECK(v > 0))")
+  (is (some? (err (str "INSERT INTO composed_projection_target "
+                       "SELECT nextval('composed_projection_seq') + 10,v "
+                       "FROM composed_projection_source ORDER BY ord"))))
+  (is (= [] (rows "SELECT id FROM composed_projection_target")))
+  (is (= [["3"]] (rows "SELECT nextval('composed_projection_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  insert-select-source-casts-stop-after-the-failing-row
+  (run "CREATE SEQUENCE source_cast_seq")
+  (run "CREATE TABLE source_cast_source (ord int, v text)")
+  (run "INSERT INTO source_cast_source VALUES (1,'1'),(2,'bad'),(3,'3')")
+  (run "CREATE TABLE source_cast_target (id bigint, v int)")
+  (is (some? (err (str "INSERT INTO source_cast_target "
+                       "SELECT nextval('source_cast_seq'),CAST(v AS int) "
+                       "FROM source_cast_source ORDER BY ord"))))
+  (is (= [] (rows "SELECT id FROM source_cast_target")))
+  (is (= [["3"]] (rows "SELECT nextval('source_cast_seq')"))
+      "both source projections before the bad cast ran; the third did not"))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  insert-select-distinct-projects-before-deduplication
+  (run "CREATE SEQUENCE distinct_cast_cutoff_seq")
+  (run "CREATE TABLE distinct_cast_cutoff_source (ord int, v text)")
+  (run "INSERT INTO distinct_cast_cutoff_source VALUES (1,'1'),(2,'bad'),(3,'3')")
+  (run "CREATE TABLE distinct_cast_cutoff_target (id bigint, v int, ord int)")
+  (is (some? (err (str "INSERT INTO distinct_cast_cutoff_target "
+                       "SELECT DISTINCT nextval('distinct_cast_cutoff_seq'),"
+                       "CAST(v AS int),ord FROM distinct_cast_cutoff_source "
+                       "ORDER BY ord"))))
+  (is (= [] (rows "SELECT id FROM distinct_cast_cutoff_target")))
+  (is (= [["3"]] (rows "SELECT nextval('distinct_cast_cutoff_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 5}
+  insert-select-projects-the-source-before-target-defaults
+  (run "CREATE SEQUENCE source_default_order_seq")
+  (run "CREATE TABLE source_default_order_source (ord int, v int)")
+  (run (str "INSERT INTO source_default_order_source "
+            "VALUES (1,1),(2,-1),(3,2)"))
+  (run (str "CREATE TABLE source_default_order_target "
+            "(a bigint DEFAULT nextval('source_default_order_seq'), "
+            " b bigint, v int CHECK(v > 0))"))
+  (is (some? (err (str "INSERT INTO source_default_order_target(b,v) "
+                       "SELECT nextval('source_default_order_seq'),v "
+                       "FROM source_default_order_source ORDER BY ord"))))
+  (is (= [] (rows "SELECT a FROM source_default_order_target")))
+  (is (= [["5"]] (rows "SELECT nextval('source_default_order_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  select-projection-resolves-effects-after-limit
+  (run "CREATE SEQUENCE limited_projection_seq")
+  (run "CREATE TABLE limited_projection_source (ord int)")
+  (run "INSERT INTO limited_projection_source VALUES (1),(2),(3)")
+  (is (= [["1"] ["2"]]
+         (rows (str "SELECT nextval('limited_projection_seq') "
+                    "FROM limited_projection_source ORDER BY ord LIMIT 2"))))
+  (is (= [["3"]] (rows "SELECT nextval('limited_projection_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 4}
+  select-distinct-preserves-volatile-projection-calls
+  (run "CREATE SEQUENCE distinct_projection_seq")
+  (run "CREATE TABLE distinct_projection_source (ord int)")
+  (run "INSERT INTO distinct_projection_source VALUES (1),(2),(3)")
+  (is (= [["1"] ["2"] ["3"]]
+         (rows (str "SELECT DISTINCT nextval('distinct_projection_seq') "
+                    "FROM distinct_projection_source"))))
+  (is (= [["4"]] (rows "SELECT nextval('distinct_projection_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 4}
+  select-distinct-evaluates-composed-volatile-projections
+  (run "CREATE SEQUENCE distinct_composed_seq")
+  (run "CREATE TABLE distinct_composed_source (ord int)")
+  (run "INSERT INTO distinct_composed_source VALUES (1),(2),(3)")
+  (is (= [["1"] ["2"] ["3"]]
+         (rows (str "SELECT DISTINCT nextval('distinct_composed_seq') + 0 "
+                    "FROM distinct_composed_source"))))
+  (is (= [["4"]] (rows "SELECT nextval('distinct_composed_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 4}
+  select-order-by-forces-volatile-sort-keys-before-limit
+  (run "CREATE SEQUENCE sorted_projection_seq")
+  (run "CREATE TABLE sorted_projection_source (ord int)")
+  (run "INSERT INTO sorted_projection_source VALUES (1),(2),(3)")
+  (is (= [["3"] ["2"]]
+         (rows (str "SELECT nextval('sorted_projection_seq') "
+                    "FROM sorted_projection_source "
+                    "ORDER BY nextval('sorted_projection_seq') DESC LIMIT 2"))))
+  (is (= [["4"]] (rows "SELECT nextval('sorted_projection_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 4}
+  select-order-by-composes-volatile-sort-keys
+  (run "CREATE SEQUENCE sorted_composed_seq")
+  (run "CREATE TABLE sorted_composed_source (ord int)")
+  (run "INSERT INTO sorted_composed_source VALUES (1),(2),(3)")
+  (is (= [["3"] ["2"]]
+         (rows (str "SELECT nextval('sorted_composed_seq') + 0 "
+                    "FROM sorted_composed_source "
+                    "ORDER BY nextval('sorted_composed_seq') + 0 DESC LIMIT 2"))))
+  (is (= [["4"]] (rows "SELECT nextval('sorted_composed_seq')"))))
+
+(deftest nextval-in-predicates-is-explicitly-unsupported
+  (run "CREATE SEQUENCE predicate_projection_seq")
+  (run "CREATE TABLE predicate_projection_source (v int)")
+  (run "INSERT INTO predicate_projection_source VALUES (1),(2),(3)")
+  (let [result (run (str "SELECT v FROM predicate_projection_source "
+                         "WHERE nextval('predicate_projection_seq') < 2"))]
+    (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult result))))
+  (is (= [["1"]] (rows "SELECT nextval('predicate_projection_seq')"))
+      "an unsupported predicate must not silently consume or compare markers"))
+
+(deftest distinct-on-does-not-deduplicate-the-final-projection
+  (run "CREATE TABLE distinct_on_projection_source (id int)")
+  (run "INSERT INTO distinct_on_projection_source VALUES (1),(2),(3)")
+  (is (= [["1"] ["1"] ["1"]]
+         (rows (str "SELECT DISTINCT ON (id) 1 "
+                    "FROM distinct_on_projection_source ORDER BY id")))))
+
+(deftest insert-select-distinct-deduplicates-projected-values
+  (run "CREATE TABLE distinct_cast_source (v text)")
+  (run "INSERT INTO distinct_cast_source VALUES ('01'),('1')")
+  (run "CREATE TABLE distinct_cast_target (v int)")
+  (is (= "INSERT 0 1"
+         (tag (str "INSERT INTO distinct_cast_target "
+                   "SELECT DISTINCT CAST(v AS int) FROM distinct_cast_source"))))
+  (is (= [["1"]] (rows "SELECT v FROM distinct_cast_target"))))
+
+(deftest insert-select-source-runs-at-execute
+  (run "CREATE TABLE execute_source (v int)")
+  (run "CREATE TABLE execute_target (v int)")
+  (run "INSERT INTO execute_source VALUES (1)")
+  (let [prepared (.parse *handler*
+                         "INSERT INTO execute_target SELECT v FROM execute_source"
+                         (int-array 0))]
+    (run "INSERT INTO execute_source VALUES (2)")
+    (.executePrepared *handler* prepared (object-array [nil]))
+    (is (= [["1"] ["2"]]
+           (rows "SELECT v FROM execute_target ORDER BY v")))))
+
+(deftest prepared-insert-select-rebuilds-enriched-sources-at-execute
+  (run "CREATE TABLE enriched_execute_source (v int)")
+  (run "CREATE TABLE enriched_execute_target (v int)")
+  (run "INSERT INTO enriched_execute_source VALUES (1)")
+  (let [prepared (.parse *handler*
+                         (str "INSERT INTO enriched_execute_target "
+                              "SELECT s.v FROM enriched_execute_source s "
+                              "CROSS JOIN generate_series(1,1) g")
+                         (int-array 0))]
+    (run "INSERT INTO enriched_execute_source VALUES (2)")
+    (.executePrepared *handler* prepared (object-array [nil]))
+    (is (= [["1"] ["2"]]
+           (rows "SELECT v FROM enriched_execute_target ORDER BY v")))))
+
+(deftest insert-select-parse-does-not-run-source-effects
+  (run "CREATE SEQUENCE parse_effect_seq")
+  (run "CREATE TABLE parse_effect_source (v int)")
+  (run "INSERT INTO parse_effect_source VALUES (1)")
+  (run "CREATE TABLE parse_effect_target (id bigint, v int)")
+  (let [prepared (.parse *handler*
+                         (str "INSERT INTO parse_effect_target "
+                              "SELECT nextval('parse_effect_seq'),v "
+                              "FROM parse_effect_source")
+                         (int-array 0))]
+    (is (= [["1"]] (rows "SELECT nextval('parse_effect_seq')")))
+    (.executePrepared *handler* prepared (object-array [nil]))
+    (is (= [["2" "1"]]
+           (rows "SELECT id,v FROM parse_effect_target")))))
 
 (deftest ^{:postgres-major 17 :postgres-nextval 3}
   do-nothing-still-evaluates-the-skipped-candidates-default
