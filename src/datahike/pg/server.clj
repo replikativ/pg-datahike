@@ -6480,6 +6480,37 @@
                  (update :local-sequence-identities (fnil conj #{}) [name eid])
                  (update-in [:local-sequence-generations [name eid]] (fnil inc 0)))))))
 
+(defn- checkpoint-sequence-only-window!
+  "Advance an open transaction's conflict watermark across a fully proven
+   sequence-only durable window.
+
+   Bulk INSERT/COPY can reserve more values than the bounded recent-commit
+   ring retains. Without this checkpoint, the transaction later sees a ring
+   gap and aborts conservatively even though only non-transactional nextval
+   writes advanced the branch. Direct sequence mutations in the transaction
+   deliberately opt out because those do conflict with durable reservations."
+  [conn tx-state]
+  (let [{:keys [in-tx? begin-max-tx tx-buffer]} @tx-state
+        db-now (when in-tx? (d/db conn))
+        current-max-tx (:max-tx db-now)]
+    (when (and begin-max-tx current-max-tx
+               (> (long current-max-tx) (long begin-max-tx))
+               (not-any? direct-sequence-value-write? tx-buffer)
+               (= ::sequence-only
+                  (ring-write-eas-graced (db-ring-key db-now)
+                                         begin-max-tx current-max-tx)))
+      (swap! tx-state
+             (fn [state]
+               (-> state
+                   (assoc :begin-max-tx current-max-tx)
+                   ;; A rollback-to-savepoint must not resurrect a watermark
+                   ;; that predates non-transactional reservations which the
+                   ;; rollback itself cannot undo.
+                   (update :savepoints
+                           (fn [savepoints]
+                             (mapv #(assoc % :begin-max-tx current-max-tx)
+                                   savepoints)))))))))
+
 (defn- nextval-for-tx!
   "Reserve from a committed sequence independently, or from a sequence newly
    created in this transaction's speculative database. The latter update is
@@ -6494,7 +6525,9 @@
                    [(:name speculative-descriptor) (:eid speculative-descriptor)])
         local? (contains? (:local-sequence-identities state #{}) identity)]
     (if (and (sequence-descriptor (d/db conn) seq-name) (not local?))
-      (nextval! conn seq-name)
+      (let [value (nextval! conn seq-name)]
+        (checkpoint-sequence-only-window! conn tx-state)
+        value)
       (locking tx-state
         (let [state @tx-state
               db (:speculative-db state)
@@ -10417,7 +10450,7 @@
    the QueryHandler reify's copyChunk/copyComplete/copyAbort
    methods (which read the session out of `:copy-state`)."
   [ctx parsed]
-  (let [{:keys [schema copy-state conn]} ctx
+  (let [{:keys [schema copy-state conn tx-state]} ctx
         {:keys [ns table columns options]} parsed
         ;; The attribute namespace is the TABLE name, never the schema
         ;; qualifier. This read `(or ns table)`, so `COPY public.emp`
@@ -10433,7 +10466,10 @@
             (throw (ex-info (str "schema \"" ns "\" does not exist")
                             {:error :undefined-table :table (str ns "." table)})))
         ns table
-        db-now (when conn (d/db conn))
+        db-now (when conn
+                 (if (:in-tx? @tx-state)
+                   (:speculative-db @tx-state)
+                   (d/db conn)))
         current-schema (or (some-> db-now :schema) schema)
         table-exists? (some (fn [ident]
                               (and (keyword? ident)
@@ -10462,36 +10498,57 @@
           step-fn      (resolve (symbol (str decoder-ns) "decode-step"))
           finalize-fn  (resolve (symbol (str decoder-ns) "decode-finalize"))
           decoder      (make-fn (assoc options :columns col-names))]
-      (reset! copy-state
-              {:decoder         decoder
-               :decode-step-fn  step-fn
-               :decode-finalize-fn finalize-fn
-               :columns         col-names
-               :ns              ns
-               :table           table
-               :row-marker      (pgs/row-marker-attr table)
-               :catalog-basis   (catalog-basis/capture db-now)
-               :rows-committed  0
-               :pending-rows    []
-               :batch-size      1000
-               :error           nil})
+      (let [constraint-plan
+            (schema-cached db-now [::row-constraint-plan table]
+                           #(row-constraints/compile-constraint-metadata
+                             (cached-row-constraint-metadata db-now table)))]
+        (reset! copy-state
+                {:decoder         decoder
+                 :decode-step-fn  step-fn
+                 :decode-finalize-fn finalize-fn
+                 :columns         col-names
+                 :ns              ns
+                 :table           table
+                 :row-marker      (pgs/row-marker-attr table)
+                 :tempid-prefix   (str "copy-" (java.util.UUID/randomUUID) "-row-")
+                 :catalog-basis   (catalog-basis/capture db-now)
+               ;; A transaction may have its own speculative DDL, so retain a
+               ;; second basis for the durable branch.  Checking both before
+               ;; evaluating a batch prevents an already-stale COPY from
+               ;; consuming sequence defaults while still allowing COPY of a
+               ;; table created earlier in this BEGIN.
+                 :durable-catalog-basis (catalog-basis/capture (d/db conn))
+                 :constraint-plan constraint-plan
+                 :unique-specs    (plain-unique-specs db-now table constraint-plan)
+                 :sequence-defaults (stmt/insert-sequence-defaults db-now table)
+                 :speculative-db  db-now
+                 :tx-data         []
+                 :tempids         {}
+                 :local-sequence-op-offset (count (:tx-buffer @tx-state))
+                 :rows-processed  0
+                 :pending-rows    []
+                 :pending-unique  #{}
+                 :batch-size      1000
+                 :error           nil}))
       ;; Return QueryResult signalling COPY-IN with the column count.
       (let [r (PgWireServer$QueryResult/empty "COPY 0")]
         (.withCopyInMode r (count col-names))
         r))))
 
 (defn- copy-flush-batch!
-  "Transact a batch of rows from the copy-state's pending buffer.
-   Mutates the session: clears pending, adds row-count, and on
-   error sets :error so future chunks no-op until copyComplete /
-   copyAbort surfaces it."
+  "Validate one bounded COPY executor batch against a private snapshot.
+
+   This is deliberately NOT a durable commit boundary.  PostgreSQL also
+   flushes bounded COPY executor buffers, but the complete statement remains
+   one transaction.  Materialized rows accumulate for one publication at
+   CopyDone (or in the surrounding explicit transaction's buffer)."
   [ctx]
-  (let [{:keys [conn copy-state]} ctx
+  (let [{:keys [conn copy-state tx-state]} ctx
         s @copy-state
         rows (:pending-rows s)]
     (when (and (seq rows) (nil? (:error s)))
       (try
-        (let [db-now (d/db conn)
+        (let [db-now (:speculative-db s)
               _ (assert-catalog-current! (:catalog-basis s) db-now)
               available (columns-from-schema (:schema db-now) (:ns s) db-now)
               _ (when (empty? available)
@@ -10500,44 +10557,165 @@
                   ;; explicitly rather than leaking Datahike schema internals.
                   (throw (errors/pg-error :undefined-table
                                           {:table (:table s)})))
-              defaults (stmt/insert-sequence-defaults db-now (:table s))
-              rows (mapv (fn [row]
-                           (reduce-kv
-                            (fn [row attr sequence-name]
-                              (if (contains? row attr)
-                                row
-                                (assoc row attr
-                                       {:fn :nextval :seq-name sequence-name
-                                        :generated-default? true})))
-                            row defaults))
-                         rows)
-              rows (sql/resolve-nextvals! rows #(nextval! conn %))
-              tx-data' (binding [*statement-catalog-basis* (:catalog-basis s)]
-                         (-> rows
-                             (apply-column-constraints (:table s) (:ns s) db-now)))]
-          (transact-recorded! conn tx-data')
+              prepared rows
+              ;; nextval-for-tx! buffers reservations for a sequence created
+              ;; inside the surrounding transaction.  Mirror just those new
+              ;; operations into COPY's private snapshot; otherwise publishing
+              ;; the COPY snapshot would overwrite the locally advanced
+              ;; sequence state at CopyDone.
+              local-sequence-ops
+              (when (:in-tx? @tx-state)
+                (->> (drop (:local-sequence-op-offset s)
+                           (:tx-buffer @tx-state))
+                     (filter direct-sequence-value-write?)
+                     vec))
+              spec-report (dc/with db-now (into local-sequence-ops prepared))
+              _ (unique-constraints/validate-report! spec-report)]
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
-                                 (update :rows-committed + (count rows)))))
+                                 (assoc :pending-unique #{})
+                                 (assoc :speculative-db (:db-after spec-report))
+                                 (assoc :local-sequence-op-offset
+                                        (count (:tx-buffer @tx-state)))
+                                 (update :tx-data into prepared)
+                                 (update :tempids merge (:tempids spec-report))
+                                 (update :rows-processed + (count prepared)))))
         (catch Throwable e
-          (swap! copy-state assoc :error (.getMessage e))
-          (throw e))))))
+          ;; Latch the original throwable so CopyDone can preserve SQLSTATE.
+          ;; Later chunks are ignored, which also preserves volatile/default
+          ;; cutoff after the first rejected source row.
+          (swap! copy-state assoc :error e :pending-rows []))))))
 
 (defn- copy-process-rows!
-  "Fold a batch of decoded rows into the session: build entity maps
-   via `copy/row->entity-map`, append to pending, and flush whenever
-   we cross batch-size."
+  "Prepare decoded rows completely in source order, then append the already
+   materialized candidates to the bounded speculative executor batch."
   [ctx rows]
-  (let [{:keys [conn copy-state schema]} ctx
-        schema (stmt/enrich-schema-with-pg-array-meta schema (d/db conn))
-        {:keys [columns ns row-marker batch-size]} @copy-state]
+  (let [{:keys [conn copy-state schema tx-state]} ctx
+        copy-db (:speculative-db @copy-state)
+        schema (stmt/enrich-schema-with-pg-array-meta
+                (or (:schema copy-db) schema) copy-db)
+        {:keys [columns ns row-marker batch-size tempid-prefix]} @copy-state]
     (doseq [row rows]
-      (let [next-idx (-> @copy-state :rows-committed (+ (count (:pending-rows @copy-state))))
-            entity (datahike.pg.sql.copy/row->entity-map
-                    row columns ns row-marker schema next-idx)]
-        (swap! copy-state update :pending-rows conj entity)))
-    (when (>= (count (:pending-rows @copy-state)) batch-size)
-      (copy-flush-batch! ctx))))
+      (when-not (:error @copy-state)
+        (try
+          (let [s @copy-state
+                db-now (:speculative-db s)
+                ;; Check the live catalog before coercion/default evaluation.
+                ;; A stale statement must not consume a sequence reservation.
+                _ (assert-catalog-current! (:durable-catalog-basis s) (d/db conn))
+                _ (assert-catalog-current! (:catalog-basis s) db-now)
+                next-idx (-> s :rows-processed (+ (count (:pending-rows s))))
+                entity (datahike.pg.sql.copy/row->entity-map
+                        row columns ns row-marker schema next-idx tempid-prefix)
+                entity (reduce-kv
+                        (fn [candidate attr sequence-name]
+                          (if (contains? candidate attr)
+                            candidate
+                            (assoc candidate attr
+                                   {:fn :nextval :seq-name sequence-name
+                                    :generated-default? true})))
+                        entity (:sequence-defaults s))
+                resolve-value
+                (fn [value]
+                  (sql/resolve-nextvals!
+                   value
+                   (fn [sequence-name]
+                     (if (:in-tx? @tx-state)
+                       (nextval-for-tx! conn tx-state sequence-name)
+                       (nextval! conn sequence-name)))))
+                candidate (materialize-insert-candidate
+                           entity (:constraint-plan s) db-now resolve-value)
+                seen (validate-plain-candidate-unique!
+                      db-now (:table s) (:unique-specs s)
+                      (:pending-unique s #{}) candidate)
+                candidate (into {} (remove (comp nil? val)) candidate)]
+            (swap! copy-state
+                   #(-> %
+                        (update :pending-rows conj candidate)
+                        (assoc :pending-unique seen)))
+            (when (>= (count (:pending-rows @copy-state)) batch-size)
+              (copy-flush-batch! ctx)))
+          (catch Throwable e
+            (swap! copy-state assoc :error e :pending-rows [])))))))
+
+(defn- publish-copy!
+  "Publish a completely validated COPY exactly once.
+
+   In autocommit this is one durable Datahike transaction.  Inside BEGIN the
+   rows join the ordinary speculative database and commit buffer, so later
+   statements see them and ROLLBACK discards them."
+  [{:keys [conn copy-state tx-state]}]
+  (let [{:keys [tx-data table ns catalog-basis speculative-db tempids
+                constraint-plan]} @copy-state
+        ;; PostgreSQL implements immediate FKs as queued AFTER ROW triggers
+        ;; and drains them after COPY has consumed the input.  Checking here,
+        ;; against the completed private snapshot, therefore permits a child
+        ;; in an early executor batch to reference a parent in a later one.
+        _ (doseq [row tx-data]
+            (row-constraints/validate-mutation!
+             speculative-db table row constraint-plan {}
+             (fn [ast logical-row row-ns schema]
+               (sql/eval-check-predicate ast logical-row row-ns schema))
+             nil))
+        constrained-tx-data
+        (binding [*statement-catalog-basis* catalog-basis]
+          (apply-column-constraints tx-data table ns speculative-db))
+        ;; A string tempid plus :db.unique/identity is an upsert in Datahike.
+        ;; COPY is PostgreSQL INSERT semantics, so recheck every native and
+        ;; catalog key at writer time before any candidate map can silently
+        ;; resolve onto a concurrently inserted entity.
+        unique-guard
+        [:db.fn/call
+         (fresh-insert-fn
+          (fn [txdb]
+            (let [specs (plain-unique-specs txdb table constraint-plan)]
+              (reduce (fn [seen row]
+                        (validate-plain-candidate-unique!
+                         txdb table specs seen row))
+                      #{} tx-data))
+            []))]
+        commit-tx-data
+        (if (seq tx-data)
+          ;; apply-column-constraints puts the catalog guard first. Keep it
+          ;; first, then uniqueness admission, then the constraint/materialized
+          ;; row payload.
+          (into [(first constrained-tx-data) unique-guard]
+                (rest constrained-tx-data))
+          constrained-tx-data)]
+    (if (:in-tx? @tx-state)
+      (swap! tx-state
+             (fn [ts]
+               (-> ts
+                   (update :tx-buffer into commit-tx-data)
+                   (assoc :speculative-db speculative-db)
+                   (update :eid->tempid merge
+                           (into {} (keep (fn [[tid eid]]
+                                            (when (string? tid) [eid tid])))
+                                 tempids)))))
+      (when (seq tx-data)
+        (transact-recorded! conn commit-tx-data)))))
+
+(defn- copy-decoder-awaits-cr-lookahead? [decoder]
+  (let [^StringBuilder buf (:line-buf decoder)
+        n (when buf (.length buf))]
+    (and (pos? (long (or n 0)))
+         (= \return (.charAt buf (dec n))))))
+
+(defn- copy-next-slice-end
+  "Choose the next decoder boundary without letting a second source row run
+   ahead. A CR needs one character of lookahead to distinguish CRLF from bare
+   CR; when the previous call deferred it, feed exactly that one character."
+  [decoder ^String chunk start]
+  (let [n (.length chunk)]
+    (if (copy-decoder-awaits-cr-lookahead? decoder)
+      (min n (inc start))
+      (loop [i start]
+        (if (>= i n)
+          n
+          (case (.charAt chunk i)
+            \newline (inc i)
+            \return (min n (+ i 2))
+            (recur (inc i))))))))
 
 (def ^:private temp-table-prefix "__dh_pg_temp_")
 
@@ -10886,7 +11064,7 @@
         ;;    :decode-finalize-fn  fn taking [decoder] → [rows eod?]
         ;;    :columns ["id" "name" ...]
         ;;    :ns "users"  :table "users"
-        ;;    :rows-committed long
+        ;;    :rows-processed long
         ;;    :pending-rows  vec of partial-batch rows
         ;;    :batch-size    long}
         copy-state (atom nil)
@@ -10947,15 +11125,35 @@
 
       (copyChunk [_ chunk-bytes]
         (when-let [s @copy-state]
-          (let [chunk (String. ^bytes chunk-bytes java.nio.charset.StandardCharsets/UTF_8)
-                step-fn (:decode-step-fn s)
-                [d' rows _eod?] (step-fn (:decoder s) chunk)
-                ctx-fresh {:conn conn
-                           :schema (:schema (d/db conn))
-                           :copy-state copy-state}]
-            (swap! copy-state assoc :decoder d')
-            (when (seq rows)
-              (copy-process-rows! ctx-fresh rows)))))
+          (when-not (:error s)
+            (try
+              (let [chunk (String. ^bytes chunk-bytes java.nio.charset.StandardCharsets/UTF_8)
+                    ctx-fresh {:conn conn
+                               :schema (:schema (d/db conn))
+                               :copy-state copy-state
+                               :tx-state tx-state}]
+                ;; Do not let parsing a later physical line run ahead of an
+                ;; earlier row's defaults and constraints.  In particular,
+                ;; an earlier CHECK failure wins over a later coercion/CSV
+                ;; error and consumes exactly its own sequence reservation.
+                (loop [start 0]
+                  (when (and (< start (.length chunk))
+                             (nil? (:error @copy-state)))
+                    (let [current @copy-state
+                          decoder (:decoder current)
+                          end (long (copy-next-slice-end decoder chunk start))
+                          step-fn (:decode-step-fn current)
+                          [d' rows _eod?]
+                          (step-fn decoder (subs chunk start end))]
+                      (swap! copy-state assoc :decoder d')
+                      (when (seq rows)
+                        (copy-process-rows! ctx-fresh rows))
+                      (recur end)))))
+              (catch Throwable e
+                ;; Stay in COPY-IN protocol mode and report the typed error at
+                ;; CopyDone.  Throwing here made the Java loop emit XX000 while
+                ;; accidentally leaving its COPY state active.
+                (swap! copy-state assoc :error e :pending-rows []))))))
 
       (copyComplete [_]
         (let [s @copy-state]
@@ -10963,24 +11161,38 @@
             (PgWireServer$QueryResult/empty "COPY 0")
             (let [ctx-fresh {:conn conn
                              :schema (:schema (d/db conn))
-                             :copy-state copy-state}
+                             :copy-state copy-state
+                             :tx-state tx-state}
                   finalize-fn (:decode-finalize-fn s)
-                  [final-rows _eod?] (finalize-fn (:decoder s))]
-              (when (seq final-rows)
+                  final-result (when-not (:error s)
+                                 (try
+                                   (finalize-fn (:decoder s))
+                                   (catch Throwable e
+                                     (swap! copy-state assoc :error e)
+                                     nil)))
+                  [final-rows _eod?] final-result]
+              (when (and (nil? (:error @copy-state)) (seq final-rows))
                 (copy-process-rows! ctx-fresh final-rows))
               (try
                 ;; Drain remaining pending rows
                 (copy-flush-batch! ctx-fresh)
-                (let [committed (:rows-committed @copy-state)]
+                (when-let [e (:error @copy-state)]
+                  (throw e))
+                (publish-copy! ctx-fresh)
+                (let [processed (:rows-processed @copy-state)]
                   (reset! copy-state nil)
-                  (PgWireServer$QueryResult/empty (str "COPY " committed)))
+                  (PgWireServer$QueryResult/empty (str "COPY " processed)))
                 (catch Throwable e
-                  (let [committed (:rows-committed @copy-state)]
+                  (let [processed (:rows-processed @copy-state)]
+                    (when (:in-tx? @tx-state)
+                      (swap! tx-state assoc :aborted? true))
                     (reset! copy-state nil)
                     (classified-error
-                     (str "COPY failed after " committed " rows: ") e))))))))
+                     (str "COPY failed after processing " processed " rows: ") e))))))))
 
       (copyAbort [_ _reason]
+        (when (:in-tx? @tx-state)
+          (swap! tx-state assoc :aborted? true))
         (reset! copy-state nil))
 
       ;; --- Deferred-CC INSERT batching ---------------------------------
@@ -11746,7 +11958,7 @@
                         ;;                     DATABASE swap! through it
                         ;;   :copy-state     — atom holding the COPY-IN session
                         ;;                     (decoder, decoder fns, target table, batch
-                        ;;                     accumulator, rows-committed counter); set
+                        ;;                     accumulator, rows-processed counter); set
                         ;;                     by exec-copy-from-stdin, mutated by
                         ;;                     copyChunk/copyComplete/copyAbort callbacks
                         (let [ctx {:conn conn
