@@ -2685,6 +2685,25 @@
      nil)
     attrs))
 
+(defn- materialize-insert-source-projection
+  "Resolve INSERT ... SELECT output expressions in SELECT-list order.
+
+   PostgreSQL's source Result node produces a complete tuple before
+   ModifyTable fills target defaults. Keeping this as a distinct phase also
+   means a rejected target row prevents every later source effect."
+  [candidate source-order db resolve-value]
+  (let [schema (dbi/-schema db)]
+    (reduce (fn [attrs attr]
+              (if (contains? attrs attr)
+                (let [resolved (resolve-value (get attrs attr))
+                      coerced (when (some? resolved)
+                                (or (#'sql/coerce-insert-value
+                                     resolved attr schema db)
+                                    resolved))]
+                  (assoc attrs attr coerced))
+                attrs))
+            candidate source-order)))
+
 (defn- plain-unique-specs [db table-name constraint-plan]
   (let [table-attrs (into #{} (map :attr) (:columns constraint-plan))
         native
@@ -2773,7 +2792,11 @@
            conflict-state nil
            seen-unique #{}]
       (if-let [candidate (first candidates)]
-        (let [candidate (materialize-insert-candidate
+        (let [candidate (cond-> candidate
+                          (seq (:insert-source-order parsed))
+                          (materialize-insert-source-projection
+                           (:insert-source-order parsed) base-db resolve-value))
+              candidate (materialize-insert-candidate
                          candidate constraint-plan base-db resolve-value)
               ;; ON CONFLICT arbitration has statement-wide state: two source
               ;; rows may not update the same target, and an earlier update can
@@ -5012,6 +5035,36 @@
    doc/design-alignment.md)."
   false)
 
+(defn- substitute-select-plan-params
+  "Substitute only execution-bearing values in a cached SELECT plan.
+
+   In particular, preserve enriched DB values, schemas, parser functions and
+   parameter-index maps by identity. Walking the complete INSERT source plan
+   rebuilt those large immutable structures on every prepared Execute."
+  [plan fetch]
+  (let [sub #(sql/substitute-params % fetch)]
+    (cond-> plan
+      (contains? plan :in-args) (update :in-args sub)
+      (contains? plan :literal-row) (update :literal-row sub)
+      (contains? plan :literal-rows) (update :literal-rows sub)
+      (contains? plan :compound-exprs) (update :compound-exprs sub)
+      (contains? plan :project-set) (update :project-set sub)
+      (contains? plan :secondary-candidate) (update :secondary-candidate sub)
+      (contains? plan :secondary-order-candidate)
+      (update :secondary-order-candidate sub)
+      (contains? plan :sub-results)
+      (update :sub-results
+              (fn [branches]
+                (mapv #(substitute-select-plan-params % fetch) branches)))
+      (contains? plan :deferred-recursive-ctes)
+      (update :deferred-recursive-ctes sub))))
+
+(defn- substitute-insert-source-params [source-plan fetch]
+  (cond-> (update source-plan :source substitute-select-plan-params fetch)
+    (get-in source-plan [:conflict-plan :set-params])
+    (update-in [:conflict-plan :set-params]
+               #(sql/substitute-params % fetch))))
+
 (defn- resolve-param-refs
   "Given a parsed result from sql/parse-sql and a 1-indexed `bound`
    vector (element 0 unused), return a parsed result with all
@@ -5033,6 +5086,8 @@
       (update :tx-data sql/substitute-params fetch)
       (contains? parsed :insert-candidates)
       (update :insert-candidates sql/substitute-params fetch)
+      (contains? parsed :insert-source)
+      (update :insert-source substitute-insert-source-params fetch)
       (contains? parsed :secondary-candidate)
       (update :secondary-candidate sql/substitute-params fetch)
       (contains? parsed :secondary-order-candidate)
@@ -7608,7 +7663,13 @@
         (format-query-result (or literal-rows [literal-row])
                              find-aliases
                              schema-oids))
-      (let [;; Catalog-only SELECT: re-resolve the enriched-db against the
+      (let [call-seen (java.util.IdentityHashMap.)
+            resolve-result-value
+            #(sql/resolve-nextvals!
+              % (fn [sequence-name]
+                  (nextval-for-tx! (:conn ctx) tx-state sequence-name))
+              nil call-seen)
+            ;; Catalog-only SELECT: re-resolve the enriched-db against the
             ;; CURRENT db so a reused prepared statement reflects catalog
             ;; changes (CREATE TYPE etc.) since Parse — the cache makes this
             ;; a lookup, and it's DDL-invalidated. CTE/derived enrichment
@@ -7771,6 +7832,21 @@
                                    (empty? (seq results)))
                           (expr/empty-aggregate-row query))
                         results)
+            ;; Volatile ORDER BY expressions belong below Sort and are
+            ;; evaluated for every input row, including rows later removed by
+            ;; OFFSET/LIMIT. Resolve only the key columns here; other SELECT
+            ;; expressions remain lazy until their row survives shaping.
+            results (if (seq sql-order-by)
+                      (let [idxs (mapv first (partition 3 sql-order-by))]
+                        (map (fn [row]
+                               (let [rv (if (sequential? row) (vec row) [row])]
+                                 (reduce (fn [r idx]
+                                           (if (< idx (count r))
+                                             (update r idx resolve-result-value)
+                                             r))
+                                         rv idxs)))
+                             results))
+                      results)
             ;; Server-side null-safe sort (when ORDER BY has nullable columns).
             ;; With LIMIT n (+ OFFSET o) only the first n+o sorted rows are
             ;; ever emitted, so a bounded top-k selection replaces the full
@@ -7815,6 +7891,17 @@
             ;; statement's OFFSET/LIMIT.
             results (if (seq project-set)
                       (stmt/apply-project-set results project-set)
+                      results)
+            results (if (seq project-order-by)
+                      (let [idxs (mapv first (partition 3 project-order-by))]
+                        (map (fn [row]
+                               (let [rv (if (sequential? row) (vec row) [row])]
+                                 (reduce (fn [r idx]
+                                           (if (< idx (count r))
+                                             (update r idx resolve-result-value)
+                                             r))
+                                         rv idxs)))
+                             results))
                       results)
             results (if (seq project-order-by)
                       (sort (null-safe-order-cmp project-order-by) results)
@@ -7937,10 +8024,17 @@
                            (assoc parsed :find-aliases find-aliases)
                            results query-db (dbi/-schema query-db))]
               [rs as])
-            ;; Apply DISTINCT deduplication for aggregate queries
-            results (if (and has-distinct? has-aggregates?)
-                      (distinct results)
-                      results)]
+            ;; Plain DISTINCT deduplicates the concrete projected row. DISTINCT
+            ;; ON was already handled by its ordered key prefix above.
+            results (if (and has-distinct? (nil? (:distinct-on-n parsed)))
+                      (distinct (map resolve-result-value results))
+                      results)
+            ;; Stateful SELECT projection calls are represented as inert
+            ;; markers while Datalog shapes the result. Resolve only rows that
+            ;; survived WHERE/ORDER/OFFSET/LIMIT. INSERT ... SELECT bypasses
+            ;; this result formatter and deliberately leaves the same markers
+            ;; for ordered, one-candidate-at-a-time preparation.
+            results (mapv resolve-result-value results)]
         ;; Derive schema-based OIDs for proper type metadata.
         ;; Shared with describeResult; see compute-schema-oids.
         (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
@@ -8092,12 +8186,24 @@
     (cond
       (:in-tx? @tx-state)
       (try
-        (let [table-name (:table parsed)
-              initial-state @tx-state
+        (let [initial-state @tx-state
               spec-db (:speculative-db initial-state)
-              resolver #(sql/resolve-nextvals!
-                         % (fn [sequence-name]
-                             (nextval-for-tx! conn tx-state sequence-name)))
+              source? (contains? parsed :insert-source)
+              call-seen (java.util.IdentityHashMap.)
+              nextval-resolver (fn [sequence-name]
+                                 (nextval-for-tx! conn tx-state sequence-name))
+              resolver #(sql/resolve-nextvals! % nextval-resolver nil call-seen)
+              source-db (or (:enriched-db parsed)
+                            (get-in parsed [:insert-source :source :enriched-db])
+                            spec-db)
+              parsed (if source?
+                       (stmt/materialize-insert-select
+                        (:insert-source parsed) source-db resolver)
+                       parsed)
+              _ (when source?
+                  (reject-explicit-always-identities!
+                   (:tx-data parsed) (:table parsed) spec-db))
+              table-name (:table parsed)
               prepared (prepare-insert-candidates parsed spec-db resolver)
               ;; A sequence created inside this transaction reserves into the
               ;; live speculative overlay. Preparation must not subsequently
@@ -8185,11 +8291,25 @@
       ;; former deferred-CC "batchable" path was retired once implicit-tx
       ;; took over grouping (see doc/design-alignment.md).
       :else
-      (execute-insert
-       conn parsed
-       #(sql/resolve-nextvals! % (fn [sequence-name]
-                                   (nextval-for-tx! conn tx-state sequence-name)))
-       :tx-wrap (:tx-wrap ctx)))))
+      (let [source? (contains? parsed :insert-source)
+            db (d/db conn)
+            call-seen (java.util.IdentityHashMap.)
+            nextval-resolver (fn [sequence-name]
+                               (nextval-for-tx! conn tx-state sequence-name))
+            resolver #(sql/resolve-nextvals! % nextval-resolver nil call-seen)
+            source-db (or (:enriched-db parsed)
+                          (get-in parsed [:insert-source :source :enriched-db])
+                          db)
+            parsed (if source?
+                     (stmt/materialize-insert-select
+                      (:insert-source parsed) source-db resolver)
+                     parsed)
+            _ (when source?
+                (reject-explicit-always-identities!
+                 (:tx-data parsed) (:table parsed) db))]
+        (execute-insert
+         conn parsed resolver
+         :tx-wrap (:tx-wrap ctx))))))
 
 (defn- exec-update-with-recursive
   [ctx parsed]
@@ -11989,8 +12109,15 @@
                                        ;; effective snapshot selected above
                                        ;; (branch/as-of/cursor/transaction),
                                        ;; not from head at Bind time.
-                                         cached (if (and (:runtime-subqueries? cached)
-                                                         (:enriched-db cached))
+                                         cached (if (or (and (:runtime-subqueries? cached)
+                                                             (:enriched-db cached))
+                                                        (and (= :insert (:type cached))
+                                                             (:insert-source cached)
+                                                             (or (:enriched-db cached)
+                                                                 (get-in cached
+                                                                         [:insert-source
+                                                                          :source
+                                                                          :enriched-db]))))
                                                   (binding [params/*bound-params* (vec (rest bound))
                                                             params/*declared-param-oids*
                                                             (:declared-param-oids cached)]

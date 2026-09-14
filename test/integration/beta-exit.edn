@@ -118,12 +118,12 @@
    :exit "INSERT and COPY preserve reserved sequence advances across row failure and rollback without reusing values; generated identity provenance, prepared NULLs, inheritance, defaults, conflict constraints, and PostgreSQL COPY field/default evaluation order pass independent review and integration gates."}
   {:id :sequence-row-evaluation-order
    :wave 5
-   :status :open
+   :status :closed
    :evidence ["test/datahike/test/pg_on_conflict_semantics_test.clj"
               "test/datahike/test/pg_nextval_in_values_test.clj"
               "doc/postgres-compatibility.md"
               "doc/routines-and-triggers.md"]
-   :exit "The ordered executor now matches PostgreSQL 17 for VALUES, DEFAULT VALUES, ON CONFLICT, COPY, and INSERT SELECT target defaults, including early-row failure, prepared NULL, RETURNING, and rollback cases. Close the blocker when volatile expressions in a non-trivial INSERT SELECT source use the same lazy candidate cutoff and commit never reruns their effects."}
+   :exit "The ordered executor matches PostgreSQL 17 for VALUES, DEFAULT VALUES, ON CONFLICT, COPY, and INSERT SELECT. INSERT SELECT sources run at Execute against the statement snapshot; stateful projections resolve in SELECT-list order before target defaults, stop at the first rejected candidate, and reach commit only as concrete values."}
   {:id :three-valued-null
    :wave 1
    :status :closed

@@ -35,8 +35,10 @@ commands:
       - run:
           name: Install Clojure CLI
           command: |
-            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-            chmod +x linux-install.sh
+            if [ ! -x linux-install.sh ]; then
+              curl -sSLO --fail --retry 8 --retry-all-errors --retry-delay 2 https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+              chmod +x linux-install.sh
+            fi
             sudo ./linux-install.sh
       - run:
           name: Install babashka
@@ -107,6 +109,7 @@ jobs:
           paths:
             - .m2
             - replikativ
+            - project/linux-install.sh
 
   build:
     executor: clj-jdk21
@@ -261,8 +264,10 @@ jobs:
             # canonical installer from GitHub Releases instead. --fail
             # aborts on any HTTP error so we don't silently write the
             # error body to disk and try to execute it.
-            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-            chmod +x linux-install.sh
+            if [ ! -x linux-install.sh ]; then
+              curl -sSLO --fail --retry 8 --retry-all-errors --retry-delay 2 https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+              chmod +x linux-install.sh
+            fi
             sudo ./linux-install.sh
       - run:
           name: Install babashka
@@ -385,8 +390,10 @@ jobs:
             # images surface).
             sudo apt-get update && sudo apt-get install -y --no-install-recommends \
               openjdk-21-jdk-headless netcat-openbsd
-            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-            chmod +x linux-install.sh
+            if [ ! -x linux-install.sh ]; then
+              curl -sSLO --fail --retry 8 --retry-all-errors --retry-delay 2 https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+              chmod +x linux-install.sh
+            fi
             sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
@@ -422,8 +429,10 @@ jobs:
           command: |
             sudo apt-get update && sudo apt-get install -y --no-install-recommends \
               openjdk-21-jdk-headless netcat-openbsd
-            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-            chmod +x linux-install.sh
+            if [ ! -x linux-install.sh ]; then
+              curl -sSLO --fail --retry 8 --retry-all-errors --retry-delay 2 https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+              chmod +x linux-install.sh
+            fi
             sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
@@ -470,8 +479,10 @@ jobs:
             # canonical installer from GitHub Releases instead. --fail
             # aborts on any HTTP error so we don't silently write the
             # error body to disk and try to execute it.
-            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-            chmod +x linux-install.sh
+            if [ ! -x linux-install.sh ]; then
+              curl -sSLO --fail --retry 8 --retry-all-errors --retry-delay 2 https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+              chmod +x linux-install.sh
+            fi
             sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
@@ -498,8 +509,10 @@ jobs:
           command: |
             sudo apt-get update && sudo apt-get install -y --no-install-recommends \
               openjdk-21-jdk-headless netcat-openbsd
-            curl -sSLO --fail https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-            chmod +x linux-install.sh
+            if [ ! -x linux-install.sh ]; then
+              curl -sSLO --fail --retry 8 --retry-all-errors --retry-delay 2 https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+              chmod +x linux-install.sh
+            fi
             sudo ./linux-install.sh
             curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
       - run:
