@@ -38,7 +38,12 @@ transactions. COPY also evaluates and validates source rows in order: a failed
 row consumes defaults evaluated for that row, but no later row's defaults. Its
 executor batches speculative validation, while the rows become durable only
 after the complete COPY succeeds. `CopyFail`, a later-row error, and transaction
-rollback therefore leave no copied row behind.
+rollback therefore leave no copied row behind. Text and CSV input retain
+incomplete UTF-8 code points across wire frames and reject malformed input with
+SQLSTATE 22021. A raw, unquoted `DEFAULT` marker is evaluated in COPY column-list
+order; omitted-column defaults follow in physical column order. Stable time
+defaults, cancellation, and `statement_timeout` cover the complete COPY stream,
+not each wire frame separately.
 
 Exact evaluation order remains open for volatile expressions produced by a
 non-trivial INSERT SELECT source. That path still needs the shared lazy

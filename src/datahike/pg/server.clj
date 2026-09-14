@@ -39,6 +39,7 @@
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
+            [datahike.pg.sql.copy :as copy]
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.template :as template]
             [datahike.pg.sql.ctx :as sql-ctx]
@@ -985,6 +986,53 @@
           (finally
             (when timer#
               (.cancel ^java.util.concurrent.ScheduledFuture timer# false))))))
+
+(defn- decode-copy-utf8
+  "Strictly decode one COPY byte chunk while retaining an incomplete final
+   UTF-8 code point for the next wire frame. Returns
+   [valid-prefix tail-bytes error]. The valid prefix is deliberately returned
+   before a later encoding error so earlier source rows retain PostgreSQL's
+   evaluation order (and an already-read end marker can suppress trailing
+   garbage)."
+  [^bytes tail ^bytes chunk end-of-input?]
+  (let [tail-len (alength tail)
+        chunk-len (alength chunk)
+        input-bytes (byte-array (+ tail-len chunk-len))]
+    (System/arraycopy tail 0 input-bytes 0 tail-len)
+    (System/arraycopy chunk 0 input-bytes tail-len chunk-len)
+    (let [decoder (-> (.newDecoder java.nio.charset.StandardCharsets/UTF_8)
+                      (.onMalformedInput java.nio.charset.CodingErrorAction/REPORT)
+                      (.onUnmappableCharacter java.nio.charset.CodingErrorAction/REPORT))
+          input (java.nio.ByteBuffer/wrap input-bytes)
+          output (java.nio.CharBuffer/allocate (max 1 (alength input-bytes)))]
+      (let [result (.decode decoder input output end-of-input?)
+            flush-result (when (and end-of-input? (not (.isError result)))
+                           (.flush decoder output))
+            coding-error? (or (.isError result)
+                              (and flush-result (.isError flush-result)))
+            _ (.flip output)
+            decoded (.toString output)
+            nul-at (.indexOf decoded (int \u0000))
+            error (when (or coding-error? (not= -1 nul-at))
+                    (ex-info "invalid byte sequence for encoding UTF8"
+                             {:error :character-not-in-repertoire
+                              :sqlstate "22021"}))
+            valid-prefix (if (= -1 nul-at) decoded (subs decoded 0 nul-at))
+            remaining (if coding-error? 0 (.remaining input))
+            next-tail (byte-array remaining)]
+        (when (pos? remaining)
+          (.get input next-tail))
+        [valid-prefix next-tail error]))))
+
+(defn- check-copy-interrupt!
+  [{:keys [cancel deadline-nanos]}]
+  (cond
+    (and deadline-nanos (<= deadline-nanos (System/nanoTime)))
+    (throw (ex-info "canceling statement due to statement timeout"
+                    {:error :query-canceled :sqlstate "57014"}))
+
+    (some-> cancel deref)
+    (throw (errors/pg-error :query-canceled {}))))
 
 (defn- classified-error
   "Build an error QueryResult from a Throwable with auto-detected
@@ -2597,6 +2645,17 @@
     (throw (ex-info "INSERT plan has no candidate execution mode"
                     {:error :internal-error :sqlstate "XX000"}))))
 
+(defn- materialize-column-default
+  [default resolve-value]
+  (let [[kind value arg] default
+        raw (cond
+              (= :nextval kind) {:fn :nextval :seq-name arg
+                                 :generated-default? true}
+              default (row-constraints/eval-default kind value)
+              :else nil)
+        resolved (when default (resolve-value raw))]
+    resolved))
+
 (defn- materialize-insert-candidate
   "Evaluate one candidate's target columns in physical column order.
 
@@ -2609,14 +2668,9 @@
         (reduce
          (fn [attrs {:keys [attr default]}]
            (let [present? (contains? attrs attr)
-                 [kind value arg] default
-                 raw (cond
-                       present? (get attrs attr)
-                       (= :nextval kind) {:fn :nextval :seq-name arg
-                                          :generated-default? true}
-                       default (row-constraints/eval-default kind value)
-                       :else nil)
-                 resolved (if (or present? default) (resolve-value raw) raw)
+                 resolved (if present?
+                            (resolve-value (get attrs attr))
+                            (materialize-column-default default resolve-value))
                  coerced (when (some? resolved)
                            (or (#'sql/coerce-insert-value resolved attr schema db)
                                resolved))]
@@ -10501,7 +10555,21 @@
       (let [constraint-plan
             (schema-cached db-now [::row-constraint-plan table]
                            #(row-constraints/compile-constraint-metadata
-                             (cached-row-constraint-metadata db-now table)))]
+                             (cached-row-constraint-metadata db-now table)))
+            sequence-defaults (stmt/insert-sequence-defaults db-now table)
+            ;; Identity generation can be represented by the durable sequence
+            ;; catalog without a :pg/default-kind datom. Normalize it into the
+            ;; same physical-column plan once, before processing any rows.
+            constraint-plan
+            (update constraint-plan :columns
+                    (fn [specs]
+                      (mapv (fn [{:keys [attr default] :as spec}]
+                              (if (or default
+                                      (nil? (get sequence-defaults attr)))
+                                spec
+                                (assoc spec :default
+                                       [:nextval nil (get sequence-defaults attr)])))
+                            specs)))]
         (reset! copy-state
                 {:decoder         decoder
                  :decode-step-fn  step-fn
@@ -10520,7 +10588,6 @@
                  :durable-catalog-basis (catalog-basis/capture (d/db conn))
                  :constraint-plan constraint-plan
                  :unique-specs    (plain-unique-specs db-now table constraint-plan)
-                 :sequence-defaults (stmt/insert-sequence-defaults db-now table)
                  :speculative-db  db-now
                  :tx-data         []
                  :tempids         {}
@@ -10529,6 +10596,18 @@
                  :pending-rows    []
                  :pending-unique  #{}
                  :batch-size      1000
+                 ;; COPY remains one SQL statement even though pgwire invokes
+                 ;; us once per CopyData frame. Preserve stable-expression,
+                 ;; cancellation, and timeout context across those callbacks.
+                 :statement-time  params/*statement-time*
+                 :scalar-subquery-cache params/*scalar-subquery-cache*
+                 :cancel          params/*cancel*
+                 :deadline-nanos  (let [timeout-ms (:statement-timeout
+                                                    @(:session-state ctx))]
+                                    (when (and timeout-ms (pos? timeout-ms))
+                                      (+ (System/nanoTime)
+                                         (* 1000000 (long timeout-ms)))))
+                 :utf8-tail       (byte-array 0)
                  :error           nil}))
       ;; Return QueryResult signalling COPY-IN with the column count.
       (let [r (PgWireServer$QueryResult/empty "COPY 0")]
@@ -10543,7 +10622,7 @@
    one transaction.  Materialized rows accumulate for one publication at
    CopyDone (or in the surrounding explicit transaction's buffer)."
   [ctx]
-  (let [{:keys [conn copy-state tx-state]} ctx
+  (let [{:keys [copy-state tx-state]} ctx
         s @copy-state
         rows (:pending-rows s)]
     (when (and (seq rows) (nil? (:error s)))
@@ -10600,21 +10679,48 @@
         (try
           (let [s @copy-state
                 db-now (:speculative-db s)
+                _ (check-copy-interrupt! s)
                 ;; Check the live catalog before coercion/default evaluation.
                 ;; A stale statement must not consume a sequence reservation.
                 _ (assert-catalog-current! (:durable-catalog-basis s) (d/db conn))
                 _ (assert-catalog-current! (:catalog-basis s) db-now)
                 next-idx (-> s :rows-processed (+ (count (:pending-rows s))))
-                entity (datahike.pg.sql.copy/row->entity-map
-                        row columns ns row-marker schema next-idx tempid-prefix)
-                entity (reduce-kv
-                        (fn [candidate attr sequence-name]
-                          (if (contains? candidate attr)
-                            candidate
-                            (assoc candidate attr
-                                   {:fn :nextval :seq-name sequence-name
-                                    :generated-default? true})))
-                        entity (:sequence-defaults s))
+                constraint-plan (:constraint-plan s)
+                column-defaults
+                (into {}
+                      (map (juxt :attr :default))
+                      (:columns constraint-plan))
+                ;; PostgreSQL's format parser identifies every raw DEFAULT
+                ;; marker before it invokes any column input function. Thus a
+                ;; marker targeting a column without a default wins over an
+                ;; earlier coercion error or sequence reservation in the row.
+                _ (doseq [[column raw] (map vector columns row)
+                          :when (copy/default-sentinel? raw)
+                          :let [attr (keyword ns column)]
+                          :when (nil? (get column-defaults attr))]
+                    (throw (ex-info
+                            "unexpected default marker in COPY data"
+                            {:error :bad-copy-format
+                             :sqlstate "22P04"
+                             :table (:table s)
+                             :column column
+                             :detail (str "Column \"" column
+                                          "\" has no default value.")})))
+                ;; The raw-field parser above only considers expected fields
+                ;; for DEFAULT markers. Once that pass succeeds PostgreSQL
+                ;; reports short/wide rows, so a marker in an expected prefix
+                ;; wins while a marker solely in excess input remains data.
+                _ (when-not (= (count row) (count columns))
+                    (throw (ex-info
+                            (if (> (count row) (count columns))
+                              "extra data after last expected column"
+                              (str "missing data for column \""
+                                   (nth columns (count row)) "\""))
+                            {:error :bad-copy-format
+                             :sqlstate "22P04"
+                             :row (inc next-idx)
+                             :expected-columns (count columns)
+                             :actual-columns (count row)})))
                 resolve-value
                 (fn [value]
                   (sql/resolve-nextvals!
@@ -10623,8 +10729,45 @@
                      (if (:in-tx? @tx-state)
                        (nextval-for-tx! conn tx-state sequence-name)
                        (nextval! conn sequence-name)))))
+                ;; PostgreSQL processes supplied fields in COPY column-list
+                ;; order. A DEFAULT marker therefore executes at this point,
+                ;; before coercion (or failure) of the next supplied field.
+                entity
+                (reduce
+                 (fn [candidate [column raw]]
+                   (params/check-cancel!)
+                   (let [attr (keyword ns column)]
+                     (cond
+                       (copy/null-sentinel? raw)
+                       (assoc candidate attr nil)
+
+                       (copy/default-sentinel? raw)
+                       (if-let [default (get column-defaults attr)]
+                         (let [resolved (materialize-column-default
+                                         default resolve-value)
+                               coerced (when (some? resolved)
+                                         (or (#'sql/coerce-insert-value
+                                              resolved attr schema db-now)
+                                             resolved))]
+                           (assoc candidate attr coerced))
+                         (throw (ex-info
+                                 "unexpected default marker in COPY data"
+                                 {:error :bad-copy-format
+                                  :sqlstate "22P04"
+                                  :table (:table s)
+                                  :column column
+                                  :detail (str "Column \"" column
+                                               "\" has no default value.")})))
+
+                       :else
+                       (assoc candidate attr
+                              (copy/coerce-field
+                               raw attr schema)))))
+                 (cond-> {:db/id (str tempid-prefix next-idx)}
+                   row-marker (assoc row-marker true))
+                 (map vector columns row))
                 candidate (materialize-insert-candidate
-                           entity (:constraint-plan s) db-now resolve-value)
+                           entity constraint-plan db-now resolve-value)
                 seen (validate-plain-candidate-unique!
                       db-now (:table s) (:unique-specs s)
                       (:pending-unique s #{}) candidate)
@@ -10637,6 +10780,32 @@
               (copy-flush-batch! ctx)))
           (catch Throwable e
             (swap! copy-state assoc :error e :pending-rows [])))))))
+
+(declare copy-next-slice-end)
+
+(defn- copy-process-chars!
+  "Feed decoded characters to the format parser without allowing a later
+   physical row to get ahead of an earlier row's defaults or constraints."
+  [{:keys [copy-state] :as ctx} ^String chunk]
+  (loop [start 0]
+    (when (and (< start (.length chunk))
+               (nil? (:error @copy-state)))
+      (let [current @copy-state
+            decoder (:decoder current)
+            end (long (copy-next-slice-end decoder chunk start))
+            step-fn (:decode-step-fn current)
+            [d' rows _eod?] (step-fn decoder (subs chunk start end))]
+        (swap! copy-state assoc :decoder d')
+        (when (seq rows)
+          (copy-process-rows! ctx rows))
+        (recur end)))))
+
+(defn- with-copy-execution-context
+  [copy-session f]
+  (binding [params/*statement-time* (:statement-time copy-session)
+            params/*scalar-subquery-cache* (:scalar-subquery-cache copy-session)
+            params/*cancel* (:cancel copy-session)]
+    (f)))
 
 (defn- publish-copy!
   "Publish a completely validated COPY exactly once.
@@ -10682,6 +10851,9 @@
           (into [(first constrained-tx-data) unique-guard]
                 (rest constrained-tx-data))
           constrained-tx-data)]
+    ;; Constraint/default work above can itself be substantial for a large
+    ;; statement. Recheck immediately before the one visible publication.
+    (check-copy-interrupt! @copy-state)
     (if (:in-tx? @tx-state)
       (swap! tx-state
              (fn [ts]
@@ -11127,28 +11299,22 @@
         (when-let [s @copy-state]
           (when-not (:error s)
             (try
-              (let [chunk (String. ^bytes chunk-bytes java.nio.charset.StandardCharsets/UTF_8)
-                    ctx-fresh {:conn conn
-                               :schema (:schema (d/db conn))
-                               :copy-state copy-state
-                               :tx-state tx-state}]
-                ;; Do not let parsing a later physical line run ahead of an
-                ;; earlier row's defaults and constraints.  In particular,
-                ;; an earlier CHECK failure wins over a later coercion/CSV
-                ;; error and consumes exactly its own sequence reservation.
-                (loop [start 0]
-                  (when (and (< start (.length chunk))
-                             (nil? (:error @copy-state)))
-                    (let [current @copy-state
-                          decoder (:decoder current)
-                          end (long (copy-next-slice-end decoder chunk start))
-                          step-fn (:decode-step-fn current)
-                          [d' rows _eod?]
-                          (step-fn decoder (subs chunk start end))]
-                      (swap! copy-state assoc :decoder d')
-                      (when (seq rows)
-                        (copy-process-rows! ctx-fresh rows))
-                      (recur end)))))
+              (with-copy-execution-context
+                s
+                (fn []
+                  (check-copy-interrupt! s)
+                  (let [[chunk tail encoding-error]
+                        (decode-copy-utf8 (:utf8-tail s) chunk-bytes false)
+                        ctx-fresh {:conn conn
+                                   :schema (:schema (d/db conn))
+                                   :copy-state copy-state
+                                   :tx-state tx-state}]
+                    (swap! copy-state assoc :utf8-tail tail)
+                    (copy-process-chars! ctx-fresh chunk)
+                    (when (and encoding-error
+                               (nil? (:error @copy-state))
+                               (not (get-in @copy-state [:decoder :eod?])))
+                      (swap! copy-state assoc :error encoding-error)))))
               (catch Throwable e
                 ;; Stay in COPY-IN protocol mode and report the typed error at
                 ;; CopyDone.  Throwing here made the Java loop emit XX000 while
@@ -11159,36 +11325,52 @@
         (let [s @copy-state]
           (if (nil? s)
             (PgWireServer$QueryResult/empty "COPY 0")
-            (let [ctx-fresh {:conn conn
-                             :schema (:schema (d/db conn))
-                             :copy-state copy-state
-                             :tx-state tx-state}
-                  finalize-fn (:decode-finalize-fn s)
-                  final-result (when-not (:error s)
-                                 (try
-                                   (finalize-fn (:decoder s))
-                                   (catch Throwable e
-                                     (swap! copy-state assoc :error e)
-                                     nil)))
-                  [final-rows _eod?] final-result]
-              (when (and (nil? (:error @copy-state)) (seq final-rows))
-                (copy-process-rows! ctx-fresh final-rows))
-              (try
-                ;; Drain remaining pending rows
-                (copy-flush-batch! ctx-fresh)
-                (when-let [e (:error @copy-state)]
-                  (throw e))
-                (publish-copy! ctx-fresh)
-                (let [processed (:rows-processed @copy-state)]
-                  (reset! copy-state nil)
-                  (PgWireServer$QueryResult/empty (str "COPY " processed)))
-                (catch Throwable e
-                  (let [processed (:rows-processed @copy-state)]
-                    (when (:in-tx? @tx-state)
-                      (swap! tx-state assoc :aborted? true))
-                    (reset! copy-state nil)
-                    (classified-error
-                     (str "COPY failed after processing " processed " rows: ") e))))))))
+            (with-copy-execution-context
+              s
+              (fn []
+                (let [ctx-fresh {:conn conn
+                                 :schema (:schema (d/db conn))
+                                 :copy-state copy-state
+                                 :tx-state tx-state}]
+                  (when-not (:error @copy-state)
+                    (try
+                      (check-copy-interrupt! s)
+                      (let [[tail-text tail encoding-error]
+                            (decode-copy-utf8 (:utf8-tail s) (byte-array 0) true)]
+                        (swap! copy-state assoc :utf8-tail tail)
+                        (copy-process-chars! ctx-fresh tail-text)
+                        (when (and encoding-error
+                                   (nil? (:error @copy-state))
+                                   (not (get-in @copy-state [:decoder :eod?])))
+                          (swap! copy-state assoc :error encoding-error)))
+                      (catch Throwable e
+                        (swap! copy-state assoc :error e))))
+                  (let [current @copy-state
+                        finalize-fn (:decode-finalize-fn current)
+                        final-result (when-not (:error current)
+                                       (try
+                                         (finalize-fn (:decoder current))
+                                         (catch Throwable e
+                                           (swap! copy-state assoc :error e)
+                                           nil)))
+                        [final-rows _eod?] final-result]
+                    (when (and (nil? (:error @copy-state)) (seq final-rows))
+                      (copy-process-rows! ctx-fresh final-rows))
+                    (try
+                      (copy-flush-batch! ctx-fresh)
+                      (when-let [e (:error @copy-state)]
+                        (throw e))
+                      (publish-copy! ctx-fresh)
+                      (let [processed (:rows-processed @copy-state)]
+                        (reset! copy-state nil)
+                        (PgWireServer$QueryResult/empty (str "COPY " processed)))
+                      (catch Throwable e
+                        (let [processed (:rows-processed @copy-state)]
+                          (when (:in-tx? @tx-state)
+                            (swap! tx-state assoc :aborted? true))
+                          (reset! copy-state nil)
+                          (classified-error
+                           (str "COPY failed after processing " processed " rows: ") e)))))))))))
 
       (copyAbort [_ _reason]
         (when (:in-tx? @tx-state)

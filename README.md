@@ -392,7 +392,9 @@ JDBC client. Schema-side coverage includes `CREATE TABLE` with FK
 constraints, `CREATE SEQUENCE`, `DEFAULT nextval(...)`, `CREATE TYPE …
 AS ENUM`, `CREATE DOMAIN`, partitioned tables (parent + children).
 Data-side coverage includes `INSERT` (single + multi-VALUES) and
-`COPY … FROM stdin` (text and CSV formats). Run with the `:pg-dump`
+atomic `COPY … FROM stdin` (text and CSV formats), including streaming UTF-8,
+NULL/default markers, constraints, and statement cancellation. Explicit COPY
+`ENCODING` currently accepts UTF-8 spellings only. Run with the `:pg-dump`
 compat preset to silently accept the rest of `pg_dump`'s noise
 (triggers, functions, materialized views, ALTER OWNER):
 
@@ -559,7 +561,8 @@ values, scalar distance functions and `<->` / `<#>` / `<=>` operators (exact
 scan evaluation; ANN indexes, vector arrays, vector uniqueness, and
 DISTINCT/GROUP BY vector keys are not exposed yet), `bytea`,
 `timestamp with time zone`, `CHARACTER(N)`, `SERIAL`,
-`COPY … FROM stdin` (text + CSV), `ALTER TABLE … ADD CONSTRAINT
+atomic `COPY … FROM stdin` (text + CSV, streaming UTF-8, NULL/default markers),
+`ALTER TABLE … ADD CONSTRAINT
 FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
 
 ### Accepted under `:compat :pg-dump` (no semantics, schema loads)

@@ -116,6 +116,23 @@
   (let [o (opts "COPY t FROM stdin WITH (DEFAULT '\\D')")]
     (is (= "\\D" (:default-marker o)))))
 
+(deftest default-marker-option-validation
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"newline or carriage return"
+                        (parse (str "COPY t FROM STDIN WITH (DEFAULT '"
+                                    \newline "')"))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"delimiter character"
+                        (parse "COPY t FROM STDIN WITH (DELIMITER ';', DEFAULT 'x;y')")))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"quote character"
+                        (parse "COPY t FROM STDIN WITH (FORMAT csv, DEFAULT 'x\"y')")))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot be the same"
+                        (parse "COPY t FROM STDIN WITH (DEFAULT '\\N')"))))
+
+(deftest non-utf8-copy-encoding-is-not-silently-misdecoded
+  (is (= "UTF8" (get-in (parse "COPY t FROM STDIN WITH (ENCODING 'UTF8')")
+                        [:options :encoding])))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not supported"
+                        (parse "COPY t FROM STDIN WITH (ENCODING 'LATIN1')"))))
+
 ;; ============================================================================
 ;; Legacy keyword form
 ;; ============================================================================
@@ -228,7 +245,7 @@
   ;; rejected it: "value does not match schema definition. Must be
   ;; conform to: bytes?" — on pagila's staff.picture.
   (let [schema {:t/b {:db/valueType :db.type/bytes}}
-        coerce #(#'copy/coerce-string-to-attr-type % :t/b schema)]
+        coerce #(copy/coerce-field % :t/b schema)]
     (is (= [0x1e 0x3d] (mapv #(bit-and % 0xff) (coerce "\\x1e3d"))))
     (is (= [] (vec (coerce "\\x"))))
     (testing "a non-hex value falls back to its UTF-8 bytes rather than throwing"

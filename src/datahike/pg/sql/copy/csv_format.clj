@@ -108,16 +108,21 @@
    final row vector. `state` is the decoder state with row
    and saw-quote-flags accumulators."
   [{:keys [opts columns] :as state}]
-  (let [{:keys [null-marker force-not-null force-null]} opts
+  (let [{:keys [null-marker default-marker force-not-null force-null]} opts
         row (:row state)
         flags (:saw-quote-flags state)]
     (->> (map-indexed
           (fn [idx ^String raw]
             (let [saw? (nth flags idx)]
-              (if (match-null? raw saw? idx columns null-marker
-                               force-not-null force-null)
-                ::null
-                raw)))
+              (cond
+                (match-null? raw saw? idx columns null-marker
+                             force-not-null force-null) ::null
+                ;; PostgreSQL recognizes DEFAULT only in a raw, unquoted
+                ;; CSV field. Quoting is retained separately by this decoder
+                ;; precisely because the cooked field text is otherwise the
+                ;; same for `\D` and `"\D"`.
+                (and default-marker (not saw?) (= raw default-marker)) ::default
+                :else raw)))
           row)
          vec)))
 

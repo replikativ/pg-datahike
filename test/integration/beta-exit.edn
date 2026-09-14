@@ -111,10 +111,11 @@
    :exit "A released Datahike implementation preserves finite-to-NaN native transaction effects and enforces PostgreSQL float4/float8 uniqueness. The comparator and persisted-index migration decision is deferred to the Datahike 1.0 upgrade review (draft PR #1075); preserve the explicitly skipped native-NaN acceptance test until resolved."}
   {:id :insert-sequence-constraint-completion
    :wave 5
-   :status :open
+   :status :closed
    :evidence ["test/datahike/test/pg_on_conflict_semantics_test.clj"
-              "test/datahike/test/pg_constraints_test.clj"]
-   :exit "INSERT and COPY preserve reserved sequence advances across row failure and rollback without reusing values; generated identity provenance, prepared NULLs, inheritance, defaults, and conflict constraints pass independent review and integration gates. Exact per-row evaluation order is tracked separately."}
+              "test/datahike/test/pg_constraints_test.clj"
+              "test/datahike/test/pg_copy_e2e_test.clj"]
+   :exit "INSERT and COPY preserve reserved sequence advances across row failure and rollback without reusing values; generated identity provenance, prepared NULLs, inheritance, defaults, conflict constraints, and PostgreSQL COPY field/default evaluation order pass independent review and integration gates."}
   {:id :sequence-row-evaluation-order
    :wave 5
    :status :open
@@ -122,7 +123,7 @@
               "test/datahike/test/pg_nextval_in_values_test.clj"
               "doc/postgres-compatibility.md"
               "doc/routines-and-triggers.md"]
-   :exit "The ordered executor now matches PostgreSQL 17 for VALUES, DEFAULT VALUES, ON CONFLICT, and INSERT SELECT target defaults, including early-row failure, prepared NULL, RETURNING, and rollback cases. Close the blocker when COPY and volatile expressions in a non-trivial INSERT SELECT source use the same lazy candidate cutoff and commit never reruns their effects."}
+   :exit "The ordered executor now matches PostgreSQL 17 for VALUES, DEFAULT VALUES, ON CONFLICT, COPY, and INSERT SELECT target defaults, including early-row failure, prepared NULL, RETURNING, and rollback cases. Close the blocker when volatile expressions in a non-trivial INSERT SELECT source use the same lazy candidate cutoff and commit never reruns their effects."}
   {:id :three-valued-null
    :wave 1
    :status :closed

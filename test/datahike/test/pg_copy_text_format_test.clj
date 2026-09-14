@@ -53,6 +53,15 @@
   (testing "With null-marker = \\N, empty string is empty string, not null"
     (is (= [["a" "" "c"]] (decode "a\t\tc\n")))))
 
+(deftest default-marker-is-raw-and-unescaped
+  (let [opts (assoc text-opts :default-marker "\\D")]
+    (is (= [["1" :datahike.pg.sql.copy.text-format/default]]
+           (tf/decode-all opts ["1\t\\D\n"])))
+    (is (= [["1" "\\D"]]
+           (tf/decode-all opts ["1\t\\\\D\n"])))
+    (is (= [["1" "\"D\""]]
+           (tf/decode-all opts ["1\t\"\\D\"\n"])))))
+
 (deftest leading-spaces-preserved
   (testing "Leading whitespace inside a field is preserved (no SQL trim)"
     (is (= [["a" "" " c"]] (decode "a\t\t c\n")))))

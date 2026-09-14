@@ -85,6 +85,17 @@
       (is (= [["NIL" "data"]]
              (csv/decode-all opts ["\"NIL\",data\n"]))))))
 
+(deftest default-marker-must-be-unquoted
+  (let [opts (assoc csv-defaults :default-marker "\\D")]
+    (is (= [["1" :datahike.pg.sql.copy.csv-format/default]]
+           (csv/decode-all opts ["1,\\D\n"])))
+    (is (= [["1" "\\D"]]
+           (csv/decode-all opts ["1,\"\\D\"\n"])))
+    ;; Backslash has no escape semantics in CSV, so two backslashes are
+    ;; ordinary data and do not match the one-backslash marker.
+    (is (= [["1" "\\\\D"]]
+           (csv/decode-all opts ["1,\\\\D\n"])))))
+
 (deftest force-not-null-keeps-quoted-empty-as-empty-string
   (testing "FORCE_NOT_NULL on a column — bare empty is treated as empty string, not null"
     (let [opts (assoc csv-defaults

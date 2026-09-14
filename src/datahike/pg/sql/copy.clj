@@ -36,7 +36,7 @@
      FORCE_NOT_NULL  ( col, ... ) | *
      FORCE_NULL      ( col, ... ) | *
      FORCE_QUOTE     ( col, ... ) | *   — TO-only; we accept for COPY FROM as a no-op
-     ENCODING        'X'                — accepted, ignored (UTF-8 internal)
+     ENCODING        'UTF8'             — UTF-8 aliases accepted; others rejected
      FREEZE          [ BOOL ]           — accepted, ignored
      DEFAULT         'X'                — defaults-marker (PG 16+)
      OIDS            [ BOOL ]           — legacy, removed in PG 12; rejected
@@ -306,9 +306,8 @@
 ;; ----------------------------------------------------------------------------
 
 (def ^:private pg-encoding-aliases
-  "Common pg_dump-emitted encoding names that we treat as UTF-8.
-   Datahike is UTF-8 internal; an explicit ENCODING option is
-   accepted for round-trip compatibility but doesn't change behavior."
+  "Common PostgreSQL spellings for UTF-8. Other encodings are rejected
+   explicitly rather than silently decoded as UTF-8."
   #{"utf8" "utf-8" "unicode"})
 
 (defn- normalize-format
@@ -385,8 +384,34 @@
                         ;; default = quote char
                         quote-char)
         encoding (some (fn [[k v]] (when (= "encoding" k) v)) opts-vec)
+        _ (when (and encoding
+                     (not (contains? pg-encoding-aliases
+                                     (str/lower-case encoding))))
+            (throw (ex-info
+                    (str "COPY encoding " encoding " is not supported; use UTF8")
+                    {:error :feature-not-supported :sqlstate "0A000"
+                     :encoding encoding})))
         freeze? (some (fn [[k v]] (when (= "freeze" k) (boolean v))) opts-vec)
-        default-marker (some (fn [[k v]] (when (= "default" k) v)) opts-vec)]
+        default-marker (some (fn [[k v]] (when (= "default" k) v)) opts-vec)
+        _ (when (and default-marker
+                     (or (str/includes? default-marker "\n")
+                         (str/includes? default-marker "\r")))
+            (throw (ex-info
+                    "COPY default representation cannot use newline or carriage return"
+                    {:error :invalid-parameter-value :sqlstate "22023"})))
+        _ (when (and default-marker (str/includes? default-marker delim))
+            (throw (ex-info
+                    "COPY delimiter character must not appear in the DEFAULT specification"
+                    {:error :feature-not-supported :sqlstate "0A000"})))
+        _ (when (and default-marker (= :csv format)
+                     (str/includes? default-marker quote-char))
+            (throw (ex-info
+                    "CSV quote character must not appear in the DEFAULT specification"
+                    {:error :feature-not-supported :sqlstate "0A000"})))
+        _ (when (and default-marker (= default-marker null-marker))
+            (throw (ex-info
+                    "NULL specification and DEFAULT specification cannot be the same"
+                    {:error :feature-not-supported :sqlstate "0A000"})))]
     {:format         format
      :delimiter      delim
      :null-marker    null-marker
@@ -413,8 +438,15 @@
 ;; in the entity map (which Datahike treats as "don't write this attr").
 (def ^:private text-null  :datahike.pg.sql.copy.text-format/null)
 (def ^:private csv-null   :datahike.pg.sql.copy.csv-format/null)
+(def ^:private text-default :datahike.pg.sql.copy.text-format/default)
+(def ^:private csv-default  :datahike.pg.sql.copy.csv-format/default)
 
-(defn- null-sentinel? [v] (or (= v text-null) (= v csv-null)))
+(defn null-sentinel? [v] (or (= v text-null) (= v csv-null)))
+
+(defn default-sentinel?
+  "True for the format-specific sentinel emitted by a raw COPY DEFAULT marker."
+  [v]
+  (or (= v text-default) (= v csv-default)))
 
 (defn- pg-timestamptz->iso
   "Normalise PostgreSQL's `timestamp with time zone` OUTPUT form to
@@ -472,7 +504,7 @@
                     (.atStartOfDay ld (java.time.ZoneId/of "UTC")))))
                 (catch Throwable _ nil)))))))))
 
-(defn- coerce-string-to-attr-type
+(defn coerce-field
   "Convert a raw string from a COPY data row into the typed value
    expected by `attr`'s `:db/valueType`. Returns the typed value, or
    the raw string if no coercion is recognised. Any string→long
@@ -590,8 +622,12 @@
               attr (keyword ns col)]
           (cond
             (null-sentinel? raw) (assoc acc attr nil)
+            ;; Omission is how the ordinary INSERT candidate path requests
+            ;; evaluation of the column default. The caller first verifies
+            ;; that this particular column actually has one.
+            (default-sentinel? raw) acc
             :else
-            (assoc acc attr (coerce-string-to-attr-type raw attr schema)))))
+            (assoc acc attr (coerce-field raw attr schema)))))
       base
       (range (count columns))))))
 
