@@ -457,9 +457,8 @@
    makes Datahike collapse entity-maps that share a tempid. Mints
    fresh strings per substitute pass so every commit sees unique
    tempids."
-  [tx-data]
-  (let [renames (java.util.HashMap.)
-        rename (fn [old]
+  [tx-data ^java.util.HashMap renames]
+  (let [rename (fn [old]
                  (or (.get renames old)
                      (let [new (str (gensym "tem-"))]
                        (.put renames old new)
@@ -474,6 +473,12 @@
                  (seq? v) (map walk v)
                  :else v))]
     (walk tx-data)))
+
+(defn- refresh-insert-tempids [parsed]
+  (let [renames (java.util.HashMap.)]
+    (cond-> (update parsed :tx-data refresh-tempids renames)
+      (contains? parsed :insert-candidates)
+      (update :insert-candidates refresh-tempids renames))))
 
 (defn typed-substitute
   "Replace ParamRefs in `parsed.tx-data` with bound values from
@@ -506,9 +511,10 @@
                                 (or (stmt/coerce-insert-value raw attr schema) raw)
                                 raw)))
                           (range) raws)]
-          (-> parsed
-              (update :tx-data params/substitute-params bound)
-              (update :tx-data refresh-tempids)))))
+          (-> (cond-> (update parsed :tx-data params/substitute-params bound)
+                (contains? parsed :insert-candidates)
+                (update :insert-candidates params/substitute-params bound))
+              (refresh-insert-tempids)))))
     (catch Throwable _ nil)))
 
 ;; ============================================================================

@@ -489,7 +489,7 @@
   "Function markers translate-* may emit for SQL constructs that must
    be re-evaluated per execute (i.e. NOT cacheable as a parse-time
    value). Resolved by `resolve-nextvals!` against a per-fn resolver."
-  #{:nextval :now :eval :random-uuid :uuid-v7})
+  #{:nextval :now :eval :random-uuid :uuid-v7 :raise})
 
 (defn call-marker?
   "True if v is a deferred function-call marker emitted by translate-*
@@ -542,6 +542,7 @@
                        :now     (java.util.Date.)
                        :random-uuid (java.util.UUID/randomUUID)
                        :uuid-v7 (coerce/generate-uuid-v7)
+                       :raise   (throw (ex-info (:message v) (:data v)))
                       ;; An arbitrary scalar expression in INSERT
                       ;; VALUES. Deferred rather than folded at parse
                       ;; time for the same reason `now()` is: the parse

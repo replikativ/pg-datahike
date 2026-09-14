@@ -66,6 +66,9 @@ MODULES=(
 #   supported Python 3.11/3.12 runtimes without contacting pg-datahike.
 # - server_failure_during_writes asserts that an asynchronous error beats an
 #   arbitrary batch position; CPU/JVM scheduling decides whether it does.
+# - executemany_timeout races a client-side 0.5s deadline against a batch of
+#   pg_sleep calls. It has both passed and failed on adjacent CI runs of the
+#   same implementation, so its exact verdict is not a stable server signal.
 # - timeout_flow_control relies on a concurrent UPDATE holding a PostgreSQL
 #   row lock. Datahike has no row-lock analogue, so whether the client timeout
 #   lands before the first update is a machine-speed race rather than a stable
@@ -74,6 +77,7 @@ MODULES=(
 DESELECTS=(
   "--deselect=tests/test_connect.py::TestConnectParams::test_connect_params"
   "--deselect=tests/test_execute.py::TestExecuteMany::test_executemany_server_failure_during_writes"
+  "--deselect=tests/test_execute.py::TestExecuteMany::test_executemany_timeout"
   "--deselect=tests/test_execute.py::TestExecuteMany::test_executemany_timeout_flow_control"
 )
 
