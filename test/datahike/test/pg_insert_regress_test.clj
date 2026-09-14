@@ -56,3 +56,13 @@
   (is (= [["10" "20" "40"] ["2" "3" "values are fun!"]
           ["-1" "2" "testing"]]
          (rows "SELECT * FROM ir WHERE a IS NOT NULL ORDER BY a DESC"))))
+
+(deftest templated-multi-row-returning-keeps-source-order
+  (run "CREATE TABLE returning_order (id int PRIMARY KEY, label text)")
+  (is (= [["9" "nine"] ["1" "one"] ["8" "eight"] ["2" "two"]
+          ["7" "seven"] ["3" "three"] ["6" "six"] ["4" "four"]
+          ["5" "five"]]
+         (rows (str "INSERT INTO returning_order VALUES "
+                    "(9,'nine'),(1,'one'),(8,'eight'),(2,'two'),"
+                    "(7,'seven'),(3,'three'),(6,'six'),(4,'four'),(5,'five') "
+                    "RETURNING id,label")))))

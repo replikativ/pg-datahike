@@ -51,14 +51,16 @@ with comments for non-obvious causes. The live failure-ID set must equal it:
 new failures, newly passing entries, and entries that did not run all fail the
 job.
 
-Three individual tests are deselected in `run.sh`. `test_connect_params` tests
+Four individual tests are deselected in `run.sh`. `test_connect_params` tests
 Python URL parsing without contacting the server.
 `test_executemany_server_failure_during_writes` depends on which asynchronous
-failure wins a scheduling race. `test_executemany_timeout_flow_control` relies
-on a concurrent `UPDATE` holding a PostgreSQL row lock; without row locking,
-its observed partial-write count depends on machine speed. The neighboring
-`test_executemany_timeout` remains in the exact failure baseline, so timeout
-rollback behavior is still tracked rather than silently waived.
+failure wins a scheduling race. `test_executemany_timeout` has both passed and
+failed on adjacent CI runs because it races a 0.5-second client deadline
+against batched `pg_sleep` calls. `test_executemany_timeout_flow_control`
+additionally relies on a concurrent `UPDATE` holding a PostgreSQL row lock;
+without row locking, its observed partial-write count depends on machine speed.
+These timing tests need a deterministic harness before they can gate server
+compatibility.
 
 ## Known caveats of this harness
 

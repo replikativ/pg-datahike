@@ -83,7 +83,6 @@ tests/test_exceptions.py::TestExceptions::test_exceptions_str
 tests/test_exceptions.py::TestExceptions::test_exceptions_unpacking
 
 # --- tests/test_execute.py ---
-tests/test_execute.py::TestExecuteMany::test_executemany_timeout
 tests/test_execute.py::TestExecuteScript::test_execute_script_2
 tests/test_execute.py::TestExecuteScript::test_execute_script_interrupted_close
 

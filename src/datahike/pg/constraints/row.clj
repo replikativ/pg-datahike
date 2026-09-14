@@ -24,29 +24,34 @@
                       (if (and parent (not (seen parent)))
                         (recur parent (conj seen parent) (conj out parent))
                         out)))]
-    (into []
-          (keep (fn [{:keys [name attr]}]
-                  (when (and attr (not= :db/id attr))
-                    (let [attr (if (get schema attr)
-                                 attr
-                                 (or (some #(let [candidate (keyword % name)]
-                                              (when (get schema candidate) candidate))
-                                           ancestors)
-                                     attr))
-                          entity (d/entity db attr)
-                          kind (:pg/default-kind entity)]
-                      {:name name :attr attr
-                       :not-null? (true? (:pg/not-null entity))
-                       :default (when kind
-                                  [kind (:pg/default-value entity)
-                                   (:pg/default-arg entity)])}))))
-          (vals (reduce (fn [columns column]
-                          (if (contains? columns (:name column))
-                            columns
-                            (assoc columns (:name column) column)))
-                        (array-map)
-                        (mapcat #(pgs/column-info schema % db)
-                                (cons table-name ancestors)))))))
+    (let [ordered-columns
+          (:columns
+           (reduce (fn [{:keys [seen] :as state} column]
+                     (if (contains? seen (:name column))
+                       state
+                       (-> state
+                           (update :seen conj (:name column))
+                           (update :columns conj column))))
+                   {:seen #{} :columns []}
+                   (mapcat #(pgs/column-info schema % db)
+                           (cons table-name ancestors))))]
+      (into []
+            (keep (fn [{:keys [name attr]}]
+                    (when (and attr (not= :db/id attr))
+                      (let [attr (if (get schema attr)
+                                   attr
+                                   (or (some #(let [candidate (keyword % name)]
+                                                (when (get schema candidate) candidate))
+                                             ancestors)
+                                       attr))
+                            entity (d/entity db attr)
+                            kind (:pg/default-kind entity)]
+                        {:name name :attr attr
+                         :not-null? (true? (:pg/not-null entity))
+                         :default (when kind
+                                    [kind (:pg/default-value entity)
+                                     (:pg/default-arg entity)])}))))
+            ordered-columns))))
 
 (defn constraint-metadata
   "Read per-table row-constraint inputs without parsing SQL expressions or

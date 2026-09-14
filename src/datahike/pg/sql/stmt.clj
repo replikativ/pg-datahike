@@ -8244,13 +8244,17 @@
 
 (defn- reduce-on-conflict
   [txdb row-attrs set-params
-   {:keys [table-name conflict-cols do-nothing?] :as plan}]
-  (let [unique-specs (conflict-unique-specs txdb table-name)
+   {:keys [table-name conflict-cols do-nothing?] :as plan}
+   & [initial]]
+  (let [cached-context (::conflict-context initial)
+        unique-specs (or (:unique-specs cached-context)
+                         (conflict-unique-specs txdb table-name))
         arbiters (if conflict-cols
                    [conflict-cols]
                    (mapv :cols unique-specs))
         spec-by-cols (into {} (map (juxt :cols identity)) unique-specs)
-        constraint-plan (row-constraints/constraint-plan txdb table-name)
+        constraint-plan (or (:constraint-plan cached-context)
+                            (row-constraints/constraint-plan txdb table-name))
         entries-for (fn [attrs specs]
                       (into []
                             (keep (fn [{:keys [cols name]}]
@@ -8298,7 +8302,7 @@
                  (let [post-entries (entries-for row-after unique-specs)
                        _ (validate-conflict-row-constraints!
                           txdb table-name row-after constraint-plan
-                          (assoc effective-rows existing row-after) true)
+                          (assoc effective-rows existing row-after) false)
                        _ (doseq [entry post-entries
                                  :let [other (matching-current
                                               key->ref effective-rows entry)]
@@ -8313,6 +8317,7 @@
                        (update :tx-data into ops)
                        (update :row-refs conj existing)
                        (update :affected inc)
+                       (update :mutated-rows conj row-after)
                        (assoc :key->ref with-post)
                        (update :affected-existing conj existing)
                        (assoc-in [:effective-rows existing] row-after)))
@@ -8324,26 +8329,30 @@
                                         key->ref effective-rows entry)]
                            :when other]
                      (conflict-unique-violation! table-name entry))
-                 _ (validate-conflict-row-constraints!
-                    txdb table-name attrs constraint-plan
-                    effective-rows true)
                  tempid (str (gensym "upsert-"))
-                 clean-attrs (into {} (remove (comp nil? val)) attrs)
+                 clean-attrs (if (:preserve-nulls? plan)
+                               attrs
+                               (into {} (remove (comp nil? val)) attrs))
                  inserted-entries all-entries]
              (-> result
                  (update :tx-data conj (assoc clean-attrs :db/id tempid))
                  (update :row-refs conj tempid)
                  (update :affected inc)
+                 (update :mutated-rows conj attrs)
                  (assoc-in [:effective-rows tempid] attrs)
                  (update :key->ref
                          #(reduce (fn [m entry] (assoc m (:key entry) tempid))
                                   % inserted-entries)))))))
-     {:tx-data []
-      :row-refs []
-      :affected 0
-      :key->ref {}
-      :affected-existing #{}
-      :effective-rows {}}
+     (assoc (or initial
+                {:tx-data []
+                 :row-refs []
+                 :affected 0
+                 :mutated-rows []
+                 :key->ref {}
+                 :affected-existing #{}
+                 :effective-rows {}})
+            ::conflict-context {:unique-specs unique-specs
+                                :constraint-plan constraint-plan})
      row-attrs)))
 
 (defn- on-conflict-result
@@ -8351,16 +8360,28 @@
   (let [row-refs (atom [])
         affected (atom 0)
         set-params (:set-params plan)
+        candidate-step (fn [txdb state candidate runtime-set-params]
+                         (reduce-on-conflict
+                          txdb [candidate] runtime-set-params
+                          (assoc plan :preserve-nulls? true) state))
         tx-fn (fn [txdb row-attrs set-params]
                 (reset! row-refs [])
                 (reset! affected 0)
                 (let [result (reduce-on-conflict txdb row-attrs set-params plan)]
+                  (doseq [row (:mutated-rows result)]
+                    (validate-conflict-row-constraints!
+                     txdb (:table-name plan) row
+                     (row-constraints/constraint-plan txdb (:table-name plan))
+                     (:effective-rows result) true))
                   (reset! row-refs (:row-refs result))
                   (reset! affected (:affected result))
                   (:tx-data result)))]
     (cond-> {:type :insert
              :row-refs row-refs
              :affected-count affected
+             :insert-mode :on-conflict
+             :insert-candidates row-attrs
+             :insert-candidate-step candidate-step
              :tx-data [[:db.fn/call tx-fn row-attrs set-params]]
              :count row-count
              :table (:table-name plan)
@@ -8495,7 +8516,19 @@
                                   ^Function e)
                               materialized (materialize-table-function tf eval-fn nil)]
                           {:set-values (mapv first (:rows materialized))})
-                        {:scalar-value (eval-fn e)}))
+                        {:scalar-value
+                         (try
+                           (eval-fn e)
+                           (catch Exception ex
+                             ;; Constant/expression failures belong to row
+                             ;; execution, not translation. Keeping the error
+                             ;; as an ordered marker lets an earlier nextval in
+                             ;; the same target list retain its PostgreSQL side
+                             ;; effect before this value raises.
+                             {:fn :raise
+                              :message (ex-message ex)
+                              :data (or (ex-data ex)
+                                        {:error :data-exception})}))}))
                     row-exprs)
         set-cells (filter :set-values cells)]
     (if (empty? set-cells)
@@ -8711,11 +8744,14 @@
            [attrs] 1 returning
            (conflict-plan conflict-action conflict-target table-name ns
                           schema db target-alias))
-          (cond-> {:type :insert
-                   :tx-data [(assoc attrs :db/id (str (gensym "default-")))]
-                   :count 1
-                   :table table-name :ns ns}
-            returning (assoc :returning returning))))
+          (let [entity (assoc attrs :db/id (str (gensym "default-")))]
+            (cond-> {:type :insert
+                     :insert-mode :plain
+                     :insert-candidates [entity]
+                     :tx-data [entity]
+                     :count 1
+                     :table table-name :ns ns}
+              returning (assoc :returning returning)))))
 
       ;; INSERT INTO ... SELECT ... — run the SELECT against current db,
       ;; then treat each result row as if it were a VALUES tuple.
@@ -8835,7 +8871,8 @@
         (cond
           ;; Empty result set — nothing to insert.
           (empty? row-attrs)
-          (cond-> {:type :insert :tx-data [] :count 0
+          (cond-> {:type :insert :insert-mode :plain :insert-candidates []
+                   :tx-data [] :count 0
                    :table table-name :ns ns}
             returning (assoc :returning returning))
           ;; Non-empty with ON CONFLICT — delegate via :db.fn/call so the
@@ -8856,15 +8893,18 @@
            (conflict-plan conflict-action conflict-target table-name ns
                           schema db target-alias))
           :else
-          (cond-> {:type :insert
-                   :tx-data (vec (mapcat
-                                  (fn [attrs]
-                                    (when (seq attrs)
-                                      [(assoc attrs :db/id (str (gensym "insert-select-")))]))
-                                  row-attrs))
-                   :count (count row-attrs)
-                   :table table-name :ns ns}
-            returning (assoc :returning returning))))
+          (let [entities (vec (mapcat
+                               (fn [attrs]
+                                 (when (seq attrs)
+                                   [(assoc attrs :db/id (str (gensym "insert-select-")))]))
+                               row-attrs))]
+            (cond-> {:type :insert
+                     :insert-mode :plain
+                     :insert-candidates entities
+                     :tx-data entities
+                     :count (count row-attrs)
+                     :table table-name :ns ns}
+              returning (assoc :returning returning)))))
 
       ;; Normal INSERT with VALUES
       (and (instance? Values select) (seq col-names))
@@ -9087,6 +9127,9 @@
         ;; Add RETURNING clause if present
             returning (extract-returning (.getReturningClause insert))]
         (cond-> (assoc result :alias target-alias)
+          (not conflict-action)
+          (assoc :insert-mode :plain
+                 :insert-candidates (filterv map? (:tx-data result)))
           (and (not conflict-action) (not returning)
                (empty? ancestor-tables) (empty? sequence-defaults)
                (empty? (.getWithItemsList insert))

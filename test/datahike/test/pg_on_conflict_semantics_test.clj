@@ -59,20 +59,72 @@
 (defn- seed! []
   (run "INSERT INTO t (id, title, n) VALUES (1, 'keep', 10)"))
 
-(deftest ^{:compatibility-gap :sequence-row-evaluation-order
-           :postgres-major 17 :postgres-nextval 2}
-  known-gap-batch-sequence-reservation-precedes-first-row-failure
-  ;; Differential witness, not a PostgreSQL conformance assertion. Executed
-  ;; against PostgreSQL 17: both failed statements below leave nextval at 2.
-  ;; Our current eager reservation consumes the second candidate too (3).
-  ;; Replace this gap assertion with oracle equality when the shared statement
-  ;; executor closes beta blocker :sequence-row-evaluation-order.
+(deftest ^{:postgres-major 17 :postgres-nextval 2}
+  batch-sequence-reservation-stops-at-first-row-failure
+  ;; ExecModifyTable fetches and validates one source tuple before requesting
+  ;; the next. The rejected first candidate consumes its own default, but the
+  ;; second candidate is never evaluated.
   (doseq [[table suffix] [["gap_plain" ""]
                           ["gap_conflict" " ON CONFLICT(v) DO NOTHING"]]]
     (run (str "CREATE TABLE " table " (id serial, v int UNIQUE CHECK(v > 0))"))
-    (is (some? (err (str "INSERT INTO " table "(v) VALUES (-1),(1)" suffix))))
-    (is (= [["3"]] (rows (str "SELECT nextval('" table "_id_seq')")))
-        "Known gap: PostgreSQL 17 returns 2; pg-datahike currently reserves both candidates")))
+    (is (some? (err (str "INSERT INTO " table "(v) VALUES (-1),(1)" suffix))) table)
+    (is (= [["2"]] (rows (str "SELECT nextval('" table "_id_seq')"))) table)))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  batch-sequence-reservations-follow-successful-source-prefix
+  (run "CREATE TABLE ordered_failure (id serial, v int CHECK(v > 0))")
+  (is (some? (err "INSERT INTO ordered_failure(v) VALUES (1),(-1),(2)")))
+  (is (= [] (rows "SELECT id FROM ordered_failure"))
+      "the failed statement publishes none of its speculative rows")
+  (is (= [["3"]] (rows "SELECT nextval('ordered_failure_id_seq')"))
+      "the first two candidates consumed defaults; the third was never evaluated"))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  insert-select-defaults-follow-the-source-prefix
+  (run "CREATE TABLE ordered_source (ord int, v int)")
+  (run "INSERT INTO ordered_source VALUES (1,1),(2,-1),(3,2)")
+  (run "CREATE TABLE ordered_select (id serial, v int CHECK(v > 0))")
+  (is (some? (err (str "INSERT INTO ordered_select(v) "
+                       "SELECT v FROM ordered_source ORDER BY ord"))))
+  (is (= [] (rows "SELECT id FROM ordered_select")))
+  (is (= [["3"]] (rows "SELECT nextval('ordered_select_id_seq')"))))
+
+(deftest ^{:compatibility-gap :insert-select-volatile-projection-order
+           :postgres-major 17 :postgres-nextval 3}
+  known-gap-insert-select-volatile-projection-order
+  (run "CREATE SEQUENCE projected_seq")
+  (run "CREATE TABLE projected_source (ord int, v int)")
+  (run "INSERT INTO projected_source VALUES (1,1),(2,-1),(3,2)")
+  (run "CREATE TABLE projected_target (id bigint, v int CHECK(v > 0))")
+  (is (some? (err (str "INSERT INTO projected_target "
+                       "SELECT nextval('projected_seq'),v "
+                       "FROM projected_source ORDER BY ord"))))
+  (is (= [] (rows "SELECT id FROM projected_target")))
+  ;; A non-trivial SELECT projection does not yet execute nextval. PostgreSQL
+  ;; consumes two values before the second target row fails; keep the current
+  ;; result explicit until INSERT SELECT uses a lazy source executor.
+  (is (= [["1"]] (rows "SELECT nextval('projected_seq')"))))
+
+(deftest ^{:postgres-major 17 :postgres-nextval 3}
+  do-nothing-still-evaluates-the-skipped-candidates-default
+  (run "CREATE TABLE skipped_default (id serial, v int UNIQUE)")
+  (run "INSERT INTO skipped_default(v) VALUES (1)")
+  (is (= "INSERT 0 0"
+         (tag "INSERT INTO skipped_default(v) VALUES (1) ON CONFLICT(v) DO NOTHING")))
+  (is (= [["3"]] (rows "SELECT nextval('skipped_default_id_seq')"))))
+
+(deftest forward-self-foreign-keys-see-the-complete-statement
+  (doseq [[table suffix] [["forward_plain" ""]
+                          ["forward_conflict" " ON CONFLICT(id) DO NOTHING"]]]
+    (run (str "CREATE TABLE " table
+              " (id int PRIMARY KEY, parent int REFERENCES " table "(id))"))
+    (is (= "INSERT 0 2"
+           (tag (str "INSERT INTO " table
+                     " VALUES (1,2),(2,NULL)" suffix)))
+        table)
+    (is (= [["1" "2"] ["2" nil]]
+           (rows (str "SELECT id,parent FROM " table " ORDER BY id")))
+        table)))
 
 (deftest generated-always-retains-default-provenance
   (run "CREATE TABLE generated_ids (id int GENERATED ALWAYS AS IDENTITY, v int)")

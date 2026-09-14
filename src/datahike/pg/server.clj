@@ -1275,7 +1275,8 @@
   database, and only for the transactions that actually committed in
   our window. Commits that bypass transact-tx-buffer! (COPY batches,
   direct DDL) leave gaps — the checker detects incomplete coverage and
-  falls back to the attribute-level database scan."}
+  aborts conservatively. ::sequence-only records non-transactional
+  nextval reservations without treating them as ordinary row writes."}
   recent-commit-writes (atom clojure.lang.PersistentQueue/EMPTY))
 
 (def ^:private recent-commit-ring-size 512)
@@ -1304,10 +1305,17 @@
                               (<= (:max-tx %) current-max-tx))
                         @recent-commit-writes)
         want (- current-max-tx begin-max-tx)]
-    (if (or (not= want (count entries))
-            (some #(= ::opaque (:eas %)) entries))
+    (cond
+      (or (not= want (count entries))
+          (some #(= ::opaque (:eas %)) entries))
       ::gap
-      (reduce into #{} (map :eas entries)))))
+
+      (every? #(= ::sequence-only (:eas %)) entries)
+      ::sequence-only
+
+      :else
+      (reduce into #{}
+              (keep #(when (set? (:eas %)) (:eas %)) entries)))))
 
 (defn- ring-write-eas-graced
   "ring-write-eas with a short grace loop: a committer records its write
@@ -1424,6 +1432,8 @@
              (throw e))))
        (thunk)))))
 
+(declare direct-sequence-value-write?)
+
 (defn- transact-recorded!
   "d/transact that records the commit's [eid attr] write set in the
    recent-commit ring. EVERY server-side transact must go through this
@@ -1438,9 +1448,11 @@
                                    (seq tx-options)
                                    (assoc :tx-options tx-options)))
          db-after (:db-after report)
-         eas (tx-buffer-eas tx-data db-before)]
-     (record-commit-writes! (db-ring-key db-after) (:max-tx db-after)
-                            (if (= ::opaque eas) ::opaque eas))
+         eas (if (and (seq tx-data)
+                      (every? direct-sequence-value-write? tx-data))
+               ::sequence-only
+               (tx-buffer-eas tx-data db-before))]
+     (record-commit-writes! (db-ring-key db-after) (:max-tx db-after) eas)
      report)))
 
 (defn- transact-speculative-report!
@@ -2556,20 +2568,255 @@
                     result))))]])
      (or *statement-catalog-basis* (catalog-basis/capture db)))))
 
-(defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
+(defn- single-insert-candidate-tx-data
+  "Project a translated INSERT onto one already materialized candidate.
+
+   Plain INSERTs may carry a leading uniqueness tx-fn plus the outer entity
+   maps. ON CONFLICT carries its candidates only as the tx-fn argument. Keep
+   the same resolved candidate object in both positions so deferred-call
+   identity cannot split during preparation."
+  [{:keys [insert-mode tx-data]} candidate]
+  (case insert-mode
+    :on-conflict
+    [(assoc (first tx-data) 2 [candidate])]
+
+    :plain
+    (conj
+     (into []
+           (keep (fn [entry]
+                   (cond
+                     (map? entry) nil
+                     (and (vector? entry)
+                          (= :db.fn/call (first entry))
+                          (vector? (nth entry 2 nil)))
+                     (assoc entry 2 [candidate])
+                     :else entry)))
+           tx-data)
+     candidate)
+
+    (throw (ex-info "INSERT plan has no candidate execution mode"
+                    {:error :internal-error :sqlstate "XX000"}))))
+
+(defn- materialize-insert-candidate
+  "Evaluate one candidate's target columns in physical column order.
+
+   The translated map is only storage; map iteration is never an execution
+   order. Omitted non-sequence defaults are materialized here as well, so the
+   final constraint/rebase pass sees values rather than expressions."
+  [candidate constraint-plan db resolve-value]
+  (let [schema (dbi/-schema db)
+        attrs
+        (reduce
+         (fn [attrs {:keys [attr default]}]
+           (let [present? (contains? attrs attr)
+                 [kind value arg] default
+                 raw (cond
+                       present? (get attrs attr)
+                       (= :nextval kind) {:fn :nextval :seq-name arg
+                                          :generated-default? true}
+                       default (row-constraints/eval-default kind value)
+                       :else nil)
+                 resolved (if (or present? default) (resolve-value raw) raw)
+                 coerced (when (some? resolved)
+                           (or (#'sql/coerce-insert-value resolved attr schema db)
+                               resolved))]
+             (cond-> attrs
+               (or present? default) (assoc attr coerced))))
+         candidate
+         (:columns constraint-plan))]
+    (row-constraints/validate-pre-arbiter!
+     db (:table constraint-plan) attrs constraint-plan
+     (fn [ast row ns schema]
+       (sql/eval-check-predicate ast row ns schema))
+     nil)
+    attrs))
+
+(defn- plain-unique-specs [db table-name constraint-plan]
+  (let [table-attrs (into #{} (map :attr) (:columns constraint-plan))
+        native
+        (into []
+              (keep (fn [[attr schema-entry]]
+                      (when (and (keyword? attr) (map? schema-entry)
+                                 (:db/unique schema-entry))
+                        (let [components (when (= :db.type/tuple
+                                                  (:db/valueType schema-entry))
+                                           (:db/tupleAttrs schema-entry))]
+                          (when (if (seq components)
+                                  (every? table-attrs components)
+                                  (contains? table-attrs attr))
+                            {:kind :native
+                             :identity [:native attr]
+                             :attr attr
+                             :attrs (vec (or components [attr]))
+                             :columns (mapv name (or components [attr]))})))))
+              (dbi/-schema db))
+        catalog
+        (into []
+              (comp
+               (filter #(= table-name (:table %)))
+               (map (fn [descriptor]
+                      {:kind :catalog
+                       :identity [:catalog (:entity descriptor)]
+                       :attrs (:attrs descriptor)
+                       :columns (mapv :name (:keys descriptor))
+                       :constraint (:name descriptor)})))
+              (unique-constraints/index-descriptors db))]
+    (into native catalog)))
+
+(defn- validate-plain-candidate-unique!
+  "Check one plain INSERT candidate without applying it to a speculative DB.
+
+   The final writer-side guard remains authoritative for concurrency. This
+   ordered check exists so a duplicate at source row N stops evaluation before
+   row N+1's volatile expressions, while avoiding one full `dc/with` per row."
+  [db table-name specs seen candidate]
+  (reduce
+   (fn [seen {:keys [kind identity attr attrs columns constraint]}]
+     (let [values (mapv #(get candidate %) attrs)]
+       (if (some nil? values)
+         seen
+         (let [value (if (= 1 (count values)) (first values) values)
+               canonical (mapv unique-constraints/canonical-key-value values)
+               key [identity canonical]
+               existing?
+               (case kind
+                 :native (first (d/datoms db :avet attr value))
+                 :catalog (unique-constraints/conflicting-eid
+                           db table-name attrs values))]
+           (when (or existing? (contains? seen key))
+             (throw (ex-info "unique violation"
+                             {:error :unique-violation
+                              :sqlstate "23505"
+                              :table table-name
+                              :constraint constraint
+                              :columns columns
+                              :value value
+                              :datahike/collision [identity canonical]})))
+           (conj seen key)))))
+   seen
+   specs))
+
+(defn- prepare-insert-candidates
+  "Resolve and validate INSERT candidates in PostgreSQL source order.
+
+   A failed candidate stops the fold before any later volatile/default marker
+   is evaluated. Sequence reservations already issued for earlier candidates
+   remain consumed, while row effects remain speculative until the complete
+   statement succeeds. Candidate sequence markers and column defaults are
+   materialized into returned tx-data, so commit/rebase never reserves a
+   sequence value again. Deterministic constraints and ON CONFLICT arbitration
+   remain writer-side checks and may be re-evaluated on the commit basis."
+  [parsed base-db resolve-value]
+  (let [table-name (:table parsed)
+        constraint-plan
+        (schema-cached base-db [::row-constraint-plan table-name]
+                       #(row-constraints/compile-constraint-metadata
+                         (cached-row-constraint-metadata base-db table-name)))
+        unique-specs (when (= :plain (:insert-mode parsed))
+                       (plain-unique-specs base-db table-name constraint-plan))]
+    (loop [candidates (:insert-candidates parsed)
+           prepared []
+           conflict-state nil
+           seen-unique #{}]
+      (if-let [candidate (first candidates)]
+        (let [candidate (materialize-insert-candidate
+                         candidate constraint-plan base-db resolve-value)
+              ;; ON CONFLICT arbitration has statement-wide state: two source
+              ;; rows may not update the same target, and an earlier update can
+              ;; change the key seen by a later row. Carry that reducer state
+              ;; forward while applying only the new row-operation delta to
+              ;; the speculative database.
+              on-conflict? (= :on-conflict (:insert-mode parsed))
+              next-conflict-state
+              (when on-conflict?
+                ((:insert-candidate-step parsed)
+                 base-db conflict-state candidate
+                 (nth (first (:tx-data parsed)) 3 nil)))
+              next-seen-unique (if on-conflict?
+                                 seen-unique
+                                 (validate-plain-candidate-unique!
+                                  base-db table-name unique-specs seen-unique candidate))
+              replay-tx-data (when-not on-conflict?
+                               (single-insert-candidate-tx-data parsed candidate))]
+          (recur (next candidates)
+                 (if on-conflict?
+                   prepared
+                   (into prepared replay-tx-data))
+                 next-conflict-state
+                 next-seen-unique))
+        (if (= :on-conflict (:insert-mode parsed))
+          (do
+            (doseq [row (:mutated-rows conflict-state)]
+              (row-constraints/validate-mutation!
+               base-db table-name row constraint-plan
+               (:effective-rows conflict-state)
+               (fn [ast row ns schema]
+                 (sql/eval-check-predicate ast row ns schema))
+               nil))
+            {:tx-data (:tx-data conflict-state)
+             :row-refs (:row-refs conflict-state)
+             :affected-count (:affected conflict-state)})
+          {:tx-data prepared})))))
+
+(defn- restore-prepared-insert-outcome! [parsed prepared]
+  (when-let [row-refs (:row-refs parsed)]
+    (reset! row-refs (:row-refs prepared)))
+  (when-let [affected-count (:affected-count parsed)]
+    (reset! affected-count (:affected-count prepared))))
+
+(defn- opaque-materialized-upsert-guard [_]
+  [])
+
+(defn- guard-materialized-upsert [tx-data parsed]
+  (if (= :on-conflict (:insert-mode parsed))
+    (into [[:db.fn/call opaque-materialized-upsert-guard]] tx-data)
+    tx-data))
+
+(defn- materialized-insert-base
+  "Choose the durable basis on which already-evaluated INSERT operations may
+   be applied. Plain INSERT candidates can be checked against the latest DB.
+   ON CONFLICT candidates contain an arbitration decision made against
+   `candidate-db`; moving that decision forward is sound only when every
+   intervening commit was a non-transactional sequence reservation."
+  [candidate-db durable-db parsed]
+  (let [begin (:max-tx candidate-db)
+        current (:max-tx durable-db)
+        advanced? (and begin current (> (long current) (long begin)))]
+    (if (and advanced? (= :on-conflict (:insert-mode parsed)))
+      (if (= ::sequence-only
+             (ring-write-eas-graced (db-ring-key durable-db) begin current))
+        durable-db
+        (throw (ex-info "could not serialize access due to concurrent update"
+                        {:error :serialization-failure
+                         :detail (str "INSERT arbitration base=" begin
+                                      ", current=" current)})))
+      durable-db)))
+
+(defn- execute-insert [conn parsed resolve-candidate
+                       & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [table-name (:table parsed)
-          db (d/db conn)
-          tx-data (-> (:tx-data parsed)
+          candidate-db (d/db conn)
+          prepared (prepare-insert-candidates parsed candidate-db resolve-candidate)
+          ;; Existing sequences reserve outside the SQL transaction. Their
+          ;; nextval writes can therefore advance the connection while the
+          ;; candidate fold is running. Re-evaluate the already-materialized
+          ;; row operations on the resulting durable basis; this never runs a
+          ;; volatile/default expression again.
+          db (materialized-insert-base candidate-db (d/db conn) parsed)
+          tx-data (-> (:tx-data prepared)
                       (apply-column-constraints table-name (:ns parsed) db)
+                      (guard-materialized-upsert parsed)
                       tx-wrap)
           returning (:returning parsed)
+          speculative? (or returning (= :on-conflict (:insert-mode parsed)))
           ;; RETURNING can itself fail (for example, a scalar subquery can
           ;; produce two rows). Evaluate it against a speculative post-write
           ;; db before committing so the statement remains atomic.
-          tx-report (if returning (dc/with db tx-data) (transact-recorded! conn tx-data))
-          _ (when returning
-              (unique-constraints/validate-report! tx-report))]
+          tx-report (if speculative? (dc/with db tx-data) (transact-recorded! conn tx-data))
+          _ (when speculative?
+              (unique-constraints/validate-report! tx-report))
+          _ (restore-prepared-insert-outcome! parsed prepared)]
       (if-let [returning (:returning parsed)]
         ;; RETURNING: resolve row refs in VALUES order — either from
         ;; :row-refs atom (ON CONFLICT) or :db/id tempids on entity maps.
@@ -2601,7 +2848,10 @@
                                              (:alias parsed) schema :insert)]
           (transact-speculative-report! conn db tx-report)
           result)
-        (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
+        (do
+          (when speculative?
+            (transact-speculative-report! conn db tx-report))
+          (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
 
@@ -4727,6 +4977,8 @@
       (update :in-args sql/substitute-params fetch)
       (contains? parsed :tx-data)
       (update :tx-data sql/substitute-params fetch)
+      (contains? parsed :insert-candidates)
+      (update :insert-candidates sql/substitute-params fetch)
       (contains? parsed :secondary-candidate)
       (update :secondary-candidate sql/substitute-params fetch)
       (contains? parsed :secondary-order-candidate)
@@ -4809,7 +5061,9 @@
                            (if (vector? arg) (mapv coerce-entity arg) arg)))
                     (subvec entry 2))
               :else entry))]
-      (update parsed :tx-data #(mapv coerce-entry %)))
+      (cond-> (update parsed :tx-data #(mapv coerce-entry %))
+        (contains? parsed :insert-candidates)
+        (update :insert-candidates #(mapv coerce-entity %))))
     parsed))
 
 (declare nextval! nextval-for-tx! restore-local-sequence-reservations!)
@@ -5377,11 +5631,13 @@
                                   {:error :serialization-failure
                                    :detail "concurrent update after inserts in this transaction"})))
                 (let [our-eas (tx-buffer-eas buf base)
-                      their (when (not= ::opaque our-eas)
-                              (ring-write-eas-graced (db-ring-key base) begin cur))
-                      conflict? (if (and (not= ::opaque our-eas) (not= ::gap their))
-                                  (eas-overlap? our-eas their)
-                                  true)]
+                      their (ring-write-eas-graced (db-ring-key base) begin cur)
+                      conflict? (cond
+                                  (= ::gap their) true
+                                  (= ::sequence-only their)
+                                  (some direct-sequence-value-write? buf)
+                                  (= ::opaque our-eas) true
+                                  :else (eas-overlap? our-eas their))]
                   (when conflict?
                     (throw (ex-info "could not serialize access due to concurrent update"
                                     {:error :serialization-failure
@@ -5397,6 +5653,14 @@
   (and (vector? op)
        (= :db/add (first op))
        (= :datahike.pg.enum/unsafe-values (nth op 2 nil))))
+
+(defn- direct-sequence-value-write?
+  "True when a buffered operation itself mutates sequence storage."
+  [op]
+  (or (and (map? op) (contains? op :__seq__/value))
+      (and (vector? op)
+           (contains? #{:db/add :db/retract :db/cas :db.fn/cas} (first op))
+           (= :__seq__/value (nth op 2 nil)))))
 
 (defn- durable-replay-buffer [buffer]
   ;; Only preceding marker adds owned by this buffer may be absent on replay.
@@ -5446,9 +5710,8 @@
     ;; rows of the same column.
       (when (and (seq buf) advanced?)
         (let [our-eas (tx-buffer-eas buf real-db)
-              their-eas (when (not= ::opaque our-eas)
-                          (ring-write-eas-graced (db-ring-key real-db)
-                                                 begin-max-tx current-max-tx))
+              their-eas (ring-write-eas-graced (db-ring-key real-db)
+                                               begin-max-tx current-max-tx)
             ;; No attribute-level whole-database fallback here anymore:
             ;; an unresolvable window (ring gap after the grace loop, or
             ;; an unattributable buffer) aborts conservatively instead.
@@ -5456,9 +5719,19 @@
             ;; cost seconds — while row locks were held, which convoyed
             ;; every other writer (measured: tpcb c4 collapsed to 3 tps).
               conflict?
-              (if (and (not= ::opaque our-eas) (not= ::gap their-eas))
+              (cond
+                (= ::gap their-eas) true
+
+                ;; nextval commits outside the surrounding transaction. They
+                ;; do not conflict unless this transaction directly mutates
+                ;; the same private sequence storage.
+                (= ::sequence-only their-eas)
+                (some direct-sequence-value-write? buf)
+
+                (not= ::opaque our-eas)
                 (eas-overlap? our-eas their-eas)
-                true)]
+
+                :else true)]
           (when conflict?
             (throw (ex-info "could not serialize access due to concurrent update"
                             {:error  :serialization-failure
@@ -7701,7 +7974,10 @@
    land in the same implicit-tx commit."
   [parsed]
   (if (and (= :insert (:type parsed)) (:tx-data parsed))
-    (assoc parsed :tx-data (remap-tempids (:tx-data parsed) (str "-" (gensym))))
+    (let [suffix (str "-" (gensym))]
+      (cond-> (assoc parsed :tx-data (remap-tempids (:tx-data parsed) suffix))
+        (contains? parsed :insert-candidates)
+        (update :insert-candidates remap-tempids suffix)))
     parsed))
 
 (defn- writes-tempid?
@@ -7730,13 +8006,37 @@
       (:in-tx? @tx-state)
       (try
         (let [table-name (:table parsed)
-              spec-db (:speculative-db @tx-state)
-              tx-data (-> (:tx-data parsed)
-                          (apply-column-constraints table-name
-                                                    (:ns parsed)
-                                                    spec-db))
-              spec-report (dc/with spec-db tx-data)
+              initial-state @tx-state
+              spec-db (:speculative-db initial-state)
+              resolver #(sql/resolve-nextvals!
+                         % (fn [sequence-name]
+                             (nextval-for-tx! conn tx-state sequence-name)))
+              prepared (prepare-insert-candidates parsed spec-db resolver)
+              ;; A sequence created inside this transaction reserves into the
+              ;; live speculative overlay. Preparation must not subsequently
+              ;; replace that overlay with the snapshot captured before the
+              ;; reservation (prepared batches would otherwise restart the
+              ;; local sequence for every Execute).
+              post-reservation-spec-db (:speculative-db @tx-state)
+              durable-db (d/db conn)
+              reservation-only-advance?
+              (and (empty? (:tx-buffer initial-state))
+                   (> (long (:max-tx durable-db))
+                      (long (:begin-max-tx initial-state)))
+                   (= ::sequence-only
+                      (ring-write-eas-graced
+                       (db-ring-key durable-db)
+                       (:begin-max-tx initial-state)
+                       (:max-tx durable-db))))
+              final-base (if reservation-only-advance?
+                           durable-db
+                           post-reservation-spec-db)
+              tx-data (apply-column-constraints
+                       (:tx-data prepared) table-name (:ns parsed) final-base)
+              tx-data (guard-materialized-upsert tx-data parsed)
+              spec-report (dc/with final-base tx-data)
               _ (unique-constraints/validate-report! spec-report)
+              _ (restore-prepared-insert-outcome! parsed prepared)
               new-tempids (into {} (keep (fn [[tid eid]] (when (string? tid) [eid tid])))
                                 (:tempids spec-report))
               db-after (:db-after spec-report)
@@ -7782,6 +8082,8 @@
                             (-> ts
                                 (update :tx-buffer into tx-data)
                                 (assoc :speculative-db db-after)
+                                (cond-> reservation-only-advance?
+                                  (assoc :begin-max-tx (:max-tx durable-db)))
                                 (update :eid->tempid merge new-tempids))))
           (or returning-result
               (empty-result (str "INSERT 0 " (insert-affected-count parsed)))))
@@ -7796,7 +8098,11 @@
       ;; former deferred-CC "batchable" path was retired once implicit-tx
       ;; took over grouping (see doc/design-alignment.md).
       :else
-      (execute-insert conn parsed :tx-wrap (:tx-wrap ctx)))))
+      (execute-insert
+       conn parsed
+       #(sql/resolve-nextvals! % (fn [sequence-name]
+                                   (nextval-for-tx! conn tx-state sequence-name)))
+       :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-update-with-recursive
   [ctx parsed]
@@ -11409,7 +11715,9 @@
                             ;; postwalk-rebuilds tx-data, which clones the
                             ;; marker into two distinct objects — running it
                             ;; first would defeat the dedup and double-bump.
-                            parsed (resolve-nextval-markers parsed conn tx-state)
+                            parsed (if (= :insert (:type parsed))
+                                     parsed
+                                     (resolve-nextval-markers parsed conn tx-state))
                             ;; Give a reused INSERT a fresh tempid per
                             ;; execution. parse-sql is LRU-cached and
                             ;; prepared statements are reused, so the cached
