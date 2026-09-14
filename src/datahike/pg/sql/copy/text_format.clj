@@ -1,7 +1,7 @@
 (ns datahike.pg.sql.copy.text-format
   "PostgreSQL COPY-IN text-format decoder. Pure data transformation:
    bytes / string chunks in, vectors of fields out. Field values are
-   either Strings or the sentinel `::null` (used in place of `nil` so
+   either Strings or the sentinels `::null` / `::default` (used in place of `nil` so
    downstream tx-data builders can distinguish a missing column from
    an explicit NULL).
 
@@ -172,7 +172,8 @@
    Returns either:
      {:eod? true}                     — the line was the EOD marker `\\.`
      {:row [String | ::null ...]}     — a normal data row"
-  [^String line {:keys [^String delimiter ^String null-marker]}]
+  [^String line {:keys [^String delimiter ^String null-marker
+                        ^String default-marker]}]
   (cond
     (= line "\\.")
     {:eod? true}
@@ -180,9 +181,10 @@
     :else
     (let [raw-fields (split-fields line delimiter)
           row (mapv (fn [^String raw]
-                      (if (= raw null-marker)
-                        ::null
-                        (de-escape-field raw)))
+                      (cond
+                        (= raw null-marker) ::null
+                        (and default-marker (= raw default-marker)) ::default
+                        :else (de-escape-field raw)))
                     raw-fields)]
       {:row row})))
 

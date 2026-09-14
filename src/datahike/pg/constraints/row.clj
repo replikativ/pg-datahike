@@ -8,7 +8,8 @@
    mirrors PostgreSQL's ExecInsert/ExecOnConflictUpdate ordering."
   (:require [datahike.api :as d]
             [datahike.pg.jsonb :as jb]
-            [datahike.pg.schema :as pgs])
+            [datahike.pg.schema :as pgs]
+            [datahike.pg.sql.params :as params])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]))
 
 (defn column-specs [db table-name]
@@ -196,12 +197,16 @@
                     :else value)
                   (catch Exception _ value))
     (:bit :bit-coerced) value
-    :fn (case value
-          "now" (java.util.Date.)
-          "current_date" (java.time.LocalDate/now java.time.ZoneOffset/UTC)
-          "current_time" (java.time.LocalTime/now java.time.ZoneOffset/UTC)
-          "current_user" "datahike"
-          nil)
+    :fn (let [^java.util.Date statement-time
+              (or params/*statement-time* (java.util.Date.))
+              instant (.toInstant statement-time)
+              utc (.atZone instant java.time.ZoneOffset/UTC)]
+          (case value
+            "now" statement-time
+            "current_date" (.toLocalDate utc)
+            "current_time" (.toLocalTime utc)
+            "current_user" "datahike"
+            nil))
     nil))
 
 (defn prepare-candidate

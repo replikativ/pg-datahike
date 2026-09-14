@@ -802,6 +802,11 @@ public final class PgWireServer {
         return (((long) pid) << 32) | (secret & 0xFFFFFFFFL);
     }
 
+    private static void clearStatementCancel(AtomicBoolean flag) {
+        if (flag != null) flag.set(false);
+        Thread.interrupted();
+    }
+
     /**
      * Thread-local pointing at the current connection's cancel flag so
      * query-execution code paths can cheaply check it between statements.
@@ -1051,7 +1056,11 @@ public final class PgWireServer {
             AtomicBoolean doingCommandRead = COMMAND_READ_REGISTRY.get(cancelKeys[0]);
 
             while (running.get() && !client.isClosed()) {
-                if (doingCommandRead != null) doingCommandRead.set(true);
+                // COPY-IN is still an active SQL statement while the backend
+                // waits for its next CopyData frame. A CancelRequest in this
+                // window must remain pending instead of being discarded as
+                // an idle-session cancel.
+                if (doingCommandRead != null) doingCommandRead.set(copyState[0] != 1);
                 int msgType = in.read();
                 if (msgType == -1) break;
 
@@ -1144,6 +1153,7 @@ public final class PgWireServer {
                                 }
                                 sendReadyForQuery(out, txStatus[0]);
                                 out.flush();
+                                clearStatementCancel(cancelState[0]);
                             }
                             case 'f' -> {
                                 String reason = readCopyFailReason(body);
@@ -1154,6 +1164,7 @@ public final class PgWireServer {
                                 if (txStatus[0] == 'T') txStatus[0] = 'E';
                                 sendReadyForQuery(out, txStatus[0]);
                                 out.flush();
+                                clearStatementCancel(cancelState[0]);
                             }
                             // Flush / Sync — ignored during COPY-IN
                             case 'H', 'S' -> { /* no-op */ }
@@ -1166,6 +1177,7 @@ public final class PgWireServer {
                                 if (txStatus[0] == 'T') txStatus[0] = 'E';
                                 sendReadyForQuery(out, txStatus[0]);
                                 out.flush();
+                                clearStatementCancel(cancelState[0]);
                             }
                         }
                         // Skip the regular dispatch for this iteration
@@ -1267,9 +1279,12 @@ public final class PgWireServer {
                 // after the last check-cancel! site) cannot leak into
                 // the next statement. Also clear any stray interrupt
                 // bit from the safety-net path.
-                if (msgType == 'E' || msgType == 'Q' || msgType == 'S') {
-                    if (cancelState[0] != null) cancelState[0].set(false);
-                    Thread.interrupted();
+                // A Q which entered COPY-IN has not reached a statement
+                // boundary yet. CopyDone/CopyFail clear inside the COPY
+                // routing block above, before its early continue.
+                if ((msgType == 'E' || msgType == 'Q' || msgType == 'S')
+                        && copyState[0] != 1) {
+                    clearStatementCancel(cancelState[0]);
                 }
             }
         } catch (IOException e) {

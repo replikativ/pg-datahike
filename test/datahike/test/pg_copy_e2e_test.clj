@@ -60,6 +60,10 @@
         in    (StringReader. body)]
     (.copyIn cm sql in)))
 
+(defn- open-copy
+  ^CopyIn [^Connection c ^String sql]
+  (.copyIn (CopyManager. (.unwrap c PGConnection)) sql))
+
 (defn- query-rows [^Connection c sql]
   (with-open [stmt (.createStatement c)
               rs   (.executeQuery stmt sql)]
@@ -85,6 +89,182 @@
     (is (= [[2 7]] (query-rows c "SELECT id,v FROM copy_ids")))
     (is (= 1 (copy-in-text c "COPY copy_ids(id,v) FROM STDIN" "99\t8\n")))
     (is (= [[2 7] [99 8]] (query-rows c "SELECT id,v FROM copy_ids ORDER BY id")))))
+
+(deftest copy-default-marker
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st (str "CREATE TABLE copy_defaults ("
+                        "id int PRIMARY KEY, v text NOT NULL DEFAULT 'fallback')")))
+    (is (= 2 (copy-in-text c "COPY copy_defaults FROM STDIN WITH (DEFAULT '\\D')"
+                           "1\t\\D\n2\tvalue\n")))
+    (is (= [[1 "fallback"] [2 "value"]]
+           (query-rows c "SELECT id,v FROM copy_defaults ORDER BY id")))
+    (let [e (try
+              (copy-in-text c "COPY copy_defaults FROM STDIN WITH (DEFAULT '\\D')"
+                            "\\D\tvalue\n")
+              nil
+              (catch java.sql.SQLException e e))]
+      (is (= "22P04" (.getSQLState ^java.sql.SQLException e))))
+    (is (= 1 (copy-in-text c
+                           "COPY copy_defaults FROM STDIN WITH (FORMAT csv, DEFAULT '\\D')"
+                           "3,\"\\D\"\n")))
+    (is (= "\\D" (ffirst (query-rows c "SELECT v FROM copy_defaults WHERE id=3"))))))
+
+(deftest copy-decodes-utf8-across-wire-frame-boundaries
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [^CopyIn copy (open-copy c "COPY users(id,name) FROM STDIN")
+          bytes (.getBytes "1\tGrüße 🌍\n" java.nio.charset.StandardCharsets/UTF_8)]
+      ;; One byte per CopyData message exercises every boundary inside the
+      ;; two-byte and four-byte characters.
+      (dotimes [offset (alength bytes)]
+        (.writeToCopy copy bytes offset 1))
+      (is (= 1 (.endCopy copy))))
+    (is (= [["Grüße 🌍"]]
+           (query-rows c "SELECT name FROM users WHERE id=1")))))
+
+(deftest copy-rejects-truncated-utf8
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [^CopyIn copy (open-copy c "COPY users(id,name) FROM STDIN")
+          prefix (.getBytes "1\t" java.nio.charset.StandardCharsets/UTF_8)
+          truncated (byte-array [(unchecked-byte 0xE2) (unchecked-byte 0x82)])]
+      (.writeToCopy copy prefix 0 (alength prefix))
+      (.writeToCopy copy truncated 0 (alength truncated))
+      (let [e (try (.endCopy copy) nil
+                   (catch java.sql.SQLException e e))]
+        (is (= "22021" (.getSQLState ^java.sql.SQLException e)))))
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM users")))))
+
+(deftest copy-rejects-malformed-utf8-and-nul
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (doseq [invalid [(byte-array [(unchecked-byte 0xE2)
+                                  (unchecked-byte 0x28)
+                                  (unchecked-byte 0xA1)])
+                     (byte-array [0])]]
+      (let [^CopyIn copy (open-copy c "COPY users(id,name) FROM STDIN")
+            prefix (.getBytes "1\t" java.nio.charset.StandardCharsets/UTF_8)]
+        (.writeToCopy copy prefix 0 (alength prefix))
+        (.writeToCopy copy invalid 0 (alength invalid))
+        (let [e (try (.endCopy copy) nil
+                     (catch java.sql.SQLException e e))]
+          (is (= "22021" (.getSQLState ^java.sql.SQLException e))))))
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM users")))))
+
+(deftest copy-ignores-invalid-bytes-after-text-end-marker
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [^CopyIn copy (open-copy c "COPY users(id,name) FROM STDIN")
+          prefix (.getBytes "1\tok\n\\.\n" java.nio.charset.StandardCharsets/UTF_8)
+          invalid (byte-array [(unchecked-byte 0xFF)])
+          payload (byte-array (+ (alength prefix) 1))]
+      (System/arraycopy prefix 0 payload 0 (alength prefix))
+      (aset-byte payload (alength prefix) (aget invalid 0))
+      (.writeToCopy copy payload 0 (alength payload))
+      (is (= 1 (.endCopy copy))))
+    (is (= [[1 "ok"]] (query-rows c "SELECT id,name FROM users")))))
+
+(deftest copy-defaults-follow-supplied-column-order
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE copy_order_a (id int GENERATED ALWAYS AS IDENTITY, v int)")
+      (.execute st "CREATE TABLE copy_order_b (id int GENERATED ALWAYS AS IDENTITY, v int)"))
+    ;; A supplied DEFAULT marker is evaluated where it occurs: id first,
+    ;; then the invalid v field. The failed statement still reserves id=1.
+    (is (thrown? java.sql.SQLException
+                 (copy-in-text c
+                               "COPY copy_order_a(id,v) FROM STDIN WITH (DEFAULT '\\D')"
+                               "\\D\tnot-an-int\n")))
+    (is (= 1 (copy-in-text c "COPY copy_order_a(v) FROM STDIN" "10\n")))
+    (is (= [[2 10]] (query-rows c "SELECT id,v FROM copy_order_a")))
+    ;; Reversing the supplied columns makes coercion fail before the marker,
+    ;; so no identity value is consumed.
+    (is (thrown? java.sql.SQLException
+                 (copy-in-text c
+                               "COPY copy_order_b(v,id) FROM STDIN WITH (DEFAULT '\\D')"
+                               "not-an-int\t\\D\n")))
+    (is (= 1 (copy-in-text c "COPY copy_order_b(v) FROM STDIN" "10\n")))
+    (is (= [[1 10]] (query-rows c "SELECT id,v FROM copy_order_b")))))
+
+(deftest invalid-default-marker-is-detected-before-row-conversion
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE SEQUENCE copy_preflight_seq")
+      (.execute st (str "CREATE TABLE copy_preflight ("
+                        "generated int DEFAULT nextval('copy_preflight_seq'), "
+                        "plain int)"))
+      (.execute st "CREATE TABLE copy_preflight_plain (a int, b int)"))
+    ;; The second marker has no default. PostgreSQL discovers that while
+    ;; parsing the raw row, before evaluating the valid sequence marker.
+    (let [e (try
+              (copy-in-text c
+                            "COPY copy_preflight FROM STDIN WITH (DEFAULT '\\D')"
+                            "\\D\t\\D\n")
+              nil
+              (catch java.sql.SQLException e e))]
+      (is (= "22P04" (.getSQLState ^java.sql.SQLException e))))
+    (is (= 1 (copy-in-text c "COPY copy_preflight(plain) FROM STDIN" "7\n")))
+    (is (= [[1 7]] (query-rows c "SELECT generated,plain FROM copy_preflight")))
+    (doseq [body ["\\D\n" "\\D\t2\textra\n"]]
+      (let [e (try
+                (copy-in-text c
+                              "COPY copy_preflight_plain FROM STDIN WITH (DEFAULT '\\D')"
+                              body)
+                nil
+                (catch java.sql.SQLException e e))]
+        (is (re-find #"unexpected default marker" (.getMessage e)))))
+    (let [e (try
+              (copy-in-text c
+                            "COPY copy_preflight_plain FROM STDIN WITH (DEFAULT '\\D')"
+                            "1\t2\t\\D\n")
+              nil
+              (catch java.sql.SQLException e e))]
+      (is (re-find #"extra data" (.getMessage e))))))
+
+(deftest cancel-request-between-copy-frames-does-not-leak
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (let [^PGConnection pgconn (.unwrap c PGConnection)
+          ^CopyIn copy (.copyIn (CopyManager. pgconn)
+                                "COPY users(id,name) FROM STDIN")
+          first-row (.getBytes "1\tbefore\n" java.nio.charset.StandardCharsets/UTF_8)
+          second-row (.getBytes "2\tafter\n" java.nio.charset.StandardCharsets/UTF_8)]
+      (.writeToCopy copy first-row 0 (alength first-row))
+      ;; CancelRequest uses its own connection and has no acknowledgement.
+      ;; Give its accept task a short scheduling window before the next frame.
+      (.cancelQuery pgconn)
+      (Thread/sleep 50)
+      (.writeToCopy copy second-row 0 (alength second-row))
+      (let [e (try (.endCopy copy) nil
+                   (catch java.sql.SQLException e e))]
+        (is (= "57014" (.getSQLState ^java.sql.SQLException e)))))
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM users")))
+    ;; The COPY statement boundary clears both flag and interrupt state.
+    (is (= [[1]] (query-rows c "SELECT 1")))))
+
+(deftest copy-keeps-one-statement-time-for-defaults
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE copy_time (id int PRIMARY KEY, at timestamp DEFAULT now())"))
+    (let [^CopyIn copy (open-copy c "COPY copy_time(id) FROM STDIN")
+          first-row (.getBytes "1\n" java.nio.charset.StandardCharsets/UTF_8)
+          second-row (.getBytes "2\n" java.nio.charset.StandardCharsets/UTF_8)]
+      (.writeToCopy copy first-row 0 (alength first-row))
+      (Thread/sleep 20)
+      (.writeToCopy copy second-row 0 (alength second-row))
+      (is (= 2 (.endCopy copy))))
+    (let [[first-time second-time]
+          (map first (query-rows c "SELECT at FROM copy_time ORDER BY id"))]
+      (is (= first-time second-time)))))
+
+(deftest statement-timeout-covers-the-copy-stream
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (with-open [st (.createStatement c)]
+      (.execute st "SET statement_timeout = '20ms'"))
+    (let [^CopyIn copy (open-copy c "COPY users(id,name) FROM STDIN")
+          row (.getBytes "1\tlate\n" java.nio.charset.StandardCharsets/UTF_8)]
+      (Thread/sleep 75)
+      (.writeToCopy copy row 0 (alength row))
+      (let [e (try (.endCopy copy) nil
+                   (catch java.sql.SQLException e e))]
+        (is (= "57014" (.getSQLState ^java.sql.SQLException e)))))
+    (is (= [[0]] (query-rows c "SELECT count(*) FROM users")))))
 
 (deftest copy-late-row-failure-rolls-back-the-whole-statement
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
