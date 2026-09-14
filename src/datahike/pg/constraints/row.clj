@@ -48,18 +48,18 @@
                         (mapcat #(pgs/column-info schema % db)
                                 (cons table-name ancestors)))))))
 
-(defn constraint-plan
-  "Compile immutable per-table metadata once for a statement/tx function."
+(defn constraint-metadata
+  "Read per-table row-constraint inputs without parsing SQL expressions or
+   evaluating defaults, predicates, or queries written in SQL. FK column JSON
+   is decoded only to resolve the same physical attribute mappings as a plan.
+   Retains raw definitions so changes can be compared before using a plan."
   [db table-name]
   (let [schema (:schema db)
         columns (column-specs db table-name)
         checks (when (get schema :pg/check-name)
                  (mapv (fn [[constraint expression]]
                          {:constraint constraint
-                          :ast (try
-                                 (CCJSqlParserUtil/parseCondExpression expression)
-                                 (catch Exception _
-                                   (CCJSqlParserUtil/parseExpression expression)))})
+                          :expression expression})
                        (d/q '{:find [?name ?expression]
                               :in [$ ?table]
                               :where [[?check :pg/check-name ?name]
@@ -74,6 +74,8 @@
                             parent-by-name (into {} (map (juxt :name :attr))
                                                  (pgs/column-info schema parent-table db))]
                         {:constraint constraint
+                         :child-definition child-json
+                         :parent-definition parent-json
                          :child-attrs (mapv child-by-name
                                             (vec (jb/parse-jsonb child-json)))
                          :parent-table parent-table
@@ -106,14 +108,19 @@
                          [name {:kind :domain :attr attr :domain-name domain-name
                                 :check-name (:datahike.pg.domain/check-name domain)
                                 :not-null? (true? (:datahike.pg.domain/not-null domain))
-                                :check-ast (when expression
-                                             (try
-                                               (CCJSqlParserUtil/parseCondExpression expression)
-                                               (catch Exception _
-                                                 (CCJSqlParserUtil/parseExpression expression))))}]))
+                                :check-expression expression}]))
 
                      enum-name
                      [name {:kind :enum :attr attr :enum-name enum-name
+                            :unsafe-values
+                            (if (get (:schema db) :datahike.pg.enum/unsafe-values)
+                              (into #{} (map (comp str first))
+                                    (d/q '{:find [?value]
+                                           :in [$ ?name]
+                                           :where [[?enum :datahike.pg.enum/name ?name]
+                                                   [?enum :datahike.pg.enum/unsafe-values ?value]]}
+                                         db enum-name))
+                              #{})
                             :values (into #{} (map (comp str first))
                                           (d/q '{:find [?value]
                                                  :in [$ ?name]
@@ -123,7 +130,40 @@
                      :else nil)))
                columns))]
     {:table table-name :columns columns
-     :checks checks :fks fks :domain-enum domain-enum}))
+     :checks (vec checks) :fks (vec fks) :domain-enum domain-enum}))
+
+(defn- parse-constraint-expression [expression]
+  (try
+    (CCJSqlParserUtil/parseCondExpression expression)
+    (catch Exception _
+      (CCJSqlParserUtil/parseExpression expression))))
+
+(defn compile-constraint-metadata
+  "Compile a previously read metadata snapshot. Does not reread its database
+   or evaluate defaults/predicates. Check ordering follows the input snapshot."
+  [{:keys [checks fks domain-enum] :as metadata}]
+  (assoc metadata
+         :checks (when checks
+                   (mapv (fn [{:keys [constraint expression]}]
+                           {:constraint constraint :ast (parse-constraint-expression expression)})
+                         checks))
+         :fks (when fks (mapv #(dissoc % :child-definition :parent-definition) fks))
+         :domain-enum
+         (into {}
+               (map (fn [[name spec]]
+                      [name (if (= :domain (:kind spec))
+                              (-> spec
+                                  (dissoc :check-expression)
+                                  (assoc :check-ast
+                                         (when-let [expression (:check-expression spec)]
+                                           (parse-constraint-expression expression))))
+                              spec)]))
+               domain-enum)))
+
+(defn constraint-plan
+  "Compile per-table metadata once for a statement/tx function."
+  [db table-name]
+  (compile-constraint-metadata (constraint-metadata db table-name)))
 
 (defn plan-required?
   "True when an INSERT needs the row-constraint transaction function.
@@ -236,6 +276,15 @@
            (not (contains? (:values spec) (str value))))
       (throw (ex-info "invalid input value for enum"
                       {:error :invalid-text-representation :sqlstate "22P02"
+                       :type (:enum-name spec) :value value
+                       :table table-name :column column-name}))
+
+      (and (= :enum (:kind spec)) (some? value)
+           (contains? (:unsafe-values spec) (str value)))
+      (throw (ex-info (str "unsafe use of new value " (pr-str (str value))
+                           " of enum type " (:enum-name spec))
+                      {:sqlstate "55P04"
+                       :hint "New enum values must be committed before they can be used."
                        :type (:enum-name spec) :value value
                        :table table-name :column column-name}))))
   (when validate-domain-fn (validate-domain-fn attrs))

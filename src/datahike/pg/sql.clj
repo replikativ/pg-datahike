@@ -19,6 +19,7 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
+            [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.classify :as cls]
@@ -458,13 +459,8 @@
   global-catalog-cache)
 
 (defn invalidate-catalog-cache!
-  "Clear the server-wide enriched-db catalog cache. Called from every DDL
-   exec branch (via invalidate-schema-cache!). The cache key is only the
-   user-schema hash + catalog-table-names, which does NOT change when a
-   CREATE TYPE / ENUM / DOMAIN adds a registry *entity* (new datoms under
-   pre-existing idents) or when ALTER changes a column's typmod — so those
-   would otherwise serve stale catalog rows (e.g. a 2nd composite invisible
-   in pg_type). DDL is rare, so a full clear is the simplest correct fix."
+  "Clear cached catalog schema fragments. Rows and enriched database snapshots
+   are not cached: catalog extensions may read arbitrary current user data."
   []
   (.clear ^java.util.Map global-catalog-cache))
 
@@ -475,17 +471,23 @@
   (when cache (.put cache k v))
   v)
 
+(defn- translation-cache-key [sql schema db]
+  ;; Keep exact values, not their hashes: native catalog transactions do not
+  ;; necessarily change Datahike's schema object or the server's DDL token.
+  [::translation sql schema (catalog-basis/capture db)
+   params/*declared-param-oids* params/*temp-table-map*
+   (when params/*session-state*
+     (select-keys @params/*session-state* [:search-path]))])
+
 (defn enrich-db-with-catalogs
   "Materialise the given catalog tables' schema + data on top of `db`,
    returning the enriched db (its `:schema` carries the catalog attrs).
    Returns `db` unchanged when `catalog-names` is empty.
 
-   Cached in the server-wide LRU by [user-schema-hash sorted-names]; the
-   cache is DDL-invalidated (invalidate-catalog-cache!). Callable at BOTH
-   parse time (to translate against the catalog schema) and execute time
-   (so a prepared catalog statement re-resolves fresh catalog rows against
-   the current db instead of a stale parse-time snapshot — real PG re-plans
-   on catalog change). `schema` is `db`'s user schema."
+   Only catalog schema fragments are cached. Catalog rows are derived from
+   this exact input DB and materialized on top of it on every call. Thus a
+   catalog join cannot accidentally inherit another call's user rows.
+   `schema` is `db`'s user schema."
   [db schema catalog-names]
   (if (empty? catalog-names)
     db
@@ -499,29 +501,20 @@
           ;; whose outer scope already enriched the same catalogs.
           sorted-names (sort (remove #(contains? existing (pgs/row-marker-attr %))
                                      catalog-names))
-          cache *catalog-cache*
-          ;; The schema hash alone does not identify the catalog CONTENT
-          ;; for sequence-backed tables: `nextval` moves :__seq__/value
-          ;; and a second CREATE SEQUENCE adds a row, neither of which
-          ;; touches the schema (the :__seq__/* attrs are installed by
-          ;; the FIRST CREATE SEQUENCE and never change after). Without
-          ;; this component, `SELECT last_value FROM pg_sequences` re-run
-          ;; after a nextval was served from the cache and reported the
-          ;; pre-advance value. Only paid when such a table is actually
-          ;; being materialised.
-          seq-fingerprint (when (some catalog/sequence-backed-catalogs sorted-names)
-                            (hash (catalog/sequence-state db)))
-          cache-key [(hash existing) sorted-names seq-fingerprint]]
+          cache *catalog-cache*]
       (cond
         (empty? sorted-names) db
         :else
-        (or (cache-get cache cache-key)
-            (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
-                  combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
-                                             sorted-names))
-                  spec-db (d/db-with db combined-schema)
-                  built (if (seq combined-data) (d/db-with spec-db combined-data) spec-db)]
-              (cache-put! cache cache-key built)))))))
+        (let [;; Include the actual registered schema fragments, so replacing
+              ;; an extension does not depend on a global invalidation race.
+              fragments (mapv catalog/catalog-schema-for sorted-names)
+              cache-key [sorted-names fragments]
+              combined-schema (or (cache-get cache cache-key)
+                                  (cache-put! cache cache-key (vec (mapcat identity fragments))))
+              combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
+                                         sorted-names))
+              spec-db (d/db-with db combined-schema)]
+          (if (seq combined-data) (d/db-with spec-db combined-data) spec-db))))))
 
 ;; ============================================================================
 ;; parse-sql result cache
@@ -534,17 +527,14 @@
 ;; VALUES (?)` calls, ORM-generated SELECT-by-id — pays this cost on
 ;; every Parse message.
 ;;
-;; The cache key is `[sql schema-hash]`. The schema-hash captures
-;; everything translation depends on: column types, identity unique-
-;; ness, FK metadata. Two connections with the same user schema share
-;; entries. DDL changes the schema → new hash → cache miss.
+;; Translation keys contain exact schema/catalog inputs and parameter/session
+;; bindings. Native metadata writes are visible without server invalidation.
 ;;
 ;; We do NOT cache results that depend on transient state:
 ;;   - :type :system            (current_user, now(), session GUCs)
 ;;   - :type :error             (transient parse failures shouldn't pin)
 ;;   - :enriched-db tagged maps (catalog data depends on db rows, not
-;;                               just schema; the enriched-db itself is
-;;                               cached separately by *catalog-cache*)
+;;                               just schema)
 ;;   - bound-param substitution (callers Bind via resolve-param-refs
 ;;                               on the cached map; we cache the
 ;;                               un-substituted shape)
@@ -569,14 +559,9 @@
 
 (defn invalidate-parse-cache!
   "Clear the server-wide parse-sql result cache. Called from every DDL
-   exec branch (via server/invalidate-schema-cache!). The cache key is
-   `[sql (hash schema)]`, but translation also depends on the `:pg/*`
-   metadata stored on ident *entities* (NOT NULL, CHECK, FK, defaults,
-   typmod) which does not appear in `(dbi/-schema db)` — so an
-   `ALTER TABLE … ADD CHECK / SET NOT NULL / ALTER COLUMN TYPE` leaves
-   the hash unchanged and would keep serving parse results translated
-   against the old constraints. The AST cache is untouched: JSqlParser
-   output depends only on the SQL text."
+   exec branch (via server/invalidate-schema-cache!). Exact cache keys also
+   detect native catalog changes. The AST cache is untouched: JSqlParser
+   output depends only on SQL text."
   []
   (.clear ^java.util.Map global-parse-cache))
 
@@ -2491,7 +2476,7 @@
               (try
                 (let [tem-sql (:templated tem)
                       cache (when (cacheable-sql-size? (:templated tem)) *parse-cache*)
-                      cache-key (when cache [tem-sql (hash schema)])
+                      cache-key (when cache (translation-cache-key tem-sql schema db))
                       placeholder-parsed
                       (or (when cache (cache-get cache cache-key))
                           (let [p (parse-sql* tem-sql schema db)]
@@ -2671,7 +2656,7 @@
    (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
          ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
          ;; so it must neither be served from nor written to the shared result
-         ;; cache (whose key is only [sql schema]). Bypass caching entirely in
+         ;; cache. Bypass caching entirely in
          ;; that case — otherwise the binding-free version (e.g. the parse done
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
@@ -2679,7 +2664,6 @@
                           (nil? params/*bound-params*)
                           (cacheable-sql-size? sql))
                  *parse-cache*)
-         schema-key (when cache (hash schema))
          ;; Schema-flexibility is part of the key because it changes the
          ;; TRANSLATION, not just the data: under :write an unknown
          ;; column is 42703, under :read it reads as NULL (a real column
@@ -2687,8 +2671,6 @@
          ;; identical schemas but different flexibility would otherwise
          ;; share entries, and whichever parsed first would decide for
          ;; both.
-         flex-key (when cache
-                    (try (:schema-flexibility (:config db)) (catch Throwable _ nil)))
          ;; The declared parameter types are part of the key, not
          ;; incidental context. `SELECT 1 + 1` and `SELECT 1.5 + 1`
          ;; template to the SAME `SELECT $1 + $2`, and what differs is not
@@ -2701,8 +2683,7 @@
          ;;
          ;; PostgreSQL keys a prepared plan on its declared parameter
          ;; types for the same reason.
-         cache-key (when cache [sql schema-key flex-key
-                                params/*declared-param-oids*])
+         cache-key (when cache (translation-cache-key sql schema db))
          cached (when cache (cache-get cache cache-key))]
      (cond
        cached cached

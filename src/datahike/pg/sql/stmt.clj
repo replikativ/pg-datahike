@@ -46,6 +46,7 @@
             [datahike.datom]
             [datahike.query :as dq]
             [datahike.pg.cache :as pg-cache]
+            [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.errors :as errors]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.constraints.unique :as unique-constraints]
@@ -7702,16 +7703,9 @@
                        :hint (str "Perhaps you meant to reference the table alias \""
                                   alias-name "\".")})))))
 
-;; Per-schema cache for enriched-schema. NOT a pure function of the
-;; schema map: the :pg/array-elem / :pg/typmod / :pg/type facts live on
-;; ident *entities* in the db, so two databases with structurally equal
-;; schema maps can enrich differently — the cache must key on schema
-;; IDENTITY (same object ⇒ same database generation), not equality.
-;; CREATE TABLE / ALTER ADD COLUMN mint a new schema map (new identity
-;; → natural miss), but a typmod-only ALTER COLUMN TYPE does not, so
-;; the server's DDL path also clears this cache explicitly
-;; (invalidate-enriched-schema-cache!, wired into
-;; server/invalidate-schema-cache!).
+;; Array/type metadata lives on ident entities, independently of schema-map
+;; identity. Exact catalog inputs distinguish native metadata transactions as
+;; well as SQL DDL, without retaining a database snapshot in the key.
 (def ^:private enriched-schema-cache
   (pg-cache/bounded-cache 64))
 
@@ -7789,13 +7783,12 @@
    array column INSERTs we need that metadata available via
    `(get-in schema [attr :pg/array-elem])`, so this helper queries
    db for every ident's array-elem/ndim and merges the results into
-   the schema map. Memoised per schema-identity — was ~0.7 ms/row of
-   pure recomputation on the Pagila pg_dump replay before caching."
+   the schema map. Memoised by the supplied schema and exact catalog inputs."
   [schema db]
   (if (nil? db)
     schema
     (let [^java.util.Map outer enriched-schema-cache
-          k (pg-cache/identity-key schema)]
+          k [schema (catalog-basis/capture db)]]
       (or (.get outer k)
           (locking outer
             (or (.get outer k)
@@ -8514,6 +8507,26 @@
                       cells))
               (range width))))))
 
+(defn- literal-catalog-expression?
+  "Closed expression vocabulary for target-local INSERT admission. Anything
+   that can consult other catalog objects retains whole-catalog validation."
+  ([expression] (literal-catalog-expression? expression 32))
+  ([expression remaining]
+   (and (pos? remaining)
+        (cond
+          (#{LongValue DoubleValue StringValue NullValue BooleanValue} (class expression)) true
+          (= JdbcParameter (class expression))
+          (every? #{16 20 21 23 25 700 701 1042 1043}
+                  (vals params/*declared-param-oids*))
+          (= Parenthesis (class expression))
+          (literal-catalog-expression? (.getExpression ^Parenthesis expression) (dec remaining))
+          (= SignedExpression (class expression))
+          (literal-catalog-expression? (.getExpression ^SignedExpression expression) (dec remaining))
+          (= ParenthesedExpressionList (class expression))
+          (and (= 1 (count expression))
+               (literal-catalog-expression? (first expression) (dec remaining)))
+          :else false))))
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
@@ -9029,6 +9042,13 @@
         ;; Add RETURNING clause if present
             returning (extract-returning (.getReturningClause insert))]
         (cond-> (assoc result :alias target-alias)
+          (and (not conflict-action) (not returning)
+               (empty? ancestor-tables) (empty? sequence-defaults)
+               (empty? (.getWithItemsList insert))
+               (not (contains? temp-table-map raw-table))
+               (every? literal-catalog-expression? (mapcat identity row-exprs)))
+          (assoc :catalog-dependency-shape :literal-insert-v1
+                 :catalog-target-name raw-table)
           returning (assoc :returning returning))))))
 
 (defn translate-delete

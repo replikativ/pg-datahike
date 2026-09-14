@@ -54,6 +54,19 @@ with `ALTER TABLE parent ALTER COLUMN id SET DEFAULT nextval('parent_id_seq')`.
 Fresh SERIAL declarations store an ordinary nextval default and report no
 identity generation in the PostgreSQL catalogs.
 
+## Concurrent catalog changes
+
+Writes validate the catalog metadata used to prepare them against the writer's
+current snapshot. If that metadata has changed, the statement or transaction
+can fail with SQLSTATE `40001`; retry the whole transaction from a fresh
+snapshot. This also applies to metadata changed through Datahike's native API.
+
+Simple literal INSERTs into ordinary scalar tables can tolerate unrelated
+catalog changes when their target metadata is unchanged. Other statement forms
+use a conservative whole-catalog check and may require a retry even when the
+concurrent change concerns another table. Sequence counter advances and ordinary
+row writes do not count as catalog changes.
+
 ## Wire security
 
 pg-datahike implements PostgreSQL's conventional `SSLRequest` negotiation and

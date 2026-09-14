@@ -25,6 +25,8 @@
             [datahike.versioning :as versioning]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.cache :as pg-cache]
+            [datahike.pg.catalog.admission :as catalog-admission]
+            [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.constraints.unique :as unique-constraints]
@@ -298,6 +300,33 @@
    attributes such ops as the empty write-set instead of ::opaque."
   [f]
   (with-meta f {:datahike.pg/fresh-insert true}))
+
+(def ^:dynamic *statement-catalog-basis* nil)
+
+(defn- assert-catalog-current! [expected db]
+  (when (and expected
+             (not (or (catalog-basis/matches? expected db)
+                      (catalog-admission/valid?
+                       (::catalog-admission/certificate (meta expected)) db))))
+    (throw (ex-info "catalog changed while statement was being executed"
+                    {:error :serialization-failure :sqlstate "40001"}))))
+
+(defn- catalog-guard-op [expected]
+  [:db.fn/call
+   (vary-meta (fresh-insert-fn
+               (fn [txdb]
+                 (assert-catalog-current! expected txdb)
+                 []))
+              assoc ::guard-catalog-basis expected)])
+
+(defn- guard-catalog-tx
+  "Retain the lowering catalog as a writer-time precondition, not a request
+   to lower SQL or evaluate defaults again. The guard has no row write-set."
+  ([tx-data] (guard-catalog-tx tx-data *statement-catalog-basis*))
+  ([tx-data expected]
+   (if (and expected (seq tx-data))
+     (into [(catalog-guard-op expected)] tx-data)
+     tx-data)))
 
 (def ^:private row-lock-timeout-ms
   "How long an in-transaction UPDATE/DELETE waits for a conflicting row
@@ -1401,7 +1430,7 @@
    (transact-recorded! conn tx-data nil))
   ([conn tx-data tx-options]
    (let [db-before @conn
-         report (d/transact conn (cond-> {:tx-data tx-data}
+         report (d/transact conn (cond-> {:tx-data (guard-catalog-tx tx-data)}
                                    (seq tx-options)
                                    (assoc :tx-options tx-options)))
          db-after (:db-after report)
@@ -1439,7 +1468,8 @@
                             {:error :serialization-failure
                              :detail "database advanced while RETURNING was evaluated"}))))]
     (let [report (d/transact
-                  conn [[:db.fn/call guarded-expand expected-max-tx expanded]])
+                  conn (guard-catalog-tx
+                        [[:db.fn/call guarded-expand expected-max-tx expanded]]))
           db-after (:db-after report)
           eas (tx-buffer-eas expanded db-before)]
       (record-commit-writes! (db-ring-key db-after) (:max-tx db-after) eas)
@@ -1814,11 +1844,12 @@
 
 (defn- schema-cached
   "`(schema-cached db cache-key produce)` — memoise `(produce)`
-   (a 0-arg thunk) by `[schema-identity cache-key]`."
+   (a 0-arg thunk) by schema identity, exact catalog basis, and cache-key."
   [db cache-key produce]
   (if-not *schema-cache-enabled?*
     (produce)
-    (let [schema-k (pg-cache/identity-key (dbi/-schema db))
+    (let [schema-k [(pg-cache/identity-key (dbi/-schema db))
+                    (catalog-basis/capture db)]
           ^java.util.Map outer schema-deriv-cache
           ^java.util.concurrent.ConcurrentHashMap inner
           (or (.get outer schema-k)
@@ -2040,7 +2071,8 @@
                  :enum-name enum-name
                  :values (conj (or (:values cur) #{}) (str values))})))
       (doseq [[col spec] enum-map]
-        (.put result col spec)))
+        (.put result col (assoc spec :unsafe-values
+                                (params/unsafe-enum-values db (:enum-name spec))))))
     (into {} result)))
 
 (defn- read-domain-enum-checks
@@ -2112,13 +2144,21 @@
             ;; strings, regardless of how the user inserted (string vs
             ;; keyword). Compare via str-coercion so both shapes work.
             (and (= :enum (:kind spec)) (some? v))
-            (when-not (contains? (:values spec) (str v))
-              (throw (ex-info "invalid input value for enum"
-                              {:error :invalid-text-representation
-                               :type  (:enum-name spec)
-                               :value v
-                               :table table-name
-                               :column col-name})))))))))
+            (do
+              (when-not (contains? (:values spec) (str v))
+                (throw (ex-info "invalid input value for enum"
+                                {:error :invalid-text-representation
+                                 :type  (:enum-name spec)
+                                 :value v
+                                 :table table-name
+                                 :column col-name})))
+              (when (contains? (:unsafe-values spec) (str v))
+                (throw (ex-info (str "unsafe use of new value " (pr-str (str v))
+                                     " of enum type " (:enum-name spec))
+                                {:sqlstate "55P04"
+                                 :hint "New enum values must be committed before they can be used."
+                                 :type (:enum-name spec) :value v
+                                 :table table-name :column col-name}))))))))))
 
 (defn- read-fk-constraints
   "All FK constraints where the given table is the CHILD side. Returns
@@ -2429,6 +2469,12 @@
                          #(read-column-constraints* db table-name))]
     (if (= ::nil v) {} v)))
 
+(defn- cached-row-constraint-metadata [db table-name]
+  (schema-cached db [::row-constraint-metadata table-name]
+                 #(binding [datahike.query/*query-result-cache?* false
+                            pgs/*catalog-tx-cache* nil]
+                    (row-constraints/constraint-metadata db table-name))))
+
 (defn- apply-column-constraints
   "Wrap an INSERT tx-data vector in a :db.fn/call that validates
    every incoming entity against the table's registered constraints:
@@ -2451,57 +2497,60 @@
   [tx-data table-name ns db]
   (let [constraint-plan
         (schema-cached db [::row-constraint-plan table-name]
-                       #(row-constraints/constraint-plan db table-name))
+                       #(row-constraints/compile-constraint-metadata
+                         (cached-row-constraint-metadata db table-name)))
         explicit-nulls? (some (fn [entry]
                                 (and (map? entry) (some nil? (vals entry))))
                               tx-data)]
-    (if-not (row-constraints/plan-required? constraint-plan explicit-nulls?)
-      tx-data
-      [[:db.fn/call
+    (guard-catalog-tx
+     (if-not (row-constraints/plan-required? constraint-plan explicit-nulls?)
+       tx-data
+       [[:db.fn/call
         ;; fresh-insert-fn: conflict attribution treats this as writing no
         ;; existing rows — it emits the payload as fresh entities (or raises).
         ;; Sequence reservations have already committed independently through
         ;; nextval markers, so this transaction never writes their counters.
-        (fresh-insert-fn
-         (fn [txdb]
-           (let [input-tx-data tx-data
-                 result (reduce
-                         (fn [acc entry]
-                           (if-not (map? entry)
-                             (conj acc entry)
-                             (let [{:keys [attrs]}
-                                   (row-constraints/prepare-candidate
-                                    entry constraint-plan
-                                    (fn [value attr]
-                                      (or (#'sql/coerce-insert-value
-                                           value attr (dbi/-schema txdb) txdb)
-                                          value)))]
-                               (conj acc attrs))))
-                         []
-                         input-tx-data)
+         (fresh-insert-fn
+          (fn [txdb]
+            (let [input-tx-data tx-data
+                  result (reduce
+                          (fn [acc entry]
+                            (if-not (map? entry)
+                              (conj acc entry)
+                              (let [{:keys [attrs]}
+                                    (row-constraints/prepare-candidate
+                                     entry constraint-plan
+                                     (fn [value attr]
+                                       (or (#'sql/coerce-insert-value
+                                            value attr (dbi/-schema txdb) txdb)
+                                           value)))]
+                                (conj acc attrs))))
+                          []
+                          input-tx-data)
                 ;; Second pass — CHECK + FK enforcement sees the final
                 ;; entity maps (post-default, post-identity). Only map
                 ;; entries count as rows; :db/add tuples from sequence
                 ;; bumps etc. don't.
-                 filled-entities (filterv map? result)
-                 effective-rows (into {}
-                                      (keep (fn [row]
-                                              (when-let [id (:db/id row)] [id row])))
-                                      filled-entities)]
-             (doseq [em filled-entities]
-               (row-constraints/validate-mutation!
-                txdb table-name em constraint-plan effective-rows
-                (fn [ast row ns schema]
-                  (sql/eval-check-predicate ast row ns schema))
-                nil))
+                  filled-entities (filterv map? result)
+                  effective-rows (into {}
+                                       (keep (fn [row]
+                                               (when-let [id (:db/id row)] [id row])))
+                                       filled-entities)]
+              (doseq [em filled-entities]
+                (row-constraints/validate-mutation!
+                 txdb table-name em constraint-plan effective-rows
+                 (fn [ast row ns schema]
+                   (sql/eval-check-predicate ast row ns schema))
+                 nil))
              ;; Datahike represents SQL NULL as an absent datom.  Nil map
              ;; entries existed only long enough to distinguish explicit
              ;; NULL from an omitted/defaulted column above.
-             (mapv (fn [entry]
-                     (if (map? entry)
-                       (into {} (remove (comp nil? val)) entry)
-                       entry))
-                   result))))]])))
+              (mapv (fn [entry]
+                      (if (map? entry)
+                        (into {} (remove (comp nil? val)) entry)
+                        entry))
+                    result))))]])
+     (or *statement-catalog-basis* (catalog-basis/capture db)))))
 
 (defn- execute-insert [conn parsed & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
@@ -5315,6 +5364,25 @@
        (= :db/add (first op))
        (= :datahike.pg.enum/unsafe-values (nth op 2 nil))))
 
+(defn- durable-replay-buffer [buffer]
+  ;; Only preceding marker adds owned by this buffer may be absent on replay.
+  ;; Actual writer metadata remains exact, including any foreign markers.
+  (:ops
+   (reduce (fn [{:keys [markers] :as state} op]
+             (cond
+               (unsafe-enum-marker-op? op)
+               (update state :markers conj [(nth op 1) (nth op 3)])
+
+               (and (vector? op) (= :db.fn/call (first op))
+                    (::guard-catalog-basis (meta (second op))))
+               (update state :ops conj
+                       (catalog-guard-op
+                        (catalog-basis/without-replayed-enum-markers
+                         (::guard-catalog-basis (meta (second op))) markers)))
+
+               :else (update state :ops conj op)))
+           {:markers #{} :ops []} buffer)))
+
 (defn- transact-tx-buffer!
   "Commit the accumulated transaction buffer to `conn`, with the same
    concurrent-write (40001 serialization_failure) detection as an
@@ -5331,7 +5399,7 @@
     (let [;; Unsafe enum-label facts exist only in the speculative DB.  Once
           ;; the surrounding transaction commits, every added label becomes
           ;; safe, so never persist those marker operations.
-          buf (vec (remove unsafe-enum-marker-op? (:tx-buffer @tx-state)))
+          buf (durable-replay-buffer (:tx-buffer @tx-state))
           begin-max-tx (:begin-max-tx @tx-state)
           real-db (d/db conn)
           current-max-tx (when begin-max-tx (:max-tx real-db))
@@ -6650,11 +6718,14 @@
                          (or (:speculative-db ts) (d/db conn))
                          (d/db conn))
                     schema (dbi/-schema db)
-                    entry (if (and entry (identical? (:schema entry) schema))
-                            entry
-                            (let [e (compile-fast-select parsed db)]
-                              (.put ^java.util.Map fast-select-cache k (or e ::none))
-                              e))]
+                    current-plan? (and (::catalog-basis (meta parsed))
+                                       (catalog-basis/matches? (::catalog-basis (meta parsed)) db))
+                    entry (when current-plan?
+                            (if (and entry (identical? (:schema entry) schema))
+                              entry
+                              (let [e (compile-fast-select parsed db)]
+                                (.put ^java.util.Map fast-select-cache k (or e ::none))
+                                e)))]
                 (when entry
                   (when on-query (on-query (:sql parsed)))
                   ((:exec entry) db bound)))))
@@ -6679,7 +6750,7 @@
    repeated for every execution."
   [resolved plan]
   (if (= :select (:type resolved))
-    (assoc resolved ::select-shape-plan plan)
+    (assoc resolved ::select-shape-plan (or (::select-shape-plan plan) plan))
     resolved))
 
 (defn- candidate-page-entrypoint
@@ -7354,6 +7425,7 @@
                           [(pg-cache/identity-key
                             (or (::select-shape-plan parsed) parsed))
                            (pg-cache/identity-key (dbi/-schema db))
+                           (catalog-basis/capture db)
                            find-aliases])
               cached-shape (when shape-key
                              (.get ^java.util.Map select-shape-cache shape-key))]
@@ -7573,7 +7645,7 @@
                                    tx-data)]
           (swap! tx-state (fn [ts]
                             (cond-> ts
-                              true (update :tx-buffer into commit-tx-data)
+                              true (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                               spec-report (assoc :speculative-db (:db-after spec-report)))))
           (empty-result (str "UPDATE " (count eids))))
         (catch Exception e
@@ -7651,7 +7723,7 @@
           ;; changing the transaction's speculative image or commit buffer.
           (swap! tx-state (fn [ts]
                             (-> ts
-                                (update :tx-buffer into commit-tx-data)
+                                (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                                 (assoc :speculative-db db-after))))
           (or returning-result (empty-result (str "UPDATE " (count eids)))))
         (catch Exception e
@@ -7711,7 +7783,7 @@
                                                  (:tx-buffer ts))
                                            (:tx-buffer ts))]
                               (-> ts
-                                  (assoc :tx-buffer (into buffer commit-tx-data)
+                                  (assoc :tx-buffer (into buffer (guard-catalog-tx commit-tx-data))
                                          :speculative-db (:db-after spec-report))
                                   (update :eid->tempid #(apply dissoc % inserted-eids))))))
           (or returning-result (empty-result (str "DELETE " (count eids)))))
@@ -7797,7 +7869,7 @@
                                    restart-tx)]
           (swap! tx-state (fn [ts]
                             (-> ts
-                                (update :tx-buffer into commit-tx-data)
+                                (update :tx-buffer into (guard-catalog-tx commit-tx-data))
                                 (assoc :speculative-db (:db-after spec-report)))))
           (empty-result "TRUNCATE TABLE"))
         (catch Exception e
@@ -9886,6 +9958,7 @@
                :ns              ns
                :table           table
                :row-marker      (pgs/row-marker-attr table)
+               :catalog-basis   (catalog-basis/capture db-now)
                :rows-committed  0
                :pending-rows    []
                :batch-size      1000
@@ -9907,6 +9980,7 @@
     (when (and (seq rows) (nil? (:error s)))
       (try
         (let [db-now (d/db conn)
+              _ (assert-catalog-current! (:catalog-basis s) db-now)
               available (columns-from-schema (:schema db-now) (:ns s) db-now)
               _ (when (empty? available)
                   ;; A multi-statement simple query can currently reach COPY
@@ -9926,8 +10000,9 @@
                             row defaults))
                          rows)
               rows (sql/resolve-nextvals! rows #(nextval! conn %))
-              tx-data' (-> rows
-                           (apply-column-constraints (:table s) (:ns s) db-now))]
+              tx-data' (binding [*statement-catalog-basis* (:catalog-basis s)]
+                         (-> rows
+                             (apply-column-constraints (:table s) (:ns s) db-now)))]
           (transact-recorded! conn tx-data')
           (swap! copy-state #(-> %
                                  (assoc :pending-rows [])
@@ -10113,9 +10188,14 @@
     ;; Preserve the ordinary parser's schema identity and deferred values for
     ;; sessions with no temp namespace. Rewriting is only needed once a temp
     ;; table exists or for the CREATE that introduces one.
-    (if (or (seq mapping) (:temp? parsed))
-      (physicalize-temp-parse parsed temp-tables session-id db)
-      parsed)))
+    (let [parsed (if (or (seq mapping) (:temp? parsed))
+                   (physicalize-temp-parse parsed temp-tables session-id db)
+                   parsed)]
+      ;; Metadata stamping creates a fresh map even on a parse-LRU hit. Keep
+      ;; the underlying SELECT identity for result-shape reuse; its cache key
+      ;; independently includes the exact current catalog basis.
+      (with-meta (retain-select-shape-plan parsed parsed)
+        (assoc (meta parsed) ::catalog-basis (catalog-basis/capture db))))))
 
 (defonce ^:private fallback-unique-admissions (atom {}))
 
@@ -10179,7 +10259,8 @@
          conn [[:db.fn/call prepare-pg-schema-tx]
                [:db.fn/call (fn [db]
                               (unique-constraints/validate-db! db)
-                              [])]])
+                              [])]]
+         catalog-basis/tracking-options)
         (deliver (:result candidate) {:ok true})
         true
         (catch Throwable e
@@ -10478,6 +10559,10 @@
 
       (planCacheToken [_]
         [@schema-cache-generation
+         (catalog-basis/capture
+          (if (:in-tx? @tx-state)
+            (or (:speculative-db @tx-state) (d/db conn))
+            (apply-temporal (d/db conn) session-state)))
          (select-keys @session-state
                       [:branch :commit-id :as-of :since :history
                        :valid-at :valid-from :valid-to :valid-between
@@ -10506,7 +10591,9 @@
                                     ;; OID 0 instead of the text fallback.
                                     (when (pos? (long o)) [(inc i) o])))
                     (seq param-oids))]
-          (binding [catalog/*registered-databases* registered-databases
+          (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
+                                                      (java.util.IdentityHashMap.))
+                    catalog/*registered-databases* registered-databases
                     params/*session-state* session-state
                     ;; Parameter types declared by the Parse message affect
                     ;; expression resolution and lowering, not merely the
@@ -10833,7 +10920,9 @@
                                   :sql (:sql parsed)
                                   :declared-param-oids (:declared-param-oids parsed))))
                        parsed)]
-          (binding [params/*statement-time* (java.util.Date.)
+          (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
+                                                      (java.util.IdentityHashMap.))
+                    params/*statement-time* (java.util.Date.)
                     params/*scalar-subquery-cache* (atom {})
                     *max-result-rows* max-result-rows]
             (or
@@ -10861,7 +10950,9 @@
         ;; *registered-databases* bound here too so Simple Query (which
         ;; doesn't go through `parse` first) sees the registry when it
         ;; hits pg_database.
-        (binding [catalog/*registered-databases* registered-databases
+        (binding [catalog-basis/*capture-cache* (or catalog-basis/*capture-cache*
+                                                    (java.util.IdentityHashMap.))
+                  catalog/*registered-databases* registered-databases
                   params/*statement-time* (java.util.Date.)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
@@ -10966,6 +11057,7 @@
                             ;; would require a `schema-as-of` upstream in
                             ;; datahike (see TODO).
                             schema (dbi/-schema db)
+                            statement-basis (catalog-basis/capture db)
                       ;; Prepared-statement path: reuse the Parse-time result
                       ;; and resolve ParamRef placeholders against the bound
                       ;; values decoded by the wire layer. Simple Query and
@@ -10974,25 +11066,33 @@
                       ;; (Extended-Query Parse already counted at this.parse).
                             {parsed :parsed templated-bound :bound}
                             (if-let [cached *cached-parsed*]
-                              {:parsed
-                               (if-let [bound *cached-bound*]
-                                 (let [;; A runtime subquery over a CTE or
+                              (let [cached (if (= (::catalog-basis (meta cached)) statement-basis)
+                                             cached
+                                             (binding [params/*declared-param-oids*
+                                                       (:declared-param-oids cached)]
+                                               (assoc (parse-session-sql sql schema db
+                                                                         temp-tables session-id)
+                                                      :declared-param-oids
+                                                      (:declared-param-oids cached))))]
+                                {:parsed
+                                 (if-let [bound *cached-bound*]
+                                   (let [;; A runtime subquery over a CTE or
                                        ;; derived relation needs query-local
                                        ;; enrichment rebuilt from the SAME
                                        ;; effective snapshot selected above
                                        ;; (branch/as-of/cursor/transaction),
                                        ;; not from head at Bind time.
-                                       cached (if (and (:runtime-subqueries? cached)
-                                                       (:enriched-db cached))
-                                                (binding [params/*bound-params* (vec (rest bound))
-                                                          params/*declared-param-oids*
-                                                          (:declared-param-oids cached)]
-                                                  (assoc (parse-session-sql sql schema db
-                                                                            temp-tables session-id)
-                                                         :sql (:sql cached)
-                                                         :declared-param-oids
-                                                         (:declared-param-oids cached)))
-                                                cached)]
+                                         cached (if (and (:runtime-subqueries? cached)
+                                                         (:enriched-db cached))
+                                                  (binding [params/*bound-params* (vec (rest bound))
+                                                            params/*declared-param-oids*
+                                                            (:declared-param-oids cached)]
+                                                    (assoc (parse-session-sql sql schema db
+                                                                              temp-tables session-id)
+                                                           :sql (:sql cached)
+                                                           :declared-param-oids
+                                                           (:declared-param-oids cached)))
+                                                  cached)]
                                    ;; Re-coerce INSERT values after ParamRef
                                    ;; substitution so untyped text params
                                    ;; (e.g. node-postgres "270" → int column)
@@ -11001,11 +11101,11 @@
                                    ;; :pg/type; without it a parameterised
                                    ;; INSERT into a jsonb column skipped
                                    ;; canonicalization.
-                                   (retain-select-shape-plan
-                                    (coerce-insert-tx-data
-                                     (resolve-param-refs cached bound) schema db)
-                                    cached))
-                                 cached)}
+                                     (retain-select-shape-plan
+                                      (coerce-insert-tx-data
+                                       (resolve-param-refs cached bound) schema db)
+                                      cached))
+                                   cached)})
                               ;; Simple-protocol plan stability: rewrite
                               ;; bare number literals to $N so every cache
                               ;; layer (AST, parse result, datalog parse,
@@ -11189,7 +11289,23 @@
                                      (not (:in-tx? @tx-state))
                                      (contains? write-parse-types (:type parsed)))
                             (open-implicit-tx! ctx))
-                          (binding [params/*runtime-db* db]
+                          (binding [params/*runtime-db* db
+                                    *statement-catalog-basis*
+                                    (when (contains? #{:insert :update :update-with-recursive
+                                                       :delete :truncate} (:type parsed))
+                                      (if-let [certificate
+                                               (when (:catalog-dependency-shape parsed)
+                                                 (schema-cached
+                                                  db [::admission-certificate
+                                                      (:catalog-dependency-shape parsed)
+                                                      (:catalog-target-name parsed)
+                                                      (:table parsed) (:ns parsed)]
+                                                  #(catalog-admission/capture
+                                                    db parsed
+                                                    (cached-row-constraint-metadata db (:table parsed)))))]
+                                        (vary-meta statement-basis assoc
+                                                   ::catalog-admission/certificate certificate)
+                                        statement-basis))]
                             (case (:type parsed)
                               :system                (exec-system ctx parsed)
                               :select                (exec-select ctx parsed)
