@@ -51,6 +51,15 @@ with comments for non-obvious causes. The live failure-ID set must equal it:
 new failures, newly passing entries, and entries that did not run all fail the
 job.
 
+Three individual tests are deselected in `run.sh`. `test_connect_params` tests
+Python URL parsing without contacting the server.
+`test_executemany_server_failure_during_writes` depends on which asynchronous
+failure wins a scheduling race. `test_executemany_timeout_flow_control` relies
+on a concurrent `UPDATE` holding a PostgreSQL row lock; without row locking,
+its observed partial-write count depends on machine speed. The neighboring
+`test_executemany_timeout` remains in the exact failure baseline, so timeout
+rollback behavior is still tracked rather than silently waived.
+
 ## Known caveats of this harness
 
 - asyncpg's testbase calls `cluster.get_pg_version()` on startup. When `PGHOST`
