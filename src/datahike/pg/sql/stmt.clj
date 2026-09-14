@@ -8527,6 +8527,51 @@
                (literal-catalog-expression? (first expression) (dec remaining)))
           :else false))))
 
+(defn- target-delete-expression?
+  "Closed target-only predicate vocabulary for DELETE admission. Qualified
+   columns may name only the target or its alias; functions and subqueries
+   deliberately fall back to whole-catalog validation."
+  ([expression target alias]
+   (target-delete-expression? expression target alias 64))
+  ([expression target alias remaining]
+   (and (pos? remaining)
+        (or
+         (nil? expression)
+         (when (instance? Column expression)
+           (let [qualifier (some-> (.getTable ^Column expression) .getName unquote-ident)]
+             (or (str/blank? qualifier) (= target qualifier) (= alias qualifier))))
+         (contains? #{LongValue DoubleValue StringValue NullValue BooleanValue}
+                    (class expression))
+         (and (instance? JdbcParameter expression)
+              ;; Parameter coercion may consult a user-defined type.  The
+              ;; target-only certificate does not observe unrelated type
+              ;; catalog rows, so admit only the same closed builtin scalar
+              ;; set as literal INSERT.  An empty map is fine only when this
+              ;; expression is not a parameter (handled by the branch above).
+              (seq params/*declared-param-oids*)
+              (every? #{16 20 21 23 25 700 701 1042 1043}
+                      (vals params/*declared-param-oids*)))
+         (when (instance? Parenthesis expression)
+           (target-delete-expression? (.getExpression ^Parenthesis expression)
+                                      target alias (dec remaining)))
+         ;; Even a literal CAST can name a domain or enum outside the target
+         ;; relation.  Keep all casts on whole-catalog validation until the
+         ;; certificate explicitly observes their type dependencies.
+         (when (instance? NotExpression expression)
+           (target-delete-expression? (.getExpression ^NotExpression expression)
+                                      target alias (dec remaining)))
+         (when (instance? IsNullExpression expression)
+           (target-delete-expression? (.getLeftExpression ^IsNullExpression expression)
+                                      target alias (dec remaining)))
+         (when (contains? #{AndExpression OrExpression EqualsTo NotEqualsTo
+                            GreaterThan GreaterThanEquals MinorThan MinorThanEquals}
+                          (class expression))
+           (let [binary ^net.sf.jsqlparser.expression.BinaryExpression expression]
+             (and (target-delete-expression? (.getLeftExpression binary)
+                                             target alias (dec remaining))
+                  (target-delete-expression? (.getRightExpression binary)
+                                             target alias (dec remaining)))))))))
+
 (defn translate-insert
   "Translate an INSERT statement to Datahike transaction data.
    Supports single-row and multi-row VALUES, with or without column list.
@@ -9045,7 +9090,6 @@
           (and (not conflict-action) (not returning)
                (empty? ancestor-tables) (empty? sequence-defaults)
                (empty? (.getWithItemsList insert))
-               (not (contains? temp-table-map raw-table))
                (every? literal-catalog-expression? (mapcat identity row-exprs)))
           (assoc :catalog-dependency-shape :literal-insert-v1
                  :catalog-target-name raw-table)
@@ -9070,13 +9114,18 @@
         _ (reject-hidden-target-name! delete raw-table alias-name)
         ns table-name
         where-expr (.getWhere delete)]
-    (cond-> {:type :delete
-             :table table-name
-             :alias alias-name
-             :ns ns
-             :where-expr where-expr}
-      (.getReturningClause delete)
-      (assoc :returning (extract-returning (.getReturningClause delete))))))
+    (let [returning (.getReturningClause delete)]
+      (cond-> {:type :delete
+               :table table-name
+               :alias alias-name
+               :ns ns
+               :where-expr where-expr}
+        (and (not returning)
+             (target-delete-expression? where-expr raw-table alias-name))
+        (assoc :catalog-dependency-shape :target-delete-v1
+               :catalog-target-name raw-table)
+        returning
+        (assoc :returning (extract-returning returning))))))
 
 (declare translate-recursive-cte)
 

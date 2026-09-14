@@ -1116,6 +1116,8 @@
                                   :db/cardinality :db.cardinality/one}
                                  {:db/ident :__seq__/identity-generation :db/valueType :db.type/string
                                   :db/cardinality :db.cardinality/one}
+                                 {:db/ident :__seq__/owned-by-table :db/valueType :db.type/string
+                                  :db/cardinality :db.cardinality/one}
                                  (cond-> {:__seq__/name seq-name
                                           :__seq__/value 0
                                           :__seq__/increment 1
@@ -1124,7 +1126,8 @@
                                           :__seq__/cache 1
                                           :__seq__/cycle false
                                           :__seq__/start 1
-                                          :__seq__/type seq-type}
+                                          :__seq__/type seq-type
+                                          :__seq__/owned-by-table table-name}
                                    (get identity-generations col-name)
                                    (assoc :__seq__/identity-generation
                                           (get identity-generations col-name)))]))
@@ -1315,6 +1318,8 @@
    {:db/ident :__seq__/start :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one}
    {:db/ident :__seq__/type :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :__seq__/owned-by-table :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}])
 
 (defn sequence-entity

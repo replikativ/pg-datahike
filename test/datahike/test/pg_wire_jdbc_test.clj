@@ -39,6 +39,7 @@
 
 (def ^:dynamic *server* nil)
 (def ^:dynamic *port* nil)
+(def ^:dynamic *datahike-conn* nil)
 
 (defn jdbc-fixture [f]
   ;; Each test gets a fresh in-memory DB, a fresh PgWireServer on a
@@ -60,7 +61,8 @@
         (.start server)
         (try
           (binding [*server* server
-                    *port*   (.getPort server)]
+                    *port*   (.getPort server)
+                    *datahike-conn* conn]
             (f))
           (finally
             (.stop server)
@@ -244,6 +246,53 @@
                       rs (.executeQuery st (str "SELECT count(*) FROM " table))]
             (is (.next rs))
             (is (= 7 (.getInt rs 1)))))))))
+
+(deftest test-temp-insert-tolerates-unrelated-session-cleanup
+  (testing "another session dropping its temp catalog does not stale this insert"
+    (let [^Connection c1 (open {:preferQueryMode "simple"})
+          ^Connection c2 (open {:preferQueryMode "simple"})]
+      (try
+        (with-open [st (.createStatement c1)]
+          (.executeUpdate st "CREATE TEMPORARY TABLE cleanup_source (value INTEGER)"))
+        (with-open [st (.createStatement c2)]
+          (.executeUpdate st "CREATE TEMPORARY TABLE cleanup_target (value INTEGER)"))
+        (.setAutoCommit c2 false)
+        (with-open [st (.createStatement c2)]
+          (.executeUpdate st "INSERT INTO cleanup_target (value) VALUES (1)"))
+        (let [before (:max-tx (d/db *datahike-conn*))]
+          (.close c1)
+          (let [deadline (+ (System/currentTimeMillis) 5000)]
+            (loop []
+              (when (and (<= (:max-tx (d/db *datahike-conn*)) before)
+                         (< (System/currentTimeMillis) deadline))
+                (Thread/sleep 10)
+                (recur))))
+          (is (< before (:max-tx (d/db *datahike-conn*)))
+              "the unrelated session cleanup committed before this transaction"))
+        (.commit c2)
+        (with-open [st (.createStatement c2)
+                    rs (.executeQuery st "SELECT count(*) FROM cleanup_target")]
+          (is (.next rs))
+          (is (= 1 (.getInt rs 1))))
+        (finally
+          (when-not (.isClosed c1) (.close c1))
+          (.close c2))))))
+
+(deftest test-serial-created-in-transaction-reserves-locally
+  (with-conn [c {:preferQueryMode "simple"}]
+    (.setAutoCommit c false)
+    (with-open [st (.createStatement c)]
+      (.executeUpdate st "CREATE TEMPORARY TABLE fresh_serial (id SERIAL, value TEXT)")
+      (is (= 2 (.executeUpdate
+                st "INSERT INTO fresh_serial (value) VALUES ('a'), ('b')"))))
+    (.commit c)
+    (with-open [st (.createStatement c)
+                rs (.executeQuery st "SELECT id FROM fresh_serial ORDER BY id")]
+      (is (.next rs))
+      (is (= 1 (.getInt rs 1)))
+      (is (.next rs))
+      (is (= 2 (.getInt rs 1)))
+      (is (not (.next rs))))))
 
 (deftest test-text-parameter-decoder-rejects-invalid-utf8
   (doseq [bytes [(byte-array [97 0 98])

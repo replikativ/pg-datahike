@@ -308,8 +308,12 @@
              (not (or (catalog-basis/matches? expected db)
                       (catalog-admission/valid?
                        (::catalog-admission/certificate (meta expected)) db))))
-    (throw (ex-info "catalog changed while statement was being executed"
-                    {:error :serialization-failure :sqlstate "40001"}))))
+    (let [certificate (::catalog-admission/certificate (meta expected))]
+      (throw (ex-info "catalog changed while statement was being executed"
+                      {:error :serialization-failure :sqlstate "40001"
+                       :catalog-certificate? (boolean certificate)
+                       :catalog-target (:table certificate)
+                       :catalog-dependency-shape (:dependency-shape certificate)})))))
 
 (defn- catalog-guard-op [expected]
   [:db.fn/call
@@ -4266,7 +4270,14 @@
              current-db catalog-objects/pg-type-oid
              catalog-objects/public-namespace-oid table-name)
             name-conflict? (or existing-relation existing-type
-                               (table-exists? current-db table-name))]
+                               (table-exists? current-db table-name))
+            sequence-conflict
+            (when-not name-conflict?
+              (some (fn [column]
+                      (let [sequence-name (str table-name "_" column "_seq")]
+                        (when (sequence-exists? current-db sequence-name)
+                          sequence-name)))
+                    (:identity-cols parsed)))]
         (cond
       ;; CREATE TABLE on an existing table. PG raises 42P07
       ;; duplicate_table; IF NOT EXISTS downgrades it to a notice +
@@ -4274,11 +4285,12 @@
       ;; idempotent, which masked Hibernate/Flyway schema-drift bugs
       ;; (postgres.c: commands/tablecmds.c heap_create_with_catalog).
           (and table-name name-conflict? (not if-not-exists?))
-          (classified-error ""
-                            (ex-info (str "relation \"" table-name "\" already exists")
-                                     {:sqlstate "42P07"
-                                      :table table-name
-                                      :constraint table-name}))
+          [(classified-error ""
+                             (ex-info (str "relation \"" table-name "\" already exists")
+                                      {:sqlstate "42P07"
+                                       :table table-name
+                                       :constraint table-name}))
+           false]
 
       ;; CREATE TABLE IF NOT EXISTS on an already-existing table: PG emits
       ;; a notice and makes no change. Returning success WITHOUT
@@ -4288,12 +4300,27 @@
       ;; [nil int4]"), because the guard compares against the schema view,
       ;; which doesn't surface custom :pg/* attrs.
           (and table-name name-conflict? if-not-exists?)
-          (empty-result "CREATE TABLE")
+          [(empty-result "CREATE TABLE") false]
+
+          ;; The current identity lowering uses PostgreSQL's conventional
+          ;; table_column_seq name directly.  Until it allocates a numbered
+          ;; suffix like PostgreSQL, reject a collision rather than letting
+          ;; Datahike's unique-identity upsert adopt an independent sequence
+          ;; and attach destructive table ownership to it.
+          sequence-conflict
+          [(classified-error ""
+                             (ex-info (str "relation \"" sequence-conflict
+                                           "\" already exists")
+                                      {:sqlstate "42P07"
+                                       :table sequence-conflict
+                                       :constraint sequence-conflict}))
+           false]
 
           (:in-tx? @tx-state)
-          (execute-ddl-in-tx tx-state
-                             (table-create-tx-data current-db parsed)
-                             "CREATE TABLE")
+          [(execute-ddl-in-tx tx-state
+                              (table-create-tx-data current-db parsed)
+                              "CREATE TABLE")
+           true]
 
           :else
           (let [outcome
@@ -4303,11 +4330,11 @@
                   :committed
                   (catch Exception e e))]
             (cond
-              (= :committed outcome) (empty-result "CREATE TABLE")
+              (= :committed outcome) [(empty-result "CREATE TABLE") true]
               (and (catalog-cas-failure? outcome)
                    (< attempt catalog-allocation-max-retries))
               (recur (inc attempt))
-              :else (classified-error "CREATE TABLE error: " outcome))))))))
+              :else [(classified-error "CREATE TABLE error: " outcome) false])))))))
 
 (defn- execute-ddl-create-view [ctx parsed]
   (let [{:keys [conn tx-state session-id]} ctx
@@ -4785,7 +4812,7 @@
       (update parsed :tx-data #(mapv coerce-entry %)))
     parsed))
 
-(declare nextval!)
+(declare nextval! nextval-for-tx! restore-local-sequence-reservations!)
 
 (defn- resolve-nextval-markers
   "Sibling pass to `resolve-param-refs`: walk `parsed`'s tx-data /
@@ -4795,13 +4822,12 @@
    the live conn.
 
    Runs after ParamRef substitution and before per-type dispatch so the
-   markers never reach the transactor. Each call commits independently
-   via the same CAS-retry path `SELECT nextval(...)` uses, matching
-   PG's non-transactional `nextval` semantics: advances stick even if
-   the surrounding tx rolls back, and concurrent advances yield
-   distinct values."
-  [parsed conn]
-  (let [resolver #(nextval! conn %)
+   markers never reach the transactor. Existing sequences reserve through the
+   live CAS-retry path.  A sequence created by the current transaction is not
+   globally addressable yet, so its reservations stay with that sequence
+   generation and are committed atomically with its creation."
+  [parsed conn tx-state]
+  (let [resolver #(nextval-for-tx! conn tx-state %)
         resolve  #(sql/resolve-nextvals! % resolver)]
     (cond-> parsed
       (contains? parsed :in-args)     (update :in-args resolve)
@@ -5241,6 +5267,9 @@
              ;; — the code Odoo/ORMs retry on).
              :begin-max-tx (:max-tx real-db)
              :eid->tempid {} :savepoints []
+             :local-sequence-reservations {}
+             :local-sequence-generations {}
+             :local-sequence-identities #{}
              :temp-tables-before @temp-tables)
       (tag-tx-status (empty-result "BEGIN") tx-state))))
 
@@ -5261,6 +5290,9 @@
            :speculative-db (apply-temporal real-db session-state)
            :begin-max-tx (:max-tx real-db)
            :eid->tempid {} :savepoints []
+           :local-sequence-reservations {}
+           :local-sequence-generations {}
+           :local-sequence-identities #{}
            :temp-tables-before @temp-tables)))
 
 (defn- handle-savepoint
@@ -5276,6 +5308,8 @@
                   :tx-buffer (:tx-buffer @tx-state)
                   :tx-options (:tx-options @tx-state)
                   :eid->tempid (:eid->tempid @tx-state)
+                  :local-sequence-generations (:local-sequence-generations @tx-state)
+                  :local-sequence-identities (:local-sequence-identities @tx-state)
                   :owned-locks (:owned-locks @tx-state)
                   :ddl-version (:ddl-version @tx-state)
                   :temp-tables @temp-tables
@@ -5457,7 +5491,10 @@
                       :tx-options {}
                       :ddl-version 0
                       :owned-locks #{})
-               (dissoc :temp-tables-before)))))
+               (dissoc :temp-tables-before
+                       :local-sequence-reservations
+                       :local-sequence-generations
+                       :local-sequence-identities)))))
 
 (defn- restore-temp-tables!
   "Restore the session temp namespace to its transaction-start snapshot."
@@ -5571,6 +5608,7 @@
       :else
       (let [target (nth sp-stack target-idx)
             {:keys [speculative-db tx-buffer tx-options eid->tempid
+                    local-sequence-generations local-sequence-identities
                     owned-locks begin-max-tx ddl-version]} target
             target-temp-tables (:temp-tables target)
             current-ddl-version (long (or (:ddl-version @tx-state) 0))
@@ -5592,6 +5630,8 @@
                :tx-buffer tx-buffer
                :tx-options (or tx-options {})
                :eid->tempid eid->tempid
+               :local-sequence-generations (or local-sequence-generations {})
+               :local-sequence-identities (or local-sequence-identities #{})
                :owned-locks (or owned-locks #{})
                ;; Restore the conflict watermark alongside the snapshot —
                ;; see handle-savepoint. Snapshots from before this field
@@ -5601,6 +5641,10 @@
                ;; Keep savepoints up to AND INCLUDING the target (the
                ;; target stays active, more recent ones go).
                :savepoints (subvec sp-stack 0 (inc target-idx)))
+        ;; Sequence advances are not subtransactional in PostgreSQL.  Reapply
+        ;; reservations for sequence generations that survive the restored
+        ;; snapshot, and forget generations created after the savepoint.
+        (restore-local-sequence-reservations! tx-state)
         (empty-result "ROLLBACK")))))
 
 (defn- handle-discard-all
@@ -5967,6 +6011,58 @@
    retries even at thousands of qps; 100 is generous."
   100)
 
+(defn- bare-sequence-name [seq-name]
+  (if (and seq-name (str/includes? seq-name "."))
+    (last (str/split seq-name #"\." 2))
+    seq-name))
+
+(defn- sequence-descriptor [db seq-name]
+  (let [bare-name (bare-sequence-name seq-name)
+        eid (when (get (dbi/-schema db) :__seq__/name)
+              (ffirst (d/q '{:find [?e]
+                             :where [[?e :__seq__/name ?n]]
+                             :in [$ ?n]}
+                           db bare-name)))]
+    (when eid
+      (let [attr (fn [a default]
+                   (let [v (ffirst (d/q {:find '[?v]
+                                         :where [['?e a '?v]]
+                                         :in '[$ ?e]}
+                                        db eid))]
+                     (if (some? v) v default)))
+            increment (attr :__seq__/increment 1)]
+        {:eid eid
+         :name bare-name
+         :increment increment
+         :current (attr :__seq__/value 0)
+         :maximum (attr :__seq__/maxvalue (if (pos? increment) Long/MAX_VALUE -1))
+         :minimum (attr :__seq__/minvalue (if (pos? increment) 1 Long/MIN_VALUE))
+         :cycle? (boolean (attr :__seq__/cycle false))}))))
+
+(defn- advance-sequence-value
+  [{:keys [increment maximum minimum cycle?]} seq-name ^long current]
+  (if (pos? increment)
+    (if (if (>= maximum 0)
+          (> current (- maximum increment))
+          (> (+ current increment) maximum))
+      (if cycle?
+        minimum
+        (throw (errors/pg-error
+                :sequence-generator-limit-exceeded
+                {:detail (str "nextval: reached maximum value of sequence \""
+                              seq-name "\" (" maximum ")")})))
+      (+ current increment))
+    (if (if (< minimum 0)
+          (< current (- minimum increment))
+          (< (+ current increment) minimum))
+      (if cycle?
+        maximum
+        (throw (errors/pg-error
+                :sequence-generator-limit-exceeded
+                {:detail (str "nextval: reached minimum value of sequence \""
+                              seq-name "\" (" minimum ")")})))
+      (+ current increment))))
+
 (defn nextval!
   "Atomically advance the named sequence on `conn` and return the new
    long. Shared core of `SELECT nextval(...)` and INSERT-VALUES nextval
@@ -6003,60 +6099,12 @@
    budget is exhausted."
   [conn ^String seq-name]
   (let [q-fn d/q
-        db0 (d/db conn)
-        ;; Schema-qualified name (`public.foo_seq`)? Sequences live in a
-        ;; flat namespace in pg-datahike, so strip the schema prefix —
-        ;; same convention CREATE SEQUENCE uses.
-        bare-name (if (and seq-name (clojure.string/includes? seq-name "."))
-                    (last (clojure.string/split seq-name #"\." 2))
-                    seq-name)
-        eid (ffirst (q-fn '{:find [?e]
-                            :where [[?e :__seq__/name ?n]]
-                            :in [$ ?n]}
-                          db0 bare-name))
-        _ (when-not eid
+        descriptor (sequence-descriptor (d/db conn) seq-name)
+        _ (when-not descriptor
             (throw (ex-info "sequence does not exist"
                             {:error :undefined-sequence
                              :sequence seq-name})))
-        incr (or (ffirst (q-fn '{:find [?i]
-                                 :where [[?e :__seq__/increment ?i]]
-                                 :in [$ ?e]}
-                               db0 eid))
-                 1)
-        ;; Bounds and CYCLE. Absent on sequences created before these
-        ;; attributes existed (and on the IDENTITY-column path), so fall
-        ;; back to the type-max/min an unqualified CREATE SEQUENCE gives.
-        seq-attr (fn [attr default]
-                   (let [v (ffirst (q-fn {:find '[?v]
-                                          :where [['?e attr '?v]]
-                                          :in '[$ ?e]}
-                                         db0 eid))]
-                     (if (some? v) v default)))
-        maxv (seq-attr :__seq__/maxvalue (if (pos? incr) Long/MAX_VALUE -1))
-        minv (seq-attr :__seq__/minvalue (if (pos? incr) 1 Long/MIN_VALUE))
-        cycle? (boolean (seq-attr :__seq__/cycle false))
-        ;; PG's wraparound test asks whether the NEXT value would pass the
-        ;; bound, and is written to avoid signed overflow (sequence.c:732).
-        ;; Exhausted without CYCLE is 2200H; with CYCLE the counter wraps
-        ;; to MINVALUE going up / MAXVALUE going down — not to START.
-        advance (fn [^long curr]
-                  (if (pos? incr)
-                    (if (if (>= maxv 0) (> curr (- maxv incr)) (> (+ curr incr) maxv))
-                      (if cycle?
-                        minv
-                        (throw (errors/pg-error
-                                :sequence-generator-limit-exceeded
-                                {:detail (str "nextval: reached maximum value of sequence \""
-                                              seq-name "\" (" maxv ")")})))
-                      (+ curr incr))
-                    (if (if (< minv 0) (< curr (- minv incr)) (< (+ curr incr) minv))
-                      (if cycle?
-                        maxv
-                        (throw (errors/pg-error
-                                :sequence-generator-limit-exceeded
-                                {:detail (str "nextval: reached minimum value of sequence \""
-                                              seq-name "\" (" minv ")")})))
-                      (+ curr incr))))
+        eid (:eid descriptor)
         read-curr (fn []
                     (ffirst (q-fn '{:find [?v]
                                     :where [[?e :__seq__/value ?v]]
@@ -6077,7 +6125,7 @@
     ;; (commit-wait-time) between batches before flushing.
     (loop [attempt 0]
       (let [curr (or (read-curr) 0)
-            next (advance curr)
+            next (advance-sequence-value descriptor seq-name curr)
             cas-ok?
             (try (transact-recorded! conn [[:db/cas eid :__seq__/value curr next]])
                  true
@@ -6095,11 +6143,114 @@
           (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
               (recur (inc attempt))))))))
 
+(defn- restore-local-sequence-reservations!
+  "Overlay non-subtransactional reservations on a savepoint-restored
+   speculative DB.  The key includes the speculative entity id so dropping
+   and recreating the same sequence name cannot transfer reservations between
+   generations."
+  [tx-state]
+  (locking tx-state
+    (let [{:keys [speculative-db tx-buffer local-sequence-reservations
+                  local-sequence-generations savepoints] :as state} @tx-state
+          snapshots (cons state savepoints)
+          reachable? (fn [[name eid storage-generation]]
+                       (boolean
+                        (some (fn [{db :speculative-db
+                                    generations :local-sequence-generations}]
+                                (let [descriptor (sequence-descriptor db name)]
+                                  (and (= eid (:eid descriptor))
+                                       (= storage-generation
+                                          (get generations [name eid] 0)))))
+                              snapshots)))
+          [db buffer retained]
+          (reduce-kv
+           (fn [[db buffer retained] [name eid storage-generation :as generation] value]
+             (let [descriptor (sequence-descriptor db name)
+                   current-generation (get local-sequence-generations [name eid] 0)
+                   current? (and (= eid (:eid descriptor))
+                                 (= storage-generation current-generation))
+                   retained (if (reachable? generation)
+                              (assoc retained generation value)
+                              retained)]
+               (if (and current? (not= value (:current descriptor)))
+                 (let [op [:db/add [:__seq__/name name] :__seq__/value value]
+                       report (dc/with db [op])]
+                   [(:db-after report) (conj buffer op) retained])
+                 [db buffer retained])))
+           [speculative-db tx-buffer {}]
+           (or local-sequence-reservations {}))]
+      (swap! tx-state assoc
+             :speculative-db db
+             :tx-buffer buffer
+             :local-sequence-reservations retained))))
+
+(defn- bump-local-sequence-generation!
+  "Mark a transactional sequence-storage rewrite.  Reservations handed out
+   after the rewrite belong to that new generation and must disappear if a
+   savepoint rollback restores the old sequence storage."
+  [tx-state seq-name]
+  (when-let [{:keys [name eid]} (sequence-descriptor (:speculative-db @tx-state)
+                                                     seq-name)]
+    (swap! tx-state update-in [:local-sequence-generations [name eid]] (fnil inc 0))))
+
+(defn- register-local-sequence!
+  "Mark sequence storage created by the current transaction.  This remains
+   necessary when DROP + CREATE reuses Datahike's unique-identity entity id:
+   the same SQL name/eid can still denote replacement storage that must not
+   reserve from the old committed sequence."
+  [tx-state seq-name]
+  (when-let [{:keys [name eid]} (sequence-descriptor (:speculative-db @tx-state)
+                                                     seq-name)]
+    (swap! tx-state
+           (fn [state]
+             (-> state
+                 (update :local-sequence-identities (fnil conj #{}) [name eid])
+                 (update-in [:local-sequence-generations [name eid]] (fnil inc 0)))))))
+
+(defn- nextval-for-tx!
+  "Reserve from a committed sequence independently, or from a sequence newly
+   created in this transaction's speculative database. The latter update is
+   buffered with the creating transaction because no globally visible sequence
+   exists yet. Full rollback removes that new generation; rollback to a
+  savepoint preserves reservations when the generation itself survives."
+  [conn tx-state seq-name]
+  (let [state @tx-state
+        speculative-descriptor (when (:in-tx? state)
+                                 (sequence-descriptor (:speculative-db state) seq-name))
+        identity (when speculative-descriptor
+                   [(:name speculative-descriptor) (:eid speculative-descriptor)])
+        local? (contains? (:local-sequence-identities state #{}) identity)]
+    (if (and (sequence-descriptor (d/db conn) seq-name) (not local?))
+      (nextval! conn seq-name)
+      (locking tx-state
+        (let [state @tx-state
+              db (:speculative-db state)
+              descriptor (when (:in-tx? state) (sequence-descriptor db seq-name))]
+          (when-not descriptor
+            (throw (ex-info "sequence does not exist"
+                            {:error :undefined-sequence :sequence seq-name})))
+          (let [identity [(:name descriptor) (:eid descriptor)]
+                storage-generation (get-in state [:local-sequence-generations identity] 0)
+                generation (conj identity storage-generation)
+              ;; The speculative DB is normally authoritative.  Reservations
+              ;; are overlaid into it when a savepoint is restored; consulting
+              ;; the side journal directly here would ignore a later SETVAL or
+              ;; transactional ALTER SEQUENCE RESTART.
+                next (advance-sequence-value descriptor seq-name (:current descriptor))
+                op [:db/add [:__seq__/name (:name descriptor)] :__seq__/value next]
+                report (dc/with db [op])]
+            (swap! tx-state (fn [current]
+                              (-> current
+                                  (assoc :speculative-db (:db-after report))
+                                  (update :tx-buffer conj op)
+                                  (assoc-in [:local-sequence-reservations generation] next))))
+            next))))))
+
 (defn- handle-nextval
   "SELECT nextval('seq_name') — wire wrapper around `nextval!`."
-  [{:keys [conn session-state]} parsed]
+  [{:keys [conn tx-state session-state]} parsed]
   (try
-    (let [v (nextval! conn (:seq-name parsed))]
+    (let [v (nextval-for-tx! conn tx-state (:seq-name parsed))]
       ;; Remember which sequence this session last advanced so lastval()
       ;; can answer. PG scopes lastval to the session for exactly this
       ;; reason — it is the "what id did my INSERT just get" idiom, and
@@ -6208,6 +6359,11 @@
                                  :in [$ ?n]}
                                lookup-db seq-name))
           seq-ent (when seq-eid (d/pull lookup-db '[*] seq-eid))
+          committed-descriptor (sequence-descriptor (d/db conn) seq-name)
+          sequence-identity [seq-name seq-eid]
+          committed-generation? (and (= seq-eid (:eid committed-descriptor))
+                                     (not (contains? (:local-sequence-identities @tx-state #{})
+                                                     sequence-identity)))
           increment (get seq-ent :__seq__/increment 1)
           minv (get seq-ent :__seq__/minvalue Long/MIN_VALUE)
           maxv (get seq-ent :__seq__/maxvalue Long/MAX_VALUE)]
@@ -6224,11 +6380,24 @@
           (when (and session-state is-called?)
             (swap! session-state update :seq-called (fnil conj #{}) seq-name))
           (if (:in-tx? @tx-state)
-            (let [spec-report (dc/with (:speculative-db @tx-state) setval-tx)]
+            (let [spec-report (dc/with (:speculative-db @tx-state) setval-tx)
+                  generation-id sequence-identity
+                  storage-generation (get-in @tx-state
+                                             [:local-sequence-generations generation-id]
+                                             0)]
               (swap! tx-state (fn [st]
-                                (-> st
-                                    (assoc :speculative-db (:db-after spec-report))
-                                    (update :tx-buffer into setval-tx)))))
+                                (cond-> (-> st
+                                            (assoc :speculative-db (:db-after spec-report))
+                                            (update :tx-buffer into setval-tx))
+                                  ;; Only transaction-local storage uses this
+                                  ;; journal.  Existing committed sequences
+                                  ;; retain their pre-existing SETVAL path in
+                                  ;; this PR; choosing a live lane by name alone
+                                  ;; is unsound after ALTER or drop/recreate.
+                                  (not committed-generation?)
+                                  (assoc-in [:local-sequence-reservations
+                                             (conj generation-id storage-generation)]
+                                            stored)))))
             (transact-recorded! conn setval-tx))
           (single-row-result "setval" PgWireServer/OID_INT8 (str new-val)))
         (error-result (str "Sequence not found: " seq-name))))
@@ -7893,7 +8062,7 @@
   [ctx parsed]
   (let [{:keys [conn tx-state temp-tables session-id]} ctx
         logical (:temp-logical-name parsed)
-        ^PgWireServer$QueryResult result
+        [^PgWireServer$QueryResult result created?]
         (execute-ddl-create conn parsed tx-state session-id)]
     ;; Record CREATE TEMP/TEMPORARY TABLE so the connection-close hook can
     ;; drop it (PG temp tables live for the session, not forever). Only
@@ -7901,6 +8070,10 @@
     ;; schedule a spurious drop.
     (when (and temp-tables (:new-temp-mapping? parsed) (nil? (.-error result)))
       (swap! temp-tables assoc logical (:table-name parsed)))
+    (when (and (:in-tx? @tx-state) created? (nil? (.-error result)))
+      (doseq [column (:identity-cols parsed)]
+        (register-local-sequence! tx-state
+                                  (str (:table-name parsed) "_" column "_seq"))))
     result))
 
 (defn- sequence-current-params
@@ -7970,7 +8143,10 @@
                         (conj [:db/add eid :__seq__/value
                                (- (:restart params) (:increment params))]))]
           (if (:in-tx? @tx-state)
-            (execute-ddl-in-tx tx-state tx-data "ALTER SEQUENCE")
+            (let [result (execute-ddl-in-tx tx-state tx-data "ALTER SEQUENCE")]
+              (when (nil? (.error ^PgWireServer$QueryResult result))
+                (bump-local-sequence-generation! tx-state seq-name))
+              result)
             (do (transact-recorded! conn tx-data)
                 (empty-result "ALTER SEQUENCE"))))
         (catch Exception e
@@ -8023,7 +8199,10 @@
                          :oid oid :kind :sequence :name seq-name
                          :namespace-oid catalog-objects/public-namespace-oid})))]
             (if (:in-tx? @tx-state)
-              (execute-ddl-in-tx tx-state create-data "CREATE SEQUENCE")
+              (let [result (execute-ddl-in-tx tx-state create-data "CREATE SEQUENCE")]
+                (when (nil? (.error ^PgWireServer$QueryResult result))
+                  (register-local-sequence! tx-state seq-name))
+                result)
               (let [outcome (try (transact-recorded! conn create-data)
                                  :committed
                                  (catch Exception e e))]
@@ -9532,8 +9711,8 @@
         (classified-error "ALTER TABLE error: " e)))))
 
 (defn- drop-table-tx-data
-  "Build the retractions for every row, schema attribute, and secondary-index
-   declaration belonging to `table` in `db`."
+  "Build the retractions for every row, schema attribute, owned sequence, and
+   secondary-index declaration belonging to `table` in `db`."
   [db table]
   (let [db-schema (dbi/-schema db)
         ;; All schema attributes in this table's namespace.
@@ -9563,6 +9742,18 @@
                                                            db))]
                                  (when attr-eid [:db/retractEntity attr-eid])))
                              table-attrs)
+        ;; SERIAL/IDENTITY creates an owned sequence in PostgreSQL; dropping
+        ;; the table drops that sequence too.  Leaving it behind made a later
+        ;; CREATE TABLE with the same SERIAL column resume the old counter.
+        owned-sequence-eids
+        (when (get db-schema :__seq__/owned-by-table)
+          (map first
+               (d/q '{:find [?sequence]
+                      :in [$ ?table]
+                      :where [[?sequence :__seq__/owned-by-table ?table]]}
+                    db table)))
+        sequence-tx-data (mapv (fn [eid] [:db/retractEntity eid])
+                               owned-sequence-eids)
         ;; Physical PostgreSQL indexes are schema dependents of their table.
         ;; Retract declarations in the SAME root transaction so no committed
         ;; database value can retain an index whose covered attributes have
@@ -9628,6 +9819,7 @@
                           (concat (map #(vector :db/retractEntity %)
                                        inheritance-eids)
                                   (filter some? schema-tx-data)
+                                  sequence-tx-data
                                   secondary-tx-data
                                   index-object-tx-data
                                   object-tx-data))]
@@ -10084,6 +10276,7 @@
        (or (= k :ns)
            (= k :inherits)
            (= k :seq-name)
+           (= k :catalog-target-name)
            (str/includes? (name k) "table"))))
 
 (defn- physicalize-temp-parse
@@ -11216,7 +11409,7 @@
                             ;; postwalk-rebuilds tx-data, which clones the
                             ;; marker into two distinct objects — running it
                             ;; first would defeat the dedup and double-bump.
-                            parsed (resolve-nextval-markers parsed conn)
+                            parsed (resolve-nextval-markers parsed conn tx-state)
                             ;; Give a reused INSERT a fresh tempid per
                             ;; execution. parse-sql is LRU-cached and
                             ;; prepared statements are reused, so the cached

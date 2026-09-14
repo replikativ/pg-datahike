@@ -3,9 +3,14 @@
             [datahike.core :as dc]
             [datahike.pg.catalog.admission :as admission]
             [datahike.pg.constraints.row :as row]
-            [datahike.pg.schema :as pgs]))
+            [datahike.pg.schema :as pgs]
+            [datahike.pg.sql :as sql]
+            [datahike.pg.sql.params :as params]
+            [datahike.db.interface :as dbi]))
 
 (def parsed {:type :insert :table "target" :catalog-dependency-shape :literal-insert-v1})
+(def delete-parsed {:type :delete :table "target"
+                    :catalog-dependency-shape :target-delete-v1})
 
 (defn- transact [db data] (:db-after (dc/with db data)))
 
@@ -20,6 +25,7 @@
     (attribute :pg/not-null :db.type/boolean)
     (attribute :pg/type :db.type/string)
     (attribute :pg/table-oid :db.type/long)
+    (attribute :pg/fk-parent-table :db.type/string)
     (attribute :datahike.pg/for-ident :db.type/keyword)
     (attribute :datahike.pg/column :db.type/string)
     (attribute :datahike.pg/internal-index :db.type/boolean)
@@ -54,6 +60,39 @@
           row (transact other [{:other/value 9 :other/db-row-exists true}])]
       (is (true? (admission/valid? certificate other)))
       (is (true? (admission/valid? certificate row))))))
+
+(deftest target-only-delete-observes-its-own-dependencies
+  (let [db (fixture)
+        certificate (admission/capture db delete-parsed)]
+    (is (some? certificate))
+    (is (true? (admission/valid?
+                certificate
+                (transact db [(attribute :unrelated/value :db.type/long)]))))
+    (is (false? (admission/valid?
+                 certificate
+                 (transact db [[:db/add [:db/ident :target/value]
+                                :pg/not-null true]]))))
+    (is (false? (admission/valid?
+                 certificate
+                 (transact db [{:pg/fk-parent-table "target"}]))))))
+
+(deftest delete-admission-is-selected-conservatively-by-the-parser
+  (let [db (fixture)
+        parse (fn [text]
+                (sql/parse-sql text (dbi/-schema db) db))]
+    (is (= :target-delete-v1
+           (:catalog-dependency-shape (parse "DELETE FROM target WHERE value = 1"))))
+    (is (nil? (:catalog-dependency-shape
+               (parse "DELETE FROM target WHERE CAST(value AS bigint) = 1")))
+        "casts retain whole-catalog validation because their type can be user-defined")
+    (is (= :target-delete-v1
+           (:catalog-dependency-shape
+            (binding [params/*declared-param-oids* {1 23}]
+              (parse "DELETE FROM target WHERE value = ?")))))
+    (is (nil? (:catalog-dependency-shape
+               (binding [params/*declared-param-oids* {1 900001}]
+                 (parse "DELETE FROM target WHERE value = ?"))))
+        "custom parameter types retain whole-catalog validation")))
 
 (deftest target-column-schema-and-hints-remain-dependencies
   (let [db (fixture) certificate (admission/capture db parsed)]
