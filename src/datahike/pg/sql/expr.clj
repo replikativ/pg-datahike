@@ -47,6 +47,7 @@
             [clojure.string :as str]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
+            [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.jsonb :as jb]
@@ -683,7 +684,13 @@
             definitions (if-let [db (:db ctx)]
                           (into {}
                                 (map (fn [[name definition]]
-                                       [(long (Math/abs (.hashCode ^String name)))
+                                       [(long
+                                         (or (:datahike.pg.object/oid
+                                              (catalog-objects/object-by-identity
+                                               db catalog-objects/pg-class-oid
+                                               catalog-objects/public-namespace-oid
+                                               name))
+                                             (Math/abs (.hashCode ^String name))))
                                         definition]))
                                 (d/q '{:find [?name ?definition]
                                        :where [[?e :datahike.pg/view-name ?name]
@@ -4372,13 +4379,21 @@
                        (when alias
                          (let [qualified (Column. (Table. ^String (name alias))
                                                   ^String col-name)]
-                           (when (= resolved
-                                    (ctx/resolve-column qualified
-                                                        (:table-aliases ctx)
-                                                        (:default-table ctx)
-                                                        (:col-overrides ctx)
-                                                        (:derived-aliases ctx)
-                                                        (:ci-index ctx)))
+                           ;; This is an ownership probe across FROM items.
+                           ;; A different relation may legitimately lack the
+                           ;; column even though another one owns it.
+                           (when (try
+                                   (= resolved
+                                      (ctx/resolve-column qualified
+                                                          (:table-aliases ctx)
+                                                          (:default-table ctx)
+                                                          (:col-overrides ctx)
+                                                          (:derived-aliases ctx)
+                                                          (:ci-index ctx)))
+                                   (catch clojure.lang.ExceptionInfo e
+                                     (if (= :undefined-column (:error (ex-data e)))
+                                       false
+                                       (throw e))))
                              alias))))
                      aliases)
         owner (or (when (some #{(:default-table ctx)} owners)

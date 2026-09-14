@@ -61,14 +61,20 @@ MODULES=(
 )
 
 # These are deliberately below module granularity because the rest of each
-# module is valuable. Neither is a stable server-compatibility signal:
+# module is valuable. None is a stable server-compatibility signal:
 # - connect_params tests Python's stdlib URL parser and differs across the
 #   supported Python 3.11/3.12 runtimes without contacting pg-datahike.
 # - server_failure_during_writes asserts that an asynchronous error beats an
 #   arbitrary batch position; CPU/JVM scheduling decides whether it does.
+# - timeout_flow_control relies on a concurrent UPDATE holding a PostgreSQL
+#   row lock. Datahike has no row-lock analogue, so whether the client timeout
+#   lands before the first update is a machine-speed race rather than a stable
+#   compatibility signal. The ordinary executemany timeout case remains in
+#   the exact expected-failure baseline.
 DESELECTS=(
   "--deselect=tests/test_connect.py::TestConnectParams::test_connect_params"
   "--deselect=tests/test_execute.py::TestExecuteMany::test_executemany_server_failure_during_writes"
+  "--deselect=tests/test_execute.py::TestExecuteMany::test_executemany_timeout_flow_control"
 )
 
 cd "${CLONE_DIR}"

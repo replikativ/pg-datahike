@@ -14,6 +14,7 @@
    templatable) statement must keep its untemplated behavior."
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.server :as pg]
             [datahike.pg.sql.template :as template])
   (:import [datahike.pg PgWireServer$QueryHandler]))
@@ -165,6 +166,27 @@
                                            (object-array [nil (long 2)])))))
             (is (= 1 @calls) "only the row query should reach Datahike")))
         (finally (release! h))))))
+
+(deftest catalog-stamping-preserves-canonical-select-shape-identity
+  (let [h (fresh-handler)]
+    (try
+      (seed-accounts! h)
+      (let [db (d/db (:conn h))
+            parse #(#'pg/parse-session-sql "SELECT bal FROM t WHERE id = $1"
+                                           (dbi/-schema db) db (atom {}) "shape-test")
+            first-plan (parse)
+            second-plan (parse)
+            first-shape (::pg/select-shape-plan first-plan)
+            second-shape (::pg/select-shape-plan second-plan)
+            resolved (#'pg/retain-select-shape-plan (assoc second-plan :bound-example 2)
+                                                    second-plan)]
+        (is (not (identical? first-plan second-plan)) "Each caller gets its own metadata wrapper")
+        (is (some? first-shape))
+        (is (identical? first-shape second-shape) "Both wrappers retain the parse-LRU shape")
+        (is (identical? first-shape (::pg/select-shape-plan resolved)))
+        (is (= (::pg/catalog-basis (meta first-plan))
+               (::pg/catalog-basis (meta second-plan)))))
+      (finally (release! h)))))
 
 (deftest blacklisted-statements-keep-untemplated-behavior
   (testing "HAVING / BETWEEN / IN statements bypass the templater and still work"

@@ -103,3 +103,14 @@
     ;; not an access control mechanism. Document this contract.
     (is (= [["private"]]
            (rows c "SELECT internal_note FROM widget WHERE sku = 'A'")))))
+
+(deftest hidden-hint-does-not-resurrect-dropped-registered-column
+  (with-open [c (jdbc)]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE managed_hint (id int, note text)")
+      (.execute st "INSERT INTO managed_hint VALUES (1,'private')")
+      (.execute st "ALTER TABLE managed_hint DROP COLUMN note"))
+    (pgs/set-hint! *conn* :managed_hint/note {:hidden true})
+    (let [raised (try (rows c "SELECT note FROM managed_hint") nil
+                      (catch java.sql.SQLException e e))]
+      (is (= "42703" (some-> raised .getSQLState))))))

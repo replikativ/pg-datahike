@@ -9,6 +9,7 @@
    Every virtual table gets an implicit 'db_id' column (the entity ID)."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.db.interface :as dbi]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.types :as types]))
 
@@ -59,7 +60,10 @@
                   (or built-in?
                       (registered? :datahike.pg.enum/name)
                       (registered? :datahike.pg.domain/name)
-                      (registered? :datahike.pg.composite/name))))))
+                      (registered? :datahike.pg.composite/name)
+                      (some? (catalog-objects/object-by-identity
+                              db catalog-objects/pg-type-oid
+                              catalog-objects/public-namespace-oid base)))))))
 
 ;; ============================================================================
 ;; Internal namespace filter
@@ -129,6 +133,10 @@
     :db/valueType :db.type/boolean
     :db/cardinality :db.cardinality/one
     :db/doc "When true, the target attribute is excluded from virtual table derivation (pg_tables, information_schema.columns, SELECT *)."}
+   {:db/ident :datahike.pg/internal-index
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/doc "The target's :db/index is an internal access path, not an independently visible SQL index."}
    {:db/ident :datahike.pg/references
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one
@@ -553,12 +561,15 @@
                       (let [p (pull-fn db
                                        '[:datahike.pg/column
                                          :datahike.pg/hidden
+                                         :datahike.pg/internal-index
                                          :datahike.pg/references
                                          :datahike.pg/table]
                                        e)
                             h (cond-> {}
                                 (:datahike.pg/column p)     (assoc :column (:datahike.pg/column p))
                                 (:datahike.pg/hidden p)     (assoc :hidden true)
+                                (:datahike.pg/internal-index p)
+                                (assoc :internal-index? true)
                                 (:datahike.pg/references p) (assoc :references (:datahike.pg/references p))
                                 (:datahike.pg/table p)      (assoc :table (:datahike.pg/table p)))]
                         (when (seq h) [for-ident h]))))
@@ -603,7 +614,8 @@
                      (update acc ident assoc :pg-type pt))
                    ident-hints
                    pg-types)
-           ::column-order column-order)))
+           ::column-order column-order
+           ::catalog-db db)))
 
 (defn schema-hints
   "Return `{attr-ident → {:column str? :hidden bool? :references kw? :table str?}}`
@@ -713,6 +725,7 @@
    "real" "float4" "float4" "float4"
    "double precision" "float8" "float8" "float8" "double" "float8" "float" "float8"
    "numeric" "numeric" "decimal" "numeric"
+   "bit" "bit" "varbit" "varbit" "bit varying" "varbit"
    "uuid" "uuid" "date" "date" "time" "time"
    "timestamp" "timestamp" "timestamptz" "timestamptz"
    "json" "json" "jsonb" "jsonb" "bytea" "bytea" "oid" "oid"})
@@ -730,6 +743,45 @@
     (if arr?
       (get types/element-oid->array-oid oid types/oid-text-array)
       oid)))
+
+(defn user-type-object
+  "Resolve a scalar declared SQL type to its persistent pg_type object."
+  [db pg-type]
+  (let [declared (-> pg-type str str/trim)
+        without-modifier (str/replace declared #"\s*\([^)]*\)" "")
+        array? (str/ends-with? without-modifier "[]")
+        scalar (if array?
+                 (subs without-modifier 0 (- (count without-modifier) 2))
+                 without-modifier)
+        unqualified (last (str/split scalar #"\." 2))
+        normalized (types/normalize-sql-type-name unqualified)
+        canonical (get sql-type->pg-name normalized normalized)]
+    (when (and db (not array?))
+      (catalog-objects/object-by-identity
+       db catalog-objects/pg-type-oid
+       catalog-objects/public-namespace-oid canonical))))
+
+(defn resolve-type-oid
+  "Resolve a declared SQL type against the persistent pg_type registry, then
+   fall back to PostgreSQL's built-in type table. User-defined array types are
+   intentionally not invented until their codecs and catalog objects exist."
+  ([db pg-type] (resolve-type-oid db pg-type nil))
+  ([db pg-type planned-user-types]
+   (let [declared (some-> pg-type str str/trim)
+         without-modifier (some-> declared
+                                  (str/replace #"\s*\([^)]*\)" ""))
+         array? (some-> without-modifier (str/ends-with? "[]"))
+         scalar (when without-modifier
+                  (if array?
+                    (subs without-modifier 0 (- (count without-modifier) 2))
+                    without-modifier))
+         unqualified (some-> scalar (str/split #"\." 2) last)
+         normalized (some-> unqualified types/normalize-sql-type-name)
+         canonical (get sql-type->pg-name normalized normalized)]
+     (or (when-not array? (get planned-user-types canonical))
+         (:datahike.pg.object/oid (user-type-object db pg-type))
+         (when pg-type (field-type->oid pg-type))
+         types/oid-text))))
 
 (defn composite-types
   "Read the user composite-type registry from `db`. Returns a vector of
@@ -756,7 +808,7 @@
                                        (let [[fname ftype] (clojure.string/split line #"\t" 2)]
                                          {:field-name fname
                                           :pg-type ftype
-                                          :oid (field-type->oid ftype)}))))})))))
+                                          :oid (resolve-type-oid db ftype)}))))})))))
 
 (declare derive-virtual-tables)
 
@@ -777,10 +829,17 @@
    ;; (tableOid, attnum), so the two disagreeing sent an UPDATE's value
    ;; to the wrong column: `invalid input syntax for numeric:
    ;; "2014-12-23"` in ResultSetTest.testUpdateWithPGobject.
-   (let [cols (get-in (derive-virtual-tables schema hints) [table-name :columns])]
-     (when (seq cols)
-       (some (fn [[i c]] (when (= col-name (:name c)) (inc i)))
-             (map-indexed vector cols))))))
+   (let [db (::catalog-db hints)
+         relation-oid (when db (table-oid db table-name))
+         column (when relation-oid
+                  (catalog-objects/column-by-name db relation-oid col-name))]
+     (or (:datahike.pg.column/attnum column)
+         (let [cols (get-in (derive-virtual-tables schema hints)
+                            [table-name :columns])]
+           (when (seq cols)
+             (some (fn [[i c]]
+                     (when (= col-name (:name c)) (long (inc i))))
+                   (map-indexed vector cols))))))))
 
 (defn- internal-attr?
   "Return true if an attribute ident belongs to the internal Datahike schema
@@ -836,6 +895,7 @@
                                         :unique      (:db/unique props)
                                         :ref?        (= vtype :db.type/ref)
                                         :references  (:references h)
+                                        :internal-index? (:internal-index? h)
                                         :indexed?    (or (:db/index props) (some? (:db/unique props)))}]
                                (-> tables
                                    (update-in [table-name :columns] (fnil conj []) col)
@@ -861,8 +921,11 @@
                (assoc acc tname
                       (update t :columns
                               (fn [cols]
-                                (vec (sort-by (fn [c] (get order (name (:attr c)) n))
-                                              cols)))))))
+                                (vec
+                                 (sort-by
+                                  (fn [c]
+                                    (get order (name (:attr c)) n))
+                                  cols)))))))
            {} tables-from-attrs))
          ;; Also surface tables that exist in the schema but have NO own
          ;; user columns — typically INHERITS children whose columns all
@@ -952,12 +1015,46 @@
                         (char (+ (int c) 32)) c))))
       (.toString sb))))
 
+(defn- registered-column-index [hints]
+  (when-let [db (::catalog-db hints)]
+    (let [schema (dbi/-schema db)
+          hidden-by-table (group-by (comp namespace key)
+                                    (filter (comp :hidden val)
+                                            (dissoc hints ::catalog-db)))]
+      (into {}
+            (for [relation (mapcat #(catalog-objects/objects-by-kind db %)
+                                   [:table :view])
+                  :let [table-name (:datahike.pg.object/name relation)
+                        relation-oid (:datahike.pg.object/oid relation)
+                        columns (catalog-objects/columns-by-relation db relation-oid)
+                        known-storage (into #{} (map :datahike.pg.column/storage-ident) columns)
+                      ;; Hidden native attributes were deliberately omitted
+                      ;; from the migrated visible column registry. Hiding is
+                      ;; a projection hint, not an access-control boundary:
+                      ;; explicit references still work. Never resurrect a
+                      ;; registered (possibly dropped or renamed) column via
+                      ;; its retained storage attribute.
+                        hidden-native (into {}
+                                            (keep (fn [[attr hint]]
+                                                    (when (and (:hidden hint)
+                                                               (= table-name (namespace attr))
+                                                               (get schema attr)
+                                                               (not (contains? known-storage attr)))
+                                                      [(fold-name (name attr)) attr])))
+                                            (get hidden-by-table table-name))]]
+              [table-name
+               (into hidden-native
+                     (map (fn [column]
+                            [(fold-name (:datahike.pg.column/name column))
+                             (:datahike.pg.column/storage-ident column)]))
+                     (remove :datahike.pg.column/dropped? columns))])))))
+
 (defn- ci-index*
-  [tables]
+  [tables registered]
   {:tables  (reduce (fn [m tname]
                       (let [k (fold-name tname)]
                         (if (contains? m k) (assoc m k ambiguous) (assoc m k tname))))
-                    {} (keys tables))
+                    {} (into #{} (concat (keys tables) (keys registered))))
    :columns (reduce-kv (fn [m tname {:keys [attrs]}]
                          (assoc m tname
                                 (reduce-kv (fn [cm cname attr]
@@ -966,7 +1063,13 @@
                                                  (assoc cm k ambiguous)
                                                  (assoc cm k attr))))
                                            {} attrs)))
-                       {} tables)})
+                       {} tables)
+   ;; CREATE/ALTER-managed relations use the durable column registry as the
+   ;; parse-analysis authority. It includes inherited columns and maps a
+   ;; logical name to its possibly renamed physical storage ident. In
+   ;; particular, a retained schema attr whose registry row was tombstoned is
+   ;; not a SQL column merely because its storage still exists.
+   :registered-columns registered})
 
 (defn ci-index
   "A case-folding index over the schema:
@@ -990,7 +1093,9 @@
    already has `:datahike.pg/column` renames applied, so hint-renamed
    columns get covered for free."
   ([schema] (ci-index schema nil))
-  ([schema hints] (ci-index* (derive-virtual-tables schema hints))))
+  ([schema hints]
+   (ci-index* (derive-virtual-tables schema hints)
+              (or (registered-column-index hints) {}))))
 
 (defn canonical-table
   "The stored name for `tname`, or `tname` when nothing else claims it.
@@ -1003,7 +1108,14 @@
    the table has no such column (the caller then falls back to
    `(keyword tname cname)`, preserving NULL-for-unknown-column)."
   [ci tname cname]
-  (get-in ci [:columns tname (fold-name cname)]))
+  (if (contains? (:registered-columns ci) tname)
+    (get-in ci [:registered-columns tname (fold-name cname)])
+    (get-in ci [:columns tname (fold-name cname)])))
+
+(defn registered-relation?
+  "True when `tname` has a durable CREATE/ALTER-managed column registry."
+  [ci tname]
+  (contains? (:registered-columns ci) tname))
 
 (defn ambiguous? [x] (= ambiguous x))
 
@@ -1030,7 +1142,10 @@
          tables (derive-virtual-tables schema hints)]
      (for [[tname {:keys [columns]}] (sort-by key tables)
            [idx col] (map-indexed vector (cons {:name "db_id" :valuetype :db.type/long} columns))]
-       ["datahike" "public" tname (:name col) (str (inc idx))
+       ["datahike" "public" tname (:name col)
+        (str (if (zero? idx)
+               1
+               (inc (or (column-attnum schema tname (:name col) hints) idx))))
         ;; From the column's declared OID, not its storage valueType —
         ;; the same correction pg_attribute.atttypid needed. A `date`
         ;; column reported `timestamp without time zone` here because
@@ -1039,23 +1154,30 @@
         "YES" nil]))))
 
 (defn column-order-from-db
-  "Derive column creation order for a table from schema entity IDs.
-   Returns [col-name ...] in the order attributes were transacted (CREATE TABLE order).
-   Requires a Datahike db value. Falls back to alphabetical if db is nil."
+  "Return columns in durable PostgreSQL attnum order. Databases without
+   persisted attnums fall back to schema entity order (the historical CREATE
+   TABLE ordering convention)."
   [db table-name]
   (if db
-    (let [q-fn d/q
-          ns-prefix (str table-name "/")
-          results (q-fn '{:find [?e ?ident]
-                          :where [[?e :db/ident ?ident]]
-                          :order-by [?e :asc]}
-                        db)]
-      (mapv (fn [[_ ident]] (name ident))
-            (filter (fn [[_ ident]]
-                      (and (keyword? ident)
-                           (= table-name (namespace ident))
-                           (not= (name ident) row-marker-col)))
-                    results)))
+    (let [registered
+          (when-let [relation (catalog-objects/object-by-identity
+                               db catalog-objects/pg-class-oid
+                               catalog-objects/public-namespace-oid table-name)]
+            (mapv :datahike.pg.column/name
+                  (catalog-objects/columns-by-relation
+                   db (:datahike.pg.object/oid relation) true)))]
+      (if (seq registered)
+        registered
+        (let [results (d/q '{:find [?e ?ident]
+                             :where [[?e :db/ident ?ident]]
+                             :order-by [?e :asc]}
+                           db)]
+          (mapv (fn [[_ ident]] (name ident))
+                (filter (fn [[_ ident]]
+                          (and (keyword? ident)
+                               (= table-name (namespace ident))
+                               (not= (name ident) row-marker-col)))
+                        results)))))
     nil))
 
 (defn column-info
@@ -1083,7 +1205,7 @@
              ;; COUNT(*) under as-of to emit a `:find` containing the
              ;; entity var with no `:where` binding it.
              ordered (if-let [col-order (when db (seq (column-order-from-db db table-name)))]
-                       (let [col-map (into {} (map (fn [c] [(name (:attr c)) c]) columns))]
+                       (let [col-map (into {} (map (juxt :name identity)) columns)]
                          (vec (keep col-map col-order)))
                        columns)]
          (into [{:name "db_id" :attr :db/id :oid types/oid-int8

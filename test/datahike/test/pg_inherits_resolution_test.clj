@@ -123,6 +123,58 @@
   (is (= [["3" "r" "30" "e"]]
          (rows "SELECT id, pname, pnum, cname FROM chi WHERE id = 3"))))
 
+(deftest inherited-columns-have-child-specific-catalog-addresses
+  (is (= [["id" "1"] ["pname" "2"] ["pnum" "3"] ["cname" "4"]]
+         (rows (str "SELECT a.attname, a.attnum FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "WHERE c.relname = 'chi' ORDER BY a.attnum"))))
+  (is (= [["chi" "1"] ["par" "1"]]
+         (rows (str "SELECT c.relname, a.attnum FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "WHERE a.attname = 'id' AND c.relname IN ('par', 'chi') "
+                    "ORDER BY c.relname")))))
+
+(deftest a-parent-with-live-children-cannot-be-dropped
+  (let [result (.execute *handler* "DROP TABLE par")]
+    (is (= "2BP01" (.-sqlstate ^PgWireServer$QueryResult result)))
+    (is (= [["1" "p"] ["2" "q"]]
+           (rows "SELECT id, pname FROM chi ORDER BY id")))))
+
+(deftest added-parent-columns-propagate-durable-child-addresses
+  ;; PostgreSQL permits omitting the noise word COLUMN; cover that spelling as
+  ;; well as propagation through more than one generation.
+  (.execute *handler* "CREATE TABLE add_grand(extra text) INHERITS(chi)")
+  (is (nil? (.-error ^PgWireServer$QueryResult
+             (.execute *handler* "ALTER TABLE par ADD added int"))))
+  (.execute *handler*
+            "INSERT INTO add_grand(id,pname,pnum,cname,extra,added) VALUES(8,'p',80,'c','g',9)")
+  (is (= [["added" "5"]]
+         (rows (str "SELECT a.attname,a.attnum FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid=a.attrelid "
+                    "WHERE c.relname='chi' AND a.attname='added'"))))
+  (is (= [["9"]] (rows "SELECT added FROM add_grand WHERE id=8"))))
+
+(deftest parent-add-does-not-reorder-positional-child-inserts
+  (.execute *handler* "CREATE TABLE order_parent(a int)")
+  (.execute *handler* "CREATE TABLE order_child(c int) INHERITS(order_parent)")
+  (.execute *handler* "ALTER TABLE order_parent ADD b int")
+  (is (nil? (.-error ^PgWireServer$QueryResult
+             (.execute *handler* "INSERT INTO order_child VALUES(1,2,3)"))))
+  (is (= [["1" "2" "3"]]
+         (rows "SELECT a,c,b FROM order_child"))))
+
+(deftest dropping-a-child-retires-its-inheritance-edge
+  (.execute *handler* "CREATE TABLE drop_parent(a int)")
+  (.execute *handler* "CREATE TABLE drop_child(b int) INHERITS(drop_parent)")
+  (is (nil? (.-error ^PgWireServer$QueryResult
+             (.execute *handler* "DROP TABLE drop_child"))))
+  (is (nil? (.-error ^PgWireServer$QueryResult
+             (.execute *handler* "DROP TABLE drop_parent"))))
+  (.execute *handler* "CREATE TABLE drop_parent(a int)")
+  (.execute *handler* "CREATE TABLE drop_child(b int)")
+  (is (nil? (.-error ^PgWireServer$QueryResult
+             (.execute *handler* "DROP TABLE drop_parent")))))
+
 (deftest transitive-inheritance-preserves-columns-and-markers
   (.execute *handler* "CREATE TABLE grand (gname text) INHERITS (chi)")
   (.execute *handler* "INSERT INTO grand VALUES (4, 's', 40, 'f', 'g')")

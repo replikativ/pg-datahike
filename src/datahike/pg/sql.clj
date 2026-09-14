@@ -19,6 +19,7 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
+            [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.errors :as errors]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.classify :as cls]
@@ -41,7 +42,7 @@
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement.select
-            PlainSelect SelectItem Join OrderByElement
+            PlainSelect SelectItem AllColumns Join OrderByElement
             ParenthesedSelect SetOperationList TableStatement Values
             UnionOp IntersectOp ExceptOp Limit Offset]
            [net.sf.jsqlparser.schema Column Table]
@@ -78,6 +79,8 @@
 (def substitute-params params/substitute-params)
 (def nextval-marker? params/nextval-marker?)
 (def resolve-nextvals! params/resolve-nextvals!)
+
+(declare ^:dynamic *parse-cache* ^:dynamic *ast-cache*)
 (def ^:private unquote-ident params/unquote-ident)
 
 (def ^:private view-name-attr :datahike.pg/view-name)
@@ -120,11 +123,33 @@
 
       :else nil)))
 
-(defn- view-select-typmods [^PlainSelect select db output-count]
+(defn- registered-column-typmod [db table-name column-name]
+  (when db
+    (ffirst
+     (d/q '{:find [?typmod]
+            :in [$ ?table-name ?column-name]
+            :where [[?relation :datahike.pg.object/class-oid 1259]
+                    [?relation :datahike.pg.object/name ?table-name]
+                    [?column :datahike.pg.column/relation ?relation]
+                    [?column :datahike.pg.column/name ?column-name]
+                    [?column :datahike.pg.column/dropped? false]
+                    [(get-else $ ?column :datahike.pg.column/typmod -1) ?typmod]]}
+          db table-name column-name))))
+
+(defn- source-column-typmod [db table-name column-name]
+  (long (or (registered-column-typmod db table-name column-name)
+            (params/pg-typmod-of-attr db (keyword table-name column-name))
+            -1)))
+
+(defn- view-select-typmods [^PlainSelect select db output-aliases]
   (let [from (.getFromItem select)
         ^Table from-table (when (instance? Table from) from)
         table-name (some-> from-table .getName unquote-ident)
         table-alias (some-> from-table .getAlias .getName unquote-ident)
+        select-items (.getSelectItems select)
+        star? (some (fn [^SelectItem item]
+                      (instance? AllColumns (.getExpression item)))
+                    select-items)
         item-typmods
         (mapv (fn [^SelectItem item]
                 (let [expression (.getExpression item)]
@@ -142,13 +167,23 @@
                       (long (or (params/pg-typmod-of-attr
                                  db (keyword source-table
                                              (unquote-ident (.getColumnName column))))
+                                (registered-column-typmod
+                                 db source-table
+                                 (unquote-ident (.getColumnName column)))
                                 -1)))
 
                     :else -1)))
-              (.getSelectItems select))]
-    (if (= output-count (count item-typmods))
-      item-typmods
-      (vec (repeat output-count -1)))))
+              select-items)]
+    (if star?
+      ;; A star expands after parsing, so there is one SelectItem but several
+      ;; validated output columns (including the one-column case, where counts
+      ;; happen to match). For the common single-source form, recover
+      ;; each modifier from the durable source descriptor. Unknown/joined
+      ;; outputs stay at PostgreSQL's ordinary -1 modifier.
+      (if table-name
+        (mapv #(source-column-typmod db table-name %) output-aliases)
+        (vec (repeat (count output-aliases) -1)))
+      item-typmods)))
 
 (defn- translate-create-view [^CreateView cv schema db]
   (let [view-name (unquote-ident (str (.getView cv)))
@@ -168,8 +203,12 @@
       (throw (errors/pg-error :feature-not-supported
                               {:feature "CREATE VIEW column name lists"})))
     (when (and table-exists? (not existing-eid))
-      (throw (ex-info (str "relation \"" view-name "\" already exists")
-                      {:error :duplicate-table :table view-name :sqlstate "42P07"})))
+      (throw (if replace?
+               (ex-info (str "\"" view-name "\" is not a view")
+                        {:error :wrong-object-type :sqlstate "42809"})
+               (ex-info (str "relation \"" view-name "\" already exists")
+                        {:error :duplicate-table :table view-name
+                         :sqlstate "42P07"}))))
     (when (and existing-eid (not replace?) (not if-not-exists?))
       (throw (ex-info (str "relation \"" view-name "\" already exists")
                       {:error :duplicate-table :table view-name :sqlstate "42P07"})))
@@ -178,17 +217,32 @@
                               {:feature "CREATE VIEW with a non-plain SELECT"})))
     ;; Validate now; execute the stored definition against the then-current
     ;; snapshot whenever the view is read.
-    (let [validated (stmt/translate-select ^PlainSelect select schema db)
+    (let [^net.sf.jsqlparser.statement.select.Select owned-statement
+          (CCJSqlParserUtil/parse (str select))
+          ^PlainSelect owned-select (.getPlainSelect owned-statement)
+          validated (binding [stmt/*freeze-view-stars?* true
+                              *ast-cache* nil
+                              *parse-cache* nil]
+                      (stmt/translate-select owned-select schema db))
           aliases (:find-aliases validated)
-          typmods (view-select-typmods ^PlainSelect select db (count aliases))
+          typmods (view-select-typmods owned-select db aliases)
           columns (mapv (fn [name oid typmod]
                           {:name name :oid (long (or oid types/oid-text))
                            :typmod typmod})
-                        aliases (:select-item-oids validated) typmods)]
+                        aliases (:select-item-oids validated) typmods)
+          duplicate-name (some (fn [[name n]] (when (> n 1) name))
+                               (frequencies aliases))]
+      (when duplicate-name
+        (throw (ex-info (str "column \"" duplicate-name
+                             "\" specified more than once")
+                        {:error :duplicate-column :sqlstate "42701"
+                         :column duplicate-name})))
       (if (and existing-eid if-not-exists? (not replace?))
         {:type :ddl-create-view :noop? true :view-name view-name :tx-data []}
         {:type :ddl-create-view
          :view-name view-name
+         :replace? replace?
+         :columns columns
          :tx-data (cond-> []
                     (not (contains? schema view-name-attr))
                     (conj {:db/ident view-name-attr
@@ -206,7 +260,7 @@
                     true
                     (conj {:db/id (or existing-eid (str (gensym "view-")))
                            view-name-attr view-name
-                           view-definition-attr (str select)
+                           view-definition-attr (str owned-select)
                            view-columns-attr (pr-str columns)}))}))))
 
 ;; Aggregate + scalar fns moved to datahike.pg.sql.fns. Re-export at the old
@@ -405,13 +459,8 @@
   global-catalog-cache)
 
 (defn invalidate-catalog-cache!
-  "Clear the server-wide enriched-db catalog cache. Called from every DDL
-   exec branch (via invalidate-schema-cache!). The cache key is only the
-   user-schema hash + catalog-table-names, which does NOT change when a
-   CREATE TYPE / ENUM / DOMAIN adds a registry *entity* (new datoms under
-   pre-existing idents) or when ALTER changes a column's typmod — so those
-   would otherwise serve stale catalog rows (e.g. a 2nd composite invisible
-   in pg_type). DDL is rare, so a full clear is the simplest correct fix."
+  "Clear cached catalog schema fragments. Rows and enriched database snapshots
+   are not cached: catalog extensions may read arbitrary current user data."
   []
   (.clear ^java.util.Map global-catalog-cache))
 
@@ -422,17 +471,23 @@
   (when cache (.put cache k v))
   v)
 
+(defn- translation-cache-key [sql schema db]
+  ;; Keep exact values, not their hashes: native catalog transactions do not
+  ;; necessarily change Datahike's schema object or the server's DDL token.
+  [::translation sql schema (catalog-basis/capture db)
+   params/*declared-param-oids* params/*temp-table-map*
+   (when params/*session-state*
+     (select-keys @params/*session-state* [:search-path]))])
+
 (defn enrich-db-with-catalogs
   "Materialise the given catalog tables' schema + data on top of `db`,
    returning the enriched db (its `:schema` carries the catalog attrs).
    Returns `db` unchanged when `catalog-names` is empty.
 
-   Cached in the server-wide LRU by [user-schema-hash sorted-names]; the
-   cache is DDL-invalidated (invalidate-catalog-cache!). Callable at BOTH
-   parse time (to translate against the catalog schema) and execute time
-   (so a prepared catalog statement re-resolves fresh catalog rows against
-   the current db instead of a stale parse-time snapshot — real PG re-plans
-   on catalog change). `schema` is `db`'s user schema."
+   Only catalog schema fragments are cached. Catalog rows are derived from
+   this exact input DB and materialized on top of it on every call. Thus a
+   catalog join cannot accidentally inherit another call's user rows.
+   `schema` is `db`'s user schema."
   [db schema catalog-names]
   (if (empty? catalog-names)
     db
@@ -446,29 +501,20 @@
           ;; whose outer scope already enriched the same catalogs.
           sorted-names (sort (remove #(contains? existing (pgs/row-marker-attr %))
                                      catalog-names))
-          cache *catalog-cache*
-          ;; The schema hash alone does not identify the catalog CONTENT
-          ;; for sequence-backed tables: `nextval` moves :__seq__/value
-          ;; and a second CREATE SEQUENCE adds a row, neither of which
-          ;; touches the schema (the :__seq__/* attrs are installed by
-          ;; the FIRST CREATE SEQUENCE and never change after). Without
-          ;; this component, `SELECT last_value FROM pg_sequences` re-run
-          ;; after a nextval was served from the cache and reported the
-          ;; pre-advance value. Only paid when such a table is actually
-          ;; being materialised.
-          seq-fingerprint (when (some catalog/sequence-backed-catalogs sorted-names)
-                            (hash (catalog/sequence-state db)))
-          cache-key [(hash existing) sorted-names seq-fingerprint]]
+          cache *catalog-cache*]
       (cond
         (empty? sorted-names) db
         :else
-        (or (cache-get cache cache-key)
-            (let [combined-schema (vec (mapcat catalog/catalog-schema-for sorted-names))
-                  combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
-                                             sorted-names))
-                  spec-db (d/db-with db combined-schema)
-                  built (if (seq combined-data) (d/db-with spec-db combined-data) spec-db)]
-              (cache-put! cache cache-key built)))))))
+        (let [;; Include the actual registered schema fragments, so replacing
+              ;; an extension does not depend on a global invalidation race.
+              fragments (mapv catalog/catalog-schema-for sorted-names)
+              cache-key [sorted-names fragments]
+              combined-schema (or (cache-get cache cache-key)
+                                  (cache-put! cache cache-key (vec (mapcat identity fragments))))
+              combined-data (vec (mapcat #(catalog/catalog-data-for % schema db)
+                                         sorted-names))
+              spec-db (d/db-with db combined-schema)]
+          (if (seq combined-data) (d/db-with spec-db combined-data) spec-db))))))
 
 ;; ============================================================================
 ;; parse-sql result cache
@@ -481,17 +527,14 @@
 ;; VALUES (?)` calls, ORM-generated SELECT-by-id — pays this cost on
 ;; every Parse message.
 ;;
-;; The cache key is `[sql schema-hash]`. The schema-hash captures
-;; everything translation depends on: column types, identity unique-
-;; ness, FK metadata. Two connections with the same user schema share
-;; entries. DDL changes the schema → new hash → cache miss.
+;; Translation keys contain exact schema/catalog inputs and parameter/session
+;; bindings. Native metadata writes are visible without server invalidation.
 ;;
 ;; We do NOT cache results that depend on transient state:
 ;;   - :type :system            (current_user, now(), session GUCs)
 ;;   - :type :error             (transient parse failures shouldn't pin)
 ;;   - :enriched-db tagged maps (catalog data depends on db rows, not
-;;                               just schema; the enriched-db itself is
-;;                               cached separately by *catalog-cache*)
+;;                               just schema)
 ;;   - bound-param substitution (callers Bind via resolve-param-refs
 ;;                               on the cached map; we cache the
 ;;                               un-substituted shape)
@@ -516,14 +559,9 @@
 
 (defn invalidate-parse-cache!
   "Clear the server-wide parse-sql result cache. Called from every DDL
-   exec branch (via server/invalidate-schema-cache!). The cache key is
-   `[sql (hash schema)]`, but translation also depends on the `:pg/*`
-   metadata stored on ident *entities* (NOT NULL, CHECK, FK, defaults,
-   typmod) which does not appear in `(dbi/-schema db)` — so an
-   `ALTER TABLE … ADD CHECK / SET NOT NULL / ALTER COLUMN TYPE` leaves
-   the hash unchanged and would keep serving parse results translated
-   against the old constraints. The AST cache is untouched: JSqlParser
-   output depends only on the SQL text."
+   exec branch (via server/invalidate-schema-cache!). Exact cache keys also
+   detect native catalog changes. The AST cache is untouched: JSqlParser
+   output depends only on SQL text."
   []
   (.clear ^java.util.Map global-parse-cache))
 
@@ -742,6 +780,8 @@
                         visible-rows)]
       (-> base
           (assoc :column-order aliases)
+          (assoc :column-type-oids
+                 (into {} (map vector aliases oids)))
           (update :tx-data into (concat (mapv :schema col-specs) data-tx))))))
 
 (defn- plain-selects-in
@@ -2225,7 +2265,9 @@
                           drop-type (when-let [t (.getType d)] (str/lower-case t))
                           obj-name (-> d .getName .getName)]
                       (case drop-type
-                        "sequence" {:type :ddl-drop-sequence :seq-name obj-name}
+                        "sequence" {:type :ddl-drop-sequence
+                                    :seq-name (unquote-ident obj-name)
+                                    :if-exists? (.isIfExists d)}
                         "index" {:type :ddl-drop-index
                                  :name (unquote-ident obj-name)
                                  :if-exists? (.isIfExists d)}
@@ -2271,6 +2313,7 @@
                                   (mapv (comp unquote-ident str)
                                         (or (.getColumnsNames idx) [])))
                        :column-specs column-specs
+                       :tail-parameters (mapv str (or (.getTailParameters ci) []))
                        :options (create-index-options ci)})
 
           ;; ALTER TABLE — extract operations for ADD COLUMN support
@@ -2282,19 +2325,51 @@
                                       (let [op (str (.getOperation exp))]
                                         (cond
                                 ;; ADD COLUMN
-                                          (and (= op "ADD") (.hasColumn exp))
+                                          (and (= op "ADD")
+                                               (seq (.getColDataTypeList exp))
+                                               (or (.hasColumn exp)
+                                                   (nil? (.getIndex exp))))
                                           (let [cdts (.getColDataTypeList exp)]
                                             {:op :add-column
-                                             :columns (mapv (fn [^ColumnDefinition cdt]
-                                                              {:name (unquote-ident (.getColumnName cdt))
+                                             :columns (mapv (fn [cdt]
+                                                              (let [definition?
+                                                                    (instance? ColumnDefinition cdt)
+                                                                    name (if definition?
+                                                                           (.getColumnName
+                                                                            ^ColumnDefinition cdt)
+                                                                           (.getColumnName
+                                                                            ^net.sf.jsqlparser.statement.alter.AlterExpression$ColumnDataType
+                                                                            cdt))
+                                                                    col-type
+                                                                    (if definition?
+                                                                      (.getColDataType
+                                                                       ^ColumnDefinition cdt)
+                                                                      (.getColDataType
+                                                                       ^net.sf.jsqlparser.statement.alter.AlterExpression$ColumnDataType
+                                                                       cdt))
+                                                                    specs (when-not definition?
+                                                                            (.getColumnSpecs
+                                                                             ^net.sf.jsqlparser.statement.alter.AlterExpression$ColumnDataType
+                                                                             cdt))
+                                                                    upper-specs
+                                                                    (into #{} (map (comp str/upper-case str)) specs)]
+                                                                {:name (unquote-ident name)
                                                                ;; Preserve identifier quotes/case here. The executor
                                                                ;; normalizes valid built-ins; lowercasing now would turn
                                                                ;; distinct `"Vector"` into pgvector's `vector` silently.
-                                                               :type (str (.getColDataType cdt))
-                                                               :primary-key? (boolean
-                                                                              (ddl/column-is-primary-key? cdt))
-                                                               :unique? (boolean
-                                                                         (ddl/column-is-unique? cdt))})
+                                                                 :type (str col-type)
+                                                                 :primary-key?
+                                                                 (if definition?
+                                                                   (boolean
+                                                                    (ddl/column-is-primary-key?
+                                                                     ^ColumnDefinition cdt))
+                                                                   (contains? upper-specs "PRIMARY"))
+                                                                 :unique?
+                                                                 (if definition?
+                                                                   (boolean
+                                                                    (ddl/column-is-unique?
+                                                                     ^ColumnDefinition cdt))
+                                                                   (contains? upper-specs "UNIQUE"))}))
                                                             cdts)})
                                 ;; ADD [CONSTRAINT name] PRIMARY KEY / UNIQUE —
                                 ;; carry the columns so the executor can upgrade
@@ -2319,7 +2394,17 @@
                                                               (or uk-cols (.getColumnsNames idx)))}
                                               ;; FK, CHECK, etc. — no-op
                                               :else {:op :add-constraint}))
-                                ;; DROP — no-op
+                                ;; DROP COLUMN
+                                          (and (= op "DROP") (.hasColumn exp))
+                                          {:op :drop-column
+                                           :name (unquote-ident (.getColumnName exp))
+                                           :if-exists? (.isUsingIfExists exp)}
+                                ;; RENAME COLUMN
+                                          (= op "RENAME")
+                                          {:op :rename-column
+                                           :old-name (unquote-ident (.getColumnOldName exp))
+                                           :new-name (unquote-ident (.getColumnName exp))}
+                                ;; Other DROP forms remain compatibility no-ops.
                                           (= op "DROP") {:op :drop}
                                 ;; ALTER (SET NOT NULL, TYPE change, etc.) — no-op
                                           :else {:op :other :raw (str exp)})))
@@ -2391,7 +2476,7 @@
               (try
                 (let [tem-sql (:templated tem)
                       cache (when (cacheable-sql-size? (:templated tem)) *parse-cache*)
-                      cache-key (when cache [tem-sql (hash schema)])
+                      cache-key (when cache (translation-cache-key tem-sql schema db))
                       placeholder-parsed
                       (or (when cache (cache-get cache cache-key))
                           (let [p (parse-sql* tem-sql schema db)]
@@ -2571,7 +2656,7 @@
    (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
          ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
          ;; so it must neither be served from nor written to the shared result
-         ;; cache (whose key is only [sql schema]). Bypass caching entirely in
+         ;; cache. Bypass caching entirely in
          ;; that case — otherwise the binding-free version (e.g. the parse done
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
@@ -2579,7 +2664,6 @@
                           (nil? params/*bound-params*)
                           (cacheable-sql-size? sql))
                  *parse-cache*)
-         schema-key (when cache (hash schema))
          ;; Schema-flexibility is part of the key because it changes the
          ;; TRANSLATION, not just the data: under :write an unknown
          ;; column is 42703, under :read it reads as NULL (a real column
@@ -2587,8 +2671,6 @@
          ;; identical schemas but different flexibility would otherwise
          ;; share entries, and whichever parsed first would decide for
          ;; both.
-         flex-key (when cache
-                    (try (:schema-flexibility (:config db)) (catch Throwable _ nil)))
          ;; The declared parameter types are part of the key, not
          ;; incidental context. `SELECT 1 + 1` and `SELECT 1.5 + 1`
          ;; template to the SAME `SELECT $1 + $2`, and what differs is not
@@ -2601,8 +2683,7 @@
          ;;
          ;; PostgreSQL keys a prepared plan on its declared parameter
          ;; types for the same reason.
-         cache-key (when cache [sql schema-key flex-key
-                                params/*declared-param-oids*])
+         cache-key (when cache (translation-cache-key sql schema db))
          cached (when cache (cache-get cache cache-key))]
      (cond
        cached cached

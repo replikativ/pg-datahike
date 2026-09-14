@@ -84,7 +84,9 @@
                                               (map #(str "(" % ",'" (apply str (repeat 40 \y)) "')")
                                                    (range 2000))))
                 key-strings (fn []
-                              (concat (map first (keys parse-cache))
+                              ;; Translation keys start with their cache-kind
+                              ;; tag; SQL text is the second component.
+                              (concat (map second (keys parse-cache))
                                       (keys ast-cache)))]
             (is (pos? (+ (.size parse-cache) (.size ast-cache))))
             (is (> (count big) 65536))

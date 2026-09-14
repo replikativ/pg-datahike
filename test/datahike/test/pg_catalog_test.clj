@@ -72,14 +72,376 @@
 
 (deftest create-table-if-not-exists-does-not-consume-an-oid
   (is (nil? (:err (ex "CREATE TABLE oid_once (id integer)"))))
-  (let [oid (Long/parseLong
-             (ffirst (rows "SELECT oid FROM pg_class WHERE relname = 'oid_once'")))]
+  (let [next-before (:datahike.pg.catalog/next-oid
+                     (catalog-objects/catalog-entity (d/db *conn*)))]
     (is (nil? (:err (ex "CREATE TABLE IF NOT EXISTS oid_once (id integer)"))))
+    (is (= next-before
+           (:datahike.pg.catalog/next-oid
+            (catalog-objects/catalog-entity (d/db *conn*)))))
     (is (nil? (:err (ex "CREATE TABLE oid_after_noop (id integer)"))))
-    (is (= (inc oid)
+    (is (= next-before
            (Long/parseLong
             (ffirst (rows (str "SELECT oid FROM pg_class "
                                "WHERE relname = 'oid_after_noop'"))))))))
+
+(deftest table-columns-have-durable-subobject-addresses
+  (is (nil? (:err (ex "CREATE TABLE addressed_columns (a integer, b text)"))))
+  (let [oid (Long/parseLong
+             (ffirst (rows (str "SELECT oid FROM pg_class "
+                                "WHERE relname = 'addressed_columns'"))))]
+    (is (= [["a" "1"] ["b" "2"]]
+           (rows (str "SELECT attname, attnum FROM pg_attribute "
+                      "WHERE attrelid = " oid " ORDER BY attnum"))))
+    (is (nil? (:err (ex "ALTER TABLE addressed_columns ADD COLUMN c bigint"))))
+    (is (= [["a" "1"] ["b" "2"] ["c" "3"]]
+           (rows (str "SELECT attname, attnum FROM pg_attribute "
+                      "WHERE attrelid = " oid " ORDER BY attnum"))))
+    (is (= [1 2 3]
+           (mapv :datahike.pg.column/attnum
+                 (catalog-objects/columns-by-relation (d/db *conn*) oid true))))))
+
+(deftest column-drop-readd-and-rename-preserve-address-history
+  (is (nil? (:err (ex (str "CREATE TABLE column_lifecycle "
+                           "(a integer, b text, c integer UNIQUE)")))))
+  (is (nil? (:err (ex "INSERT INTO column_lifecycle VALUES (1, 'old', 3)"))))
+  (let [oid (Long/parseLong
+             (ffirst (rows (str "SELECT oid FROM pg_class "
+                                "WHERE relname = 'column_lifecycle'"))))]
+    (is (nil? (:err (ex "ALTER TABLE column_lifecycle DROP COLUMN b"))))
+    (is (= [["a" "1" "f"]
+            ["........pg.dropped.2........" "2" "t"]
+            ["c" "3" "f"]]
+           (rows (str "SELECT attname, attnum, attisdropped FROM pg_attribute "
+                      "WHERE attrelid = " oid " ORDER BY attnum"))))
+    (is (= [["a" "2"] ["c" "4"]]
+           (rows (str "SELECT column_name, ordinal_position "
+                      "FROM information_schema.columns "
+                      "WHERE table_name = 'column_lifecycle' "
+                      "AND column_name <> 'db_id' ORDER BY ordinal_position"))))
+    (is (= [["3"]]
+           (rows (str "SELECT indkey FROM pg_index "
+                      "WHERE indrelid = " oid))))
+    (is (nil? (:err (ex "ALTER TABLE column_lifecycle ADD COLUMN b text"))))
+    (is (= [["a" "1"] ["c" "3"] ["b" "4"]]
+           (rows (str "SELECT attname, attnum FROM pg_attribute "
+                      "WHERE attrelid = " oid " AND NOT attisdropped "
+                      "ORDER BY attnum"))))
+    (is (nil? (:err (ex "INSERT INTO column_lifecycle (a, c, b) VALUES (2, 4, 'new')"))))
+    (is (= [["1" "3" nil] ["2" "4" "new"]]
+           (rows "SELECT a, c, b FROM column_lifecycle ORDER BY a")))
+    (is (nil? (:err (ex "ALTER TABLE column_lifecycle RENAME COLUMN c TO x"))))
+    (is (= [["1" "3"] ["2" "4"]]
+           (rows "SELECT a, x FROM column_lifecycle ORDER BY a")))
+    (is (= [["x" "3"] ["b" "4"]]
+           (rows (str "SELECT attname, attnum FROM pg_attribute "
+                      "WHERE attrelid = " oid " AND attnum >= 3 "
+                      "ORDER BY attnum"))))))
+
+(deftest replacing-a-view-preserves-its-existing-row-type
+  (is (nil? (:err (ex "CREATE TABLE replace_base (id integer, n numeric)"))))
+  (is (nil? (:err (ex (str "CREATE VIEW replace_view AS "
+                           "SELECT id, n::numeric(8,2) AS amount FROM replace_base")))))
+  (let [[relation-oid row-type-oid]
+        (first (rows (str "SELECT oid, reltype FROM pg_class "
+                          "WHERE relname = 'replace_view'")))
+        columns-sql (str "SELECT attname, atttypid, atttypmod, attnum "
+                         "FROM pg_attribute WHERE attrelid = " relation-oid
+                         " ORDER BY attnum")
+        original-columns (rows columns-sql)]
+    (is (nil? (:err (ex (str "CREATE OR REPLACE VIEW replace_view AS "
+                             "SELECT id, n::numeric(8,2) AS amount FROM replace_base")))))
+    (is (= [[relation-oid row-type-oid]]
+           (rows (str "SELECT oid, reltype FROM pg_class "
+                      "WHERE relname = 'replace_view'"))))
+    (is (= original-columns (rows columns-sql)))
+    (doseq [statement
+            ["CREATE OR REPLACE VIEW replace_view AS SELECT id FROM replace_base"
+             (str "CREATE OR REPLACE VIEW replace_view AS "
+                  "SELECT id AS renamed, n::numeric(8,2) AS amount FROM replace_base")
+             (str "CREATE OR REPLACE VIEW replace_view AS "
+                  "SELECT id::bigint AS id, n::numeric(8,2) AS amount FROM replace_base")
+             (str "CREATE OR REPLACE VIEW replace_view AS "
+                  "SELECT id, n::numeric(9,2) AS amount FROM replace_base")]]
+      (is (= "42P16" (:sqlstate (ex statement))) statement))
+    (is (= original-columns (rows columns-sql)))
+    (is (nil? (:err (ex (str "CREATE OR REPLACE VIEW replace_view AS "
+                             "SELECT id, n::numeric(8,2) AS amount, "
+                             "id + 1 AS next_id FROM replace_base")))))
+    (is (= [["id" "1"] ["amount" "2"] ["next_id" "3"]]
+           (rows (str "SELECT attname, attnum FROM pg_attribute "
+                      "WHERE attrelid = " relation-oid " ORDER BY attnum"))))
+    (is (nil? (:err (ex "BEGIN"))))
+    (is (nil? (:err (ex (str "CREATE OR REPLACE VIEW replace_view AS "
+                             "SELECT id, n::numeric(8,2) AS amount, "
+                             "id + 1 AS next_id, id + 2 AS later FROM replace_base")))))
+    (is (nil? (:err (ex "ROLLBACK"))))
+    (is (= [["id" "1"] ["amount" "2"] ["next_id" "3"]]
+           (rows (str "SELECT attname, attnum FROM pg_attribute "
+                      "WHERE attrelid = " relation-oid " ORDER BY attnum"))))))
+
+(deftest view-stars-have-a-frozen-output-descriptor
+  (is (nil? (:err (ex "CREATE TABLE star_base (id integer, label varchar(12))"))))
+  (is (nil? (:err (ex "INSERT INTO star_base VALUES (1, 'one')"))))
+  (is (nil? (:err (ex "CREATE VIEW star_view AS SELECT * FROM star_base"))))
+  (is (nil? (:err (ex "CREATE OR REPLACE VIEW star_view AS SELECT * FROM star_base"))))
+  (is (= [["id" "-1"] ["label" "16"]]
+         (rows (str "SELECT a.attname, a.atttypmod FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "WHERE c.relname = 'star_view' ORDER BY a.attnum"))))
+  (is (nil? (:err (ex "ALTER TABLE star_base ADD COLUMN later text"))))
+  (is (= [["1" "one"]]
+         (rows "SELECT * FROM star_view")))
+  (is (= [["id"] ["label"]]
+         (rows (str "SELECT a.attname FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "WHERE c.relname = 'star_view' ORDER BY a.attnum"))))
+  (is (nil? (:err (ex "CREATE VIEW star_source AS SELECT id FROM star_base"))))
+  (is (nil? (:err (ex "CREATE VIEW star_dependent AS SELECT * FROM star_source"))))
+  (is (nil? (:err (ex (str "CREATE OR REPLACE VIEW star_source AS "
+                           "SELECT id, label FROM star_base")))))
+  (is (= [["1"]] (rows "SELECT * FROM star_dependent")))
+  (is (= [["id"]]
+         (rows (str "SELECT a.attname FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "WHERE c.relname = 'star_dependent' ORDER BY a.attnum")))))
+
+(deftest addressable-ddl-objects-have-postgresql-shaped-catalog-identities
+  (doseq [ddl ["CREATE TABLE address_table (id integer, payload text)"
+               "CREATE TYPE address_pair AS (left_value integer, right_value text)"
+               "CREATE DOMAIN address_domain AS integer NOT NULL"
+               "CREATE SEQUENCE address_sequence"
+               "CREATE VIEW address_view AS SELECT id, payload FROM address_table"
+               "CREATE INDEX address_payload_idx ON address_table (id, payload)"]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (let [[table-oid table-type-oid]
+        (mapv parse-long
+              (first (rows (str "SELECT oid, reltype FROM pg_class "
+                                "WHERE relname = 'address_table'"))))
+        [table-type-type-oid table-typrelid]
+        (mapv parse-long
+              (first (rows (str "SELECT oid, typrelid FROM pg_type "
+                                "WHERE typname = 'address_table'"))))
+        [composite-class-oid composite-type-oid]
+        (mapv parse-long
+              (first (rows (str "SELECT oid, reltype FROM pg_class "
+                                "WHERE relname = 'address_pair'"))))
+        [composite-pg-type-oid composite-typrelid]
+        (mapv parse-long
+              (first (rows (str "SELECT oid, typrelid FROM pg_type "
+                                "WHERE typname = 'address_pair'"))))]
+    (is (= table-type-oid table-type-type-oid))
+    (is (= table-oid table-typrelid))
+    (is (not= table-oid table-type-oid))
+    (is (= composite-type-oid composite-pg-type-oid))
+    (is (= composite-class-oid composite-typrelid))
+    (is (not= composite-class-oid composite-type-oid)))
+  (is (= [["d" "23" "t"]]
+         (rows (str "SELECT typtype, typbasetype, typnotnull FROM pg_type "
+                    "WHERE typname = 'address_domain'"))))
+  (is (= #{["address_sequence" "S"]
+           ["address_view" "v"]
+           ["address_payload_idx" "i"]}
+         (set (rows (str "SELECT relname, relkind FROM pg_class WHERE relname IN "
+                         "('address_sequence', 'address_view', 'address_payload_idx')")))))
+  (is (= [["address_payload_idx" "address_table" "1 2" "f"]]
+         (rows (str "SELECT i.relname, t.relname, x.indkey, x.indisunique "
+                    "FROM pg_class i JOIN pg_index x ON x.indexrelid = i.oid "
+                    "JOIN pg_class t ON t.oid = x.indrelid "
+                    "WHERE i.relname = 'address_payload_idx'"))))
+  (let [definition (ffirst
+                    (rows (str "SELECT indexdef FROM pg_indexes "
+                               "WHERE indexname = 'address_payload_idx'")))]
+    (is (str/includes? definition
+                       "INDEX address_payload_idx ON public.address_table"))
+    (is (str/includes? definition "USING btree (id, payload)")))
+  (let [[view-oid view-type-oid]
+        (mapv parse-long
+              (first (rows (str "SELECT oid, reltype FROM pg_class "
+                                "WHERE relname = 'address_view'"))))
+        [projected-type-oid projected-relation-oid]
+        (mapv parse-long
+              (first (rows (str "SELECT oid, typrelid FROM pg_type "
+                                "WHERE typname = 'address_view'"))))]
+    (is (= view-type-oid projected-type-oid))
+    (is (= view-oid projected-relation-oid))
+    (is (not= view-oid view-type-oid)))
+  (doseq [ddl ["DROP INDEX address_payload_idx"
+               "DROP VIEW address_view"
+               "DROP SEQUENCE address_sequence"
+               "DROP DOMAIN address_domain"
+               "DROP TYPE address_pair"
+               "DROP TABLE address_table"]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (is (empty? (rows (str "SELECT relname FROM pg_class WHERE relname IN "
+                         "('address_table', 'address_pair', 'address_sequence', "
+                         "'address_view', 'address_payload_idx')"))))
+  (is (empty? (rows (str "SELECT typname FROM pg_type WHERE typname IN "
+                         "('address_table', 'address_pair', 'address_domain', "
+                         "'address_view')")))))
+
+(deftest user-defined-column-types-retain-their-catalog-oids
+  (doseq [ddl ["CREATE TYPE catalog_mood AS ENUM ('low', 'high')"
+               "CREATE DOMAIN catalog_mood_domain AS catalog_mood"
+               (str "CREATE TYPE catalog_holder AS "
+                    "(direct catalog_mood, wrapped catalog_mood_domain)")
+               (str "CREATE TABLE catalog_typed "
+                    "(direct catalog_mood, wrapped catalog_mood_domain, "
+                    "holder catalog_holder)")]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (let [type-oids
+        (into {}
+              (map (fn [[name oid]] [name oid]))
+              (rows (str "SELECT typname, oid FROM pg_type WHERE typname IN "
+                         "('catalog_mood', 'catalog_mood_domain', 'catalog_holder')")))
+        mood-oid (get type-oids "catalog_mood")
+        domain-oid (get type-oids "catalog_mood_domain")
+        holder-oid (get type-oids "catalog_holder")]
+    (is (= [[mood-oid]]
+           (rows (str "SELECT typbasetype FROM pg_type "
+                      "WHERE typname = 'catalog_mood_domain'"))))
+    (is (= [["direct" mood-oid] ["wrapped" domain-oid]]
+           (rows (str "SELECT a.attname, a.atttypid FROM pg_attribute a "
+                      "JOIN pg_class c ON c.oid = a.attrelid "
+                      "WHERE c.relname = 'catalog_holder' ORDER BY a.attnum"))))
+    (is (= [["direct" mood-oid]
+            ["wrapped" domain-oid]
+            ["holder" holder-oid]]
+           (rows (str "SELECT a.attname, a.atttypid FROM pg_attribute a "
+                      "JOIN pg_class c ON c.oid = a.attrelid "
+                      "WHERE c.relname = 'catalog_typed' ORDER BY a.attnum"))))))
+
+(deftest explicit-unique-indexes-are-enforced-and-transactional
+  (is (nil? (:err (ex "CREATE TABLE explicit_unique (id integer, code text)"))))
+  (is (nil? (:err (ex "CREATE UNIQUE INDEX explicit_unique_code ON explicit_unique (code)"))))
+  (is (= [["t"]]
+         (rows (str "SELECT x.indisunique FROM pg_index x "
+                    "JOIN pg_class i ON i.oid = x.indexrelid "
+                    "WHERE i.relname = 'explicit_unique_code'"))))
+  (is (nil? (:err (ex "INSERT INTO explicit_unique VALUES (1, 'same')"))))
+  (is (= "23505" (:sqlstate
+                  (ex "INSERT INTO explicit_unique VALUES (2, 'same')"))))
+  (is (nil? (:err (ex "BEGIN"))))
+  (is (nil? (:err (ex "DROP INDEX explicit_unique_code"))))
+  (is (empty? (rows (str "SELECT oid FROM pg_class "
+                         "WHERE relname = 'explicit_unique_code'"))))
+  (is (nil? (:err (ex "ROLLBACK"))))
+  (is (= 1 (count (rows (str "SELECT oid FROM pg_class "
+                             "WHERE relname = 'explicit_unique_code'"))))))
+
+(deftest drop-commands-refuse-the-wrong-relation-kind
+  (doseq [ddl ["CREATE TABLE kind_table(id int)"
+               "CREATE VIEW kind_view AS SELECT id FROM kind_table"
+               "CREATE SEQUENCE kind_sequence"
+               "CREATE INDEX kind_index ON kind_table(id)"]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (let [before (into {} (rows (str "SELECT relname,oid FROM pg_class "
+                                   "WHERE relname LIKE 'kind_%'")))]
+    (doseq [ddl ["DROP TABLE IF EXISTS kind_view"
+                 "DROP TABLE IF EXISTS kind_sequence"
+                 "DROP VIEW IF EXISTS kind_table"
+                 "DROP INDEX IF EXISTS kind_table"]]
+      (is (= "42809" (:sqlstate (ex ddl))) ddl))
+    (is (= before
+           (into {} (rows (str "SELECT relname,oid FROM pg_class "
+                               "WHERE relname LIKE 'kind_%'")))))))
+
+(deftest views-freeze-star-shape-and-one-column-typmods
+  (doseq [ddl ["CREATE TABLE freeze_left(a int)"
+               "CREATE TABLE freeze_right(b int)"
+               "INSERT INTO freeze_left VALUES(1)"
+               "INSERT INTO freeze_right VALUES(2)"
+               (str "CREATE VIEW freeze_joined AS SELECT * FROM freeze_left "
+                    "CROSS JOIN freeze_right")
+               (str "CREATE VIEW freeze_nested AS SELECT a FROM "
+                    "(SELECT * FROM freeze_left CROSS JOIN freeze_right) q")
+               "ALTER TABLE freeze_right ADD COLUMN a text"]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (is (= [["1" "2"]] (rows "SELECT * FROM freeze_joined")))
+  (is (= [["1"]] (rows "SELECT * FROM freeze_nested")))
+  (is (nil? (:err (ex "CREATE TABLE freeze_typed(label varchar(12))"))))
+  (is (nil? (:err (ex "CREATE VIEW freeze_one AS SELECT * FROM freeze_typed"))))
+  (is (nil? (:err (ex (str "CREATE OR REPLACE VIEW freeze_one AS "
+                           "SELECT label FROM freeze_typed"))))))
+
+(deftest dropped-column-storage-does-not-leak-into-logical-lifecycle
+  (doseq [ddl ["CREATE TABLE column_life(a int,b int NOT NULL,pg$att4 int)"
+               "CREATE INDEX column_life_b_idx ON column_life(b)"
+               "ALTER TABLE column_life DROP COLUMN b"
+               "INSERT INTO column_life(a,pg$att4) VALUES(1,4)"
+               "ALTER TABLE column_life RENAME COLUMN a TO b"
+               "ALTER TABLE column_life ADD COLUMN a int"]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (is (= [] (rows "SELECT indexname FROM pg_indexes WHERE indexname='column_life_b_idx'")))
+  (is (= "42703" (:sqlstate
+                  (ex "CREATE INDEX dead_column_idx ON column_life(no_such)"))))
+  (is (= [["b" "1" "f"]
+          ["........pg.dropped.2........" "2" "t"]
+          ["pg$att4" "3" "f"]
+          ["a" "4" "f"]]
+         (rows (str "SELECT attname,attnum,attisdropped FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid=a.attrelid "
+                    "WHERE c.relname='column_life' ORDER BY attnum")))))
+
+(deftest unsigned-composite-oids-cross-java-boundaries-without-post-commit-errors
+  (let [catalog (catalog-objects/catalog-entity (d/db *conn*))]
+    (d/transact *conn*
+                [[:db/add (:db/id catalog)
+                  :datahike.pg.catalog/next-oid 2147483648]])
+    (is (nil? (:err (ex "CREATE TYPE unsigned_oid_record AS (a int)"))))
+    (is (= [["2147483648"]]
+           (rows "SELECT oid FROM pg_type WHERE typname='unsigned_oid_record'")))))
+
+(deftest retired-column-names-cannot-reach-retained-storage
+  (doseq [ddl ["CREATE TABLE retired_column(a int,b int UNIQUE)"
+               "INSERT INTO retired_column VALUES(1,2)"
+               "ALTER TABLE retired_column DROP COLUMN b"]]
+    (is (nil? (:err (ex ddl))) ddl))
+  (doseq [statement ["SELECT b FROM retired_column"
+                     "SELECT a FROM retired_column WHERE b=2"
+                     "INSERT INTO retired_column(a,b) VALUES(2,3)"
+                     "INSERT INTO retired_column(a,b) SELECT 2,3 WHERE false"
+                     "UPDATE retired_column SET b=3 WHERE false"
+                     "DELETE FROM retired_column WHERE b=2"
+                     "DELETE FROM retired_column WHERE a=1 RETURNING b"
+                     (str "INSERT INTO retired_column(a) VALUES(2) "
+                          "ON CONFLICT(b) DO NOTHING")]]
+    (is (= "42703" (:sqlstate (ex statement))) statement))
+  (is (= [["1"]] (rows "SELECT a FROM retired_column")))
+  (is (nil? (:err (ex "ALTER TABLE retired_column RENAME COLUMN a TO current_a"))))
+  (doseq [statement ["SELECT a FROM retired_column"
+                     "INSERT INTO retired_column(a) VALUES(2)"
+                     "UPDATE retired_column SET a=3"]]
+    (is (= "42703" (:sqlstate (ex statement))) statement))
+  (is (= [["1"]] (rows "SELECT current_a FROM retired_column"))))
+
+(deftest relation-and-type-namespace-conflicts-fail-before-allocation
+  (is (nil? (:err (ex "CREATE TABLE namespace_table (id integer)"))))
+  (let [next-oid (:datahike.pg.catalog/next-oid
+                  (catalog-objects/catalog-entity (d/db *conn*)))]
+    (doseq [[statement state]
+            [["CREATE SEQUENCE namespace_table" "42P07"]
+             ["CREATE INDEX namespace_table ON namespace_table (id)" "42P07"]
+             ["CREATE VIEW namespace_table AS SELECT id FROM namespace_table" "42P07"]
+             [(str "CREATE OR REPLACE VIEW namespace_table AS "
+                   "SELECT id FROM namespace_table") "42809"]
+             ["CREATE TYPE namespace_table AS ENUM ('x')" "42710"]]]
+      (is (= state (:sqlstate (ex statement))) statement)
+      (is (= next-oid
+             (:datahike.pg.catalog/next-oid
+              (catalog-objects/catalog-entity (d/db *conn*)))))))
+  (is (nil? (:err (ex "CREATE TYPE namespace_type AS ENUM ('x')"))))
+  (is (= "42P07" (:sqlstate
+                  (ex "CREATE TABLE namespace_type (id integer)"))))
+  (is (= "42710" (:sqlstate
+                  (ex "CREATE DOMAIN namespace_type AS text"))))
+  (is (nil? (:err (ex "CREATE SEQUENCE namespace_sequence"))))
+  (is (= "42P07" (:sqlstate
+                  (ex "CREATE TABLE namespace_sequence (id integer)"))))
+  (is (= "42P07" (:sqlstate
+                  (ex "CREATE VIEW namespace_sequence AS SELECT 1 AS id"))))
+  (is (= "42809" (:sqlstate (ex "DROP SEQUENCE namespace_table"))))
+  (is (= "42P01" (:sqlstate (ex "DROP SEQUENCE missing_sequence"))))
+  (is (nil? (:err (ex "DROP SEQUENCE IF EXISTS missing_sequence")))))
 
 ;; ============================================================================
 ;; pg_type — type name → OID probes

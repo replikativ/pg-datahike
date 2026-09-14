@@ -185,12 +185,30 @@
        ;; a quoted identifier still select precisely: `"firstName"`
        ;; hits `:person/firstName` directly, and `"firstname"` hits
        ;; `:person/firstname` if that is what exists.
-       (let [kw (or (get-in col-overrides [alias-key col-name])
-                    (get-in col-overrides [table-name col-name])
-                    (when-let [a (pgs/canonical-attr ci table-name col-name)]
-                      (when-not (pgs/ambiguous? a) a))
-                    (keyword table-name col-name))]
-         (if (not= alias-key table-name)
+       (let [override (or (get-in col-overrides [alias-key col-name])
+                          (get-in col-overrides [table-name col-name]))
+             canonical (when-let [a (pgs/canonical-attr ci table-name col-name)]
+                         (when-not (pgs/ambiguous? a) a))
+             _ (when (and (not derived?)
+                          (pgs/registered-relation? ci table-name)
+                          ;; A bare relation name is a whole-row reference;
+                          ;; its lowering happens after column resolution.
+                          (not (and (nil? table-alias)
+                                    (or (contains? table-aliases col-name)
+                                        (= default-table col-name))))
+                          (nil? override)
+                          (nil? canonical))
+                 (throw (ex-info (str "column \"" col-name "\" does not exist")
+                                 {:error :undefined-column
+                                  :sqlstate "42703"
+                                  :column col-name})))
+             kw (or override canonical (keyword table-name col-name))]
+         ;; A durable child-column descriptor can map a logical child column
+         ;; to storage in an ancestor namespace. Preserve the CHILD's entity
+         ;; binding in that case; using the storage namespace as alias-key
+         ;; would scan the parent relation independently and cross-join rows.
+         (if (or (not= alias-key table-name)
+                 (not= alias-key (namespace kw)))
            [:aliased alias-key kw]
            kw))))))
 
@@ -355,7 +373,9 @@
    ;; default name-from-ident path for unhinted columns.
    :col-overrides (merge-with merge
                               (reduce-kv (fn [acc ident h]
-                                           (if-let [col (:column h)]
+                                           (if-let [col (when-not
+                                                         (= ident :datahike.pg.schema/catalog-db)
+                                                          (:column h))]
                                              (let [ns (namespace ident)]
                                                (assoc-in acc [ns col] ident))
                                              acc))

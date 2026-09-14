@@ -131,6 +131,7 @@
             :if-not-exists? false
             :columns ["embedding"]
             :column-specs [{:name "embedding" :params ["vector_l2_ops"]}]
+            :tail-parameters ["WITH" "(m=16,ef_construction=64)"]
             :options {:m 16 :ef_construction 64}}
            (dissoc ddl :param-count))))
   (let [db (d/db *conn*)

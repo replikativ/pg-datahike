@@ -4,7 +4,7 @@
    under the released :secondary-stack or development :local-secondary-stack
    alias (JDK 22+)."
   (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is use-fixtures]]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.server :as pg])
   (:import [datahike.pg PgWireServer$QueryResult]))
@@ -153,6 +153,16 @@
                  (str "CREATE INDEX secondary_docs_embedding_hnsw ON secondary_docs "
                       "USING hnsw (embedding vector_cosine_ops) "
                       "WITH (m=8, ef_construction=32)"))))
+
+      (testing "catalog identity and secondary definition share one entity"
+        (doseq [[ident index-type]
+                [[:datahike.pg.index/secondary_docs_priority_idx :stratum]
+                 [:datahike.pg.index/secondary_docs_body_gin :scriptum]
+                 [:datahike.pg.index/secondary_docs_body_gist :scriptum]
+                 [:datahike.pg.index/secondary_docs_embedding_hnsw :proximum]]]
+          (let [entity (d/entity (d/db *conn*) ident)]
+            (is (= :index (:datahike.pg.object/kind entity)))
+            (is (= index-type (:db.secondary/type entity))))))
 
       (let [schema (:schema (d/db *conn*))]
         (is (= :ready

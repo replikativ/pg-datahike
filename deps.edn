@@ -2,7 +2,7 @@
 
  :deps
  {org.clojure/clojure               {:mvn/version "1.12.4"}
-  org.replikativ/datahike           {:mvn/version "0.8.1864"}
+  org.replikativ/datahike           {:mvn/version "0.8.1893"}
   ;; SQL parser. Main workhorse downstream of classify/rewrite/shape.
   com.github.jsqlparser/jsqlparser  {:mvn/version "5.2"}
   ;; JSON codec for the json/jsonb types. Declared rather than inherited
@@ -32,7 +32,7 @@
                      :javac-opts ["--release" "17"]}
          :extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}}}
 
-  ;; Unit tests — ns-based, run against :local/root datahike.
+  ;; Unit tests — ns-based, run against the released Datahike dependency.
   :test {:extra-paths ["test"]
          :extra-deps  {lambdaisland/kaocha  {:mvn/version "1.91.1392"}
                        org.postgresql/postgresql {:mvn/version "42.7.3"}}

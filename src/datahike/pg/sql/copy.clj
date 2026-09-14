@@ -562,8 +562,8 @@
      row-idx     — sequential row index (used to mint a fresh
                     `:db/id \"copy-row-<n>\"` tempid)
 
-   NULL values are dropped from the entity (Datahike treats missing
-   keys as 'no datom for this attr', which is the same as SQL NULL).
+   Explicit NULL values remain nil until row validation, so they suppress
+   column defaults. The validator removes nil keys before storage.
    Empty fields are kept as empty strings; not-null enforcement
    happens later via `apply-column-constraints`."
   [row columns ns row-marker schema row-idx]
@@ -577,7 +577,7 @@
              attr (keyword ns col)]
          (cond
            (nil? raw)             acc      ;; row shorter than columns — drop
-           (null-sentinel? raw)   acc      ;; explicit NULL → no datom
+           (null-sentinel? raw)   (assoc acc attr nil)
            :else
            (assoc acc attr (coerce-string-to-attr-type raw attr schema)))))
      base

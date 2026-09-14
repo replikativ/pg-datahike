@@ -414,6 +414,48 @@
     (exec! c "INSERT INTO t VALUES (1, NULL)")  ; null → CHECK is unknown → ok
     (is (= [[1 nil]] (mapv vec (query-rows c "SELECT id, n FROM t"))))))
 
+(deftest domain-check-evaluates-null-input
+  ;; NULL input does not imply an UNKNOWN result: IS NOT NULL yields FALSE.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN present_int AS integer CHECK (VALUE IS NOT NULL)")
+    (exec! c "CREATE TABLE t (id int PRIMARY KEY, n present_int)")
+    (exec! c "INSERT INTO t VALUES (1, 10)")
+    (doseq [sql ["INSERT INTO t VALUES (2, NULL)"
+                 "INSERT INTO t (id) VALUES (3)"
+                 "INSERT INTO t VALUES (1, NULL) ON CONFLICT (id) DO NOTHING"
+                 "UPDATE t SET n = NULL WHERE id = 1"]]
+      (let [raised (try (exec! c sql) nil
+                        (catch java.sql.SQLException e e))]
+        (is (= "23514" (some-> raised .getSQLState)) sql)))
+    (is (= [[1 10]] (mapv vec (query-rows c "SELECT id, n FROM t"))))))
+
+(deftest update-validates-domain-and-enum-in-transactions
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE DOMAIN false_only AS boolean NOT NULL CHECK (VALUE = FALSE)")
+    (exec! c "CREATE TYPE status AS ENUM ('on', 'off')")
+    (exec! c "CREATE TABLE t (id int PRIMARY KEY, b false_only, s status)")
+    (exec! c "INSERT INTO t VALUES (1, FALSE, 'on')")
+    ;; An aliased logical row must retain FALSE under its physical attribute.
+    (is (nil? (#'pg/enforce-domain-enum-checks!
+               (d/db *conn*) "t" "alias" [{:t/b false :t/s "on"}])))
+    (doseq [transaction? [false true]
+            [sql state] [["UPDATE t SET b = NULL WHERE id = 1" "23502"]
+                         ["UPDATE t SET b = TRUE WHERE id = 1" "23514"]
+                         ["UPDATE t SET s = 'invalid' WHERE id = 1" "22P02"]]]
+      (when transaction? (exec! c "BEGIN"))
+      (try
+        (let [raised (try (exec! c sql) nil
+                          (catch java.sql.SQLException e e))]
+          (is (= state (some-> raised .getSQLState))
+              (str "transaction=" transaction? ": " sql)))
+        (finally (when transaction? (exec! c "ROLLBACK")))))
+    (exec! c "UPDATE t SET b = FALSE, s = 'off' WHERE id = 1")
+    (is (= [[false "off"]] (mapv vec (query-rows c "SELECT b, s FROM t"))))
+    (exec! c "CREATE TABLE nullable_bool (id int PRIMARY KEY, b boolean)")
+    (exec! c "INSERT INTO nullable_bool VALUES (1, FALSE)")
+    (exec! c "UPDATE nullable_bool SET b = NULL WHERE id = 1")
+    (is (= [[nil]] (mapv vec (query-rows c "SELECT b FROM nullable_bool"))))))
+
 (deftest enum-membership-enforces-on-insert
   ;; An ENUM column accepts only declared members. Non-members raise
   ;; 22P02 (invalid_text_representation), matching real PG.

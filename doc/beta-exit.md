@@ -56,6 +56,22 @@ from PostgreSQL, drivers and applications into a strict repeatable gate.
   Its standalone JAR and non-root Podman image pass the restart, file
   persistence, TLS/password authentication and abrupt-client-drop soak.
 
+### Index and constraint behavior
+
+Catalog migration and initial constraint validation commit atomically before
+a SQL handler becomes available. A failed validation leaves the database
+unchanged. Independent transaction predicates can enforce constraints without
+replacing one another.
+
+Index backfill is synchronous and may require substantial memory for large
+attributes. Transaction-local permission to backfill does not change the
+database's persistent configuration. Uniqueness upgrades validate existing
+current values, including attributes that already have an index.
+
+Native scalar NaN writes and exact per-row sequence evaluation order remain
+compatibility limitations. These features do not yet satisfy the beta-exit
+criteria.
+
 ## Where coverage is still weak
 
 - pgjdbc breadth has been rerun and classified. Eight stable classes gate each
