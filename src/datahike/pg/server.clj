@@ -8738,6 +8738,7 @@
   [ctx parsed index-type attr config catalog-tx index-oid]
   (let [{:keys [conn tx-state secondary-index-build-timeout-ms]} ctx
         tx @tx-state
+        method (or (:method parsed) "btree")
         index-ident (secondary-index-ident (:name parsed))]
     ;; The declaration and its initial generation are published through the
     ;; connection writer, not speculative db-with state. A standalone CREATE
@@ -8755,18 +8756,31 @@
     (load-secondary-adapter! index-type)
     (transact-recorded!
      conn
-     (into (vec catalog-tx)
-           [{:db/id [:datahike.pg.object/address-key
-                     (catalog-objects/address-key
-                      catalog-objects/pg-class-oid index-oid)]
-             :db.secondary/type index-type
-             :db.secondary/attrs [attr]
-             :db.secondary/config
-             (merge config
-                    {:pg/index-name (:name parsed)
-                     :pg/table (:table parsed)
-                     :pg/method (:method parsed)})}])
-     (when (= "btree" (:method parsed))
+     ;; Declare the ident and its secondary definition in the same entity map.
+     ;; A later map would attempt to alter an already declared schema entry,
+     ;; even though both maps occur within one atomic transaction.
+     (let [index-ref [:datahike.pg.object/address-key
+                      (catalog-objects/address-key
+                       catalog-objects/pg-class-oid index-oid)]
+           declaration? #(and (map? %)
+                              (= index-ref (:db/id %))
+                              (= index-ident (:db/ident %)))]
+       (when-not (= 1 (count (filter declaration? catalog-tx)))
+         (throw (IllegalStateException.
+                 "Expected one catalog declaration for the secondary index")))
+       (mapv (fn [entity]
+               (if (declaration? entity)
+                 (assoc entity
+                        :db.secondary/type index-type
+                        :db.secondary/attrs [attr]
+                        :db.secondary/config
+                        (merge config
+                               {:pg/index-name (:name parsed)
+                                :pg/table (:table parsed)
+                                :pg/method method}))
+                 entity))
+             catalog-tx))
+     (when (= "btree" method)
        {:allow-index-backfill? true}))
     ;; PostgreSQL's non-CONCURRENT CREATE INDEX does not return while the
     ;; index is still being built. Datahike's writer remains available during
