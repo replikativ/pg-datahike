@@ -73,6 +73,9 @@
 (defn run [names]
   (with-open [o (fz/reference-conn)
               t (fz/target-conn)]
+    ;; One call must never stall the sweep: the synthesised INTERVAL '1 day'
+    ;; made pg_sleep_for sleep a day on the oracle.
+    (doseq [c [o t]] (fz/exec! c "SET statement_timeout = '10s'"))
     (let [cands (candidates o names)
           ;; EVERY buildable overload, not one per name: the overloads are
           ;; where the divergences hide -- `length(text)` agreed while
@@ -90,7 +93,7 @@
                                  (= :error (first b)) :missing
                                  :else :wrong)}))]
       {:calls (count calls)
-       :unbuildable (sort (remove (set (keys calls)) (distinct (map first cands))))
+       :unbuildable (sort (remove (set (vals calls)) (distinct (map first cands))))
        :results (vec results)})))
 
 (defn report [names]
@@ -113,7 +116,7 @@
 (def ^:private excluded-families
   "pg_catalog families that are server administration, storage, planner or
    index-AM internals -- out of scope by design, and noise in the report."
-  (str "^(_|pg_stat|pg_ls|pg_read|pg_file|pg_log|pg_replication|pg_wal|pg_create|"
+  (str "^(_|pg_sleep|pg_stat|pg_ls|pg_read|pg_file|pg_log|pg_replication|pg_wal|pg_create|"
        "pg_drop|pg_promote|pg_backup|pg_terminate|pg_cancel|pg_reload|pg_rotate|"
        "binary_upgrade|gin_|gist_|brin|spg|bt|hash|ts_|tsm_|pg_snapshot|txid|"
        "pg_xact|pg_get_wal|pg_import|pg_sequence_last|pg_partition|pg_mcv|heap_|"
