@@ -713,26 +713,80 @@
               -1)))
         find-aliases)))))
 
+(declare window-projection-indices)
+
+(defn- select-output-shape
+  "The visible output [aliases oids] of one SELECT plan, as Execute streams
+   it. `oids` holds nil where the column is statically unknown -- Describe
+   sends those as text, set-operation typing treats them as UNKNOWN.
+
+   The plan's :find-aliases are NOT the output when server-side passes
+   reshape the row: windows APPEND one column per spec and drop their
+   `__win_*` inputs, arithmetic over aggregates replaces the hidden
+   `__compound_N` columns with its value, and deferred correlated items
+   splice their value at :out-pos and drop the `__corr_` inputs. Describe
+   advertising the unshaped count made every extended-protocol client run
+   off the end of the row (`SELECT id, row_number() OVER (…)`, `SELECT
+   max(v) - min(v)`), and set operations rejected such branches as having
+   the wrong number of columns."
+  [parsed db item-oids]
+  (let [aliases (vec (:find-aliases parsed))
+        resolved (compute-schema-oids parsed db)
+        ;; A statically-inferred item OID (literals / casts / aggregates --
+        ;; see oid-infer) is authoritative over compute-schema-oids'
+        ;; alias-NAME fallback, which would otherwise match `SELECT 1 AS a`
+        ;; to an unrelated table column named "a".
+        oids (mapv (fn [i]
+                     (let [schema-oid (aget ^ints resolved i)
+                           item-oid (when item-oids (nth item-oids i nil))]
+                       (cond
+                         (some? item-oid)     item-oid
+                         (not= schema-oid -1) schema-oid
+                         :else                nil)))
+                   (range (count aliases)))
+        [aliases oids]
+        (if-let [wspecs (:window-specs parsed)]
+          (let [all-aliases (into aliases
+                                  (map (fn [sp] (or (:alias sp) (name (:op sp)))))
+                                  wspecs)
+                win-oid (fn [sp]
+                          (or (:oid sp)
+                              (case (:op sp)
+                                (:count :row_number :row-number :rank :dense_rank
+                                        :dense-rank) PgWireServer/OID_INT8
+                                :ntile PgWireServer/OID_INT4
+                                :avg PgWireServer/OID_NUMERIC
+                                nil)))
+                all-oids (into oids (map win-oid) wspecs)
+                vis (window-projection-indices aliases wspecs)]
+            [(mapv #(nth all-aliases %) vis) (mapv #(nth all-oids %) vis)])
+          [aliases oids])
+        [aliases oids]
+        (if-let [ces (:compound-exprs parsed)]
+          (let [all-aliases (into aliases (map :alias) ces)
+                all-oids (into oids (repeat (count ces) nil))
+                vis (stmt/compound-projection-indices all-aliases ces)]
+            [(mapv #(nth all-aliases %) vis) (mapv #(nth all-oids %) vis)])
+          [aliases oids])]
+    (if-let [{:keys [subqueries corr-col->idx n-output]} (:correlated-subqueries parsed)]
+      (let [hidden (set (vals corr-col->idx))
+            keep-vis (fn [xs] (vec (keep-indexed (fn [i x] (when-not (hidden i) x)) xs)))]
+        [(stmt/correlated-splice (keep-vis aliases)
+                                 (into {} (map (juxt :out-pos :alias)) subqueries)
+                                 n-output)
+         (stmt/correlated-splice (keep-vis oids)
+                                 (into {} (map (juxt :out-pos :oid)) subqueries)
+                                 n-output)])
+      [aliases oids])))
+
 (defn- select-output-oids
   "Static visible output OIDs for one translated SELECT branch."
   [parsed db]
-  (let [aliases (:find-aliases parsed)
-        ;; :find-aliases already contains only projected columns. Hidden
-        ;; ORDER-BY/entity-id terms exist solely in (:find query), so
-        ;; subtracting :hidden-count here erased real result columns.
-        visible (count aliases)
-        resolved (compute-schema-oids parsed (or (:enriched-db parsed) db))
-        item-oids (effective-item-oids
-                   (assoc parsed :select-item-oids
-                          (:select-item-resolution-oids parsed)))]
-    (mapv (fn [i]
-            (let [schema-oid (aget ^ints resolved i)
-                  item-oid (when item-oids (nth item-oids i nil))]
-              (cond
-                (some? item-oid) item-oid
-                (not= schema-oid -1) schema-oid
-                :else nil)))
-          (range visible))))
+  (second (select-output-shape
+           parsed (or (:enriched-db parsed) db)
+           (effective-item-oids
+            (assoc parsed :select-item-oids
+                   (:select-item-resolution-oids parsed))))))
 
 (defn- set-operation-output-oids
   "Resolve PostgreSQL's per-column common type across set-op branches."
@@ -7633,13 +7687,17 @@
       (catch Exception _ [query in-args nil]))
     [query in-args nil]))
 
-(defn- exec-select
-  "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
-   UPDATE row-locking variants (skip / nowait / block), aggregate-on-
-   empty default rows, server-side null-safe ORDER BY, hidden ORDER-BY
-   column stripping, window functions, HAVING, compound aggregate
-   expressions, DISTINCT-on-aggregates, and schema-derived OID
-   computation for the result-set metadata."
+(defn- select-rows
+  "The row-producing half of `exec-select`: run the plan and apply every
+   server-side pass (hidden-column stripping, windows, HAVING, compound
+   aggregates, deferred correlated subqueries, DISTINCT, nextval markers).
+   Returns {:results :find-aliases :query :query-db}, or {:literal? true
+   :results :find-aliases} for a table-free SELECT.
+
+   Set-operation branches run through here too. They had a reduced copy
+   of this pipeline that skipped the deferred passes, so a correlated
+   scalar in a UNION branch answered its hidden correlation column instead
+   of the subquery value (psql `\\d` reads pg_publication that way)."
   [ctx parsed]
   (let [{:keys [db tx-state session-state]} ctx
         {:keys [query find-aliases limit offset
@@ -7649,20 +7707,9 @@
                 project-set project-order-by project-limit project-offset
                 enriched-db literal-row literal-rows for-update]} parsed]
     (if (or literal-row literal-rows)
-      ;; Table-free SELECT: return literal row(s) directly.
-      ;; :literal-rows is used by table-function expansions
-      ;; (unnest(array_fill(...))) that produce N rows from
-      ;; compile-time-known arguments. Pass :select-item-oids
-      ;; (via a synthetic schema-oids array keyed by
-      ;; -1 sentinel) so SELECT TRUE reports BOOL even when
-      ;; value inference would look at a String.
-      (let [item-oids (effective-item-oids parsed)
-            schema-oids (when item-oids
-                          (int-array
-                           (map #(types/oid->wire-int (or % -1)) item-oids)))]
-        (format-query-result (or literal-rows [literal-row])
-                             find-aliases
-                             schema-oids))
+      {:literal? true
+       :results (or literal-rows [literal-row])
+       :find-aliases find-aliases}
       (let [call-seen (java.util.IdentityHashMap.)
             resolve-result-value
             #(sql/resolve-nextvals!
@@ -8035,92 +8082,121 @@
             ;; this result formatter and deliberately leaves the same markers
             ;; for ordered, one-candidate-at-a-time preparation.
             results (mapv resolve-result-value results)]
-        ;; Derive schema-based OIDs for proper type metadata.
-        ;; Shared with describeResult; see compute-schema-oids.
-        (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
-              ;; Result shape (final OIDs + column sources) is a pure function
-              ;; of (statement, schema, aliases): cache it across executions.
-              ;; Keyed on the parsed OBJECT (stable via the parse LRU /
-              ;; prepared statements) and the schema OBJECT (stable across
-              ;; non-DDL transactions). Only for the base db — an enriched-db
-              ;; (CTE / SRF virtual tables) carries per-execution type info.
-              shape-key (when (identical? query-db db)
-                          [(pg-cache/identity-key
-                            (or (::select-shape-plan parsed) parsed))
-                           (pg-cache/identity-key (dbi/-schema db))
-                           (catalog-basis/capture db)
-                           find-aliases])
-              cached-shape (when shape-key
-                             (.get ^java.util.Map select-shape-cache shape-key))]
-          (if cached-shape
-            (let [[schema-oids sources] cached-shape
-                  result (format-query-result results find-aliases schema-oids
-                                              (when sources (nth sources 2)))]
-              (if sources
-                (-> ^PgWireServer$QueryResult result
-                    (.withColumnSources (first sources) (second sources))
-                    (.withColumnTypmods (nth sources 2)))
-                result))
-            (let [;; Resolve column OIDs against the same db the query ran on:
-              ;; when a derived table / SRF-in-FROM materialised a virtual
-              ;; table (:enriched-db), its columns' :pg/type markers (e.g.
-              ;; generate_series → int4) only live there, not on the base
-              ;; conn db.
-                  schema-oids (compute-schema-oids parsed-with-shape query-db)
-              ;; Blend parse-time OIDs (oid-infer)
-              ;; over the -1 sentinel so empty
-              ;; result sets and aggregate /
-              ;; CAST / literal columns keep the
-              ;; correct type when value inference
-              ;; would otherwise fall back to TEXT.
-                  item-oids (effective-item-oids parsed)
-                  schema-oids (if (and item-oids (seq find-aliases))
-                                (let [n (count find-aliases)
-                                      out (int-array n)]
-                                  (dotimes [i n]
-                                    (let [so (aget ^ints schema-oids i)
-                                          io (when (< i (count item-oids))
-                                               (nth item-oids i))]
-                                      (aset out i
-                                            (int (if io io so)))))
-                                  out)
-                                schema-oids)
-              ;; Window outputs are appended after the visible base
-              ;; projection. Use their catalog-derived OIDs rather than
-              ;; runtime classes: ntile is represented by a Long here but is
-              ;; int4 in PostgreSQL, while lag/lead retain their input OID.
-                  schema-oids (if (seq window-specs)
-                                (let [out (aclone ^ints schema-oids)
-                                      fallback-start (- (alength out) (count window-specs))]
-                                  (doseq [[i spec] (map-indexed vector window-specs)]
-                                    (when-let [o (:oid spec)]
-                                      (aset out (or (:out-pos spec) (+ fallback-start i)) (int o))))
-                                  out)
-                                schema-oids)
-              ;; Correlated subqueries: the spliced columns aren't schema/
-              ;; item columns, so force each one's advertised OID (its
-              ;; inner-projection :oid) at its out-pos — keeping the
-              ;; execute-path encoding consistent with the RowDescription
-              ;; describeResult sent (e.g. array_agg → text[] binary).
-                  schema-oids (if-let [cs (:correlated-subqueries parsed)]
-                                (let [out (aclone ^ints schema-oids)]
-                                  (doseq [{:keys [out-pos oid]} (:subqueries cs)]
-                                    (when (< out-pos (alength out))
-                                      (aset out out-pos (types/oid->wire-int
-                                                         (or oid PgWireServer/OID_TEXT)))))
-                                  out)
-                                schema-oids)
-                  sources (compute-column-sources parsed-with-shape db)
-                  _ (when shape-key
-                      (.put ^java.util.Map select-shape-cache shape-key
-                            [schema-oids sources]))
-                  result (format-query-result results find-aliases schema-oids
-                                              (when sources (nth sources 2)))]
-              (if sources
-                (-> ^PgWireServer$QueryResult result
-                    (.withColumnSources (first sources) (second sources))
-                    (.withColumnTypmods (nth sources 2)))
-                result))))))))
+        {:results results :find-aliases find-aliases
+         :query query :query-db query-db}))))
+
+(defn- exec-select
+  "Execute a SELECT. Handles literal-row table-free SELECTs, FOR
+   UPDATE row-locking variants (skip / nowait / block), aggregate-on-
+   empty default rows, server-side null-safe ORDER BY, hidden ORDER-BY
+   column stripping, window functions, HAVING, compound aggregate
+   expressions, DISTINCT-on-aggregates, and schema-derived OID
+   computation for the result-set metadata."
+  [ctx parsed]
+  (let [{:keys [db]} ctx
+        {:keys [window-specs]} parsed
+        {:keys [literal? results find-aliases query query-db]} (select-rows ctx parsed)]
+    (if literal?
+      ;; Table-free SELECT: return literal row(s) directly.
+      ;; :literal-rows is used by table-function expansions
+      ;; (unnest(array_fill(...))) that produce N rows from
+      ;; compile-time-known arguments. Pass :select-item-oids
+      ;; (via a synthetic schema-oids array keyed by
+      ;; -1 sentinel) so SELECT TRUE reports BOOL even when
+      ;; value inference would look at a String.
+      (let [item-oids (effective-item-oids parsed)
+            schema-oids (when item-oids
+                          (int-array
+                           (map #(types/oid->wire-int (or % -1)) item-oids)))]
+        (format-query-result results
+                             find-aliases
+                             schema-oids))
+      ;; Derive schema-based OIDs for proper type metadata.
+      ;; Shared with describeResult; see compute-schema-oids.
+      (let [parsed-with-shape (assoc parsed :find-aliases find-aliases :query query)
+            ;; Result shape (final OIDs + column sources) is a pure function
+            ;; of (statement, schema, aliases): cache it across executions.
+            ;; Keyed on the parsed OBJECT (stable via the parse LRU /
+            ;; prepared statements) and the schema OBJECT (stable across
+            ;; non-DDL transactions). Only for the base db — an enriched-db
+            ;; (CTE / SRF virtual tables) carries per-execution type info.
+            shape-key (when (identical? query-db db)
+                        [(pg-cache/identity-key
+                          (or (::select-shape-plan parsed) parsed))
+                         (pg-cache/identity-key (dbi/-schema db))
+                         (catalog-basis/capture db)
+                         find-aliases])
+            cached-shape (when shape-key
+                           (.get ^java.util.Map select-shape-cache shape-key))]
+        (if cached-shape
+          (let [[schema-oids sources] cached-shape
+                result (format-query-result results find-aliases schema-oids
+                                            (when sources (nth sources 2)))]
+            (if sources
+              (-> ^PgWireServer$QueryResult result
+                  (.withColumnSources (first sources) (second sources))
+                  (.withColumnTypmods (nth sources 2)))
+              result))
+          (let [;; Resolve column OIDs against the same db the query ran on:
+            ;; when a derived table / SRF-in-FROM materialised a virtual
+            ;; table (:enriched-db), its columns' :pg/type markers (e.g.
+            ;; generate_series → int4) only live there, not on the base
+            ;; conn db.
+                schema-oids (compute-schema-oids parsed-with-shape query-db)
+            ;; Blend parse-time OIDs (oid-infer)
+            ;; over the -1 sentinel so empty
+            ;; result sets and aggregate /
+            ;; CAST / literal columns keep the
+            ;; correct type when value inference
+            ;; would otherwise fall back to TEXT.
+                item-oids (effective-item-oids parsed)
+                schema-oids (if (and item-oids (seq find-aliases))
+                              (let [n (count find-aliases)
+                                    out (int-array n)]
+                                (dotimes [i n]
+                                  (let [so (aget ^ints schema-oids i)
+                                        io (when (< i (count item-oids))
+                                             (nth item-oids i))]
+                                    (aset out i
+                                          (int (if io io so)))))
+                                out)
+                              schema-oids)
+            ;; Window outputs are appended after the visible base
+            ;; projection. Use their catalog-derived OIDs rather than
+            ;; runtime classes: ntile is represented by a Long here but is
+            ;; int4 in PostgreSQL, while lag/lead retain their input OID.
+                schema-oids (if (seq window-specs)
+                              (let [out (aclone ^ints schema-oids)
+                                    fallback-start (- (alength out) (count window-specs))]
+                                (doseq [[i spec] (map-indexed vector window-specs)]
+                                  (when-let [o (:oid spec)]
+                                    (aset out (or (:out-pos spec) (+ fallback-start i)) (int o))))
+                                out)
+                              schema-oids)
+            ;; Correlated subqueries: the spliced columns aren't schema/
+            ;; item columns, so force each one's advertised OID (its
+            ;; inner-projection :oid) at its out-pos — keeping the
+            ;; execute-path encoding consistent with the RowDescription
+            ;; describeResult sent (e.g. array_agg → text[] binary).
+                schema-oids (if-let [cs (:correlated-subqueries parsed)]
+                              (let [out (aclone ^ints schema-oids)]
+                                (doseq [{:keys [out-pos oid]} (:subqueries cs)]
+                                  (when (< out-pos (alength out))
+                                    (aset out out-pos (types/oid->wire-int
+                                                       (or oid PgWireServer/OID_TEXT)))))
+                                out)
+                              schema-oids)
+                sources (compute-column-sources parsed-with-shape db)
+                _ (when shape-key
+                    (.put ^java.util.Map select-shape-cache shape-key
+                          [schema-oids sources]))
+                result (format-query-result results find-aliases schema-oids
+                                            (when sources (nth sources 2)))]
+            (if sources
+              (-> ^PgWireServer$QueryResult result
+                  (.withColumnSources (first sources) (second sources))
+                  (.withColumnTypmods (nth sources 2)))
+              result)))))))
 
 (defn- remap-tempids
   "Rewrite every string tempid in `form` (any string sitting in a
@@ -10457,37 +10533,12 @@
         ;; (or similar) to :find for server-side sort, which must
         ;; not leak into UNION/INTERSECT/EXCEPT row comparison or
         ;; the returned result shape.
-        exec-sub (fn [{:keys [query in-args find-aliases hidden-count
-                              project-set project-order-by project-limit
-                              project-offset fetch-with-ties?]}]
-                   (let [q-input (assoc query :cancel (current-cancel))
-                         raw (binding [params/*runtime-db* query-db]
-                               (if (seq in-args)
-                                 (apply d/q q-input query-db in-args)
-                                 (run-param-query q-input #(d/q q-input query-db))))
-                         raw (if (seq project-set)
-                               (stmt/apply-project-set raw project-set)
-                               raw)
-                         project-cmp (when (seq project-order-by)
-                                       (null-safe-order-cmp project-order-by))
-                         raw (if project-cmp (sort project-cmp raw) raw)
-                         raw (if (seq project-set)
-                               (let [offset-rows (cond->> raw
-                                                   project-offset (drop project-offset))]
-                                 (if (and fetch-with-ties? project-cmp)
-                                   (take-with-ties project-limit project-cmp offset-rows)
-                                   (cond->> offset-rows
-                                     project-limit (take project-limit))))
-                               raw)
-                         hc (or hidden-count 0)
-                         visible (- (count (:find query)) hc)
-                         results (if (pos? hc)
-                                   (map (fn [row]
-                                          (if (sequential? row)
-                                            (vec (take visible row))
-                                            row))
-                                        raw)
-                                   raw)]
+        ;; Each branch runs the full SELECT row pipeline against the
+        ;; statement's query DB; only the combination below is set-op
+        ;; specific.
+        exec-sub (fn [sub]
+                   (let [{:keys [results find-aliases]}
+                         (select-rows (assoc ctx :db query-db) sub)]
                      {:results (map #(set-ops/coerce-row % result-oids) results)
                       :find-aliases find-aliases}))
         executed (mapv exec-sub sub-results)
@@ -11761,8 +11812,7 @@
              "SELECT 0"))
 
           (= :select (:type parsed))
-          (let [aliases (:find-aliases parsed)
-                ;; Use the in-tx speculative-db when a transaction is
+          (let [;; Use the in-tx speculative-db when a transaction is
                 ;; open so OIDs for tables created in the uncommitted
                 ;; transaction resolve correctly — otherwise Describe
                 ;; advertises an OID derived from the committed schema
@@ -11772,110 +11822,11 @@
                 db (if (:in-tx? @tx-state)
                      (or (:speculative-db @tx-state) (d/db conn))
                      (d/db conn))
-                resolved (compute-schema-oids parsed db)
-                ;; Parse-time OIDs from oid-infer (one per find-alias,
-                ;; nil for entries we can't statically type). Prefer
-                ;; these over compute-schema-oids' -1 sentinel since
-                ;; they cover literals, aggregates, CAST, function
-                ;; calls, and arithmetic — shapes that have no schema
-                ;; attribute. See datahike.pg.sql.oid-infer.
                 ;; Bare `$N` output columns are typed from the Parse
                 ;; message's declared OID — see effective-item-oids
-                ;; (issue #27).
-                item-oids (effective-item-oids parsed)
-                oids (int-array
-                      (for [i (range (count aliases))]
-                        (let [schema-oid (aget ^ints resolved i)
-                              item-oid (when item-oids
-                                         (nth item-oids i nil))]
-                          (cond
-                            ;; A statically-inferred item OID (only set for
-                            ;; literals / casts — see oid-infer) is
-                            ;; authoritative and must win over compute-schema-
-                            ;; oids' alias-NAME fallback, which would otherwise
-                            ;; match e.g. `SELECT 1 AS a` to an unrelated table
-                            ;; column named "a" — making Describe disagree
-                            ;; with Execute (Execute uses item-oids) and
-                            ;; corrupting binary-format decoding on the client.
-                            (some? item-oid)     item-oid
-                            (not= schema-oid -1) schema-oid
-                            :else                PgWireServer/OID_TEXT))))
-                ;; Correlated scalar subqueries (slice A): the parsed
-                ;; find-aliases/oids describe the non-subquery + hidden
-                ;; __corr_ columns. Re-shape to the actual output —
-                ;; splice each subquery's alias/OID at its out-pos and drop
-                ;; the __corr_ columns — so RowDescription matches what
-                ;; exec-select streams.
-                ;; Arithmetic over aggregates: the parsed find-aliases
-                ;; describe the HIDDEN per-aggregate columns
-                ;; (`__compound_0`, `__compound_1`), not the one column the
-                ;; expression produces. Execute appends the computed value
-                ;; and drops the hidden ones, so without the same reshape
-                ;; here Describe advertised `__compound_0`/`__compound_1`
-                ;; and a client reading by the advertised count ran off the
-                ;; end of the row -- `SELECT max(v) - min(v)` was
-                ;; unreadable over the extended protocol, which is every
-                ;; client except psql's simple queries.
-                ;;
-                ;; The computed column is typed OID_TEXT, the same fallback
-                ;; the aggregate columns it is built from already use here.
-                ;; Window functions: exec-select APPENDS one value per spec
-                ;; and then drops the `__win_*` helper columns it added to
-                ;; :find for partition / order / aggregate inputs. The parsed
-                ;; find-aliases describe neither, so Describe advertised the
-                ;; wrong COUNT and every extended-protocol client ran off the
-                ;; end of the row -- `SELECT id, row_number() OVER (…)` came
-                ;; back as one column over JDBC while psql's simple query
-                ;; showed two. Same reshape, and the same reasoning, as the
-                ;; compound-expr case below.
-                [aliases oids]
-                (if-let [wspecs (:window-specs parsed)]
-                  (let [all-aliases (into (vec aliases)
-                                          (map (fn [sp] (or (:alias sp) (name (:op sp)))))
-                                          wspecs)
-                        ;; int8 for the counting / ranking ops, numeric for
-                        ;; AVG; anything else falls back to text, which is the
-                        ;; same default the aggregate columns here already use.
-                        win-oid (fn [sp]
-                                  (or (:oid sp)
-                                      (case (:op sp)
-                                        (:count :row_number :row-number :rank :dense_rank
-                                                :dense-rank) PgWireServer/OID_INT8
-                                        :ntile PgWireServer/OID_INT4
-                                        :avg PgWireServer/OID_NUMERIC
-                                        PgWireServer/OID_TEXT)))
-                        all-oids (into (vec oids) (map win-oid) wspecs)
-                        vis (window-projection-indices aliases wspecs)]
-                    [(mapv #(nth all-aliases %) vis)
-                     (int-array (map #(types/oid->wire-int (nth all-oids %)) vis))])
-                  [aliases oids])
-                [aliases oids]
-                (if-let [ces (:compound-exprs parsed)]
-                  (let [all-aliases (into (vec aliases) (map :alias) ces)
-                        all-oids (into (vec oids)
-                                       (repeat (count ces) PgWireServer/OID_TEXT))
-                        vis (stmt/compound-projection-indices all-aliases ces)]
-                    [(mapv #(nth all-aliases %) vis)
-                     (int-array (map #(types/oid->wire-int (nth all-oids %)) vis))])
-                  [aliases oids])
-                [aliases oids]
-                (if-let [cs (:correlated-subqueries parsed)]
-                  (let [{:keys [subqueries corr-col->idx n-output]} cs
-                        corr-idx-set (set (vals corr-col->idx))
-                        vis-idxs (vec (remove corr-idx-set (range (count aliases))))
-                        vis-aliases (mapv #(nth aliases %) vis-idxs)
-                        vis-oids (mapv #(aget ^ints oids %) vis-idxs)
-                        a (stmt/correlated-splice vis-aliases
-                                                  (into {} (map (fn [s] [(:out-pos s) (:alias s)])) subqueries)
-                                                  n-output)
-                        o (stmt/correlated-splice vis-oids
-                                                  (into {} (map (fn [s] [(:out-pos s)
-                                                                         (types/oid->wire-int
-                                                                          (or (:oid s) PgWireServer/OID_TEXT))]))
-                                                        subqueries)
-                                                  n-output)]
-                    [a (int-array (map int o))])
-                  [aliases oids])
+                ;; (issue #27). Statically unknown columns go out as text.
+                [aliases oids] (select-output-shape parsed db (effective-item-oids parsed))
+                oids (int-array (map #(types/oid->wire-int (or % PgWireServer/OID_TEXT)) oids))
                 sources (compute-column-sources parsed db)
                 qr (PgWireServer$QueryResult.
                     (into-array String aliases)
@@ -11900,10 +11851,11 @@
           ;; arity + column types, so the first branch is canonical.
           (= :set-operation (:type parsed))
           (when-let [sub (first (:sub-results parsed))]
-            (let [aliases (vec (:find-aliases sub))
-                  db (if (:in-tx? @tx-state)
+            (let [db (if (:in-tx? @tx-state)
                        (or (:speculative-db @tx-state) (d/db conn))
                        (d/db conn))
+                  aliases (first (select-output-shape
+                                  sub (or (:enriched-db sub) db) nil))
                   oids (int-array
                         (map int (set-operation-output-oids (:sub-results parsed) db)))]
               (PgWireServer$QueryResult.

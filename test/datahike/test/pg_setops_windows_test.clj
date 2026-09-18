@@ -174,3 +174,34 @@
              (col c 2 "SELECT id, row_number() OVER (ORDER BY id) AS c FROM ft ORDER BY id")))
       (is (= [nil "10" nil "10" "-3"]
              (col c 2 "SELECT id, lag(i) OVER (ORDER BY id) AS c FROM ft ORDER BY id"))))))
+
+(defn- rows [^Connection c sql]
+  (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+    (let [n (.getColumnCount (.getMetaData rs))]
+      (loop [acc []]
+        (if (.next rs)
+          (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
+          acc)))))
+
+(deftest set-operation-branches-run-the-full-select-pipeline
+  ;; Branches ran a reduced copy of the SELECT executor that skipped the
+  ;; server-side passes: a correlated scalar answered its hidden
+  ;; correlation column, and a window or aggregate-arithmetic branch was
+  ;; rejected as having the wrong number of columns.
+  (with-open [c (jdbc)]
+    (seed! c)
+    (testing "correlated scalar subquery in a branch"
+      (is (= [["1" "ten"] ["1" nil] ["2" "null-k"] ["3" nil]]
+             (rows c (str "SELECT id, (SELECT v FROM fu WHERE fu.id = ft.id) FROM ft "
+                          "WHERE id <= 3 UNION ALL SELECT id, NULL FROM ft WHERE id = 1 "
+                          "ORDER BY 1, 2")))))
+    (testing "window function in a branch"
+      (is (= [["1" "0"] ["1" "2"] ["2" "0"] ["2" "2"]]
+             (rows c (str "SELECT id, count(*) OVER () FROM ft WHERE id <= 2 "
+                          "UNION ALL SELECT id, 0 FROM ft WHERE id <= 2 ORDER BY 1, 2")))))
+    (testing "arithmetic over aggregates in a branch"
+      (is (= ["4" "5"] (col c 1 "SELECT max(id) - min(id) FROM ft UNION SELECT 5 ORDER BY 1"))))
+    (testing "a parenthesised branch keeps its own ORDER BY / LIMIT"
+      (is (= ["5" "1"]
+             (col c 1 (str "(SELECT id FROM ft ORDER BY id DESC LIMIT 1) "
+                           "UNION ALL (SELECT id FROM ft ORDER BY id LIMIT 1)")))))))
