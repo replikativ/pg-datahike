@@ -1619,11 +1619,10 @@
 ;; ============================================================================
 
 (def ^:private show-settings
-  {"server_version"                "15.0"
+  {"server_version"                PgWireServer/SERVER_VERSION
    ;; Clients branch on the NUMBER (psql, pg_dump, libpq's
-   ;; PQserverVersion); it answered nothing at all. Kept consistent with
-   ;; server_version above.
-   "server_version_num"            "150000"
+   ;; PQserverVersion).
+   "server_version_num"            PgWireServer/SERVER_VERSION_NUM
    "server_encoding"               "UTF8"
    "client_encoding"               "UTF8"
    "search_path"                   "\"$user\", public"
@@ -1736,7 +1735,8 @@
    (into-array String ["version"])
    (int-array [PgWireServer/OID_TEXT])
    (into-array (Class/forName "[Ljava.lang.String;")
-               [(into-array String ["PostgreSQL 15.0 (Datahike PgWire compatibility layer)"])])
+               [(into-array String [(str "PostgreSQL " PgWireServer/SERVER_VERSION
+                                         " (Datahike PgWire compatibility layer)")])])
    "SELECT 1"))
 
 (defn- effective-search-path [session-state]
@@ -5277,7 +5277,8 @@
                        objects we don't model: triggers, functions,
                        procedures, aggregates, materialized views,
                        rules, operators, casts, languages, partition
-                       attach/detach, ALTER TYPE / ALTER DOMAIN
+                       attach/detach, partitioned parents (loaded as
+                       plain empty tables), ALTER TYPE / ALTER DOMAIN
                        boilerplate. The data load + roundtrip still
                        work; advisory side-effects (audit triggers,
                        computed defaults driven by triggers) are lost.
@@ -5290,7 +5291,7 @@
    :pg-dump    #{:grant :revoke :policy :rls :create-extension
                  :trigger :function :procedure :aggregate
                  :materialized-view :rule :operator :cast :language
-                 :attach-partition :alter-type :alter-domain
+                 :attach-partition :partitioned-table :alter-type :alter-domain
                  ;; non-ENUM CREATE TYPE forms (composite, range, base)
                  :type}})
 
@@ -8628,6 +8629,14 @@
 
 (defn- exec-ddl-create
   [ctx parsed]
+  ;; Declarative partitioning is not modelled. Refuse it rather than create
+  ;; an unpartitioned table that accepts rows PostgreSQL rejects; the
+  ;; :pg-dump preset opts in to loading the parent as a plain empty table
+  ;; (pg_dump puts the rows in the partitions).
+  (when-let [strategy (:partition-by parsed)]
+    (when-not (contains? (:silently-accept ctx) :partitioned-table)
+      (throw (errors/pg-error :feature-not-supported
+                              {:feature (str "PARTITION BY " strategy)}))))
   (let [{:keys [conn tx-state temp-tables session-id]} ctx
         logical (:temp-logical-name parsed)
         [^PgWireServer$QueryResult result created?]

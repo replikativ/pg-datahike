@@ -2256,7 +2256,12 @@
                     (instance? CreateTable stmt)
                     (if (.getSelect ^CreateTable stmt)
                       (translate-create-table-as ^CreateTable stmt schema db)
-                      (ddl/translate-create-table ^CreateTable stmt db))
+                      ;; preprocess-sql lifted any PARTITION BY clause out
+                      ;; for the parser; the executor decides what it means.
+                      (let [plan (ddl/translate-create-table ^CreateTable stmt db)]
+                        (if-let [clause (rw/partition-by-clause (cls/tokenize-all sql))]
+                          (assoc plan :partition-by (:strategy clause))
+                          plan)))
 
           ;; DROP TABLE / DROP SEQUENCE
                     (instance? Drop stmt)

@@ -99,6 +99,13 @@ public final class PgWireServer {
     // PostgreSQL type OIDs (authoritative: src/include/catalog/pg_type.dat)
     public static final int OID_BOOL        = 16;
     public static final int OID_BYTEA       = 17;
+    // The PostgreSQL release we implement and report: the regression
+    // campaign and the semantics are pinned to REL_17_7. Clients branch on
+    // these (psql, pg_dump, libpq PQserverVersion, driver feature gates),
+    // so every place that reports a version reads them from here.
+    public static final String SERVER_VERSION = "17.7";
+    public static final String SERVER_VERSION_NUM = "170007";
+
     public static final int OID_CHAR        = 18;  // PG internal "char" (1 byte)
     public static final int OID_NAME        = 19;
     public static final int OID_INT8        = 20;   // bigint
@@ -1469,7 +1476,7 @@ public final class PgWireServer {
                 out.writeInt(0);
                 out.flush();
 
-                sendParameterStatus(out, "server_version", "15.0");
+                sendParameterStatus(out, "server_version", SERVER_VERSION);
                 sendParameterStatus(out, "server_encoding", "UTF8");
                 sendParameterStatus(out, "client_encoding", "UTF8");
                 sendParameterStatus(out, "DateStyle", "ISO, MDY");

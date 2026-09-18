@@ -573,9 +573,11 @@ FOREIGN KEY … ON UPDATE CASCADE ON DELETE RESTRICT`.
 `ALTER TYPE / DOMAIN`, `ALTER TABLE … ATTACH PARTITION` /
 `DETACH PARTITION`, `ALTER … OWNER TO`, `\restrict`/`\unrestrict`
 psql metacommands, `pg_catalog.set_config(...)`. Partitioned tables
-load: the parent's `PARTITION BY` clause is stripped, partition
-children load as independent tables, and pg_dump's per-child INSERTs
-land where they should.
+load: the parent becomes a plain, empty table, partition children load
+as independent tables, and pg_dump's per-child rows land where they
+should. Outside this preset `PARTITION BY` is refused with 0A000
+(accept it on its own with `:silently-accept #{:partitioned-table}`) --
+an unpartitioned parent would accept rows PostgreSQL rejects.
 
 ### Known gaps (by design or deferred)
 

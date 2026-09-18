@@ -27,13 +27,14 @@ block may fail.
 
 It deliberately does **not** assert "zero errors". pagila carries
 triggers, functions, `ATTACH PARTITION`, a materialized view and an
-aggregate — all rejected on purpose, ~40 statements' worth. Asserting
+aggregate, and a partitioned parent — all rejected on purpose, ~50 statements' worth. Asserting
 zero would mean either faking them or disabling the suite. A *data*
 error is different and is always a failure.
 
-Partitioned parents are excluded from the comparison: `ATTACH PARTITION`
-is unsupported, so our rows live in the partition tables and the parent
-is legitimately empty. The partitions themselves are compared.
+Partitioned parents are refused (`PARTITION BY` raises 0A000) and are
+excluded from the comparison. pg_dump emits each partition as a plain
+`CREATE TABLE` plus `ATTACH PARTITION` (also refused), so the rows land
+in the partitions, and the partitions are compared like any other table.
 
 ## Running locally
 

@@ -4,6 +4,18 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### PostgreSQL identity and loud refusals
+
+- The server reports PostgreSQL 17.7 (`server_version` 17.7,
+  `server_version_num` 170007, `version()`), the release the semantics and
+  the regression campaign are pinned to. It reported 15.0. All four
+  reporting paths read one constant in `PgWireServer`.
+- `CREATE TABLE … PARTITION BY` is refused with 0A000 instead of silently
+  creating an unpartitioned table. The `:pg-dump` preset keeps loading the
+  parent as a plain empty table (new reject-kind `:partitioned-table`).
+- The pagila `pg_dump` round-trip now also compares the partition tables
+  (21 tables, previously 14): the partition filter had excluded them.
+
 ### Beta-exit verification
 
 - Added an executable 0.2.0 beta-exit ledger covering per-commit, manual-release,

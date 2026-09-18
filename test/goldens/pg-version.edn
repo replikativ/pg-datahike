@@ -1,2 +1,2 @@
 {:error nil,
- :rows [["PostgreSQL 15.0 (Datahike PgWire compatibility layer)"]]}
+ :rows [["PostgreSQL 17.7 (Datahike PgWire compatibility layer)"]]}
