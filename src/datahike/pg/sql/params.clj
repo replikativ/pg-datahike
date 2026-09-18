@@ -401,17 +401,33 @@
    that implementation detail for another FROM item."
   nil)
 
+(def ^:dynamic *outer-scope-aliases*
+  "Aliases in *from-bindings* that belong to an ENCLOSING query level --
+   the outer row of a correlated subquery or a LATERAL item.
+
+   Different from *from-source-aliases* in exactly the way PostgreSQL's
+   `colNameToVar` (parse_relation.c) distinguishes levels: it searches
+   the innermost level first and stops at the first level with a match;
+   ambiguity is only possible WITHIN one level. An UPDATE's FROM items
+   share the target's level, so a column both expose is ambiguous. An
+   outer row does not: `(SELECT id FROM ft t2 WHERE t2.id = ft.id)`
+   resolves the bare `id` to t2, and consults the outer row only when
+   the inner level has no such column."
+  nil)
+
 (defn binding-column-owners
-  "Return the aliases in `bindings` that expose `col-name`.
+  "Return the aliases in `bindings` that expose `col-name`, restricted to
+   `aliases` (default: *from-source-aliases*, when set).
 
    Presence is tested with contains? so a SQL NULL remains a found value."
-  [bindings col-name]
-  (into [] (keep (fn [[alias row]]
-                   (when (and (or (nil? *from-source-aliases*)
-                                  (contains? *from-source-aliases* alias))
-                              (contains? row col-name))
-                     alias)))
-        bindings))
+  ([bindings col-name]
+   (binding-column-owners bindings col-name *from-source-aliases*))
+  ([bindings col-name aliases]
+   (into [] (keep (fn [[alias row]]
+                    (when (and (or (nil? aliases) (contains? aliases alias))
+                               (contains? row col-name))
+                      alias)))
+         bindings)))
 
 (defn ambiguous-column!
   [col-name]
