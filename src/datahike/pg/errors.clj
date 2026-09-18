@@ -234,8 +234,9 @@
 
    :undefined-function
    {:sqlstate "42883"
-    :format (fn [{:keys [function detail]}]
-              (or detail
+    :format (fn [{:keys [function detail message]}]
+              (or message
+                  detail
                   (when function
                     (str "function " function " does not exist"))))}
 

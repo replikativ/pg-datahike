@@ -40,6 +40,19 @@
 (def ^:const pg-namespace-oid 2615)
 (def ^:const pg-trigger-oid 2620)
 
+(def catalog-relation-oids
+  "pg_class OIDs of the system catalogs we materialise, from each header's
+   `CATALOG(name, oid, ...)` declaration (src/include/catalog/*.h). What a
+   catalog row's `tableoid` answers; pg_dump keys every object it reads by
+   (tableoid, oid). Views have no tableoid and are deliberately absent."
+  {"pg_attrdef" 2604 "pg_attribute" 1249 "pg_class" 1259 "pg_collation" 3456
+   "pg_constraint" 2606 "pg_database" 1262 "pg_depend" 2608
+   "pg_description" 2609 "pg_enum" 3501 "pg_extension" 3079 "pg_index" 2610
+   "pg_inherits" 2611 "pg_namespace" 2615 "pg_policy" 3256 "pg_proc" 1255
+   "pg_publication" 6104 "pg_publication_namespace" 6237
+   "pg_publication_rel" 6106 "pg_rewrite" 2618 "pg_statistic_ext" 3381
+   "pg_trigger" 2620 "pg_type" 1247})
+
 (def ^:const pg-catalog-namespace-oid 11)
 (def ^:const public-namespace-oid 2200)
 

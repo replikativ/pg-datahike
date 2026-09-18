@@ -20,7 +20,7 @@
 
    API:
      (catalog-probe sql) → :get-fk-conname | :get-primary-keys
-                         | :get-field-metadata | :empty-catalog | nil"
+                         | :get-field-metadata | nil"
   (:require [clojure.string :as str]
             [datahike.pg.sql.classify :as cls]))
 
@@ -129,26 +129,6 @@
 ;; Probe predicates
 ;; ============================================================================
 
-(def ^:private empty-catalog-tables
-  "Catalog / introspection tables we don't materialize. A SELECT that
-   references any of these gets an empty-row result matching the
-   outer SELECT's projection shape. pg_index, pg_attrdef,
-   pg_constraint, pg_description, pg_stat_user_tables, pg_depend,
-   pg_inherits are deliberately NOT here — they flow through the
-   real catalog path since we synthesize rows (or empty-but-real
-   tables for the LEFT-JOIN-able ones) for them."
-  #{"pg_rewrite" "pg_trigger"
-    "pg_stat_activity"
-    "pg_locks"})
-
-(def ^:private empty-catalog-fns
-  "PG system functions that route to the empty-catalog handler. The set
-   is empty now that pg_get_indexdef / pg_get_constraintdef lower to
-   real catalog joins (see datahike.pg.sql.expr) and the comment-lookup
-   pair stub to NULL. Kept as a hook for any future fns that need the
-   shape-level shortcut."
-  #{})
-
 (defn- fk-conname?
   "Odoo's post-add-foreign-key lookup:
      SELECT fk.conname AS name FROM pg_constraint fk WHERE …"
@@ -176,34 +156,19 @@
        (contains? qrefs "pg_catalog.pg_class")
        (contains? qrefs "pg_catalog.pg_attribute")))
 
-(defn- empty-catalog?
-  "Any SELECT that touches a catalog table or function we don't
-   implement. Checked LAST — the specific probes above would also
-   satisfy this predicate (they reference pg_constraint, pg_class,
-   etc.) and must win."
-  [{:keys [idents qrefs fn-names]}]
-  (or (boolean (some empty-catalog-tables idents))
-      (boolean (some empty-catalog-tables
-                     (map #(last (str/split % #"\.")) qrefs)))
-      (boolean (some empty-catalog-fns fn-names))))
-
-;; ============================================================================
-;; Public entry
-;; ============================================================================
-
 (defn catalog-probe
   "If sql is a SELECT that matches a known catalog-probe shape,
    return the :kind keyword the dispatch in server.clj expects; else
    nil.
 
-   Order of checks (most-specific first) matters: every named probe
-   would also trigger :empty-catalog since they all reference
-   catalog tables. We want the richer classification to win."
+   Catalog relations we have no rows for are ordinary (empty) catalog
+   tables now, served through the normal SQL path. Answering any query
+   that merely MENTIONED one with an empty result made `count(*)`
+   return no row and emptied every query that joined one."
   [^String sql]
   (let [shape (summarize (cls/tokenize sql))]
     (when (:select? shape)
       (cond
         (field-metadata? shape) :get-field-metadata
         (primary-keys?   shape) :get-primary-keys
-        (fk-conname?     shape) :get-fk-conname
-        (empty-catalog?  shape) :empty-catalog))))
+        (fk-conname?     shape) :get-fk-conname))))

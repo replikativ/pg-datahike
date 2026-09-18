@@ -84,14 +84,15 @@
                     ON (a.attrelid = def.adrelid AND a.attnum = def.adnum)
             WHERE (c.oid, a.attnum) IN ((16384, 1), (16384, 2))"))))
 
-(deftest probe-empty-catalog
-  (testing "schema-qualified catalog reference (pg_trigger — still unmaterialized)"
-    (is (= :empty-catalog
-           (shape/catalog-probe
-            "SELECT * FROM pg_catalog.pg_trigger"))))
-  (testing "pg_settings is materialized; pg_trigger remains empty"
-    (is (nil? (shape/catalog-probe "SELECT * FROM pg_settings")))
-    (is (= :empty-catalog (shape/catalog-probe "SELECT * FROM pg_trigger"))))
+(deftest probe-catalogs-have-no-shape-shortcut
+  ;; Every catalog a client reads is a real relation now, so no probe
+  ;; answers from the SELECT list's shape: that shortcut made
+  ;; `count(*) FROM pg_trigger` return zero rows labelled `?column?`.
+  (testing "pg_trigger, schema-qualified or not"
+    (is (nil? (shape/catalog-probe "SELECT * FROM pg_catalog.pg_trigger")))
+    (is (nil? (shape/catalog-probe "SELECT count(*) FROM pg_trigger"))))
+  (testing "pg_settings"
+    (is (nil? (shape/catalog-probe "SELECT * FROM pg_settings"))))
   (testing "pg_constraint is now materialized — no shape-level shortcut"
     (is (nil? (shape/catalog-probe
                "SELECT n.nspname, c.conname FROM pg_constraint c
@@ -125,18 +126,18 @@
 ;; ============================================================================
 
 (deftest probe-keyword-in-string-not-matched
-  (testing "'pg_constraint' literal in projection — not empty-catalog"
+  (testing "'pg_constraint' literal in projection — not matched"
     (is (nil? (shape/catalog-probe
                "SELECT 'pg_constraint' AS name FROM users"))))
   (testing "'fk.conname' in a string — not fk-conname"
     (is (nil? (shape/catalog-probe
                "SELECT 'fk.conname AS name' AS q FROM users"))))
-  (testing "'format_type' in a string — not empty-catalog"
+  (testing "'format_type' in a string — not matched"
     (is (nil? (shape/catalog-probe
                "SELECT 'format_type is cool' FROM users")))))
 
 (deftest probe-keyword-in-comment-not-matched
-  (testing "pg_constraint inside block comment — not empty-catalog"
+  (testing "pg_constraint inside block comment — not matched"
     (is (nil? (shape/catalog-probe
                "SELECT id /* from pg_constraint */ FROM users"))))
   (testing "pg_catalog.pg_class inside line comment — not field-metadata"
@@ -149,7 +150,7 @@
                "SELECT $$SELECT FROM pg_constraint$$ AS q")))))
 
 ;; ============================================================================
-;; Specificity ordering — named probes beat :empty-catalog
+;; Specificity ordering — the most specific named probe wins
 ;; ============================================================================
 
 (deftest probe-ordering

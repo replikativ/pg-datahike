@@ -1620,6 +1620,10 @@
 
 (def ^:private show-settings
   {"server_version"                "15.0"
+   ;; Clients branch on the NUMBER (psql, pg_dump, libpq's
+   ;; PQserverVersion); it answered nothing at all. Kept consistent with
+   ;; server_version above.
+   "server_version_num"            "150000"
    "server_encoding"               "UTF8"
    "client_encoding"               "UTF8"
    "search_path"                   "\"$user\", public"
@@ -5399,10 +5403,6 @@
     :dh-create-branch       {:names ["create_branch"]               :oids [PgWireServer/OID_TEXT]}
     :dh-delete-branch       {:names ["delete_branch"]               :oids [PgWireServer/OID_TEXT]}
     :show                   (show-metadata parsed)
-    :empty-catalog          (let [{:keys [names oids]
-                                   :or {names ["id"] oids [PgWireServer/OID_INT8]}}
-                                  (sql/extract-empty-catalog-shape (:sql parsed))]
-                              {:names (vec names) :oids (vec oids)})
     :get-primary-keys       {:names ["TABLE_CAT" "TABLE_SCHEM" "TABLE_NAME"
                                      "COLUMN_NAME" "KEY_SEQ" "PK_NAME"
                                      "IS_NOT_NULL"]
@@ -6317,26 +6317,6 @@
 
 ;; --- Catalog probes ---------------------------------------------------------
 
-(defn- handle-empty-catalog
-  "Zero-row SELECT whose RowDescription matches the outer query's
-   projection shape. pgjdbc's DatabaseMetaData.getTables / getColumns /
-   getIndexInfo issue 12+-column SELECTs against pg_constraint /
-   pg_description and fail on column-index-out-of-range if the shape
-   is wrong. SELECT * (or anything we can't parse) falls back to the
-   legacy 1-column id int8 shape."
-  [{:keys [sql]} _parsed]
-  (if-let [{:keys [names oids]} (sql/extract-empty-catalog-shape sql)]
-    (PgWireServer$QueryResult.
-     (into-array String names)
-     (int-array (map types/oid->wire-int oids))
-     (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
-     "SELECT 0")
-    (PgWireServer$QueryResult.
-     (into-array String ["id"])
-     (int-array [PgWireServer/OID_INT8])
-     (into-array (Class/forName "[Ljava.lang.String;") (make-array String 0 0))
-     "SELECT 0")))
-
 (defn- handle-get-fk-conname
   "Odoo's post-add-foreign-key lookup. Returns a synthetic deterministic
    name since we don't track constraint entities the same way PG does."
@@ -7086,7 +7066,6 @@
       :pg-sleep                (handle-pg-sleep ctx parsed)
       :pg-notify               (handle-pg-notify ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
-      :empty-catalog      (handle-empty-catalog ctx parsed)
       :create-index       (empty-result "CREATE INDEX")
       :get-fk-conname     (handle-get-fk-conname ctx parsed)
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
@@ -11772,17 +11751,7 @@
         ;; compute-schema-oids, matching the simple-query path — any -1
         ;; sentinels (no schema attr, e.g. aggregates) fall back to
         ;; OID_TEXT since we don't yet have values to infer from.
-        ;;
-        ;; :empty-catalog SELECTs (pg_catalog joins Datahike doesn't
-        ;; implement — pg_index, pg_constraint, etc.) also land here:
-        ;; the Execute handler will synthesize a zero-row result with a
-        ;; column shape parsed from the SELECT list, so Describe has to
-        ;; advertise that same shape. Returning NoData here and then
-        ;; sending RowDescription + DataRows at Execute leaves pgjdbc's
-        ;; state machine convinced the statement has no field structure
-        ;; ("Received resultset tuples, but no field structure for them"
-        ;; inside updatable-ResultSet metadata lookups for pgjdbc's PK
-        ;; probe, which queries pg_index via that join).
+
         (cond
           ;; INSERT/UPDATE/DELETE … RETURNING produces rows, so its
           ;; prepared form must Describe the RETURNING column shape —
@@ -11867,7 +11836,7 @@
 
           ;; Any system query whose parse attached :metadata (via
           ;; system-result-metadata) — covers :current-database, :now,
-          ;; :version, :nextval, advisory locks, :empty-catalog,
+          ;; :version, :nextval, advisory locks,
           ;; :get-primary-keys, :get-field-metadata, :show, etc. No-row
           ;; system commands (SET, BEGIN, DECLARE CURSOR, …) have no
           ;; :metadata — they fall through to nil, i.e. NoData, which

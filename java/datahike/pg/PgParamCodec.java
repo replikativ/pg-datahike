@@ -862,9 +862,16 @@ public final class PgParamCodec {
                 // PG "char" (OID 18): a single byte (charsend / pq_sendbyte).
                 // pg_type.typtype/typcategory are this type; asyncpg
                 // binary-decodes it to bytes for its is_scalar_type check.
+                // The value is held as its charout text (see the decoder):
+                // "" is \0 and a \ooo escape is that byte.
                 case PgWireServer.OID_CHAR -> {
                     String s = value.toString();
-                    yield s.isEmpty() ? new byte[0] : new byte[] { (byte) s.charAt(0) };
+                    if (s.isEmpty()) yield new byte[] { 0 };
+                    if (s.length() == 4 && s.charAt(0) == '\\'
+                            && s.substring(1).matches("[0-3][0-7][0-7]")) {
+                        yield new byte[] { (byte) Integer.parseInt(s.substring(1), 8) };
+                    }
+                    yield new byte[] { s.getBytes(StandardCharsets.UTF_8)[0] };
                 }
 
                 case PgWireServer.OID_INT2 ->
@@ -1130,6 +1137,20 @@ public final class PgParamCodec {
                  PgWireServer.OID_VARCHAR,
                  PgWireServer.OID_NAME ->
                 decodeUtf8(bytes);
+
+            // "char" -- charrecv reads exactly one raw byte. The value is
+            // held as its charout text: \0 is the empty string and a
+            // high-bit byte prints as a \ooo octal escape.
+            case PgWireServer.OID_CHAR -> {
+                if (bytes.length != 1) {
+                    throw new PgWireServer.PgProtocolException("22P03",
+                        "incorrect binary data format in bind parameter");
+                }
+                int b = bytes[0] & 0xff;
+                if (b == 0) yield "";
+                if (b < 0x80) yield String.valueOf((char) b);
+                yield String.format("\\%03o", b);
+            }
 
             // bytea — already raw; pass through.
             case PgWireServer.OID_BYTEA ->
