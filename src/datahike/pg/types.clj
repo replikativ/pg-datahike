@@ -425,6 +425,9 @@
     "regnamespace" oid-regnamespace
     "tid"         oid-tid
     "char"        oid-char
+    ;; The SQL spelling of the same type: `'r'::"char"` (pg_dump's
+    ;; acldefault call, for one). Unquoted `char` is bpchar.
+    "\"char\""    oid-char
     "bytea"       oid-bytea
     ;; bit / bit varying. Datahike has no bit type, so these columns
     ;; store PG's text form (the digit run) as :db.type/string — the
@@ -512,6 +515,8 @@
    oid-varchar    "character varying"
    oid-bpchar     "character"
    oid-name       "name"
+   ;; format_type quotes it: unquoted `char` is bpchar.
+   oid-char       "\"char\""
    oid-money      "money"
    oid-bytea      "bytea"
    oid-date       "date"
@@ -864,6 +869,21 @@
    oid-bit       #{oid-varbit}
    oid-varbit    #{oid-bit}})
 
+(def oid->typcollation
+  "`typcollation` from pg_type.dat: the collatable base types and the
+   collation their values carry by default. `name` is C (950), the
+   character types use the database default (100); every other type is
+   not collatable (0)."
+  {oid-text 100 oid-varchar 100 oid-bpchar 100 oid-name 950})
+
+(defn typcollation
+  "Collation OID of a type, element type for an array (PostgreSQL gives
+   an array its element's typcollation), 0 when not collatable."
+  [oid]
+  (or (get oid->typcollation oid)
+      (get oid->typcollation (get array-oid->element-oid oid))
+      0))
+
 (defn implicit-coercible?
   "Can `from` be coerced to `to` implicitly? `can_coerce_type` with
    COERCION_IMPLICIT, for a single scalar argument."
@@ -1177,6 +1197,10 @@
         (contains? cast-numeric-types base)   :numeric
         (contains? cast-money-types base)     :money
         (contains? cast-float-types base)     :float
+        ;; QUOTED "char" is PostgreSQL's internal one-byte type (OID 18);
+        ;; unquoted char is character, i.e. bpchar. normalize-sql-type-name
+        ;; keeps identifier quotes, so the two stay distinct here.
+        (= base "\"char\"")                   :internal-char
         (contains? cast-text-types base)      :text
         (contains? cast-boolean-types base)   :boolean
         (contains? cast-date-types base)      :date

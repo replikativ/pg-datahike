@@ -3097,7 +3097,7 @@
           ;; ::numeric still keeps arbitrary precision: cast-scalar parses
           ;; via the string form so a literal's scale survives (0.001000 →
           ;; scale 6), never via double.
-          (or is-int? is-float? is-numeric? is-money?)
+          (or is-int? is-float? is-numeric? is-money? (= :internal-char cast-cat))
           (sql-cast/cast-scalar inner-raw type-str
                                 {:explicit? true
                                  :parse-timestamp parse-timestamp-string})
@@ -4793,6 +4793,34 @@
           (swap! (:nullable-vars ctx) conj out-var)
           out-var)))))
 
+(defn- tableoid-ref?
+  [expr]
+  (and (instance? Column expr)
+       (nil? (.getArrayConstructor ^Column expr))
+       (= "tableoid" (str/lower-case (params/unquote-ident (.getColumnName ^Column expr))))))
+
+(defn- translate-tableoid
+  "The `tableoid` system column: the pg_class OID of the relation a row
+   comes from, a constant per relation. Every table has it and no user
+   column may take the name, so it never competes with ordinary resolution.
+   Unqualified, it needs exactly one relation in scope (42702 otherwise).
+   Derived relations, CTEs and views have none (42703)."
+  [ctx ^Column expr]
+  (let [aliases (:table-aliases ctx)
+        tbl (.getTable expr)
+        relation (if tbl
+                   (get aliases (params/unquote-ident (.getName ^Table tbl)))
+                   (let [occurrences (or (seq (:relation-aliases (meta aliases)))
+                                         (seq (distinct (vals aliases)))
+                                         (some-> (:default-table ctx) vector))]
+                     (when (> (count occurrences) 1)
+                       (params/ambiguous-column! "tableoid"))
+                     (some->> (first occurrences) (#(get aliases % %)))))]
+    (or (when (and relation (not (contains? (set (:derived-aliases ctx)) relation)))
+          (or (get catalog-objects/catalog-relation-oids relation)
+              (some-> (:db ctx) (pgs/table-oid relation))))
+        (throw (errors/pg-error :undefined-column {:column "tableoid"})))))
+
 (defn column-value!
   "Return a column's SQL value variable. Most Datahike scalar values are
    already their SQL representation. NUMERIC specials use reserved
@@ -4973,6 +5001,9 @@
       (swap! (:in-args ctx) conj value-fn)
       (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
       result-var)
+
+    (tableoid-ref? expr)
+    (translate-tableoid ctx expr)
 
     ;; A bare identifier naming a table in scope is a PostgreSQL
     ;; WHOLE-ROW REFERENCE: `SELECT t FROM t` yields the composite
@@ -5702,6 +5733,11 @@
         (instance? OrExpression expr)
         (instance? LikeExpression expr)
         (instance? Matches expr)
+        ;; `~ ~* !~ !~*` -- implemented in translate-predicate-expr, but
+        ;; missing from this list, so `SELECT s ~ 'a'` raised "expression
+        ;; of type RegExpMatchOperator is not supported" while the same
+        ;; test in WHERE worked.
+        (instance? RegExpMatchOperator expr)
         (instance? Between expr)
         (instance? IsBooleanExpression expr)
         (instance? IsUnknownExpression expr)

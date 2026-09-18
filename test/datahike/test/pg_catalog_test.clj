@@ -1002,3 +1002,70 @@
   (testing "ARRAY(SELECT col FROM tbl) — empty result → empty array"
     (let [r (ex "SELECT array(SELECT relname FROM pg_class WHERE relname = '__no_such__')")]
       (is (nil? (:err r))))))
+
+;; ============================================================================
+;; Catalogs psql / pg_dump read unconditionally. Real relations with PG 17
+;; columns, so a projection or a count answers the way PostgreSQL does
+;; rather than through a shape-only stub.
+;; ============================================================================
+
+(deftest trigger-rule-lock-and-activity-catalogs-are-relations
+  (doseq [t ["pg_trigger" "pg_rewrite" "pg_locks" "pg_stat_activity"]]
+    (let [r (ex (str "SELECT count(*) FROM " t))]
+      (is (nil? (:err r)) (str t ": " (:err r)))
+      (is (= ["count"] (:cols r)) t)
+      (is (= [["0"]] (:rows r)) t)))
+  (is (nil? (:err (ex "SELECT tgname, tgrelid, tgenabled FROM pg_trigger WHERE tgrelid = 1")))))
+
+(deftest collations
+  (is (= [["100" "default" "d"] ["950" "C" "c"] ["951" "POSIX" "c"]]
+         (rows (str "SELECT oid, collname, collprovider FROM pg_collation "
+                    "WHERE oid IN (100, 950, 951) ORDER BY oid"))))
+  (testing "NULL collcollate is absent, not a stored nil"
+    (is (= [["default" nil] ["C" "C"]]
+           (rows "SELECT collname, collcollate FROM pg_collation WHERE oid IN (100, 950) ORDER BY oid"))))
+  (testing "typcollation: collatable types carry default (100), name is C (950)"
+    (is (= [["int4" "0"] ["name" "950"] ["text" "100"] ["varchar" "100"]]
+           (rows (str "SELECT typname, typcollation FROM pg_type "
+                      "WHERE typname IN ('text','varchar','name','int4') ORDER BY typname")))))
+  (testing "attcollation follows the column type"
+    (is (= [["age" "0"] ["name" "100"]]
+           (rows (str "SELECT attname, attcollation FROM pg_attribute a "
+                      "JOIN pg_class c ON c.oid = a.attrelid "
+                      "WHERE c.relname = 'person' AND a.attname IN ('name','age') "
+                      "ORDER BY attname"))))))
+
+(deftest quoted-char-type
+  ;; `"char"` (OID 18) is the one-byte internal type; unquoted `char` is
+  ;; bpchar. charin keeps the first byte.
+  (is (= [["h"]] (rows "SELECT 'hello'::\"char\"")))
+  (testing "the same fold when a templated numeric literal sits beside it"
+    (is (= [["h" "1"]] (rows "SELECT 'hello'::\"char\", 1"))))
+  (is (= [["\"char\""]] (rows "SELECT pg_typeof('x'::\"char\")")))
+  (testing "charin keeps the first BYTE; charout escapes a high-bit byte"
+    (is (= [["\\303" "A"]] (rows "SELECT 'é'::\"char\", E'\\\\101'::\"char\""))))
+  (is (= [["hello"]] (rows "SELECT 'hello'::char(5)"))))
+
+(deftest regex-match-in-select-list
+  (is (= [["t" "t" "f"]] (rows "SELECT 'abc' ~ 'b', 'abc' !~ 'z', 'abc' ~* 'Z'"))))
+
+(deftest server-version-num-matches-server-version
+  (let [v (ffirst (rows "SHOW server_version"))
+        n (ffirst (rows "SHOW server_version_num"))]
+    (is (= (Long/parseLong (first (str/split v #"\."))) (quot (Long/parseLong n) 10000)))))
+
+(deftest tableoid-system-column
+  ;; pg_dump keys every catalog object by (tableoid, oid); a NULL tableoid
+  ;; made it report "schema with OID 2200 does not exist".
+  (is (= [["2615" "1259" "1247"]]
+         (rows (str "SELECT n.tableoid, c.tableoid, t.tableoid "
+                    "FROM pg_namespace n, pg_class c, pg_type t "
+                    "WHERE n.nspname = 'public' AND c.relname = 'person' "
+                    "AND t.typname = 'int4'"))))
+  (is (= [["t"]]
+         (rows (str "SELECT p.tableoid = (SELECT oid FROM pg_class WHERE relname = 'person') "
+                    "FROM person p"))))
+  (testing "unqualified over two relations is ambiguous, as in PostgreSQL"
+    (is (= "42702" (:sqlstate (ex "SELECT tableoid FROM person a, person b")))))
+  (testing "a derived relation has no tableoid"
+    (is (= "42703" (:sqlstate (ex "SELECT tableoid FROM (SELECT 1) s"))))))

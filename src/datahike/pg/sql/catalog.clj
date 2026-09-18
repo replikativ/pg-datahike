@@ -16,7 +16,7 @@
    Two public entry points:
    - `register-catalog-table!` / `unregister-catalog-table!`
      — the extension seam
-   - `extract-empty-catalog-shape` / `system-query?`
+   - `system-query?`
      — called by the wire handler to short-circuit common boot probes
        (pgjdbc's field-metadata, Hibernate's feature detection) into
        fast paths before JSqlParser even runs."
@@ -31,11 +31,10 @@
             [datahike.pg.sql.shape :as shape]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
-  (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
-           [net.sf.jsqlparser.schema Column Table]
-           [net.sf.jsqlparser.statement.select PlainSelect SelectItem AllColumns Join ParenthesedSelect SetOperationList]
+  (:import [net.sf.jsqlparser.schema Table]
+           [net.sf.jsqlparser.statement.select PlainSelect Join ParenthesedSelect SetOperationList]
            [net.sf.jsqlparser.expression.operators.relational EqualsTo]
-           [net.sf.jsqlparser.expression StringValue Alias]))
+           [net.sf.jsqlparser.expression StringValue]))
 
 (set! *warn-on-reflection* true)
 
@@ -103,6 +102,14 @@
     ;; Logical replication is unsupported; psql nevertheless runs its
     ;; publication UNION query for every ordinary table it describes.
     "pg_publication" "pg_publication_namespace" "pg_publication_rel"
+    ;; Real relations, not the shape.clj token shortcut that used to
+    ;; answer any query MENTIONING them with an empty result -- so
+    ;; `SELECT count(*) FROM pg_trigger` returned no row at all, and a
+    ;; query that merely joined one lost every row.
+    "pg_trigger" "pg_rewrite" "pg_locks" "pg_stat_activity"
+    ;; psql 17 resolves every column's collation while describing a
+    ;; relation (`\d t`); without the catalog the whole command failed.
+    "pg_collation"
     "information_schema_columns" "information_schema_tables"
     "information_schema_sequences"
     "information_schema_table_constraints"
@@ -218,7 +225,25 @@
   [table-name user-schema cte-db]
   (if-let [entry (get @extra-catalog-tables table-name)]
     ((:data-fn entry) user-schema cte-db)
-    (catalog-data-for* table-name user-schema cte-db)))
+    (let [rows (catalog-data-for* table-name user-schema cte-db)]
+      (case table-name
+        ;; Collation follows the type, as in PostgreSQL: a column carries
+        ;; its type's typcollation unless declared otherwise (COLLATE is
+        ;; not modelled), and a domain its base type's.
+        "pg_type"
+        (mapv (fn [r]
+                (assoc r :pg_type/typcollation
+                       (long (types/typcollation
+                              (or (let [b (:pg_type/typbasetype r)]
+                                    (when (and b (pos? (long b))) b))
+                                  (:pg_type/oid r))))))
+              rows)
+        "pg_attribute"
+        (mapv (fn [r]
+                (assoc r :pg_attribute/attcollation
+                       (long (types/typcollation (:pg_attribute/atttypid r)))))
+              rows)
+        rows))))
 
 (defn catalog-schema-for*
   "Built-in catalog schema — every table-name is a key in a case
@@ -250,6 +275,7 @@
      {:db/ident :pg_type/typrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typbasetype :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_type/typnotnull :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_type/typcollation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident (pgs/row-marker-attr "pg_type") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_attribute"
     [{:db/ident :pg_attribute/attname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
@@ -280,6 +306,7 @@
      ;; attisdropped: asyncpg's composite-field introspection filters
      ;; `NOT ia.attisdropped`, so the column must exist (always false here).
      {:db/ident :pg_attribute/attisdropped :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_attribute/attcollation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
      {:db/ident (pgs/row-marker-attr "pg_attribute") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_namespace"
     ;; nspowner/nspacl exist for pg_dump, which selects them and then
@@ -409,6 +436,94 @@
      {:db/ident :pg_enum/enumsortorder :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
      {:db/ident :pg_enum/enumlabel :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
      {:db/ident (pgs/row-marker-attr "pg_enum") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_collation"
+    ;; PostgreSQL 17's built-in collations (pg_collation.dat); the OS-locale rows
+    ;; a real server adds at initdb are environment-specific and omitted.
+    [{:db/ident :pg_collation/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_collation/collname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_collation/collnamespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_collation/collowner :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_collation/collprovider :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_collation/collisdeterministic :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_collation/collencoding :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_collation/collcollate :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_collation/collctype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_collation/colllocale :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_collation/collicurules :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_collation/collversion :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_collation") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_trigger"
+    ;; Empty until triggers exist -- PostgreSQL 17 columns (tgattr/tgargs omitted:
+    ;; int2vector and bytea over no rows).
+    [{:db/ident :pg_trigger/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgparentid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_trigger/tgfoid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgtype :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_trigger/tgenabled :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_trigger/tgisinternal :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_trigger/tgconstrrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgconstrindid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgconstraint :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_trigger/tgdeferrable :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_trigger/tginitdeferred :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_trigger/tgnargs :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_trigger/tgqual :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_trigger/tgoldtable :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_trigger/tgnewtable :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident (pgs/row-marker-attr "pg_trigger") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_rewrite"
+    ;; Empty: no rules (views do not yet carry their _RETURN rule object).
+    [{:db/ident :pg_rewrite/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_rewrite/rulename :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_rewrite/ev_class :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_rewrite/ev_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_rewrite/ev_enabled :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "char"}
+     {:db/ident :pg_rewrite/is_instead :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_rewrite/ev_qual :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_rewrite/ev_action :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_rewrite") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_locks"
+    ;; Empty: Datahike has no lock table to expose.
+    [{:db/ident :pg_locks/locktype :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_locks/database :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_locks/relation :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_locks/page :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_locks/tuple :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_locks/virtualxid :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_locks/transactionid :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_locks/classid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_locks/objid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_locks/objsubid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int2"}
+     {:db/ident :pg_locks/virtualtransaction :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_locks/pid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_locks/mode :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_locks/granted :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_locks/fastpath :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_locks") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    "pg_stat_activity"
+    ;; Correct shape, no rows yet. PostgreSQL always shows at least the current
+    ;; session; populating it from the connection registry is a follow-up.
+    [{:db/ident :pg_stat_activity/datid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_stat_activity/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_stat_activity/pid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_stat_activity/leader_pid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_stat_activity/usesysid :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "oid"}
+     {:db/ident :pg_stat_activity/usename :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
+     {:db/ident :pg_stat_activity/application_name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/client_addr :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/client_hostname :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/client_port :db/valueType :db.type/long :db/cardinality :db.cardinality/one :pg/type "int4"}
+     {:db/ident :pg_stat_activity/wait_event_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/wait_event :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/state :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/backend_xid :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/backend_xmin :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/query_id :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/query :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_stat_activity/backend_type :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     {:db/ident (pgs/row-marker-attr "pg_stat_activity") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_policy"
     ;; Always empty: pg-datahike does not implement row-level security. These
     ;; are the columns psql 17's describe.c projects when describing a table.
@@ -1576,6 +1691,24 @@
         (pgs/row-marker-attr "pg_enum") true}))
     "pg_policy"
     []
+    "pg_collation"
+    (mapv (fn [[oid collname provider encoding collate]]
+            ;; A NULL collcollate/collctype is an absent datom.
+            (cond-> {:pg_collation/oid oid :pg_collation/collname collname
+                     :pg_collation/collnamespace 11 :pg_collation/collowner 10
+                     :pg_collation/collprovider provider
+                     :pg_collation/collisdeterministic true
+                     :pg_collation/collencoding encoding
+                     (pgs/row-marker-attr "pg_collation") true}
+              collate (assoc :pg_collation/collcollate collate
+                             :pg_collation/collctype collate)))
+          [[100 "default" "d" -1 nil] [811 "pg_c_utf8" "b" 6 nil]
+           [950 "C" "c" -1 "C"] [951 "POSIX" "c" -1 "POSIX"]
+           [962 "ucs_basic" "b" 6 nil] [963 "unicode" "i" -1 nil]])
+    "pg_trigger" []
+    "pg_rewrite" []
+    "pg_locks" []
+    "pg_stat_activity" []
     "pg_statistic_ext"
     []
     "pg_publication"
@@ -1894,55 +2027,6 @@
 ;; ============================================================================
 ;; System query detection
 ;; ============================================================================
-
-(defn extract-empty-catalog-shape
-  "Parse a SELECT that was classified as `:empty-catalog` and return
-   `{:names [String…] :oids [int…]}` matching the projection shape the
-   client expects in RowDescription. Used when we respond to a known-
-   empty catalog query with zero rows — clients like pgJDBC's
-   `DatabaseMetaData.getTables` issue 12-column SELECTs and will raise
-   `column index out of range` if the RowDescription doesn't match.
-
-   For `SELECT *` and anything we can't parse, returns nil so callers
-   can fall back to a minimal 1-column shape (which is wrong, but
-   harmless for psycopg2 / asyncpg that always go by column name).
-
-   Types are all OID_TEXT. That's the honest answer (we don't know),
-   and it matches PG's `unknown`-to-`text` coercion at the wire
-   boundary for untyped columns."
-  [^String sql]
-  (try
-    (let [stmt (CCJSqlParserUtil/parse ^String sql)]
-      (when-let [^PlainSelect ps (cond
-                                   (instance? PlainSelect stmt) stmt
-                                   (instance? ParenthesedSelect stmt)
-                                   (.getSelect ^ParenthesedSelect stmt)
-                                   :else nil)]
-        (let [items (.getSelectItems ps)]
-          ;; Bail on SELECT * — we have no schema for catalog views,
-          ;; so the column shape is unknowable without materialising.
-          (when-not (some (fn [^SelectItem it]
-                            (instance? AllColumns (.getExpression it)))
-                          items)
-            (let [names (mapv
-                         (fn [^SelectItem it]
-                           (or
-                            ;; Explicit AS alias takes precedence.
-                            (when-let [a (.getAlias it)]
-                              (unquote-ident (.getName ^Alias a)))
-                            ;; Bare column reference: use the column name.
-                            (let [e (.getExpression it)]
-                              (when (instance? Column e)
-                                (unquote-ident (.getColumnName ^Column e))))
-                            ;; Anything else (function call, expression
-                            ;; without alias): PG would name it
-                            ;; "?column?" — mirror that.
-                            "?column?"))
-                         items)]
-              {:names names
-               :oids  (vec (repeat (count names) types/oid-text))})))))
-    (catch Exception _
-      nil)))
 
 (def classify-system-kinds
   "Classifier :kind values that route to the system-type dispatch in

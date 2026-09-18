@@ -293,6 +293,22 @@
       (-> (pg-bits/parse-bit-literal (str v) varying?)
           (pg-bits/coerce-width w explicit?)))))
 
+(defn- internal-char-in
+  "PostgreSQL's charin followed by charout (utils/adt/char.c), since a
+   `\"char\"` is held as its output text. Input is a `\\ooo` octal escape or
+   else the FIRST BYTE of the UTF-8 text (\\0 when empty). Output is empty
+   for \\0, the character itself when ASCII, and `\\ooo` for a high-bit
+   byte -- so `'é'::\"char\"` is `\\303`, not `é`."
+  [^String t]
+  (let [b (cond
+            (empty? t) 0
+            (re-matches #"\\[0-3][0-7][0-7]" t) (Long/parseLong (subs t 1) 8)
+            :else (bit-and 0xff (aget (.getBytes t java.nio.charset.StandardCharsets/UTF_8) 0)))]
+    (cond
+      (zero? b) ""
+      (< b 0x80) (str (char b))
+      :else (format "\\%03o" b))))
+
 (defn cast-scalar
   "Apply a SQL cast of `v` to the target named by `type-str`.
 
@@ -379,6 +395,9 @@
         ;; both the wrong format and rendered in the JVM's default time
         ;; zone — see types/temporal->pg-text. The length modifier is
         ;; applied after, since it applies to the RENDERED text.
+        :internal-char (internal-char-in
+                        (if (string? v) v (types/->pg-text v src-oid)))
+
         :text (apply-text-length
                (cond
                  (pg-bits/pg-bit? v) (pg-bits/to-pg-text v)

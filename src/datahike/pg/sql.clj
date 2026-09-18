@@ -393,7 +393,6 @@
 ;; datahike.pg (public facade) or server.clj (system-query fast path).
 (def register-catalog-table!     catalog/register-catalog-table!)
 (def unregister-catalog-table!   catalog/unregister-catalog-table!)
-(def extract-empty-catalog-shape catalog/extract-empty-catalog-shape)
 (def system-query?               catalog/system-query?)
 
 ;; Expression + predicate translation moved to datahike.pg.sql.expr.
