@@ -69,6 +69,14 @@
    :release-gate? true
    :evidence ["test/integration/pgdump/run.sh"]
    :claim "default COPY-format Pagila restore with source/target row-count equality"}
+  {:id :differential-fuzz
+   :cadence :commit
+   :status :gating
+   :ci-job "differential-fuzz"
+   :release-gate? true
+   :evidence ["test/datahike/fuzz/differential.clj"
+              "test/integration/fuzz/expected-divergences.edn"]
+   :claim "fixed-seed generated SELECT, prepared and DML samples agree with PostgreSQL 17.7 on rows or SQLSTATE, apart from listed divergences"}
   {:id :postgres-inventory
    :cadence :commit
    :status :gating

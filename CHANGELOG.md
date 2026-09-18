@@ -4,6 +4,18 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Differential fuzzing is a per-commit gate
+
+- `datahike.fuzz.differential` (`bb fuzz`) generates SELECT, prepared and
+  DML samples, runs them on PostgreSQL 17.7 and pg-datahike, and compares
+  rows, or SQLSTATEs when both fail. The `differential-fuzz` CI job runs a
+  fixed seed against a 17.7 sidecar and gates deployment. Known divergences
+  are listed with reasons in `test/integration/fuzz/expected-divergences.edn`.
+- `bb fncov` measures function breadth by calling every buildable
+  `pg_catalog` overload on both servers.
+- `doc/integration-testing.md` maps each behaviour area to the harnesses
+  that cover it, and records the PostgreSQL regression-suite status.
+
 ### Silent wrong answers found by SQLSTATE-exact fuzzing
 
 - `INSERT ... VALUES` evaluates non-literal expressions as PostgreSQL does.

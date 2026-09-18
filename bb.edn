@@ -32,6 +32,12 @@
                 :task (apply shell "clojure -M:dev -m datahike.test.cross-engine"
                              *command-line-args*)}
 
+  fuzz {:doc "Differential fuzzer vs a real PostgreSQL 17.7. Usage: bb fuzz [select|prepared|dml|all] [n] [seed]. Requires REFERENCE_URL + TARGET_URL env (defaults: local oracle :15998, dev server :15432)."
+        :task (apply shell "clojure -M:dev -m datahike.fuzz.differential" *command-line-args*)}
+
+  fncov {:doc "Function-coverage sweep: call every buildable pg_catalog overload on PostgreSQL and pg-datahike and diff. Usage: bb fncov [name ...]. Same REFERENCE_URL / TARGET_URL as bb fuzz."
+         :task (apply shell "clojure -M:dev -m datahike.fuzz.fncov" *command-line-args*)}
+
   pg-regress {:doc "Run named PostgreSQL regression tests against an existing pg-datahike server (non-gating by default)."
               :task (apply shell "bash test/integration/postgres-regress/run.sh"
                            *command-line-args*)}
