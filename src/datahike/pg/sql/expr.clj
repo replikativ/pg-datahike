@@ -67,7 +67,8 @@
             BooleanValue Parenthesis NotExpression CaseExpression WhenClause
             SignedExpression CastExpression TimeKeyExpression JsonExpression
             ExtractExpression TrimFunction BinaryExpression
-            TimezoneExpression ArrayConstructor JdbcParameter JdbcNamedParameter]
+            TimezoneExpression ArrayConstructor JdbcParameter JdbcNamedParameter
+            RowConstructor]
            [net.sf.jsqlparser.expression.operators.relational
             DoubleAnd EqualsTo ExistsExpression ExpressionList
             GreaterThan GreaterThanEquals InExpression IsBooleanExpression
@@ -376,6 +377,52 @@
    value itself carries no answer."
   [ctx expr]
   (try (oid-infer/expr-oid expr (oid-env ctx)) (catch Throwable _ nil)))
+
+(defn- row-operand? [expr]
+  (or (instance? RowConstructor expr)
+      (and (instance? ParenthesedExpressionList expr)
+           (> (.size ^ParenthesedExpressionList expr) 1))
+      (and (instance? Function expr)
+           (= "row" (str/lower-case (str (.getName ^Function expr)))))))
+
+(defn- regex-operator-symbol [op-type]
+  (case op-type
+    "MATCH_CASESENSITIVE" "~"
+    "MATCH_CASEINSENSITIVE" "~*"
+    "NOT_MATCH_CASESENSITIVE" "!~"
+    "NOT_MATCH_CASEINSENSITIVE" "!~*"
+    op-type))
+
+(defn- check-pattern-match-operands!
+  "Pattern matching (`~ ~* !~ !~*`, and LIKE/ILIKE, which PostgreSQL
+   resolves as the operators `~~ ~~* !~~ !~~*`) is defined on the string
+   category -- LIKE also on bytea. Anything else has no operator (42883);
+   row against row is the row-comparison 0A000 (parse_expr.c
+   make_row_comparison_op). Without this, `1 ~ 'a'` and `ROW(..) ~~ ROW(..)`
+   failed with a ClassCastException and `'abc' ~ 1` answered false."
+  [ctx op left right like?]
+  (when (and (row-operand? left) (row-operand? right))
+    (throw (errors/pg-error
+            :feature-not-supported
+            {:message (str "could not determine interpretation of row comparison operator " op)
+             :hint "Row comparison operators must be associated with btree operator families."})))
+  (let [oid-of #(if (row-operand? %) 2249 (source-oid ctx %))
+        allowed? (fn [oid]
+                   (or (nil? oid)
+                       (= :S (get types/oid->category oid))
+                       (and like? (= oid types/oid-bytea))))
+        type-name (fn [expr oid]
+                    (if (instance? StringValue expr)
+                      "unknown"
+                      (get types/oid->pg-name oid (if (= 2249 oid) "record" "?"))))
+        lo (oid-of left) ro (oid-of right)]
+    (when-not (and (allowed? lo) (allowed? ro))
+      (throw (errors/pg-error
+              :undefined-function
+              {:message (str "operator does not exist: " (type-name left lo) " " op " "
+                             (type-name right ro))
+               :hint (str "No operator matches the given name and argument "
+                          "types. You might need to add explicit type casts.")})))))
 
 (defn- enum-name-of-expr
   "Recover the declared enum type from a cast or stored enum column. Enum
@@ -2676,6 +2723,9 @@
     (let [^LikeExpression e expr
           not-like? (.isNot e)
           case-insensitive? (.isCaseInsensitive e)
+          _ (check-pattern-match-operands!
+             ctx (str (when not-like? "!") "~~" (when case-insensitive? "*"))
+             (.getLeftExpression e) (.getRightExpression e) true)
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           pattern (translate-expr ctx (.getRightExpression e))
@@ -2740,6 +2790,9 @@
     (instance? RegExpMatchOperator expr)
     (let [^RegExpMatchOperator e expr
           op-type (str (.getOperatorType e))
+          _ (check-pattern-match-operands!
+             ctx (regex-operator-symbol op-type)
+             (.getLeftExpression e) (.getRightExpression e) false)
           negate? (or (= op-type "NOT_MATCH_CASESENSITIVE")
                       (= op-type "NOT_MATCH_CASEINSENSITIVE"))
           ci? (or (= op-type "MATCH_CASEINSENSITIVE")
@@ -7043,6 +7096,9 @@
     (instance? RegExpMatchOperator expr)
     (let [^RegExpMatchOperator e expr
           op-type (str (.getOperatorType e))
+          _ (check-pattern-match-operands!
+             ctx (regex-operator-symbol op-type)
+             (.getLeftExpression e) (.getRightExpression e) false)
           negate? (or (= op-type "NOT_MATCH_CASESENSITIVE")
                       (= op-type "NOT_MATCH_CASEINSENSITIVE"))
           case-insensitive? (or (= op-type "MATCH_CASEINSENSITIVE")
@@ -7110,6 +7166,9 @@
     (let [^LikeExpression e expr
           not-like? (.isNot e)
           case-insensitive? (.isCaseInsensitive e)
+          _ (check-pattern-match-operands!
+             ctx (str (when not-like? "!") "~~" (when case-insensitive? "*"))
+             (.getLeftExpression e) (.getRightExpression e) true)
           col (translate-expr ctx (.getLeftExpression e))
           right-expr (.getRightExpression e)
           pattern (translate-expr ctx right-expr)

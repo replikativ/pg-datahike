@@ -869,6 +869,22 @@
             [pos end " XOR "]))
         toks))
 
+(def ^:private like-operator-spellings
+  {"~~" " LIKE " "!~~" " NOT LIKE " "~~*" " ILIKE " "!~~*" " NOT ILIKE "})
+
+(defn like-operator-rule
+  "Spell PostgreSQL's LIKE operators as keywords. `~~ !~~ ~~* !~~*` ARE
+   `LIKE`, `NOT LIKE`, `ILIKE`, `NOT ILIKE` (pg_operator: textlike and
+   friends -- the keyword forms are parsed into these operators).
+   JSqlParser has no such tokens and read `a ~~ b` as `a ~ (~b)`, a regex
+   match against the bitwise NOT of the pattern. The tokenizer emits each
+   spelling as one :op token and keeps strings and comments opaque."
+  [toks]
+  (keep (fn [{:keys [type text pos end]}]
+          (when-let [kw (and (= :op type) (like-operator-spellings text))]
+            [pos end kw]))
+        toks))
+
 (defn negative-numeric-scale-rule
   "Encode a negative NUMERIC/DECIMAL scale for JSqlParser.
 
@@ -970,5 +986,6 @@
    wide-integer-literal-rule
    dollar-quoted-string-rule
    hash-xor-rule
+   like-operator-rule
    json-path-operator-spacing-rule
    partition-by-rule])

@@ -1046,8 +1046,22 @@
     (is (= [["\\303" "A"]] (rows "SELECT 'é'::\"char\", E'\\\\101'::\"char\""))))
   (is (= [["hello"]] (rows "SELECT 'hello'::char(5)"))))
 
-(deftest regex-match-in-select-list
-  (is (= [["t" "t" "f"]] (rows "SELECT 'abc' ~ 'b', 'abc' !~ 'z', 'abc' ~* 'Z'"))))
+(deftest pattern-match-operators
+  (testing "regex operators in the select list, not only in WHERE"
+    (is (= [["t" "t" "f"]] (rows "SELECT 'abc' ~ 'b', 'abc' !~ 'z', 'abc' ~* 'Z'"))))
+  (testing "~~ !~~ ~~* !~~* are LIKE, NOT LIKE, ILIKE, NOT ILIKE"
+    ;; JSqlParser read `a ~~ b` as `a ~ (~b)`.
+    (is (= [["t" "f" "t" "f"]]
+           (rows "SELECT 'abc' ~~ 'a%', 'abc' !~~ 'a%', 'ABC' ~~* 'a%', 'ABC' !~~* 'a%'")))
+    (is (= [["1"]] (rows "SELECT count(*) FROM person WHERE name ~~ 'Al%'")))
+    (is (= [["a~~b"]] (rows "SELECT 'a~~b'"))
+        "the operator spelling inside a string literal is untouched"))
+  (testing "operands outside the string category have no operator (42883)"
+    (is (= "42883" (:sqlstate (ex "SELECT 'abc' ~ 1"))))
+    (is (= "42883" (:sqlstate (ex "SELECT age ~ '3' FROM person"))))
+    (is (= "42883" (:sqlstate (ex "SELECT * FROM person WHERE age LIKE '3%'")))))
+  (testing "row against row is the row-comparison error"
+    (is (= "0A000" (:sqlstate (ex "SELECT ROW('ABC','DEF') ~~ ROW('DEF','ABC')"))))))
 
 (deftest server-version-num-matches-server-version
   (let [v (ffirst (rows "SHOW server_version"))
