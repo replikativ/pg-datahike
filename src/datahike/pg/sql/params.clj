@@ -150,12 +150,23 @@
   [ref f]
   (update ref ::transforms (fnil conj []) f))
 
+(defn expression-param-ref
+  "Placeholder for an INSERT VALUES expression over parameters
+   (`$2 || 'x'`, `$3 + 1`). Parse has no values, so evaluation waits for
+   Bind: `f` receives the 0-based vector of bound values $1..$`max-idx`
+   and returns the expression's value. Casts wrapping the expression
+   still compose through `transform-param-ref`."
+  [max-idx f]
+  (assoc (->ParamRef max-idx) ::expression f))
+
 (defn resolve-param-ref
   "Resolve one ParamRef through the 1-based `fetch` function, applying any
    boundary coercion carried by the placeholder."
   [ref fetch]
   (let [value (reduce (fn [v f] (f v))
-                      (fetch (:idx ref))
+                      (if-let [expression (::expression ref)]
+                        (expression (mapv fetch (range 1 (inc (long (:idx ref))))))
+                        (fetch (:idx ref)))
                       (::transforms ref))]
     (case (first (::coercion ref))
       :seek-key

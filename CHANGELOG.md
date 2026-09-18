@@ -4,6 +4,21 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Silent wrong answers found by SQLSTATE-exact fuzzing
+
+- `INSERT ... VALUES` evaluates non-literal expressions as PostgreSQL does.
+  It used to store the SQL text of anything it could not evaluate (`'a' ||
+  NULL`, `CASE`, a bare identifier), the internal `:__null__` sentinel for
+  NULL results, and `now()` for any `AT TIME ZONE`. Expressions over
+  prepared-statement parameters are evaluated at Bind (they reached the
+  column as text such as `$3 + 1`).
+- A `SELECT` without `FROM` raises 42703 / 42P01 for column references
+  instead of answering no rows or implicitly adding the table. asyncpg's
+  `test_prepare_02` now passes.
+- Casts with no pathway in PostgreSQL (`date::int`, `bool::numeric`, ...)
+  raise 42846 at parse instead of 22P02 at run time, using the pinned
+  `pg_cast.dat`.
+
 ### PostgreSQL identity and loud refusals
 
 - The server reports PostgreSQL 17.7 (`server_version` 17.7,
