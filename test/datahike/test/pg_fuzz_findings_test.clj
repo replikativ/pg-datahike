@@ -195,3 +195,37 @@
              (rows c "SELECT b AS g, count(*) AS n FROM ft GROUP BY 1 HAVING count(*) = 2 ORDER BY 1")))
       (is (= [["f" "2"] ["t" "2"]]
              (rows c "SELECT b AS g, count(*) AS n FROM ft GROUP BY 1 HAVING count(*) > 1 ORDER BY 1"))))))
+
+;; ---------------------------------------------------------------------------
+;; Second sweep: the fuzzer compares SQLSTATEs, not just "both errored".
+
+(defn- state [^Connection c sql]
+  (try (with-open [st (.createStatement c)] (.execute st sql)) nil
+       (catch java.sql.SQLException e (.getSQLState e))))
+
+(deftest cast-without-a-pathway-is-42846
+  ;; parse_coerce.c find_coercion_pathway: no pg_cast row and no I/O
+  ;; conversion. These failed at RUN time with 22P02, as if the value were
+  ;; merely malformed.
+  (with-open [c (jdbc)]
+    (seed! c)
+    (doseq [sql ["SELECT d::int FROM ft" "SELECT b::numeric FROM ft"
+                 "SELECT n::bool FROM ft" "SELECT f::bool FROM ft"
+                 "SELECT d::bool FROM ft" "SELECT i::date FROM ft"
+                 "SELECT ARRAY[1,2]::date[]"]]
+      (is (= "42846" (state c sql)) sql))
+    (testing "casts PostgreSQL does have still work"
+      (is (= [["1" "t" "1" "10" "20" "2020-01-01 00:00:00" "{1,2}"]]
+             (rows c (str "SELECT id, i::bool, b::int, i::text, j::varchar, "
+                          "d::timestamp, ARRAY[1,2]::text FROM ft WHERE id = 1")))))))
+
+(deftest select-without-from-has-no-columns
+  ;; `SELECT foo` resolved against the whole schema and answered no rows;
+  ;; `SELECT ft.i` quietly added ft to the query.
+  (with-open [c (jdbc)]
+    (seed! c)
+    (is (= "42703" (state c "SELECT i")))
+    (is (= "42P01" (state c "SELECT ft.i")))
+    (testing "outer references from a FROM-less subquery still resolve"
+      (is (= [["1" "10"] ["2" nil]]
+             (rows c "SELECT id, (SELECT ft.i) FROM ft WHERE id <= 2 ORDER BY id"))))))

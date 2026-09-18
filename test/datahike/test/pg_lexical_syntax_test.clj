@@ -74,7 +74,9 @@
 
 (deftest hash-in-an-operator-position-is-xor-not-an-identifier
   (testing "adjacent operands are still tokenized as PostgreSQL XOR"
-    (is (nil? (parse-err "SELECT a#b")))
+    ;; Lexically fine: PostgreSQL's complaint is the missing column, not
+    ;; the `#` (no FROM, so `a` resolves to nothing).
+    (is (= "42703" (first (parse-err "SELECT a#b"))))
     (is (nil? (parse-err "SELECT 5 # 3")))
     (is (= [["6"]] (rows "SELECT 5 # 3")))))
 

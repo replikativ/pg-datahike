@@ -1000,7 +1000,10 @@
     (instance? CastExpression expr)
     (let [v (srf-const-eval (.getLeftExpression ^CastExpression expr))]
       (if (= ::corr v) ::corr (apply-sql-cast v ^CastExpression expr)))
-    (instance? ArrayConstructor expr) (extract-value ^ArrayConstructor expr)
+    ;; No schema here: an element that is not a literal cannot be
+    ;; evaluated, which is what ::corr says.
+    (instance? ArrayConstructor expr)
+    (try (extract-value ^ArrayConstructor expr) (catch Exception _ ::corr))
     :else ::corr))
 
 (defn- numeric-series-error! [message]
@@ -6414,23 +6417,50 @@
     (long v)
     v))
 
-(defn- eval-const-expr
-  "Evaluate a constant scalar expression by running it as a one-row
-   SELECT. Returns nil when it cannot be evaluated — an unimplemented
-   function, or no parse hook in scope — so callers can fall back."
-  [e schema db]
-  (try
-    (when-let [pf params/*parse-sql*]
-      (when (and schema db)
-        (let [p (pf (str "SELECT " e) schema db)]
-          (if-let [q (:query p)]
+(defn- run-const-select
+  "The single value of a parsed one-row `SELECT <expr>`, NULL as nil."
+  [p db]
+  (when (= :error (:type p))
+    (throw (ex-info (str (:message p))
+                    {:sqlstate (:sqlstate p) :error-fields (:error-fields p)})))
+  (let [v (if-let [q (:query p)]
             (let [ia (:in-args p)
                   qdb (or (:enriched-db p) db)
                   r (first (if (seq ia) (apply d/q q qdb ia) (d/q q qdb)))]
-              (widen-integral (if (sequential? r) (first r) r)))
+              (if (sequential? r) (first r) r))
             (let [lr (:literal-row p)]
-              (widen-integral (if (sequential? lr) (first lr) lr)))))))
-    (catch Throwable _ nil)))
+              (if (sequential? lr) (first lr) lr)))]
+    (when-not (= :__null__ v) (widen-integral v))))
+
+(defn- const-value
+  "Value of an INSERT VALUES expression that is not a plain literal,
+   computed exactly as PostgreSQL would: as the one-row `SELECT <expr>`.
+
+   Every evaluation error propagates with its SQLSTATE (a bare column is
+   42703, as in PostgreSQL: VALUES has no FROM), and NULL comes back as
+   nil. This replaced a fallback to the expression's SQL TEXT, which stored
+   `'a' || NULL`, `CASE ... END` and bare identifiers verbatim, and the
+   internal `:__null__` sentinel for NULL results -- silently.
+
+   Parameters: before Bind the values do not exist, so an expression over
+   `$N` becomes a placeholder evaluated at Bind with every parameter bound
+   (params/expression-param-ref)."
+  [e schema db]
+  (let [pf params/*parse-sql*
+        sql (str "SELECT " e)]
+    (when-not (and pf schema db)
+      (throw (errors/pg-error :feature-not-supported
+                              {:message (str "cannot evaluate expression here: " e)})))
+    (if params/*bound-params*
+      (run-const-select (pf sql schema db) db)
+      (let [p (pf sql schema db)]
+        (if-let [idxs (seq (keys (:param-placeholders p)))]
+          (params/expression-param-ref
+           (apply max idxs)
+           (fn [bound]
+             (binding [params/*bound-params* bound]
+               (run-const-select (pf sql schema db) db))))
+          (run-const-select p db))))))
 
 (defn- extract-numeric-binary
   "Evaluate a binary numeric expression in INSERT ... VALUES using the
@@ -6524,7 +6554,7 @@
                                          (.getRightExpression expression)
                                          schema db fns/sql-+)]
        (if (= ::unhandled value)
-         (or (eval-const-expr e schema db) (str e))
+         (const-value e schema db)
          value))
      (instance? Subtraction e)
      (let [^Subtraction expression e
@@ -6532,7 +6562,7 @@
                                          (.getRightExpression expression)
                                          schema db fns/sql--)]
        (if (= ::unhandled value)
-         (or (eval-const-expr e schema db) (str e))
+         (const-value e schema db)
          value))
      (instance? Multiplication e)
      (let [^Multiplication expression e
@@ -6540,7 +6570,7 @@
                                          (.getRightExpression expression)
                                          schema db fns/sql-*)]
        (if (= ::unhandled value)
-         (or (eval-const-expr e schema db) (str e))
+         (const-value e schema db)
          value))
      (instance? Division e)
      (let [^Division expression e
@@ -6548,7 +6578,7 @@
                                          (.getRightExpression expression)
                                          schema db fns/sql-div)]
        (if (= ::unhandled value)
-         (or (eval-const-expr e schema db) (str e))
+         (const-value e schema db)
          value))
      (instance? Modulo e)
      (let [^Modulo expression e
@@ -6556,14 +6586,14 @@
                                          (.getRightExpression expression)
                                          schema db fns/sql-mod)]
        (if (= ::unhandled value)
-         (or (eval-const-expr e schema db) (str e))
+         (const-value e schema db)
          value))
     ;; Parenthesized single expression — unwrap
      (instance? ParenthesedExpressionList e)
      (let [^ParenthesedExpressionList pel e]
        (if (= (count pel) 1)
          (extract-value (first pel) schema db)
-         (str e)))
+         (const-value e schema db)))
     ;; Scalar subquery: (SELECT id FROM table WHERE ...)
      (instance? ParenthesedSelect e)
      (strict-scalar-value (.getSelect ^ParenthesedSelect e)
@@ -6609,11 +6639,9 @@
          ;; uncoerced and `length('hello')` into an int column failed
          ;; with "invalid input syntax".
          ;;
-         ;; Falls back to the old text behaviour when the expression
-         ;; cannot be evaluated (an unimplemented function), rather than
-         ;; storing nil — which would turn a wrong value into a failed
-         ;; INSERT.
-         :else (or (eval-const-expr e schema db) (str e))))
+         ;; An expression that cannot be evaluated raises, with its
+         ;; SQLSTATE; it used to fall back to storing its text.
+         :else (const-value e schema db)))
     ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
     ;; parse as TimeKeyExpression, not Function — same marker as the
     ;; function forms above; without this branch the keyword fell
@@ -6621,14 +6649,14 @@
     ;; transactor (issue #14).
      (instance? TimeKeyExpression e)
      {:fn :now}
-     (instance? TimezoneExpression e)
     ;; now() AT TIME ZONE 'UTC' → current timestamp marker, like the
-    ;; bare-function case above.
-     (let [left (.getLeftExpression ^TimezoneExpression e)]
-       (if (and (instance? net.sf.jsqlparser.expression.Function left)
-                (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))
-         {:fn :now}
-         {:fn :now}))  ;; any timezone expression defaults to current time
+    ;; bare-function case above. Any other AT TIME ZONE is an ordinary
+    ;; expression; it used to become now() as well.
+     (and (instance? TimezoneExpression e)
+          (let [left (.getLeftExpression ^TimezoneExpression e)]
+            (and (instance? net.sf.jsqlparser.expression.Function left)
+                 (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))))
+     {:fn :now}
 
     ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].
     ;; Build a typed PgArray; coerce-insert-value will serialize it
@@ -6662,7 +6690,7 @@
            elements (mapv #(unwrap (extract-value % schema db)) exprs)]
        (pg-arr/array elem-type elements))
 
-     :else (str e))))
+     :else (const-value e schema db))))
 
 (defn- apply-numeric-typmod
   "PG NUMERIC(p,s) on input: round/pad to scale `s` (1 → 1.00, 1.239 →

@@ -232,6 +232,13 @@
    {:sqlstate "2200H"
     :format (fn [{:keys [message detail]}] (or message detail))}
 
+   ;; An explicit cast with no pathway (parse_coerce.c): no pg_cast row and
+   ;; no I/O conversion -- `date::int`, `bool::numeric`.
+   :cannot-coerce
+   {:sqlstate "42846"
+    :format (fn [{:keys [source target message]}]
+              (or message (str "cannot cast type " source " to " target)))}
+
    :undefined-function
    {:sqlstate "42883"
     :format (fn [{:keys [function detail message]}]

@@ -3003,7 +3003,13 @@
         ;; declared source type. Bit columns are stored as digit strings in
         ;; Datahike, so runtime class alone cannot distinguish bit B'10'
         ;; (integer 2) from text '10' (integer 10).
-        src-oid (source-oid ctx inner)]
+        src-oid (source-oid ctx inner)
+        _ (let [target-oid (source-oid ctx cast-expr)]
+            (when-not (types/cast-exists? src-oid target-oid)
+              (throw (errors/pg-error
+                      :cannot-coerce
+                      {:source (get types/oid->pg-name src-oid)
+                       :target (get types/oid->pg-name target-oid)}))))]
     (cond
       is-vector?
       (let [cast1 #(sql-cast/cast-scalar % type-str {:explicit? true})]
@@ -5111,6 +5117,21 @@
                       result-var))
                   base-var
                   idx-exprs))
+
+        ;; No FROM at all: nothing for a column to belong to. An outer
+        ;; row's column was resolved above (`bound`); anything else is
+        ;; PostgreSQL's 42703 / 42P01. It used to resolve against the
+        ;; whole schema -- `SELECT foo` answered no rows, and `SELECT t.x`
+        ;; quietly added t to the query (the long-gone add_missing_from).
+        (and (nil? (:default-table ctx)) (empty? (:table-aliases ctx)))
+        (let [col (unquote-ident (.getColumnName col-expr))]
+          (if tbl
+            (throw (ex-info (str "missing FROM-clause entry for table \""
+                                 (unquote-ident (.getName ^Table tbl)) "\"")
+                            {:error :undefined-table :sqlstate "42P01"
+                             :table (unquote-ident (.getName ^Table tbl))}))
+            (throw (ex-info (str "column \"" col "\" does not exist")
+                            {:error :undefined-column :sqlstate "42703" :column col}))))
 
         :else
         (let [resolved (ctx/resolve-column expr

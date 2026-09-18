@@ -869,6 +869,65 @@
    oid-bit       #{oid-varbit}
    oid-varbit    #{oid-bit}})
 
+(def ^:private pg-cast-names
+  "castsource -> #{casttarget}: every pg_cast.dat row (any castcontext)
+   between types we carry, generated from the pinned REL_17_7 catalog.
+   An explicit `::` may use any of them; see `cast-exists?`."
+  {"bit" #{"bit" "int4" "int8" "varbit"}
+   "bool" #{"bpchar" "int4" "text" "varchar"}
+   "bpchar" #{"bpchar" "char" "name" "text" "varchar"}
+   "char" #{"bpchar" "int4" "text" "varchar"}
+   "date" #{"timestamp" "timestamptz"}
+   "float4" #{"float8" "int2" "int4" "int8" "numeric"}
+   "float8" #{"float4" "int2" "int4" "int8" "numeric"}
+   "int2" #{"float4" "float8" "int4" "int8" "numeric" "oid" "regclass" "regnamespace" "regtype"}
+   "int4" #{"bit" "bool" "char" "float4" "float8" "int2" "int8" "money" "numeric" "oid" "regclass" "regnamespace" "regtype"}
+   "int8" #{"bit" "float4" "float8" "int2" "int4" "money" "numeric" "oid" "regclass" "regnamespace" "regtype"}
+   "interval" #{"interval" "time"}
+   "json" #{"jsonb"}
+   "jsonb" #{"bool" "float4" "float8" "int2" "int4" "int8" "json" "numeric"}
+   "money" #{"numeric"}
+   "name" #{"bpchar" "text" "varchar"}
+   "numeric" #{"float4" "float8" "int2" "int4" "int8" "money" "numeric"}
+   "oid" #{"int4" "int8" "regclass" "regnamespace" "regtype"}
+   "regclass" #{"int4" "int8" "oid"}
+   "regnamespace" #{"int4" "int8" "oid"}
+   "regtype" #{"int4" "int8" "oid"}
+   "text" #{"bpchar" "char" "name" "regclass" "varchar"}
+   "time" #{"interval" "time" "timetz"}
+   "timestamp" #{"date" "time" "timestamp" "timestamptz"}
+   "timestamptz" #{"date" "time" "timestamp" "timestamptz" "timetz"}
+   "timetz" #{"time" "timetz"}
+   "varbit" #{"bit" "varbit"}
+   "varchar" #{"bpchar" "char" "name" "regclass" "text" "varchar"}})
+
+(def explicit-casts
+  "`pg-cast-names` by OID."
+  (into {}
+        (keep (fn [[source targets]]
+                (when-let [s (get pg-name->oid source)]
+                  [s (into #{} (keep pg-name->oid) targets)])))
+        pg-cast-names))
+
+(defn cast-exists?
+  "Does PostgreSQL have an explicit cast from `source` to `target`
+   (parse_coerce.c find_coercion_pathway)? The same type; a pg_cast row;
+   an I/O conversion, which exists TO every string-category type and FROM
+   one for explicit casts; or, for arrays, a cast between the elements.
+   OIDs outside the categorised set -- enums, domains, composites, the
+   unknown/NULL literal -- answer true: they are resolved elsewhere, and a
+   false 'no such cast' would be worse than the runtime check they get."
+  [source target]
+  (let [cat #(get oid->category %)]
+    (cond
+      (or (nil? source) (nil? target) (= source target)) true
+      (contains? (get explicit-casts source) target) true
+      (or (= :S (cat target)) (= :S (cat source))) true
+      (and (array-oid->element-oid source) (array-oid->element-oid target))
+      (cast-exists? (array-oid->element-oid source) (array-oid->element-oid target))
+      (or (nil? (cat source)) (nil? (cat target))) true
+      :else false)))
+
 (def oid->typcollation
   "`typcollation` from pg_type.dat: the collatable base types and the
    collation their values carry by default. `name` is C (950), the

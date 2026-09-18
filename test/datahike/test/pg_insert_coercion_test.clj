@@ -176,3 +176,57 @@
       (with-open [rs (.executeQuery st "SELECT id, bin FROM s WHERE id = 2")]
         (is (.next rs))
         (is (some? (.getBytes rs 2)))))))
+
+;; ---------------------------------------------------------------------------
+;; VALUES expressions are evaluated as PostgreSQL computes them, never stored
+;; as their SQL text. Found by the differential fuzzer once it compared
+;; SQLSTATEs: `VALUES (13, n)` failed with 22P02 because `n` had become the
+;; string "n". Expectations are a PostgreSQL 17 oracle's.
+
+(defn- rows [^java.sql.Statement st sql]
+  (with-open [rs (.executeQuery st sql)]
+    (let [n (.getColumnCount (.getMetaData rs))]
+      (loop [acc []]
+        (if (.next rs)
+          (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
+          acc)))))
+
+(defn- sqlstate-of [^java.sql.Statement st sql]
+  (try (.executeUpdate st sql) nil
+       (catch SQLException e (.getSQLState e))))
+
+(deftest insert-values-evaluates-expressions-not-their-text
+  (with-open [c (open) st (.createStatement c)]
+    (.execute st "CREATE TABLE vx (id INT, s TEXT, n INT)")
+    (doseq [v ["(1, nullif('a','a'), 1)"
+               "(2, 'x', nullif(1,1))"
+               "(3, upper(NULL), 3)"
+               "(4, 'a' || NULL, 4)"
+               "(5, CASE WHEN 1 = 2 THEN 'y' END, 5)"
+               "(6, coalesce(NULL, NULL), 6)"
+               "(7, 'a' || 'b', 2 + NULL)"
+               "(8, repeat('x', 3), length('hello'))"]]
+      (.executeUpdate st (str "INSERT INTO vx VALUES " v)))
+    (is (= [["1" nil "1"] ["2" "x" nil] ["3" nil "3"] ["4" nil "4"]
+            ["5" nil "5"] ["6" nil "6"] ["7" "ab" nil] ["8" "xxx" "5"]]
+           (rows st "SELECT id, s, n FROM vx ORDER BY id")))
+    (testing "a reference is an error, as VALUES has no FROM"
+      (is (= "42703" (sqlstate-of st "INSERT INTO vx VALUES (9, foo, 9)")))
+      (is (= "42P01" (sqlstate-of st "INSERT INTO vx VALUES (9, other.s, 9)"))))
+    (testing "evaluation errors surface with their SQLSTATE"
+      (is (= "22012" (sqlstate-of st "INSERT INTO vx VALUES (9, 'z', 1/0)"))))
+    (is (= [["8"]] (rows st "SELECT count(*) FROM vx")) "no failed row was stored")))
+
+(deftest prepared-insert-evaluates-expressions-over-parameters-at-bind
+  ;; `? + 1` reached the column as the text "$3 + 1".
+  (with-open [c (open "&prepareThreshold=1")]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE px (id INT, s TEXT, n INT)"))
+    (doseq [k [1 2 3]]
+      (with-open [ps (.prepareStatement
+                      c "INSERT INTO px VALUES (?, ? || 'x', CAST(? + 1 AS int) * 2)")]
+        (.setInt ps 1 k) (.setString ps 2 (str "a" k)) (.setInt ps 3 k)
+        (is (= 1 (.executeUpdate ps)))))
+    (with-open [st (.createStatement c)]
+      (is (= [["1" "a1x" "4"] ["2" "a2x" "6"] ["3" "a3x" "8"]]
+             (rows st "SELECT id, s, n FROM px ORDER BY id"))))))
