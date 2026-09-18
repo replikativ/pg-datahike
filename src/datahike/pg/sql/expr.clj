@@ -826,12 +826,11 @@
       ;; that JDBC / psycopg2 / asyncpg / Metabase actually probe on
       ;; connect; everything else throws (PG: error 42704) unless
       ;; the caller passes missing_ok=true, in which case we return
-      ;; NULL. Values are 0.1-stable; revisit if any client gates a
-      ;; feature on the reported version.
+      ;; NULL. The version is PgWireServer's, the release we implement.
       (= fname "current_setting")
       (let [fn-param (symbol (str "?cur-setting" (swap! (:var-counter ctx) inc)))
-            settings {"server_version"             "15.0"
-                      "server_version_num"         "150000"
+            settings {"server_version"             datahike.pg.PgWireServer/SERVER_VERSION
+                      "server_version_num"         datahike.pg.PgWireServer/SERVER_VERSION_NUM
                       "client_encoding"            "UTF8"
                       "server_encoding"            "UTF8"
                       "TimeZone"                   "UTC"

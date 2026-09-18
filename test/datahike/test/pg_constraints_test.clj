@@ -292,6 +292,30 @@
         (is (str/includes? (:err (exec h "CREATE EXTENSION pg_trgm")) "not supported"))
         (finally (close-handler bundle))))))
 
+(deftest partitioned-table-strict-refuses-pg-dump-loads-plain-parent
+  ;; Stripping PARTITION BY used to create an unpartitioned table that
+  ;; accepted rows PostgreSQL rejects for lacking a partition.
+  (let [ddl "CREATE TABLE pay (id int, d date) PARTITION BY RANGE (d)"]
+    (testing "strict (default): 0A000, nothing created"
+      (let [[h & _ :as bundle] (fresh-handler nil)]
+        (try
+          (let [r (.execute ^datahike.pg.PgWireServer$QueryHandler h ddl)]
+            (is (= "0A000" (.sqlstate r)))
+            (is (str/includes? (.error r) "PARTITION BY RANGE")))
+          (is (some? (:err (exec h "SELECT count(*) FROM pay"))))
+          (finally (close-handler bundle)))))
+    (testing "per feature: :silently-accept #{:partitioned-table}"
+      (let [[h & _ :as bundle] (fresh-handler {:silently-accept #{:partitioned-table}})]
+        (try
+          (is (= {:err nil :tag "CREATE TABLE"} (exec h ddl)))
+          (finally (close-handler bundle)))))
+    (testing ":compat :pg-dump loads the parent as a plain, empty table"
+      (let [[h & _ :as bundle] (fresh-handler {:compat :pg-dump})]
+        (try
+          (is (= {:err nil :tag "CREATE TABLE"} (exec h ddl)))
+          (is (nil? (:err (exec h "SELECT count(*) FROM pay"))))
+          (finally (close-handler bundle)))))))
+
 ;; ============================================================================
 ;; SAVEPOINT — error paths (25P01 outside-tx, 3B001 nonexistent)
 ;; ============================================================================

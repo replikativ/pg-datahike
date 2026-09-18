@@ -5,6 +5,7 @@
    the REFERENCES lifter."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest testing is]]
+            [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.rewrite :as rw]))
 
 ;; ============================================================================
@@ -345,3 +346,26 @@
 ;; here (IF NOT EXISTS and NO MINVALUE/MAXVALUE/CYCLE stripping) are gone.
 ;; Sequence DDL is token-classified in full now and never reaches
 ;; JSqlParser, so there is nothing to rewrite — see pg-sequence-ddl-test.
+
+;; ============================================================================
+;; partition-by-clause / partition-by-rule — the clause is lifted out for
+;; the parser; refusing it (or not, under :pg-dump) is the executor's call
+;; ============================================================================
+
+(deftest partition-by-clause-is-detected-and-lifted
+  (doseq [[sql strategy] [["CREATE TABLE p (a int, b date) PARTITION BY RANGE (b)" "RANGE"]
+                          ["CREATE TABLE p (a int) PARTITION BY LIST (a);" "LIST"]
+                          ["create table p (a int) partition by hash ((a + 1))" "HASH"]]]
+    (is (= strategy (:strategy (rw/partition-by-clause (cls/tokenize-all sql)))) sql)
+    (let [out (rw/rewrite sql [rw/partition-by-rule])]
+      (is (not (re-find #"(?i)partition" out)) sql)
+      (is (re-find #"^(?i)create table p \(a int" out) sql))))
+
+(deftest partition-by-clause-ignores-window-and-non-ddl-uses
+  (doseq [sql ["SELECT g, sum(v) OVER (PARTITION BY g) FROM w"
+               "SELECT rank() OVER (PARTITION BY range (x)) FROM w"
+               "CREATE TABLE w2 AS SELECT count(*) OVER (PARTITION BY list (g)) FROM w"
+               "CREATE TABLE t (note text DEFAULT 'PARTITION BY RANGE (x)')"
+               "SELECT 'CREATE TABLE p (a int) PARTITION BY RANGE (a)'"]]
+    (is (nil? (rw/partition-by-clause (cls/tokenize-all sql))) sql)
+    (is (= sql (rw/rewrite sql [rw/partition-by-rule])) sql)))

@@ -103,12 +103,13 @@ if [[ "${data_errors}" -ne 0 ]]; then
 fi
 
 echo "[4/4] comparing per-table row counts"
-# Partitioned parents are excluded: ATTACH PARTITION is unsupported, so
-# our rows live in the partition tables and the parent is legitimately
-# empty. Compare the partitions themselves instead.
+# Partitioned parents (relkind 'p') are refused with 0A000 and have no
+# counterpart here: pg_dump emits each partition as a plain CREATE TABLE
+# plus ATTACH PARTITION, so the rows land in the partitions. Compare
+# every ordinary table, partitions included.
 tables=$(src -At -c "
   SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT c.relispartition
+   WHERE n.nspname = 'public' AND c.relkind = 'r'
      AND c.oid NOT IN (SELECT inhparent FROM pg_inherits)
    ORDER BY 1")
 

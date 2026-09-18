@@ -730,56 +730,60 @@
 ;; ============================================================================
 
 ;; ============================================================================
-;; CREATE TABLE … (cols) PARTITION BY <strategy> (<expr>) — JSqlParser
-;; chokes on the `RANGE` / `LIST` / `HASH` keyword after the closing `)`
-;; of the column definition list. We don't model partitioning; pg_dump
-;; emits one CREATE TABLE per partition child anyway, and the data
-;; lands in the children. Strip the trailing `PARTITION BY …` clause
-;; so the parent table parses as a normal (empty) base table.
-;;
-;; Match shape (after the column-def `)`):
-;;   PARTITION BY <ident>(RANGE|LIST|HASH) ( <balanced-paren-group> )
+;; CREATE TABLE … (cols) PARTITION BY <strategy> (<expr>) — declarative
+;; partitioning is not modelled. The clause is lifted out for the parser
+;; and the decision (refuse, or load a plain parent under :pg-dump) is
+;; made at execute.
 ;; ============================================================================
 
-(defn partition-by-rule
-  "Strip `PARTITION BY <strategy> (<expr>)` after a top-level CREATE TABLE
-   body. Replaces the matched span with a single space; the trailing
-   `;` stays in place so statement boundaries are unaffected.
+(defn partition-by-clause
+  "The table-level `PARTITION BY <strategy> (...)` clause of a CREATE
+   TABLE, as {:strategy \"RANGE\" :span [start end]}, or nil.
 
-   Walks the token stream looking for `partition` `by` <ident>
-   followed by a `(...)` group. The clause is paired with a CREATE
-   TABLE — not a CREATE INDEX or other DDL — but the rule doesn't
-   need that context: PARTITION BY only appears in CREATE TABLE in
-   any well-formed PG SQL, and the pre-parse rewrite is conservative
-   (we'd at worst delete a syntactically-similar but semantically-
-   absurd substring elsewhere)."
+   Only `PARTITION BY` at paren depth 0 right after the column list's `)`
+   counts; a window's `OVER (PARTITION BY ...)` is always inside
+   parentheses, and strings/comments are opaque tokens."
   [toks]
-  (let [n (count toks)]
-    (loop [i 0, acc []]
-      (if (>= i (- n 3))
-        acc
-        (let [t0 (nth toks i)
-              t1 (nth toks (inc i) nil)
-              t2 (nth toks (+ i 2) nil)
-              t3 (nth toks (+ i 3) nil)]
-          (if (and (= "partition" (kw-text t0))
-                   (= "by" (kw-text t1))
-                   (#{"range" "list" "hash"} (kw-text t2))
-                   (punct? t3 "("))
-            (let [close-idx (loop [k (+ i 4), depth 1]
-                              (cond
-                                (>= k n) -1
-                                (punct? (nth toks k) "(") (recur (inc k) (inc depth))
-                                (punct? (nth toks k) ")")
-                                (if (= depth 1) k (recur (inc k) (dec depth)))
-                                :else (recur (inc k) depth)))]
-              (if (neg? close-idx)
-                (recur (inc i) acc)
-                (let [start-pos (:pos t0)
-                      end-pos (:end (nth toks close-idx))]
-                  (recur (inc close-idx)
-                         (conj acc [start-pos end-pos " "])))))
-            (recur (inc i) acc)))))))
+  (let [code (vec (remove #(= :comment (:type %)) toks))
+        n (count code)
+        create-table? (and (= "create" (kw-text (first code)))
+                           (some #(= "table" (kw-text %)) (take 6 code)))
+        close-of (fn [open-idx]
+                   (loop [k (inc open-idx), depth 1]
+                     (cond
+                       (>= k n) nil
+                       (punct? (nth code k) "(") (recur (inc k) (inc depth))
+                       (punct? (nth code k) ")") (if (= depth 1) k (recur (inc k) (dec depth)))
+                       :else (recur (inc k) depth))))]
+    (when create-table?
+      (loop [i 0, depth 0]
+        (when (< i (- n 3))
+          (let [t (nth code i)]
+            (cond
+              (punct? t "(") (recur (inc i) (inc depth))
+              (punct? t ")") (recur (inc i) (dec depth))
+              (and (zero? depth) (pos? i)
+                   (punct? (nth code (dec i)) ")")
+                   (= "partition" (kw-text t))
+                   (= "by" (kw-text (nth code (inc i))))
+                   (#{"range" "list" "hash"} (kw-text (nth code (+ i 2))))
+                   (punct? (nth code (+ i 3)) "("))
+              (when-let [close (close-of (+ i 3))]
+                {:strategy (str/upper-case (kw-text (nth code (+ i 2))))
+                 :span [(:pos t) (:end (nth code close))]})
+              :else (recur (inc i) depth))))))))
+
+(defn partition-by-rule
+  "Remove the table-level `PARTITION BY` clause, which JSqlParser cannot
+   parse. This is NOT the policy: declarative partitioning is not
+   modelled, and parse-sql records the strategy on the CREATE TABLE plan
+   so the executor refuses it (0A000) unless the session accepts
+   `:partitioned-table` (the :pg-dump compat preset, where the parent
+   loads as an ordinary empty table). Deciding at execute keeps the
+   parse -- and the parse cache -- independent of session settings."
+  [toks]
+  (when-let [{[start end] :span} (partition-by-clause toks)]
+    [[start end " "]]))
 
 ;; ============================================================================
 ;; DEFAULT <fn>(<args>) — JSqlParser's grammar rejects a function call with
