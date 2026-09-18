@@ -2247,7 +2247,11 @@
       (when (instance? Table item)
         (some-> ^Table item .getName unquote-ident str/lower-case))))
 
-(defn- plain-select-scope-nodes [^PlainSelect ps]
+(defn plain-select-scope-nodes
+  "The expressions of one SELECT level -- items, WHERE, HAVING, QUALIFY,
+   GROUP BY, ORDER BY and join conditions. `params/ast-columns` treats a
+   SELECT as a scope boundary, so walking a level means walking these."
+  [^PlainSelect ps]
   (let [joins (or (.getJoins ps) [])
         group-exprs (try
                       (some-> ps .getGroupBy .getGroupByExpressionList seq)
@@ -4488,7 +4492,7 @@
                               {} corr-refs)
         parsed (binding [params/*from-bindings* null-bindings
                          params/*from-binding-oids* corr-oids
-                         params/*from-source-aliases* (set (map first corr-refs))
+                         params/*outer-scope-aliases* (set (map first corr-refs))
                          params/*lateral-outer-aliases* (set (map first corr-refs))]
                  ((:parse-sql ctx) (str inner) (:schema ctx) (:db ctx)))
         _ (validate-parsed-in-plan! parsed)
@@ -4578,7 +4582,7 @@
                                           {} (map vector corr-refs outer-values))
                          rhs (binding [params/*from-bindings* bindings
                                        params/*from-binding-oids* corr-oids
-                                       params/*from-source-aliases*
+                                       params/*outer-scope-aliases*
                                        (set (map first corr-refs))
                                        params/*lateral-outer-aliases*
                                        (set (map first corr-refs))]
@@ -4643,16 +4647,12 @@
   "Validate scalar width and executable stages before scanning an outer row."
   [ctx inner corr-refs]
   (let [corr-oids (correlation-oids ctx corr-refs)
-        unqualified-outer-scope? (and (instance? PlainSelect inner)
-                                      (nil? (.getFromItem ^PlainSelect inner)))
         null-bindings (reduce (fn [m [alias col]]
                                 (assoc-in m [alias col] :__null__))
                               {} corr-refs)
         parsed (binding [params/*from-bindings* null-bindings
                          params/*from-binding-oids* corr-oids
-                         params/*from-source-aliases*
-                         (when unqualified-outer-scope?
-                           (set (map first corr-refs)))
+                         params/*outer-scope-aliases* (set (map first corr-refs))
                          params/*lateral-outer-aliases* (set (map first corr-refs))]
                  ((:parse-sql ctx) (str inner) (:schema ctx) (:db ctx)))]
     (throw-subquery-error! parsed)
@@ -4747,8 +4747,6 @@
         inner-sql (str inner)
         corr-refs (vec corr-refs)
         corr-oids (correlation-oids ctx corr-refs)
-        unqualified-outer-scope? (and (instance? PlainSelect inner)
-                                      (nil? (.getFromItem ^PlainSelect inner)))
         ;; Through translate-expr, so the outer column resolves exactly as
         ;; it would anywhere else in the statement -- aliases, ref columns
         ;; and the nullable-var bookkeeping included.
@@ -4774,9 +4772,7 @@
                              {} (map vector corr-refs outer-vals))]
               (binding [params/*from-bindings* fb
                         params/*from-binding-oids* corr-oids
-                        params/*from-source-aliases*
-                        (when unqualified-outer-scope?
-                          (set (map first corr-refs)))
+                        params/*outer-scope-aliases* (set (map first corr-refs))
                         ;; Without it the inner translator reads `t2.id =
                         ;; ft.id` as an implicit JOIN against the relation
                         ;; `ft` and adds ft to the inner FROM -- the
@@ -4862,6 +4858,69 @@
                     "localtime" "localtimestamp"}
                   (str/lower-case (.getColumnName ^Column expr)))))
 
+(defn- resolves-at-this-level?
+  "Does an unqualified column name resolve against the CURRENT query
+   level's own FROM items?"
+  [ctx ^Column col-expr]
+  (try
+    (let [resolved (ctx/resolve-column
+                    col-expr (:table-aliases ctx)
+                    (:default-table ctx)
+                    (:col-overrides ctx)
+                    (:derived-aliases ctx) (:ci-index ctx))
+          attr (ctx/attr-of ctx resolved)]
+      (boolean (and attr (contains? (:schema ctx) attr))))
+    (catch Exception _ false)))
+
+(defn column-binding
+  "`[:bound value]` when `col-expr` denotes a value supplied through
+   *from-bindings* rather than a column of this level's relations, else
+   nil. Raises 42702 for a reference PostgreSQL finds ambiguous.
+
+   PostgreSQL's `colNameToVar` (parse_relation.c) searches the innermost
+   level first and stops at the first level with a match; ambiguity is
+   only raised WITHIN a level. So:
+
+     - a qualified reference whose qualifier is bound is the binding;
+     - an unqualified name exposed by an UPDATE's FROM items
+       (*from-source-aliases*) shares the target's level -- matching
+       both is ambiguous;
+     - an unqualified name exposed by an OUTER row (*outer-scope-aliases*)
+       is used only when this level has no such column.
+
+   One resolver for every consumer. The WHERE equality fast paths used to
+   bind a qualified outer column as though it named a relation --
+   `(SELECT v FROM c WHERE t.id = 1)` compiled to \"some row of t has id
+   1\" -- because they ran before this substitution was ever consulted."
+  [ctx ^Column col-expr]
+  (when params/*from-bindings*
+    (let [tbl (.getTable col-expr)
+          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
+          col-name (unquote-ident (.getColumnName col-expr))]
+      (if tbl-name
+        (when (contains? params/*from-bindings* tbl-name)
+          [:bound (get-in params/*from-bindings* [tbl-name col-name])])
+        (let [same (when (seq params/*from-source-aliases*)
+                     (params/binding-column-owners params/*from-bindings* col-name
+                                                   params/*from-source-aliases*))
+              here? (delay (resolves-at-this-level? ctx col-expr))]
+          (cond
+            (> (count same) 1) (params/ambiguous-column! col-name)
+            (and (= 1 (count same)) @here?) (params/ambiguous-column! col-name)
+            (= 1 (count same))
+            [:bound (get-in params/*from-bindings* [(first same) col-name])]
+
+            (and (seq params/*outer-scope-aliases*) (not @here?))
+            (let [outer (params/binding-column-owners
+                         params/*from-bindings* col-name params/*outer-scope-aliases*)]
+              (cond
+                (> (count outer) 1) (params/ambiguous-column! col-name)
+                (= 1 (count outer))
+                [:bound (get-in params/*from-bindings* [(first outer) col-name])]
+                :else nil))
+
+            :else nil))))))
+
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
    Returns a Datalog-compatible value or variable symbol."
@@ -4926,24 +4985,6 @@
 
     (instance? Column expr)
     (let [^Column col-expr expr
-          tbl (.getTable col-expr)
-          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
-          col-name (unquote-ident (.getColumnName col-expr))
-          binding-owners (when (and (nil? tbl-name) (seq params/*from-source-aliases*))
-                           (params/binding-column-owners params/*from-bindings* col-name))
-          ;; UPDATE's target relation is represented in ctx, while each
-          ;; FROM row is a constant binding. Account for both scopes before
-          ;; choosing an unqualified FROM column.
-          target-column? (when (seq binding-owners)
-                           (try
-                             (let [resolved (ctx/resolve-column
-                                             col-expr (:table-aliases ctx)
-                                             (:default-table ctx)
-                                             (:col-overrides ctx)
-                                             (:derived-aliases ctx) (:ci-index ctx))
-                                   attr (ctx/attr-of ctx resolved)]
-                               (boolean (and attr (contains? (:schema ctx) attr))))
-                             (catch Exception _ false)))
           ;; JSqlParser parses `xs[2]` as a Column with a side-channel
           ;; `ArrayConstructor` carrying the indices: `(.getColumnName)`
           ;; returns the bare name `xs`; `(.getArrayConstructor)` is the
@@ -4952,20 +4993,11 @@
           ;; ArrayExpression branch above. We only need to recognise
           ;; the single-bracket Column-with-ArrayConstructor case here
           ;; so users can write `WHERE xs[2] = 20` or `SELECT xs[2]`.
-          ac (.getArrayConstructor col-expr)]
+          ac (.getArrayConstructor col-expr)
+          tbl (.getTable col-expr)
+          bound (column-binding ctx col-expr)]
       (cond
-        (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
-        ;; Bound by the current UPDATE ... FROM row.
-        (get-in params/*from-bindings* [tbl-name col-name])
-
-        (and (nil? tbl-name) (> (count binding-owners) 1))
-        (params/ambiguous-column! col-name)
-
-        (and (nil? tbl-name) (= 1 (count binding-owners)) target-column?)
-        (params/ambiguous-column! col-name)
-
-        (and (nil? tbl-name) (= 1 (count binding-owners)))
-        (get-in params/*from-bindings* [(first binding-owners) col-name])
+        bound (second bound)
 
         (some? ac)
         ;; Walk the bracket-expressions left-to-right, applying
@@ -6194,7 +6226,13 @@
                                (and (contains? (or params/*lateral-outer-aliases* #{}) t)
                                     (contains? (get params/*from-bindings* t)
                                                (unquote-ident (.getColumnName c))))))
-                           [left right])))
+                           [left right]))
+                ;; ...and neither side is an UNQUALIFIED name that the
+                ;; outer-level rule resolves to the outer row: that is a
+                ;; constant too, and unifying it would join against the
+                ;; outer relation instead.
+                (not (and (seq params/*outer-scope-aliases*)
+                          (some #(column-binding ctx %) [left right]))))
        (let [resolve-col #(try (ctx/resolve-column ^Column %
                                                    (:table-aliases ctx)
                                                    (:default-table ctx)
@@ -6678,7 +6716,10 @@
                  (instance? Column left)
                  (not= types/oid-vector (source-oid ctx left))
                  (nil? (.getArrayConstructor ^Column left))
-                 (instance? JdbcParameter right))
+                 (instance? JdbcParameter right)
+                 ;; A column that is really an OUTER row's value is a
+                 ;; constant, not a relation to seek -- see column-binding.
+                 (not (column-binding ctx left)))
           ;; col = $N in a top-level conjunct: index-seekable data
           ;; pattern with the :in-bound param var (Parse time), or the
           ;; value-bound pattern when *bound-params* already inlined the
@@ -6707,6 +6748,11 @@
           (if (and (instance? Column left)
                    (not= types/oid-vector (source-oid ctx left))
                    (nil? (.getArrayConstructor ^Column left))
+                   ;; `outer.col = 1` inside a correlated subquery compares
+                   ;; two CONSTANTS. Taking this branch compiled it to a data
+                   ;; pattern -- \"some row of outer has col 1\" -- which is
+                   ;; true for every outer row once any row qualifies.
+                   (not (column-binding ctx left))
                    (or (instance? LongValue right)
                        (instance? DoubleValue right)
                        (instance? StringValue right)))

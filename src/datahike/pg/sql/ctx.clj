@@ -69,9 +69,17 @@
          ;; A relation alias may rename its output columns (`v AS v1(x1)`).
          ;; Those names do not exist in the schema's case-folded index, so
          ;; unqualified resolution must search alias-scoped overrides first.
+         ;; Only relations IN SCOPE may claim the name: `col-overrides`
+         ;; also carries make-ctx's schema-wide renames for every table
+         ;; (e.g. `p.a` re-added after DROP COLUMN is stored as
+         ;; `:p/pg$att3`), and letting an absent table win silently
+         ;; cross-joined `p` into `SELECT a FROM zq`.
+         in-scope (into #{default-table} cat [(keys table-aliases) (vals table-aliases)])
          override-owners (when (nil? table-alias)
                            (into #{} (keep (fn [[alias cols]]
-                                             (when (contains? cols col-name0) alias)))
+                                             (when (and (contains? in-scope alias)
+                                                        (contains? cols col-name0))
+                                               alias)))
                                  col-overrides))
          override-owner (cond
                           (= 1 (count override-owners)) (first override-owners)

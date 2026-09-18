@@ -822,3 +822,74 @@
            (rows c (str "SELECT f1, f3 FROM subselect_tbl upper_t WHERE f3 IN "
                         "(SELECT upper_t.f1 + f2 FROM subselect_tbl "
                         "WHERE f2 = CAST(f3 AS integer)) ORDER BY f1"))))))
+
+;; ============================================================================
+;; Name scope across query levels (parse_relation.c colNameToVar): the
+;; innermost level that has the column wins, and ambiguity is only ever
+;; raised WITHIN one level. Expectations are a PostgreSQL 17 oracle's.
+;; ============================================================================
+
+(deftest inner-column-shadows-outer-in-lateral
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE sc_ft (id int, v int)")
+    (exec! c "INSERT INTO sc_ft VALUES (1,10),(2,20)")
+    (exec! c "CREATE TABLE sc_t2 (id int, w int)")
+    (exec! c "INSERT INTO sc_t2 VALUES (1,100),(2,200)")
+    ;; Bare `id` is sc_t2.id -- the LATERAL's own level -- so the
+    ;; predicate is t2.id = t2.id, not a correlation. It used to be
+    ;; reported ambiguous inside the producer, swallowed, and answered
+    ;; as an empty LATERAL.
+    (is (= [["1" "100"] ["1" "200"] ["2" "100"] ["2" "200"]]
+           (rows c (str "SELECT sc_ft.id, l.w FROM sc_ft, "
+                        "LATERAL (SELECT w FROM sc_t2 WHERE sc_t2.id = id) l "
+                        "ORDER BY 1, 2"))))
+    (is (= [["1" "100"] ["2" "200"]]
+           (rows c (str "SELECT sc_ft.id, l.w FROM sc_ft, "
+                        "LATERAL (SELECT w FROM sc_t2 WHERE sc_t2.id = sc_ft.id) l "
+                        "ORDER BY 1"))))))
+
+(deftest outer-only-predicate-in-subquery
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE sc_lt (id int)")
+    (exec! c "INSERT INTO sc_lt VALUES (1),(2)")
+    (exec! c "CREATE TABLE sc_lc (v int)")
+    (exec! c "INSERT INTO sc_lc VALUES (7)")
+    (testing "a predicate over outer columns only filters per outer row"
+      ;; The numeric literals are templated to $N on the simple-query
+      ;; path; the deferred inner SELECT is re-parsed per row and must
+      ;; still see them.
+      (is (= [["1" "7"] ["2" nil]]
+             (rows c "SELECT id, (SELECT v FROM sc_lc WHERE sc_lt.id = 1) FROM sc_lt ORDER BY 1")))
+      (is (= [["1" "8"] ["2" nil]]
+             (rows c "SELECT id, (SELECT v + 1 FROM sc_lc WHERE sc_lt.id + 0 = 1) FROM sc_lt ORDER BY 1")))
+      (is (= [["1" nil] ["2" "7"]]
+             (rows c (str "SELECT sc_lt.id, x.v FROM sc_lt LEFT JOIN LATERAL "
+                          "(SELECT v FROM sc_lc WHERE sc_lt.id = 2) x ON true ORDER BY 1")))))
+    (testing "a bound parameter inside the correlated subquery, re-executed"
+      (with-open [ps (.prepareStatement
+                      c "SELECT id, (SELECT v FROM sc_lc WHERE sc_lt.id = ?) FROM sc_lt ORDER BY 1")]
+        (doseq [[k expected] [[1 [["1" "7"] ["2" nil]]]
+                              [2 [["1" nil] ["2" "7"]]]
+                              [1 [["1" "7"] ["2" nil]]]]]
+          (.setInt ps 1 (int k))
+          (with-open [rs (.executeQuery ps)]
+            (is (= expected
+                   (loop [acc []]
+                     (if (.next rs)
+                       (recur (conj acc [(.getString rs 1) (.getString rs 2)]))
+                       acc))))))))))
+
+(deftest unqualified-column-ignores-relations-not-in-scope
+  (with-open [c (jdbc)]
+    ;; Re-adding a dropped column stores it under a renamed attribute
+    ;; (:sc_p/pg$att3). That rename is a schema-wide override, and an
+    ;; unqualified `a` in a query over a DIFFERENT table resolved to it,
+    ;; cross-joining sc_p in and returning zero rows.
+    (exec! c "CREATE TABLE sc_p (a int, b int)")
+    (exec! c "ALTER TABLE sc_p DROP COLUMN a")
+    (exec! c "ALTER TABLE sc_p ADD COLUMN a int")
+    (exec! c "CREATE TABLE sc_zq (id int, a int)")
+    (exec! c "INSERT INTO sc_zq VALUES (1,5),(2,6)")
+    (is (= ["5" "6"] (col c 1 "SELECT a FROM sc_zq ORDER BY a")))
+    (exec! c "INSERT INTO sc_p (a, b) VALUES (9, 1)")
+    (is (= ["9"] (col c 1 "SELECT a FROM sc_p")))))

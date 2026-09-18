@@ -1732,11 +1732,15 @@
       (let [fb (reduce (fn [m [[a c] v]] (assoc-in m [a c] v))
                        {} (map vector corr-refs outer-vals))]
         (binding [params/*from-bindings* fb
-                  ;; Bare columns in a LATERAL VALUES/SELECT body use the
-                  ;; same unique-owner lookup as UPDATE ... FROM. Mark these
-                  ;; bindings as visible sources so `VALUES (outer_col)` can
-                  ;; resolve without a qualifier, as PostgreSQL permits.
-                  params/*from-source-aliases* (set (map first corr-refs))
+                  ;; The outer row is an ENCLOSING level. A bare column
+                  ;; resolves to it only when the inner level has no such
+                  ;; column -- so `VALUES (outer_col)` works, and `(SELECT id
+                  ;; FROM ft t2 WHERE t2.id = ft.id)` keeps its `id` on t2.
+                  ;; Treating the outer row as a SAME-level source made that
+                  ;; bare `id` ambiguous between t2 and ft; the error was
+                  ;; swallowed, the producer returned no rows, and an INNER
+                  ;; LATERAL over the same table answered empty.
+                  params/*outer-scope-aliases* (set (map first corr-refs))
                   params/*lateral-outer-aliases* (set (map first corr-refs))]
           (or (try
                 (let [p (when parse-fn (parse-fn inner-sql inner-schema query-db))
@@ -2176,14 +2180,12 @@
    treats nil as SQL NULL, and the shared one has to be strict about it
    (a Datalog binding that yields nil FILTERS THE ROW)."
   [parse-fn sql subquery? inner-schema query-db]
-  ;; WHEN and plain THEN/ELSE fragments are reparsed as a no-FROM SELECT.
-  ;; Make their row bindings visible for unqualified references. A full
-  ;; subquery keeps lexical SQL scoping instead: its inner columns must shadow
-  ;; same-named outer columns.
-  (binding [params/*from-source-aliases*
-            (if subquery?
-              params/*from-source-aliases*
-              (set (keys params/*from-bindings*)))]
+  ;; The row bindings are an OUTER level: visible to an unqualified
+  ;; reference only when the fragment's own FROM has no such column. That
+  ;; covers both the no-FROM WHEN/THEN fragments and a full subquery whose
+  ;; inner columns must shadow same-named outer ones -- see
+  ;; params/*outer-scope-aliases*.
+  (binding [params/*outer-scope-aliases* (set (keys params/*from-bindings*))]
     (expr/eval-correlated-scalar parse-fn sql subquery? inner-schema query-db)))
 
 (defn- eval-corr-then
@@ -2205,9 +2207,9 @@
               ;; Outer values are row constants, not inner Datalog
               ;; relations. Keep the LATERAL scope for the entire CASE
               ;; because a selected branch may contain its own WITH RECURSIVE
-              ;; query. The empty source set also lets an inner column shadow
-              ;; an outer column with the same name, as PostgreSQL requires.
-              params/*from-source-aliases* #{}
+              ;; query. They are an OUTER level, so an inner column shadows
+              ;; a same-named outer one, as PostgreSQL requires.
+              params/*outer-scope-aliases* aliases
               params/*lateral-outer-aliases* aliases
               *eval-update-db* query-db]
       (case (:kind spec)
@@ -2932,7 +2934,7 @@
         ;; placeholders are sufficient to determine the scalar output type.
         (when sql
           (binding [params/*from-bindings* fb
-                    params/*from-source-aliases* #{}
+                    params/*outer-scope-aliases* aliases
                     params/*lateral-outer-aliases* aliases]
             (first (:select-item-oids (parse-fn sql schema db)))))))
     (catch Throwable _ nil)))
@@ -6276,7 +6278,13 @@
              ;; N sort keys -- no second resolution path needed.
              :distinct-on-n   (when (seq distinct-on-items) (count distinct-on-items))
              :in-args         in-args
-             :runtime-subqueries? @(:runtime-subqueries? ctx)
+             ;; Deferred correlated items re-parse their inner SQL per
+             ;; outer row too, so an outer `$N` inside them must still be
+             ;; resolvable then -- the simple-query numeric templater keys
+             ;; off this flag, and without it `(SELECT v FROM lc WHERE
+             ;; lt.id = 1)` ran with an unbound `$1` and answered NULL.
+             :runtime-subqueries? (or @(:runtime-subqueries? ctx)
+                                      (boolean (seq correlated-subqs)))
              :hidden-count    hidden-count
              ;; Pass enriched db when derived tables or derived-table-joins
              ;; created speculative data (FROM (…) AS sub or JOIN (…) AS sub).
@@ -6991,19 +6999,6 @@
 (defonce ^:private ^ThreadLocal dml-scalar-cache
   (ThreadLocal.))
 
-(defn- no-from-select-columns
-  "Columns in a no-FROM SELECT's projection.
-
-   params/ast-columns intentionally treats SELECT nodes as scope boundaries,
-   so asking it for columns on the PlainSelect itself returns none. DML scalar
-   correlation needs to inspect each select-item expression explicitly."
-  [inner]
-  (when (and (instance? PlainSelect inner)
-             (nil? (.getFromItem ^PlainSelect inner)))
-    (mapcat (fn [^SelectItem item]
-              (params/ast-columns (.getExpression item)))
-            (.getSelectItems ^PlainSelect inner))))
-
 (defn- dml-scalar-correlated?
   [inner]
   (let [aliases (set (keys params/*from-bindings*))
@@ -7013,13 +7008,21 @@
                 (when-let [qualifier (some-> col .getTable .getName unquote-ident)]
                   (contains? aliases qualifier)))
               (params/ast-columns inner))
-        unqualified (when (instance? PlainSelect inner)
-                      (some (fn [^Column col]
-                              (and (str/blank? (some-> col .getTable .getName))
-                                   (seq (params/binding-column-owners
-                                         params/*from-bindings*
-                                         (unquote-ident (.getColumnName col))))))
-                            (no-from-select-columns inner)))]
+        ;; ANY bare name the outer row also exposes, FROM clause or not: an
+        ;; unqualified reference reaches the outer level whenever the inner
+        ;; level lacks the column (params/*outer-scope-aliases*). Counting
+        ;; one the inner level would have answered only forgoes the
+        ;; once-per-statement cache; missing a real one would reuse one
+        ;; row's answer for every row.
+        unqualified (some (fn [^Column col]
+                            (and (str/blank? (some-> col .getTable .getName))
+                                 (seq (params/binding-column-owners
+                                       params/*from-bindings*
+                                       (unquote-ident (.getColumnName col))
+                                       nil))))
+                          (when (instance? PlainSelect inner)
+                            (mapcat params/ast-columns
+                                    (remove nil? (expr/plain-select-scope-nodes inner)))))]
     (boolean (or (seq qualified) directly-qualified unqualified))))
 
 (defn with-dml-row-context
@@ -7046,20 +7049,17 @@
 (defn- strict-scalar-value
   [inner schema db parse-fn]
   (when (and db parse-fn)
-    (let [no-from-unqualified?
-          (and (instance? PlainSelect inner)
-               (some (fn [^Column col]
-                       (and (str/blank? (some-> col .getTable .getName))
-                            (seq (params/binding-column-owners
-                                  params/*from-bindings*
-                                  (unquote-ident (.getColumnName col))))))
-                     (no-from-select-columns inner)))
+    (let [;; Everything in *from-bindings* -- the UPDATE target row and
+          ;; its FROM rows -- belongs to the ENCLOSING statement, so it is
+          ;; an outer level for this subquery: an inner column shadows it,
+          ;; and it answers a bare name only when the inner has none. This
+          ;; replaces a "does the subquery have a FROM clause" test that
+          ;; approximated the same rule.
           evaluate #(binding [params/*lateral-outer-aliases*
                               (set (keys params/*from-bindings*))
-                              params/*from-source-aliases*
-                              (if no-from-unqualified?
-                                (set (keys params/*from-bindings*))
-                                params/*from-source-aliases*)]
+                              params/*from-source-aliases* nil
+                              params/*outer-scope-aliases*
+                              (set (keys params/*from-bindings*))]
                       (expr/strict-scalar-subquery parse-fn inner schema db))
           v (if (dml-scalar-correlated? inner)
               (evaluate)
