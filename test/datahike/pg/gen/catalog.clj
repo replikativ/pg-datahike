@@ -198,7 +198,7 @@
         (for [[k cols] columns]
           (str " " k "\n {:columns " (pr-str cols) "\n  :rows\n  ["
                (str/join "\n   " (for [row (get catalog k)]
-                                    (pr-str (mapv row cols))))
+                                   (pr-str (mapv row cols))))
                "]}")))
        "}\n"))
 

@@ -20,12 +20,14 @@
   (is (= pg-catalog/pg-version
          (re-find #"^\d+\.\d+" PgWireServer/SERVER_VERSION))))
 
-(deftest committed-catalog-matches-the-pinned-source
-  (if (.exists (io/file gen/default-source "src/include/catalog/pg_proc.dat"))
+;; Only where the pinned checkout exists (a developer machine); without it
+;; the checksum test above still catches an edited file. Kaocha fails a
+;; test that makes no assertion, so the test is not defined at all.
+(when (.exists (io/file gen/default-source "src/include/catalog/pg_proc.dat"))
+  (deftest committed-catalog-matches-the-pinned-source
     (is (= (slurp gen/output-path)
            (gen/render (gen/generate gen/default-source)))
-        "regenerate with `bb gen-catalog`")
-    (println "skipping: no PostgreSQL checkout at" gen/default-source)))
+        "regenerate with `bb gen-catalog`")))
 
 (deftest derived-tables-read-the-catalog
   (testing "PostgreSQL facts the hand-written tables had wrong"
