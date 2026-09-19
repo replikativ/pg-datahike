@@ -197,3 +197,71 @@
                      (run "ROLLBACK TO SAVEPOINT keep_me"))))
   (is (= [["1"]] (rows "SELECT 1")))
   (run "COMMIT"))
+
+(deftest returning-evaluates-like-select
+  ;; Expectations are PostgreSQL 17's. RETURNING was evaluated by a second
+  ;; interpreter: `||` merged JSON whenever an operand parsed as JSON, a
+  ;; templated literal (`i + 1`) read as NULL, and values rendered without
+  ;; their type (timestamptz lost +00, a date printed as a timestamp).
+  (run (str "CREATE TABLE returning_like_select (id int PRIMARY KEY, i int, s text, "
+            "ts timestamptz, n numeric, d date)"))
+  (is (= [["11" "a[1]" "2020-01-01 10:00:00+00" "1.50" "2020-01-02"]]
+         (rows (str "INSERT INTO returning_like_select VALUES "
+                    "(1, 10, 'a', '2020-01-01 10:00:00+00', 1.50, '2020-01-02') "
+                    "RETURNING i + 1, s || '[1]', ts, n, d"))))
+  (is (= [["21" "20x" "t"]]
+         (rows (str "UPDATE returning_like_select SET i = i * 2 WHERE id = 1 "
+                    "RETURNING i + 1, i::text || 'x', i > 5"))))
+  (testing "the value after the assignment cast"
+    (is (= [["2"]] (rows "UPDATE returning_like_select SET i = 1.6 WHERE id = 1 RETURNING i"))))
+  (testing "EXISTS as a value, its subquery reading the pre-statement snapshot (i is still 2)"
+    (is (= [["f" "f"]]
+           (rows (str "UPDATE returning_like_select SET i = 7 WHERE id = 1 "
+                      "RETURNING EXISTS (SELECT 1 FROM returning_like_select r WHERE r.i = 7), "
+                      "NOT EXISTS (SELECT 1 FROM returning_like_select)"))))))
+
+(defn- sqlstate [sql]
+  (.-sqlstate ^PgWireServer$QueryResult (run sql)))
+
+(deftest returning-scopes-like-postgres
+  ;; Expectations are PostgreSQL 17's. The row RETURNING projects is in
+  ;; scope as its table (or alias) and nothing else: no FROM relation is
+  ;; enumerated, so a whole-row reference reads the row, not the table.
+  (run "CREATE TABLE returning_scope (id int PRIMARY KEY, a int, b int, f boolean)")
+  (run "CREATE TABLE returning_other (id int PRIMARY KEY, x int)")
+  (run "INSERT INTO returning_other VALUES (1, 7)")
+  (run "INSERT INTO returning_scope VALUES (9, 90, 90, false)")
+  (testing "a whole-row reference is the returned row"
+    (is (= [["(1,1,,t)"]]
+           (rows "INSERT INTO returning_scope VALUES (1, 1, NULL, true) RETURNING returning_scope"))))
+  (testing "names outside the row"
+    (is (= "42P01" (sqlstate "INSERT INTO returning_scope AS r VALUES (2, 2, 2, true) RETURNING returning_scope.a")))
+    (is (= "42P01" (sqlstate "INSERT INTO returning_scope VALUES (2, 2, 2, true) RETURNING other.x")))
+    (is (= "42703" (sqlstate "INSERT INTO returning_scope VALUES (2, 2, 2, true) RETURNING nosuch"))))
+  (testing "one row: no aggregate, no window"
+    (is (= "42803" (sqlstate "UPDATE returning_scope SET a = a WHERE id = 1 RETURNING count(*)")))
+    (is (= "42P20" (sqlstate "UPDATE returning_scope SET a = a WHERE id = 1 RETURNING row_number() OVER ()"))))
+  (testing "a system function is an expression over the row, not a sole-call shortcut"
+    (is (= [["t"]] (rows "UPDATE returning_scope SET a = a WHERE id = 1 RETURNING now() IS NOT NULL")))
+    (is (= [["t"]] (rows "UPDATE returning_scope SET a = a WHERE id = 1 RETURNING now() = now()"))))
+  (testing "EXISTS as a value keeps its subquery's shape"
+    (is (= [["t" "f" "f" "t"]]
+           (rows (str "UPDATE returning_scope SET a = a WHERE id = 1 RETURNING "
+                      "EXISTS (SELECT count(*) FROM returning_other WHERE false), "
+                      "EXISTS (SELECT 1 FROM returning_other LIMIT 0), "
+                      "EXISTS (SELECT 1 FROM returning_other OFFSET 5), "
+                      "EXISTS (WITH c AS (SELECT 1) SELECT * FROM c)")))))
+  (testing "the row's columns inside a subquery's predicates"
+    (is (= [["1" "1" "0"]]
+           (rows (str "UPDATE returning_scope SET a = a WHERE id = 1 RETURNING "
+                      "(SELECT count(*) FROM returning_other WHERE b IS NULL), "
+                      "(SELECT count(*) FROM returning_other WHERE f), "
+                      "(SELECT count(*) FROM returning_other WHERE NOT f)")))))
+  (testing "RETURNING * over names that need quoting"
+    (run "CREATE TABLE \"returning_Q\" (\"MyCol\" int PRIMARY KEY, \"Order\" int, \"sp ace\" int)")
+    (is (= [["1" "2" "3"]] (rows "INSERT INTO \"returning_Q\" VALUES (1, 2, 3) RETURNING *"))))
+  (testing "ON CONFLICT WHERE sees the target and excluded on one level"
+    (is (= "42702" (sqlstate (str "INSERT INTO returning_scope VALUES (1, 9, 9, true) "
+                                  "ON CONFLICT (id) DO UPDATE SET a = 5 WHERE a > 0"))))
+    (is (= "42703" (sqlstate (str "INSERT INTO returning_scope VALUES (1, 9, 9, true) "
+                                  "ON CONFLICT (id) DO UPDATE SET a = 5 WHERE excluded.nosuch > 0"))))))

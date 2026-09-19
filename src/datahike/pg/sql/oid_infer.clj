@@ -404,8 +404,12 @@
           col-table  (when-let [t (.getTable col)]
                        (or (params/unquote-ident (.getName t))
                            (params/unquote-ident (.getAlias t))))
-          bound-oid  (when col-table
-                       (get-in from-binding-oids [col-table col-name]))
+          bound-oid  (if col-table
+                       (get-in from-binding-oids [col-table col-name])
+                       ;; An unqualified name over a row scope (row-eval):
+                       ;; the scope column's declared type.
+                       (some #(get-in from-binding-oids [% col-name])
+                             params/*row-scope-aliases*))
           table-real (or (get table-aliases col-table col-table)
                          ;; An unqualified column uses default-table, which
                          ;; may itself be a SQL alias (including a CTE name

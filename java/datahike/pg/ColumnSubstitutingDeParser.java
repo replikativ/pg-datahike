@@ -19,22 +19,18 @@ import net.sf.jsqlparser.util.deparser.ExpressionDeParser;
 
 /**
  * Deparses an expression back to SQL with every column reference replaced
- * by the text a function returns for it. Row-level expressions (CHECK
- * constraints, domain checks, ON CONFLICT ... WHERE) are evaluated by
- * translating them as a one-row SELECT in which each column becomes a
- * typed parameter.
+ * by the text a function returns for it, failing closed on shapes whose
+ * columns it cannot reach (Unsupported).
+ *
+ * Used to ANALYSE expressions, not to evaluate them: DDL reads the columns
+ * a CHECK references (constraint naming) and refuses subqueries in CHECK
+ * and domain constraints; row-level evaluation (row-eval) quotes a
+ * domain's VALUE so its text parses again. Evaluation itself goes through
+ * the SELECT translator, whose own scoping binds column references.
  *
  * A subclass rather than a Clojure proxy: the deparser visits nested
  * expressions through {@code this}, and proxy-super disables the override
  * for exactly those nested calls.
- *
- * Fails closed. ExpressionDeParser renders a few node types through their
- * operands' toString, which would leave a column reference in the text
- * where the SELECT has no table to resolve it in; those it cannot
- * substitute raise {@link Unsupported} rather than deparse to SQL that
- * means something else. A subquery is one of them: its own columns must
- * not be replaced, and resolving which names belong to the row and which
- * to the subquery is the translator's job, not a text rewrite's.
  */
 public final class ColumnSubstitutingDeParser extends ExpressionDeParser {
 

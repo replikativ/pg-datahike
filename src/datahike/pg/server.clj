@@ -1763,62 +1763,54 @@
 ;; ============================================================================
 
 (defn- returning-items
-  "Expand a parsed RETURNING projection to executable output descriptors."
+  "RETURNING's output columns, {:kind :name :expr}, with `*` and `t.*`
+   expanded to the table's columns (inherited ones included) in order.
+   The expressions are resolved, validated and typed where they are
+   compiled, as a projection over the row (row-eval)."
   [returning db table-name table-alias schema]
-  (let [columns (->> (pgs/column-info schema table-name db)
-                     (remove #(= "db_id" (:name %)))
-                     vec)
-        visible-name (or table-alias table-name)
-        aliases {visible-name table-name}
-        return-ctx (sql-ctx/make-ctx
-                    schema aliases visible-name
-                    {:db db :parse-sql sql/parse-sql :hints (pgs/schema-hints db)})
-        env {:db db
-             :schema schema
-             :default-table visible-name
-             :table-aliases aliases
-             :scalar-subquery-oid #(expr/scalar-subquery-output-oid return-ctx %)
-             :hints (pgs/schema-hints db)}
-        _ (doseq [{:keys [kind expr]} returning
-                  :when (= :expr kind)
-                  ^net.sf.jsqlparser.schema.Column column (params/ast-columns expr)
-                  :let [resolved (sql-ctx/resolve-column
-                                  column aliases visible-name
-                                  (:col-overrides return-ctx)
-                                  (:derived-aliases return-ctx)
-                                  (:ci-index return-ctx))
-                        attr (sql-ctx/attr-of return-ctx resolved)]]
-            (sql-ctx/validate-column! return-ctx attr))]
+  (let [visible (or table-alias table-name)]
     (vec
      (mapcat
-      (fn [{:keys [kind table expr name] :as item}]
+      (fn [{:keys [kind table] :as item}]
         (if (= :star kind)
           (do
-            (when (and table (not (contains? aliases table)))
+            (when (and table (not= table visible))
               (throw (ex-info (str "missing FROM-clause entry for table \"" table "\"")
                               {:error :undefined-table :sqlstate "42P01" :table table})))
-            (map (fn [{:keys [name oid]}]
-                   {:kind :column
-                    :name name
-                    :attr (#'sql/resolve-inherited-attr
-                           (keyword table-name name) schema db)
-                    :oid oid})
-                 columns))
-          [(if (instance? Column expr)
-             (let [resolved (sql-ctx/resolve-column
-                             expr aliases visible-name
-                             (:col-overrides return-ctx)
-                             (:derived-aliases return-ctx)
-                             (:ci-index return-ctx))]
-               (assoc item
-                      :kind :column
-                      :name name
-                      :attr (sql-ctx/attr-of return-ctx resolved)
-                      :oid (or (oid/expr-oid expr env)
-                               PgWireServer/OID_TEXT)))
-             (assoc item :name name :oid (or (oid/expr-oid expr env)
-                                             PgWireServer/OID_TEXT)))]))
+            (map (fn [{:keys [name]}] {:kind :column :name name})
+                 (row-eval/table-columns db schema table-name)))
+          [item]))
       returning))))
+
+(declare ^:dynamic *cached-bound*)
+
+(defn- returning-asts
+  "RETURNING items as expressions over the row visible as `visible`: a
+   column item (from `*` or a bare column) is the column itself."
+  [items visible]
+  (let [;; Quoted always: the expressions are compiled from their text,
+        ;; and a stored name need not be a plain identifier (`"MyCol"`,
+        ;; `"Order"`, `"sp ace"`).
+        quoted #(str \" (str/replace % "\"" "\"\"") \")]
+    (mapv (fn [{:keys [kind name expr]}]
+            (if (and (= :column kind) (not (instance? Column expr)))
+              (Column. (net.sf.jsqlparser.schema.Table. ^String (quoted visible))
+                       ^String (quoted name))
+              expr))
+          items)))
+
+(defn- returning-columns
+  "RETURNING as {:items :asts :oids}: the output columns, the expressions
+   evaluated per row, and their OIDs as the compiled projection types them
+   -- what Describe reports and Execute renders with."
+  [returning db table-name table-alias schema]
+  (let [items (returning-items returning db table-name table-alias schema)
+        visible (or table-alias table-name)
+        asts (returning-asts items visible)
+        plan-oids (row-eval/row-oids asts table-name schema db {:alias visible})]
+    {:items items
+     :asts asts
+     :oids (mapv #(or % PgWireServer/OID_TEXT) plan-oids)}))
 
 (defn- build-returning-result
   "Build a QueryResult for a RETURNING projection from affected entity IDs.
@@ -1831,28 +1823,28 @@
    table-name: the table name (namespace prefix for attributes).
    schema: database schema."
   [returning row-db subquery-db eids table-name table-alias schema command]
-  (let [items (returning-items returning row-db table-name table-alias schema)
+  (let [;; A templated simple query carries its literals only as the
+        ;; 1-indexed *cached-bound*; RETURNING `i + 1` read `$1` as NULL.
+        bound (or params/*bound-params* (some-> *cached-bound* rest vec))
+        {:keys [items asts oids]} (binding [params/*bound-params* bound]
+                                    (returning-columns returning row-db table-name
+                                                       table-alias schema))
         col-names (mapv :name items)
-        rows (for [eid eids]
-               (let [datoms (d/datoms row-db :eavt eid)
-                     entity-map (into {} (map (fn [^datahike.datom.Datom d]
-                                                [(.-a d) (.-v d)])
-                                              datoms))]
-                 (stmt/with-dml-row-context
-                   #(binding [stmt/*eval-update-db* subquery-db
-                              stmt/*eval-update-parse-fn* sql/parse-sql]
-                      (mapv (fn [{:keys [kind attr expr]}]
-                              (if (= :column kind)
-                                (get entity-map attr)
-                                (stmt/eval-update-expr expr entity-map table-name schema)))
-                            items))
-                   subquery-db schema table-name table-alias entity-map)))
+        visible (or table-alias table-name)
+        results (binding [params/*bound-params* bound]
+                  (mapv (fn [eid]
+                          (row-eval/row-values
+                           asts (into {} (map (fn [^datahike.datom.Datom d] [(.-a d) (.-v d)]))
+                                      (d/datoms row-db :eavt eid))
+                           table-name schema row-db
+                           {:alias visible :exec-db subquery-db}))
+                        eids))
         row-arrays (into-array (Class/forName "[Ljava.lang.String;")
-                               (for [row rows]
-                                 (into-array String (map value->string row))))
+                               (for [{:keys [values]} results]
+                                 ;; Rendered as SELECT renders: by OID.
+                                 (into-array String (map value->string values oids))))
         col-name-array (into-array String col-names)
-        oids (int-array (map #(types/oid->wire-int
-                               (or (:oid %) PgWireServer/OID_TEXT)) items))
+        oids (int-array (map types/oid->wire-int oids))
         tag (case command
               :update (str "UPDATE " (count eids))
               :delete (str "DELETE " (count eids))
@@ -2717,8 +2709,6 @@
           (empty-result (str "INSERT 0 " (insert-affected-count parsed))))))
     (catch Exception e
       (classified-error "INSERT error: " e))))
-
-(declare ^:dynamic *cached-bound*)
 
 (defn- ensure-evar-anchor!
   "The UPDATE/DELETE row-matching query needs at least one data pattern
@@ -11565,11 +11555,10 @@
                      (d/db conn))
                 schema (dbi/-schema db)
                 table-ns (or (:ns parsed) (:table parsed))
-                items (returning-items (:returning parsed) db table-ns
-                                       (:alias parsed) schema)
+                {:keys [items oids]} (returning-columns (:returning parsed) db table-ns
+                                                        (:alias parsed) schema)
                 names (mapv :name items)
-                oids (int-array (map #(types/oid->wire-int
-                                       (or (:oid %) PgWireServer/OID_TEXT)) items))]
+                oids (int-array (map types/oid->wire-int oids))]
             (PgWireServer$QueryResult.
              (into-array String names)
              oids

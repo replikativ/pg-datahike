@@ -470,13 +470,18 @@
   (when cache (.put cache k v))
   v)
 
+(defn translation-context
+  "What a translation depends on besides its SQL, schema and catalog: the
+   declared parameter types, the session's temp tables and search_path."
+  []
+  [params/*declared-param-oids* params/*temp-table-map*
+   (when params/*session-state*
+     (select-keys @params/*session-state* [:search-path]))])
+
 (defn- translation-cache-key [sql schema db]
   ;; Keep exact values, not their hashes: native catalog transactions do not
   ;; necessarily change Datahike's schema object or the server's DDL token.
-  [::translation sql schema (catalog-basis/capture db)
-   params/*declared-param-oids* params/*temp-table-map*
-   (when params/*session-state*
-     (select-keys @params/*session-state* [:search-path]))])
+  (into [::translation sql schema (catalog-basis/capture db)] (translation-context)))
 
 (defn enrich-db-with-catalogs
   "Materialise the given catalog tables' schema + data on top of `db`,
@@ -555,6 +560,18 @@
   "Server-wide cache for parse-sql results. Tests can rebind to an
    isolated map; nil disables caching entirely."
   global-parse-cache)
+
+(defn cached-result
+  "The value of (f), kept in the parse-sql result cache under `k`, with
+   the same LRU bound and the same clearing on DDL. `k` must hold
+   everything the value depends on. A result of :type :error is not
+   kept."
+  [k f]
+  (let [cache *parse-cache*]
+    (if-some [hit (cache-get cache k)]
+      hit
+      (let [v (f)]
+        (if (= :error (:type v)) v (cache-put! cache k v))))))
 
 (defn invalidate-parse-cache!
   "Clear the server-wide parse-sql result cache. Called from every DDL
@@ -1073,7 +1090,11 @@
     ;; don't re-tokenize the same SQL twice per statement.
       (let [cls-info (cls/classify sql)
             explain (explain-prefix sql)
-            sys-type (catalog/system-query?* sql cls-info)]
+            ;; A row-scope expression list (row-eval) is never a
+            ;; catalog probe or a sole system call: `RETURNING now()` is
+            ;; an expression over the row, projected by the translator.
+            sys-type (when-not params/*statement-row-scope-tables*
+                       (catalog/system-query?* sql cls-info))]
         (cond
           sys-type
           (let [base (merge
@@ -2659,17 +2680,21 @@
        hits JSqlParser, repeated or not."
   ([^String sql schema] (parse-sql sql schema nil))
   ([^String sql schema db]
-   (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
+   ;; A row scope (row-eval) belongs to this statement only: a subquery
+   ;; parsed from here on sees the row as an outer relation.
+   (binding [params/*statement-row-scope-tables* params/*row-scope-tables*
+             params/*row-scope-tables* nil]
+     (let [;; A parse made under *from-bindings* (correlated subquery / LATERAL
          ;; per-row eval) resolves outer column refs to ROW-SPECIFIC constants,
          ;; so it must neither be served from nor written to the shared result
          ;; cache. Bypass caching entirely in
          ;; that case — otherwise the binding-free version (e.g. the parse done
          ;; for result-OID inference) poisons the entry and the correlated ref
          ;; collapses to an unbindable get-else ("Cannot resolve any clauses").
-         cache (when (and (empty? params/*from-bindings*)
-                          (nil? params/*bound-params*)
-                          (cacheable-sql-size? sql))
-                 *parse-cache*)
+           cache (when (and (empty? params/*from-bindings*)
+                            (nil? params/*bound-params*)
+                            (cacheable-sql-size? sql))
+                   *parse-cache*)
          ;; Schema-flexibility is part of the key because it changes the
          ;; TRANSLATION, not just the data: under :write an unknown
          ;; column is 42703, under :read it reads as NULL (a real column
@@ -2689,18 +2714,18 @@
          ;;
          ;; PostgreSQL keys a prepared plan on its declared parameter
          ;; types for the same reason.
-         cache-key (when cache (translation-cache-key sql schema db))
-         cached (when cache (cache-get cache cache-key))]
-     (cond
-       cached cached
+           cache-key (when cache (translation-cache-key sql schema db))
+           cached (when cache (cache-get cache cache-key))]
+       (cond
+         cached cached
 
-       :else
+         :else
        ;; Lexical validation runs BEFORE templating: parameterize-numbers
        ;; would rewrite `SELECT 42#` to `SELECT $1#` and hand JSqlParser
        ;; a shape whose `#` is even harder to see.
-       (or (unsupported-operator-error sql)
-           (templated-parse sql schema db)
-           (let [parsed (parse-sql* sql schema db)]
-             (when (and cache (cacheable-parse? parsed))
-               (cache-put! cache cache-key parsed))
-             parsed))))))
+         (or (unsupported-operator-error sql)
+             (templated-parse sql schema db)
+             (let [parsed (parse-sql* sql schema db)]
+               (when (and cache (cacheable-parse? parsed))
+                 (cache-put! cache cache-key parsed))
+               parsed)))))))

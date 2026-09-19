@@ -4,6 +4,22 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Row-level expressions share the SELECT translator's scoping
+
+The translator can now treat a single written row as a relation in scope, a "row scope". Its columns are bound to placeholders typed by their declared OIDs, it takes column metadata from its table, and subqueries correlate against it with the translator's own name resolution. CHECK, domain CHECK, ON CONFLICT … WHERE and RETURNING are evaluated through it. This follows how PostgreSQL projects over a tuple (ExecCheck, ExecQual, ExecProcessReturning).
+
+- **RETURNING no longer uses the hand-written UPDATE evaluator.** Fixed:
+  - `s || '[1]'` merged JSON whenever an operand parsed as JSON;
+  - a templated literal (`RETURNING i + 1`) evaluated to NULL;
+  - values rendered without their type: timestamptz lost `+00`, a date printed as a timestamp;
+  - inherited columns are read from the table that declares them.
+
+  Describe and Execute report the same OIDs, those of the compiled projection. Subqueries read the pre-statement snapshot, as in PostgreSQL. The row is in scope under its visible name only: `RETURNING t` is the row itself, a name outside it is 42P01, aggregates are 42803 and window functions 42P20, and `RETURNING *` handles names that need quoting. `RETURNING now()` is an expression over the row rather than the sole-call shortcut. `nextval()` in RETURNING raises 0A000 until the projection resolves sequence markers.
+- **CHECK and ON CONFLICT evaluation drop the text substitution of 0.2.** Column references are no longer rewritten to `CAST($n AS type)`. ON CONFLICT … WHERE sees `excluded` as a scope of its own, on the target's level: an unqualified column both have is 42702, and `excluded.nosuch` is 42703 instead of NULL.
+- **EXISTS in value position** (a projection, RETURNING, a CHECK) is evaluated as a correlated scalar subquery over the same WITH, FROM, WHERE, grouping and OFFSET. An ungrouped aggregate always yields a row and LIMIT 0 none. FETCH and a computed LIMIT raise 0A000. It raised "not supported" before.
+- **An outer column in `IS NULL` or as a bare boolean** inside a subquery reads the outer value. It scanned the subquery's relation for an attribute of the outer table.
+- **The fuzzer compares RETURNING rows,** and gains a RETURNING class.
+
 ### Constraint names are per table, and dropped with the table
 
 - CHECK and FOREIGN KEY constraints are identified by table and name (`:pg/constraint-key`), not by name alone. Two tables may each declare a constraint called `pos`.

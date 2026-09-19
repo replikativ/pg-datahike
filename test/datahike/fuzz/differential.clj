@@ -90,12 +90,16 @@
     (catch Exception e [:error (sqlstate e)])))
 
 (defn exec!
-  "Run a statement; [:ok update-count] or [:error sqlstate]."
+  "Run a statement; [:ok update-count], [:rows sorted-rows] for one that
+   returns rows (RETURNING, whose order PostgreSQL leaves unspecified), or
+   [:error sqlstate]."
   [^Connection c sql]
   (try
     (with-open [st (.createStatement c)]
-      (.execute st sql)
-      [:ok (.getUpdateCount st)])
+      (if (.execute st sql)
+        (with-open [rs (.getResultSet st)]
+          [:rows (vec (sort-by pr-str (read-rows rs)))])
+        [:ok (.getUpdateCount st)]))
     (catch Exception e [:error (sqlstate e)])))
 
 (defn- prep-q
@@ -387,7 +391,18 @@
   [^java.util.Random r]
   (let [pick (fn [v] (nth v (.nextInt r (count v))))
         num  #(pick (into cols-num ["1" "0" "-1" "2.5" "10"]))]
-    (case (.nextInt r 11)
+    (case (.nextInt r 12)
+      ;; RETURNING is a projection over the written row, typed as SELECT
+      ;; types it; its subqueries read the pre-statement snapshot.
+      11 (let [ret (pick ["id, i + 1" "s || '[1]'" "d, n" "b, NOT b" "i IS NULL, coalesce(j, -1)"
+                          "(SELECT count(*) FROM ft x WHERE x.i = ft.i)"
+                          "EXISTS (SELECT 1 FROM fu WHERE fu.k = ft.i)" "f * 2, i::text || 'x'"])]
+           [:returning (pick [(format "UPDATE ft SET i = %s WHERE %s %s %s RETURNING %s"
+                                      (num) (num) (pick cmp) (num) ret)
+                              (format "INSERT INTO ft (id, i, s) VALUES (%d, %s, 'r') RETURNING %s"
+                                      (+ 10 (.nextInt r 5)) (num) ret)
+                              (format "DELETE FROM ft WHERE %s %s %s RETURNING %s"
+                                      (num) (pick cmp) (num) ret)])])
       10 (let [[col vals] (pick [["s" ["'abc'" "'b'" "'zz'" "'m'" "''" "NULL"]]
                                  ["d" ["'2020-01-01'" "'2040-01-01'" "'2030-01-01'" "NULL"]]
                                  ["n" ["0" "10" "10.5" "-1" "'5'" "NULL"]]
