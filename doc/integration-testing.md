@@ -95,7 +95,7 @@ REFERENCE_URL=... TARGET_URL=... bb fuzz [select|prepared|dml|all] [n] [seed]
 
 | Surface | Generated | Compared |
 |---|---|---|
-| `select` | ~50 classes: comparisons, 3-valued logic, arithmetic and numeric edges, CASE, casts, string/date/timestamp functions, arrays, jsonb, aggregates, GROUP BY/HAVING, DISTINCT (ON), joins, self-joins, set operations, window functions (frames, ranking, FILTER, top-N), CTEs, recursion, correlated subqueries, LATERAL | rows, or SQLSTATE when both fail |
+| `select` | ~55 classes: comparisons, 3-valued logic, arithmetic and numeric edges, CASE, casts, string/date/timestamp functions, arrays, jsonb, aggregates, GROUP BY/HAVING, DISTINCT (ON), joins, self-joins, set operations, window functions (frames, ranking, FILTER, top-N), CTEs, recursion, correlated subqueries, LATERAL; and type-directed values — rendering of time/timetz/timestamptz/money/interval/date columns through every output path (wire, `::text`, `\|\|`, `concat`, arrays, rows), AT TIME ZONE, and typed-literal input including invalid input | rows, or SQLSTATE when both fail |
 | `prepared` | parameterised predicates, projections and aggregates with NULL and edge parameters over the extended protocol | rows, or SQLSTATE |
 | `dml` | INSERT (VALUES and SELECT), UPDATE, DELETE; both sides re-seeded per sample | row count or SQLSTATE, plus the resulting table |
 

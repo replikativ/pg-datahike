@@ -338,6 +338,7 @@
 (def sql-between? fns/sql-between?)
 (def sql-substring fns/sql-substring)
 (def sql-extract fns/sql-extract)
+(def sql-at-time-zone fns/sql-at-time-zone)
 (def sql-btrim fns/sql-btrim)
 (def sql-ltrim fns/sql-ltrim)
 (def sql-rtrim fns/sql-rtrim)

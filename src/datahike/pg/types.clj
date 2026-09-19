@@ -515,6 +515,8 @@
    oid-varchar    "character varying"
    oid-bpchar     "character"
    oid-name       "name"
+   ;; The anonymous row type: ROW(a, b) and a bare `(a, b)`.
+   2249           "record"
    ;; format_type quotes it: unquoted `char` is bpchar.
    oid-char       "\"char\""
    oid-money      "money"
@@ -1496,63 +1498,103 @@
                           (if (< a 10) (str "0" a) (str a)))))]
         (if minus? (str "-" body) body)))))
 
+(defn- seconds-text
+  "Seconds with PostgreSQL's fractional part (datetime.c AppendSeconds):
+   microseconds, trailing zeros dropped, nothing at all when zero."
+  [sec nanos]
+  (let [micros (quot (long nanos) 1000)]
+    (str (format "%02d" (long sec))
+         (when (pos? micros)
+           (str "." (str/replace (format "%06d" micros) #"0+$" ""))))))
+
+(defn- time-text [^java.time.LocalTime t]
+  (str (format "%02d:%02d:" (.getHour t) (.getMinute t))
+       (seconds-text (.getSecond t) (.getNano t))))
+
+(defn offset-text
+  "EncodeTimezone: +HH, then :MM and :SS only when non-zero."
+  [^java.time.ZoneOffset o]
+  (let [total (.getTotalSeconds o)
+        a (Math/abs total)
+        h (quot a 3600) m (quot (rem a 3600) 60) sec (rem a 60)]
+    (str (if (neg? total) "-" "+") (format "%02d" h)
+         (when (or (pos? m) (pos? sec)) (format ":%02d" m))
+         (when (pos? sec) (format ":%02d" sec)))))
+
+(defn- timestamp-text [^java.time.LocalDateTime ldt]
+  (str (.toLocalDate ldt) " " (time-text (.toLocalTime ldt))))
+
+(defn money-text
+  "cash_out in the C locale: `-$1,234,567.89`."
+  [v]
+  (let [bd (.setScale (bigdec v) 2 java.math.RoundingMode/HALF_UP)
+        s (.format (doto (java.text.DecimalFormat.
+                          "#,##0.00" (java.text.DecimalFormatSymbols. java.util.Locale/ROOT))
+                     (.setRoundingMode java.math.RoundingMode/HALF_UP))
+                   (.abs bd))]
+    (str (when (neg? (.signum bd)) "-") "$" s)))
+
 (defn temporal->pg-text
   "PostgreSQL's text rendering of a temporal value, or nil if `v` is not
    temporal.
 
-   The wire renderer had its own copy of these rules, so anything that
-   converted a value to text by a route OTHER than the wire — `::text`,
-   `CAST(… AS varchar)`, `||`, `concat()` — fell through to Clojure's
-   `str` and emitted `java.util.Date.toString`:
+   Never `.toString`: java.time drops a zero seconds field (`10:00`) and
+   groups fractions in threes (`10:00:00.120`), and java.util.Date renders
+   in the JVM's default time zone and locale -- all of which reached
+   clients at one time or another.
 
-     SELECT ts::text  →  Wed Jan 01 02:00:00 PST 2020
-                         (want 2020-01-01 10:00:00)
-
-   which is not merely misformatted: it is rendered in the JVM's default
-   time zone and locale, so the same query answered differently on
-   different machines.
-
-   `src-oid` disambiguates `date` from `timestamp`. Datahike has only
-   :db.type/instant, so a `date` COLUMN and a `timestamp` COLUMN both
-   arrive here as java.util.Date at UTC and nothing about the value says
-   which is which. A `::date` CAST produces a LocalDate and needs no
-   hint. Absent a hint, an instant renders as a timestamp — the wider of
-   the two, and the one that loses no information."
+   `src-oid` disambiguates what the value's class cannot: Datahike has only
+   :db.type/instant, so `date`, `timestamp` and `timestamptz` columns all
+   arrive as java.util.Date at UTC. Absent a hint an instant renders as a
+   timestamp, the wider form that loses no information."
   ([v] (temporal->pg-text v nil))
   ([v src-oid]
    (cond
      (instance? java.time.LocalDate v)     (str v)
-     (instance? java.time.LocalTime v)     (str v)
-     (instance? java.time.OffsetTime v)    (str/replace (str v) #"Z$" "+00")
-     (instance? java.time.LocalDateTime v) (str/replace (str v) "T" " ")
-
-     (and (inst? v) (= src-oid oid-date))
-     (-> ^java.util.Date v .toInstant (.atZone java.time.ZoneOffset/UTC) .toLocalDate str)
+     (instance? java.time.LocalTime v)     (time-text v)
+     (instance? java.time.OffsetTime v)
+     (let [^java.time.OffsetTime t v]
+       (str (time-text (.toLocalTime t)) (offset-text (.getOffset t))))
+     (instance? java.time.LocalDateTime v) (timestamp-text v)
+     (instance? java.time.OffsetDateTime v)
+     (let [^java.time.OffsetDateTime t v]
+       (str (timestamp-text (.toLocalDateTime (.withOffsetSameInstant t java.time.ZoneOffset/UTC)))
+            "+00"))
 
      (inst? v)
      (let [^java.time.Instant inst (if (instance? java.time.Instant v)
                                      v
-                                     (.toInstant ^java.util.Date v))]
-       (-> (str inst)
-           (str/replace "T" " ")
-           ;; timestamptz keeps a UTC offset; timestamp drops it.
-           (str/replace "Z" (if (= src-oid oid-timestamptz) "+00" ""))))
+                                     (.toInstant ^java.util.Date v))
+           ldt (java.time.LocalDateTime/ofInstant inst java.time.ZoneOffset/UTC)]
+       (cond
+         (= src-oid oid-date)        (str (.toLocalDate ldt))
+         (= src-oid oid-timestamptz) (str (timestamp-text ldt) "+00")
+         :else                       (timestamp-text ldt)))
 
      :else nil)))
 
 (defn ->pg-text
-  "`str`, except that temporal values render the PostgreSQL way. Every
-   value→text conversion that is not the wire renderer should go through
-   here; see `temporal->pg-text` for why."
+  "PostgreSQL's output function for a value (its type's `typoutput`).
+
+   Dispatch is by the value's TYPE when the caller knows it (`src-oid`),
+   then by its class. The type has to win: several PostgreSQL types share
+   one representation here -- money and numeric are both BigDecimal;
+   date, timestamp and timestamptz are all instants -- and rendering by
+   class alone printed money as `1.50` instead of `$1.50`.
+
+   Every value->text conversion goes through here: the wire renderer,
+   `::text`, `||`, format(), array elements and record fields."
   ([v] (->pg-text v nil))
   ([v src-oid]
    (cond
-     ;; See the same branch in the wire renderer: `.toString` on a
-     ;; negative-scale BigDecimal produces an exponent form PostgreSQL
-     ;; never emits.
+     ;; SQL NULL, including the internal sentinel: it must never render as
+     ;; text (`concat(NULL, 'x')` answered ":__null__x").
+     (or (nil? v) (= :__null__ v)) nil
+     (and (= src-oid oid-money) (number? v)) (money-text v)
+     ;; `.toString` on a negative-scale BigDecimal produces an exponent
+     ;; form PostgreSQL never emits.
      (numeric-special? v) (numeric-special-text v)
      (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
-     ;; Same PostgreSQL float form the wire renderer uses.
      (or (instance? Float v) (instance? Double v))
      (float->pg-text v (instance? Float v))
      :else (or (temporal->pg-text v src-oid) (str v)))))

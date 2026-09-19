@@ -129,8 +129,24 @@
    "CREATE TABLE fu (id int, k int, v text)"
    "INSERT INTO fu VALUES (1,10,'ten'),(2,NULL,'null-k'),(3,99,NULL)"])
 
-(defn- seed! [^Connection c]
-  (doseq [s setup]
+(def value-setup
+  ;; Types whose rendering depends on the TYPE, not the JVM value: they
+  ;; share carriers (money/numeric, time as text, instants for every
+  ;; datetime), so a renderer that dispatches on the value's class gets
+  ;; them wrong. Fractions, offsets and negatives are deliberate. Read-only,
+  ;; so seeded once per run, not per DML sample.
+  ["DROP TABLE IF EXISTS fv"
+   "CREATE TABLE fv (id int, t time, ttz timetz, tz timestamptz, m money, iv interval, d date, ts timestamp)"
+   (str "INSERT INTO fv VALUES "
+        "(1,'10:00','10:00+02','2020-01-01 10:00:00+00:00',1234.5,'1 day','2020-01-01','2020-01-01 10:00:00'),"
+        "(2,'23:59:59.5','00:00:00-03:30','2021-06-15 23:30:00.25+00:00',-0.75,'02:03:04','2021-06-15','2021-06-15 00:00:00.125'),"
+        "(3,NULL,NULL,NULL,NULL,NULL,NULL,NULL)")])
+
+(defn- seed!
+  "Run the fixture statements (default: the mutable `ft`/`fu` tables, which
+   the DML surface re-seeds before every sample)."
+  [^Connection c & [statements]]
+  (doseq [s (or statements setup)]
     (let [[status state :as r] (exec! c s)]
       (when (= :error status)
         (throw (ex-info (str "fixture statement failed (" state "): " s) {:result r}))))))
@@ -154,7 +170,7 @@
         num  #(pick (into cols-num ["1" "0" "-1" "2.5" "10"]))
         any  #(pick cols-any)
         txt  #(pick ["s" "'aa'" "'%a%'" "''"])]
-    (case (.nextInt r 51)
+    (case (.nextInt r 56)
       0  [:cmp-proj  (format "SELECT id, %s %s %s AS c FROM ft ORDER BY id" (num) (pick cmp) (num))]
       1  [:cmp-where (format "SELECT id FROM ft WHERE %s %s %s ORDER BY id" (num) (pick cmp) (num))]
       2  [:arith     (format "SELECT id, %s %s %s AS c FROM ft ORDER BY id" (num) (pick arith) (num))]
@@ -250,7 +266,7 @@
                                                 "9223372036854775807 + 1" "1/0" "1.0/0"
                                                 "'NaN'::float8 + 1" "'Infinity'::float8 * 0"
                                                 "0.1 + 0.2" "round(2.5)" "round(-2.5)"
-                                                "trunc(-2.5)" "mod(-7, 3)" "(-7) %% 3"]))]
+                                                "trunc(-2.5)" "mod(-7, 3)" "(-7) % 3"]))]
       ;; PostgreSQL requires the DISTINCT ON expressions to lead ORDER BY.
       34 (let [k (any)]
            [:distincton (format "SELECT DISTINCT ON (%s) id, %s FROM ft ORDER BY %s, id"
@@ -296,6 +312,22 @@
                              (pick ["" "PARTITION BY b "])
                              (pick ["id" "i" "j"])
                              (pick ["r = 1" "r <= 2" "r IS NOT NULL"]))]
+      ;; ---- type-directed values: output, containers, zones, input ------
+      51 [:render    (let [c (pick ["t" "ttz" "tz" "m" "iv" "d" "ts"])]
+                       (format "SELECT id, %s, %s::text FROM fv ORDER BY id" c c))]
+      52 [:container (let [c (pick ["t" "ttz" "tz" "m" "d" "ts"])]
+                       (format "SELECT id, %s FROM fv ORDER BY id"
+                               (pick [(format "ARRAY[%s]" c) (format "ROW(%s, id)" c)
+                                      (format "(%s, id)::text" c) (format "(id, %s)" c)])))]
+      53 [:atz       (format "SELECT id, %s AT TIME ZONE '%s' FROM fv ORDER BY id"
+                             (pick ["ts" "tz" "ttz" "d"])
+                             (pick ["UTC" "America/New_York" "+05" "-03:30" "Asia/Kolkata" "EST"]))]
+      54 [:typein    (format "SELECT '%s'::%s"
+                             (pick ["10:00" "1:2:3 PM" "10:00:00.1234567" "25:00" "garbage"
+                                    "10:00+02" "2020-01-01 10:00:00" "2020-01-01" "12.5"])
+                             (pick ["time" "timetz" "money"]))]
+      55 [:concatv   (let [c (pick ["t" "tz" "m" "d" "ts"])]
+                       (format "SELECT id, 'x' || %s, concat(%s, '|') FROM fv ORDER BY id" c c))]
       50 [:winfilter (format "SELECT id, %s(%s) FILTER (WHERE %s) OVER (%s) AS c FROM ft ORDER BY id"
                              (pick ["sum" "count" "avg" "min" "array_agg"])
                              (pick ["i" "j" "n"])
@@ -373,7 +405,8 @@
     ;; pgjdbc sends the client's TimeZone at startup, overriding the
     ;; server's; pin both sessions or date_trunc differs by the host zone.
     (doseq [c [o t]] (exec! c "SET TimeZone='UTC'"))
-    (when (not= surface :dml) (seed! o) (seed! t))
+    (when (not= surface :dml)
+      (doseq [c [o t]] (seed! c) (seed! c value-setup)))
     (let [r (java.util.Random. (long seed))]
       (loop [i 0 seen #{} ran {} diffs []]
         (if (>= i n)

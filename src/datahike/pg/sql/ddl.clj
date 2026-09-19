@@ -447,7 +447,7 @@
 
       (#{"jsonb" "json" "money" "interval" "tsvector" "tsquery" "vector"} bt) bt
 
-      (#{"date" "time" "timestamp" "timestamptz"
+      (#{"date" "time" "timetz" "timestamp" "timestamptz"
          "timestamp without time zone" "timestamp with time zone"
          "time without time zone" "time with time zone"} bt)
       (cond
@@ -863,66 +863,15 @@
                                (assoc :pg/default-value (str (:value default-spec)))
                                (= :nextval (:kind default-spec))
                                (assoc :pg/default-arg (:value default-spec))))
-                       ;; Track original SQL type when the Datahike
-                       ;; valueType isn't a 1:1 mapping. jsonb/json
-                       ;; both reduce to :db.type/string; date/time/
-                       ;; timestamp all collapse to :db.type/instant.
-                       ;; Without this hint, ParameterDescription
-                       ;; advertises a DATE param as `timestamp`
-                       ;; (OID 1114) and pgjdbc rejects subsequent
-                       ;; setDate binds with "Can't change resolved
-                       ;; type for param …".
-                       (and (not array-spec)
-                            (#{"jsonb" "json" "money" "interval" "tsvector" "tsquery"
-                               "date" "time" "timestamp"
-                               "timestamptz" "timestamp without time zone"
-                               "timestamp with time zone"
-                               "time without time zone"
-                               "time with time zone"} base-type))
-                       (assoc :pg/type
-                              (cond
-                                (#{"timestamp without time zone"} base-type) "timestamp"
-                                (#{"timestamp with time zone"} base-type)    "timestamptz"
-                                (= "time without time zone" base-type) "time"
-                                (= "time with time zone" base-type) "timetz"
-                                :else base-type))
-
-                       ;; bit / bit varying columns. Like jsonb they
-                       ;; reduce to :db.type/string (the stored form is
-                       ;; PG's own text output — the digit run), so the
-                       ;; hint is what makes RowDescription report bit
-                       ;; (1560) / varbit (1562) instead of text — see
-                       ;; issue #28.
-                       (and (not array-spec)
-                            (#{:bit :varbit} (types/cast-category base-type)))
-                       (assoc :pg/type
-                              (if (= :varbit (types/cast-category base-type))
-                                "varbit" "bit"))
-
-                       ;; Narrow integer columns. Datahike stores every
-                       ;; integer as :db.type/long, which would otherwise
-                       ;; advertise int8 (OID 20) for a column the user
-                       ;; declared `smallint`/`integer`. Record the width
-                       ;; so RowDescription / ParameterDescription report
-                       ;; int2 / int4 like PG — clients pick int4 vs int8
-                       ;; parsers off the OID (node-postgres returns int8
-                       ;; as a string, int4 as a number). bigint needs no
-                       ;; hint: :db.type/long already → int8.
-                       ;; Guard on (not array-spec): an `int[]` column has
-                       ;; base-type "int" too, and already set :pg/type to
-                       ;; its array name ("_int4") above — must not clobber.
-                       (and (not array-spec)
-                            (#{"smallint" "int2" "smallserial" "serial2"} base-type))
-                       (assoc :pg/type "int2")
-                       (and (not array-spec)
-                            (#{"integer" "int" "int4" "serial" "serial4"} base-type))
-                       (assoc :pg/type "int4")
-
-                       ;; oid columns: stored as a long, but advertise the
-                       ;; PG `oid` type (26) so clients parse it as a number
-                       ;; rather than an int8 string.
-                       (and (not array-spec) (= "oid" base-type))
-                       (assoc :pg/type "oid")
+                       ;; The declared SQL type when the storage valueType
+                       ;; does not imply it (dates/times on instants, json/
+                       ;; bit/money on strings, narrow ints on longs). One
+                       ;; table, shared with ALTER TABLE ADD COLUMN: this
+                       ;; branch used to carry its own copy, and the copies
+                       ;; drifted -- neither knew the short name `timetz`,
+                       ;; so such columns reported (and rendered) as text.
+                       (and (not array-spec) (pg-type-hint base-type false))
+                       (assoc :pg/type (pg-type-hint base-type false))
 
                        ;; ENUM-typed column: remember the enum's name so
                        ;; the dump can re-emit the column as `<enum>`

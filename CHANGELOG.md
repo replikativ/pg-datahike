@@ -4,6 +4,29 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Values render and parse by their SQL type
+
+- One output function (`types/->pg-text`) serves the wire, `::text`, `||`,
+  `concat`, array elements and record fields, and dispatches on the value's
+  TYPE before its JVM class. money prints `$1,234.50`; time keeps its seconds
+  (`10:00:00`); fractional seconds print PostgreSQL's way (`.12`, not
+  `.120`); timestamp array elements no longer use java.util.Date.toString in
+  the JVM's zone; ARRAY and ROW take element/field types from the
+  expressions.
+- `AT TIME ZONE` converts (it returned its operand unchanged) and swaps
+  timestamp/timestamptz as PostgreSQL does; numeric zones are POSIX-style.
+- time/timetz and money input validate (22007/22008/22P02) instead of
+  passing text through, on casts and on writes; stored time values are
+  canonical.
+- A bare `(a, b)` is a row (it leaked query variable names); `f((a, b))`
+  passes one row argument.
+- `timetz` columns are typed as such (CREATE TABLE had its own copy of the
+  type-hint table, which lacked the short name).
+- SQL NULL never renders as the internal `:__null__` sentinel.
+- Tests that asserted the old rendering are corrected to PostgreSQL's
+  expected output, including four admitted money.sql strict slices.
+- The differential fuzzer gains type-directed classes over a second table.
+
 ### Differential fuzzing is a per-commit gate
 
 - `datahike.fuzz.differential` (`bb fuzz`) generates SELECT, prepared and
