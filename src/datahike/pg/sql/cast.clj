@@ -118,15 +118,20 @@
     (let [^java.math.BigDecimal bd (coerce/coerce-numeric v :bigdec)]
       (.setScale bd 2 java.math.RoundingMode/HALF_UP))
     (let [input v
-          trimmed (str/trim v)
-          negative? (or (and (str/starts-with? trimmed "(")
-                             (str/ends-with? trimmed ")"))
-                        (str/includes? trimmed "-"))
-          numeric-text (str/replace trimmed #"[\s$,+()\-]" "")]
-      (when-not (re-matches #"(?:\d+(?:\.\d*)?|\.\d+)" numeric-text)
+          ;; cash.c cash_in, positionally: [ ( ] [sign] [$] [sign] digits
+          ;; (with , separators) [.digits] [sign] [$] [ ) ]. It used to strip
+          ;; every '-', space and paren wherever they were, so
+          ;; '2020-01-01'::money answered -$20,200,101.00.
+          [_ lp s1 s2 digits s3 rp]
+          (re-matches #"\s*(\()?\s*([+-])?\s*\$?\s*([+-])?\s*(\d[\d,]*(?:\.\d*)?|\.\d+)\s*([+-])?\s*\$?\s*(\))?\s*" v)
+          signs (remove nil? [s1 s2 s3])]
+      (when (or (nil? digits) (not= (some? lp) (some? rp)) (> (count signs) 1)
+                (and lp (seq signs)))
         (throw (errors/pg-error :invalid-text-representation
                                 {:type "money" :value input})))
-      (let [unsigned (java.math.BigDecimal. numeric-text)
+      (let [negative? (or (some? lp) (= ["-"] signs))
+            numeric-text (str/replace digits "," "")
+            unsigned (java.math.BigDecimal. numeric-text)
             signed (if negative? (.negate unsigned) unsigned)
             scaled (.setScale signed 2 java.math.RoundingMode/HALF_UP)
             cents (.toBigIntegerExact (.movePointRight scaled 2))]
@@ -292,6 +297,68 @@
       :else
       (-> (pg-bits/parse-bit-literal (str v) varying?)
           (pg-bits/coerce-width w explicit?)))))
+
+(def ^:private time-input
+  ;; H:MM[:SS[.frac]] [AM|PM] [zone], or compact HHMMSS -- the forms of
+  ;; datetime.c DecodeTimeOnly that applications use. Zone: Z, UTC, or
+  ;; +-HH[[:]MM[[:]SS]].
+  #"(?i)^(?:(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?|(\d{2})(\d{2})(\d{2}))\s*(am|pm)?\s*(z|utc|[+-]\d{1,2}(?::?\d{2}(?::?\d{2})?)?)?$")
+
+(defn- parse-time-input
+  "PostgreSQL time / timetz input. A plain `time` ignores a zone, as
+   time_in does; `timetz` keeps it and defaults to the session zone (UTC).
+   A leading date (`2020-01-01 10:00`) is allowed and dropped. Raises 22007
+   for text that is not a time and 22008 for an out-of-range field -- it
+   used to hand the unparsed STRING back, typed as a time."
+  [^String input timetz?]
+  (let [s (str/trim input)
+        time-part (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)
+        type-name (if timetz? "time with time zone" "time")
+        [_ h m sec frac ch cm cs ampm zone] (re-matches time-input time-part)]
+    (when-not (or h ch)
+      (throw (errors/pg-error :invalid-datetime-format {:type type-name :value input})))
+    (let [raw-hour (Long/parseLong (or h ch))
+          minute (Long/parseLong (or m cm))
+          second (Long/parseLong (or sec cs "0"))
+          ;; Rounded to microseconds, as PostgreSQL stores them.
+          micros (if frac
+                   (.longValue (.setScale (.movePointRight (java.math.BigDecimal. (str "0." frac)) 6)
+                                          0 java.math.RoundingMode/HALF_UP))
+                   0)
+          hour (case (some-> ampm str/lower-case)
+                 "am" (if (= 12 raw-hour) 0 raw-hour)
+                 "pm" (if (< raw-hour 12) (+ raw-hour 12) raw-hour)
+                 raw-hour)
+          ;; 24:00:00 exactly is a valid PostgreSQL time; nothing later is.
+          end-of-day? (and (= 24 hour) (zero? minute) (zero? second) (nil? frac))]
+      (when (or (and (> hour 23) (not end-of-day?)) (> minute 59) (> second 59)
+                (and ampm (or (zero? raw-hour) (> raw-hour 12))))
+        (throw (errors/pg-error :datetime-field-overflow {:value input})))
+      (let [nanos-of-day (+ (* (+ (* (+ (* hour 60) minute) 60) second) 1000000000)
+                            (* micros 1000))
+            end-of-day? (= nanos-of-day 86400000000000)
+            _ (when (> nanos-of-day 86400000000000)
+                (throw (errors/pg-error :datetime-field-overflow {:value input})))
+            t (when-not end-of-day? (java.time.LocalTime/ofNanoOfDay nanos-of-day))
+            offset (when timetz?
+                     (if (or (nil? zone) (#{"z" "utc"} (str/lower-case zone)))
+                       java.time.ZoneOffset/UTC
+                       (let [[_ sign zh zm zs] (re-matches #"([+-])(\d{1,2}):?(\d{2})?:?(\d{2})?" zone)
+                             secs (+ (* 3600 (Long/parseLong zh))
+                                     (* 60 (Long/parseLong (or zm "0")))
+                                     (Long/parseLong (or zs "0")))]
+                         (java.time.ZoneOffset/ofTotalSeconds
+                          (int (if (= "-" sign) (- secs) secs))))))]
+        (cond
+          ;; 24:00:00 is a valid PostgreSQL time (pgjdbc sends LocalTime.MAX
+          ;; as it) but java.time has no end-of-day value. Time values are
+          ;; stored as their canonical text, so carry this one AS that text:
+          ;; it stores, renders and orders correctly (zero-padded).
+          end-of-day?
+          (str "24:00:00" (when timetz?
+                            ((requiring-resolve 'datahike.pg.types/offset-text) offset)))
+          (not timetz?) t
+          :else (java.time.OffsetTime/of t offset))))))
 
 (defn- internal-char-in
   "PostgreSQL's charin followed by charout (utils/adt/char.c), since a
@@ -484,10 +551,7 @@
                             (instance? java.util.Date v)
                             (-> ^java.util.Date v .toInstant
                                 (.atZone java.time.ZoneOffset/UTC) .toLocalTime)
-                            :else (let [s (str/trim (str v))
-                                        time-only (or (second (re-find #"^\d{4}-\d{1,2}-\d{1,2}[ T](.+)$" s)) s)]
-                                    (try (java.time.LocalTime/parse time-only)
-                                         (catch Exception _ v))))]
+                            :else (parse-time-input (str v) timetz?))]
                 (if (and timetz? (instance? java.time.LocalTime local))
                   (java.time.OffsetTime/of ^java.time.LocalTime local java.time.ZoneOffset/UTC)
                   local))

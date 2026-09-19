@@ -75,7 +75,10 @@
               t (fz/target-conn)]
     ;; One call must never stall the sweep: the synthesised INTERVAL '1 day'
     ;; made pg_sleep_for sleep a day on the oracle.
-    (doseq [c [o t]] (fz/exec! c "SET statement_timeout = '10s'"))
+    (doseq [c [o t]]
+      (fz/exec! c "SET statement_timeout = '10s'")
+      ;; pgjdbc sends the client's zone at startup; pin it like the fuzzer.
+      (fz/exec! c "SET TimeZone = 'UTC'"))
     (let [cands (candidates o names)
           ;; EVERY buildable overload, not one per name: the overloads are
           ;; where the divergences hide -- `length(text)` agreed while

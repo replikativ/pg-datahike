@@ -435,42 +435,14 @@
                              (fn [t oids] (PgParamCodec/registerRecordLayout t oids)) v)
                             (pg-rec/to-pg-text v))
      (pg-vector/vector-value? v) (pg-vector/to-pg-text v)
-    ;; CAST results carry a Java type that encodes the source SQL type,
-    ;; so we can emit the PG-correct text form without dragging the
-    ;; timestamp through a lossy date-only conversion.
-     (instance? java.time.LocalDate v) (str v)       ;; "2017-03-13"
-     (instance? java.time.LocalTime v) (str v)       ;; "14:25:48.130861"
-     (instance? java.time.OffsetTime v) (str/replace (str v) #"Z$" "+00")
-     (instance? java.time.LocalDateTime v)           ;; "2017-03-13 14:25:48.130861"
-     (-> (str v) (str/replace "T" " "))
-     ;; A `date` COLUMN stores a java.util.Date (Datahike has only
-     ;; :db.type/instant), so it fell to the generic instant branch below
-     ;; and rendered "2020-01-01 00:00:00". A `::date` CAST produces a
-     ;; LocalDate and was already right, which is why the cast path
-     ;; looked correct and the column path did not. The declared OID is
-     ;; what distinguishes them.
-     ;;
-     ;; Not cosmetic: PgParamCodec binary-encodes OID 1082 with
-     ;; LocalDate.parse, which throws on "2020-01-01 00:00:00"; the
-     ;; exception was swallowed and TEXT bytes went out labelled as
-     ;; binary, so every binary-format client read garbage from a date
-     ;; column.
-     (and (inst? v) (= oid PgWireServer/OID_DATE))
-     (-> ^java.util.Date v .toInstant
-         (.atZone java.time.ZoneOffset/UTC) .toLocalDate str)
-
-     (inst? v)    (let [^java.time.Instant inst
-                        (if (instance? java.util.Date v)
-                          (.toInstant ^java.util.Date v)
-                          (if (instance? java.time.Instant v)
-                            v
-                            (.toInstant ^java.util.Date v)))
-                        ;; ISO-8601 format: 2024-01-15T10:30:00Z → 2024-01-15 10:30:00
-                        s (str inst)]
-                    (-> s
-                        (str/replace "T" " ")
-                       ;; timestamptz keeps a UTC offset; timestamp drops it.
-                        (str/replace "Z" (if (= oid PgWireServer/OID_TIMESTAMPTZ) "+00" ""))))
+     ;; Temporal values: one renderer, shared with `::text` and every
+     ;; other value->text path (types/temporal->pg-text). This branch used
+     ;; to carry its own copy of the rules, and the copies drifted.
+     (or (inst? v) (instance? java.time.temporal.Temporal v))
+     (types/temporal->pg-text v oid)
+     ;; money and numeric are both BigDecimal; only the column's type
+     ;; tells them apart.
+     (and (= oid types/oid-money) (number? v)) (types/money-text v)
      ;; toPlainString, not str: a numeric literal written with an
      ;; exponent keeps a NEGATIVE scale (`1.0e3` is unscaled 10 at scale
      ;; -1), and `.toString` renders that as "1.0E+3". PostgreSQL has no

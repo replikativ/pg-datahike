@@ -2774,6 +2774,82 @@
     (instance? java.time.LocalDateTime v) (.atZone ^java.time.LocalDateTime v java.time.ZoneOffset/UTC)
     :else nil))
 
+(defn- resolve-time-zone
+  "A PostgreSQL time-zone spec as a java.time ZoneId. Names and
+   abbreviations resolve through the tz database. A NUMERIC spec -- `+05`,
+   `-03:30`, `UTC+3` -- is POSIX-style, so its sign is INVERTED: `+05` is
+   five hours WEST of UTC (datetime.c DecodePosixTimezone). Unknown names
+   raise 22023, as in PostgreSQL."
+  ^java.time.ZoneId [zone]
+  (let [z (str/trim (str zone))
+        posix (fn [sign h m sec]
+                (let [total (+ (* 3600 (Long/parseLong h))
+                               (* 60 (Long/parseLong (or m "0")))
+                               (Long/parseLong (or sec "0")))]
+                  (java.time.ZoneOffset/ofTotalSeconds
+                   (int (if (= "-" sign) total (- total))))))]
+    (if-let [[_ sign h m sec] (re-matches #"(?i)(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?" z)]
+      (posix sign h m sec)
+      (try
+        (java.time.ZoneId/of z java.time.ZoneId/SHORT_IDS)
+        (catch Exception _
+          (try (java.time.ZoneId/of (str/upper-case z) java.time.ZoneId/SHORT_IDS)
+               (catch Exception _
+                 (throw (errors/pg-error :invalid-parameter-value
+                                         {:message (str "time zone \"" z "\" not recognized")})))))))))
+
+(defn- local-date-time
+  "A timestamp value as its wall-clock LocalDateTime. Timestamps are held
+   as instants whose UTC reading IS the wall-clock time."
+  ^java.time.LocalDateTime [v]
+  (cond
+    (instance? java.time.LocalDateTime v) v
+    (instance? java.time.LocalDate v) (.atStartOfDay ^java.time.LocalDate v)
+    (instance? java.time.OffsetDateTime v)
+    (.toLocalDateTime (.withOffsetSameInstant ^java.time.OffsetDateTime v java.time.ZoneOffset/UTC))
+    (inst? v) (java.time.LocalDateTime/ofInstant
+               (if (instance? java.time.Instant v) v (.toInstant ^java.util.Date v))
+               java.time.ZoneOffset/UTC)
+    :else nil))
+
+(defn sql-at-time-zone
+  "`value AT TIME ZONE zone` (timestamp.c timestamp_zone / timestamptz_zone,
+   date.c timetz_zone). `kind` comes from the operand's static type:
+     :timestamp    wall-clock time in `zone` -> the instant (timestamptz)
+     :timestamptz  the instant -> wall-clock time in `zone` (timestamp)
+     :timetz       the time, shifted to `zone`'s offset (timetz)
+   Instants are returned as java.util.Date; a timestamp result is the
+   instant whose UTC reading is the wall-clock time, like a timestamp
+   column. NULL in either operand is NULL."
+  [v zone kind]
+  (if (or (nil? v) (= :__null__ v) (nil? zone) (= :__null__ zone))
+    :__null__
+    (let [zid (resolve-time-zone zone)]
+      (case kind
+        :timestamp
+        (java.util.Date/from (.toInstant (.atZone (local-date-time v) zid)))
+
+        :timestamptz
+        (let [inst (.toInstant (.atZone (local-date-time v) java.time.ZoneOffset/UTC))]
+          (java.util.Date/from
+           (.toInstant (.atZone (java.time.LocalDateTime/ofInstant inst zid)
+                                java.time.ZoneOffset/UTC))))
+
+        :timetz
+        (let [v (if (string? v)
+                  ;; time/timetz columns keep their text form
+                  ((requiring-resolve 'datahike.pg.sql.cast/cast-scalar) v "timetz" {})
+                  v)
+              ^java.time.OffsetTime t (cond
+                                        (instance? java.time.OffsetTime v) v
+                                        (instance? java.time.LocalTime v)
+                                        (java.time.OffsetTime/of v java.time.ZoneOffset/UTC)
+                                        :else (throw (errors/pg-error
+                                                      :invalid-parameter-value
+                                                      {:message "AT TIME ZONE expects a time value"})))
+              offset (.getOffset (.getRules zid) (java.time.Instant/now))]
+          (.withOffsetSameInstant t offset))))))
+
 (defn sql-extract
   "`EXTRACT(field FROM value)` / `date_part(field, value)`. PostgreSQL
    returns NUMERIC, so the result is a BigDecimal -- `extract(epoch …)`

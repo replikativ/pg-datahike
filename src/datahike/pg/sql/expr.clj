@@ -68,7 +68,7 @@
             SignedExpression CastExpression TimeKeyExpression JsonExpression
             ExtractExpression TrimFunction BinaryExpression
             TimezoneExpression ArrayConstructor JdbcParameter JdbcNamedParameter
-            RowConstructor]
+            RowConstructor IntervalExpression]
            [net.sf.jsqlparser.expression.operators.relational
             DoubleAnd EqualsTo ExistsExpression ExpressionList
             GreaterThan GreaterThanEquals InExpression IsBooleanExpression
@@ -656,6 +656,12 @@
         ;; empty, so they arrived with no arguments at all.
         params (or (.getParameters f)
                    (some-> (.getNamedParameters f) .getExpressions))
+        ;; JSqlParser flattens `f((a, b))` -- ONE row argument -- into the
+        ;; argument list (a, b); only the list's class tells them apart.
+        params (if (and (instance? ParenthesedExpressionList params)
+                        (> (.size ^ParenthesedExpressionList params) 1))
+                 [params]
+                 params)
         arg-exprs (when params (vec params))
         _ (validate-function-argument-types! ctx fname arg-exprs)
         arg-exprs (coerce-function-unknowns ctx fname arg-exprs)
@@ -733,7 +739,16 @@
       ;; the ROW retypes it to the named composite; here it stays anonymous.
       (= fname "row")
       (let [fn-param (symbol (str "?row" (swap! (:var-counter ctx) inc)))
-            row-fn   (fn [& vals] (pg-rec/make-record types/infer-oid-from-value (vec vals)))]
+            ;; Field types come from the field EXPRESSIONS where known: a
+            ;; value alone cannot tell money from numeric or date from
+            ;; timestamp, and record_out renders each field by its type.
+            static-oids (mapv #(source-oid ctx %) params)
+            row-fn   (fn [& vals]
+                       (pg-rec/->PgRecord
+                        2249
+                        (mapv (fn [v static]
+                                {:oid (or static (types/infer-oid-from-value v)) :value v})
+                              vals static-oids)))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj row-fn)
         (swap! (:where-clauses ctx) conj
@@ -5285,13 +5300,18 @@
                                         (get types/sql-name->elem-kw t))
                                       :else nil))
                                   es)
+                            ;; No literal decides it: use the elements'
+                            ;; static type. `ARRAY[money_col]` defaulted
+                            ;; to text and rendered its elements as numeric.
+                            (some #(some-> (source-oid ctx %) types/oid->elem-kw) es)
                             :text))
           elem-type (detect-elem exprs)
           args (mapv #(translate-expr ctx %) exprs)
           arg-vars (mapv #(if (seq? %) (ctx/materialize-arg! ctx %) %) args)
           fn-param (symbol (str "?pg-arr-ctor" (swap! (:var-counter ctx) inc)))
+          ;; A NULL element is nil inside an array, never the sentinel.
           build-fn (fn [& elements]
-                     (pg-arr/array elem-type (vec elements)))
+                     (pg-arr/array elem-type (mapv #(if (= :__null__ %) nil %) elements)))
           result-var (ctx/fresh-var! ctx)]
       (if (empty? exprs)
         ;; Empty array — bind a constant PgArray value directly.
@@ -5409,11 +5429,17 @@
     (instance? Parenthesis expr)
     (translate-expr ctx (.getExpression ^Parenthesis expr))
 
+    ;; `(a, b)` in value position IS `ROW(a, b)` in PostgreSQL. It used to
+    ;; translate to a Clojure vector of query variables, which reached the
+    ;; client as `["?p1", "?p2"]`. Row comparisons and IN lists read the
+    ;; list from the AST before it gets here.
     (instance? ParenthesedExpressionList expr)
     (let [^ParenthesedExpressionList pel expr]
       (if (= 1 (.size pel))
         (translate-expr ctx (.get pel 0))
-        (mapv #(translate-expr ctx %) pel)))
+        (translate-expr ctx (doto (Function.)
+                              (.setName "ROW")
+                              (.setParameters (ExpressionList. ^java.util.List (vec pel)))))))
 
     (instance? SignedExpression expr)
     (let [^SignedExpression se expr
@@ -5806,18 +5832,50 @@
                   result))))
 
     ;; expr AT TIME ZONE 'zone' — e.g. now() AT TIME ZONE 'UTC'
+    ;; value AT TIME ZONE zone [AT TIME ZONE zone ...]. This returned its
+    ;; left operand unchanged -- a silent wrong answer for any zone but UTC,
+    ;; with the input's type where PostgreSQL swaps timestamp and
+    ;; timestamptz. JSqlParser nests a chain to the RIGHT (`ts AT ('UTC' AT
+    ;; 'EST')`); PostgreSQL is left-associative, so flatten the zones first.
     (instance? TimezoneExpression expr)
-    (let [left (.getLeftExpression ^TimezoneExpression expr)]
-      (if (and (instance? Function left)
-               (= "now" (str/lower-case (.getName ^Function left))))
-        (let [fn-param (symbol (str "?now-fn" (swap! (:var-counter ctx) inc)))
-              now-fn (fn [] (or params/*statement-time* (java.util.Date.)))
-              result-var (ctx/fresh-var! ctx)]
-          (swap! (:in-params ctx) conj fn-param)
-          (swap! (:in-args ctx) conj now-fn)
-          (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
-          result-var)
-        (translate-expr ctx left)))
+    (let [left (.getLeftExpression ^TimezoneExpression expr)
+          zones (letfn [(flat [z]
+                          (if (instance? TimezoneExpression z)
+                            (cons (.getLeftExpression ^TimezoneExpression z)
+                                  (mapcat flat (.getTimezoneExpressions ^TimezoneExpression z)))
+                            [z]))]
+                  (vec (mapcat flat (.getTimezoneExpressions ^TimezoneExpression expr))))
+          apply-zone
+          (fn [value-var value-oid zone-expr]
+            (let [kind (condp contains? value-oid
+                         #{types/oid-timestamp} :timestamp
+                         #{types/oid-time types/oid-timetz} :timetz
+                         ;; timestamptz, date (implicitly cast to
+                         ;; timestamptz) and an untyped literal (datetime's
+                         ;; preferred type is timestamptz)
+                         :timestamptz)
+                  zone-var (let [z (translate-expr ctx zone-expr)]
+                             (if (seq? z) (ctx/materialize-arg! ctx z) z))
+                  value-var (if (seq? value-var) (ctx/materialize-arg! ctx value-var) value-var)]
+              [(list 'datahike.pg.sql/sql-at-time-zone value-var zone-var kind)
+               (case kind :timestamp types/oid-timestamptz
+                     :timestamptz types/oid-timestamp
+                     :timetz types/oid-timetz)]))
+          left-oid (if (and (instance? Function left)
+                            (= "now" (str/lower-case (.getName ^Function left))))
+                     types/oid-timestamptz
+                     (source-oid ctx left))]
+      (first (reduce (fn [[v oid] z] (apply-zone v oid z))
+                     [(translate-expr ctx left) left-oid]
+                     zones)))
+
+    ;; INTERVAL '1 day' is the SQL-standard spelling of '1 day'::interval.
+    (instance? IntervalExpression expr)
+    (let [^IntervalExpression e expr
+          raw (str (or (.getParameter e) (.getExpression e)))
+          text (str (str/replace raw #"^'|'$" "")
+                    (when-let [t (.getIntervalType e)] (str " " (str/lower-case (str t)))))]
+      (sql-cast/cast-scalar text "interval" {:explicit? true}))
 
     ;; EXTRACT(field FROM value) is its own AST node, not a Function, so it
     ;; never reached the function table at all.

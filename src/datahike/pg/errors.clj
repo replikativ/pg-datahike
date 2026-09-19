@@ -234,6 +234,17 @@
 
    ;; An explicit cast with no pathway (parse_coerce.c): no pg_cast row and
    ;; no I/O conversion -- `date::int`, `bool::numeric`.
+   ;; datetime.c DateTimeParseError: DTERR_BAD_FORMAT / DTERR_FIELD_OVERFLOW.
+   :invalid-datetime-format
+   {:sqlstate "22007"
+    :format (fn [{:keys [type value message]}]
+              (or message (str "invalid input syntax for type " type ": \"" value "\"")))}
+
+   :datetime-field-overflow
+   {:sqlstate "22008"
+    :format (fn [{:keys [value message]}]
+              (or message (str "date/time field value out of range: \"" value "\"")))}
+
    :cannot-coerce
    {:sqlstate "42846"
     :format (fn [{:keys [source target message]}]
