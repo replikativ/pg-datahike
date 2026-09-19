@@ -4,6 +4,13 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Datahike 0.8.1895
+
+- Retracting an attribute no longer leaves an empty schema entry behind
+  (datahike #1089). Every DROP TABLE left one per column: after 400
+  CREATE/DROP cycles the schema map held 2527 entries, 2400 of them
+  empty, against 127 now.
+
 ### CHECK constraints are evaluated like SELECT
 
 CHECK constraints, domain checks and ON CONFLICT ... WHERE are evaluated by the SELECT translator (`datahike.pg.sql.row-eval`). The expression's columns become typed parameters of a one-row SELECT, which is translated once per expression. The interpreter it replaces is deleted. That interpreter treated every shape it did not know as satisfied, and compared only numbers with `<`/`>`. As a result:
