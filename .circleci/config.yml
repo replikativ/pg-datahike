@@ -372,6 +372,47 @@ jobs:
           path: test/integration/pgdump/pagila-default-format.sql
           destination: pagila-default-format.sql
 
+  differential-fuzz:
+    # Generated SQL run on a real PostgreSQL and on pg-datahike, answers
+    # diffed: rows, or the SQLSTATE when both fail. The oracle is 17.7, the
+    # release we implement and report. Fixed seed, so the samples are the
+    # same every run; known divergences are listed with a reason in
+    # test/integration/fuzz/expected-divergences.edn, and an unlisted one
+    # (or a listed one that now agrees) fails the job. See the README there.
+    docker:
+      - image: cimg/openjdk:21.0
+      - image: cimg/postgres:17.7
+        environment:
+          POSTGRES_USER: pgtest
+          POSTGRES_PASSWORD: pgtest
+          POSTGRES_DB: postgres
+    resource_class: medium
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci
+      - install-clj-tools
+      - run:
+          name: Wait for the oracle PostgreSQL
+          command: |
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends netcat-openbsd
+            for i in $(seq 1 60); do
+              nc -z 127.0.0.1 5432 && exit 0
+              sleep 2
+            done
+            echo "oracle PostgreSQL never came up" >&2; exit 1
+      - run:
+          name: Compile Java sources
+          command: bb prep
+      - start-pgwire-and-wait
+      - run:
+          name: Differential fuzz (select, prepared, dml)
+          command: bb fuzz all
+          environment:
+            REFERENCE_URL: "jdbc:postgresql://127.0.0.1:5432/postgres?user=pgtest&password=pgtest"
+            TARGET_URL: "jdbc:postgresql://127.0.0.1:15432/datahike?user=datahike&password=datahike"
+          no_output_timeout: 20m
+
   asyncpg-conformance:
     docker:
       - image: cimg/python:3.11
@@ -651,6 +692,10 @@ workflows:
           context: ghcr-read-package
           requires:
             - build
+      - differential-fuzz:
+          context: ghcr-read-package
+          requires:
+            - build
       - asyncpg-conformance:
           context: ghcr-read-package
           requires:
@@ -677,6 +722,7 @@ workflows:
             - hibernate-app-conformance
             - sqlalchemy-conformance
             - pgdump-roundtrip
+            - differential-fuzz
             - asyncpg-conformance
             - node-postgres-conformance
       - build-uber:

@@ -1,0 +1,13 @@
+;; Known, explained disagreements between PostgreSQL 17.7 and pg-datahike
+;; found by datahike.fuzz.differential. One entry per sample:
+;;   {:surface :select|:prepared|:dml, :key <the SQL as generated>, :reason "..."}
+;;
+;; A disagreement NOT listed here fails the run (regression). A listed entry
+;; that the run draws and that now AGREES also fails (baseline drift): prune
+;; it and record the newly supported behaviour. Keep reasons specific --
+;; "unsupported" is not a reason; say what is missing.
+[{:surface :select
+  :key "SELECT id, to_char(d, 'YYYY-MM-DD') AS c FROM ft ORDER BY id"
+  :reason "to_char over date/timestamp is refused with 0A000: PostgreSQL's
+           formatting.c template language (YYYY, MM, Day, FM, TH, ...) is not
+           implemented. Numeric to_char works."}]

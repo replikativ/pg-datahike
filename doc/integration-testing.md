@@ -1,9 +1,10 @@
 # Integration testing model
 
-pg-datahike is tested at four complementary boundaries. The jobs in layers
-1–3 run for every pull request; suites with known upstream gaps use explicit
-manifests so only a new regression fails the build. Layer 4 is a local
-discovery and admission workflow.
+pg-datahike is tested at five complementary boundaries. The jobs in layers
+1–3 and the differential fuzzer run for every pull request; suites with known
+upstream gaps use explicit manifests so only a new regression fails the build.
+Layer 4 is a local discovery and admission workflow. The [coverage
+map](#coverage-map) below shows which of them covers which behaviour.
 
 ## Layer 1 — unit (per-commit)
 
@@ -12,8 +13,8 @@ bb test
 bb sqllogictest
 ```
 
-A current full run reports 1,604 tests / 6,808 assertions and the SQLLogic
-runner reports 61 assertions. Treat the runner output, rather than these
+A current full run reports about 1,890 tests / 8,420 assertions and the
+SQLLogic runner reports 61 assertions. Treat the runner output, rather than these
 snapshot counts, as authoritative as coverage grows.
 
 Run on every PR + commit. Covered by the `unittest` and `sqllogictest`
@@ -80,6 +81,42 @@ The `setup.sh` / `run.sh` scripts live under `test/integration/<harness>/`
 and are shared between local dev (`cd test/integration/asyncpg && ./run.sh`)
 and CI (just wrapped in a job).
 
+## Differential fuzzing (per-commit)
+
+`datahike.fuzz.differential` generates SQL, runs every sample on a real
+PostgreSQL 17.7 and on pg-datahike, and diffs the answers. Hand-written
+tests check what their author suspected; the fuzzer checks what nobody
+thought of. Its first run found 58 disagreements, including two regressions
+the hand-written tests of the same PRs had missed (#75).
+
+```
+REFERENCE_URL=... TARGET_URL=... bb fuzz [select|prepared|dml|all] [n] [seed]
+```
+
+| Surface | Generated | Compared |
+|---|---|---|
+| `select` | ~50 classes: comparisons, 3-valued logic, arithmetic and numeric edges, CASE, casts, string/date/timestamp functions, arrays, jsonb, aggregates, GROUP BY/HAVING, DISTINCT (ON), joins, self-joins, set operations, window functions (frames, ranking, FILTER, top-N), CTEs, recursion, correlated subqueries, LATERAL | rows, or SQLSTATE when both fail |
+| `prepared` | parameterised predicates, projections and aggregates with NULL and edge parameters over the extended protocol | rows, or SQLSTATE |
+| `dml` | INSERT (VALUES and SELECT), UPDATE, DELETE; both sides re-seeded per sample | row count or SQLSTATE, plus the resulting table |
+
+The `differential-fuzz` job runs a fixed seed against a PostgreSQL 17.7
+sidecar and gates deployment. Known divergences are listed, each with a
+reason, in `test/integration/fuzz/expected-divergences.edn`. An unlisted
+disagreement fails, and so does a listed one that now agrees. A new seed is
+how to look for new bugs locally; see `test/integration/fuzz/README.md`.
+
+Comparing SQLSTATEs rather than "both failed" matters: when it was
+introduced it found casts reporting 22P02 instead of 42846, and INSERT
+VALUES storing the SQL text of expressions it could not evaluate.
+
+Function breadth is measured separately and does not gate: `bb fncov` calls
+every buildable `pg_catalog` overload on both servers and lists the functions
+that answer differently (`:wrong`) or not at all (`:missing`).
+
+Not generated yet: DDL and ALTER sequences, catalog views after DDL,
+transactions and savepoints, `ON CONFLICT` / `RETURNING`, COPY, and
+anything beyond the fixed two-table schema. These are the next surfaces.
+
 ## Cross-engine differential testing
 
 `datahike.test.cross-engine` is a dev + triage tool that runs the
@@ -145,9 +182,43 @@ summary highlights frequent target errors and internal-looking failures so
 unsupported surface does not hide class casts, unknown Datalog variables, or
 lost connections.
 
+Status (pinned REL_17_7, 2026-09-18): 222 scheduled files, of which 80 are in
+the campaign (3 strict, 77 discovery), 73 in the backlog and 69 deliberately
+out of scope. 100 strict slices (about 1,300 lines of upstream SQL) are
+admitted as focused tests. A full discovery run over the 152
+application-facing files matches PostgreSQL's expected output exactly for 5
+(`boolean`, `delete`, `md5`, `portals_p2`, `select_having`); 19 still show
+internal failures, the first thing to eliminate under the beta rule.
+
 Use `PG_REGRESS_STRICT=1` only for an admitted test that is expected to match
 completely. Endpoint, PostgreSQL checkout, and binary overrides are documented
 in `test/integration/postgres-regress/README.md`.
+
+## Coverage map
+
+Which harness exercises which behaviour. "Gate" means a per-commit failure;
+"discovery" means measured but not gating.
+
+| Behaviour | Unit / focused | SQLLogic | Client suites | Differential fuzz | PostgreSQL regression |
+|---|---|---|---|---|---|
+| Expressions, NULL logic, casts, numeric edges | gate | gate | incidental | gate (`select`) | discovery (`boolean` matches exactly) |
+| Built-in functions and operators | gate | partial | incidental | gate for the generated set; breadth measured by `bb fncov` (not gating) | discovery, many type files in backlog |
+| Aggregates, GROUP BY, HAVING, DISTINCT | gate | gate | incidental | gate | discovery (`select_having` matches) |
+| Joins, subqueries, correlation, LATERAL, CTEs | gate | partial | ORM queries | gate | discovery (`join`, `subselect`, `with`) |
+| Window functions | gate | — | — | gate | discovery (`window`) |
+| INSERT / UPDATE / DELETE | gate | gate | ORM CRUD | gate (`dml`) | discovery (`delete` matches) |
+| `ON CONFLICT`, `RETURNING` | gate | — | ORMs | — | discovery (`insert_conflict`) |
+| Extended protocol, parameters, codecs | embedded JDBC tests | — | gate: pgjdbc, asyncpg, node-postgres | gate (`prepared`) | — |
+| DDL and catalog / introspection | gate + catalog goldens | — | gate: ORM boot, SQLAlchemy/asyncpg introspection, pgjdbc metadata; psql by hand | — | backlog (`create_table`, `alter_table`) |
+| Transactions and savepoints | gate | — | gate (clients) | — | discovery (`transactions`) |
+| COPY and dump restore | gate | — | gate: pg_dump round-trip | — | discovery (`copy`, `copy2`) |
+| SQLSTATEs of failures | gate | — | asserted by clients | gate (every sample) | discovery |
+
+The regression suite is the widest source of cases but the weakest gate: CI
+only validates its inventory, and the strict slices are admitted as focused
+unit tests. The fuzzer is the widest gate for query semantics. DDL,
+catalogs, transactions and COPY rely on unit tests and client suites, and
+have no generated coverage yet.
 
 ## Beta-exit coverage
 
