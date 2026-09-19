@@ -229,3 +229,21 @@
     (testing "outer references from a FROM-less subquery still resolve"
       (is (= [["1" "10"] ["2" nil]]
              (rows c "SELECT id, (SELECT ft.i) FROM ft WHERE id <= 2 ORDER BY id"))))))
+
+(deftest aggregates-resolve-their-argument-types
+  ;; ParseFuncOrColumn resolves an aggregate by its argument types; no
+  ;; overload is 42883. These were XX000 (a ClassCastException at run time),
+  ;; 0A000 over a window, or a silent `false` for bool_and(int).
+  (with-open [c (jdbc)]
+    (seed! c)
+    (doseq [sql ["SELECT sum(s) FROM ft" "SELECT avg(s) FROM ft" "SELECT stddev(s) FROM ft"
+                 "SELECT sum(s) OVER () FROM ft" "SELECT avg(s) OVER (ORDER BY id) FROM ft"
+                 "SELECT stddev(s) OVER (PARTITION BY b) FROM ft" "SELECT sum(b) FROM ft"
+                 "SELECT avg(d) FROM ft" "SELECT bool_and(i) FROM ft" "SELECT min(b) FROM ft"
+                 "SELECT coalesce(sum(s), 0) FROM ft"]]
+      (is (= "42883" (state c sql)) sql))
+    (testing "an untyped literal that fits several candidates is ambiguous"
+      (is (= "42725" (state c "SELECT sum('1') FROM ft"))))
+    (testing "valid calls, and literals that resolve"
+      (is (= [["" "3" "t"]]
+             (rows c "SELECT min(s), count(DISTINCT j), bool_and('t') FROM ft"))))))

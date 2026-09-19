@@ -4211,6 +4211,7 @@
         ;; AnalyticExpression, and a HOISTED aggregate can be either.
         emit-agg!
         (fn [f-node alias0]
+          (expr/validate-aggregate-node! ctx f-node)
           (if (instance? net.sf.jsqlparser.expression.AnalyticExpression f-node)
             (emit-analytic-agg! f-node alias0)
             (emit-agg-fn! f-node alias0)))
@@ -4573,6 +4574,7 @@
                                     {:type :range :start :unbounded-preceding :end :current-row}
                                     {:type :rows :start :unbounded-preceding :end :unbounded-following}))
                           ;; Build window spec
+                          _ (expr/validate-aggregate-node! ctx ae)
                           op-kw (keyword fname)
                           ;; The aggregate is the SAME function the plain
                           ;; (non-window) path uses, chosen by the same
