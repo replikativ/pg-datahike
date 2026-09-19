@@ -403,14 +403,13 @@
 
 ;; Statement-level translation (SELECT / INSERT / UPDATE / DELETE / CTE)
 ;; moved to datahike.pg.sql.stmt. Re-export:
-;;   - eval-check-predicate / eval-update-expr — public reach-ins from
-;;     server.clj for CHECK + UPDATE row-level evaluation.
+;;   - eval-update-expr — public reach-in from server.clj for UPDATE
+;;     row-level evaluation.
 ;;   - coerce-insert-value — server.clj reaches via
 ;;     `#'sql/coerce-insert-value` at INSERT row build time.
 ;;   - translate-select / translate-insert / translate-update /
 ;;     translate-delete / select-item-alias — referenced by parse-sql
 ;;     dispatch below. Local private aliases avoid qualifying each site.
-(def eval-check-predicate stmt/eval-check-predicate)
 (def eval-update-expr     stmt/eval-update-expr)
 (def coerce-insert-value stmt/coerce-insert-value)
 (def ^:private translate-select    stmt/translate-select)

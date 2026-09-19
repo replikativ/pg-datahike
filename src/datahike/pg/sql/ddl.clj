@@ -32,7 +32,9 @@
            [net.sf.jsqlparser.statement.create.table
             CreateTable ColumnDefinition ColDataType Index
             CheckConstraint ForeignKeyIndex]
-           [net.sf.jsqlparser.statement.create.sequence CreateSequence]))
+           [net.sf.jsqlparser.statement.create.sequence CreateSequence]
+           [net.sf.jsqlparser.parser CCJSqlParserUtil]
+           [datahike.pg ColumnSubstitutingDeParser ColumnSubstitutingDeParser$Unsupported]))
 
 (set! *warn-on-reflection* true)
 
@@ -149,6 +151,22 @@
   [^ColumnDefinition col]
   (when-let [specs (.getColumnSpecs col)]
     (specs-contain-seq? specs ["not" "null"])))
+
+(defn reject-check-subquery!
+  "PostgreSQL refuses a subquery in a CHECK constraint -- of a table or a
+   domain -- when it is created (0A000), rather than on every write. Row-level evaluation
+   cannot run one either, so a table accepting it could take no rows."
+  [^String expr]
+  (when-let [ast (try (CCJSqlParserUtil/parseCondExpression expr)
+                      (catch Exception _ nil))]
+    (try
+      (ColumnSubstitutingDeParser/deparse
+       ast (reify java.util.function.Function
+             (apply [_ c] (str c))))
+      (catch ColumnSubstitutingDeParser$Unsupported e
+        (when (= "a subquery" (ex-message e))
+          (throw (errors/pg-error :feature-not-supported
+                                  {:message "cannot use subquery in check constraint"})))))))
 
 (defn column-check-expr-text
   "Extract the text of an inline `CHECK (…)` constraint from a
@@ -268,12 +286,11 @@
             (= low "null")  {:kind :literal :value nil}
             (= low "true")  {:kind :literal :value true}
             (= low "false") {:kind :literal :value false}
-            ;; Number literal (possibly signed, decimal).
+            ;; Number literal (possibly signed, decimal), kept as its text:
+            ;; the column type's input function reads it at write time, so
+            ;; `numeric DEFAULT 1.50` keeps its scale (a double lost it).
             (re-matches #"-?\d+(?:\.\d+)?" base)
-            {:kind :literal
-             :value (if (str/includes? base ".")
-                      (Double/parseDouble base)
-                      (Long/parseLong base))}
+            {:kind :literal :value base}
             ;; Single-quoted string. PG doubles embedded ' as ''; keep
             ;; that for parity with StringValue literals elsewhere.
             (re-matches #"'(?:[^']|'')*'" base)
@@ -291,12 +308,13 @@
              :value (str "x" (subs base 2 (dec (count base))))}
             ;; Known zero-arg functions. Match either form: `now`,
             ;; `now()`, `current_timestamp`, `CURRENT_TIMESTAMP`. Also
-            ;; accept the AT TIME ZONE wrapper Odoo uses
-            ;; (`now() AT TIME ZONE 'UTC'`) — for our `:db.type/instant`
-            ;; columns the timezone wrapper is a no-op since we don't
-            ;; track per-column timezone offsets, so it folds into
-            ;; plain `now`.
-            (re-matches #"(?i)(?:now|current_timestamp|statement_timestamp|transaction_timestamp|clock_timestamp)(?:\(\))?(?:\s+at\s+time\s+zone\s+'[^']+')?"
+            ;; accept the AT TIME ZONE wrapper Odoo uses, for UTC only:
+            ;; `now() AT TIME ZONE 'UTC'` is the UTC wall-clock time, which
+            ;; is how a timestamp is stored, so it IS `now`. Any other zone
+            ;; shifts the time; folding it into `now` stored a wrong value,
+            ;; so it is refused below until DEFAULT expressions are
+            ;; evaluated by the translator.
+            (re-matches #"(?i)(?:now|current_timestamp|statement_timestamp|transaction_timestamp|clock_timestamp)(?:\(\))?(?:\s+at\s+time\s+zone\s+'(?:utc|etc/utc|gmt|z|zulu|\+00|\+00:00)')?"
                         base)
             {:kind :fn :value "now"}
             (re-matches #"(?i)current_date(?:\(\))?" base)
@@ -915,6 +933,8 @@
         ;; CHECK-constraint entities. One per CHECK clause, named
         ;; deterministically so CREATE TABLE IF NOT EXISTS is
         ;; idempotent (:pg/check-name carries :db.unique/identity).
+        _ (doseq [{:keys [expr]} (:checks constraints)]
+            (reject-check-subquery! expr))
         check-entities
         (vec (for [[i {:keys [name col expr]}] (map-indexed vector (:checks constraints))
                    :let [cname (or name

@@ -519,6 +519,18 @@
     (some #(when (= enum-name (:name %)) %)
           (pgs/enum-types (:db ctx)))))
 
+(defn check-enum-labels!
+  "Raise 22P02 for an untyped literal among `exprs` that is not a label of
+   the enum `spec`. PostgreSQL reads the literal with enum_in when the
+   statement is parsed, so `m > 'xyz'` fails even over no rows."
+  [spec exprs]
+  (doseq [e exprs
+          :when (instance? StringValue e)
+          :let [label (.getNotExcapedValue ^StringValue e)]
+          :when (not (contains? (set (:values spec)) label))]
+    (throw (errors/pg-error :invalid-text-representation
+                            {:type (:name spec) :value label :enum? true}))))
+
 (defn enum-rank-var!
   "Bind the declaration-order rank of enum `value` and return its logic var.
    SQL NULL remains the null sentinel so the normal server-side NULL ordering
@@ -2570,6 +2582,36 @@
                  (cmp (pg-vector/compare-values a b)))))
       (list p l r))
 
+    ;; Enum ordering is declaration order, not the labels' text order:
+    ;; `'happy'::mood > 'sad'` with ('sad','ok','happy') is TRUE. The WHERE
+    ;; lowering (translate-comparison) ranks enums; value position -- a
+    ;; projection, a CHECK -- compared the label strings.
+    (and (or (instance? GreaterThan expr) (instance? GreaterThanEquals expr)
+             (instance? MinorThan expr) (instance? MinorThanEquals expr))
+         (let [^net.sf.jsqlparser.expression.BinaryExpression e expr]
+           (enum-spec-for-exprs ctx [(.getLeftExpression e) (.getRightExpression e)])))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
+          spec (enum-spec-for-exprs ctx [(.getLeftExpression e) (.getRightExpression e)])
+          _ (check-enum-labels! spec [(.getLeftExpression e) (.getRightExpression e)])
+          rank (zipmap (:values spec) (range))
+          cmp (cond (instance? GreaterThan e) > (instance? GreaterThanEquals e) >=
+                    (instance? MinorThan e) < :else <=)
+          p (symbol (str "?enum-value-cmp-" (swap! (:var-counter ctx) inc)))
+          ;; An operand outside the enum's labels is invalid input for it.
+          rank-of (fn [v]
+                    (or (get rank (str v))
+                        (throw (errors/pg-error :invalid-text-representation
+                                                {:type (:name spec) :value (str v) :enum? true}))))]
+      (check-comparison-types! ctx '< (.getLeftExpression e) (.getRightExpression e))
+      (swap! (:in-params ctx) conj p)
+      (swap! (:in-args ctx) conj
+             (fn [a b]
+               (if (or (fns/sql-null? a) (fns/sql-null? b))
+                 :__null__
+                 (cmp (rank-of a) (rank-of b)))))
+      (apply list p (translate-value-comparison-operands
+                     ctx (.getLeftExpression e) (.getRightExpression e))))
+
     ;; The NaN-aware comparisons, as in translate-comparison: PostgreSQL
     ;; sorts NaN above everything, and IEEE-754 answers false for every
     ;; comparison involving one.
@@ -3236,6 +3278,14 @@
           is-bool? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::date — extract the LocalDate so serialization can omit the
         ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
+          ;; A value that is already temporal (a bound parameter, a
+          ;; folded expression) is converted, not stringified: `str` of a
+          ;; java.util.Date is its toString, which no parser reads, and the
+          ;; cast silently became NULL.
+          (and (or is-date? is-ts?) (not (string? inner-raw)))
+          (sql-cast/cast-scalar inner-raw type-str
+                                {:explicit? true
+                                 :parse-timestamp parse-timestamp-string})
           is-date? (try
                      (java.time.LocalDate/parse
                       (str/trim (str inner-raw))
@@ -6232,6 +6282,11 @@
     (cond
       (= oid types/oid-money) [(sql-cast/cast-scalar s "money" {})]
       (= oid types/oid-vector) [(pg-vector/coerce s)]
+      ;; A time/timetz EXPRESSION carries LocalTime/OffsetTime; a column of
+      ;; those types still stores its canonical text (below: no coercion).
+      (and (#{types/oid-time types/oid-timetz} oid)
+           (not (instance? Column typed)))
+      [(sql-cast/cast-scalar s (types/oid->pg-name oid) {:explicit? true})]
       ;; Text needs no input function.
       (= :db.type/string vt) nil
       :else
@@ -6491,6 +6546,7 @@
      ;; which replaces the AST nodes this test needs.
      (let [enum-spec (when (contains? #{'< '> '<= '>=} op)
                        (enum-spec-for-exprs ctx [left right]))
+           _ (when enum-spec (check-enum-labels! enum-spec [left right]))
            jsonb-cmp? (and (contains? #{'= 'not=} op)
                            (or (jsonb-column? ctx left)
                                (jsonb-column? ctx right)))

@@ -27,6 +27,7 @@
    (:schema db) doesn't surface."
   (:require [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
@@ -344,8 +345,8 @@
 
 (defn cast-domain-value
   "Coerce and validate one value against a persisted domain definition.
-   Reuses stmt/eval-check-predicate at runtime so casts and column writes do
-   not grow separate CHECK semantics."
+   The CHECK runs through row-eval, as column writes' do, so casts and
+   writes share one CHECK semantics."
   [db spec value]
   (cond
     (or (nil? value) (= :__null__ value))
@@ -371,14 +372,14 @@
                     (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression check-expr)
                     (catch Exception _
                       (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression check-expr)))
-              eval-check (requiring-resolve 'datahike.pg.sql.stmt/eval-check-predicate)
-              ok? (eval-check ast {(keyword "" "value") coerced} "" (:schema db))]
+              check-result (requiring-resolve 'datahike.pg.sql.row-eval/check-result)
+              ok? (check-result ast {(keyword "" "value") coerced} "" (:schema db) db
+                                {"value" base})]
           (when (false? ok?)
-            (throw (ex-info "domain check constraint violation"
-                            {:error :check-violation
-                             :constraint (or (:check-name spec)
-                                             (str (:name spec) "_check"))
-                             :domain (:name spec) :value coerced})))))
+            (throw (errors/pg-error :check-violation
+                                    {:constraint (or (:check-name spec)
+                                                     (str (:name spec) "_check"))
+                                     :domain (:name spec) :value coerced})))))
       coerced)))
 
 (def ^:dynamic *parse-sql*
@@ -500,6 +501,30 @@
                 (seq? v)         (map walk v)
                 :else            v))]
       (walk x))))
+
+(defn substitute-select-plan
+  "Substitute only execution-bearing values in a cached SELECT plan.
+
+   In particular, preserve enriched DB values, schemas, parser functions and
+   parameter-index maps by identity. Walking the complete INSERT source plan
+   rebuilt those large immutable structures on every prepared Execute."
+  [plan fetch]
+  (let [sub #(substitute-params % fetch)]
+    (cond-> plan
+      (contains? plan :in-args) (update :in-args sub)
+      (contains? plan :literal-row) (update :literal-row sub)
+      (contains? plan :literal-rows) (update :literal-rows sub)
+      (contains? plan :compound-exprs) (update :compound-exprs sub)
+      (contains? plan :project-set) (update :project-set sub)
+      (contains? plan :secondary-candidate) (update :secondary-candidate sub)
+      (contains? plan :secondary-order-candidate)
+      (update :secondary-order-candidate sub)
+      (contains? plan :sub-results)
+      (update :sub-results
+              (fn [branches]
+                (mapv #(substitute-select-plan % fetch) branches)))
+      (contains? plan :deferred-recursive-ctes)
+      (update :deferred-recursive-ctes sub))))
 
 ;; ---------------------------------------------------------------------------
 ;; nextval() marker + resolution
