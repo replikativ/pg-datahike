@@ -884,8 +884,10 @@
       ;; expression of an ArrayExpression. Peek through single-item lists.
       (instance? net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList expr)
       (let [^net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList pel expr]
-        (when (= 1 (.size pel))
-          (expr-oid (.get pel 0) env)))
+        (if (= 1 (.size pel))
+          (expr-oid (.get pel 0) env)
+          ;; `(a, b)` is ROW(a, b): an anonymous record.
+          2249))
 
       ;; PostgreSQL folds a unary sign INTO the constant before typing it
       ;; (gram.y doNegate), so `-2147483648` is int4 even though 2147483648
@@ -1075,6 +1077,25 @@
 
       ;; EXTRACT is numeric; date_part (the function spelling) is float8.
       (instance? ExtractExpression expr) types/oid-numeric
+
+      ;; AT TIME ZONE swaps timestamp and timestamptz (timestamp.c
+      ;; timestamp_zone / timestamptz_zone); a time becomes timetz. Each
+      ;; zone in a chain applies to the previous result.
+      (instance? net.sf.jsqlparser.expression.TimezoneExpression expr)
+      (let [^net.sf.jsqlparser.expression.TimezoneExpression e expr
+            zones (letfn [(n [z] (if (instance? net.sf.jsqlparser.expression.TimezoneExpression z)
+                                   (+ 1 (reduce + (map n (.getTimezoneExpressions
+                                                          ^net.sf.jsqlparser.expression.TimezoneExpression z))))
+                                   1))]
+                    (reduce + (map n (.getTimezoneExpressions e))))
+            step (fn [oid]
+                   (cond
+                     (= oid types/oid-timestamp) types/oid-timestamptz
+                     (#{types/oid-time types/oid-timetz} oid) types/oid-timetz
+                     :else types/oid-timestamp))]
+        (nth (iterate step (expr-oid (.getLeftExpression e) env)) zones))
+
+      (instance? net.sf.jsqlparser.expression.IntervalExpression expr) types/oid-interval
 
       ;; --- CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP
       ;; (parsed as TimeKeyExpression by JSqlParser) ----------------------

@@ -151,10 +151,10 @@
               rs (.executeQuery st "SELECT 66::money")]
     (is (.next rs))
     (is (= "money" (.getColumnTypeName (.getMetaData rs) 1)))
-    (is (= "66.00" (.getString rs 1))))
+    (is (= "$66.00" (.getString rs 1))))
   (with-open [c (jdbc)]
     (is (= ["money"] (col c 1 "SELECT pg_typeof(66::money)::text")))
-    (is (= ["123.46" "-123456.78"]
+    (is (= ["$123.46" "-$123,456.78"]
            (col c 1 (str "SELECT '$123.455'::money "
                          "UNION ALL SELECT '($123,456.78)'::money"))))))
 
@@ -184,12 +184,14 @@
   ;; PostgreSQL 17 src/test/regress/sql/money.sql lines 53-73.
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE money_input (m money)")
-    (doseq [[input expected] [["$123.45" "123.45"]
-                              ["$123.451" "123.45"]
-                              ["$123.454" "123.45"]
-                              ["$123.455" "123.46"]
-                              ["$123.456" "123.46"]
-                              ["$123.459" "123.46"]]]
+    ;; Expected values are money.out's, `$` and all: cash_out renders the
+    ;; type, and these once asserted our numeric-style rendering instead.
+    (doseq [[input expected] [["$123.45" "$123.45"]
+                              ["$123.451" "$123.45"]
+                              ["$123.454" "$123.45"]
+                              ["$123.455" "$123.46"]
+                              ["$123.456" "$123.46"]
+                              ["$123.459" "$123.46"]]]
       (exec! c "DELETE FROM money_input")
       (with-open [ps (.prepareStatement c "INSERT INTO money_input VALUES (?)")]
         (.setString ps 1 input)
@@ -205,15 +207,15 @@
       (is (.next rs))
       (is (= "money" (.getColumnTypeName (.getMetaData rs) 1)))
       (is (= "float8" (.getColumnTypeName (.getMetaData rs) 2)))
-      (is (= "3.00" (.getString rs 1)))
+      (is (= "$3.00" (.getString rs 1)))
       (is (= "0.5" (.getString rs 2))))
-    (doseq [[sql expected] [["SELECT '878.08'::money / 11::float8" "79.83"]
-                            ["SELECT '878.08'::money / 11::float4" "79.83"]
-                            ["SELECT '878.08'::money / 11::bigint" "79.82"]
-                            ["SELECT '878.08'::money / 11::int" "79.82"]
-                            ["SELECT '878.08'::money / 11::smallint" "79.82"]
+    (doseq [[sql expected] [["SELECT '878.08'::money / 11::float8" "$79.83"]
+                            ["SELECT '878.08'::money / 11::float4" "$79.83"]
+                            ["SELECT '878.08'::money / 11::bigint" "$79.82"]
+                            ["SELECT '878.08'::money / 11::int" "$79.82"]
+                            ["SELECT '878.08'::money / 11::smallint" "$79.82"]
                             ["SELECT '90000000000000099.00'::money / 10::bigint"
-                             "9000000000000009.90"]]]
+                             "$9,000,000,000,000,009.90"]]]
       (is (= [expected] (col c 1 sql)) sql))
     (doseq [sql ["SELECT '92233720368547758.07'::money + '0.01'::money"
                  "SELECT '-92233720368547758.08'::money - '0.01'::money"

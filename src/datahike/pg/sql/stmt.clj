@@ -6788,6 +6788,14 @@
 
           (= "tsquery" pg-type) (tsearch/canonical-tsquery val)
 
+        ;; time / timetz columns keep their text form, so the write is where
+        ;; PostgreSQL's input function has to run: it validates ('25:00' is
+        ;; 22008, 'garbage' 22007) and canonicalises ('1:2:3 PM' is stored
+        ;; as 13:02:03). The raw input string used to be stored verbatim.
+          (and (#{"time" "timetz"} pg-type) (some? val) (not= :__null__ val))
+          (types/->pg-text (sql-cast/cast-scalar val pg-type {:explicit? true})
+                           (if (= "time" pg-type) types/oid-time types/oid-timetz))
+
         ;; pgvector's vector type is Datahike's native float array. Parse
         ;; every write through the same input function, even if it is already
         ;; a float[], so vector(n) is enforced on INSERT and UPDATE alike.

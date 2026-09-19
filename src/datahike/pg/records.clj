@@ -54,17 +54,18 @@
 (defn- field-cell
   "Render one field value to its record_out cell. NULL → bare empty (no
    quotes); everything else renders then is quoted+escaped when needed."
-  [v]
+  [v oid]
   (cond
     (nil? v)        ""               ; SQL NULL → nothing between the commas
     (= :__null__ v) ""
     :else
+    ;; record_out calls each FIELD type's output function -- the field
+    ;; OID is what tells money from numeric and date from timestamp.
     (let [raw (cond
                 (boolean? v)   (if v "t" "f")
-                (number? v)    (str v)
                 (arr/array? v) (arr/to-pg-text v)
                 (record? v)    (to-pg-text v)
-                :else          (str v))]
+                :else          (types/->pg-text v oid))]
       (if (field-needs-quote? raw)
         (str "\"" (str/replace raw #"[\"\\]" "\\\\$0") "\"")
         raw))))
@@ -72,7 +73,7 @@
 (defn to-pg-text
   "Render a PgRecord to PG's canonical `record_out` text: `(f1,f2,...)`."
   [^PgRecord r]
-  (str "(" (str/join "," (map (comp field-cell :value) (:fields r))) ")"))
+  (str "(" (str/join "," (map #(field-cell (:value %) (:oid %)) (:fields r))) ")"))
 
 (defn register-layouts!
   "Recursively register each PgRecord's field OIDs (via `reg-fn` — a 2-arg fn

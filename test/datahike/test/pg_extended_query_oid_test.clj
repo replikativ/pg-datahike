@@ -313,7 +313,9 @@
   (let [sql (str "SELECT DATE '2020-01-01' "
                  "UNION ALL SELECT TIMESTAMP '2020-01-02 03:04:05'")]
     (assert-describe-and-execute-oids [oid-timestamp] sql)
-    (is (= [["2020-01-01 00:00"] ["2020-01-02 03:04:05"]]
+    ;; PostgreSQL always prints the seconds; this once asserted
+    ;; LocalDateTime.toString's "00:00".
+    (is (= [["2020-01-01 00:00:00"] ["2020-01-02 03:04:05"]]
            (exec-rows sql)))))
 
 (deftest timestamptz-set-operation-carriers-are-canonical

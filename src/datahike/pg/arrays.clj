@@ -403,25 +403,31 @@
    numbers → Java toString, strings → quoted+escaped as needed, nil →
    unquoted NULL. Nested PgArrays and sequential collections recurse
    into PG's `{…}` format so multi-dim ARRAY[[1,0],[0,1]] renders
-   as `{{1,0},{0,1}}` (matching PG's `array_out`)."
-  [v]
-  (cond
-    (nil? v)        "NULL"
-    (boolean? v)    (if v "t" "f")
+   as `{{1,0},{0,1}}` (matching PG's `array_out`).
+
+   `array_out` calls the ELEMENT type's output function, so temporal and
+   money elements go through types/->pg-text with the element OID; `str`
+   printed a timestamp element as java.util.Date.toString, in the JVM's
+   local time zone."
+  ([v] (element->text v nil))
+  ([v elem-oid]
+   (cond
+     (or (nil? v) (= :__null__ v)) "NULL"
+     (boolean? v)    (if v "t" "f")
     ;; PostgreSQL's float text form inside an array too -- `array_out`
     ;; calls the element type's own output function, so `{1.0E7}` was
     ;; wrong for the same reason a bare float8 was.
-    (or (instance? Float v) (instance? Double v))
-    ((requiring-resolve 'datahike.pg.types/float->pg-text) v (instance? Float v))
-    (number? v)     (str v)
-    (array? v)      (to-pg-text v)
-    (sequential? v) (if (empty? v)
-                      "{}"
-                      (str "{" (str/join "," (map element->text v)) "}"))
-    :else           (let [s (str v)]
-                      (if (needs-quote? s)
-                        (str "\"" (escape-for-array-text s) "\"")
-                        s))))
+     (or (instance? Float v) (instance? Double v))
+     ((requiring-resolve 'datahike.pg.types/float->pg-text) v (instance? Float v))
+     (and (number? v) (not= elem-oid 790)) (str v)
+     (array? v)      (to-pg-text v)
+     (sequential? v) (if (empty? v)
+                       "{}"
+                       (str "{" (str/join "," (map #(element->text % elem-oid) v)) "}"))
+     :else           (let [s ((requiring-resolve 'datahike.pg.types/->pg-text) v elem-oid)]
+                       (if (needs-quote? s)
+                         (str "\"" (escape-for-array-text s) "\"")
+                         s)))))
 
 (defn- lbound-prefix
   "PG emits a `[lo:hi]…=` prefix only when any lbound != 1. Format
@@ -447,9 +453,10 @@
    Used by the wire layer's value->string for any PgArray value."
   [^PgArray a]
   (let [elts (:elements a)
+        elem-oid (get @(requiring-resolve 'datahike.pg.types/elem-kw->oid) (:elem-type a))
         body (if (empty? elts)
                "{}"
-               (str "{" (str/join "," (map element->text elts)) "}"))]
+               (str "{" (str/join "," (map #(element->text % elem-oid) elts)) "}"))]
     (if-let [pfx (lbound-prefix a)]
       (str pfx "=" body)
       body)))
