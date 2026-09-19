@@ -198,3 +198,65 @@
       (is (= "42703" (.getSQLState ^java.sql.SQLException e)))
       (is (re-find #"SET target columns cannot be qualified"
                    (.getMessage ^java.sql.SQLException e))))))
+
+(defn- sqlstate [^Connection c sql]
+  (try (exec! c sql) nil
+       (catch java.sql.SQLException e (.getSQLState e))))
+
+(deftest set-is-computed-by-the-update-query
+  ;; PostgreSQL plans an UPDATE as a query over the target whose target
+  ;; list computes the new values. Expectations are PostgreSQL 17's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE SEQUENCE us")
+    (exec! c (str "CREATE TABLE u (id int PRIMARY KEY, x int, y int, v varchar(3), "
+                  "q int DEFAULT nextval('us'), k int DEFAULT 7, ts timestamptz, a int[], j jsonb)"))
+    (exec! c "INSERT INTO u (id, x, y, a, j) VALUES (1,10,1,'{1,2}','{\"k\":1}'), (2,20,0,NULL,NULL), (3,30,2,'{3}','[]')")
+    (testing "subqueries read the pre-statement snapshot"
+      (exec! c "UPDATE u SET x = (SELECT max(x) FROM u) + 1 WHERE id < 3")
+      (is (= [["1" "31"] ["2" "31"] ["3" "30"]] (rows c "SELECT id, x FROM u ORDER BY id"))))
+    (testing "WHERE filters before SET is evaluated"
+      (is (= 2 (update-count c "UPDATE u SET x = 100 / y WHERE y <> 0")))
+      (is (= [["1" "100"] ["2" "31"] ["3" "50"]] (rows c "SELECT id, x FROM u ORDER BY id"))))
+    (testing "a correlated subquery reads the row"
+      (exec! c "UPDATE u SET y = (SELECT x FROM u v WHERE v.id = u.id + 1)")
+      (is (= [["1" "31"] ["2" "50"] ["3" nil]] (rows c "SELECT id, y FROM u ORDER BY id"))))
+    (testing "the assignment cast follows the expression's type"
+      (exec! c "UPDATE u SET x = 1.6 WHERE id = 1")
+      (is (= [["2"]] (rows c "SELECT x FROM u WHERE id = 1")))
+      (exec! c "UPDATE u SET x = 2.5 WHERE id = 1")
+      (is (= [["3"]] (rows c "SELECT x FROM u WHERE id = 1")))
+      (exec! c "UPDATE u SET x = 2.5::float8 WHERE id = 1")
+      (is (= [["2"]] (rows c "SELECT x FROM u WHERE id = 1")))
+      (is (= "42804" (sqlstate c "UPDATE u SET x = '1.6'::text WHERE false")))
+      (is (= "22001" (sqlstate c "UPDATE u SET v = 'abcd' WHERE id = 1"))))
+    (testing "DEFAULT is the column default, a sequence advancing per row"
+      (exec! c "UPDATE u SET q = DEFAULT, k = DEFAULT")
+      (is (= [["3" "1"]] (rows c "SELECT count(DISTINCT q), count(DISTINCT k) FROM u"))))
+    (testing "now() is the statement's time"
+      (exec! c "UPDATE u SET ts = now()")
+      (is (= [["1"]] (rows c "SELECT count(DISTINCT ts) FROM u"))))
+    (testing "array and jsonb operators are the SELECT translator's"
+      (exec! c "UPDATE u SET a = a || 9, j = CASE WHEN j @> '{\"k\":1}' THEN j || '{\"m\":2}' ELSE j END")
+      (is (= [["1" "{1,2,9}" "{\"k\": 1, \"m\": 2}"] ["2" "{9}" nil] ["3" "{3,9}" "[]"]]
+             (rows c "SELECT id, a, j FROM u ORDER BY id"))))
+    (testing "a volatile function is evaluated per row"
+      (exec! c "ALTER TABLE u ADD COLUMN g uuid")
+      (exec! c "UPDATE u SET g = gen_random_uuid()")
+      (is (= [["3"]] (rows c "SELECT count(DISTINCT g) FROM u"))))
+    (testing "an untyped operand beside an array takes the array's type"
+      (is (= [["1" "{1,2,9}" "{1,2,9,4,5}"] ["2" "{9}" "{9,4,5}"] ["3" "{3,9}" "{3,9,4,5}"]]
+             (rows c "SELECT id, a || NULL, a || '{4,5}' FROM u ORDER BY id"))))
+    (testing "what the SET list may not contain"
+      (is (= "42803" (sqlstate c "UPDATE u SET x = count(*)")))
+      (is (= "42P20" (sqlstate c "UPDATE u SET x = row_number() OVER ()")))
+      (is (= "42703" (sqlstate c "UPDATE u SET nosuch = 1"))))))
+
+(deftest set-plan-over-a-temp-table
+  ;; A temp table is stored under a per-session name; the UPDATE's text
+  ;; still qualifies columns with the name it was given.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TEMP TABLE tt (id int PRIMARY KEY, x int)")
+    (exec! c "INSERT INTO tt VALUES (1, 1), (2, 2)")
+    (exec! c "UPDATE tt SET x = tt.x + 10 WHERE tt.id = 1")
+    (exec! c "UPDATE tt t SET x = t.x + 100 WHERE t.id = 2")
+    (is (= [["1" "11"] ["2" "102"]] (rows c "SELECT id, x FROM tt ORDER BY id")))))

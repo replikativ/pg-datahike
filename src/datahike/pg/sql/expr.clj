@@ -1091,10 +1091,20 @@
       ;;
       ;; With no FROM there is no entity var and nothing to vary over --
       ;; and a single row is exactly one draw, so folding is right there.
-      (and (contains? #{"random" "random_normal"} fname)
+      ;; Every function pg_proc marks volatile gets this, not a list of
+      ;; names: `gen_random_uuid()` handed every row of an UPDATE the
+      ;; same UUID.
+      (and (contains? types/volatile-proc-names fname)
+           (contains? fns/sql-fn->clj-fn fname)
            (:default-table ctx))
-      (let [fn-param (symbol (str "?vol-" fname (swap! (:var-counter ctx) inc)))
-            impl (get fns/sql-fn->clj-fn fname)
+      (let [_ (fns/check-arity! fname (count args))
+            fn-param (symbol (str "?vol-" fname (swap! (:var-counter ctx) inc)))
+            clj-fn (get fns/sql-fn->clj-fn fname)
+            spec (get fns/sql-function-specs fname)
+            impl (if (or (contains? fns/non-strict-fns fname)
+                         (= false (:strict? spec)))
+                   clj-fn
+                   (fns/null-safe clj-fn))
             evar (ctx/entity-var! ctx (:default-table ctx))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj (fn [_row & more] (apply impl (or more nil))))
@@ -2972,9 +2982,15 @@
                                    (.getRightExpression ^ExistsExpression expr))))
       (translate-expr ctx expr)
 
-      (or (instance? ExistsExpression expr)
-          (instance? JsonOperator expr)
-          (instance? DoubleAnd expr))
+      ;; `@>`, `?`, `&&` ... are boolean-valued operators: their value
+      ;; is the condition (NULL stays NULL).
+      (or (instance? DoubleAnd expr)
+          (and (instance? JsonOperator expr)
+               (contains? #{"@>" "<@" "?" "?|" "?&" "@?" "@@"}
+                          (.getStringExpression ^JsonOperator expr))))
+      (translate-expr ctx expr)
+
+      (or (instance? ExistsExpression expr) (instance? JsonOperator expr))
       (throw (ex-info "predicate not supported in inline boolean context"
                       {:error :feature-not-supported
                        :feature (str "predicate of type " (.getName ^Class (type expr))
@@ -5805,8 +5821,29 @@
           l-oid (source-oid ctx (.getLeftExpression e))
           r-oid (source-oid ctx (.getRightExpression e))
           null? (fn [x] (or (nil? x) (= :__null__ x)))
+          ;; The element type of an array-typed operand.
+          ;; An untyped literal or NULL beside an array is resolved as
+          ;; that array's type: `a || NULL` and `a || '{4,5}'` are
+          ;; array_cat (operator resolution, unknown takes the other
+          ;; operand's type).
+          l-unknown? (oid-infer/untyped-literal? (.getLeftExpression e))
+          r-unknown? (oid-infer/untyped-literal? (.getRightExpression e))
+          elem-of #(some-> % types/array-oid->element-oid types/oid->elem-kw)
+          l-oid (if (and l-unknown? (elem-of r-oid)) r-oid l-oid)
+          r-oid (if (and r-unknown? (elem-of l-oid)) l-oid r-oid)
+          l-array (elem-of l-oid)
+          r-array (elem-of r-oid)
+          ;; An array column's value is its stored text: read it as the
+          ;; array its type says, so `a || 3` appends to it.
+          as-array (fn [x oid]
+                     (if-let [elem (and (string? x)
+                                        (some-> oid types/array-oid->element-oid types/oid->elem-kw))]
+                       (or (coerce-pg-array x elem) x)
+                       x))
           concat-fn (fn [a b]
-                      (cond
+                      (let [a (if (and l-array (string? a)) (as-array a l-oid) a)
+                            b (if (and r-array (string? b)) (as-array b r-oid) b)]
+                        (cond
                         ;; `||` is STRICT: NULL on either side makes the
                         ;; whole expression NULL. This is exactly where it
                         ;; differs from concat(), which ignores its NULL
@@ -5815,25 +5852,41 @@
                         ;; the empty string, so `'a' || NULL` answered 'a'.
                         ;; Strictness holds for the array and jsonb
                         ;; overloads too, hence the guard ahead of them.
-                        (or (null? a) (null? b)) :__null__
-                        jsonb-concat? (jb/jsonb-concat a b)
-                        (and (pg-arr/array? a) (pg-arr/array? b))
-                        (pg-arr/concat-arrs a b)
+                        ;; The array overloads are not strict: array_cat
+                        ;; answers the other side for a NULL array,
+                        ;; array_append / array_prepend a one-element
+                        ;; array (or append a NULL element).
+                          (and l-array r-array (or (null? a) (null? b)))
+                          (if (null? a) (if (null? b) :__null__ b) a)
+                          (and l-array (not r-array) (null? a))
+                          (pg-arr/array l-array [(when-not (null? b) b)])
+                          (and r-array (not l-array) (null? b))
+                          (pg-arr/array r-array [(when-not (null? a) a)])
+                          (and l-array (not r-array) (null? b))
+                          (let [arr (as-array a l-oid)]
+                            (pg-arr/array (:elem-type arr) (conj (vec (:elements arr)) nil)))
+                          (and r-array (not l-array) (null? a))
+                          (let [arr (as-array b r-oid)]
+                            (pg-arr/array (:elem-type arr) (into [nil] (:elements arr))))
+                          (or (null? a) (null? b)) :__null__
+                          jsonb-concat? (jb/jsonb-concat a b)
+                          (and (pg-arr/array? a) (pg-arr/array? b))
+                          (pg-arr/concat-arrs a b)
                         ;; bit || bit is bitcat, not string concat — the
                         ;; generic `(str a b)` below would stringify the
                         ;; PgBit records themselves.
-                        (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b))
-                        (pg-bits/concat-bits a b)
-                        (and (bytes? a) (bytes? b))
-                        (byte-array (concat a b))
+                          (and (pg-bits/pg-bit? a) (pg-bits/pg-bit? b))
+                          (pg-bits/concat-bits a b)
+                          (and (bytes? a) (bytes? b))
+                          (byte-array (concat a b))
                         ;; Append/prepend scalar to array — PG allows
                         ;; `arr || scalar` and `scalar || arr`.
-                        (pg-arr/array? a)
-                        (pg-arr/array (:elem-type a) (conj (:elements a) b))
-                        (pg-arr/array? b)
-                        (pg-arr/array (:elem-type b) (into [a] (:elements b)))
-                        :else (str (types/->pg-text a l-oid)
-                                   (types/->pg-text b r-oid))))
+                          (pg-arr/array? a)
+                          (pg-arr/array (:elem-type a) (conj (:elements a) b))
+                          (pg-arr/array? b)
+                          (pg-arr/array (:elem-type b) (into [a] (:elements b)))
+                          :else (str (types/->pg-text a l-oid)
+                                     (types/->pg-text b r-oid)))))
           result-var (ctx/fresh-var! ctx)]
       (swap! (:in-params ctx) conj fn-param)
       (swap! (:in-args ctx) conj concat-fn)

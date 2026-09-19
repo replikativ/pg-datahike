@@ -472,9 +472,10 @@
 
 (defn translation-context
   "What a translation depends on besides its SQL, schema and catalog: the
-   declared parameter types, the session's temp tables and search_path."
+   declared parameter types, the session's temp tables, whether the SQL is
+   nested in a statement (see params/*nested-parse?*) and search_path."
   []
-  [params/*declared-param-oids* params/*temp-table-map*
+  [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
    (when params/*session-state*
      (select-keys @params/*session-state* [:search-path]))])
 
@@ -1047,7 +1048,7 @@
    parse-sql wraps this with the LRU result cache."
   [^String sql schema db]
   (binding [params/*parse-db* db
-            params/*parse-sql* parse-sql
+            params/*parse-sql* (params/nested-parse-fn parse-sql)
             ;; Use datahike's query PLANNER (not the legacy engine) for all
             ;; parse-time materialisation (derived tables / set-ops / CTEs /
             ;; correlated-subquery per-row eval). The legacy engine
@@ -1090,10 +1091,12 @@
     ;; don't re-tokenize the same SQL twice per statement.
       (let [cls-info (cls/classify sql)
             explain (explain-prefix sql)
-            ;; A row-scope expression list (row-eval) is never a
-            ;; catalog probe or a sole system call: `RETURNING now()` is
-            ;; an expression over the row, projected by the translator.
-            sys-type (when-not params/*statement-row-scope-tables*
+            ;; Neither a row-scope expression list (row-eval) nor SQL
+            ;; nested in a statement is a catalog probe or a sole system
+            ;; call: `RETURNING now()` and `(SELECT nextval('s'))` are
+            ;; expressions, projected by the translator.
+            sys-type (when-not (or params/*statement-row-scope-tables*
+                                   params/*nested-parse?*)
                        (catalog/system-query?* sql cls-info))]
         (cond
           sys-type
