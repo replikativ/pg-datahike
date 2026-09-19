@@ -336,25 +336,29 @@
         (throw (errors/pg-error :datetime-field-overflow {:value input})))
       (let [nanos-of-day (+ (* (+ (* (+ (* hour 60) minute) 60) second) 1000000000)
                             (* micros 1000))
-            _ (when (>= nanos-of-day 86400000000000)
-                ;; A fraction rounding up past 23:59:59.999999, or 24:00
-                ;; itself: java.time has no end-of-day time, so refuse
-                ;; rather than store a different value.
-                (throw (errors/pg-error :feature-not-supported
-                                        {:message (str "time 24:00:00 is not supported: \"" input "\"")})))
-            t (java.time.LocalTime/ofNanoOfDay nanos-of-day)]
-        (if-not timetz?
-          t
-          (java.time.OffsetTime/of
-           t
-           (if (or (nil? zone) (#{"z" "utc"} (str/lower-case zone)))
-             java.time.ZoneOffset/UTC
-             (let [[_ sign zh zm zs] (re-matches #"([+-])(\d{1,2}):?(\d{2})?:?(\d{2})?" zone)
-                   secs (+ (* 3600 (Long/parseLong zh))
-                           (* 60 (Long/parseLong (or zm "0")))
-                           (Long/parseLong (or zs "0")))]
-               (java.time.ZoneOffset/ofTotalSeconds
-                (int (if (= "-" sign) (- secs) secs)))))))))))
+            end-of-day? (= nanos-of-day 86400000000000)
+            _ (when (> nanos-of-day 86400000000000)
+                (throw (errors/pg-error :datetime-field-overflow {:value input})))
+            t (when-not end-of-day? (java.time.LocalTime/ofNanoOfDay nanos-of-day))
+            offset (when timetz?
+                     (if (or (nil? zone) (#{"z" "utc"} (str/lower-case zone)))
+                       java.time.ZoneOffset/UTC
+                       (let [[_ sign zh zm zs] (re-matches #"([+-])(\d{1,2}):?(\d{2})?:?(\d{2})?" zone)
+                             secs (+ (* 3600 (Long/parseLong zh))
+                                     (* 60 (Long/parseLong (or zm "0")))
+                                     (Long/parseLong (or zs "0")))]
+                         (java.time.ZoneOffset/ofTotalSeconds
+                          (int (if (= "-" sign) (- secs) secs))))))]
+        (cond
+          ;; 24:00:00 is a valid PostgreSQL time (pgjdbc sends LocalTime.MAX
+          ;; as it) but java.time has no end-of-day value. Time values are
+          ;; stored as their canonical text, so carry this one AS that text:
+          ;; it stores, renders and orders correctly (zero-padded).
+          end-of-day?
+          (str "24:00:00" (when timetz?
+                            ((requiring-resolve 'datahike.pg.types/offset-text) offset)))
+          (not timetz?) t
+          :else (java.time.OffsetTime/of t offset))))))
 
 (defn- internal-char-in
   "PostgreSQL's charin followed by charout (utils/adt/char.c), since a

@@ -1511,7 +1511,7 @@
   (str (format "%02d:%02d:" (.getHour t) (.getMinute t))
        (seconds-text (.getSecond t) (.getNano t))))
 
-(defn- offset-text
+(defn offset-text
   "EncodeTimezone: +HH, then :MM and :SS only when non-zero."
   [^java.time.ZoneOffset o]
   (let [total (.getTotalSeconds o)

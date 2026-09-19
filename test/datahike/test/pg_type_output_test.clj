@@ -110,3 +110,20 @@
       (exec! c "UPDATE tv SET t = '1:2:3' WHERE id = 1")
       (is (= [["1" "01:02:03"] ["4" "14:05:00"]]
              (rows c "SELECT id, t FROM tv WHERE t IS NOT NULL ORDER BY id"))))))
+
+(deftest end-of-day-time
+  ;; 24:00:00 is a valid time; pgjdbc sends LocalTime.MAX as it
+  ;; (PreparedStatementTest.testLocalTimeMax). java.time cannot hold it, so
+  ;; it travels as its canonical text.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE eod (id int, t time, tz timetz)")
+    (exec! c "INSERT INTO eod VALUES (1, '24:00', '24:00+02'), (2, '12:00', '00:00')")
+    (is (= [["2" "12:00:00" "00:00:00+00"] ["1" "24:00:00" "24:00:00+02"]]
+           (rows c "SELECT id, t, tz FROM eod ORDER BY t")))
+    (with-open [ps (.prepareStatement c "INSERT INTO eod (id, t) VALUES (3, ?)")]
+      (.setObject ps 1 java.time.LocalTime/MAX)
+      (.executeUpdate ps))
+    (with-open [st (.createStatement c) rs (.executeQuery st "SELECT t FROM eod WHERE id = 3")]
+      (is (.next rs))
+      (is (= java.time.LocalTime/MAX (.getObject rs 1 java.time.LocalTime))))
+    (is (= "22008" (state c "SELECT '24:00:01'::time")))))
