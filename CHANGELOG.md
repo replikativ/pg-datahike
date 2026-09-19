@@ -4,6 +4,20 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### PostgreSQL's catalog is generated, not transcribed
+
+- `src/datahike/pg/pg_catalog.edn` holds the pg_type, pg_cast, pg_proc and
+  pg_operator rows of PostgreSQL 17.7, generated from the release's
+  `src/include/catalog/*.dat` by `bb gen-catalog`. Type lengths,
+  categories, preferred types, collations, array types, implicit and
+  explicit casts, and aggregate signatures are now derived from it instead
+  of hand-written tables. A test fails when the file is edited by hand or
+  disagrees with the pinned source.
+- Two hand-copied facts were wrong: `"char"` is category Z, not S. And
+  `time -> timetz` is an implicit cast; it stays excluded from resolution,
+  in a named set, until comparisons convert the time operand (with it,
+  `time = timetz` would answer false instead of raising 42883).
+
 ### Aggregates resolve their argument types
 
 - Aggregate and window-function calls are resolved against every
@@ -12,6 +26,7 @@ All notable changes to pg-datahike.
   literal that fits several candidates raises 42725, as in PostgreSQL.
   `sum(text)` used to fail with an internal ClassCastException, `sum(text)
   OVER ()` with 0A000, and `bool_and(int)` answered false.
+
 ### Values render and parse by their SQL type
 
 - One output function (`types/->pg-text`) serves the wire, `::text`, `||`,
