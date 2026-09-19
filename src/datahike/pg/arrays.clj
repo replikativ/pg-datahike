@@ -45,7 +45,8 @@
    - Booleans as `t`/`f` (PG text format for BOOL)
    - Non-default lbounds emit a `[lo1:hi1][lo2:hi2]…=` prefix"
   (:require [clojure.string :as str]
-            [datahike.pg.sql.coerce :as coerce]))
+            [datahike.pg.input :as input]
+            [datahike.pg.types :as types]))
 
 (defrecord PgArray [elem-type elements dims lbounds])
 
@@ -473,19 +474,11 @@
       nil
       (nil? raw) nil
       :else
-      (case elem-type
-        :int2     (Long/parseLong raw)
-        :int4     (Long/parseLong raw)
-        :int8     (Long/parseLong raw)
-        :float4   (Double/parseDouble raw)
-        :float8   (Double/parseDouble raw)
-        :bool     (let [b (coerce/parse-bool-token raw)]
-                    (when (nil? b)
-                      (throw (ex-info (str "invalid input syntax for type boolean: "
-                                           (pr-str raw))
-                                      {:error :invalid-text-representation
-                                       :type "boolean" :value raw})))
-                    b)
+      ;; An element is read by its type's input function, as array_in
+      ;; calls the element typinput: range-checked, and an error on
+      ;; invalid text rather than a string element.
+      (if-let [parse (some-> (types/elem-kw->oid elem-type) input/parser)]
+        (parse raw)
         raw))))
 
 (defn- parse-lbound-prefix

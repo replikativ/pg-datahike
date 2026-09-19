@@ -27,7 +27,6 @@
    Both errors are encoded as `ex-info` with `:sqlstate`; the wire
    layer's `handler.clj` already lifts those into ErrorResponse
    messages."
-  (:refer-clojure :exclude [parse-uuid])
   (:require [datahike.pg.types :as types]
             [clojure.string :as str])
   (:import [java.math BigInteger BigDecimal]
@@ -43,53 +42,6 @@
    `sqlstate` is the 5-char SQLSTATE; `msg` is the human-readable text."
   ([sqlstate msg]      (pg-error sqlstate msg nil))
   ([sqlstate msg data] (ex-info msg (merge {:sqlstate sqlstate} data))))
-
-(defn parse-uuid
-  "Parse PostgreSQL's uuid input syntax. Besides the canonical spelling,
-   uuid_in accepts surrounding braces, omitted hyphens, and hyphens after
-   any group of four hexadecimal digits. Return java.util.UUID or raise
-  22P02; callers that need a predicate can wrap this with `safe`."
-  [value]
-  (let [raw (str value)]
-    (try
-      (let [braced? (str/starts-with? raw "{")
-            s (if braced?
-                (do
-                  (when-not (str/ends-with? raw "}")
-                    (throw (IllegalArgumentException. "unclosed UUID brace")))
-                  (subs raw 1 (dec (count raw))))
-                raw)
-            _ (when (or (str/includes? s "{") (str/includes? s "}"))
-                (throw (IllegalArgumentException. "misplaced UUID brace")))
-            _ (when (re-find #"(?:^-|-$|--)" s)
-                (throw (IllegalArgumentException. "misplaced UUID hyphen")))
-            [hex n]
-            (reduce (fn [[^StringBuilder out n] ch]
-                      (let [digit (Character/digit ^char ch 16)]
-                        (cond
-                          (not= -1 digit)
-                          [(.append out ch) (inc n)]
-
-                          (= ch \-)
-                          (if (and (pos? n) (zero? (mod n 4)))
-                            [out n]
-                            (throw (IllegalArgumentException. "misplaced UUID hyphen")))
-
-                          :else
-                          (throw (IllegalArgumentException. "non-hex UUID digit")))))
-                    [(StringBuilder.) 0]
-                    s)
-            digits (str hex)]
-        (when-not (= n 32)
-          (throw (IllegalArgumentException. "wrong UUID length")))
-        (java.util.UUID/fromString
-         (str (subs digits 0 8) "-" (subs digits 8 12) "-"
-              (subs digits 12 16) "-" (subs digits 16 20) "-"
-              (subs digits 20 32))))
-      (catch Exception _
-        (throw (pg-error "22P02"
-                         (str "invalid input syntax for type uuid: \"" raw "\"")
-                         {:type "uuid" :value raw}))))))
 
 (defonce ^:private ^AtomicLong uuid-v7-ticks
   ;; Milliseconds plus a 12-bit monotonic fraction. A process-local state is
@@ -388,51 +340,16 @@
                          16))))
           bs)))))
 
-(defn parse-bool-token
-  "Mirror PG's `parse_bool_with_len` (bool.c): any prefix of true/yes
-   and false/no ('t', 'tru', 'ye', …), 'on'/'off' needing ≥2 chars so
-   a bare 'o' stays ambiguous ('on', 'of', 'off'), and exact '1'/'0'
-   (case-insensitive, leading/trailing whitespace ignored). Returns
-   nil for unrecognised input."
-  [^String s]
-  (let [v (clojure.string/lower-case (.trim s))
-        n (.length v)
-        prefix? (fn [^String word] (and (pos? n) (<= n (.length word))
-                                        (.startsWith word v)))]
-    (cond
-      (or (prefix? "true") (prefix? "yes")) true
-      (or (prefix? "false") (prefix? "no")) false
-      (and (>= n 2) (prefix? "off")) false
-      (= v "on") true
-      (= v "1") true
-      (= v "0") false)))
-
-(defn- safe [f]
-  (fn [s] (try (f s) (catch Throwable _ nil))))
+;; The input functions of the types with an unambiguous text form -- bool,
+;; the integers, oid, float4/8, numeric, uuid -- live in datahike.pg.input.
+;; What is left here is the lenient reading of the storage types that
+;; have none yet: date/time (until the datetime decoder), keyword, symbol.
 
 (def vtype->typinput
-  "`{:db/valueType → (fn [^String s] typed-value-or-nil)}`. Each fn is
-   the Datahike-side analogue of PG's typinput for the corresponding
-   target type — `oidin`/`int8in` → `Long/parseLong`, `numericin` →
-   `BigDecimal.`, etc. A nil return means the literal is unparseable
-   for that type; the caller decides how to handle (typically: keep
-   the original string so the comparison falls through to text
-   equality, never matches, returns 0 rows — exactly what PG would do
-   if the surrounding operator-resolution failed).
-
-   Restricted to pure / immutable conversions; mutable typinputs
-   (e.g. timestamptz with the session's TimeZone GUC) need ctx
-   threaded through and aren't covered."
-  {:db.type/long    (safe #(Long/parseLong (.trim ^String %)))
-   :db.type/double  (safe #(Double/parseDouble (.trim ^String %)))
-   :db.type/float   (safe #(.floatValue ^Number (Double/parseDouble (.trim ^String %))))
-   ;; NUMERIC's typinput accepts NaN and +/-Infinity as well as finite
-   ;; decimals. coerce-numeric returns the PgNumericSpecial carrier for
-   ;; those spellings and BigDecimal otherwise.
-   :db.type/bigdec  (safe #(coerce-numeric % :bigdec))
-   :db.type/boolean parse-bool-token
-   :db.type/uuid    (safe parse-uuid)
-   :db.type/string  identity
+  "`{:db/valueType → (fn [^String s] typed-value-or-nil)}` for the storage
+   types without a datahike.pg.input function. A nil return means the
+   literal is unparseable; coerce-unknown then keeps the string."
+  {:db.type/string  identity
    ;; SQL has no keyword literal; clients send the bare name as a
    ;; string. `(keyword "draft") → :draft`, `(keyword "foo/bar") →
    ;; :foo/bar`. Blank strings stay as nil so the surrounding
@@ -441,12 +358,12 @@
    :db.type/symbol  (fn [^String s] (when-not (clojure.string/blank? s) (symbol s)))})
 
 (defn coerce-unknown
-  "PG-style typinput dispatch: coerce an unknown-type string literal to
-   `vtype` using the type's typinput equivalent. Returns the typed
-   value on success, the original string on failure (so the
-   surrounding comparison falls through to text equality and matches
-   nothing — PG's outcome when an unknown literal can't resolve to
-   the operator's expected type).
+  "Lenient reading of an unknown-type string literal for the storage
+   types without a datahike.pg.input function (date/time, keyword,
+   symbol). Returns the typed value on success and the original string
+   on failure -- the passthrough the datetime decoder will retire
+   (consolidation plan, Phase 1.3). Every other type's literal goes
+   through datahike.pg.input, which raises instead.
 
    The `:db.type/instant` typinput needs a parse-timestamp helper
    that lives in expr.clj; instant coercion is wired separately via

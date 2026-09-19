@@ -170,7 +170,7 @@
         num  #(pick (into cols-num ["1" "0" "-1" "2.5" "10"]))
         any  #(pick cols-any)
         txt  #(pick ["s" "'aa'" "'%a%'" "''"])]
-    (case (.nextInt r 56)
+    (case (.nextInt r 58)
       0  [:cmp-proj  (format "SELECT id, %s %s %s AS c FROM ft ORDER BY id" (num) (pick cmp) (num))]
       1  [:cmp-where (format "SELECT id FROM ft WHERE %s %s %s ORDER BY id" (num) (pick cmp) (num))]
       2  [:arith     (format "SELECT id, %s %s %s AS c FROM ft ORDER BY id" (num) (pick arith) (num))]
@@ -328,6 +328,24 @@
                              (pick ["time" "timetz" "money"]))]
       55 [:concatv   (let [c (pick ["t" "tz" "m" "d" "ts"])]
                        (format "SELECT id, 'x' || %s, concat(%s, '|') FROM fv ORDER BY id" c c))]
+      ;; An untyped literal takes the other operand's type through that
+      ;; type's input function -- or raises its error. Valid, edge and
+      ;; invalid spellings per type; a literal that failed to parse used
+      ;; to compare as text and match nothing.
+      56 [:litcmp    (let [c (pick ["i" "sm" "bg" "b" "f" "n" "id"])
+                           lit (pick (case c
+                                       ("i" "sm" "bg" "id") ["10" " 10 " "0x0A" "1_0" "-3" "1.5" "abc" "" "99999"
+                                                             "9223372036854775807" "9223372036854775808"]
+                                       "b" ["t" "false" "no" "of" "o" "yes" " on " "1" "maybe" ""]
+                                       "f" ["1.5" "-0.5" "1e3" "inf" "NaN" "1d" "0x1p1" "1e400" "abc"]
+                                       "n" ["1.50" "2.25" "NaN" "1_0" "0x0A" "1e" "abc"]))]
+                       (format "SELECT id FROM ft WHERE %s %s '%s' ORDER BY id"
+                               c (pick ["=" "<>" "<" ">="]) lit))]
+      57 [:scalarin  (format "SELECT '%s'::%s"
+                             (pick ["0" " 12 " "-1" "1.5" "0x1F" "0o17" "0b101" "1_000" "_1" "1e3" "99999"
+                                    "4294967296" "t" "ye" "of" "o" "NaN" "-inf" "1e39" "1e-50" "0x1p-3"
+                                    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" "{a0eebc999c0b4ef8bb6d6bb9bd380a11}"])
+                             (pick ["int2" "int4" "int8" "oid" "bool" "float4" "float8" "numeric" "uuid"]))]
       50 [:winfilter (format "SELECT id, %s(%s) FILTER (WHERE %s) OVER (%s) AS c FROM ft ORDER BY id"
                              (pick ["sum" "count" "avg" "min" "array_agg"])
                              (pick ["i" "j" "n"])
