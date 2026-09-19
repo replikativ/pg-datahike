@@ -86,6 +86,13 @@
             PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
             Select SetOperationList FromItem OrderByElement WithItem]))
 
+(defn- unwrap-parenthesed-select
+  "The select inside any number of parentheses."
+  [node]
+  (if (instance? ParenthesedSelect node)
+    (recur (.getSelect ^ParenthesedSelect node))
+    node))
+
 (def ^:dynamic *defer-stateful-projection?*
   "True only while translating an ordinary SELECT-list expression."
   false)
@@ -2395,6 +2402,29 @@
      (map #(.getExpression ^OrderByElement %) (or (.getOrderByElements ps) []))
      (mapcat #(or (.getOnExpressions ^Join %) []) joins))))
 
+(defn- row-scope-owner
+  "The visible row-scope alias (row-eval) that has a column `cname`."
+  [cname visible]
+  (some (fn [alias]
+          (when (and (contains? visible alias)
+                     (contains? (get params/*from-bindings* alias) cname))
+            alias))
+        params/*row-scope-aliases*))
+
+(defn- local-item-has-column?
+  "Could FROM item `item` supply column `cname`? A stored table answers
+   from the schema; any other relation (derived, function) is assumed to,
+   so a name it might own is never taken for an outer reference."
+  [item cname]
+  (cond
+    (nil? item) false
+    (instance? Table item)
+    (let [db params/*parse-db*
+          tname (unquote-ident (.getName ^Table item))]
+      (or (nil? db)
+          (contains? (:schema db) (keyword tname cname))))
+    :else true))
+
 (defn correlated-subquery-refs
   "Return qualified outer-column references in `inner`, respecting every
    SELECT's FROM/JOIN alias scope, including derived and set-op branches."
@@ -2422,10 +2452,19 @@
                     own-refs (into #{}
                                    (keep (fn [^Column col]
                                            (let [alias (some-> col .getTable .getName
-                                                               unquote-ident str/lower-case)]
-                                             (when (contains? visible alias)
-                                               [alias (-> col .getColumnName
-                                                          unquote-ident str/lower-case)]))))
+                                                               unquote-ident str/lower-case)
+                                                 cname (-> col .getColumnName
+                                                           unquote-ident str/lower-case)]
+                                             (cond
+                                               (contains? visible alias) [alias cname]
+                                               ;; An unqualified name is the row
+                                               ;; scope's column when no relation of
+                                               ;; this SELECT has it: `(SELECT v)`.
+                                               (nil? alias)
+                                               (when-let [owner (row-scope-owner cname visible)]
+                                                 (when-not (some #(local-item-has-column? % cname)
+                                                                 local-items)
+                                                   [owner cname]))))))
                                    (mapcat params/ast-columns scope-nodes))
                     children (concat (mapcat nested-selects-in scope-nodes)
                                      (mapcat nested-selects-in local-items))
@@ -2927,6 +2966,12 @@
     (cond
       ;; Predicate types that translate-predicate-expr should handle —
       ;; if we reach here it's a gap, fail loudly rather than recurse.
+      ;; EXISTS over a plain SELECT has a value form (translate-expr).
+      (and (instance? ExistsExpression expr)
+           (instance? PlainSelect (unwrap-parenthesed-select
+                                   (.getRightExpression ^ExistsExpression expr))))
+      (translate-expr ctx expr)
+
       (or (instance? ExistsExpression expr)
           (instance? JsonOperator expr)
           (instance? DoubleAnd expr))
@@ -3989,6 +4034,8 @@
       ;; expression before either SELECT or UPDATE could evaluate it.
       {:base base :chain [[(first idents) (first ops)]]})))
 
+(declare param-value)
+
 (defn- whole-row-ref-alias
   "The table alias a bare identifier denotes as a PostgreSQL WHOLE-ROW
    reference, or nil when it is an ordinary column.
@@ -4003,7 +4050,8 @@
       (when (nil? (.getTable col))
         (let [nm (unquote-ident (.getColumnName col))
               aliases (:table-aliases ctx)]
-          (when (or (contains? aliases nm) (= nm (:default-table ctx)))
+          (when (or (contains? aliases nm) (= nm (:default-table ctx))
+                    (contains? params/*statement-row-scope-tables* nm))
             ;; The FULL resolution, same as the value path: the short
             ;; arity cannot search the other relations in scope, so a
             ;; column belonging to a JOINED relation looked unresolvable
@@ -4032,16 +4080,24 @@
    `{\"id\":1,\"nm\":\"a\"}` — jsonb/normalize-tree reads it, falling back
    to positional `f1`, `f2` without it."
   [ctx alias-name]
-  (let [table-name (get (:table-aliases ctx) alias-name alias-name)
-        cols (remove #(= :db/id (:attr %))
-                     (pgs/column-info (:schema ctx) table-name (:db ctx)))
+  (let [row-scope (get params/*statement-row-scope-tables* alias-name)
+        table-name (or row-scope (get (:table-aliases ctx) alias-name alias-name))
+        cols (cond->> (remove #(= :db/id (:attr %))
+                              (pgs/column-info (:schema ctx) table-name (:db ctx)))
+               row-scope (filter #(get-in params/*from-bindings* [alias-name (:name %)])))
         ;; `[:aliased …]` means specifically "the alias differs from the
         ;; table name"; using it unconditionally mis-resolves the plain
         ;; `FROM t` case.
         attr-ref (fn [c] (if (= alias-name table-name)
                            (:attr c)
                            [:aliased alias-name (:attr c)]))
-        vars (mapv #(column-value! ctx (attr-ref %)) cols)
+        ;; A row scope's fields are its placeholders, not a scan.
+        vars (mapv (fn [c]
+                     (if row-scope
+                       (param-value ctx (:idx (get-in params/*from-bindings*
+                                                      [alias-name (:name c)])))
+                       (column-value! ctx (attr-ref c))))
+                   cols)
         meta-cols (mapv #(select-keys % [:name :oid]) cols)
         rec-fn (fn [& vals]
                  (pg-rec/->PgRecord
@@ -4065,7 +4121,11 @@
   (into #{} (comp (map (fn [a] (some-> a name str/lower-case)))
                   (remove nil?))
         (concat (keys (or (:table-aliases ctx) {}))
-                [(:default-table ctx)])))
+                [(:default-table ctx)]
+                ;; A row scope (row-eval) is an outer relation too: a
+                ;; subquery that references it is correlated, evaluated
+                ;; per row with the row's values.
+                params/*row-scope-aliases*)))
 
 (defn- throw-subquery-error! [p]
   (when (= :error (:type p))
@@ -4602,9 +4662,19 @@
     (swap! (:nullable-vars ctx) conj result-var)
     result-var))
 
+(declare outer-from-column-ref)
+
 (defn- resolved-outer-column-ref [ctx ^Column col]
-  (let [col-name (-> col .getColumnName unquote-ident str/lower-case)
-        resolved (ctx/resolve-column col
+  (let [col-name (-> col .getColumnName unquote-ident str/lower-case)]
+    ;; A row scope (row-eval) is no FROM item of the statement's: the
+    ;; name is its column when the statement has no FROM of its own.
+    (if-let [owner (and params/*statement-row-scope-tables*
+                        (row-scope-owner col-name (set params/*row-scope-aliases*)))]
+      [owner col-name]
+      (outer-from-column-ref ctx col col-name))))
+
+(defn- outer-from-column-ref [ctx ^Column col col-name]
+  (let [resolved (ctx/resolve-column col
                                      (:table-aliases ctx)
                                      (:default-table ctx)
                                      (:col-overrides ctx)
@@ -5102,12 +5172,31 @@
           col-name (unquote-ident (.getColumnName col-expr))]
       (if tbl-name
         (when (contains? params/*from-bindings* tbl-name)
+          ;; A row scope binds every column it has: a name it lacks is
+          ;; no column, not a NULL.
+          (when (and (contains? params/*row-scope-aliases* tbl-name)
+                     (not (contains? (get params/*from-bindings* tbl-name) col-name)))
+            (throw (ex-info (str "column " tbl-name "." col-name " does not exist")
+                            {:error :undefined-column :sqlstate "42703" :column col-name})))
           [:bound (get-in params/*from-bindings* [tbl-name col-name])])
         (let [same (when (seq params/*from-source-aliases*)
                      (params/binding-column-owners params/*from-bindings* col-name
                                                    params/*from-source-aliases*))
+              ;; Row scopes share one level (ON CONFLICT's target and
+              ;; `excluded`): a name both have is ambiguous.
+              row-owners (when (seq params/*row-scope-aliases*)
+                           (params/binding-column-owners
+                            params/*from-bindings* col-name params/*row-scope-aliases*))
               here? (delay (resolves-at-this-level? ctx col-expr))]
           (cond
+            ;; A row scope's column: the row's own value at the statement
+            ;; the scope belongs to; from a subquery, an outer reference
+            ;; used only when the subquery's relations lack the name.
+            (and (seq row-owners) (or params/*statement-row-scope-tables* (not @here?)))
+            (if (next row-owners)
+              (params/ambiguous-column! col-name)
+              [:bound (get-in params/*from-bindings* [(first row-owners) col-name])])
+
             (> (count same) 1) (params/ambiguous-column! col-name)
             (and (= 1 (count same)) @here?) (params/ambiguous-column! col-name)
             (= 1 (count same))
@@ -5123,6 +5212,50 @@
                 :else nil))
 
             :else nil))))))
+
+(defn- param-value
+  "The value of parameter `idx`: the bound value when parameters are
+   bound at translation, else the parameter's query variable, registered
+   once, with a ParamRef in :in-args for Bind (or a row) to fill."
+  [ctx idx]
+  (if-let [bound params/*bound-params*]
+    (nth bound (dec (long idx)))
+    (let [holders (:param-placeholders ctx)]
+      (if-let [existing (get @holders idx)]
+        existing
+        (let [v (symbol (str "?p" idx))]
+          (swap! holders assoc idx v)
+          (swap! (:in-params ctx) conj v)
+          (swap! (:in-args ctx) conj (params/->ParamRef idx))
+          v)))))
+
+(defn- exists-constant
+  "For EXISTS over `inner` as a value: true or false when the answer
+   does not depend on the rows (an ungrouped aggregate yields exactly one
+   row, LIMIT 0 none), nil when the probe `SELECT true ... LIMIT 1` over
+   the same WITH/FROM/WHERE/grouping/OFFSET decides it. Raises 0A000 for
+   the shapes the probe cannot stand in for -- FETCH, a LIMIT that is not
+   a literal, a set-returning select list, HAVING without GROUP BY --
+   rather than answer them wrongly."
+  [^PlainSelect inner]
+  (let [unsupported #(throw (ex-info (str "EXISTS over a subquery with " % " as a value is not supported")
+                                     {:error :feature-not-supported :sqlstate "0A000"}))
+        items-fns (into #{} (comp (mapcat #(params/ast-function-names (.getExpression ^SelectItem %)))
+                                  (map #(peek (str/split % #"[.]"))))
+                        (.getSelectItems inner))
+        limit (.getLimit inner)
+        row-count (some-> limit .getRowCount)]
+    (cond
+      (.getFetch inner) (unsupported "FETCH")
+      (some #{"generate_series" "unnest"} items-fns) (unsupported "a set-returning select list")
+      (and row-count (not (instance? LongValue row-count))
+           (not (instance? NullValue row-count)))
+      (unsupported "a computed LIMIT")
+      (and (instance? LongValue row-count) (zero? (.getValue ^LongValue row-count))) false
+      (and (nil? (.getGroupBy inner)) (some fns/aggregate-function? items-fns))
+      (if (.getHaving inner) (unsupported "HAVING without GROUP BY") true)
+      (and (nil? (.getGroupBy inner)) (.getHaving inner)) (unsupported "HAVING without GROUP BY")
+      :else nil)))
 
 (defn translate-expr
   "Translate a JSqlParser Expression to a value, variable, or predicate form.
@@ -5203,7 +5336,11 @@
           tbl (.getTable col-expr)
           bound (column-binding ctx col-expr)]
       (cond
-        bound (second bound)
+        ;; A row-scope column (row-eval: RETURNING, CHECK, ON CONFLICT) is
+        ;; bound to a placeholder, filled per row: the parameter's var.
+        (and bound (nil? ac))
+        (let [v (second bound)]
+          (if (params/param-ref? v) (param-value ctx (:idx v)) v))
 
         (some? ac)
         ;; Walk the bracket-expressions left-to-right, applying
@@ -5243,7 +5380,11 @@
         (and (nil? (:default-table ctx)) (empty? (:table-aliases ctx)))
         (let [col (unquote-ident (.getColumnName col-expr))]
           (if tbl
-            (throw (ex-info (str "missing FROM-clause entry for table \""
+            (throw (ex-info (str (if (some #{(unquote-ident (.getName ^Table tbl))}
+                                           (vals params/*statement-row-scope-tables*))
+                                   ;; The row's table, visible only under its alias.
+                                   "invalid reference to FROM-clause entry for table \""
+                                   "missing FROM-clause entry for table \"")
                                  (unquote-ident (.getName ^Table tbl)) "\"")
                             {:error :undefined-table :sqlstate "42P01"
                              :table (unquote-ident (.getName ^Table tbl))}))
@@ -5459,17 +5600,7 @@
     ;;   value and return it directly as a literal. Used for UPDATE/
     ;;   DELETE where-expr that is kept as a JSqlParser AST at Parse.
     (instance? JdbcParameter expr)
-    (let [idx (.getIndex ^JdbcParameter expr)]
-      (if-let [bound params/*bound-params*]
-        (nth bound (dec (long idx)))
-        (let [holders (:param-placeholders ctx)]
-          (if-let [existing (get @holders idx)]
-            existing
-            (let [v (symbol (str "?p" idx))]
-              (swap! holders assoc idx v)
-              (swap! (:in-params ctx) conj v)
-              (swap! (:in-args ctx) conj (params/->ParamRef idx))
-              v)))))
+    (param-value ctx (.getIndex ^JdbcParameter expr))
 
     (instance? Parenthesis expr)
     (translate-expr ctx (.getExpression ^Parenthesis expr))
@@ -6001,6 +6132,39 @@
     ;; an uncorrelated one becomes a zero-argument runtime binding so a
     ;; prepared statement reads its execution snapshot. Both share strict
     ;; scalar width, cardinality and error propagation.
+    ;; EXISTS as a value (a projection, RETURNING, a CHECK): the scalar
+    ;; subquery `(SELECT true FROM ... LIMIT 1)` over the same FROM, WHERE
+    ;; and grouping, which the scalar-subquery path below evaluates --
+    ;; correlated or not -- and which is NULL exactly when no row exists.
+    ;; The predicate form (WHERE EXISTS) is lowered to patterns instead.
+    (and (instance? ExistsExpression expr)
+         (instance? PlainSelect (unwrap-parenthesed-select
+                                 (.getRightExpression ^ExistsExpression expr))))
+    (let [^ExistsExpression e expr
+          absent-means (.isNot e)]
+      (if-some [exists? (exists-constant (unwrap-parenthesed-select (.getRightExpression e)))]
+        (if absent-means (not exists?) exists?)
+        (let [^PlainSelect inner (unwrap-parenthesed-select (.getRightExpression e))
+              probe (doto (PlainSelect.)
+                      (.setWithItemsList (.getWithItemsList inner))
+                      (.setSelectItems [(SelectItem. (BooleanValue. true))])
+                      (.setFromItem (.getFromItem inner))
+                      (.setJoins (.getJoins inner))
+                      (.setWhere (.getWhere inner))
+                      (.setGroupByElement (.getGroupBy inner))
+                      (.setHaving (.getHaving inner))
+                      (.setLimit (doto (net.sf.jsqlparser.statement.select.Limit.)
+                                   (.setRowCount (LongValue. 1))))
+                      (.setOffset (.getOffset inner)))
+              found (translate-expr ctx (doto (ParenthesedSelect.) (.setSelect probe)))
+              found (if (seq? found) (ctx/materialize-arg! ctx found) found)
+              p (symbol (str "?exists-" (swap! (:var-counter ctx) inc)))
+              out (ctx/fresh-var! ctx)]
+          (swap! (:in-params ctx) conj p)
+          (swap! (:in-args ctx) conj (fn [v] (if (fns/sql-null? v) absent-means (not absent-means))))
+          (ctx/add-clause! ctx [(list p found) out])
+          out)))
+
     (or (instance? ParenthesedSelect expr) (instance? PlainSelect expr))
     (let [inner (loop [node expr]
                   (if (instance? ParenthesedSelect node)
@@ -7178,7 +7342,9 @@
           not-null? (.isNot e)
           inner (.getLeftExpression e)]
       (if (and (instance? Column inner)
-               (not (bare-session-value-column? inner)))
+               (not (bare-session-value-column? inner))
+               ;; An outer row's column is a value, tested below.
+               (not (column-binding ctx inner)))
         (let [^Column col inner
               resolved (ctx/resolve-column col
                                            (:table-aliases ctx)
@@ -8064,18 +8230,16 @@
 
     ;; Bare column as boolean predicate: WHERE col_name means WHERE col_name = TRUE
     (instance? Column expr)
-    (let [^Column col expr
-          table-name (some-> (.getTable col) .getName unquote-ident)]
-      (if (and table-name params/*from-bindings*
-               (contains? params/*from-bindings* table-name))
-        ;; A correlated outer boolean arrives as a concrete per-row binding,
-        ;; not as an inner-relation attribute. Resolving it through ctx made
-        ;; the inner query scan a nonexistent `:<outer>/col` datom, so psql's
-        ;; `... AND a.atthasdef` scalar subquery always returned NULL.
-        (if (true? (get-in params/*from-bindings*
-                           [table-name (unquote-ident (.getColumnName col))]))
-          []
-          [[(list 'not= 1 1)]])
+    (let [^Column col expr]
+      (if (column-binding ctx col)
+        ;; An outer row's column -- a correlated per-row value or a row
+        ;; scope's placeholder -- not an inner-relation attribute.
+        ;; Resolving it through ctx made the inner query scan a
+        ;; nonexistent `:<outer>/col` datom, so psql's `... AND
+        ;; a.atthasdef` scalar subquery always returned NULL.
+        (let [v (translate-expr ctx col)
+              v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
+          [[(list 'true? v)]])
         (let [resolved (ctx/resolve-column col
                                            (:table-aliases ctx)
                                            (:default-table ctx)

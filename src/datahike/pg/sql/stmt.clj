@@ -6419,23 +6419,34 @@
     (long v)
     v))
 
-(defn run-const-select
-  "The single value of a parsed one-row `SELECT <expr>`, NULL as nil."
-  [p db]
+(defn- sql-value
+  "A result cell as an SQL value: the NULL sentinel as nil."
+  [v]
+  (when-not (or (nil? v) (= :__null__ v)) (widen-integral v)))
+
+(defn run-const-select-row
+  "The first `n` values of a parsed one-row `SELECT <expr>, ...`, NULL as
+   nil; nil when the query yields no row."
+  [p db n]
   (when (= :error (:type p))
     (throw (ex-info (str (:message p))
                     {:sqlstate (:sqlstate p) :error-fields (:error-fields p)})))
-  (let [v (if-let [q (:query p)]
-            (let [ia (:in-args p)
-                  qdb (or (:enriched-db p) db)
-                  r (first (if (seq ia) (apply d/q q qdb ia) (d/q q qdb)))]
-              (if (sequential? r) (first r) r))
-            (let [lr (:literal-row p)]
-              (if (sequential? lr) (first lr) lr)))]
-    (when-not (= :__null__ v) (widen-integral v))))
+  (let [row (if-let [q (:query p)]
+              (let [ia (:in-args p)
+                    qdb (or (:enriched-db p) db)]
+                (first (if (seq ia) (apply d/q q qdb ia) (d/q q qdb))))
+              (:literal-row p))
+        row (if (sequential? row) row [row])]
+    (mapv sql-value (take n (concat row (repeat nil))))))
+
+(defn run-const-select
+  "The single value of a parsed one-row `SELECT <expr>`, NULL as nil."
+  [p db]
+  (first (run-const-select-row p db 1)))
 
 (defn const-select-fn
-  "A function of the in-args vector computing what run-const-select would,
+  "A function of the in-args vector computing the row run-const-select-row
+   would (all find columns, NULL as nil; nil for no row),
    for a plan whose query is only a chain of function clauses -- the shape
    the translator emits for a FROM-less one-row SELECT. nil for any other
    shape (data patterns, or/not, rules), which only d/q evaluates.
@@ -6448,7 +6459,7 @@
    and so yields no row, as in d/q."
   [p]
   (let [{:keys [find where in] :as q} (:query p)]
-    (when (and (map? q) (= '$ (first in)) (= 1 (count find)) (symbol? (first find))
+    (when (and (map? q) (= '$ (first in)) (seq find) (every? symbol? find)
                (empty? (:with q)) (nil? (:enriched-db p))
                (every? (fn [c]
                          (and (vector? c) (seq? (first c)) (symbol? (ffirst c))
@@ -6474,7 +6485,7 @@
                                      (cond-> bound out (conj out))
                                      (reduced nil)))
                                  (set in-syms) clauses)]
-                     (and bound-at-end (bound-at-end (first find)))))
+                     (and bound-at-end (every? bound-at-end find))))
           (fn [in-args]
             (let [env (zipmap in-syms in-args)
                   arg (fn [env a] (if (var-sym? a) (get env a) a))
@@ -6485,8 +6496,8 @@
                                     (nil? v) (reduced nil)
                                     :else (assoc env out v))))
                               env clauses)
-                  v (when env (get env (first find)))]
-              (when-not (or (nil? v) (= :__null__ v)) (widen-integral v)))))))))
+                  row (when env (mapv #(sql-value (get env %)) find))]
+              row)))))))
 
 (defn- const-value
   "Value of an INSERT VALUES expression that is not a plain literal,
@@ -7114,27 +7125,6 @@
                                     (remove nil? (expr/plain-select-scope-nodes inner)))))]
     (boolean (or (seq qualified) directly-qualified unqualified))))
 
-(defn with-dml-row-context
-  "Run `f` with one DML target row exposed as an outer SQL relation.
-
-   Every declared column is present (SQL NULL uses the sentinel), so scalar
-   subqueries in RETURNING and ON CONFLICT can resolve nullable columns and
-   retain their declared OIDs. An explicit alias hides the storage name."
-  [f db schema table-name target-alias entity-map]
-  (let [target-name (or target-alias table-name)
-        columns (remove #(= "db_id" (:name %))
-                        (pgs/column-info schema table-name db))
-        target-row (into {}
-                         (map (fn [{:keys [name attr]}]
-                                [name (get entity-map attr :__null__)]))
-                         columns)
-        target-oids (into {} (map (juxt :name :oid)) columns)]
-    (binding [params/*from-bindings* {target-name target-row}
-              params/*from-binding-oids* {target-name target-oids}
-              params/*lateral-outer-aliases* #{target-name}
-              params/*runtime-db* db]
-      (f))))
-
 (defn- strict-scalar-value
   [inner schema db parse-fn]
   (when (and db parse-fn)
@@ -7748,6 +7738,21 @@
                 (throw (errors/pg-error
                         :feature-not-supported
                         {:message "set-returning functions are not allowed in RETURNING"})))
+              ;; RETURNING projects one row: no grouping, no window
+              ;; (parse_agg.c's EXPR_KIND_RETURNING).
+              (when (seq (params/ast-window-names item-expr))
+                (throw (ex-info "window functions are not allowed in RETURNING"
+                                {:sqlstate "42P20"})))
+              (when (some fns/aggregate-function? (params/ast-function-names item-expr))
+                (throw (errors/pg-error
+                        :grouping-error
+                        {:message "aggregate functions are not allowed in RETURNING"})))
+              ;; A sequence advance is deferred to the SELECT executor's
+              ;; marker pass, which a row projection does not run.
+              (when (contains? (params/ast-function-names item-expr) "nextval")
+                (throw (errors/pg-error
+                        :feature-not-supported
+                        {:feature "nextval() in RETURNING"})))
               (cond
                 (instance? AllColumns item-expr)
                 {:kind :star}
@@ -8264,7 +8269,8 @@
     (when (or (nil? update-where)
               (true? (eval-in-context
                       #((requiring-resolve 'datahike.pg.sql.row-eval/check-result)
-                        update-where % ns schema txdb))))
+                        update-where % ns schema txdb
+                        {:alias target-alias :excluded? true}))))
       (reduce
        (fn [{:keys [row-after] :as result}
             {:keys [attr value-expr]}]

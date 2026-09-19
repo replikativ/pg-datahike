@@ -40,6 +40,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Table alias resolution
 
+(declare resolve-column*)
+
 (defn resolve-column
   "Resolve a column reference to a Datahike attribute keyword.
    Uses table-aliases map {alias → table-name} and schema-tables for lookup.
@@ -63,9 +65,29 @@
   ([^Column col table-aliases default-table col-overrides derived-aliases]
    (resolve-column col table-aliases default-table col-overrides derived-aliases nil))
   ([^Column col table-aliases default-table col-overrides derived-aliases ci]
-   (let [table-ref (.getTable col)
-         table-alias (when table-ref (params/unquote-ident (.getName ^Table table-ref)))
-         col-name0 (params/unquote-ident (.getColumnName col))
+   (let [rs params/*statement-row-scope-tables*
+         q (some-> (.getTable col) ^Table (.getName) params/unquote-ident)
+         ;; A row scope (row-eval) is no FROM item -- nothing enumerates
+         ;; it, so it is never a whole-row value, an anchor or a relation
+         ;; of `SELECT *` -- but resolution sees it as its table, so column
+         ;; metadata (declared types, enums, storage forms) is that
+         ;; table's. An unqualified name, with no FROM of the statement's
+         ;; own, names the scope's column.
+         scope (cond
+                 (nil? rs) nil
+                 q (when-not (contains? table-aliases q) (find rs q))
+                 (and (nil? default-table) (= 1 (count rs))) (first rs))]
+     (if scope
+       (resolve-column* col (assoc table-aliases (key scope) (val scope))
+                        (if q default-table (key scope))
+                        col-overrides derived-aliases ci)
+       (resolve-column* col table-aliases default-table col-overrides derived-aliases ci)))))
+
+(defn- resolve-column*
+  [^Column col table-aliases default-table col-overrides derived-aliases ci]
+  (let [table-ref (.getTable col)
+        table-alias (when table-ref (params/unquote-ident (.getName ^Table table-ref)))
+        col-name0 (params/unquote-ident (.getColumnName col))
          ;; A relation alias may rename its output columns (`v AS v1(x1)`).
          ;; Those names do not exist in the schema's case-folded index, so
          ;; unqualified resolution must search alias-scoped overrides first.
@@ -74,21 +96,21 @@
          ;; (e.g. `p.a` re-added after DROP COLUMN is stored as
          ;; `:p/pg$att3`), and letting an absent table win silently
          ;; cross-joined `p` into `SELECT a FROM zq`.
-         in-scope (into #{default-table} cat [(keys table-aliases) (vals table-aliases)])
-         override-owners (when (nil? table-alias)
-                           (into #{} (keep (fn [[alias cols]]
-                                             (when (and (contains? in-scope alias)
-                                                        (contains? cols col-name0))
-                                               alias)))
-                                 col-overrides))
-         override-owner (cond
-                          (= 1 (count override-owners)) (first override-owners)
-                          (> (count override-owners) 1)
-                          (throw (ex-info (str "column reference \"" col-name0
-                                               "\" is ambiguous")
-                                          {:error :ambiguous-column
-                                           :column col-name0}))
-                          :else nil)
+        in-scope (into #{default-table} cat [(keys table-aliases) (vals table-aliases)])
+        override-owners (when (nil? table-alias)
+                          (into #{} (keep (fn [[alias cols]]
+                                            (when (and (contains? in-scope alias)
+                                                       (contains? cols col-name0))
+                                              alias)))
+                                col-overrides))
+        override-owner (cond
+                         (= 1 (count override-owners)) (first override-owners)
+                         (> (count override-owners) 1)
+                         (throw (ex-info (str "column reference \"" col-name0
+                                              "\" is ambiguous")
+                                         {:error :ambiguous-column
+                                          :column col-name0}))
+                         :else nil)
          ;; An UNQUALIFIED name is resolved against every relation in
          ;; scope, not just the default table. PostgreSQL searches all
          ;; FROM items and raises 42702 when more than one claims the
@@ -103,11 +125,11 @@
          ;; exactly as before. Relations absent from `ci` (catalog and
          ;; speculative tables) simply do not become candidates, so this
          ;; can only ever turn a failure into a resolution.
-         relation-aliases (:relation-aliases (meta table-aliases))
-         owner (or override-owner
-                   (when (and (nil? table-alias) ci (not= "db_id" col-name0)
-                              (or (> (count relation-aliases) 1)
-                                  (> (count (set (vals table-aliases))) 1)))
+        relation-aliases (:relation-aliases (meta table-aliases))
+        owner (or override-owner
+                  (when (and (nil? table-alias) ci (not= "db_id" col-name0)
+                             (or (> (count relation-aliases) 1)
+                                 (> (count (set (vals table-aliases))) 1)))
                  ;; Group by the resolved ATTRIBUTE, not by alias.
                  ;; `table-aliases` registers BOTH `{alias -> name}` and
                  ;; `{name -> name}` for ONE from item, so `FROM pg_type t`
@@ -122,13 +144,13 @@
                  ;; registered twice from two of them. PostgreSQL does
                  ;; raise there. Narrow, and the alternative is a false
                  ;; positive on every aliased single-table query.
-                     (let [by-attr (reduce (fn [m [ak tn]]
-                                             (if-let [a (pgs/canonical-attr ci tn col-name0)]
-                                               (if (pgs/ambiguous? a)
-                                                 m
-                                                 (update m a (fnil conj #{}) ak))
-                                               m))
-                                           {} table-aliases)
+                    (let [by-attr (reduce (fn [m [ak tn]]
+                                            (if-let [a (pgs/canonical-attr ci tn col-name0)]
+                                              (if (pgs/ambiguous? a)
+                                                m
+                                                (update m a (fnil conj #{}) ak))
+                                              m))
+                                          {} table-aliases)
                            ;; A map cannot represent relation OCCURRENCES:
                            ;; `FROM t x, t y` has one distinct value (`t`),
                            ;; although an unqualified `col` is ambiguous.
@@ -136,24 +158,24 @@
                            ;; from the FROM list as metadata so self-joins are
                            ;; checked without mistaking `{t t, x t}` from one
                            ;; aliased occurrence for two relations.
-                           occurrence-candidates
-                           (when (seq relation-aliases)
-                             (into []
-                                   (keep (fn [ak]
-                                           (let [tn (get table-aliases ak ak)]
-                                             (when-let [a (pgs/canonical-attr ci tn col-name0)]
-                                               (when-not (pgs/ambiguous? a) [ak a])))))
-                                   relation-aliases))]
-                       (cond
-                         (= 1 (count occurrence-candidates))
-                         (ffirst occurrence-candidates)
+                          occurrence-candidates
+                          (when (seq relation-aliases)
+                            (into []
+                                  (keep (fn [ak]
+                                          (let [tn (get table-aliases ak ak)]
+                                            (when-let [a (pgs/canonical-attr ci tn col-name0)]
+                                              (when-not (pgs/ambiguous? a) [ak a])))))
+                                  relation-aliases))]
+                      (cond
+                        (= 1 (count occurrence-candidates))
+                        (ffirst occurrence-candidates)
 
-                         (> (count occurrence-candidates) 1)
-                         (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
-                                         {:error :ambiguous-column :column col-name0}))
+                        (> (count occurrence-candidates) 1)
+                        (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
+                                        {:error :ambiguous-column :column col-name0}))
 
-                         (= 1 (count by-attr))
-                         (let [aks (val (first by-attr))]
+                        (= 1 (count by-attr))
+                        (let [aks (val (first by-attr))]
                        ;; Prefer the default table's own alias when it is
                        ;; one of them, so the emitted form stays the plain
                        ;; keyword rather than an `[:aliased …]` wrapper.
@@ -164,61 +186,61 @@
                        ;; differs from the user's alias that produced a
                        ;; SECOND entity var for the same relation, and the
                        ;; query cross-joined it with itself.
-                           (cond
-                             (contains? aks default-table) default-table
-                             :else (or (first (sort (filter #(not= % (get table-aliases %)) aks)))
-                                       (first (sort aks)))))
+                          (cond
+                            (contains? aks default-table) default-table
+                            :else (or (first (sort (filter #(not= % (get table-aliases %)) aks)))
+                                      (first (sort aks)))))
 
-                         (> (count by-attr) 1)
-                         (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
-                                         {:error :ambiguous-column :column col-name0}))
+                        (> (count by-attr) 1)
+                        (throw (ex-info (str "column reference \"" col-name0 "\" is ambiguous")
+                                        {:error :ambiguous-column :column col-name0}))
 
-                         :else nil))))
-         alias-key (or table-alias owner default-table)
-         table-name (get table-aliases alias-key alias-key)
-         col-name (params/unquote-ident (.getColumnName col))
-         derived? (contains? (or derived-aliases #{}) alias-key)]
-     (cond
+                        :else nil))))
+        alias-key (or table-alias owner default-table)
+        table-name (get table-aliases alias-key alias-key)
+        col-name (params/unquote-ident (.getColumnName col))
+        derived? (contains? (or derived-aliases #{}) alias-key)]
+    (cond
        ;; db_id on a real-table alias is the entity-id (special-cased
        ;; everywhere as the [:db-id alias] vector). On a derived alias,
        ;; db_id is just a projected value column on the speculative
        ;; entity — resolve to the regular `:<alias>/db_id` keyword.
-       (and (= col-name "db_id") (not derived?))
-       [:db-id alias-key]
+      (and (= col-name "db_id") (not derived?))
+      [:db-id alias-key]
 
-       :else
+      :else
        ;; Exact storage name first, then the case-folded index, then the
        ;; constructed keyword — which preserves NULL-for-unknown-column
        ;; when nothing claims the name. Exact-before-folded is what makes
        ;; a quoted identifier still select precisely: `"firstName"`
        ;; hits `:person/firstName` directly, and `"firstname"` hits
        ;; `:person/firstname` if that is what exists.
-       (let [override (or (get-in col-overrides [alias-key col-name])
-                          (get-in col-overrides [table-name col-name]))
-             canonical (when-let [a (pgs/canonical-attr ci table-name col-name)]
-                         (when-not (pgs/ambiguous? a) a))
-             _ (when (and (not derived?)
-                          (pgs/registered-relation? ci table-name)
+      (let [override (or (get-in col-overrides [alias-key col-name])
+                         (get-in col-overrides [table-name col-name]))
+            canonical (when-let [a (pgs/canonical-attr ci table-name col-name)]
+                        (when-not (pgs/ambiguous? a) a))
+            _ (when (and (not derived?)
+                         (pgs/registered-relation? ci table-name)
                           ;; A bare relation name is a whole-row reference;
                           ;; its lowering happens after column resolution.
-                          (not (and (nil? table-alias)
-                                    (or (contains? table-aliases col-name)
-                                        (= default-table col-name))))
-                          (nil? override)
-                          (nil? canonical))
-                 (throw (ex-info (str "column \"" col-name "\" does not exist")
-                                 {:error :undefined-column
-                                  :sqlstate "42703"
-                                  :column col-name})))
-             kw (or override canonical (keyword table-name col-name))]
+                         (not (and (nil? table-alias)
+                                   (or (contains? table-aliases col-name)
+                                       (= default-table col-name))))
+                         (nil? override)
+                         (nil? canonical))
+                (throw (ex-info (str "column \"" col-name "\" does not exist")
+                                {:error :undefined-column
+                                 :sqlstate "42703"
+                                 :column col-name})))
+            kw (or override canonical (keyword table-name col-name))]
          ;; A durable child-column descriptor can map a logical child column
          ;; to storage in an ancestor namespace. Preserve the CHILD's entity
          ;; binding in that case; using the storage namespace as alias-key
          ;; would scan the parent relation independently and cross-join rows.
-         (if (or (not= alias-key table-name)
-                 (not= alias-key (namespace kw)))
-           [:aliased alias-key kw]
-           kw))))))
+        (if (or (not= alias-key table-name)
+                (not= alias-key (namespace kw)))
+          [:aliased alias-key kw]
+          kw)))))
 
 (defn inheritance-ancestors
   "Return a table's inheritance chain from its immediate parent to the root.

@@ -374,7 +374,7 @@
                       (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression check-expr)))
               check-result (requiring-resolve 'datahike.pg.sql.row-eval/check-result)
               ok? (check-result ast {(keyword "" "value") coerced} "" (:schema db) db
-                                {"value" base})]
+                                {:column-types {"value" base}})]
           (when (false? ok?)
             (throw (errors/pg-error :check-violation
                                     {:constraint (or (:check-name spec)
@@ -394,6 +394,25 @@
    a map {alias-name → {col-name → literal}} used by the Column branches
    of translate-expr and eval-update-expr to substitute row-level values
    for references like `src.col` to the current FROM row."
+  nil)
+
+(def ^:dynamic *row-scope-aliases*
+  "Aliases of *from-bindings* whose columns are placeholders filled per
+   row (row-eval's row scope) rather than constants: subqueries that
+   reference them correlate against them as against an outer FROM item."
+  nil)
+
+(def ^:dynamic *row-scope-tables*
+  "{alias table} of a row scope (row-eval) for the statement about to be
+   parsed. parse-sql makes it the CURRENT statement's
+   (*statement-row-scope-tables*) and clears it for nested statements: a
+   subquery sees the row as an outer relation, not as its own FROM item."
+  nil)
+
+(def ^:dynamic *statement-row-scope-tables*
+  "{alias table} of the row scope of the statement being translated, read
+   by ctx/make-ctx so column metadata resolves against the table; values
+   come from *from-bindings*. See *row-scope-tables*."
   nil)
 
 (def ^:dynamic *from-binding-oids*
@@ -794,16 +813,14 @@
       (walk node)
       (persistent! columns))))
 
-(defn ast-function-names
-  "Return the lower-case names of functions reachable in an expression AST.
-
-   Nested SELECTs are separate scopes and deliberately opaque. This is used
-   before lowering to decide whether volatile scalar calls belong above an
-   aggregate grouping step; relying on traversal order (`sum(x)+random()` vs
-   `random()+sum(x)`) would otherwise change semantics."
+(defn- ast-functions
+  "{:functions names :windows names}: the lower-case names of the plain
+   and window (OVER) function calls reachable in an expression AST.
+   Nested SELECTs are separate scopes and deliberately opaque."
   [node]
   (let [seen (java.util.IdentityHashMap.)
-        names (transient #{})]
+        names (transient #{})
+        windows (transient #{})]
     (letfn [(walk [n]
               (cond
                 (nil? n) nil
@@ -818,7 +835,7 @@
                         (when-let [ps (.getParameters ^Function n)] (walk ps)))
 
                     (instance? AnalyticExpression n)
-                    (do (conj! names (str/lower-case (.getName ^AnalyticExpression n)))
+                    (do (conj! windows (str/lower-case (.getName ^AnalyticExpression n)))
                         (doseq [^java.lang.reflect.Method m (.getMethods (class n))
                                 :let [mn (.getName m)]
                                 :when (and (zero? (count (.getParameterTypes m)))
@@ -843,7 +860,25 @@
                       (try (walk (.invoke m n (object-array 0)))
                            (catch Throwable _)))))))]
       (walk node)
-      (persistent! names))))
+      {:functions (persistent! names) :windows (persistent! windows)})))
+
+(defn ast-function-names
+  "Return the lower-case names of functions reachable in an expression AST,
+   window calls included.
+
+   Nested SELECTs are separate scopes and deliberately opaque. This is used
+   before lowering to decide whether volatile scalar calls belong above an
+   aggregate grouping step; relying on traversal order (`sum(x)+random()` vs
+   `random()+sum(x)`) would otherwise change semantics."
+  [node]
+  (let [{:keys [functions windows]} (ast-functions node)]
+    (into functions windows)))
+
+(defn ast-window-names
+  "The lower-case names of the window (OVER) calls in an expression AST,
+   nested SELECTs excluded."
+  [node]
+  (:windows (ast-functions node)))
 
 ;; ---------------------------------------------------------------------------
 ;; PG OID inference
