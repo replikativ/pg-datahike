@@ -250,6 +250,11 @@
     :format (fn [{:keys [source target message]}]
               (or message (str "cannot cast type " source " to " target)))}
 
+   ;; parse_func.c: more than one candidate survives resolution.
+   :ambiguous-function
+   {:sqlstate "42725"
+    :format (fn [{:keys [message detail]}] (or message detail))}
+
    :undefined-function
    {:sqlstate "42883"
     :format (fn [{:keys [function detail message]}]

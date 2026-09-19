@@ -450,8 +450,18 @@
 (defn filter-bool-and
   "BOOL_AND/EVERY over non-NULL inputs; an empty/all-NULL group is NULL."
   [coll]
-  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)]
-    (if (empty? vs) :__null__ (every? true? vs))))
+  (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)
+        ;; Argument resolution admits only booleans and untyped literals,
+        ;; so a string here is a literal (`bool_and('t')`): boolean input.
+        bool (fn [v]
+               (if (string? v)
+                 (let [b (coerce/parse-bool-token v)]
+                   (when (nil? b)
+                     (throw (errors/pg-error :invalid-text-representation
+                                             {:type "boolean" :value v})))
+                   b)
+                 v))]
+    (if (empty? vs) :__null__ (every? #(true? (bool %)) vs))))
 
 (def filtered-out
   "Marker for a row an aggregate FILTER excluded.

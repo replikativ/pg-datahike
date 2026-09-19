@@ -185,6 +185,18 @@
           arg-exprs))
       arg-exprs)))
 
+(defn- no-such-function
+  "42883 for a call with no matching overload, worded as PostgreSQL's
+   ParseFuncOrColumn does."
+  [fname arg-oids]
+  (errors/pg-error
+   :undefined-function
+   {:message (str "function " fname "("
+                  (str/join ", " (map #(get types/oid->pg-name % "unknown") arg-oids))
+                  ") does not exist")
+    :hint (str "No function matches the given name and argument "
+               "types. You might need to add explicit type casts.")}))
+
 (defn- validate-function-argument-types!
   "Validate extension-function signatures during analysis. Untyped string and
    NULL literals remain eligible for PostgreSQL's unknown coercion; a known,
@@ -200,15 +212,60 @@
       (when (some false?
                   (map (fn [want got] (or (nil? got) (= want got)))
                        expected actual))
-        (throw (errors/pg-error
-                :undefined-function
-                {:detail (str "function " fname "("
-                              (str/join ", "
-                                        (map #(get types/oid->pg-name % "unknown")
-                                             actual))
-                              ") does not exist")
-                 :hint (str "No function matches the given name and argument "
-                            "types. You might need to add explicit type casts.")}))))))
+        (throw (no-such-function fname actual))))))
+
+(defn validate-aggregate-call!
+  "PostgreSQL resolves an aggregate by its argument types at analysis
+   (ParseFuncOrColumn); no overload means 42883. Checked against every
+   pg_proc aggregate signature. Without this, `sum(text)` failed at run
+   time with a ClassCastException (XX000), `sum(text) OVER ()` with 0A000,
+   and `bool_and(int)` silently answered false. Untyped literals and
+   expressions we cannot type are accepted."
+  [ctx fname arg-exprs]
+  (let [arg-exprs (remove #(instance? net.sf.jsqlparser.statement.select.AllColumns %) arg-exprs)
+        unknown? (mapv oid-infer/untyped-literal? arg-exprs)
+        oids (mapv (fn [arg u]
+                     (when-not u
+                       (try (source-oid ctx arg) (catch Throwable _ nil))))
+                   arg-exprs unknown?)]
+    (case (types/aggregate-resolution fname oids unknown?)
+      :none (throw (no-such-function fname oids))
+      :ambiguous (throw (errors/pg-error
+                         :ambiguous-function
+                         {:message (str "function " fname "("
+                                        (str/join ", " (map #(get types/oid->pg-name % "unknown") oids))
+                                        ") is not unique")
+                          :hint (str "Could not choose a best candidate function. "
+                                     "You might need to add explicit type casts.")}))
+      nil)))
+
+(defn validate-aggregate-node!
+  "`validate-aggregate-call!` for an aggregate call node: a plain Function
+   or an AnalyticExpression (OVER / FILTER). Names that are not PostgreSQL
+   aggregates are left to the function lookup."
+  [ctx node]
+  (let [[fname args]
+        (cond
+          (instance? Function node)
+          (let [^Function f node]
+            [(str/lower-case (.getName f))
+             (if (.isAllColumns f) [] (vec (or (.getParameters f) [])))])
+
+          (instance? net.sf.jsqlparser.expression.AnalyticExpression node)
+          (let [^net.sf.jsqlparser.expression.AnalyticExpression a node
+                e (.getExpression a)]
+            ;; lag/lead/nth_value keep their later arguments in the
+            ;; offset and default slots rather than in the expression.
+            [(str/lower-case (.getName a))
+             (-> (cond
+                   (nil? e) []
+                   (instance? ExpressionList e) (vec e)
+                   :else [e])
+                 (into (remove nil?) [(.getOffset a) (.getDefaultValue a)]))])
+
+          :else nil)]
+    (when fname
+      (validate-aggregate-call! ctx fname args))))
 
 (def ^:dynamic *conjunctive-where*
   "True while translating top-level AND-ed conjuncts of a WHERE (or an
@@ -5681,7 +5738,10 @@
               (catch Throwable _ (pg-arr/array :text [])))
             (pg-arr/array :text [])))
 
-        (fns/aggregate-function? fname)
+        (and (fns/aggregate-function? fname)
+             ;; Resolve it before the enclosing expression types it:
+             ;; `coalesce(sum(text), 0)` must fail on sum, not on coalesce.
+             (do (validate-aggregate-node! ctx f) true))
         ;; An aggregate NESTED inside a larger expression -- `round(avg(x),
         ;; 2)`, `coalesce(sum(x), 0)`, `upper(max(s))`. PostgreSQL hoists
         ;; these: the aggregate is computed by the grouping step and the

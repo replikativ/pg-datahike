@@ -930,6 +930,124 @@
       (or (nil? (cat source)) (nil? (cat target))) true
       :else false)))
 
+(def ^:private pg-aggregate-signatures
+  "aggregate / window function name -> #{[argument type names]}: every
+   pg_proc.dat row with prokind 'a' or 'w', generated from the pinned
+   REL_17_7 catalog. Both kinds, because names are shared: rank() is a
+   window function and rank(VARIADIC \"any\") the hypothetical-set
+   aggregate."
+  {"any_value" #{["anyelement"]}
+   "array_agg" #{["anyarray"] ["anynonarray"]}
+   "avg" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["interval"] ["numeric"]}
+   "bit_and" #{["bit"] ["int2"] ["int4"] ["int8"]}
+   "bit_or" #{["bit"] ["int2"] ["int4"] ["int8"]}
+   "bit_xor" #{["bit"] ["int2"] ["int4"] ["int8"]}
+   "bool_and" #{["bool"]}
+   "bool_or" #{["bool"]}
+   "corr" #{["float8" "float8"]}
+   "count" #{[] ["any"]}
+   "covar_pop" #{["float8" "float8"]}
+   "covar_samp" #{["float8" "float8"]}
+   "cume_dist" #{[] ["any"]}
+   "dense_rank" #{[] ["any"]}
+   "every" #{["bool"]}
+   "first_value" #{["anyelement"]}
+   "json_agg" #{["anyelement"]}
+   "json_agg_strict" #{["anyelement"]}
+   "json_object_agg" #{["any" "any"]}
+   "json_object_agg_strict" #{["any" "any"]}
+   "json_object_agg_unique" #{["any" "any"]}
+   "json_object_agg_unique_strict" #{["any" "any"]}
+   "jsonb_agg" #{["anyelement"]}
+   "jsonb_agg_strict" #{["anyelement"]}
+   "jsonb_object_agg" #{["any" "any"]}
+   "jsonb_object_agg_strict" #{["any" "any"]}
+   "jsonb_object_agg_unique" #{["any" "any"]}
+   "jsonb_object_agg_unique_strict" #{["any" "any"]}
+   "lag" #{["anycompatible" "int4" "anycompatible"] ["anyelement"] ["anyelement" "int4"]}
+   "last_value" #{["anyelement"]}
+   "lead" #{["anycompatible" "int4" "anycompatible"] ["anyelement"] ["anyelement" "int4"]}
+   "max" #{["anyarray"] ["anyenum"] ["bpchar"] ["date"] ["float4"] ["float8"] ["inet"] ["int2"] ["int4"] ["int8"] ["interval"] ["money"] ["numeric"] ["oid"] ["pg_lsn"] ["text"] ["tid"] ["time"] ["timestamp"] ["timestamptz"] ["timetz"] ["xid8"]}
+   "min" #{["anyarray"] ["anyenum"] ["bpchar"] ["date"] ["float4"] ["float8"] ["inet"] ["int2"] ["int4"] ["int8"] ["interval"] ["money"] ["numeric"] ["oid"] ["pg_lsn"] ["text"] ["tid"] ["time"] ["timestamp"] ["timestamptz"] ["timetz"] ["xid8"]}
+   "mode" #{["anyelement"]}
+   "nth_value" #{["anyelement" "int4"]}
+   "ntile" #{["int4"]}
+   "percent_rank" #{[] ["any"]}
+   "percentile_cont" #{["_float8" "float8"] ["_float8" "interval"] ["float8" "float8"] ["float8" "interval"]}
+   "percentile_disc" #{["_float8" "anyelement"] ["float8" "anyelement"]}
+   "range_agg" #{["anymultirange"] ["anyrange"]}
+   "range_intersect_agg" #{["anymultirange"] ["anyrange"]}
+   "rank" #{[] ["any"]}
+   "regr_avgx" #{["float8" "float8"]}
+   "regr_avgy" #{["float8" "float8"]}
+   "regr_count" #{["float8" "float8"]}
+   "regr_intercept" #{["float8" "float8"]}
+   "regr_r2" #{["float8" "float8"]}
+   "regr_slope" #{["float8" "float8"]}
+   "regr_sxx" #{["float8" "float8"]}
+   "regr_sxy" #{["float8" "float8"]}
+   "regr_syy" #{["float8" "float8"]}
+   "row_number" #{[]}
+   "stddev" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
+   "stddev_pop" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
+   "stddev_samp" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
+   "string_agg" #{["bytea" "bytea"] ["text" "text"]}
+   "sum" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["interval"] ["money"] ["numeric"]}
+   "var_pop" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
+   "var_samp" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
+   "variance" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
+   "xmlagg" #{["xml"]}})
+
+(def ^:private polymorphic-params
+  #{"any" "anyelement" "anynonarray" "anycompatible" "anycompatiblenonarray"})
+
+(defn- aggregate-param-accepts?
+  "Can an argument of type `arg-oid` be passed where pg_proc declares
+   `param`? Unknown types (untyped literals, expressions we cannot type)
+   are accepted: rejecting them would be a false 42883."
+  [param arg-oid]
+  (cond
+    (nil? arg-oid) true
+    (polymorphic-params param) true
+    (#{"anyarray" "anycompatiblearray"} param) (contains? array-oid->element-oid arg-oid)
+    ;; Enums are user types, outside the categorised built-ins.
+    (= "anyenum" param) (and (nil? (oid->category arg-oid))
+                             (not (contains? array-oid->element-oid arg-oid)))
+    :else (when-let [p (get pg-name->oid param)]
+            (or (= p arg-oid) (contains? (get implicit-casts arg-oid) p)))))
+
+(defn aggregate-resolution
+  "How PostgreSQL resolves aggregate `fname` over `arg-oids` (nil = not
+   statically typed); `unknown?` marks the positions holding an untyped
+   literal. nil when `fname` is not a PostgreSQL aggregate, else :ok,
+   :none (42883) or :ambiguous (42725).
+
+   An untyped literal fits any candidate, so it resolves the way
+   func_select_candidate does (parse_func.c): a candidate taking a
+   string-category or polymorphic parameter there wins; so does a single
+   remaining category with a preferred type. Otherwise the call is
+   ambiguous -- `sum('1')` has numeric, money and interval candidates."
+  [fname arg-oids unknown?]
+  (when-let [sigs (get pg-aggregate-signatures fname)]
+    (let [candidates (filter (fn [sig]
+                               (and (= (count sig) (count arg-oids))
+                                    (every? true? (map aggregate-param-accepts? sig arg-oids))))
+                             sigs)
+          unknown-positions (keep-indexed (fn [i u] (when u i)) unknown?)]
+      (cond
+        (empty? candidates) :none
+        (or (= 1 (count candidates)) (empty? unknown-positions)) :ok
+        :else
+        (let [resolves?
+              (fn [i]
+                (let [params (map #(nth % i) candidates)
+                      cats (set (map #(get oid->category (get pg-name->oid %)) params))]
+                  (or (some polymorphic-params params)
+                      (contains? cats :S)
+                      (and (= 1 (count cats))
+                           (some #(contains? preferred-oids (get pg-name->oid %)) params)))))]
+          (if (every? resolves? unknown-positions) :ok :ambiguous))))))
+
 (def oid->typcollation
   "`typcollation` from pg_type.dat: the collatable base types and the
    collation their values carry by default. `name` is C (950), the

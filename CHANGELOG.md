@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Aggregates resolve their argument types
+
+- Aggregate and window-function calls are resolved against every
+  `pg_proc.dat` aggregate/window signature (generated from the pinned
+  catalog). A call with no matching overload raises 42883, and an untyped
+  literal that fits several candidates raises 42725, as in PostgreSQL.
+  `sum(text)` used to fail with an internal ClassCastException, `sum(text)
+  OVER ()` with 0A000, and `bool_and(int)` answered false.
 ### Values render and parse by their SQL type
 
 - One output function (`types/->pg-text`) serves the wire, `::text`, `||`,
