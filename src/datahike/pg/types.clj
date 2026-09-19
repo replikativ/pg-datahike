@@ -2,11 +2,12 @@
   "PostgreSQL type system registry for the PgWire compatibility layer.
 
    Centralizes all type mappings between PostgreSQL OIDs, SQL type names,
-
-   Centralizes all type mappings between PostgreSQL OIDs, SQL type names,
    Datahike value types, and wire protocol format codes.
 
-   Authoritative source: PostgreSQL 19devel src/include/catalog/pg_type.dat
+   Catalog facts -- length, category, preferred type, collation, array
+   type, casts, aggregate signatures -- are read from the generated
+   PostgreSQL catalog (datahike.pg.pg-catalog), never written here. This
+   namespace decides which of those types pg-datahike carries.
 
    Three directions of mapping:
    1. SQL name → Datahike type (for CREATE TABLE)
@@ -14,7 +15,8 @@
    3. PG OID → SQL name (for format_type() and information_schema)
    4. SQL name → category (for CAST type classification)"
   (:require [clojure.set :as set]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [datahike.pg.pg-catalog :as pg-catalog])
   (:import [datahike.pg PgWireServer]))
 
 ;; ============================================================================
@@ -95,32 +97,28 @@
 (def oid-tsvector-array     3643)
 (def oid-tsquery-array      3645)
 
+(def ^:private extension-types
+  "Types pg-datahike carries that are not built into PostgreSQL, as
+   pg_type rows. pgvector's `vector` has no fixed OID; 16383 is ours."
+  {oid-vector {:oid oid-vector :typname "vector" :typlen -1 :typtype "b"
+               :typcategory "U" :typispreferred false :typdelim ","
+               :typelem 0 :typarray 0 :typcollation 0}})
+
+(defn catalog-type
+  "The pg_type row of `oid`, built-in or extension; nil for types only a
+   database defines (enums, composites, domains)."
+  [oid]
+  (or (get pg-catalog/type-by-oid oid) (get extension-types oid)))
+
 (def element-oid->array-oid
-  "Scalar element OID → corresponding T[] OID."
-  {oid-bool        oid-bool-array
-   oid-bytea       oid-bytea-array
-   oid-name        oid-name-array
-   oid-int2        oid-int2-array
-   oid-int4        oid-int4-array
-   oid-text        oid-text-array
-   oid-int8        oid-int8-array
-   oid-float4      oid-float4-array
-   oid-float8      oid-float8-array
-   oid-oid         oid-oid-array
-   oid-varchar     oid-varchar-array
-   oid-bpchar      oid-bpchar-array
-   oid-date        oid-date-array
-   oid-time        oid-time-array
-   oid-timetz      oid-timetz-array
-   oid-timestamp   oid-timestamp-array
-   oid-timestamptz oid-timestamptz-array
-   oid-numeric     oid-numeric-array
-   oid-uuid        oid-uuid-array
-   oid-json        oid-json-array
-   oid-money       oid-money-array
-   oid-jsonb       oid-jsonb-array
-   oid-tsvector    oid-tsvector-array
-   oid-tsquery     oid-tsquery-array})
+  "Scalar element OID → corresponding T[] OID (pg_type.typarray), for the
+   element types whose arrays pg-datahike carries."
+  (into {}
+        (map (fn [e] [e (:typarray (catalog-type e))]))
+        [oid-bool oid-bytea oid-name oid-int2 oid-int4 oid-text oid-int8
+         oid-float4 oid-float8 oid-oid oid-varchar oid-bpchar oid-date
+         oid-time oid-timetz oid-timestamp oid-timestamptz oid-numeric
+         oid-uuid oid-json oid-money oid-jsonb oid-tsvector oid-tsquery]))
 
 (def array-oid->element-oid
   "Inverse of element-oid->array-oid: T[] OID → T OID."
@@ -693,137 +691,46 @@
 ;; ============================================================================
 
 (def pg-type-catalog
-  "Common PostgreSQL types for the pg_type virtual table.
-   Each entry: [oid typname typlen typtype]"
-  [[oid-bool      "bool"       1  "b"]
-   [oid-bytea     "bytea"     -1  "b"]
-   [oid-int8      "int8"       8  "b"]
-   [oid-int2      "int2"       2  "b"]
-   [oid-int4      "int4"       4  "b"]
-   [oid-text      "text"      -1  "b"]
-   [oid-oid       "oid"        4  "b"]
-   [oid-tid       "tid"        6  "b"]
-   [oid-json      "json"      -1  "b"]
-   [oid-money     "money"      8  "b"]
-   [oid-float4    "float4"     4  "b"]
-   [oid-float8    "float8"     8  "b"]
-   [oid-varchar   "varchar"   -1  "b"]
-   [oid-bpchar    "bpchar"    -1  "b"]
-   [oid-name      "name"      64  "b"]
-   [oid-date      "date"       4  "b"]
-   [oid-time      "time"       8  "b"]
-   [oid-timetz    "timetz"    12  "b"]
-   [oid-timestamp "timestamp"  8  "b"]
-   [oid-timestamptz "timestamptz" 8 "b"]
-   [oid-interval  "interval"  16  "b"]
-   [oid-numeric   "numeric"   -1  "b"]
-   [oid-uuid      "uuid"      16  "b"]
-   [oid-bit       "bit"       -1  "b"]
-   [oid-varbit    "varbit"    -1  "b"]
-   [oid-jsonb     "jsonb"     -1  "b"]
-   [oid-tsvector  "tsvector"   -1  "b"]
-   [oid-tsquery   "tsquery"    -1  "b"]
-   [oid-pg-lsn    "pg_lsn"     8  "b"]
-   [oid-regclass  "regclass"    4  "b"]
-   [oid-regtype   "regtype"     4  "b"]
-   [oid-regnamespace "regnamespace" 4 "b"]
-   [oid-vector    "vector"      -1  "b"]
-   ;; Array types — one per scalar with a paired T[] OID. typtype="b"
-   ;; like scalars; the typelem linkage is exposed via element-oid
-   ;; lookups at query time (see datahike.pg.sql.catalog).
-   [oid-bool-array        "_bool"        -1 "b"]
-   [oid-bytea-array       "_bytea"       -1 "b"]
-   [oid-name-array        "_name"        -1 "b"]
-   [oid-int2-array        "_int2"        -1 "b"]
-   [oid-int4-array        "_int4"        -1 "b"]
-   [oid-text-array        "_text"        -1 "b"]
-   [oid-int8-array        "_int8"        -1 "b"]
-   [oid-float4-array      "_float4"      -1 "b"]
-   [oid-float8-array      "_float8"      -1 "b"]
-   [oid-oid-array         "_oid"         -1 "b"]
-   [oid-varchar-array     "_varchar"     -1 "b"]
-   [oid-bpchar-array      "_bpchar"      -1 "b"]
-   [oid-date-array        "_date"        -1 "b"]
-   [oid-time-array        "_time"        -1 "b"]
-   [oid-timetz-array      "_timetz"      -1 "b"]
-   [oid-timestamp-array   "_timestamp"   -1 "b"]
-   [oid-timestamptz-array "_timestamptz" -1 "b"]
-   [oid-numeric-array     "_numeric"     -1 "b"]
-   [oid-uuid-array        "_uuid"        -1 "b"]
-   [oid-json-array        "_json"        -1 "b"]
-   [oid-money-array       "_money"       -1 "b"]
-   [oid-jsonb-array       "_jsonb"       -1 "b"]
-   [oid-tsvector-array    "_tsvector"    -1 "b"]
-   [oid-tsquery-array     "_tsquery"     -1 "b"]])
+  "The types the pg_type virtual table lists, as [oid typname typlen
+   typtype]: the scalars pg-datahike carries, then their array types."
+  (mapv (fn [oid]
+          (let [t (catalog-type oid)]
+            [oid (:typname t) (:typlen t) (:typtype t)]))
+        (concat [oid-bool oid-bytea oid-int8 oid-int2 oid-int4 oid-text oid-oid
+                 oid-tid oid-json oid-money oid-float4 oid-float8 oid-varchar
+                 oid-bpchar oid-name oid-date oid-time oid-timetz oid-timestamp
+                 oid-timestamptz oid-interval oid-numeric oid-uuid oid-bit
+                 oid-varbit oid-jsonb oid-tsvector oid-tsquery oid-pg-lsn
+                 oid-regclass oid-regtype oid-regnamespace oid-vector]
+                (vals element-oid->array-oid))))
 
 ;; ============================================================================
 ;; Type size for wire protocol RowDescription
 ;; ============================================================================
 
 (def oid->wire-size
-  "Map OID to type size for RowDescription's typlen field.
+  "Map OID to type size for RowDescription's typlen field (pg_type.typlen).
    Positive = fixed size in bytes, -1 = variable length."
-  {oid-bool       1
-   oid-char       1
-   oid-int2       2
-   oid-int4       4
-   oid-int8       8
-   oid-float4     4
-   oid-float8     8
-   oid-text      -1
-   oid-varchar   -1
-   oid-bpchar    -1
-   oid-name      64
-   oid-money      8
-   oid-bytea     -1
-   oid-date       4
-   oid-time       8
-   oid-timetz    12
-   oid-timestamp  8
-   oid-timestamptz 8
-   oid-interval  16
-   oid-numeric   -1
-   oid-uuid      16
-   oid-json      -1
-   oid-jsonb     -1
-   oid-tsvector  -1
-   oid-tsquery   -1
-   oid-pg-lsn     8
-   oid-oid        4
-   oid-vector    -1
-   ;; Array types are always variable-length on the wire.
-   oid-bool-array        -1
-   oid-bytea-array       -1
-   oid-name-array        -1
-   oid-int2-array        -1
-   oid-int4-array        -1
-   oid-text-array        -1
-   oid-int8-array        -1
-   oid-float4-array      -1
-   oid-float8-array      -1
-   oid-oid-array         -1
-   oid-varchar-array     -1
-   oid-bpchar-array      -1
-   oid-date-array        -1
-   oid-time-array        -1
-   oid-timetz-array      -1
-   oid-timestamp-array   -1
-   oid-timestamptz-array -1
-   oid-numeric-array     -1
-   oid-uuid-array        -1
-   oid-json-array        -1
-   oid-money-array       -1
-   oid-jsonb-array       -1
-   oid-tsvector-array    -1
-   oid-tsquery-array     -1})
+  (into {}
+        (map (fn [[oid]] [oid (:typlen (catalog-type oid))]))
+        (conj pg-type-catalog [oid-char])))
 
 ;; ============================================================================
 ;; Type resolution — PostgreSQL's category / preferred / implicit-cast
 ;; tables, and the algorithm that reads them
 ;; ============================================================================
 
+(def ^:private resolution-oids
+  "The types whose catalog facts type resolution consults. A type outside
+   this set is resolved leniently (see comparison-compatible?)."
+  #{oid-bool oid-int2 oid-int4 oid-int8 oid-float4 oid-float8 oid-numeric
+    oid-money oid-oid oid-text oid-varchar oid-bpchar oid-name oid-char
+    oid-date oid-time oid-timetz oid-timestamp oid-timestamptz oid-interval
+    oid-bit oid-varbit oid-uuid oid-bytea oid-json oid-jsonb oid-point
+    oid-tid oid-pg-lsn oid-tsvector oid-tsquery oid-vector})
+
 (def oid->category
-  "`typcategory` from pg_type.dat, for the types we carry.
+  "`typcategory` from pg_type, as a keyword, for `resolution-oids`.
 
    PostgreSQL resolves the type of CASE / COALESCE / GREATEST / LEAST /
    UNION, and of an operator's arguments, from three catalog facts and
@@ -833,83 +740,46 @@
    moment the arguments differ: PostgreSQL answers float8 for
    `coalesce(numeric, float8)`, which prints 1.5 where numeric prints
    1.50."
-  {oid-bool        :B
-   oid-int2        :N  oid-int4    :N  oid-int8   :N
-   oid-float4      :N  oid-float8  :N  oid-numeric :N  oid-money :N  oid-oid :N
-   oid-text        :S  oid-varchar :S  oid-bpchar :S  oid-name :S  oid-char :S
-   oid-date        :D  oid-time    :D  oid-timetz :D
-   oid-timestamp   :D  oid-timestamptz :D
-   oid-interval    :T
-   oid-bit         :V  oid-varbit  :V
-   oid-uuid        :U  oid-bytea   :U  oid-json   :U  oid-jsonb :U  oid-point :G
-   oid-tid         :U
-   oid-pg-lsn      :U  oid-tsvector :U  oid-tsquery :U  oid-vector :U})
+  (into {}
+        (map (fn [oid] [oid (keyword (:typcategory (catalog-type oid)))]))
+        resolution-oids))
 
 (def preferred-oids
-  "`typispreferred`. One per category among the types we carry: a
-   preferred type is never given up during resolution."
-  #{oid-bool oid-float8 oid-oid oid-text oid-timestamptz oid-interval oid-varbit})
+  "`typispreferred`: a preferred type is never given up during resolution."
+  (into #{} (filter (comp :typispreferred catalog-type)) resolution-oids))
+
+(def ^:private unimplemented-implicit-casts
+  "Implicit casts in pg_cast that the runtime cannot perform yet, so
+   resolution must not choose them: an operator resolved through one
+   would compare the unconverted values and answer wrongly, where leaving
+   it out raises 42883. `time -> timetz`: comparisons do not convert the
+   time operand, so `time = timetz` would compare a LocalTime with an
+   OffsetTime and answer false (consolidation plan, Phase 1.3). Remove an
+   entry together with the conversion that makes it work."
+  #{[oid-time oid-timetz]})
 
 (def implicit-casts
-  "castsource -> #{casttarget} for the pg_cast.dat entries whose
-   castcontext is 'i' (implicit). Only implicit casts count for type
-   resolution -- `float8 -> numeric` exists but is ASSIGNMENT, which is
-   exactly why numeric loses to float8 and not the other way round."
-  {oid-int2      #{oid-int4 oid-int8 oid-float4 oid-float8 oid-numeric oid-oid}
-   oid-int4      #{oid-int8 oid-float4 oid-float8 oid-numeric oid-oid}
-   oid-int8      #{oid-float4 oid-float8 oid-numeric oid-oid}
-   oid-float4    #{oid-float8}
-   oid-numeric   #{oid-float4 oid-float8}
-   oid-text      #{oid-bpchar oid-varchar oid-name}
-   oid-varchar   #{oid-text oid-bpchar oid-name}
-   oid-bpchar    #{oid-text oid-varchar oid-name}
-   oid-name      #{oid-text}
-   oid-char      #{oid-text}
-   oid-date      #{oid-timestamp oid-timestamptz}
-   oid-time      #{oid-interval}
-   oid-timestamp #{oid-timestamptz}
-   oid-bit       #{oid-varbit}
-   oid-varbit    #{oid-bit}})
-
-(def ^:private pg-cast-names
-  "castsource -> #{casttarget}: every pg_cast.dat row (any castcontext)
-   between types we carry, generated from the pinned REL_17_7 catalog.
-   An explicit `::` may use any of them; see `cast-exists?`."
-  {"bit" #{"bit" "int4" "int8" "varbit"}
-   "bool" #{"bpchar" "int4" "text" "varchar"}
-   "bpchar" #{"bpchar" "char" "name" "text" "varchar"}
-   "char" #{"bpchar" "int4" "text" "varchar"}
-   "date" #{"timestamp" "timestamptz"}
-   "float4" #{"float8" "int2" "int4" "int8" "numeric"}
-   "float8" #{"float4" "int2" "int4" "int8" "numeric"}
-   "int2" #{"float4" "float8" "int4" "int8" "numeric" "oid" "regclass" "regnamespace" "regtype"}
-   "int4" #{"bit" "bool" "char" "float4" "float8" "int2" "int8" "money" "numeric" "oid" "regclass" "regnamespace" "regtype"}
-   "int8" #{"bit" "float4" "float8" "int2" "int4" "money" "numeric" "oid" "regclass" "regnamespace" "regtype"}
-   "interval" #{"interval" "time"}
-   "json" #{"jsonb"}
-   "jsonb" #{"bool" "float4" "float8" "int2" "int4" "int8" "json" "numeric"}
-   "money" #{"numeric"}
-   "name" #{"bpchar" "text" "varchar"}
-   "numeric" #{"float4" "float8" "int2" "int4" "int8" "money" "numeric"}
-   "oid" #{"int4" "int8" "regclass" "regnamespace" "regtype"}
-   "regclass" #{"int4" "int8" "oid"}
-   "regnamespace" #{"int4" "int8" "oid"}
-   "regtype" #{"int4" "int8" "oid"}
-   "text" #{"bpchar" "char" "name" "regclass" "varchar"}
-   "time" #{"interval" "time" "timetz"}
-   "timestamp" #{"date" "time" "timestamp" "timestamptz"}
-   "timestamptz" #{"date" "time" "timestamp" "timestamptz" "timetz"}
-   "timetz" #{"time" "timetz"}
-   "varbit" #{"bit" "varbit"}
-   "varchar" #{"bpchar" "char" "name" "regclass" "text" "varchar"}})
+  "castsource -> #{casttarget} for the pg_cast entries whose castcontext
+   is 'i' (implicit), between `resolution-oids`. Only implicit casts count
+   for type resolution -- `float8 -> numeric` exists but is ASSIGNMENT,
+   which is exactly why numeric loses to float8 and not the other way
+   round. A type's length-coercion cast to itself is left out."
+  (reduce (fn [m {:keys [source target context]}]
+            (if (and (= "i" context) (not= source target)
+                     (resolution-oids source) (resolution-oids target)
+                     (not (unimplemented-implicit-casts [source target])))
+              (update m source (fnil conj #{}) target)
+              m))
+          {}
+          pg-catalog/casts))
 
 (def explicit-casts
-  "`pg-cast-names` by OID."
-  (into {}
-        (keep (fn [[source targets]]
-                (when-let [s (get pg-name->oid source)]
-                  [s (into #{} (keep pg-name->oid) targets)])))
-        pg-cast-names))
+  "castsource -> #{casttarget} for every pg_cast entry; an explicit cast
+   may use any of them, whatever its context."
+  (reduce (fn [m {:keys [source target]}]
+            (update m source (fnil conj #{}) target))
+          {}
+          pg-catalog/casts))
 
 (defn cast-exists?
   "Does PostgreSQL have an explicit cast from `source` to `target`
@@ -932,71 +802,16 @@
 
 (def ^:private pg-aggregate-signatures
   "aggregate / window function name -> #{[argument type names]}: every
-   pg_proc.dat row with prokind 'a' or 'w', generated from the pinned
-   REL_17_7 catalog. Both kinds, because names are shared: rank() is a
-   window function and rank(VARIADIC \"any\") the hypothetical-set
-   aggregate."
-  {"any_value" #{["anyelement"]}
-   "array_agg" #{["anyarray"] ["anynonarray"]}
-   "avg" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["interval"] ["numeric"]}
-   "bit_and" #{["bit"] ["int2"] ["int4"] ["int8"]}
-   "bit_or" #{["bit"] ["int2"] ["int4"] ["int8"]}
-   "bit_xor" #{["bit"] ["int2"] ["int4"] ["int8"]}
-   "bool_and" #{["bool"]}
-   "bool_or" #{["bool"]}
-   "corr" #{["float8" "float8"]}
-   "count" #{[] ["any"]}
-   "covar_pop" #{["float8" "float8"]}
-   "covar_samp" #{["float8" "float8"]}
-   "cume_dist" #{[] ["any"]}
-   "dense_rank" #{[] ["any"]}
-   "every" #{["bool"]}
-   "first_value" #{["anyelement"]}
-   "json_agg" #{["anyelement"]}
-   "json_agg_strict" #{["anyelement"]}
-   "json_object_agg" #{["any" "any"]}
-   "json_object_agg_strict" #{["any" "any"]}
-   "json_object_agg_unique" #{["any" "any"]}
-   "json_object_agg_unique_strict" #{["any" "any"]}
-   "jsonb_agg" #{["anyelement"]}
-   "jsonb_agg_strict" #{["anyelement"]}
-   "jsonb_object_agg" #{["any" "any"]}
-   "jsonb_object_agg_strict" #{["any" "any"]}
-   "jsonb_object_agg_unique" #{["any" "any"]}
-   "jsonb_object_agg_unique_strict" #{["any" "any"]}
-   "lag" #{["anycompatible" "int4" "anycompatible"] ["anyelement"] ["anyelement" "int4"]}
-   "last_value" #{["anyelement"]}
-   "lead" #{["anycompatible" "int4" "anycompatible"] ["anyelement"] ["anyelement" "int4"]}
-   "max" #{["anyarray"] ["anyenum"] ["bpchar"] ["date"] ["float4"] ["float8"] ["inet"] ["int2"] ["int4"] ["int8"] ["interval"] ["money"] ["numeric"] ["oid"] ["pg_lsn"] ["text"] ["tid"] ["time"] ["timestamp"] ["timestamptz"] ["timetz"] ["xid8"]}
-   "min" #{["anyarray"] ["anyenum"] ["bpchar"] ["date"] ["float4"] ["float8"] ["inet"] ["int2"] ["int4"] ["int8"] ["interval"] ["money"] ["numeric"] ["oid"] ["pg_lsn"] ["text"] ["tid"] ["time"] ["timestamp"] ["timestamptz"] ["timetz"] ["xid8"]}
-   "mode" #{["anyelement"]}
-   "nth_value" #{["anyelement" "int4"]}
-   "ntile" #{["int4"]}
-   "percent_rank" #{[] ["any"]}
-   "percentile_cont" #{["_float8" "float8"] ["_float8" "interval"] ["float8" "float8"] ["float8" "interval"]}
-   "percentile_disc" #{["_float8" "anyelement"] ["float8" "anyelement"]}
-   "range_agg" #{["anymultirange"] ["anyrange"]}
-   "range_intersect_agg" #{["anymultirange"] ["anyrange"]}
-   "rank" #{[] ["any"]}
-   "regr_avgx" #{["float8" "float8"]}
-   "regr_avgy" #{["float8" "float8"]}
-   "regr_count" #{["float8" "float8"]}
-   "regr_intercept" #{["float8" "float8"]}
-   "regr_r2" #{["float8" "float8"]}
-   "regr_slope" #{["float8" "float8"]}
-   "regr_sxx" #{["float8" "float8"]}
-   "regr_sxy" #{["float8" "float8"]}
-   "regr_syy" #{["float8" "float8"]}
-   "row_number" #{[]}
-   "stddev" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
-   "stddev_pop" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
-   "stddev_samp" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
-   "string_agg" #{["bytea" "bytea"] ["text" "text"]}
-   "sum" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["interval"] ["money"] ["numeric"]}
-   "var_pop" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
-   "var_samp" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
-   "variance" #{["float4"] ["float8"] ["int2"] ["int4"] ["int8"] ["numeric"]}
-   "xmlagg" #{["xml"]}})
+   pg_proc row with prokind 'a' or 'w'. Both kinds, because names are
+   shared: rank() is a window function and rank(VARIADIC \"any\") the
+   hypothetical-set aggregate."
+  (reduce (fn [m {:keys [proname args kind]}]
+            (if (#{"a" "w"} kind)
+              (update m proname (fnil conj #{})
+                      (mapv #(:typname (catalog-type %)) args))
+              m))
+          {}
+          pg-catalog/procs))
 
 (def ^:private polymorphic-params
   #{"any" "anyelement" "anynonarray" "anycompatible" "anycompatiblenonarray"})
@@ -1048,20 +863,12 @@
                            (some #(contains? preferred-oids (get pg-name->oid %)) params)))))]
           (if (every? resolves? unknown-positions) :ok :ambiguous))))))
 
-(def oid->typcollation
-  "`typcollation` from pg_type.dat: the collatable base types and the
-   collation their values carry by default. `name` is C (950), the
-   character types use the database default (100); every other type is
-   not collatable (0)."
-  {oid-text 100 oid-varchar 100 oid-bpchar 100 oid-name 950})
-
 (defn typcollation
-  "Collation OID of a type, element type for an array (PostgreSQL gives
-   an array its element's typcollation), 0 when not collatable."
+  "`typcollation` of a type: 950 (C) for `name`, 100 (the database
+   default) for the character types and their arrays, 0 when not
+   collatable."
   [oid]
-  (or (get oid->typcollation oid)
-      (get oid->typcollation (get array-oid->element-oid oid))
-      0))
+  (:typcollation (catalog-type oid) 0))
 
 (defn implicit-coercible?
   "Can `from` be coerced to `to` implicitly? `can_coerce_type` with
