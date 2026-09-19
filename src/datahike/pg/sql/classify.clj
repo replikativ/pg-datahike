@@ -749,18 +749,20 @@
    executed as one :ddl-drop with a :tables vector; pgbench -i sends
    `drop table if exists pgbench_accounts, pgbench_branches, …`.
    Single-name DROP TABLE keeps flowing through JSqlParser unchanged.
-   A trailing CASCADE/RESTRICT is accepted and ignored, matching the
-   JSqlParser branch (which discards Drop parameters)."
+   A trailing CASCADE is recorded (:cascade?): it drops the foreign keys
+   of other tables that reference a dropped one."
   [toks]
   (let [if-exists? (boolean (and (kw=? (first toks) "if")
                                  (kw=? (second toks) "exists")))
         ts (if if-exists? (drop 2 toks) toks)]
     (or (when-let [[names ts'] (read-relation-list ts)]
-          (let [ts' (if (kw-in? (first ts') #{"cascade" "restrict"})
+          (let [cascade? (boolean (kw=? (first ts') "cascade"))
+                ts' (if (kw-in? (first ts') #{"cascade" "restrict"})
                       (rest ts') ts')
                 ts' (drop-while #(= ";" (:text %)) ts')]
             (when (and (empty? ts') (> (count names) 1))
-              {:kind :drop-table-multi :tables names :if-exists? if-exists?})))
+              {:kind :drop-table-multi :tables names :if-exists? if-exists?
+               :cascade? cascade?})))
         {:kind :generic-sql})))
 
 ;; ============================================================================

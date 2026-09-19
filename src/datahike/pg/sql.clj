@@ -2278,7 +2278,9 @@
                         "view" {:type :ddl-drop-view
                                 :view-name (unquote-ident obj-name)
                                 :if-exists? (.isIfExists d)}
-                        {:type :ddl-drop :table obj-name}))
+                        {:type :ddl-drop :table obj-name
+                         :cascade? (boolean (some #(= "cascade" (str/lower-case (str %)))
+                                                  (.getParameters d)))}))
 
           ;; COMMIT (JSqlParser AST)
                     (instance? Commit stmt)

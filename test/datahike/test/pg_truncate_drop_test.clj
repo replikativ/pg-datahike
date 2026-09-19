@@ -30,14 +30,14 @@
     (is (= {:kind :drop-table-multi
             :tables ["pgbench_accounts" "pgbench_branches"
                      "pgbench_history" "pgbench_tellers"]
-            :if-exists? true}
+            :if-exists? true :cascade? false}
            (c/classify "drop table if exists pgbench_accounts, pgbench_branches, pgbench_history, pgbench_tellers"))))
   (testing "without IF EXISTS"
-    (is (= {:kind :drop-table-multi :tables ["a" "b"] :if-exists? false}
+    (is (= {:kind :drop-table-multi :tables ["a" "b"] :if-exists? false :cascade? false}
            (c/classify "DROP TABLE a, b"))))
-  (testing "trailing CASCADE / RESTRICT accepted and ignored"
-    (is (= :drop-table-multi (:kind (c/classify "DROP TABLE a, b CASCADE"))))
-    (is (= :drop-table-multi (:kind (c/classify "DROP TABLE a, b RESTRICT")))))
+  (testing "trailing CASCADE / RESTRICT accepted; CASCADE is recorded"
+    (is (true? (:cascade? (c/classify "DROP TABLE a, b CASCADE"))))
+    (is (false? (:cascade? (c/classify "DROP TABLE a, b RESTRICT")))))
   (testing "schema qualifier dropped, quoted identifiers unwrapped"
     (is (= ["a" "Weird Name"]
            (:tables (c/classify "DROP TABLE public.a, \"Weird Name\"")))))
@@ -57,14 +57,14 @@
     ;; JSqlParser reports the real syntax error.
     (is (= {:kind :generic-sql} (c/classify "DROP TABLE 'a, b'"))))
   (testing "comments between names are invisible"
-    (is (= {:kind :drop-table-multi :tables ["a" "b"] :if-exists? false}
+    (is (= {:kind :drop-table-multi :tables ["a" "b"] :if-exists? false :cascade? false}
            (c/classify "drop table -- x, y\n a, /* z, */ b")))))
 
 (deftest classify-drop-table-long-list-not-truncated
   (testing "a name list far beyond the classifier's 64-token prefix"
     (let [names (mapv #(str "t" %) (range 60))
           sql (str "DROP TABLE " (str/join ", " names))]
-      (is (= {:kind :drop-table-multi :tables names :if-exists? false}
+      (is (= {:kind :drop-table-multi :tables names :if-exists? false :cascade? false}
              (c/classify sql))))))
 
 ;; ============================================================================
