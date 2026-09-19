@@ -50,7 +50,10 @@ TESTS=(
 )
 
 # Build the --tests argument list for gradle.
-GRADLE_ARGS=(":postgresql:test")
+# --rerun: the server under test is not a task input, so without it Gradle
+# reports the test task UP-TO-DATE after the first run and the summary
+# below counts the previous run's reports.
+GRADLE_ARGS=(":postgresql:test" "--rerun")
 for t in "${TESTS[@]}"; do
   GRADLE_ARGS+=("--tests" "${t}")
 done
