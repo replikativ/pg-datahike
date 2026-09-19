@@ -63,19 +63,21 @@
   [db table-name]
   (let [schema (:schema db)
         columns (column-specs db table-name)
-        checks (when (get schema :pg/check-name)
+        checks (when (get schema :pg/check-table)
                  (mapv (fn [[constraint expression]]
                          {:constraint constraint
                           :expression expression})
                        (d/q '{:find [?name ?expression]
                               :in [$ ?table]
-                              :where [[?check :pg/check-name ?name]
-                                      [?check :pg/check-table ?table]
-                                      [?check :pg/check-expr ?expression]]}
+                              :where [[?check :pg/check-table ?table]
+                                      [?check :pg/check-expr ?expression]
+                                      (or-join [?check ?name]
+                                               [?check :pg/check-conname ?name]
+                                               [?check :pg/check-name ?name])]}
                             db table-name)))
         child-by-name (into {} (map (juxt :name :attr))
                             (pgs/column-info schema table-name db))
-        fks (when (get schema :pg/fk-name)
+        fks (when (get schema :pg/fk-child-table)
               (mapv (fn [[constraint child-json parent-table parent-json]]
                       (let [parent-cols (vec (jb/parse-jsonb parent-json))
                             parent-by-name (into {} (map (juxt :name :attr))
@@ -89,8 +91,10 @@
                          :parent-attrs (mapv parent-by-name parent-cols)}))
                     (d/q '{:find [?name ?child-cols ?parent-table ?parent-cols]
                            :in [$ ?table]
-                           :where [[?fk :pg/fk-name ?name]
-                                   [?fk :pg/fk-child-table ?table]
+                           :where [[?fk :pg/fk-child-table ?table]
+                                   (or-join [?fk ?name]
+                                            [?fk :pg/fk-conname ?name]
+                                            [?fk :pg/fk-name ?name])
                                    [?fk :pg/fk-child-cols ?child-cols]
                                    [?fk :pg/fk-parent-table ?parent-table]
                                    [?fk :pg/fk-parent-cols ?parent-cols]]}

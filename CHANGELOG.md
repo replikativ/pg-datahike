@@ -4,6 +4,19 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Constraint names are per table, and dropped with the table
+
+- CHECK and FOREIGN KEY constraints are identified by table and name (`:pg/constraint-key`), not by name alone. Two tables may each declare a constraint called `pos`.
+- DROP TABLE drops the table's own CHECK and FOREIGN KEY constraints. Left behind, they were enforced against a later table of the same name, which rejected rows its own definition allowed.
+- Dropping a table that other tables' foreign keys reference is refused (2BP01, naming each dependent constraint). With CASCADE, those foreign keys are dropped. Before, they were left pointing at nothing and attached to a later table of the same name.
+- Constraints are named as PostgreSQL names them:
+  - An explicit inline `CONSTRAINT <name> CHECK` keeps its name.
+  - An unnamed CHECK is `<table>_<column>_check` when it references one column, else `<table>_check`.
+  - A generated name is numbered past any CHECK or FOREIGN KEY name the table already has (`<table>_check1`, `<table>_a_fkey2`) and shortened to 63 bytes as `makeObjectName` does.
+  - Two explicit constraints of one table with the same name raise 42710.
+  - One remaining difference: column-level CHECKs are named before table-level ones, where PostgreSQL follows the text order.
+- Databases written before this change are migrated when the server starts. Their name-keyed constraint entities are re-keyed by table and name, and those of tables that no longer exist are removed.
+
 ### Datahike 0.8.1895
 
 - Retracting an attribute no longer leaves an empty schema entry behind

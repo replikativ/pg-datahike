@@ -2021,11 +2021,11 @@
                          #(let [rows (d/q '{:find [?n ?cc ?pt ?pc]
                                             :keys [name child-cols parent-table parent-cols]
                                             :in [$ ?tbl]
-                                            :where [[?e :pg/fk-name ?n]
-                                                    [?e :pg/fk-child-table ?tbl]
+                                            :where [[?e :pg/fk-child-table ?tbl]
                                                     [?e :pg/fk-child-cols ?cc]
                                                     [?e :pg/fk-parent-table ?pt]
-                                                    [?e :pg/fk-parent-cols ?pc]]}
+                                                    [?e :pg/fk-parent-cols ?pc]
+                                                    (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
                                           db table-name)]
                             (mapv (fn [{:keys [name child-cols parent-table parent-cols]}]
                                     {:name name
@@ -2051,12 +2051,12 @@
                      :on-delete (or od :no-action)})
                   (d/q '{:find [?n ?ct ?cc ?pc ?od]
                          :in [$ ?pt]
-                         :where [[?e :pg/fk-name ?n]
-                                 [?e :pg/fk-parent-table ?pt]
+                         :where [[?e :pg/fk-parent-table ?pt]
                                  [?e :pg/fk-child-table ?ct]
                                  [?e :pg/fk-child-cols ?cc]
                                  [?e :pg/fk-parent-cols ?pc]
-                                 [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]]}
+                                 [(get-else $ ?e :pg/fk-on-delete :no-action) ?od]
+                                 (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
                        db table-name)))]
     (if (= ::nil v) [] v)))
 
@@ -3707,7 +3707,8 @@
            :expected-next initial-next
            :next-oid @cursor})))))
 
-(declare prepare-object-catalog-tx migrate-legacy-indexes-tx)
+(declare prepare-object-catalog-tx migrate-legacy-indexes-tx
+         legacy-constraint-eids migrate-legacy-constraints-tx)
 
 (defn- prepare-pg-schema-tx
   "Install pgwire-internal schema attributes that describe PG-side facts
@@ -3726,11 +3727,13 @@
      :pg/default-value — string form of the literal or function name.
      :pg/default-arg   — argument for :nextval (sequence name).
 
-   Constraint entities (separate entities keyed by name):
-     :pg/check-name      (unique/identity) + :pg/check-table +
+   Constraint entities (separate entities keyed by table + name in
+   :pg/constraint-key; :pg/check-name / :pg/fk-name are the legacy
+   name-only keys, still read):
+     :pg/check-conname   + :pg/check-table +
      :pg/check-expr      — serialized CHECK expression. Evaluated
                            per-row at INSERT/UPDATE. PG error 23514.
-     :pg/fk-name         (unique/identity) + :pg/fk-child-table +
+     :pg/fk-conname      + :pg/fk-child-table +
      :pg/fk-child-cols   + :pg/fk-parent-table + :pg/fk-parent-cols +
      :pg/fk-on-delete / :pg/fk-on-update — child-side reference check
                            on INSERT/UPDATE; parent-side RESTRICT on
@@ -3767,9 +3770,15 @@
               [:pg/default-kind kw1]
               [:pg/default-value str1]
               [:pg/default-arg str1]
-              ;; CHECK constraints — one entity per constraint. Name
-              ;; is :db.unique/identity so repeated CREATE TABLE IF NOT
-              ;; EXISTS on the same DDL doesn't duplicate.
+              ;; Constraint identity: table + name (ddl/constraint-key).
+              ;; PostgreSQL names are unique per table, so CHECK and FK
+              ;; entities are keyed by both; :pg/check-conname and
+              ;; :pg/fk-conname carry the name itself.
+              [:pg/constraint-key (assoc str1 :db/unique :db.unique/identity)]
+              [:pg/check-conname str1]
+              [:pg/fk-conname str1]
+              ;; Legacy: databases written before constraint-key keyed
+              ;; CHECK/FK entities by name alone. Still read, never written.
               [:pg/check-name (assoc str1 :db/unique :db.unique/identity)]
               [:pg/check-table str1]
               [:pg/check-expr str1]
@@ -3807,12 +3816,49 @@
                            (:datahike.pg.catalog/version
                             (catalog-objects/catalog-entity db)))
         migrate-indexes? (or catalog-old?
-                             (not (get schema :datahike.pg.index/legacy-incomplete?)))]
+                             (not (get schema :datahike.pg.index/legacy-incomplete?)))
+        legacy-constraints? (seq (legacy-constraint-eids db))]
     ;; Sequential transaction functions see the writer's actual in-flight db
     ;; and resolved EIDs. The store predicate sees only the finished migration.
     (cond-> missing
       catalog-old? (conj [:db.fn/call prepare-object-catalog-tx])
-      migrate-indexes? (conj [:db.fn/call migrate-legacy-indexes-tx]))))
+      migrate-indexes? (conj [:db.fn/call migrate-legacy-indexes-tx])
+      legacy-constraints? (conj [:db.fn/call migrate-legacy-constraints-tx]))))
+
+(defn- legacy-constraint-eids
+  "CHECK / FOREIGN KEY entities keyed by name alone (:pg/check-name,
+   :pg/fk-name), as written before :pg/constraint-key."
+  [db]
+  (let [schema (dbi/-schema db)]
+    (concat
+     (when (get schema :pg/check-name)
+       (map first (d/q '{:find [?e] :where [[?e :pg/check-name _]]} db)))
+     (when (get schema :pg/fk-name)
+       (map first (d/q '{:find [?e] :where [[?e :pg/fk-name _]]} db))))))
+
+(defn- migrate-legacy-constraints-tx
+  "Re-key legacy constraint entities by table and name. An entity whose
+   table no longer exists is retracted: DROP TABLE used to leave its
+   constraints behind, and they applied to a later table of the same
+   name."
+  [db]
+  (let [tables (into #{} (keep (fn [[k _]] (when (keyword? k) (namespace k))))
+                     (dbi/-schema db))]
+    (into []
+          (mapcat
+           (fn [eid]
+             (let [e (d/entity db eid)
+                   [legacy-attr table name conname-attr]
+                   (if-let [n (:pg/check-name e)]
+                     [:pg/check-name (:pg/check-table e) n :pg/check-conname]
+                     [:pg/fk-name (:pg/fk-child-table e) (:pg/fk-name e) :pg/fk-conname])]
+               (if (contains? tables table)
+                 [[:db/retract eid legacy-attr name]
+                  {:db/id eid
+                   :pg/constraint-key (ddl/constraint-key table name)
+                   conname-attr name}]
+                 [[:db/retractEntity eid]]))))
+          (legacy-constraint-eids db))))
 
 (defn- prepare-object-catalog-tx [db]
   (let [catalog (catalog-objects/catalog-entity db)
@@ -10035,6 +10081,17 @@
                     db table)))
         sequence-tx-data (mapv (fn [eid] [:db/retractEntity eid])
                                owned-sequence-eids)
+        ;; The table's own CHECK and FOREIGN KEY constraints go with it.
+        ;; Left behind, they were enforced against a later table of the
+        ;; same name: `rv_z_a_check` rejected rows of a table that no
+        ;; longer declared it.
+        constraint-tx-data
+        (into []
+              (comp cat (map (fn [[eid]] [:db/retractEntity eid])))
+              [(when (get db-schema :pg/check-table)
+                 (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/check-table ?t]]} db table))
+               (when (get db-schema :pg/fk-child-table)
+                 (d/q '{:find [?e] :in [$ ?t] :where [[?e :pg/fk-child-table ?t]]} db table))])
         ;; Physical PostgreSQL indexes are schema dependents of their table.
         ;; Retract declarations in the SAME root transaction so no committed
         ;; database value can retain an index whose covered attributes have
@@ -10101,6 +10158,7 @@
                                        inheritance-eids)
                                   (filter some? schema-tx-data)
                                   sequence-tx-data
+                                  constraint-tx-data
                                   secondary-tx-data
                                   index-object-tx-data
                                   object-tx-data))]
@@ -10151,7 +10209,37 @@
                         {:error :dependent-objects-still-exist
                          :sqlstate "2BP01"
                          :table table :dependent-table child})))
-            tx-data (into [] (mapcat #(drop-table-tx-data db %)) tables)
+            ;; Foreign keys of OTHER tables that reference a dropped one.
+            ;; PostgreSQL refuses (2BP01) unless CASCADE, which drops those
+            ;; constraints. Left in place they referenced nothing, and
+            ;; re-attached to a later table of the same name.
+            referencing
+            (when (get (dbi/-schema db) :pg/fk-parent-table)
+              (d/q '{:find [?e ?name ?child ?parent]
+                     :in [$ [?parent ...]]
+                     :where [[?e :pg/fk-parent-table ?parent]
+                             [?e :pg/fk-child-table ?child]
+                             (or-join [?e ?name]
+                                      [?e :pg/fk-conname ?name]
+                                      [?e :pg/fk-name ?name])]}
+                   db tables))
+            referencing (sort-by (juxt #(nth % 3) #(nth % 2) second)
+                                 (remove #(contains? table-set (nth % 2)) referencing))
+            _ (when (and (seq referencing) (not (:cascade? parsed)))
+                (let [[_ _ _ parent] (first referencing)]
+                  (throw (ex-info
+                          (str "cannot drop table " parent
+                               " because other objects depend on it")
+                          {:error :dependent-objects-still-exist
+                           :sqlstate "2BP01"
+                           :detail (str/join "\n"
+                                             (for [[_ name child p] referencing]
+                                               (str "constraint " name " on table " child
+                                                    " depends on table " p)))
+                           :hint "Use DROP ... CASCADE to drop the dependent objects too."}))))
+            tx-data (into (mapv (fn [[e]] [:db/retractEntity e]) referencing)
+                          (mapcat #(drop-table-tx-data db %))
+                          tables)
             result (if (:in-tx? @tx-state)
                      (execute-ddl-in-tx tx-state tx-data "DROP TABLE")
                      (do

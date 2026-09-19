@@ -152,6 +152,64 @@
   (when-let [specs (.getColumnSpecs col)]
     (specs-contain-seq? specs ["not" "null"])))
 
+(defn constraint-key
+  "The identity of constraint `name` on `table`. PostgreSQL constraint
+   names are unique per table, not per database: two tables can each have
+   a CHECK called `positive`."
+  [table name]
+  (str table "\u001f" name))
+
+(defn- check-columns
+  "The distinct columns a CHECK expression references, or nil when it
+   cannot be read."
+  [^String expr]
+  (when-let [ast (try (CCJSqlParserUtil/parseCondExpression expr)
+                      (catch Exception _ nil))]
+    (try
+      (let [cols (java.util.LinkedHashSet.)]
+        (ColumnSubstitutingDeParser/deparse
+         ast (reify java.util.function.Function
+               (apply [_ c]
+                 (.add cols (params/unquote-ident (.getColumnName ^Column c)))
+                 "")))
+        (vec cols))
+      (catch ColumnSubstitutingDeParser$Unsupported _ nil))))
+
+(defn- make-object-name
+  "PostgreSQL's makeObjectName: `name1_name2_label`, shortening the longer
+   of name1 and name2 until the whole fits NAMEDATALEN - 1 (63) bytes."
+  [^String name1 ^String name2 ^String label]
+  (let [avail (- 63 (inc (count label)) (if name2 1 0))
+        [n1 n2] (loop [n1 (count name1) n2 (count (or name2 ""))]
+                  (if (<= (+ n1 n2) avail)
+                    [n1 n2]
+                    (if (> n1 n2) (recur (dec n1) n2) (recur n1 (dec n2)))))]
+    (str (subs name1 0 n1)
+         (when name2 (str "_" (subs name2 0 n2)))
+         "_" label)))
+
+(defn- choose-constraint-name
+  "PostgreSQL's ChooseConstraintName: name1_name2_label if no other
+   constraint of the table has it, else with the first free number
+   appended to the label (`t_check`, `t_check1`, ...), re-shortened to
+   fit."
+  [taken name1 name2 label]
+  (some #(let [n (make-object-name name1 name2 (str label %))]
+           (when-not (contains? taken n) n))
+        (cons "" (iterate inc 1))))
+
+(defn- reject-duplicate-constraint-names!
+  "42710 for two explicitly named constraints of one table sharing a name,
+   worded as PostgreSQL words it for a CHECK."
+  [table-name check-names fk-names]
+  (let [counts (frequencies (remove nil? (concat check-names fk-names)))]
+    (when-let [dup (some (fn [[n c]] (when (> c 1) n)) counts)]
+      (throw (ex-info (if (some #{dup} check-names)
+                        (str "check constraint \"" dup "\" already exists")
+                        (str "constraint \"" dup "\" for relation \""
+                             table-name "\" already exists"))
+                      {:error :duplicate-object :sqlstate "42710"})))))
+
 (defn reject-check-subquery!
   "PostgreSQL refuses a subquery in a CHECK constraint -- of a table or a
    domain -- when it is created (0A000), rather than on every write. Row-level evaluation
@@ -167,6 +225,15 @@
         (when (= "a subquery" (ex-message e))
           (throw (errors/pg-error :feature-not-supported
                                   {:message "cannot use subquery in check constraint"})))))))
+
+(defn- column-check-name
+  "The name of an inline `CONSTRAINT <name> CHECK (…)`, or nil."
+  [^ColumnDefinition col]
+  (when-let [specs (.getColumnSpecs col)]
+    (let [lowered (mapv #(str/lower-case (str %)) specs)
+          idx (.indexOf ^java.util.List lowered "check")]
+      (when (and (>= idx 2) (= "constraint" (nth lowered (- idx 2))))
+        (params/unquote-ident (str (nth specs (dec idx))))))))
 
 (defn column-check-expr-text
   "Extract the text of an inline `CHECK (…)` constraint from a
@@ -389,7 +456,7 @@
         ;; ColumnSpecs text.
         col-checks (vec (keep (fn [^ColumnDefinition col]
                                 (when-let [et (column-check-expr-text col)]
-                                  {:name nil
+                                  {:name (column-check-name col)
                                    :col (params/unquote-ident (.getColumnName col))
                                    :expr et}))
                               columns))
@@ -930,20 +997,34 @@
                                :datahike.pg/hidden true})
                             tuple-attrs)
         schema-tx (into schema-tx (into tuple-schema-tx tuple-hint-tx))
-        ;; CHECK-constraint entities. One per CHECK clause, named
-        ;; deterministically so CREATE TABLE IF NOT EXISTS is
-        ;; idempotent (:pg/check-name carries :db.unique/identity).
+        ;; CHECK-constraint entities, one per CHECK clause, identified by
+        ;; (table, name) so CREATE TABLE IF NOT EXISTS is idempotent and
+        ;; two tables may use the same constraint name. An unnamed CHECK
+        ;; is named as PostgreSQL names it: <table>_<column>_check when it
+        ;; references exactly one column, else <table>_check, numbered
+        ;; when taken.
         _ (doseq [{:keys [expr]} (:checks constraints)]
             (reject-check-subquery! expr))
+        _ (reject-duplicate-constraint-names!
+           table-name (map :name (:checks constraints)) (map :name (:fks constraints)))
+        ;; Names chosen so far, across CHECK and FOREIGN KEY: PostgreSQL
+        ;; numbers a generated name that any constraint of the table has.
+        constraint-names
+        (atom (set (remove nil? (concat (map :name (:checks constraints))
+                                        (map :name (:fks constraints))))))
+        choose! (fn [explicit name2 label]
+                  (let [n (or explicit (choose-constraint-name
+                                        @constraint-names table-name name2 label))]
+                    (swap! constraint-names conj n)
+                    n))
         check-entities
-        (vec (for [[i {:keys [name col expr]}] (map-indexed vector (:checks constraints))
-                   :let [cname (or name
-                                   (if col
-                                     (str table-name "_" col "_check")
-                                     (str table-name "_check_" i)))]]
-               {:pg/check-name  cname
-                :pg/check-table table-name
-                :pg/check-expr  expr}))
+        (vec (for [{:keys [name expr]} (:checks constraints)
+                   :let [cols (check-columns expr)
+                         cname (choose! name (when (= 1 (count cols)) (first cols)) "check")]]
+               {:pg/constraint-key (constraint-key table-name cname)
+                :pg/check-conname  cname
+                :pg/check-table    table-name
+                :pg/check-expr     expr}))
         child-schema-by-col
         (into {}
               (keep (fn [datum]
@@ -956,9 +1037,7 @@
         fk-entities
         (vec (for [[i {:keys [name cols parent-table parent-cols on-delete on-update]}]
                    (map-indexed vector (:fks constraints))
-                   :let [cname (or name
-                                   (str table-name "_"
-                                        (str/join "_" cols) "_fkey"))
+                   :let [cname (choose! name (str/join "_" cols) "fkey")
                          ;; SQL's omitted referenced-column list means the
                          ;; parent's PRIMARY KEY, not an empty tuple.  Keeping
                          ;; it empty made every inline `REFERENCES parent`
@@ -1021,7 +1100,8 @@
                          od (->action on-delete)
                          ou (->action on-update)]
                    :when parent-table]
-               (cond-> {:pg/fk-name         cname
+               (cond-> {:pg/constraint-key  (constraint-key table-name cname)
+                        :pg/fk-conname      cname
                         :pg/fk-child-table  table-name
                         :pg/fk-child-cols   (jb/serialize-jsonb cols)
                         :pg/fk-parent-table parent-table
@@ -1043,9 +1123,9 @@
                                :detail (str "FOREIGN KEY ON DELETE "
                                             (name (:pg/fk-on-delete fk))
                                             " is not yet supported for "
-                                            (:pg/fk-name fk)
+                                            (:pg/fk-conname fk)
                                             " — only NO ACTION / RESTRICT / CASCADE are enforced")
-                               :constraint (:pg/fk-name fk)})))
+                               :constraint (:pg/fk-conname fk)})))
             (when (contains? #{:cascade :set-null :set-default}
                              (:pg/fk-on-update fk))
               (throw (ex-info "ON UPDATE action not supported"
@@ -1055,8 +1135,8 @@
                                :detail (str "FOREIGN KEY ON UPDATE "
                                             (name (:pg/fk-on-update fk))
                                             " is not yet supported for "
-                                            (:pg/fk-name fk))
-                               :constraint (:pg/fk-name fk)}))))
+                                            (:pg/fk-conname fk))
+                               :constraint (:pg/fk-conname fk)}))))
         ;; Sequence schema + initial entity for each IDENTITY column
         seq-tx (vec (mapcat (fn [col-name]
                               (let [seq-name (str table-name "_" col-name "_seq")

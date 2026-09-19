@@ -1730,20 +1730,20 @@
           checks  (try
                     (q-fn '{:find  [?n ?t ?x]
                             :keys  [name table expr]
-                            :where [[?e :pg/check-name ?n]
-                                    [?e :pg/check-table ?t]
-                                    [?e :pg/check-expr ?x]]}
+                            :where [[?e :pg/check-table ?t]
+                                    [?e :pg/check-expr ?x]
+                                    (or-join [?e ?n] [?e :pg/check-conname ?n] [?e :pg/check-name ?n])]}
                           cte-db)
                     (catch Throwable _ []))
           ;; FK constraints persisted via :pg/fk-* attrs.
           fks (try
                 (q-fn '{:find  [?n ?ct ?cc ?pt ?pc]
                         :keys  [name child-table child-cols parent-table parent-cols]
-                        :where [[?e :pg/fk-name ?n]
-                                [?e :pg/fk-child-table ?ct]
+                        :where [[?e :pg/fk-child-table ?ct]
                                 [?e :pg/fk-child-cols ?cc]
                                 [?e :pg/fk-parent-table ?pt]
-                                [?e :pg/fk-parent-cols ?pc]]}
+                                [?e :pg/fk-parent-cols ?pc]
+                                (or-join [?e ?n] [?e :pg/fk-conname ?n] [?e :pg/fk-name ?n])]}
                       cte-db)
                 (catch Throwable _ []))
           ->oid (fn [kind nm tbl]
