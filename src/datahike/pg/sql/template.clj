@@ -508,7 +508,7 @@
         (let [bound (mapv (fn [i raw]
                             (let [attr (get idx->attr (inc i))]
                               (if attr
-                                (or (stmt/coerce-insert-value raw attr schema) raw)
+                                (stmt/coerce-insert-value raw attr schema)
                                 raw)))
                           (range) raws)]
           (-> (cond-> (update parsed :tx-data params/substitute-params bound)

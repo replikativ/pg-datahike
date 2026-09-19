@@ -12,9 +12,9 @@
    :db/valueType, and `translate-insert` / `translate-update` /
    `translate-delete` produce tx-data + (for UPDATE/DELETE) an
    eids-walk query. INSERT RETURNING and UPDATE RETURNING land in
-   `extract-returning`; CHECK / UPDATE expressions evaluated
-   per-row at handler time go through `eval-check-predicate` /
-   `eval-update-expr`.
+   `extract-returning`; UPDATE expressions evaluated per row at handler
+   time go through `eval-update-expr`. CHECK constraints are evaluated
+   by datahike.pg.sql.row-eval.
 
    The bottom half implements CTEs: `translate-cte-branch`
    materializes one WITH-clause body against an enriched db so the
@@ -198,7 +198,6 @@
          extract-value
          strict-scalar-value
          coerce-insert-value
-         eval-check-predicate
          eval-update-expr
          extract-returning
          materialize-table-function
@@ -6420,7 +6419,7 @@
     (long v)
     v))
 
-(defn- run-const-select
+(defn run-const-select
   "The single value of a parsed one-row `SELECT <expr>`, NULL as nil."
   [p db]
   (when (= :error (:type p))
@@ -6434,6 +6433,60 @@
             (let [lr (:literal-row p)]
               (if (sequential? lr) (first lr) lr)))]
     (when-not (= :__null__ v) (widen-integral v))))
+
+(defn const-select-fn
+  "A function of the in-args vector computing what run-const-select would,
+   for a plan whose query is only a chain of function clauses -- the shape
+   the translator emits for a FROM-less one-row SELECT. nil for any other
+   shape (data patterns, or/not, rules), which only d/q evaluates.
+
+   For expressions evaluated once per written row (CHECK constraints): d/q
+   costs far more than the functions it calls, most of it re-planning a
+   query the statement's own queries have pushed out of its cache. The
+   clauses run in the order the translator emitted them, which is the
+   order their inputs are bound; a function returning nil binds nothing
+   and so yields no row, as in d/q."
+  [p]
+  (let [{:keys [find where in] :as q} (:query p)]
+    (when (and (map? q) (= '$ (first in)) (= 1 (count find)) (symbol? (first find))
+               (empty? (:with q)) (nil? (:enriched-db p))
+               (every? (fn [c]
+                         (and (vector? c) (seq? (first c)) (symbol? (ffirst c))
+                              (<= 1 (count c) 2)
+                              (or (= 1 (count c)) (symbol? (second c)))))
+                       where))
+      (let [in-syms (vec (rest in))
+            var-sym? #(and (symbol? %) (str/starts-with? (name %) "?"))
+            resolve-fn (fn [f]
+                         (when-not (var-sym? f)
+                           (some-> (when (namespace f) (requiring-resolve f)) deref)))
+            clauses (mapv (fn [[[f & args] out]]
+                            {:f f :fixed (resolve-fn f) :args (vec args) :out out})
+                          where)]
+        (when (and (every? #(or (:fixed %) (var-sym? (:f %))) clauses)
+                   ;; Every variable a clause reads is bound before it, and
+                   ;; the find variable at the end: the order d/q would
+                   ;; have to find is the order written.
+                   (let [bound-at-end
+                         (reduce (fn [bound {:keys [f args out]}]
+                                   (if (every? #(or (not (var-sym? %)) (bound %))
+                                               (cons f args))
+                                     (cond-> bound out (conj out))
+                                     (reduced nil)))
+                                 (set in-syms) clauses)]
+                     (and bound-at-end (bound-at-end (first find)))))
+          (fn [in-args]
+            (let [env (zipmap in-syms in-args)
+                  arg (fn [env a] (if (var-sym? a) (get env a) a))
+                  env (reduce (fn [env {:keys [f fixed args out]}]
+                                (let [v (apply (or fixed (get env f)) (map #(arg env %) args))]
+                                  (cond
+                                    (nil? out) (if v env (reduced nil))
+                                    (nil? v) (reduced nil)
+                                    :else (assoc env out v))))
+                              env clauses)
+                  v (when env (get env (first find)))]
+              (when-not (or (nil? v) (= :__null__ v)) (widen-integral v)))))))))
 
 (defn- const-value
   "Value of an INSERT VALUES expression that is not a plain literal,
@@ -6726,7 +6779,9 @@
    value when no target is resolvable (hint-only refs without a
    threaded db, or genuinely-unmapped refs)."
   [val attr schema & [db]]
-  (when (some? val)
+  ;; The query engine's NULL sentinel is SQL NULL here too: INSERT ...
+  ;; SELECT passed `:__null__` through as a value, and Datahike rejected it.
+  (when (and (some? val) (not= :__null__ val))
     ;; A deferred call marker is NOT a value yet — `{:fn :nextval …}`,
     ;; `{:fn :now}`, `{:fn :eval …}` are resolved per execute, after
     ;; this. Coercing one here would treat the marker MAP as data: for a
@@ -7115,159 +7170,6 @@
                       value)))
                 (evaluate)))]
       (when-not (= :__null__ v) v))))
-
-(defn eval-check-predicate
-  "Evaluate a CHECK-style JSqlParser Expression against an entity map
-   and return a tri-state: true (satisfied), false (violation), or
-   nil (unknown — PG treats as satisfied). This is distinct from
-   eval-update-expr which returns the arithmetic value of the
-   expression; predicates need comparison / logical ops that only
-   make sense at enforcement time.
-
-   Column refs resolve via eval-update-expr so any entity-map-aware
-   coercion (namespace-qualified lookups) stays consistent between
-   SET-value evaluation and CHECK evaluation."
-  [expr entity-map ns-str schema]
-  (letfn [(operand [e] (eval-update-expr e entity-map ns-str schema))
-          (bool-cmp [^net.sf.jsqlparser.expression.BinaryExpression e op]
-            (let [l (operand (.getLeftExpression e))
-                  r (operand (.getRightExpression e))]
-              (when (and (some? l) (some? r)) (op l r))))
-          (num-pair [l r]
-            (cond
-              (and (number? l) (number? r)) [l r]
-              (and (some? l) (some? r))
-              (try [(Double/parseDouble (str l)) (Double/parseDouble (str r))]
-                   (catch Exception _ nil))
-              :else nil))]
-    (cond
-      (instance? net.sf.jsqlparser.expression.operators.relational.EqualsTo expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (operand (.getLeftExpression e))
-            r (operand (.getRightExpression e))]
-        (when (and (some? l) (some? r))
-          (cond
-            (and (number? l) (number? r)) (== l r)
-            :else (= l r))))
-      (instance? net.sf.jsqlparser.expression.operators.relational.NotEqualsTo expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (operand (.getLeftExpression e))
-            r (operand (.getRightExpression e))]
-        (when (and (some? l) (some? r))
-          (cond
-            (and (number? l) (number? r)) (not (== l r))
-            :else (not= l r))))
-      (instance? GreaterThan expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (operand (.getLeftExpression e))
-            r (operand (.getRightExpression e))]
-        (when-let [[a b] (num-pair l r)] (> a b)))
-      (instance? GreaterThanEquals expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (operand (.getLeftExpression e))
-            r (operand (.getRightExpression e))]
-        (when-let [[a b] (num-pair l r)] (>= a b)))
-      (instance? MinorThan expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (operand (.getLeftExpression e))
-            r (operand (.getRightExpression e))]
-        (when-let [[a b] (num-pair l r)] (< a b)))
-      (instance? MinorThanEquals expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (operand (.getLeftExpression e))
-            r (operand (.getRightExpression e))]
-        (when-let [[a b] (num-pair l r)] (<= a b)))
-      (instance? net.sf.jsqlparser.expression.operators.conditional.AndExpression expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (eval-check-predicate (.getLeftExpression e) entity-map ns-str schema)
-            r (eval-check-predicate (.getRightExpression e) entity-map ns-str schema)]
-        ;; PG 3VL: AND of (true,unknown) = unknown; (false,x) = false.
-        (cond (or (false? l) (false? r)) false
-              (and (true? l) (true? r)) true
-              :else nil))
-      (instance? net.sf.jsqlparser.expression.operators.conditional.OrExpression expr)
-      (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
-            l (eval-check-predicate (.getLeftExpression e) entity-map ns-str schema)
-            r (eval-check-predicate (.getRightExpression e) entity-map ns-str schema)]
-        (cond (or (true? l) (true? r)) true
-              (and (false? l) (false? r)) false
-              :else nil))
-      (instance? net.sf.jsqlparser.expression.NotExpression expr)
-      (let [^net.sf.jsqlparser.expression.NotExpression e expr
-            v (eval-check-predicate (.getExpression e) entity-map ns-str schema)]
-        (when (some? v) (not v)))
-      (instance? net.sf.jsqlparser.expression.operators.relational.IsNullExpression expr)
-      (let [^net.sf.jsqlparser.expression.operators.relational.IsNullExpression e expr
-            v (operand (.getLeftExpression e))]
-        (if (.isNot e) (some? v) (nil? v)))
-      (instance? net.sf.jsqlparser.expression.Parenthesis expr)
-      (eval-check-predicate
-       (.getExpression ^net.sf.jsqlparser.expression.Parenthesis expr)
-       entity-map ns-str schema)
-      (instance? net.sf.jsqlparser.expression.operators.relational.InExpression expr)
-      (let [^net.sf.jsqlparser.expression.operators.relational.InExpression e expr
-            l (operand (.getLeftExpression e))
-            rlist (.getRightExpression e)
-            items (when (instance? net.sf.jsqlparser.expression.operators.relational.ExpressionList rlist)
-                    (mapv operand
-                          (.getExpressions
-                           ^net.sf.jsqlparser.expression.operators.relational.ExpressionList rlist)))
-            hit? (boolean (and items (some #(= l %) items)))]
-        (if (.isNot e) (not hit?) hit?))
-
-      ;; `x BETWEEN lo AND hi` — symmetric, inclusive bounds, PG 3VL.
-      ;; Without this clause the :else fallback stringified the
-      ;; expression and returned a truthy "expression-text" — domains
-      ;; like `CHECK (VALUE BETWEEN 1 AND 100)` then accepted any
-      ;; value silently.
-      (instance? net.sf.jsqlparser.expression.operators.relational.Between expr)
-      (let [^net.sf.jsqlparser.expression.operators.relational.Between e expr
-            v  (operand (.getLeftExpression e))
-            lo (operand (.getBetweenExpressionStart e))
-            hi (operand (.getBetweenExpressionEnd e))]
-        (if (or (nil? v) (nil? lo) (nil? hi))
-          nil
-          (let [in? (or (when-let [[a b c] (and (number? v) (number? lo) (number? hi)
-                                                [v lo hi])]
-                          (and (>= a b) (<= a c)))
-                        (try
-                          (let [[a b c] [(Double/parseDouble (str v))
-                                         (Double/parseDouble (str lo))
-                                         (Double/parseDouble (str hi))]]
-                            (and (>= a b) (<= a c)))
-                          (catch Exception _ nil)))]
-            (cond
-              (nil? in?) nil
-              (.isNot e) (not in?)
-              :else      in?))))
-
-      ;; Leaf truthy-check — `CHECK (active)` where `active` is a
-      ;; boolean column lands here. We only enter this branch for
-      ;; shapes whose `operand` result is genuinely a stored value
-      ;; (Column ref, scalar literal). Other AST shapes (Function,
-      ;; LikeExpression, RegExp, IS DISTINCT FROM, …) return `nil`
-      ;; below to honestly admit "unknown" — better to leave a
-      ;; row uncommitted-as-validated than to silently mark every
-      ;; row as passing because the operand stringified to a non-
-      ;; empty SQL fragment.
-      (or (instance? Column expr)
-          (instance? LongValue expr)
-          (instance? DoubleValue expr)
-          (instance? StringValue expr)
-          (instance? BooleanValue expr)
-          (instance? NullValue expr))
-      (let [v (operand expr)]
-        (cond (nil? v) nil
-              (false? v) false
-              :else true))
-
-      ;; Unrecognised shape — return nil (PG 3VL unknown). This
-      ;; matches the conservative "we couldn't evaluate, treat as
-      ;; satisfied" stance for CHECK constraints, but distinct from
-      ;; the explicit `true` we emit when we DID evaluate to a
-      ;; satisfied predicate. A future LIKE / regex / function-call
-      ;; clause should land above this `:else`.
-      :else nil)))
 
 (defn- num-operand
   "PG-style unknown-operand resolution for arithmetic: a text-format
@@ -8361,7 +8263,8 @@
             txdb schema table-name target-alias old-map attrs))]
     (when (or (nil? update-where)
               (true? (eval-in-context
-                      #(eval-check-predicate update-where % ns schema))))
+                      #((requiring-resolve 'datahike.pg.sql.row-eval/check-result)
+                        update-where % ns schema txdb))))
       (reduce
        (fn [{:keys [row-after] :as result}
             {:keys [attr value-expr]}]
@@ -8386,7 +8289,7 @@
                    (value-for attrs source-column))
                  (eval-in-context #(eval-update-expr value-expr % ns schema)))
                coerced (when (some? new-val)
-                         (or (coerce-insert-value new-val attr schema) new-val))]
+                         (coerce-insert-value new-val attr schema))]
            (cond-> (if (nil? new-val)
                      (assoc result :row-after (dissoc row-after attr))
                      (assoc-in result [:row-after attr] coerced))
@@ -8403,12 +8306,13 @@
   (row-constraints/prepare-candidate
    attrs constraint-plan
    (fn [value attr]
-     (or (coerce-insert-value value attr schema txdb) value))))
+     (coerce-insert-value value attr schema txdb))))
 
 (defn- validate-conflict-row-constraints!
   [txdb table-name attrs constraint-plan effective-rows include-fk?]
-  (let [eval-check (fn [ast row ns schema]
-                     (eval-check-predicate ast row ns schema))]
+  ;; row-eval sits above this namespace (it translates through
+  ;; datahike.pg.sql), hence the runtime resolve.
+  (let [eval-check ((requiring-resolve 'datahike.pg.sql.row-eval/check-fn) txdb)]
     (if include-fk?
       (row-constraints/validate-mutation!
        txdb table-name attrs constraint-plan effective-rows eval-check nil)

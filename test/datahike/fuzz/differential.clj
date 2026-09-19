@@ -142,6 +142,15 @@
         "(2,'23:59:59.5','00:00:00-03:30','2021-06-15 23:30:00.25+00:00',-0.75,'02:03:04','2021-06-15','2021-06-15 00:00:00.125'),"
         "(3,NULL,NULL,NULL,NULL,NULL,NULL,NULL)")])
 
+(def check-setup
+  ;; CHECK shapes beyond numeric comparison: text order, LIKE, dates,
+  ;; BETWEEN, jsonb operators, IS DISTINCT FROM. Only inserted into, and
+  ;; compared by outcome, so it is seeded once per run, not per sample.
+  ["DROP TABLE IF EXISTS fc"
+   (str "CREATE TABLE fc (id int, s text CHECK (s LIKE 'a%' OR s > 'm'), "
+        "d date CHECK (d < '2030-01-01'), n numeric CHECK (n BETWEEN 0 AND 10), "
+        "j jsonb CHECK (j ->> 'k' IS DISTINCT FROM 'bad'))")])
+
 (defn- seed!
   "Run the fixture statements (default: the mutable `ft`/`fu` tables, which
    the DML surface re-seeds before every sample)."
@@ -378,7 +387,12 @@
   [^java.util.Random r]
   (let [pick (fn [v] (nth v (.nextInt r (count v))))
         num  #(pick (into cols-num ["1" "0" "-1" "2.5" "10"]))]
-    (case (.nextInt r 10)
+    (case (.nextInt r 11)
+      10 (let [[col vals] (pick [["s" ["'abc'" "'b'" "'zz'" "'m'" "''" "NULL"]]
+                                 ["d" ["'2020-01-01'" "'2040-01-01'" "'2030-01-01'" "NULL"]]
+                                 ["n" ["0" "10" "10.5" "-1" "'5'" "NULL"]]
+                                 ["j" ["'{\"k\":\"bad\"}'" "'{\"k\":\"ok\"}'" "'{}'" "NULL"]]])]
+           [:check (format "INSERT INTO fc (id, %s) VALUES (1, %s)" col (pick vals))])
       0 [:upd (format "UPDATE ft SET i = %s WHERE %s %s %s" (num) (num) (pick cmp) (num))]
       1 [:upd (format "UPDATE ft SET s = 'z' WHERE NOT (%s %s %s)" (num) (pick cmp) (num))]
       2 [:upd (format "UPDATE ft SET i = i + 1 WHERE id IN (SELECT id FROM ft WHERE %s %s %s)"
@@ -425,6 +439,8 @@
     (doseq [c [o t]] (exec! c "SET TimeZone='UTC'"))
     (when (not= surface :dml)
       (doseq [c [o t]] (seed! c) (seed! c value-setup)))
+    (when (= surface :dml)
+      (doseq [c [o t]] (seed! c check-setup)))
     (let [r (java.util.Random. (long seed))]
       (loop [i 0 seen #{} ran {} diffs []]
         (if (>= i n)

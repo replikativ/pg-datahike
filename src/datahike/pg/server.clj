@@ -35,6 +35,7 @@
             [datahike.pg.schema :as pgs]
             [datahike.pg.secondary :as pg-secondary]
             [datahike.pg.sql :as sql]
+            [datahike.pg.sql.row-eval :as row-eval]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.bits :as pg-bits]
@@ -2010,250 +2011,6 @@
             {:message (str "cannot insert a non-DEFAULT value into identity column \""
                            col "\"")}))))
 
-(defn- eval-default
-  "Evaluate a :pg/default-* triple at INSERT time. Stateless defaults
-   (literal + function) resolve immediately; stateful ones (nextval)
-   return a sentinel the tx-fn unwraps against the txdb snapshot so
-   sequence bumps are atomic with the row insert.
-
-   Returns either a concrete value or [::nextval seq-name] — the
-   caller must handle that sentinel inside :db.fn/call."
-  [kind value arg]
-  (case kind
-    :literal (try (cond
-                    (nil? value) nil
-                    (#{"true"} value) true
-                    (#{"false"} value) false
-                    (re-matches #"-?\d+" value) (Long/parseLong value)
-                    (re-matches #"-?\d+\.\d+" value) (Double/parseDouble value)
-                    :else value)
-                  (catch Exception _ value))
-    ;; Bit defaults must remain strings even when the digit run happens to
-    ;; look numeric. :literal retains its legacy numeric inference for
-    ;; existing database metadata.
-    (:bit :bit-coerced) value
-    :fn      (case value
-               "now"           (java.util.Date.)
-               "current_date"  (java.time.LocalDate/now java.time.ZoneOffset/UTC)
-               "current_time"  (java.time.LocalTime/now java.time.ZoneOffset/UTC)
-               "current_user"  "datahike"
-               nil)
-    :nextval (when value [::nextval value])
-    nil))
-
-(defn- read-check-constraints*
-  [db table-name]
-  (mapv (fn [{:keys [name expr]}] {:name name :expr expr})
-        (d/q '{:find [?n ?x]
-               :keys [name expr]
-               :in [$ ?tbl]
-               :where [[?e :pg/check-name ?n]
-                       [?e :pg/check-table ?tbl]
-                       [?e :pg/check-expr ?x]]}
-             db table-name)))
-
-(defn- read-check-constraints
-  "All CHECK constraints for `table-name`. Returns a vector of
-   {:name str :expr str} pairs. Empty when the table has none.
-   Memoised per (schema, table)."
-  [db table-name]
-  (let [v (schema-cached db [::check table-name]
-                         #(read-check-constraints* db table-name))]
-    (if (= ::nil v) [] v)))
-
-(def ^:private check-expr-ast-cache
-  "CHECK-expression text → parsed AST. Bounded LRU: enforcement runs
-   once per ROW per constraint, and re-parsing through JSqlParser per
-   row made bulk INSERTs pay a full parse × rows × constraints. The
-   AST is read-only after parse (same argument as sql.clj's AST cache),
-   and keying on the expression text needs no invalidation — a changed
-   constraint is a different string."
-  (pg-cache/bounded-cache 512))
-
-(defn- parse-check-expression
-  "Parse a stored CHECK expression string into a JSqlParser Expression
-   AST, memoised by text. Parsing at enforcement time (not CREATE
-   TABLE) keeps the persisted form a plain string — cheap to persist,
-   round-trips across restarts, no ABI ties to JSqlParser's Expression
-   class hierarchy."
-  [^String expr-text]
-  (or (.get ^java.util.Map check-expr-ast-cache expr-text)
-      (let [ast (try
-                  (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseCondExpression expr-text)
-                  (catch Exception _
-                    (net.sf.jsqlparser.parser.CCJSqlParserUtil/parseExpression expr-text)))]
-        (.put ^java.util.Map check-expr-ast-cache expr-text ast)
-        ast)))
-
-(defn- enforce-check-constraints!
-  "Evaluate every CHECK expression registered for `table-name` against
-   a proposed entity map. Raises 23514 when the expression yields
-   literal false. PG's semantics: CHECK returning NULL is NOT a
-   violation (unknown → passes), distinct from NOT NULL — the
-   tri-state from sql/eval-check-predicate encodes that directly."
-  [db table-name ns entity-map]
-  (let [checks (seq (read-check-constraints db table-name))]
-    (when checks
-      (let [schema (dbi/-schema db)]
-        (doseq [{:keys [name expr]} checks]
-          (let [ast (parse-check-expression expr)
-                val (try
-                      (sql/eval-check-predicate ast entity-map ns schema)
-                      (catch Exception _ ::error))]
-            (when (false? val)
-              (throw (ex-info "check constraint violation"
-                              {:error :check-violation
-                               :table table-name
-                               :constraint name})))))))))
-
-(defn- read-domain-enum-checks*
-  [db table-name]
-  ;; Pull every column-attr in this table's namespace that has a
-  ;; :datahike.pg/domain-of or :datahike.pg/enum-of hint. For each,
-  ;; resolve the registry entity and pre-parse the CHECK expression
-  ;; (domains) / freeze the value-set (enums) so per-row enforcement
-  ;; is just a pre-computed lookup + AST eval / set membership.
-  ;;
-  ;; `get-else` doesn't accept nil as default; use the project-wide
-  ;; `:__null__` sentinel and unwrap it in Clojure (matches the
-  ;; convention in datahike.pg.jsonb / datahike.pg.window).
-  (let [unwrap-null (fn [v] (when (not= v :__null__) v))
-        domain-rows
-        (d/q '{:find [?ident ?dname ?cname ?cexpr ?nn]
-               :keys [ident domain-name check-name check-expr not-null]
-               :in [$ ?tbl]
-               :where [[?col :db/ident ?ident]
-                       [?col :datahike.pg/domain-of ?dname]
-                       [(namespace ?ident) ?ns]
-                       [(= ?ns ?tbl)]
-                       [?dom :datahike.pg.domain/name ?dname]
-                       [(get-else $ ?dom :datahike.pg.domain/check-name :__null__) ?cname]
-                       [(get-else $ ?dom :datahike.pg.domain/check-expr :__null__) ?cexpr]
-                       [(get-else $ ?dom :datahike.pg.domain/not-null false) ?nn]]}
-             db table-name)
-        enum-rows
-        (d/q '{:find [?ident ?ename ?vs]
-               :keys [ident enum-name values]
-               :in [$ ?tbl]
-               :where [[?col :db/ident ?ident]
-                       [?col :datahike.pg/enum-of ?ename]
-                       [(namespace ?ident) ?ns]
-                       [(= ?ns ?tbl)]
-                       [?en :datahike.pg.enum/name ?ename]
-                       [?en :datahike.pg.enum/values ?vs]]}
-             db table-name)
-        result (java.util.HashMap.)]
-    (doseq [{:keys [ident domain-name check-name check-expr not-null]} domain-rows]
-      (let [col (name ident)
-            check-expr (unwrap-null check-expr)
-            check-name (unwrap-null check-name)]
-        (.put result col
-              {:kind :domain
-               :attr ident
-               :domain-name domain-name
-               :check-name check-name
-               :not-null? not-null
-               :check-ast (when check-expr
-                            (parse-check-expression check-expr))})))
-    (let [enum-map (java.util.HashMap.)]
-      (doseq [{:keys [ident enum-name values]} enum-rows]
-        (let [col (name ident)
-              cur (.get enum-map col)]
-          (.put enum-map col
-                {:kind :enum
-                 :attr ident
-                 :enum-name enum-name
-                 :values (conj (or (:values cur) #{}) (str values))})))
-      (doseq [[col spec] enum-map]
-        (.put result col (assoc spec :unsafe-values
-                                (params/unsafe-enum-values db (:enum-name spec))))))
-    (into {} result)))
-
-(defn- read-domain-enum-checks
-  "Cached per (schema, table). Returns
-     {col-name <spec>}
-   where <spec> is either
-     {:kind :domain :attr kw :domain-name str :check-name str
-      :not-null? bool :check-ast AST-or-nil}
-     {:kind :enum   :attr kw :enum-name str :values #{string ...}}.
-   Empty when the table has no domain- or enum-typed columns."
-  [db table-name]
-  (let [v (schema-cached db [::dom-enum table-name]
-                         #(read-domain-enum-checks* db table-name))]
-    (if (= ::nil v) {} v)))
-
-(defn- enforce-domain-enum-checks!
-  "Per-row column-level domain CHECK + enum membership enforcement.
-   Raises 23514 (CHECK violation) for domain failures, 22P02
-   (invalid_text_representation) for enum membership failures.
-   Both are PG-canonical. Cheap: each row visits only the columns
-   that are domain- or enum-typed in this table."
-  [db table-name ns entity-maps]
-  (let [specs (read-domain-enum-checks db table-name)]
-    (when (seq specs)
-      (let [schema (dbi/-schema db)]
-        (doseq [em entity-maps
-                [col-name spec] specs
-                :let [attr (:attr spec)
-                      ;; Look up the value under either the schema-
-                      ;; declared attr or the parsed ns-prefix; INSERT
-                      ;; tx-data uses the latter.
-                      v (if (contains? em attr)
-                          (get em attr)
-                          (get em (keyword ns col-name)))]]
-          (cond
-            ;; Domain :not-null lives on the domain itself, not the
-            ;; column. Column-level :pg/not-null already fired above
-            ;; in apply-column-constraints — this is the *domain*'s
-            ;; constraint. Both are 23502.
-            (and (= :domain (:kind spec))
-                 (:not-null? spec)
-                 (nil? v))
-            (throw (ex-info "domain not-null violation"
-                            {:error :not-null-violation
-                             :table table-name
-                             :column col-name
-                             :domain (:domain-name spec)}))
-
-            ;; Domain CHECK with a parsed AST. PG's `VALUE` keyword
-            ;; refers to the column's value; bind it under the
-            ;; conventional lower-case unqualified keyword so the existing
-            ;; eval-check-predicate / eval-update-expr machinery
-            ;; resolves it without a special case.
-            (and (= :domain (:kind spec)) (:check-ast spec))
-            (let [r (sql/eval-check-predicate (:check-ast spec)
-                                              {(keyword "" "value") v}
-                                              "" schema)]
-              (when (false? r)
-                (throw (ex-info "domain check constraint violation"
-                                {:error :check-violation
-                                 :table table-name
-                                 :column col-name
-                                 :constraint (or (:check-name spec)
-                                                 (str (:domain-name spec) "_check"))
-                                 :domain (:domain-name spec)
-                                 :value v}))))
-
-            ;; Enum membership. Stored values come back as :many
-            ;; strings, regardless of how the user inserted (string vs
-            ;; keyword). Compare via str-coercion so both shapes work.
-            (and (= :enum (:kind spec)) (some? v))
-            (do
-              (when-not (contains? (:values spec) (str v))
-                (throw (ex-info "invalid input value for enum"
-                                {:error :invalid-text-representation
-                                 :type  (:enum-name spec)
-                                 :value v
-                                 :table table-name
-                                 :column col-name})))
-              (when (contains? (:unsafe-values spec) (str v))
-                (throw (ex-info (str "unsafe use of new value " (pr-str (str v))
-                                     " of enum type " (:enum-name spec))
-                                {:sqlstate "55P04"
-                                 :hint "New enum values must be committed before they can be used."
-                                 :type (:enum-name spec) :value v
-                                 :table table-name :column col-name}))))))))))
-
 (defn- read-fk-constraints
   "All FK constraints where the given table is the CHILD side. Returns
    a vector of {:name :child-cols :parent-table :parent-cols} entries.
@@ -2569,6 +2326,15 @@
                             pgs/*catalog-tx-cache* nil]
                     (row-constraints/constraint-metadata db table-name))))
 
+(defn- row-constraint-plan
+  "The compiled constraint plan (NOT NULL, DEFAULT, CHECK, FK, domain,
+   enum) of `table-name`, cached per schema value. INSERT, UPDATE, upsert
+   and COPY all validate rows through it."
+  [db table-name]
+  (schema-cached db [::row-constraint-plan table-name]
+                 #(row-constraints/compile-constraint-metadata
+                   (cached-row-constraint-metadata db table-name))))
+
 (defn- apply-column-constraints
   "Wrap an INSERT tx-data vector in a :db.fn/call that validates
    every incoming entity against the table's registered constraints:
@@ -2590,9 +2356,7 @@
    the live connection before this function checks their resulting values."
   [tx-data table-name ns db]
   (let [constraint-plan
-        (schema-cached db [::row-constraint-plan table-name]
-                       #(row-constraints/compile-constraint-metadata
-                         (cached-row-constraint-metadata db table-name)))
+        (row-constraint-plan db table-name)
         explicit-nulls? (some (fn [entry]
                                 (and (map? entry) (some nil? (vals entry))))
                               tx-data)]
@@ -2615,9 +2379,8 @@
                                     (row-constraints/prepare-candidate
                                      entry constraint-plan
                                      (fn [value attr]
-                                       (or (#'sql/coerce-insert-value
-                                            value attr (dbi/-schema txdb) txdb)
-                                           value)))]
+                                       (#'sql/coerce-insert-value
+                                        value attr (dbi/-schema txdb) txdb)))]
                                 (conj acc attrs))))
                           []
                           input-tx-data)
@@ -2633,8 +2396,7 @@
               (doseq [em filled-entities]
                 (row-constraints/validate-mutation!
                  txdb table-name em constraint-plan effective-rows
-                 (fn [ast row ns schema]
-                   (sql/eval-check-predicate ast row ns schema))
+                 (row-eval/check-fn txdb)
                  nil))
              ;; Datahike represents SQL NULL as an absent datom.  Nil map
              ;; entries existed only long enough to distinguish explicit
@@ -2702,16 +2464,14 @@
                             (resolve-value (get attrs attr))
                             (materialize-column-default default resolve-value))
                  coerced (when (some? resolved)
-                           (or (#'sql/coerce-insert-value resolved attr schema db)
-                               resolved))]
+                           (#'sql/coerce-insert-value resolved attr schema db))]
              (cond-> attrs
                (or present? default) (assoc attr coerced))))
          candidate
          (:columns constraint-plan))]
     (row-constraints/validate-pre-arbiter!
      db (:table constraint-plan) attrs constraint-plan
-     (fn [ast row ns schema]
-       (sql/eval-check-predicate ast row ns schema))
+     (row-eval/check-fn db)
      nil)
     attrs))
 
@@ -2727,9 +2487,8 @@
               (if (contains? attrs attr)
                 (let [resolved (resolve-value (get attrs attr))
                       coerced (when (some? resolved)
-                                (or (#'sql/coerce-insert-value
-                                     resolved attr schema db)
-                                    resolved))]
+                                (#'sql/coerce-insert-value
+                                 resolved attr schema db))]
                   (assoc attrs attr coerced))
                 attrs))
             candidate source-order)))
@@ -2812,9 +2571,7 @@
   [parsed base-db resolve-value]
   (let [table-name (:table parsed)
         constraint-plan
-        (schema-cached base-db [::row-constraint-plan table-name]
-                       #(row-constraints/compile-constraint-metadata
-                         (cached-row-constraint-metadata base-db table-name)))
+        (row-constraint-plan base-db table-name)
         unique-specs (when (= :plain (:insert-mode parsed))
                        (plain-unique-specs base-db table-name constraint-plan))]
     (loop [candidates (:insert-candidates parsed)
@@ -2857,8 +2614,7 @@
               (row-constraints/validate-mutation!
                base-db table-name row constraint-plan
                (:effective-rows conflict-state)
-               (fn [ast row ns schema]
-                 (sql/eval-check-predicate ast row ns schema))
+               (row-eval/check-fn base-db)
                nil))
             {:tx-data (:tx-data conflict-state)
              :row-refs (:row-refs conflict-state)
@@ -3241,14 +2997,13 @@
                                             raw-val (if default?
                                                       (when-let [[kind value arg]
                                                                  (:default (get column-constraints column))]
-                                                        (let [v (eval-default kind value arg)]
-                                                          (when (and (vector? v)
-                                                                     (= ::nextval (first v)))
+                                                        (do
+                                                          (when (= :nextval kind)
                                                             (throw (ex-info
                                                                     "UPDATE SET DEFAULT for sequence-backed columns is not supported"
                                                                     {:error :feature-not-supported
                                                                      :sqlstate "0A000"})))
-                                                          v))
+                                                          (row-constraints/eval-default kind value)))
                                                       (binding [params/*from-bindings* eff-from-bindings
                                                                 params/*from-source-aliases*
                                                                 (when from-bindings
@@ -3429,10 +3184,10 @@
    existence) see only committed data. That's fine — PG does the
    same for non-deferred constraints."
   [db table-name ns tx-data]
-  (let [checks? (seq (read-check-constraints db table-name))
-        domains? (seq (read-domain-enum-checks db table-name))
+  (let [plan (row-constraint-plan db table-name)
+        row-checks? (or (seq (:checks plan)) (seq (:domain-enum plan)))
         fks?    (seq (read-fk-constraints db table-name))]
-    (when (or checks? domains? fks?)
+    (when (or row-checks? fks?)
       (let [;; Group ops by eid. Map form (for INSERT-in-UPDATE? rare)
             ;; pass through untouched.
             ops-by-eid (reduce (fn [acc op]
@@ -3453,10 +3208,10 @@
                                        :db/retract (dissoc m attr)
                                        m))
                                    base ops)]]
-          (when checks?
-            (enforce-check-constraints! db table-name ns post))
-          (when domains?
-            (enforce-domain-enum-checks! db table-name ns [post]))
+          ;; The same CHECK, domain and enum validation INSERT runs.
+          (when row-checks?
+            (row-constraints/validate-pre-arbiter!
+             db table-name post plan (row-eval/check-fn db) nil))
           (when fks?
             (enforce-fk-on-insert! db table-name ns [post])))))))
 
@@ -5065,32 +4820,8 @@
    doc/design-alignment.md)."
   false)
 
-(defn- substitute-select-plan-params
-  "Substitute only execution-bearing values in a cached SELECT plan.
-
-   In particular, preserve enriched DB values, schemas, parser functions and
-   parameter-index maps by identity. Walking the complete INSERT source plan
-   rebuilt those large immutable structures on every prepared Execute."
-  [plan fetch]
-  (let [sub #(sql/substitute-params % fetch)]
-    (cond-> plan
-      (contains? plan :in-args) (update :in-args sub)
-      (contains? plan :literal-row) (update :literal-row sub)
-      (contains? plan :literal-rows) (update :literal-rows sub)
-      (contains? plan :compound-exprs) (update :compound-exprs sub)
-      (contains? plan :project-set) (update :project-set sub)
-      (contains? plan :secondary-candidate) (update :secondary-candidate sub)
-      (contains? plan :secondary-order-candidate)
-      (update :secondary-order-candidate sub)
-      (contains? plan :sub-results)
-      (update :sub-results
-              (fn [branches]
-                (mapv #(substitute-select-plan-params % fetch) branches)))
-      (contains? plan :deferred-recursive-ctes)
-      (update :deferred-recursive-ctes sub))))
-
 (defn- substitute-insert-source-params [source-plan fetch]
-  (cond-> (update source-plan :source substitute-select-plan-params fetch)
+  (cond-> (update source-plan :source params/substitute-select-plan fetch)
     (get-in source-plan [:conflict-plan :set-params])
     (update-in [:conflict-plan :set-params]
                #(sql/substitute-params % fetch))))
@@ -9155,6 +8886,7 @@
    `nil`s as datoms."
   [{:keys [domain-name base-type base-args
            check-name check-expr not-null default-raw]}]
+  (when check-expr (ddl/reject-check-subquery! check-expr))
   [{:db/ident :datahike.pg.domain/name
     :db/valueType :db.type/string :db/cardinality :db.cardinality/one
     :db/unique :db.unique/identity}
@@ -10684,9 +10416,7 @@
           finalize-fn  (resolve (symbol (str decoder-ns) "decode-finalize"))
           decoder      (make-fn (assoc options :columns col-names))]
       (let [constraint-plan
-            (schema-cached db-now [::row-constraint-plan table]
-                           #(row-constraints/compile-constraint-metadata
-                             (cached-row-constraint-metadata db-now table)))
+            (row-constraint-plan db-now table)
             sequence-defaults (stmt/insert-sequence-defaults db-now table)
             ;; Identity generation can be represented by the durable sequence
             ;; catalog without a :pg/default-kind datom. Normalize it into the
@@ -10877,9 +10607,8 @@
                          (let [resolved (materialize-column-default
                                          default resolve-value)
                                coerced (when (some? resolved)
-                                         (or (#'sql/coerce-insert-value
-                                              resolved attr schema db-now)
-                                             resolved))]
+                                         (#'sql/coerce-insert-value
+                                          resolved attr schema db-now))]
                            (assoc candidate attr coerced))
                          (throw (ex-info
                                  "unexpected default marker in COPY data"
@@ -10954,8 +10683,7 @@
         _ (doseq [row tx-data]
             (row-constraints/validate-mutation!
              speculative-db table row constraint-plan {}
-             (fn [ast logical-row row-ns schema]
-               (sql/eval-check-predicate ast logical-row row-ns schema))
+             (row-eval/check-fn speculative-db)
              nil))
         constrained-tx-data
         (binding [*statement-catalog-basis* catalog-basis]

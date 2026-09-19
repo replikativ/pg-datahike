@@ -4,6 +4,32 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### CHECK constraints are evaluated like SELECT
+
+CHECK constraints, domain checks and ON CONFLICT ... WHERE are evaluated by the SELECT translator (`datahike.pg.sql.row-eval`). The expression's columns become typed parameters of a one-row SELECT, which is translated once per expression. The interpreter it replaces is deleted. That interpreter treated every shape it did not know as satisfied, and compared only numbers with `<`/`>`. As a result:
+
+- `CHECK (name > 'm')`, `CHECK (d < '2030-01-01')`, `CHECK (s LIKE 'a%')`, regex, `IS DISTINCT FROM`, jsonb operators and array subscripts accepted every row.
+- Errors inside a CHECK (`x / 0`) were swallowed.
+- `ON CONFLICT DO UPDATE ... WHERE s LIKE 'a%'` never updated.
+
+Violations report PostgreSQL's messages: `new row for relation "t" violates check constraint "..."` and `value for domain d violates check constraint "..."`.
+
+Other fixes in this change:
+
+- Columns are typed exactly as declared: modifiers (`bit(3)`, `char(3)`), enum types and quoted identifiers such as Django's `"age"` are respected. A subscript's index may itself be a column. Shapes that can't be evaluated per row raise 0A000 instead of being evaluated wrongly.
+- CREATE TABLE refuses a subquery in a CHECK (`cannot use subquery in check constraint`), as PostgreSQL does.
+- UPDATE validates CHECK, domain and enum constraints through the same plan INSERT uses. The server's second copy of that code is removed.
+- Enums compare in declaration order in value position (`SELECT 'happy'::mood > 'sad'`, CHECKs), not by their labels' text.
+- An enum label outside the enum (`m > 'xyz'`) raises 22P02 when the statement is read, as PostgreSQL's parser does, in WHERE and in value position alike. `COLLATE` inside a CHECK, `timestamptz(3)`/`time(2)` columns and quoted mixed-case enum names evaluate correctly. CREATE DOMAIN refuses a subquery in its CHECK.
+- Writes keep a coerced `false`, and SQL NULL from `INSERT ... SELECT`. Six write paths wrapped the column coercion in `(or (coerce v) v)`: a coerced `false` fell back to its input text, and a NULL fell back to the query engine's internal sentinel, which Datahike then rejected.
+- A plan that is only a chain of function calls (a FROM-less one-row SELECT) runs without `d/q`, so per-row CHECKs cost about what the rest of the insert does.
+- A cast of a bound temporal value (`CAST($1 AS date)` over a `java.util.Date`) became NULL, because the fold read `Date.toString`. It now converts the value.
+- An untyped literal compared with a `time`/`timetz` expression is read as that type.
+- DEFAULT:
+  - A numeric literal keeps its text, so `numeric DEFAULT 1.50` keeps its scale.
+  - The server's second `eval-default`, which used the wall clock for `now()`, is removed.
+  - `now() AT TIME ZONE` is folded into `now()` only for UTC. Other zones are refused (0A000) instead of silently storing the wrong time.
+
 ### Text is read by PostgreSQL's input functions
 
 `datahike.pg.input` ports the input functions of bool, int2/int4/int8, oid, float4/float8 and uuid (boolin, pg_strtoint*, uint32in_subr, float4in/float8in, uuid_in). numeric keeps `coerce-numeric`, which already matched `numeric_in`. Every path from text to these types now goes through them, with PostgreSQL's SQLSTATEs and messages:

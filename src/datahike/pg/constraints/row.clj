@@ -7,6 +7,7 @@
    and therefore also enforces foreign keys.  Keeping those phases distinct
    mirrors PostgreSQL's ExecInsert/ExecOnConflictUpdate ordering."
   (:require [datahike.api :as d]
+            [datahike.pg.errors :as errors]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.params :as params])
@@ -186,17 +187,16 @@
       (seq (:fks plan))
       (seq (:domain-enum plan))))
 
-(defn eval-default [kind value]
+(defn eval-default
+  "The value of a column DEFAULT at write time, before the column's type
+   is applied. A literal is returned as its text: like any untyped
+   literal it is read by the column type's input function when the value
+   is coerced for the column (DEFAULT 1.50 on numeric keeps its scale; a
+   guess at the literal's type read it as a double). `now` is the
+   statement time, as PostgreSQL's transaction timestamp is."
+  [kind value]
   (case kind
-    :literal (try (cond
-                    (nil? value) nil
-                    (= "true" value) true
-                    (= "false" value) false
-                    (re-matches #"-?\d+" value) (Long/parseLong value)
-                    (re-matches #"-?\d+\.\d+" value) (Double/parseDouble value)
-                    :else value)
-                  (catch Exception _ value))
-    (:bit :bit-coerced) value
+    (:literal :bit :bit-coerced) value
     :fn (let [^java.util.Date statement-time
               (or params/*statement-time* (java.util.Date.))
               instant (.toInstant statement-time)
@@ -248,7 +248,8 @@
 
 (defn validate-pre-arbiter!
   "Enforce constraints PostgreSQL checks before unique-index arbitration.
-   `eval-check-fn` receives [AST logical-row table-name schema].
+   `eval-check-fn` receives [AST logical-row table-name schema], and for a
+   domain CHECK also a map typing VALUE as the domain column.
    `validate-domain-fn`, when supplied, receives the storage row."
   [db table-name attrs plan eval-check-fn validate-domain-fn]
   (doseq [{:keys [name attr not-null?]} (:columns plan)
@@ -260,9 +261,8 @@
     (let [logical (logical-row table-name attrs (:columns plan))]
       (doseq [{:keys [constraint ast]} (:checks plan)
               :when (false? (eval-check-fn ast logical table-name (:schema db)))]
-        (throw (ex-info "check constraint violation"
-                        {:error :check-violation :sqlstate "23514"
-                         :table table-name :constraint constraint})))))
+        (throw (errors/pg-error :check-violation
+                                {:table table-name :constraint constraint})))))
   (doseq [[column-name spec] (:domain-enum plan)
           :let [value (get attrs (:attr spec))]]
     (cond
@@ -275,19 +275,18 @@
       (and (= :domain (:kind spec)) (:check-ast spec)
            (false? (eval-check-fn (:check-ast spec)
                                   {(keyword "" "value") value}
-                                  "" (:schema db))))
-      (throw (ex-info "domain check constraint violation"
-                      {:error :check-violation :sqlstate "23514"
-                       :table table-name :column column-name
-                       :constraint (or (:check-name spec)
-                                       (str (:domain-name spec) "_check"))}))
+                                  "" (:schema db) {"value" (:attr spec)})))
+      (throw (errors/pg-error :check-violation
+                              {:table table-name :column column-name
+                               :domain (:domain-name spec)
+                               :constraint (or (:check-name spec)
+                                               (str (:domain-name spec) "_check"))}))
 
       (and (= :enum (:kind spec)) (some? value)
            (not (contains? (:values spec) (str value))))
-      (throw (ex-info "invalid input value for enum"
-                      {:error :invalid-text-representation :sqlstate "22P02"
-                       :type (:enum-name spec) :value value
-                       :table table-name :column column-name}))
+      (throw (errors/pg-error :invalid-text-representation
+                              {:type (:enum-name spec) :value (str value) :enum? true
+                               :table table-name :column column-name}))
 
       (and (= :enum (:kind spec)) (some? value)
            (contains? (:unsafe-values spec) (str value)))

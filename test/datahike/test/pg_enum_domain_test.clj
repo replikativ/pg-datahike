@@ -8,8 +8,10 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest testing is use-fixtures]]
             [datahike.api :as d]
+            [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.dump :as dump]
-            [datahike.pg.server :as pg])
+            [datahike.pg.server :as pg]
+            [datahike.pg.sql.row-eval :as row-eval])
   (:import [java.sql Connection DriverManager]))
 
 (def ^:dynamic *port* nil)
@@ -385,7 +387,7 @@
       (is (= "2BP01" (some-> raised .getSQLState))))))
 
 (deftest domain-check-between-enforces
-  ;; `BETWEEN` had no clause in eval-check-predicate; the :else
+  ;; `BETWEEN` had no clause in the old CHECK interpreter; the :else
   ;; fallback stringified the AST and returned truthy, so any value
   ;; passed. Regression guard.
   (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
@@ -435,9 +437,11 @@
     (exec! c "CREATE TYPE status AS ENUM ('on', 'off')")
     (exec! c "CREATE TABLE t (id int PRIMARY KEY, b false_only, s status)")
     (exec! c "INSERT INTO t VALUES (1, FALSE, 'on')")
-    ;; An aliased logical row must retain FALSE under its physical attribute.
-    (is (nil? (#'pg/enforce-domain-enum-checks!
-               (d/db *conn*) "t" "alias" [{:t/b false :t/s "on"}])))
+    ;; A FALSE value must reach the domain CHECK as FALSE (not as absent).
+    (let [db (d/db *conn*)]
+      (is (nil? (row-constraints/validate-pre-arbiter!
+                 db "t" {:t/id 1 :t/b false :t/s "on"} (row-constraints/constraint-plan db "t")
+                 (row-eval/check-fn db) nil))))
     (doseq [transaction? [false true]
             [sql state] [["UPDATE t SET b = NULL WHERE id = 1" "23502"]
                          ["UPDATE t SET b = TRUE WHERE id = 1" "23514"]
