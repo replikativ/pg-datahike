@@ -361,7 +361,8 @@
    :table-aliases table-aliases
    :default-table default-table
    :db            db
-   :parse-sql     parse-sql
+   ;; Every parse through the context is of nested SQL (a subquery).
+   :parse-sql     (some-> parse-sql params/nested-parse-fn)
    :hints         (or hints {})
    ;; Case-folding index: PostgreSQL folds unquoted identifiers, but
    ;; storage may hold `:MixedCase/ColA` (a database created before

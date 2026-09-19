@@ -409,6 +409,20 @@
    subquery sees the row as an outer relation, not as its own FROM item."
   nil)
 
+(def ^:dynamic *nested-parse?*
+  "True while parsing SQL nested in a statement -- a subquery, CTE or
+   derived table. Such SQL is never a protocol-level system statement:
+   `(SELECT nextval('s'))` is a scalar subquery, not the sole-call
+   shortcut a client's `SELECT nextval('s')` takes."
+  false)
+
+(defn nested-parse-fn
+  "`parse-sql` for SQL nested in a statement (see *nested-parse?*)."
+  [parse-sql]
+  (fn [& args]
+    (binding [*nested-parse?* true]
+      (apply parse-sql args))))
+
 (def ^:dynamic *statement-row-scope-tables*
   "{alias table} of the row scope of the statement being translated, read
    by ctx/make-ctx so column metadata resolves against the table; values
@@ -1025,6 +1039,8 @@
            (when (pos? (.size result)) (into {} result)))))
      (catch Throwable _ nil))))
 
+(declare where-param-oids)
+
 (defn update-param-oids
   "Walk an UPDATE AST: for each SET col = ?, map param index to the
    column attribute's PG OID."
@@ -1040,9 +1056,13 @@
               vals (.getValues us)]
           (when (and cols vals)
             (doseq [[^Column c v] (map vector cols vals)]
-              (when (instance? JdbcParameter v)
+              (if (instance? JdbcParameter v)
                 (when-let [oid (col-oid (unquote-ident (.getColumnName c)))]
-                  (.put result (.getIndex ^JdbcParameter v) oid)))))))
+                  (.put result (.getIndex ^JdbcParameter v) oid))
+                ;; An expression (`SET bal = bal + $1`) types its
+                ;; parameters as a WHERE operand would.
+                (doseq [[idx oid] (where-param-oids v schema table-ns)]
+                  (.putIfAbsent result idx oid)))))))
       (when (pos? (.size result)) (into {} result)))
     (catch Throwable _ nil)))
 
@@ -1336,10 +1356,30 @@
                           (let [l (.getLeftExpression ^BinaryExpression n)
                                 r (.getRightExpression ^BinaryExpression n)
                                 lb (unwrap l)
-                                rb (unwrap r)]
-                            (when (instance? JdbcParameter lb)
+                                rb (unwrap r)
+                                ;; Arithmetic gives an unknown operand the
+                                ;; column's type only where that operator
+                                ;; exists for two operands of the type
+                                ;; (pg_operator): money * money and oid +
+                                ;; oid do not, and there is no float `%`.
+                                arith (#{net.sf.jsqlparser.expression.operators.arithmetic.Addition
+                                         net.sf.jsqlparser.expression.operators.arithmetic.Subtraction
+                                         net.sf.jsqlparser.expression.operators.arithmetic.Multiplication
+                                         net.sf.jsqlparser.expression.operators.arithmetic.Division
+                                         net.sf.jsqlparser.expression.operators.arithmetic.Modulo}
+                                       (class n))
+                                typed (if (instance? net.sf.jsqlparser.expression.operators.arithmetic.Modulo n)
+                                        #{types/oid-int2 types/oid-int4 types/oid-int8 types/oid-numeric}
+                                        #{types/oid-int2 types/oid-int4 types/oid-int8 types/oid-numeric
+                                          types/oid-float4 types/oid-float8})
+                                bindable? (fn [comparand]
+                                            (or (not arith)
+                                                (not (instance? Column comparand))
+                                                (let [[tns cn] (col-ns-name comparand)]
+                                                  (contains? typed (infer-param-oid-for-column schema tns cn)))))]
+                            (when (and (instance? JdbcParameter lb) (bindable? rb))
                               (bind-param! lb l rb))
-                            (when (instance? JdbcParameter rb)
+                            (when (and (instance? JdbcParameter rb) (bindable? lb))
                               (bind-param! rb r lb))
                             (walk l)
                             (walk r))))))]

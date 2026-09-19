@@ -2209,12 +2209,12 @@
     (is (nil? (err (.execute *handler* "INSERT INTO acct(aid, bal) VALUES (1, 100), (2, 200)"))))
     (let [parsed (.parse *handler* "UPDATE acct SET bal = bal + $1 WHERE aid = $2" nil)
           ;; bound-params is a 1-indexed Object[] (element 0 unused).
-          ;; The wire layer decodes params by their inferred OIDs, so the
-          ;; SET operand arrives typed for known columns; a String here
-          ;; still exercises the unknown-type numeric-context coercion
-          ;; (num-operand), while the WHERE param is typed like the wire
-          ;; delivers it.
-          r (.executePrepared *handler* parsed (object-array [nil "-30" (long 1)]))]
+          ;; The wire layer decodes params by the OIDs Parse inferred:
+          ;; `bal + $1` gives $1 the column's type, as PostgreSQL's
+          ;; operator resolution does, so it arrives as a number.
+          _ (is (= {1 23 2 23} (:param-oids parsed))
+                "Parse types both parameters int4")
+          r (.executePrepared *handler* parsed (object-array [nil (long -30) (long 1)]))]
       (is (nil? (err r)) (err r))
       (.commitImplicit *handler*))
     (is (= [["70"]] (rows (.execute *handler* "SELECT bal FROM acct WHERE aid = 1"))))

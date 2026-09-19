@@ -2856,6 +2856,21 @@
     (catch Exception e
       (classified-error "DELETE error: " e))))
 
+(defn- assignment-op
+  "The datom operation storing `v` (SQL NULL as nil) in `attr` of row
+   `eid`, after the column's assignment cast: SET col = NULL retracts
+   the attribute; nothing for a NULL over an absent value or a tempid
+   row, which has no prior value (Datahike rejects tempids in
+   :db/retract). `db` lets coerce-insert-value read :pg/type, which the
+   schema map does not carry -- without it jsonb went in uncanonicalized."
+  [eid entity-map attr v schema db]
+  (let [val (when (some? v) (#'sql/coerce-insert-value v attr schema db))
+        old-val (get entity-map attr)]
+    (if (nil? val)
+      (when (and (some? old-val) (integer? eid))
+        [:db/retract eid attr old-val])
+      [:db/add eid attr val])))
+
 ;; Forward-declare so build-update-tx-for-bindings (below) can read the
 ;; prepared-statement param vector; the binding site is in executePrepared
 ;; further down, after the handler closure setup.
@@ -3005,24 +3020,116 @@
                                                                 stmt/*eval-update-db* db
                                                                 stmt/*eval-update-parse-fn* sql/parse-sql]
                                                         (sql/eval-update-expr value-expr entity-map ns schema)))
-                                            resolved (resolve-param raw-val)
-                                            ;; `db` so coerce-insert-value can
-                                            ;; resolve :pg/type when the schema
-                                            ;; map does not carry it — without
-                                            ;; it every UPDATE to a jsonb column
-                                            ;; stored the text uncanonicalized.
-                                            val (when (some? resolved)
-                                                  (#'sql/coerce-insert-value resolved attr schema db))
-                                            old-val (get entity-map attr)]]
-                                  (if (nil? val)
-                                ;; SET col = NULL → retract the attribute.
-                                ;; Skip for tempid entities (no prior values to retract;
-                                ;; Datahike rejects tempids in :db/retract).
-                                    (when (and (some? old-val) (integer? eid))
-                                      [:db/retract eid attr old-val])
-                                    [:db/add eid attr val]))))
+                                            resolved (resolve-param raw-val)]]
+                                  (assignment-op eid entity-map attr resolved schema db))))
                             eids)))]
     {:eids eids :tx-data tx-data}))
+
+(declare select-rows resolve-param-refs temp-table-prefix)
+
+(defn- update-set-plan
+  "An UPDATE's SET list as PostgreSQL plans it: a query over the target
+   whose target list computes the new values (preprocess_targetlist),
+   here `SELECT <target>.db_id, (<e1>), ... FROM <target> [AS a] WHERE
+   <where>`, translated by the SELECT translator once per statement.
+   Returns {:plan :assignments}; an assignment of DEFAULT projects the
+   column's default -- `nextval(...)` per row -- or carries a
+   :default-fill for a constant one.
+
+   The values are computed where PostgreSQL computes them: over the
+   pre-statement rows the WHERE keeps, with one statement time, and with
+   uncorrelated subqueries run once."
+  [parsed schema db]
+  (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)]]
+    (or (.get ^java.util.Map update-row-match-cache k)
+        (let [{:keys [table alias assignments where-expr]} parsed
+              quoted #(str \" (str/replace % "\"" "\"\"") \")
+              column-constraints (read-column-constraints db table)
+              assignments
+              (mapv (fn [{:keys [column value-expr] :as a}]
+                      (if (and (instance? Column value-expr)
+                               (nil? (.getTable ^Column value-expr))
+                               (= "default" (str/lower-case (.getColumnName ^Column value-expr))))
+                        (let [[kind value arg] (:default (get column-constraints column))]
+                          (if (= :nextval kind)
+                            (assoc a :sql (str "nextval('" (str/replace (or arg value) "'" "''") "')"))
+                            (assoc a :sql "NULL" :default-fill [kind value])))
+                        (assoc a :sql (str value-expr))))
+                    assignments)
+              ;; A temp table is stored under a per-session name; the
+              ;; statement's own text still says the name it was given.
+              visible (or alias
+                          (when (str/starts-with? table temp-table-prefix)
+                            (second (re-matches #"[^_]*_(.*)"
+                                                (subs table (count temp-table-prefix))))))
+              text (str "SELECT " (quoted (or visible table)) ".db_id"
+                        (apply str (map #(str ", (" (:sql %) ")") assignments))
+                        " FROM " (quoted table) (when visible (str " AS " (quoted visible)))
+                        (when where-expr (str " WHERE " where-expr)))
+              plan (binding [params/*bound-params* nil
+                             params/*declared-param-oids* (:declared-param-oids parsed)]
+                     (sql/parse-sql text schema db))
+              _ (when (= :error (:type plan))
+                  (throw (ex-info (str (:message plan))
+                                  {:sqlstate (:sqlstate plan) :error-fields (:error-fields plan)})))
+              columns (row-eval/table-columns db schema table)
+              column-oids (into {} (map (juxt :attr :oid)) columns)
+              sql-name (fn [attr column]
+                         (or (some #(when (= attr (:attr %)) (:name %)) columns) column))
+
+              ;; The assignment cast is chosen from the expression's static
+              ;; type (transformAssignedExpr), so a missing one is an error
+              ;; however many rows the WHERE keeps. An untyped literal is
+              ;; read by the column's input function instead.
+              _ (binding [params/*declared-param-oids* (:declared-param-oids parsed)]
+                  (doseq [[{:keys [column value-expr default-fill]} source]
+                          (map vector assignments (rest (:select-item-oids plan)))
+                          :let [attr (keyword (:ns parsed) column)
+                                target (get column-oids attr)]
+                          :when (and (not default-fill) target
+                                     (not (oid/untyped-literal? (stmt/unwrap-parens value-expr)))
+                                     (not (types/assignment-cast-exists? source target)))]
+                    (throw (ex-info (str "column \"" (sql-name attr column) "\" is of type "
+                                         (types/format-type target -1)
+                                         " but expression is of type "
+                                         (types/format-type source -1))
+                                    {:sqlstate "42804"
+                                     :hint "You will need to rewrite or cast the expression."}))))
+              v {:plan plan :assignments assignments}]
+          (.put ^java.util.Map update-row-match-cache k v)
+          v))))
+
+(defn- build-update-tx-from-plan
+  "UPDATE without FROM: the SET values come from update-set-plan's query,
+   run by the SELECT executor (select-rows) against `db`, then take the
+   assignment cast into the column. {:eids :tx-data}."
+  [ctx db schema parsed]
+  (let [{:keys [ns]} parsed
+        {:keys [plan assignments]} (update-set-plan parsed schema db)
+        bound *cached-bound*
+        plan (if bound (resolve-param-refs plan bound) plan)
+        ;; A correlated subquery is translated per row and reads `$n`
+        ;; itself; a templated simple query carries its literals only as
+        ;; the 1-indexed *cached-bound*.
+        {:keys [results]} (binding [params/*bound-params* (or params/*bound-params*
+                                                              (some-> bound rest vec))]
+                            (select-rows (assoc ctx :db db) plan))
+        rows (mapv #(if (sequential? %) (vec %) [%]) results)
+        tx-data (into []
+                      (mapcat
+                       (fn [[eid & values]]
+                         (let [entity-map (into {} (map (fn [^datahike.datom.Datom d]
+                                                          [(.-a d) (.-v d)]))
+                                                (d/datoms db :eavt eid))]
+                           (keep (fn [[{:keys [column default-fill]} v]]
+                                   (assignment-op eid entity-map (keyword ns column)
+                                                  (if default-fill
+                                                    (apply row-constraints/eval-default default-fill)
+                                                    (when-not (= :__null__ v) v))
+                                                  schema db))
+                                 (map vector assignments values)))))
+                      rows)]
+    {:eids (mapv first rows) :tx-data tx-data}))
 
 (defn- build-update-tx
   "Build entity IDs and tx-data for an UPDATE against `db`.
@@ -3034,7 +3141,7 @@
    that row's columns bound as constants. PostgreSQL updates a target row
    at most once even when several source rows match; retain the first match
    in the source's stable entity order."
-  [db schema parsed]
+  [ctx db schema parsed]
   (if-let [{:keys [alias cols rows]} (:from-values parsed)]
     (reduce
      (fn [acc row]
@@ -3089,7 +3196,9 @@
             {:seen #{} :eids [] :tx-data []}
             source-eids)
            :seen)))
-      (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil)))))
+      (if (:enriched-db parsed)
+        (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil))
+        (build-update-tx-from-plan ctx db schema parsed)))))
 
 (defn- check-update-identity-collisions!
   "Pre-flight check: before running tx-data from build-update-tx, scan
@@ -3205,11 +3314,11 @@
           (when fks?
             (enforce-fk-on-insert! db table-name ns [post])))))))
 
-(defn- execute-update [conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
+(defn- execute-update [ctx conn parsed schema & {:keys [tx-wrap] :or {tx-wrap identity}}]
   (try
     (let [{:keys [table]} parsed
           db (d/db conn)
-          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-update-tx db schema parsed))
+          {:keys [eids tx-data]} (with-cte-namespaces parsed (build-update-tx ctx db schema parsed))
           _ (check-update-identity-collisions! db schema tx-data)
           _ (check-not-null-on-update! db tx-data)
           _ (check-updates-against-row-constraints!
@@ -8151,7 +8260,7 @@
               {:keys [eids tx-data]}
               (loop []
                 (let [spec-db (:speculative-db @tx-state)
-                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx spec-db schema parsed))
+                      {:keys [eids] :as built} (with-cte-namespaces parsed (build-update-tx ctx spec-db schema parsed))
                       lockable (filterv integer? eids)]
                   (if (and session-id (seq lockable)
                            (nil? (:origin-db spec-db)))
@@ -8206,7 +8315,7 @@
         (catch Exception e
           (swap! tx-state assoc :aborted? true)
           (classified-error "UPDATE error: " e)))
-      (execute-update conn parsed schema :tx-wrap (:tx-wrap ctx)))))
+      (execute-update ctx conn parsed schema :tx-wrap (:tx-wrap ctx)))))
 
 (defn- exec-delete
   [ctx parsed]

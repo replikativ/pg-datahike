@@ -800,6 +800,38 @@
       (or (nil? (cat source)) (nil? (cat target))) true
       :else false)))
 
+(def volatile-proc-names
+  "Names of the functions pg_proc marks VOLATILE (provolatile = 'v'):
+   evaluated anew for every row that calls them."
+  (into #{} (keep #(when (= "v" (:volatile %)) (:proname %))) pg-catalog/procs))
+
+(def ^:private assignment-casts
+  "castsource -> #{casttarget} for the pg_cast entries usable in an
+   assignment: castcontext 'i' or 'a'."
+  (reduce (fn [m {:keys [source target context]}]
+            (if (#{"i" "a"} context)
+              (update m source (fnil conj #{}) target)
+              m))
+          {}
+          pg-catalog/casts))
+
+(defn assignment-cast-exists?
+  "Can a value of `source` be stored in a column of `target`
+   (find_coercion_pathway under COERCION_ASSIGNMENT)? The same type; an
+   implicit or assignment pg_cast row; an I/O conversion to a
+   string-category type; or, for arrays, the same between the elements.
+   Like cast-exists?, an OID outside the categorised set answers true."
+  [source target]
+  (let [cat #(get oid->category %)]
+    (cond
+      (or (nil? source) (nil? target) (= source target)) true
+      (contains? (get assignment-casts source) target) true
+      (= :S (cat target)) true
+      (and (array-oid->element-oid source) (array-oid->element-oid target))
+      (assignment-cast-exists? (array-oid->element-oid source) (array-oid->element-oid target))
+      (or (nil? (cat source)) (nil? (cat target))) true
+      :else false)))
+
 (def ^:private pg-aggregate-signatures
   "aggregate / window function name -> #{[argument type names]}: every
    pg_proc row with prokind 'a' or 'w'. Both kinds, because names are

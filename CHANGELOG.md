@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### UPDATE computes its SET list in a query over the target
+
+Plain UPDATE (no FROM) is planned as PostgreSQL plans it: a query over the target whose target list computes the new values, `SELECT db_id, (e1), … FROM target WHERE …`, run by the SELECT executor. The hand-written per-row evaluator remains only for UPDATE … FROM and CTE-backed UPDATE until they move too.
+
+- The values follow PostgreSQL:
+  - subqueries read the pre-statement rows;
+  - WHERE filters before SET is evaluated (`SET x = 100 / y WHERE y <> 0`);
+  - `now()` is one value per statement, and volatile functions (`random()`, `gen_random_uuid()`, `clock_timestamp()`) are evaluated per row, in SELECT too, where only `random` was;
+  - `SET col = DEFAULT` advances a sequence default per row (it raised 0A000).
+- The assignment cast is chosen from the expression's static type, so `SET int_col = '1.6'::text` or `SET bool_col = 1` raises 42804 even when no row matches. Aggregates (42803) and window functions (42P20) are rejected in SET. An unknown target column reads `column "c" of relation "t" does not exist`.
+- Fixed along the way:
+  - arrays written by INSERT … SELECT or UPDATE were stored as the text `[7, 8]`;
+  - `||` on an array column concatenated text, and now follows array_cat/array_append's NULL rules, with an untyped operand taking the array's type;
+  - a boolean JSON or array operator (`@>`, `?`, `&&`) is accepted as a CASE condition;
+  - `num_col + $1` types the parameter as the column's type, so pgbench `-M prepared` no longer aborts;
+  - SQL nested in a statement never takes the protocol-level system-call shortcut, so `(SELECT nextval('s'))` is not answered as a top-level `SELECT nextval` (it raises until sequence calls in subqueries are supported).
+
 ### Row-level expressions share the SELECT translator's scoping
 
 The translator can now treat a single written row as a relation in scope, a "row scope". Its columns are bound to placeholders typed by their declared OIDs, it takes column metadata from its table, and subqueries correlate against it with the translator's own name resolution. CHECK, domain CHECK, ON CONFLICT … WHERE and RETURNING are evaluated through it. This follows how PostgreSQL projects over a tuple (ExecCheck, ExecQual, ExecProcessReturning).

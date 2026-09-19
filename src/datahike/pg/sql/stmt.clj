@@ -2819,7 +2819,7 @@
   [inner outer-aliases]
   (expr/correlated-subquery-refs inner outer-aliases))
 
-(defn- unwrap-parens
+(defn unwrap-parens
   "Peel redundant Parenthesis / single-element ParenthesedExpressionList
    wrappers so `(CASE … END)` and `((expr))` reach their inner node. A
    ParenthesedSelect (a scalar subquery) is NOT unwrapped — it's a leaf here."
@@ -6801,7 +6801,6 @@
     (if (params/call-marker? val)
       val
       (let [vtype     (get-in schema [attr :db/valueType])
-            elem-kw   (get-in schema [attr :pg/array-elem])
             ;; Both of these describe the DECLARED SQL type, and both live
             ;; on the ident entity rather than in Datahike's schema map, so
             ;; both need the db fallback. The enriched `:pg/numeric-scale`
@@ -6825,6 +6824,15 @@
           ;; mean "ask", not "not jsonb".
             pg-type   (or (get-in schema [attr :pg/type])
                           (params/pg-type-of-attr db attr))
+            ;; An array column's element type, from the same ident
+            ;; entity: DDL names the array type `_<elem>`. Read from the
+            ;; schema map alone, it was absent unless the caller had
+            ;; enriched the schema, and a PgArray fell through to the
+            ;; string branch -- `ARRAY[7,8]` from INSERT ... SELECT or an
+            ;; UPDATE was stored as the text `[7, 8]`.
+            elem-kw   (or (get-in schema [attr :pg/array-elem])
+                          (when (and pg-type (str/starts-with? pg-type "_"))
+                            (keyword (subs pg-type 1))))
             jsonb?    (= "jsonb" pg-type)
             ;; The declared integer width, when the column has one.
             int-type  (when (contains? #{"int2" "int4" "int8" "oid"} pg-type) pg-type)
@@ -7722,6 +7730,20 @@
                                    (.getName ^Class (type value-expr)))
                      :expr (str value-expr)}))))
 
+(defn- reject-grouping!
+  "Reject aggregate and window calls in `expr`, an expression computing
+   one row's value -- RETURNING or an UPDATE's SET list (parse_agg.c's
+   EXPR_KIND_RETURNING / EXPR_KIND_UPDATE_SOURCE). Nested SELECTs are
+   their own level and may group."
+  [expr context]
+  (when (seq (params/ast-window-names expr))
+    (throw (ex-info (str "window functions are not allowed in " context)
+                    {:sqlstate "42P20"})))
+  (when (some fns/aggregate-function? (params/ast-function-names expr))
+    (throw (errors/pg-error
+            :grouping-error
+            {:message (str "aggregate functions are not allowed in " context)}))))
+
 (defn extract-returning
   "Preserve a RETURNING target list as typed descriptors.
 
@@ -7738,15 +7760,7 @@
                 (throw (errors/pg-error
                         :feature-not-supported
                         {:message "set-returning functions are not allowed in RETURNING"})))
-              ;; RETURNING projects one row: no grouping, no window
-              ;; (parse_agg.c's EXPR_KIND_RETURNING).
-              (when (seq (params/ast-window-names item-expr))
-                (throw (ex-info "window functions are not allowed in RETURNING"
-                                {:sqlstate "42P20"})))
-              (when (some fns/aggregate-function? (params/ast-function-names item-expr))
-                (throw (errors/pg-error
-                        :grouping-error
-                        {:message "aggregate functions are not allowed in RETURNING"})))
+              (reject-grouping! item-expr "RETURNING")
               ;; A sequence advance is deferred to the SELECT executor's
               ;; marker pass, which a row projection does not run.
               (when (contains? (params/ast-function-names item-expr) "nextval")
@@ -9366,7 +9380,8 @@
               (and attr (not (pgs/ambiguous? attr))) (name attr)
               (or (pgs/registered-relation? ci table-name)
                   (nil? (get schema (keyword table-name col-name))))
-              (throw (ex-info (str "column \"" col-name "\" does not exist")
+              (throw (ex-info (str "column \"" col-name "\" of relation \""
+                                   table-name "\" does not exist")
                               {:error :undefined-column
                                :sqlstate "42703"
                                :column col-name}))
@@ -9382,7 +9397,8 @@
             (when (contains-target-list-srf? value-expr)
               (throw (errors/pg-error
                       :feature-not-supported
-                      {:message "set-returning functions are not allowed in UPDATE"}))))
+                      {:message "set-returning functions are not allowed in UPDATE"})))
+            (reject-grouping! value-expr "UPDATE"))
         ;; PostgreSQL does not permit qualification on the left-hand side
         ;; of SET, even when it names the target alias.  JSqlParser preserves
         ;; that qualifier separately on Column; dropping it silently accepted
@@ -9470,6 +9486,10 @@
                :table table-name
                :alias alias-name
                :ns ns
+               ;; The parameter types this statement was translated with:
+               ;; the SET list is translated again at Execute
+               ;; (server/update-set-plan) and must see the same ones.
+               :declared-param-oids params/*declared-param-oids*
                :where-expr where-expr
                :assignments
                (vec
