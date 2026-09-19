@@ -30,6 +30,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.input :as input]
             [datahike.pg.sql.coerce :as coerce]
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.types :as types]
@@ -175,6 +176,8 @@
                                n ")")}))))
     v))
 
+(declare cast-number-to-integer integer-to-oid)
+
 (defn cast-to-integer
   "Cast to one of PostgreSQL's three integer widths.
 
@@ -189,6 +192,34 @@
    RANGE-CHECKS against the target width: every integer target used to
    collapse to Java long, so `100000::int2` and `99999999999::int4`
    passed through unchanged where PostgreSQL raises 22003."
+  [v type-str]
+  (if (string? v)
+    ;; Text is READ, not converted: int4in, not a numeric cast, so
+    ;; '1.5'::int is 22P02 where 1.5::int rounds.
+    (let [base (base-type-name type-str)]
+      (input/parse (if (= "oid" base)
+                     types/oid-oid
+                     (get {:int2 types/oid-int2 :int4 types/oid-int4 :int8 types/oid-int8}
+                          (get types/integer-type-width base :int8)))
+                   v))
+    (if (and (integer? v) (= "oid" (base-type-name type-str)))
+      (integer-to-oid v)
+      (cast-number-to-integer v type-str))))
+
+(defn- integer-to-oid
+  "int4 -> oid reinterprets the bits, so a negative wraps into uint32;
+   int8 -> oid (oid.c int8_oid) accepts 0 .. 4294967295. Both arrive as a
+   Long here, so a value in either domain is accepted."
+  [v]
+  (let [n (long v)]
+    (cond
+      (<= 0 n 4294967295) n
+      (<= -2147483648 n -1) (bit-and n 0xFFFFFFFF)
+      :else (throw (errors/pg-error :numeric-value-out-of-range
+                                    {:message "OID out of range"})))))
+
+(defn- cast-number-to-integer
+  "cast-to-integer for a non-text source: round and range-check."
   [v type-str]
   (let [w (get types/integer-type-width (base-type-name type-str) :int8)
         [lo hi tname] (get types/integer-width-limits w)
@@ -246,14 +277,21 @@
                        (out-of-range! "real")
                        f))
                    d))]
-    (if (types/numeric-special? v)
+    (cond
+      ;; Text is read by float4in / float8in.
+      (string? v)
+      (input/parse (if float4? types/oid-float4 types/oid-float8) v)
+
+      (types/numeric-special? v)
       ;; A numeric NaN / +-Infinity maps straight onto the float one.
       (narrow (types/numeric-special->double v))
+
+      :else
       (let [d (double (coerce/coerce-numeric v :double))
             ;; A source that is ALREADY special is not an overflow --
-            ;; `'Infinity'::float8` is Infinity, not an error -- and that
-            ;; includes the string spellings. Only a Double or Float can BE
-            ;; infinite; a BigDecimal is exact however large, so testing it
+            ;; `'Infinity'::numeric::float8` is Infinity, not an error.
+            ;; Only a Double or Float can BE infinite; a BigDecimal is
+            ;; exact however large, so testing it
             ;; via `(double v)` would trigger the very overflow we are
             ;; checking for on a finite source.
             src-finite? (and (nil? (coerce/special-float v))
@@ -481,18 +519,13 @@
                    ;; only the exact tokens '1' and '0' -- so `20::bool`
                    ;; raised "invalid input syntax for type boolean: 20".
                    (integer? v) (not (zero? v))
-                   :else
-                   (let [b (coerce/parse-bool-token (str v))]
-                     (when (nil? b)
-                       (throw (errors/pg-error :invalid-text-representation
-                                               {:type "boolean" :value (str v)})))
-                     b))
+                   :else (input/parse-bool (str v)))
 
         (:bit :varbit) (cast-to-bit v type-str explicit?)
 
         :uuid (if (instance? java.util.UUID v)
                 v
-                (coerce/parse-uuid v))
+                (input/parse-uuid (str v)))
 
         :bytes (cond
                  (bytes? v)  v

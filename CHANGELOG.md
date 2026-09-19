@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Text is read by PostgreSQL's input functions
+
+`datahike.pg.input` ports the input functions of bool, int2/int4/int8, oid, float4/float8 and uuid (boolin, pg_strtoint*, uint32in_subr, float4in/float8in, uuid_in). numeric keeps `coerce-numeric`, which already matched `numeric_in`. Every path from text to these types now goes through them, with PostgreSQL's SQLSTATEs and messages:
+
+- An untyped literal compared with a typed operand. `WHERE b = 'false'` found nothing, because a successfully read `false` was mistaken for "no coercion". `WHERE i = 'abc'` answered no rows instead of 22P02.
+- Casts from text. `'1.5'::int` rounded to 2 instead of raising 22P02, and the error named `numeric`.
+- INSERT/UPDATE, COPY and `pg_input_is_valid`/`pg_input_error_info`, which reports 22003 for out-of-range values.
+- Array elements. Integer arrays keep their declared width (`int2[]` was read as int8) and are range-checked.
+- Text-format Bind parameters. The Java decoder read every bool except t/true/1 as false. Invalid numbers were XX000.
+
+The accepted syntax is PostgreSQL 16+'s:
+- `0x`/`0o`/`0b` integers and `_` separators;
+- `-1` as an oid (4294967295);
+- `inf`, hex floats, and float underflow as 22003.
+
+The duplicated bool and uuid parsers in `coerce`, `copy` and `PgParamCodec` are gone. Two new fuzzer classes, `litcmp` and `scalarin`, exercise these paths.
+
 ### Aggregates resolve their argument types
 
 - Aggregate and window-function calls are resolved against every

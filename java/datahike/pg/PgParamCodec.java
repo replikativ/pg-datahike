@@ -584,25 +584,41 @@ public final class PgParamCodec {
     // to re-parse, so bindings carry typed values identical to binary.
     // ========================================================================
 
+    /**
+     * PostgreSQL's input functions for the scalar types with one text form
+     * (bool, the integers, oid, float4/8, numeric, uuid), registered by
+     * datahike.pg.input when it loads. It raises PgProtocolException with
+     * the type's SQLSTATE (22P02 / 22003) on invalid text. There is no Java
+     * copy of these parsers: a second one drifts (this switch once read
+     * every bool but t/true/1 as false).
+     */
+    private static volatile java.util.function.BiFunction<Integer, String, Object> textInput;
+
+    public static void setTextInput(java.util.function.BiFunction<Integer, String, Object> f) {
+        textInput = f;
+    }
+
+    private static Object readText(int oid, String s) {
+        java.util.function.BiFunction<Integer, String, Object> f = textInput;
+        if (f == null) {
+            throw new IllegalStateException("datahike.pg.input is not loaded");
+        }
+        return f.apply(oid, s);
+    }
+
     public static Object decodeText(int oid, byte[] bytes) {
         String s = decodeUtf8(bytes);
         return switch (oid) {
-            case PgWireServer.OID_BOOL ->
-                "t".equalsIgnoreCase(s) || "true".equalsIgnoreCase(s) || "1".equals(s);
-            // Integer types all land in Java Long — Datahike's schema coerces to
-            // int/long/short as needed, and we want consistent Clojure value types.
-            case PgWireServer.OID_INT2,
+            case PgWireServer.OID_BOOL,
+                 PgWireServer.OID_INT2,
                  PgWireServer.OID_INT4,
                  PgWireServer.OID_INT8,
-                 PgWireServer.OID_OID ->
-                Long.parseLong(s);
-            case PgWireServer.OID_FLOAT4,
-                 PgWireServer.OID_FLOAT8 ->
-                Double.parseDouble(s);
-            case PgWireServer.OID_NUMERIC ->
-                new BigDecimal(s);
-            case PgWireServer.OID_UUID ->
-                UUID.fromString(s);
+                 PgWireServer.OID_OID,
+                 PgWireServer.OID_FLOAT4,
+                 PgWireServer.OID_FLOAT8,
+                 PgWireServer.OID_NUMERIC,
+                 PgWireServer.OID_UUID ->
+                readText(oid, s);
             // Date/time come in as ISO-8601 or PG's text forms; the downstream
             // INSERT value-coercion in sql.clj handles the variants (it already
             // did for the text-interpolated path). Leave as String here.

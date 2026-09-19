@@ -64,7 +64,8 @@
             quote \"\\\"\", escape = quote, header :false
      binary: rejected at this layer (returns :feature-not-supported)"
   (:require [clojure.string :as str]
-            [datahike.pg.sql.coerce :as coerce]
+            [datahike.pg.input :as input]
+            [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.sql.database :as database]))
 
@@ -523,24 +524,20 @@
       (some? elem) raw
       :else
       (try
+        ;; COPY reads each field with the column type's input function,
+        ;; as PostgreSQL's CopyFrom does: range-checked, and 22P02 for
+        ;; text the type does not accept. money has no entry here; its
+        ;; text reaches coerce-insert-value, which parses it.
+        (if-let [parse (input/parser
+                        (or (some-> (get-in schema [attr :pg/type]) types/pg-name->oid)
+                            (types/oid-for-dh-type vtype)))]
+          (parse raw)
         (case vtype
-          :db.type/long      (Long/parseLong raw)
           :db.type/bigint    (BigInteger. raw)
-          :db.type/bigdec    (BigDecimal. raw)
-          :db.type/double    (Double/parseDouble raw)
-          :db.type/float     (Float/parseFloat raw)
           :db.type/float-array (pg-vector/parse raw (get-in schema [attr :pg/typmod]))
-          :db.type/boolean   (case (str/lower-case raw)
-                               ("t" "true" "yes" "on" "1") true
-                               ("f" "false" "no" "off" "0") false
-                               (throw (ex-info (str "invalid boolean: " raw)
-                                               {:error :invalid-text-representation
-                                                :type "boolean"
-                                                :value raw})))
           :db.type/string    raw
           :db.type/keyword   (keyword raw)
           :db.type/symbol    (symbol raw)
-          :db.type/uuid      (coerce/parse-uuid raw)
           ;; PG's bytea OUTPUT form, which is what COPY carries:
           ;; `\x` followed by hex pairs. Without this the raw STRING
           ;; reached the transactor and datahike rejected it —
@@ -570,7 +567,7 @@
           ;; string.
           :db.type/ref       (try (Long/parseLong raw) (catch Throwable _ raw))
           ;; Default — pass through unchanged
-          raw)
+          raw))
         (catch NumberFormatException _
           (throw (ex-info (str "invalid input syntax for type "
                                (some-> vtype name) ": " raw)

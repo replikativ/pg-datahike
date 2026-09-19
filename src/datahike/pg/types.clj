@@ -1394,27 +1394,15 @@
 
 (defn cast-array-elem-kw
   "For a SQL type name like `int[]`, return the element-type keyword
-   used by PgArray :elem-type (:int8, :text, :bool, etc.). Returns
-   nil for non-array target types."
+   used by PgArray :elem-type (:int4, :text, :bool, etc.) -- the
+   element's own type, width included, as parse-array-type-name reads
+   it. :text for an array of a type without a keyword; nil for
+   non-array target types."
   [sql-type-name]
   (when sql-type-name
     (let [base (clojure.string/replace sql-type-name #"\s*\([^)]*\)" "")]
       (when (clojure.string/ends-with? base "[]")
-        (let [elem (clojure.string/trim (subs base 0 (- (count base) 2)))
-              cat (cast-category elem)]
-          (case cat
-            :integer :int8
-            :float   :float8
-            :numeric :numeric
-            :text    :text
-            :boolean :bool
-            :date    :date
-            :time    (if (contains? #{"timetz" "time with time zone"} elem)
-                       :timetz
-                       :time)
-            :timestamp :timestamp
-            :uuid    :uuid
-            :text))))))
+        (or (:elem (parse-array-type-name sql-type-name)) :text)))))
 
 (defrecord PgLsn [^java.math.BigInteger value]
   Object

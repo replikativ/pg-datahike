@@ -9,7 +9,14 @@
    We test the pure helpers directly (datahike.pg.sql.coerce) plus
    one wire-level scenario per error class."
   (:require [clojure.test :refer [deftest is testing]]
+            [datahike.pg.errors :as errors]
+            [datahike.pg.input :as input]
             [datahike.pg.sql.coerce :as c]))
+
+(defn- sqlstate-of [f]
+  (try (f) nil
+       (catch clojure.lang.ExceptionInfo e
+         (first (errors/classify-exception e)))))
 
 (deftest coerce-bigint-direct
   (testing "in-range numeric inputs round-trip"
@@ -101,19 +108,19 @@
   (is (nil? (c/coerce-numeric nil :double)))
   (is (nil? (c/coerce-numeric nil :bigdec))))
 
-(deftest parse-bool-token-pg-fidelity
+(deftest parse-bool-pg-fidelity
   (testing "PG parse_bool_with_len acceptance table (issue #12)"
     ;; prefixes of true/yes and false/no; on/off with off's 'of' prefix;
     ;; exact 1/0; case-insensitive; whitespace-trimmed.
     (doseq [s ["t" "tr" "tru" "true" "TRUE" "y" "ye" "yes" "on" "1" " t " "\tYeS "]]
-      (is (true? (c/parse-bool-token s)) s))
+      (is (true? (input/parse-bool s)) s))
     (doseq [s ["f" "fa" "fal" "fals" "false" "FALSE" "n" "no" "of" "off" "0" " off "]]
-      (is (false? (c/parse-bool-token s)) s)))
-  (testing "rejected inputs return nil"
+      (is (false? (input/parse-bool s)) s)))
+  (testing "rejected inputs raise 22P02"
     ;; 'o' is ambiguous between on/off; multi-digit numbers, garbage and
     ;; blank are invalid — PG raises 22P02 for all of these.
     (doseq [s ["o" "2" "10" "01" "maybe" "" "  " "truex" "offf" "yesno"]]
-      (is (nil? (c/parse-bool-token s)) s))))
+      (is (= "22P02" (sqlstate-of #(input/parse-bool s))) s))))
 
 (deftest postgres-uuid-input-forms
   (let [canonical "3f3e3c3b-3a30-3938-3736-353433a2313e"
@@ -122,14 +129,10 @@
                "{3f3e3c3b-3a30-3938-3736-353433a2313e}"
                "3f3e3c3b3a3039383736353433a2313e"
                "3f3e-3c3b-3a30-3938-3736-3534-33a2-313e"]]
-      (is (= expected (c/parse-uuid s)) s))
+      (is (= expected (input/parse-uuid s)) s))
     (doseq [s ["111-11111-1111-1111-1111-111111111111"
                "11111111-1111-1111-G111-111111111111"
                "{11111111-1111-1111-1111-11111111111}"
                (str " " canonical)
                (str canonical "-")]]
-      (try
-        (c/parse-uuid s)
-        (is false s)
-        (catch clojure.lang.ExceptionInfo e
-          (is (= "22P02" (:sqlstate (ex-data e))) s))))))
+      (is (= "22P02" (sqlstate-of #(input/parse-uuid s))) s))))

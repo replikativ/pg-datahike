@@ -54,6 +54,7 @@
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
+            [datahike.pg.input :as input]
             [datahike.pg.sql.ctx :as ctx]
             [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.params :as params]
@@ -3232,13 +3233,7 @@
                                 {:explicit? true
                                  :parse-timestamp parse-timestamp-string})
           is-text? (types/->pg-text inner-raw src-oid)
-          is-bool? (if (instance? Boolean inner-raw)
-                     inner-raw
-                     (let [b (coerce/parse-bool-token (str inner-raw))]
-                       (when (nil? b)
-                         (throw (errors/pg-error :invalid-text-representation
-                                                 {:type "boolean" :value (str inner-raw)})))
-                       b))
+          is-bool? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::date — extract the LocalDate so serialization can omit the
         ;; time part ("2017-03-13" instead of "2017-03-13 00:00:00").
           is-date? (try
@@ -3258,7 +3253,7 @@
                     {:explicit? true
                      :parse-timestamp parse-timestamp-string})
           is-ts?   (parse-timestamp-string (str inner-raw))
-          is-uuid? (coerce/parse-uuid inner-raw)
+          is-uuid? (sql-cast/cast-scalar inner-raw type-str {:explicit? true})
         ;; ::regnamespace — resolve schema name to namespace OID
         ;; We support a single namespace 'public' with OID 2200
           (= type-str "regnamespace") 2200
@@ -3342,7 +3337,7 @@
 
             is-uuid?
             (let [uuid-fn-param (symbol (str "?cast-uuid" (swap! (:var-counter ctx) inc)))
-                  uuid-fn coerce/parse-uuid]
+                  uuid-fn #(if (instance? java.util.UUID %) % (input/parse-uuid (str %)))]
               (swap! (:in-params ctx) conj uuid-fn-param)
               (swap! (:in-args ctx) conj (null-preserving uuid-fn))
               (swap! (:where-clauses ctx) conj [(list uuid-fn-param inner-val) result-var]))
@@ -3624,7 +3619,7 @@
    `'Infinity'::numeric / '0'`."
   [ctx typed-expr unknown-expr]
   (or (when (instance? Column typed-expr)
-        (coerce-unknown-literal ctx typed-expr unknown-expr))
+        (first (coerce-unknown-literal ctx typed-expr unknown-expr)))
       (when (and (instance? StringValue unknown-expr)
                  (not (pg-bits/bit-string-literal? unknown-expr)))
         (when-let [target (numeric-target-for-oid (source-oid ctx typed-expr))]
@@ -6218,70 +6213,68 @@
         (jb/serialize-jsonb v)
         v))))
 
-(defn- coerce-unknown-literal
-  "If `lit` is a `StringValue` and `col` resolves to a Datahike-typed
-   schema attribute, return the typinput-coerced value (long, double,
-   bigdec, bool, uuid, instant) per PG's unknown-literal resolution.
-   Otherwise return nil so the caller falls through to translate-expr.
+(defn- unknown-literal-value
+  "`[v]`: the untyped literal text `s` read as a value of `typed`'s type
+   with that type's input function, or nil when `typed` has no type the
+   literal should take (text, or one we cannot determine). The vector
+   keeps a coerced `false` distinct from 'no coercion'.
 
-   Mirrors `parse_coerce.c:coerce_type` line 233 — when an `unknown`
-   literal lands as the operand of an operator whose other side has a
-   determined type, PG calls that type's typinput function to produce
-   a typed Const. Without this, `WHERE c.oid = '16384'` compares long
-   to string and matches nothing — real PG resolves the literal via
-   `oidin('16384')`."
-  [ctx ^Column col lit]
+   Mirrors `parse_coerce.c:coerce_type` -- when an `unknown` literal is
+   the operand of an operator whose other side has a determined type, PG
+   calls that type's typinput to produce a typed Const, and invalid text
+   is an ERROR (22P02 for `int_col = 'abc'`), not a comparison that
+   matches nothing."
+  [ctx typed ^String s]
+  (let [oid (source-oid ctx typed)
+        vt (if (instance? Column typed)
+             (column-vtype ctx typed)
+             (some-> oid types/dh-type-for-oid))]
+    (cond
+      (= oid types/oid-money) [(sql-cast/cast-scalar s "money" {})]
+      (= oid types/oid-vector) [(pg-vector/coerce s)]
+      ;; Text needs no input function.
+      (= :db.type/string vt) nil
+      :else
+      (if-let [parse (or (input/parser oid)
+                         (some-> vt types/oid-for-dh-type input/parser))]
+        [(parse s)]
+        ;; Date/time, keyword and symbol storage keep the lenient reading
+        ;; until the datetime decoder (consolidation plan, Phase 1.3).
+        (when vt
+          (let [v (coerce/coerce-unknown s vt parse-timestamp-string)]
+            (when-not (identical? v s) [v])))))))
+
+(defn- coerce-unknown-literal
+  "`[v]` when `lit` is an untyped literal that takes `typed`'s type (see
+   unknown-literal-value), else nil so the caller translates `lit` as it
+   is. Without this, `WHERE c.oid = '16384'` compares a long to a string
+   and matches nothing -- PG resolves the literal via `oidin('16384')`."
+  [ctx typed lit]
   (cond
     ;; A bit-string literal compared against a bit column. Datahike has
-    ;; no bit type, so a `bit`/`varbit` column stores PG's text form —
-    ;; the digit run — and the literal has to come down to that form to
-    ;; match. (Comparing PgBit against the stored String matches
-    ;; nothing, which is how `WHERE b = B'1001000'` silently returned
-    ;; zero rows once literals started producing PgBit.)
-    ;;
-    ;; Only for a string-typed column: against anything else the value
-    ;; keeps its bit type and the normal operator rules apply.
-    (and (instance? Column col)
+    ;; no bit type, so a `bit`/`varbit` column stores PG's text form --
+    ;; the digit run -- and the literal has to come down to that form to
+    ;; match. Only for a string-typed column: against anything else the
+    ;; value keeps its bit type and the normal operator rules apply.
+    (and (instance? Column typed)
          (pg-bits/bit-string-literal? lit)
-         (= :db.type/string (column-vtype ctx col)))
-    (pg-bits/to-pg-text (pg-bits/bit-string-literal-value lit))
+         (= :db.type/string (column-vtype ctx typed)))
+    [(pg-bits/to-pg-text (pg-bits/bit-string-literal-value lit))]
 
-    (and (instance? StringValue lit)
-         (instance? Column col))
-    (let [s (.getNotExcapedValue ^StringValue lit)]
-      (if (= "money" (column-pg-type ctx col))
-        (sql-cast/cast-scalar s "money" {})
-        (when-let [vt (column-vtype ctx col)]
-          (let [v (coerce/coerce-unknown s vt parse-timestamp-string)]
-            (when (not (identical? v s)) ; signal only when coercion produced a typed value
-              v)))))))
+    ;; getNotExcapedValue, not the raw body, which would undo E''
+    ;; escape decoding.
+    (instance? StringValue lit)
+    (unknown-literal-value ctx typed (.getNotExcapedValue ^StringValue lit))))
 
 (defn- coerce-comparison-operands
   "Apply PG-style unknown-literal coercion to a `[left right]` pair of
    AST nodes for a binary comparison. Returns `[left' right']` where
-   each side is either the original AST node or a pre-resolved
-   typed Clojure value (Long/Double/Boolean/UUID/Date/...). The
-   caller's translate-expr branch handles both."
+   each side is either the original AST node or a pre-resolved typed
+   Clojure value (Long/Double/Boolean/UUID/Date/...). The caller's
+   translate-expr branch handles both."
   [ctx left right]
-  (let [coerce-for-expr
-        (fn [typed lit]
-          (when (instance? StringValue lit)
-            (let [oid (source-oid ctx typed)]
-              (if (= oid types/oid-vector)
-                (pg-vector/coerce (.getNotExcapedValue ^StringValue lit))
-                (when-let [vtype (some-> oid types/dh-type-for-oid)]
-              ;; Text expressions need no typinput coercion, and using the
-              ;; parser node's raw body here would undo E'' escape decoding.
-                  (when-not (= :db.type/string vtype)
-                    (coerce/coerce-unknown
-                     (.getNotExcapedValue ^StringValue lit)
-                     vtype parse-timestamp-string)))))))]
-    [(or (coerce-unknown-literal ctx right left)
-         (coerce-for-expr right left)
-         left)
-     (or (coerce-unknown-literal ctx left right)
-         (coerce-for-expr left right)
-         right)]))
+  [(if-let [[v] (coerce-unknown-literal ctx right left)] v left)
+   (if-let [[v] (coerce-unknown-literal ctx left right)] v right)])
 
 (def ^:private op-sym->sql
   "The SQL spelling of a comparison operator, for PostgreSQL's
@@ -6993,7 +6986,7 @@
                 ;; it parses cleanly (oidin/int8in/numericin/boolin/…).
                 ;; See coerce/coerce-unknown for the dispatch.
                   coerced (coerce-unknown-literal ctx left right)
-                  val (->> (or coerced (translate-expr ctx right))
+                  val (->> (if coerced (first coerced) (translate-expr ctx right))
                            (jsonb-canonical-operand ctx resolved)
                            (column-storage-value ctx resolved))]
               (cond
@@ -7104,9 +7097,10 @@
           ;; PG-style typinput on each bound when LHS is a typed Column
           ;; — `oid BETWEEN '16000' AND '17000'` and similar.
           coerce-bound (fn [bound-ast]
-                         (or (when (instance? Column left-ast)
-                               (coerce-unknown-literal ctx left-ast bound-ast))
-                             (translate-expr ctx bound-ast)))
+                         (if-let [[v] (when (instance? Column left-ast)
+                                        (coerce-unknown-literal ctx left-ast bound-ast))]
+                           v
+                           (translate-expr ctx bound-ast)))
           lo (coerce-bound lo-ast)
           hi (coerce-bound hi-ast)]
       ;; One predicate per form, not a disjunction and not a pair of
@@ -7441,9 +7435,10 @@
           ;; from pgjdbc's getColumns probe.
           translate-in-elem (fn [el]
                               (check-comparison-types! ctx '= left-ast el)
-                              (or (when (instance? Column left-ast)
-                                    (coerce-unknown-literal ctx left-ast el))
-                                  (translate-expr ctx el)))
+                              (if-let [[v] (when (instance? Column left-ast)
+                                             (coerce-unknown-literal ctx left-ast el))]
+                                v
+                                (translate-expr ctx el)))
           vals (cond
                  (instance? ParenthesedExpressionList right)
                  (mapv translate-in-elem ^ParenthesedExpressionList right)

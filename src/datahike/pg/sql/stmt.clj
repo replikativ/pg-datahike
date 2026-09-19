@@ -48,6 +48,7 @@
             [datahike.pg.cache :as pg-cache]
             [datahike.pg.catalog.basis :as catalog-basis]
             [datahike.pg.errors :as errors]
+            [datahike.pg.input :as input]
             [datahike.pg.constraints.row :as row-constraints]
             [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.window :as window]
@@ -6760,7 +6761,7 @@
                           (params/pg-type-of-attr db attr))
             jsonb?    (= "jsonb" pg-type)
             ;; The declared integer width, when the column has one.
-            int-type  (when (contains? #{"int2" "int4" "int8"} pg-type) pg-type)
+            int-type  (when (contains? #{"int2" "int4" "int8" "oid"} pg-type) pg-type)
           ;; PostgreSQL validates BOTH types on input — `json_in` does a
           ;; full RFC-8259 parse and only then stores the original bytes.
           ;; We validated neither, so malformed text reached storage:
@@ -6921,18 +6922,14 @@
           (sql-cast/cast-to-integer val (or int-type "int8"))
           (and (= vtype :db.type/double)
                (or (string? val) (integer? val) (decimal? val)))
-          (coerce/coerce-numeric val :double)
+          (sql-cast/cast-to-float val "float8")
           (and (= vtype :db.type/float)
                (or (string? val) (integer? val) (decimal? val)))
           (sql-cast/cast-to-float val "real")
         ;; PG boolin: 't'/'yes'/'on'/'1' etc. — Boolean/parseBoolean
         ;; would silently turn '1' into false (issue #12).
           (and (= vtype :db.type/boolean) (string? val))
-          (let [b (coerce/parse-bool-token val)]
-            (when (nil? b)
-              (throw (errors/pg-error :invalid-text-representation
-                                      {:type "boolean" :value val})))
-            b)
+          (input/parse-bool val)
         ;; :db.type/keyword: SQL has no keyword literal, so clients
         ;; send the bare name as a string. Coerce 'draft' → :draft and
         ;; 'foo/bar' → :foo/bar (Clojure's `keyword` accepts both
@@ -6975,11 +6972,10 @@
           (and (= vtype :db.type/symbol) (keyword? val))
           (symbol (namespace val) (name val))
         ;; :db.type/uuid — accept already-UUID values (param-bound or
-        ;; from CAST) directly. String parse handled below by
-        ;; falling through to coerce-unknown.
+        ;; from CAST) directly; text is read by uuid_in.
           (and (= vtype :db.type/uuid) (instance? java.util.UUID val)) val
           (and (= vtype :db.type/uuid) (string? val))
-          (coerce/parse-uuid val)
+          (input/parse-uuid val)
         ;; jsonb: serialize Clojure maps/vectors to JSON strings for :db.type/string columns
           (and (= vtype :db.type/string) (or (map? val) (sequential? val)))
           (jb/serialize-jsonb val)

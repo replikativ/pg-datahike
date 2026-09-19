@@ -39,6 +39,7 @@
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.errors :as errors]
+            [datahike.pg.input :as input]
             [datahike.pg.jsonb :as jb]
             [datahike.pg.numeric-format :as numfmt]
             [datahike.pg.records :as pg-rec]
@@ -453,14 +454,7 @@
   (let [vs (remove #(or (nil? %) (= :__null__ %)) coll)
         ;; Argument resolution admits only booleans and untyped literals,
         ;; so a string here is a literal (`bool_and('t')`): boolean input.
-        bool (fn [v]
-               (if (string? v)
-                 (let [b (coerce/parse-bool-token v)]
-                   (when (nil? b)
-                     (throw (errors/pg-error :invalid-text-representation
-                                             {:type "boolean" :value v})))
-                   b)
-                 v))]
+        bool (fn [v] (if (string? v) (input/parse-bool v) v))]
     (if (empty? vs) :__null__ (every? #(true? (bool %)) vs))))
 
 (def filtered-out
@@ -3843,6 +3837,21 @@
     (when jsonb? (jb/serialize-jsonb s))
     true))
 
+(defn- scalar-input-oid
+  "The OID of a scalar type whose input function lives in
+   datahike.pg.input, by the spellings pg_input_is_valid accepts."
+  [base]
+  (case base
+    ("bool" "boolean") types/oid-bool
+    ("int2" "smallint") types/oid-int2
+    ("int4" "int" "integer") types/oid-int4
+    ("int8" "bigint") types/oid-int8
+    "oid" types/oid-oid
+    ("float4" "real") types/oid-float4
+    ("float8" "double precision") types/oid-float8
+    "uuid" types/oid-uuid
+    nil))
+
 (defn pg-input-valid?
   "Pure subset of pg_input_is_valid(text, regtype) for application-facing
    scalar types. The function deliberately invokes the same input helpers as
@@ -3854,12 +3863,7 @@
                                         (str type-name))
           base (some-> base str/lower-case str/trim)
           modifier (some-> modifier str/trim)
-          int-value (fn [lo hi]
-                      (let [n (Long/parseLong (str/trim s))]
-                        (<= lo n hi)))
-          float-value (fn []
-                        (or (some? (coerce/special-float s))
-                            (do (Double/parseDouble (str/trim s)) true)))
+          valid? (fn [oid] (some? (input/parse oid s)))
           char-value (fn []
                        (if modifier
                          (let [limit (Long/parseLong modifier)
@@ -3867,22 +3871,16 @@
                            (<= (count unpadded) limit))
                          true))]
       (boolean
+       (if-let [oid (scalar-input-oid base)]
+         (valid? oid)
        (case base
-         ("bool" "boolean") (some? (coerce/parse-bool-token s))
-         ("int2" "smallint") (int-value -32768 32767)
-         ("int4" "int" "integer") (int-value -2147483648 2147483647)
-         ("int8" "bigint") (do (Long/parseLong (str/trim s)) true)
-         ("oid") (let [n (Long/parseLong (str/trim s))]
-                   (<= 0 n 4294967295))
-         ("float4" "real" "float8" "double precision") (float-value)
          ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
          ("json" "jsonb") (validate-json-input! s base)
-         ("uuid") (do (coerce/parse-uuid s) true)
          ("bit" "bit varying" "varbit")
          (do (sql-cast/cast-to-bit s (str type-name) false) true)
          ("char" "character" "varchar" "character varying" "text" "name")
          (char-value)
-         false)))
+         false))))
     (catch Throwable _ false)))
 
 (defn pg-input-error-info
@@ -3910,14 +3908,18 @@
                   (str "value too long for type " display-type)
                   (str "invalid input syntax for type " display-type ": " (pr-str (str value))))
         sqlstate (if too-long? "22001" "22P02")]
-    (if (contains? #{"bit" "bit varying" "varbit" "numeric" "decimal"
-                     "json" "jsonb"} base)
+    (if (or (scalar-input-oid base)
+            (contains? #{"bit" "bit varying" "varbit" "numeric" "decimal"
+                         "json" "jsonb"} base))
       ;; Preserve the typinput function's own diagnostic. In particular,
       ;; fixed-width mismatches are 22026, while bad binary/hex digits are
       ;; 22P02 with the offending digit named. A boolean-only validation
       ;; pass loses both distinctions.
       (try
         (cond
+          (scalar-input-oid base)
+          (input/parse (scalar-input-oid base) (str value))
+
           (contains? #{"numeric" "decimal"} base)
           (validate-numeric-input! value type-name)
 
@@ -4101,7 +4103,7 @@
 (defn sql-uuid-extract-version [value]
   (let [uuid (if (instance? java.util.UUID value)
                value
-               (coerce/parse-uuid value))
+               (input/parse-uuid (str value)))
         version (.version ^java.util.UUID uuid)]
     ;; RFC 9562 UUIDs use the RFC variant. PostgreSQL returns NULL for a
     ;; bit-pattern that spells a version nibble but has another variant.
@@ -4112,7 +4114,7 @@
 (defn sql-uuid-extract-timestamp [value]
   (let [uuid (if (instance? java.util.UUID value)
                value
-               (coerce/parse-uuid value))
+               (input/parse-uuid (str value)))
         version (.version ^java.util.UUID uuid)]
     (if-not (= 2 (.variant ^java.util.UUID uuid))
       :__null__
