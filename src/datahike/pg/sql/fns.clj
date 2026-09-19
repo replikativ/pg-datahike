@@ -3873,14 +3873,14 @@
       (boolean
        (if-let [oid (scalar-input-oid base)]
          (valid? oid)
-       (case base
-         ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
-         ("json" "jsonb") (validate-json-input! s base)
-         ("bit" "bit varying" "varbit")
-         (do (sql-cast/cast-to-bit s (str type-name) false) true)
-         ("char" "character" "varchar" "character varying" "text" "name")
-         (char-value)
-         false))))
+         (case base
+           ("numeric" "decimal") (do (validate-numeric-input! s type-name) true)
+           ("json" "jsonb") (validate-json-input! s base)
+           ("bit" "bit varying" "varbit")
+           (do (sql-cast/cast-to-bit s (str type-name) false) true)
+           ("char" "character" "varchar" "character varying" "text" "name")
+           (char-value)
+           false))))
     (catch Throwable _ false)))
 
 (defn pg-input-error-info

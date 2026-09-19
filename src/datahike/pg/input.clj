@@ -83,8 +83,8 @@
         skip-space (fn [i] (loop [i i] (if (and (< i n) (space? (.charAt s i))) (recur (inc i)) i)))
         i (skip-space 0)
         [minus? i] (cond (and (< i n) (= \- (.charAt s i))) [true (inc i)]
-                       (and (< i n) (= \+ (.charAt s i))) [false (inc i)]
-                       :else [false i])
+                         (and (< i n) (= \+ (.charAt s i))) [false (inc i)]
+                         :else [false i])
         prefix (when (and (< (inc i) n) (= \0 (.charAt s i)))
                  (case (.charAt s (inc i)) (\x \X) 16 (\o \O) 8 (\b \B) 2 nil))
         radix (or prefix 10)

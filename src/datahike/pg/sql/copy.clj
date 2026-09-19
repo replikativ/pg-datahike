@@ -532,42 +532,42 @@
                         (or (some-> (get-in schema [attr :pg/type]) types/pg-name->oid)
                             (types/oid-for-dh-type vtype)))]
           (parse raw)
-        (case vtype
-          :db.type/bigint    (BigInteger. raw)
-          :db.type/float-array (pg-vector/parse raw (get-in schema [attr :pg/typmod]))
-          :db.type/string    raw
-          :db.type/keyword   (keyword raw)
-          :db.type/symbol    (symbol raw)
+          (case vtype
+            :db.type/bigint    (BigInteger. raw)
+            :db.type/float-array (pg-vector/parse raw (get-in schema [attr :pg/typmod]))
+            :db.type/string    raw
+            :db.type/keyword   (keyword raw)
+            :db.type/symbol    (symbol raw)
           ;; PG's bytea OUTPUT form, which is what COPY carries:
           ;; `\x` followed by hex pairs. Without this the raw STRING
           ;; reached the transactor and datahike rejected it —
           ;; "value does not match schema definition. Must be conform
           ;; to: bytes?" — on pagila's staff.picture.
-          :db.type/bytes     (if (and (> (count raw) 1)
-                                      (= "\\x" (subs raw 0 2)))
-                               (let [hex (subs raw 2)
-                                     n (quot (count hex) 2)
-                                     ba (byte-array n)]
-                                 (dotimes [i n]
-                                   (aset-byte ba i
-                                              (unchecked-byte
-                                               (Integer/parseInt
-                                                (subs hex (* 2 i) (+ 2 (* 2 i))) 16))))
-                                 ba)
-                               (.getBytes raw java.nio.charset.StandardCharsets/UTF_8))
-          :db.type/instant   (or (parse-instant raw)
-                                 (throw (ex-info (str "invalid timestamp: " raw)
-                                                 {:error :invalid-text-representation
-                                                  :type "timestamp"
-                                                  :value raw})))
+            :db.type/bytes     (if (and (> (count raw) 1)
+                                        (= "\\x" (subs raw 0 2)))
+                                 (let [hex (subs raw 2)
+                                       n (quot (count hex) 2)
+                                       ba (byte-array n)]
+                                   (dotimes [i n]
+                                     (aset-byte ba i
+                                                (unchecked-byte
+                                                 (Integer/parseInt
+                                                  (subs hex (* 2 i) (+ 2 (* 2 i))) 16))))
+                                   ba)
+                                 (.getBytes raw java.nio.charset.StandardCharsets/UTF_8))
+            :db.type/instant   (or (parse-instant raw)
+                                   (throw (ex-info (str "invalid timestamp: " raw)
+                                                   {:error :invalid-text-representation
+                                                    :type "timestamp"
+                                                    :value raw})))
           ;; :db.type/ref — coerce-insert-value handles the lookup-ref
           ;; bridge; we just need to convert the raw string to the
           ;; target attr's value type. Best-effort: try a long first
           ;; (FK columns are usually long-valued), else pass as
           ;; string.
-          :db.type/ref       (try (Long/parseLong raw) (catch Throwable _ raw))
+            :db.type/ref       (try (Long/parseLong raw) (catch Throwable _ raw))
           ;; Default — pass through unchanged
-          raw))
+            raw))
         (catch NumberFormatException _
           (throw (ex-info (str "invalid input syntax for type "
                                (some-> vtype name) ": " raw)
