@@ -3033,6 +3033,22 @@
         (filter (fn [x] (and (symbol? x) (str/starts-with? (name x) "?"))))
         (tree-seq coll? seq clause)))
 
+(defn- clause-bound-vars
+  "The logic variables a clause BINDS, as opposed to reads: a data
+   pattern binds its entity and value, a function clause binds its
+   output. `[(?coalesce-fn2 ?y_y2) ?v1]` binds `?v1` and only reads
+   `?y_y2` -- a distinction an outer join depends on, since a variable
+   merely read by a projection is not a variable the join can key on."
+  [clause]
+  (cond
+    (and (vector? clause) (= 3 (count clause)) (keyword? (second clause)))
+    (into #{} (filter symbol?) [(first clause) (nth clause 2)])
+
+    (and (vector? clause) (= 2 (count clause)) (seq? (first clause)))
+    (if (symbol? (second clause)) #{(second clause)} #{})
+
+    :else #{}))
+
 (defn- throwing-projection?
   [form clauses]
   (boolean
@@ -5650,12 +5666,25 @@
                       ;; var has to cross into the or-join, or it is a
                       ;; fresh unbound var inside the branch and the whole
                       ;; join answers nothing.
-                      bound-outside (into #{} (mapcat clause-vars) left-clauses)
+                      ;; Bound OUTSIDE means bound by a left clause, not
+                      ;; merely mentioned by one: a projection over a right
+                      ;; column (`COALESCE(y.y2, -1)`) reads a right var in
+                      ;; the outer query, and taking that as an outer
+                      ;; binding put the right var in the not-join's head,
+                      ;; where it made the unmatched branch fire alongside
+                      ;; the matched one -- two rows per matched left row.
+                      bound-outside (into #{} (mapcat clause-bound-vars) left-clauses)
+                      matched-bound (into #{right-evar}
+                                          (mapcat clause-bound-vars)
+                                          matched-parts)
+                      right-var? (set all-right-vars)
                       matched-vars (into #{} (mapcat clause-vars) matched-parts)
                       outer-left-vars (vec (distinct
                                             (concat left-key-vars
                                                     (filter #(and (bound-outside %)
-                                                                  (not (left-key? %)))
+                                                                  (not (left-key? %))
+                                                                  (not (matched-bound %))
+                                                                  (not (right-var? %)))
                                                             matched-vars))))
                       ;; Shared vars for or-join: every left var a condition
                       ;; reads + all right-side vars + right entity var
@@ -5759,7 +5788,7 @@
                                                        (and (not= v ref-var)
                                                             (not= v owner-evar)
                                                             (not (some #{v} right-vars))
-                                                            (some #(contains? (clause-vars %) v)
+                                                            (some #(contains? (clause-bound-vars %) v)
                                                                   left-clauses)))
                                                      pred-vars))))
                       shared-vars (vec (distinct
