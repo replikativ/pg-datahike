@@ -50,11 +50,13 @@
 ;; catalog-probe — kind dispatch
 ;; ============================================================================
 
-(deftest probe-fk-conname
-  (is (= :get-fk-conname
-         (shape/catalog-probe
-          "SELECT fk.conname AS name FROM pg_constraint fk
-            WHERE fk.conrelid = 'x'::regclass AND fk.contype = 'f'"))))
+(deftest a-constraint-name-query-is-not-a-probe
+  ;; It was: the handler answered `fk_<hash of the SQL>` -- a name no
+  ;; catalog has. pg_constraint carries the real `conname`, so the query
+  ;; runs like any other and answers `child_pid_fkey`.
+  (is (nil? (shape/catalog-probe
+             "SELECT fk.conname AS name FROM pg_constraint fk
+               WHERE fk.conrelid = 'x'::regclass AND fk.contype = 'f'"))))
 
 (deftest probe-primary-keys
   (is (= :get-primary-keys
@@ -129,9 +131,6 @@
   (testing "'pg_constraint' literal in projection — not matched"
     (is (nil? (shape/catalog-probe
                "SELECT 'pg_constraint' AS name FROM users"))))
-  (testing "'fk.conname' in a string — not fk-conname"
-    (is (nil? (shape/catalog-probe
-               "SELECT 'fk.conname AS name' AS q FROM users"))))
   (testing "'format_type' in a string — not matched"
     (is (nil? (shape/catalog-probe
                "SELECT 'format_type is cool' FROM users")))))
@@ -154,10 +153,6 @@
 ;; ============================================================================
 
 (deftest probe-ordering
-  (testing "fk-conname SELECT also references pg_constraint — fk-conname wins"
-    (is (= :get-fk-conname
-           (shape/catalog-probe
-            "SELECT fk.conname AS name FROM pg_constraint fk"))))
   (testing "field-metadata SELECT references pg_class — field-metadata wins"
     (is (= :get-field-metadata
            (shape/catalog-probe
