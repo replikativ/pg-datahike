@@ -893,3 +893,45 @@
     (is (= ["5" "6"] (col c 1 "SELECT a FROM sc_zq ORDER BY a")))
     (exec! c "INSERT INTO sc_p (a, b) VALUES (9, 1)")
     (is (= ["9"] (col c 1 "SELECT a FROM sc_p")))))
+
+(defn- sqlstate [^Connection c sql]
+  (try (exec! c sql) nil (catch java.sql.SQLException e (.getSQLState e))))
+
+(deftest names-resolve-level-by-level
+  ;; PostgreSQL searches the innermost level first and stops at the first
+  ;; level that has the name; ambiguity is only possible WITHIN a level
+  ;; (colNameToVar, parse_relation.c). We collected only QUALIFIED outer
+  ;; references, so an unqualified one was 42703 -- and a LATERAL item
+  ;; could not see the relation beside it at all. Expectations are
+  ;; PostgreSQL 17's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE nr_z (id int, b int)")
+    (exec! c "CREATE TABLE nr_y (id int, c int)")
+    (exec! c "CREATE TABLE nr_u (id int, a int)")
+    (exec! c "INSERT INTO nr_z VALUES (1, NULL)")
+    (exec! c "INSERT INTO nr_y VALUES (1, 5)")
+    (exec! c "INSERT INTO nr_u VALUES (1, 2)")
+    (testing "an unqualified outer column, from a subquery with its own FROM"
+      (is (= ["1"] (col c 1 "SELECT (SELECT count(*) FROM nr_y WHERE b IS NULL) FROM nr_z")))
+      (is (= ["0"] (col c 1 "SELECT (SELECT count(*) FROM nr_y WHERE b IS NOT NULL) FROM nr_z"))))
+    (testing "the inner level wins when both have the name"
+      (is (= ["5"] (col c 1 "SELECT (SELECT max(c) FROM nr_y) FROM nr_z")))
+      (is (= ["2"] (col c 1 "SELECT (SELECT a FROM nr_u LIMIT 1) FROM nr_z"))))
+    (testing "a LATERAL item sees the relation beside it, by name or alias"
+      (is (= ["1"] (col c 1 "SELECT l.v FROM nr_z t, LATERAL (SELECT t.id AS v) l")))
+      (is (= ["1"] (col c 1 "SELECT l.v FROM nr_z, LATERAL (SELECT nr_z.id AS v) l")))
+      (is (= ["1"] (col c 1 "SELECT l.v FROM nr_z t, LATERAL (SELECT id AS v) l"))
+          "unqualified, when the LATERAL has no relation of its own")
+      (is (= ["5"] (col c 1 (str "SELECT l.v FROM nr_z t, LATERAL "
+                                 "(SELECT c AS v FROM nr_y WHERE nr_y.id = t.id) l")))))
+    (testing "ambiguity is within one level"
+      (is (= "42702" (sqlstate c "SELECT id FROM nr_z, nr_y")))
+      (is (= "42712" (sqlstate c "SELECT id FROM nr_z a, nr_y a"))
+          "two relations under one name is reported as the relation, not the column")
+      (is (= "42712" (sqlstate c "SELECT id FROM nr_z, nr_z"))))
+    (testing "a quoted name is a different relation from a folded one"
+      (is (nil? (sqlstate c "SELECT 1 FROM nr_z, nr_y AS \"NR_Z\""))))
+    (testing "an unqualified outer name two outer relations expose is ambiguous"
+      (exec! c "CREATE TABLE nr_z2 (id int, b int)")
+      (is (= "42702" (sqlstate c (str "SELECT (SELECT count(*) FROM nr_y WHERE b IS NULL) "
+                                      "FROM nr_z, nr_z2")))))))

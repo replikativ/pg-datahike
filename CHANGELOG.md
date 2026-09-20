@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Names resolve level by level
+
+PostgreSQL searches the innermost query level first and stops at the first level that has the name; ambiguity is only possible *within* a level (`colNameToVar`). Only QUALIFIED outer references were collected here, and the rest was patched per case:
+
+- **An unqualified outer column in a subquery that has its own FROM** was 42703. `SELECT (SELECT count(*) FROM y WHERE b IS NULL) FROM z` now reads `z.b`, and two outer relations exposing the name raise 42702 rather than picking one.
+- **A LATERAL item could not reference the relation beside it by ALIAS** — `FROM t x, LATERAL (SELECT x.c)` raised 42P01 where the same query by table name worked, because the alias was treated as a namespace. The reference now resolves like any other column, so renamed and inherited columns work too. An unqualified outer name inside a LATERAL resolves as well.
+- **Two FROM items visible under one name** raise **42712** ("table name … specified more than once") when the namespace is built, as PostgreSQL reports it, instead of 42702 later at the column. A quoted name stays distinct from a folded one.
+
 ### The value functions are the translator's, not statement shortcuts
 
 A SELECT whose projection was a single system call was answered by a hand-written handler instead of being translated. `version()`, `now()`, `current_schema`, `current_database()` and `pg_get_keywords()` no longer take that path:
