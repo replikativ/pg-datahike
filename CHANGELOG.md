@@ -4,6 +4,22 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A function name resolves against what this server implements
+
+The scalar-function translator ended in a fallback: a name `clojure.core/resolve` could resolve was emitted as a Datalog clause, "so a caller reaches a Clojure fn we did not enumerate". Every public of `clojure.core` was therefore a function of this server, for anyone who can connect — `slurp('/etc/passwd')` read the file, `spit('/tmp/x','y')` wrote it, `inc(1)` answered 2, and `deref(1)` leaked a ClassCastException as XX000. A name is now resolved against what we implement and is **42883** otherwise, worded as `ParseFuncOrColumn` words it, argument types and hint included: `function nosuchfn(unknown, integer) does not exist`.
+
+The decorated call forms resolved no better:
+
+- **`f(x) OVER (…)`** built a window spec for any name at all, so an unknown one failed at execution with 0A000 "not supported" and a scalar one with datalog's own "Cannot parse :find" under XX000. Now 42883 for an unknown name, and **42809** — `OVER specified, but upper is not a window function nor an aggregate function` — for a function of the wrong kind, which `pg_proc` decides, as PostgreSQL does.
+- **`f(x) FILTER (WHERE …)`** fell through to a default aggregate, so `SELECT nosuchfn(a) FILTER (WHERE true) FROM t` **answered a COUNT** where PostgreSQL raises. Now 42883, and 42809 for a scalar function.
+- **A FROM-clause function** took the last dot-separated segment as its name, so `nosuchschema.unnest(ARRAY[1,2])` returned rows.
+
+**One qualifier rule, for every path**: a qualifier is dropped only when it names the schema the function is in — `pg_catalog` for the builtins, `public` for the pgvector ones — so `public.upper('a')` is 42883 here as it is in PostgreSQL. The aggregate and window paths read the name for themselves and did not follow it: `pg_catalog.count(*)` reported that `count` does not exist on a server where `count(*)` answers, and `pg_catalog.max(a)` fell through to a per-row max — a silently wrong column.
+
+Two further locks, behind that one: the projection interpreter resolves a literal symbol the way the engine itself would rather than through `clojure.core/resolve`, and a started server installs `datahike.query.resolve/safe-symbol-resolver` for the process, with the namespaces this translator emits symbols from registered. A query reaching the engine can name a function, and Datahike's default resolver — right for a process that writes its own queries — reaches every `clojure.core` public and any class method by reflection. That install is process-wide and outlives `stop-server`; an application issuing its own Datalog queries in the same process registers its functions with `register-fn!` / `register-ns!`, as it would against Datahike's own server.
+
+One name goes the other way: `name('x')` used to answer `x`, by accident, through `clojure.core/name`. It is a real PostgreSQL function — one of the type-name cast functions (`text(…)`, `int4(…)`, `bool(…)`), none of which this server implements — so it is now 42883 with the rest of that family.
+
 ### ANY / ALL read their elements with the other side's type
 
 `'{1,2}'` on the right of `= ANY` is an untyped array literal: PostgreSQL reads its elements with the input function of the type the comparison resolves to (`parse_coerce.c`). Three separate copies of the reader split the text on commas and kept the pieces as STRINGS, so an integer column was compared against `"1"`:

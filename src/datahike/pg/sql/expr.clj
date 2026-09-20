@@ -61,7 +61,8 @@
             [datahike.pg.sql.set-ops :as set-ops]
             [datahike.pg.types :as types]
             [datahike.pg.tsearch :as tsearch]
-            [datahike.pg.vector :as pg-vector])
+            [datahike.pg.vector :as pg-vector]
+            [datahike.query.resolve :as dqr])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
             Alias ArrayExpression Function LongValue DoubleValue StringValue NullValue
@@ -205,6 +206,16 @@
     :hint (str "No function matches the given name and argument "
                "types. You might need to add explicit type casts.")}))
 
+(defn- call-arg-oids
+  "The argument types a 42883 names: an untyped literal is PostgreSQL's
+   `unknown`, and so is an argument this layer cannot type."
+  [ctx arg-exprs]
+  (mapv (fn [arg]
+          (when-not (oid-infer/untyped-literal? arg)
+            (try (source-oid ctx arg)
+                 (catch Throwable _ nil))))
+        arg-exprs))
+
 (defn- validate-function-argument-types!
   "Validate extension-function signatures during analysis. Untyped string and
    NULL literals remain eligible for PostgreSQL's unknown coercion; a known,
@@ -212,11 +223,7 @@
    later typinput error."
   [ctx fname arg-exprs]
   (when-let [expected (get-in fns/sql-function-specs [fname :arg-oids])]
-    (let [actual (mapv (fn [arg]
-                         (when-not (oid-infer/untyped-literal? arg)
-                           (try (source-oid ctx arg)
-                                (catch Throwable _ nil))))
-                       arg-exprs)]
+    (let [actual (call-arg-oids ctx arg-exprs)]
       (when (some false?
                   (map (fn [want got] (or (nil? got) (= want got)))
                        expected actual))
@@ -232,10 +239,7 @@
   [ctx fname arg-exprs]
   (let [arg-exprs (remove #(instance? net.sf.jsqlparser.statement.select.AllColumns %) arg-exprs)
         unknown? (mapv oid-infer/untyped-literal? arg-exprs)
-        oids (mapv (fn [arg u]
-                     (when-not u
-                       (try (source-oid ctx arg) (catch Throwable _ nil))))
-                   arg-exprs unknown?)]
+        oids (call-arg-oids ctx arg-exprs)]
     (case (types/aggregate-resolution fname oids unknown?)
       :none (throw (no-such-function fname oids))
       :ambiguous (throw (errors/pg-error
@@ -247,33 +251,135 @@
                                      "You might need to add explicit type casts.")}))
       nil)))
 
+(def ^:private vector-function-names
+  "pgvector installs these in its extension schema, which is public in
+   our compatibility profile, not in pg_catalog."
+  #{"vector_dims" "vector_norm" "l2_distance"
+    "vector_l2_squared_distance" "l1_distance" "inner_product"
+    "cosine_distance"})
+
+(defn resolution-name
+  "The lower-cased name a call resolves under.
+
+   A qualifier is dropped only when it names the schema the function
+   actually lives in -- `pg_catalog` for the builtins (pgjdbc and
+   friends qualify their catalog calls), `public` for the pgvector
+   functions. Every other spelling keeps its qualifier and so resolves
+   to nothing, which is PostgreSQL's answer too: `public.upper('a')` is
+   42883 there, because `upper` is in pg_catalog.
+
+   Every path that reads a function name goes through this: the scalar
+   translator, the aggregate and window paths, and a FROM-clause
+   function. `pg_catalog.count(*)` used to report that `count` does not
+   exist, on a server where `count(*)` answers."
+  [^String name]
+  (let [;; JSqlParser renders a qualified ANALYTIC name with a space
+        ;; (`pg_catalog row_number`), not with the dot it parsed.
+        raw-name (str/replace (str/lower-case name) \space \.)
+        strip (fn [^String prefix] (subs raw-name (count prefix)))]
+    (cond
+      (str/starts-with? raw-name "pg_catalog.")
+      (let [n (strip "pg_catalog.")]
+        (if (contains? vector-function-names n) raw-name n))
+
+      (str/starts-with? raw-name "public.")
+      (let [n (strip "public.")]
+        (if (contains? vector-function-names n) n raw-name))
+
+      :else raw-name)))
+
+(defn call-node-name+args
+  "[name, argument expressions] of a call node -- a plain Function or an
+   AnalyticExpression (OVER / FILTER / WITHIN GROUP) -- or nil for
+   anything else."
+  [node]
+  (cond
+    (instance? Function node)
+    (let [^Function f node]
+      [(resolution-name (.getName f))
+       (if (.isAllColumns f) [] (vec (or (.getParameters f) [])))])
+
+    (instance? net.sf.jsqlparser.expression.AnalyticExpression node)
+    (let [^net.sf.jsqlparser.expression.AnalyticExpression a node
+          e (.getExpression a)]
+      ;; lag/lead/nth_value keep their later arguments in the
+      ;; offset and default slots rather than in the expression.
+      [(resolution-name (.getName a))
+       (-> (cond
+             (nil? e) []
+             (instance? ExpressionList e) (vec e)
+             :else [e])
+           (into (remove nil?) [(.getOffset a) (.getDefaultValue a)]))])
+
+    :else nil))
+
 (defn validate-aggregate-node!
   "`validate-aggregate-call!` for an aggregate call node: a plain Function
    or an AnalyticExpression (OVER / FILTER). Names that are not PostgreSQL
    aggregates are left to the function lookup."
   [ctx node]
-  (let [[fname args]
-        (cond
-          (instance? Function node)
-          (let [^Function f node]
-            [(str/lower-case (.getName f))
-             (if (.isAllColumns f) [] (vec (or (.getParameters f) [])))])
-
-          (instance? net.sf.jsqlparser.expression.AnalyticExpression node)
-          (let [^net.sf.jsqlparser.expression.AnalyticExpression a node
-                e (.getExpression a)]
-            ;; lag/lead/nth_value keep their later arguments in the
-            ;; offset and default slots rather than in the expression.
-            [(str/lower-case (.getName a))
-             (-> (cond
-                   (nil? e) []
-                   (instance? ExpressionList e) (vec e)
-                   :else [e])
-                 (into (remove nil?) [(.getOffset a) (.getDefaultValue a)]))])
-
-          :else nil)]
+  (let [[fname args] (call-node-name+args node)]
     (when fname
       (validate-aggregate-call! ctx fname args))))
+
+(defn- known-function-name?
+  "True for a name that IS a function -- PostgreSQL's catalog decides,
+   as it does when it tells 42883 (\"no such function\") from 42809
+   (\"there is one, but not of the kind this clause needs\"), plus the
+   names we implement beyond pg_proc (the extension manifest: pgvector
+   distances, `uuidv4`, `date_add`, …).
+
+   Asking our own implementation tables alone got this wrong in both
+   directions for the names `translate-function-call` handles by
+   literal string and tabulates nowhere: `nextval('s') OVER ()` said
+   the function does not exist, on a server where `nextval('s')`
+   answers."
+  [fname]
+  (or (types/proc-name? fname)
+      (contains? oid-infer/sql-fn->return-oid fname)
+      (contains? fns/sql-function-specs fname)
+      (contains? fns/sql-fn->clj-fn fname)))
+
+(defn undefined-function!
+  "Raise the 42883 PostgreSQL raises for a call it cannot resolve, with
+   the argument types in the message."
+  [ctx fname arg-exprs]
+  (throw (no-such-function fname (call-arg-oids ctx arg-exprs))))
+
+(defn validate-decorated-call!
+  "`f(x) OVER (…)` and `f(x) FILTER (WHERE …)` resolve `f` like any other
+   call. Only a window function or an aggregate may carry OVER, only an
+   aggregate may carry FILTER; a plain function with either is 42809, and
+   a name nothing implements is 42883 -- what ParseFuncOrColumn and
+   transformWindowFuncCall report.
+
+   Neither was raised. With OVER, an unknown name became a window spec
+   and failed at execution with 0A000 \"not supported\", and a scalar
+   function built a spec over a projection the query never produced, so
+   the client got datalog's own \"Cannot parse :find\" under XX000. With
+   FILTER it was worse: an unresolved name fell through to a default
+   aggregate, so `SELECT nosuchfn(a) FILTER (WHERE true) FROM t`
+   answered a COUNT -- a number, where PostgreSQL raises.
+
+   `clause` is \"OVER\" or \"FILTER\"; `allowed?` says the name already
+   resolved to something that clause accepts."
+  [ctx fname arg-exprs clause allowed?]
+  (when-not allowed?
+    (if (known-function-name? fname)
+      (throw (errors/pg-error
+              :wrong-object-type
+              {:message (str clause " specified, but " fname
+                             " is not "
+                             (if (= clause "OVER")
+                               "a window function nor an aggregate function"
+                               "an aggregate function"))}))
+      (undefined-function! ctx fname arg-exprs))))
+
+(defn window-function-name?
+  "A window function this server computes (window.clj), by the catalog
+   return-type table that names exactly those."
+  [fname]
+  (contains? oid-infer/sql-window->return-oid fname))
 
 (def ^:dynamic *conjunctive-where*
   "True while translating top-level AND-ed conjuncts of a WHERE (or an
@@ -646,30 +752,7 @@
    Adds the binding clause to where-clauses and returns the result variable."
   [ctx ^Function f]
   (let [raw-name (str/lower-case (.getName f))
-        ;; Strip a leading `pg_catalog.` schema qualifier — pgjdbc &
-        ;; friends explicitly qualify their catalog-function calls.
-        unqualified (cond
-                      (str/starts-with? raw-name "pg_catalog.")
-                      (subs raw-name (count "pg_catalog."))
-
-                      (str/starts-with? raw-name "public.")
-                      (subs raw-name (count "public."))
-
-                      :else raw-name)
-        vector-function-names
-        #{"vector_dims" "vector_norm" "l2_distance"
-          "vector_l2_squared_distance" "l1_distance" "inner_product"
-          "cosine_distance"}
-        fname (cond
-                ;; pgvector installs these in its extension schema (public in
-                ;; our compatibility profile), not in pg_catalog.
-                (and (str/starts-with? raw-name "pg_catalog.")
-                     (contains? vector-function-names unqualified)) raw-name
-
-                (and (str/starts-with? raw-name "public.")
-                     (not (contains? vector-function-names unqualified))) raw-name
-
-                :else unqualified)
+        fname (resolution-name raw-name)
         ;; The SQL keyword call forms -- `substring(s FROM 1 FOR 2)`,
         ;; `position('a' IN s)`, `trim(BOTH ' ' FROM s)` -- put their
         ;; operands in a NamedExpressionList and leave .getParameters
@@ -1982,24 +2065,38 @@
 
       ;; Unknown function.
       ;;
-      ;; This used to emit a datalog clause naming the symbol and let
-      ;; execution fail, so a client got `Unknown function
-      ;; 'json_build_object in [(json_build_object "a" 1) ?v1]` — our
-      ;; internals, under XX000. PostgreSQL rejects an unresolvable
-      ;; function at parse time with 42883.
+      ;; Names datalog could resolve used to be passed through, "so a
+      ;; caller reaches a Clojure fn we did not enumerate". That made
+      ;; every `clojure.core` name a SQL function of this server:
+      ;; `slurp('/etc/passwd')` read a file and `spit('/tmp/x','y')`
+      ;; wrote one, for any client that can connect. What it did not
+      ;; hit was an error from our internals rather than PostgreSQL's
+      ;; -- `deref(1)` a ClassCastException, `eval(1)` datalog's own
+      ;; "Unknown function", both XX000.
       ;;
-      ;; Names datalog CAN resolve are still passed through: that is how
-      ;; a caller reaches a Clojure fn we did not enumerate, and turning
-      ;; those into errors would remove working behaviour.
+      ;; A SQL client names the functions the catalog has; every other
+      ;; name is 42883, worded as ParseFuncOrColumn words it.
       :else
-      (if (resolve (symbol fname))
-        (do (swap! (:where-clauses ctx) conj
-                   [(apply list (symbol fname) args) result-var])
-            result-var)
-        (throw (ex-info (str "function " fname " does not exist")
-                        {:error :undefined-function
-                         :sqlstate "42883"
-                         :function fname}))))))
+      (throw (no-such-function fname (call-arg-oids ctx arg-exprs))))))
+
+(defn- interpreted-fn
+  "The function a projection form's head names, when the head is a
+   literal symbol rather than a bound fn-param.
+
+   The heads this translator emits are datalog aggregates and pure
+   helpers -- `count`, `min`, one of ours under its namespace. Resolving
+   them through the runtime (`clojure.core/resolve`) made every public
+   of `clojure.core` reachable the moment any user-derived symbol got
+   this far, which is the same hole the function lookup had.
+
+   One rule for every head: whatever the ENGINE would resolve it to. In
+   a server process that is Datahike's curated query set (`safe-fns`:
+   pure, process-free) plus the namespaces `start-server` registers;
+   embedded, with no server started, it is Datahike's permissive
+   default, exactly as before."
+  [op]
+  (when (symbol? op)
+    (dqr/*symbol-resolver* op)))
 
 (defn interpret-form
   "Interpret a Clojure-like form against a variable bindings map.
@@ -2076,12 +2173,12 @@
         ;; Fallback: a generated fn-param symbol bound by the Datalog
         ;; runtime to a user-registered fn (e.g. `?pg-format6` for
         ;; format(), `?case-fn7`, `?in-set8`) — call it on the
-        ;; interpreted args. Falls back to clojure.core resolve for
-        ;; literal symbols like `count`, `min`.
+        ;; interpreted args, or resolve the literal symbol the
+        ;; translator emitted (`count`, `min`, one of ours).
         (let [evaluated-args (mapv #(interpret-form % bindings) args)
               f-from-bindings (when (symbol? op) (get bindings op))
               f (or (when (fn? f-from-bindings) f-from-bindings)
-                    (resolve op))]
+                    (interpreted-fn op))]
           (when f
             (if (some params/call-marker? evaluated-args)
               {:fn :projection :projection-fn f :args evaluated-args}

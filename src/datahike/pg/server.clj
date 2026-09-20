@@ -23,6 +23,7 @@
             [datahike.writer :as writer]
             [datahike.tx-preds :as tx-preds]
             [datahike.versioning :as versioning]
+            [datahike.query.resolve :as dqr]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.cache :as pg-cache]
             [datahike.pg.catalog.admission :as catalog-admission]
@@ -12252,6 +12253,44 @@
                       {:type :datahike.pg/invalid-tls-config})))
     [auth ssl (or public? require-tls?)]))
 
+(def ^:private symbol-emitting-namespaces
+  "The namespaces whose functions the SQL translator names in the
+   Datalog clauses it emits, by qualified symbol -- the aggregates and
+   the two index/text-search helpers, and nothing else. Every other
+   namespace of ours is reached from our own code by
+   `requiring-resolve`, never named in a clause, so registering it
+   would only widen what a query in this process can call."
+  '[datahike.pg.sql
+    datahike.pg.secondary
+    datahike.pg.tsearch])
+
+(defonce ^:private safe-symbol-resolver-installed
+  (atom false))
+
+(defn- install-safe-symbol-resolver!
+  "Resolve the symbols in a query the way Datahike's own server does.
+
+   A Datalog clause names its function by SYMBOL, and Datahike's default
+   resolver is the permissive one: any `clojure.core` public, then any
+   qualified symbol through `requiring-resolve`, then a leading-dot
+   symbol as a reflective method call. That default is for a process
+   that writes its own queries. This one runs queries it TRANSLATED from
+   SQL a client sent, so it installs the curated resolver
+   (`datahike.query.resolve/safe-fns`: pure, process-free) plus the
+   namespaces this translator emits symbols from -- the second lock on
+   the door the function lookup already closes.
+
+   Process-wide rather than per request: a query runs wherever Datahike
+   runs it, not only on the connection thread. That is a side effect on
+   the host process, and it is not undone by `stop-server`: an
+   application that also issues its OWN Datalog queries naming its own
+   functions registers them with `datahike.query.resolve/register-fn!`
+   or `register-ns!`, as it would against Datahike's own server."
+  []
+  (when (compare-and-set! safe-symbol-resolver-installed false true)
+    (run! dqr/register-ns! symbol-emitting-namespaces)
+    (alter-var-root #'dqr/*symbol-resolver* (constantly dqr/safe-symbol-resolver))))
+
 (defn start-server
   "Start a PostgreSQL wire protocol server for one or more Datahike
    connections.
@@ -12335,6 +12374,7 @@
                                database-template]
                         :or {port 5432 host "127.0.0.1" default "datahike"}
                         :as opts}]]
+  (install-safe-symbol-resolver!)
   (let [registry (normalize-registry conn-or-registry default)
         registry-atom (atom registry)
         ;; Build hooks from template if not explicitly supplied. The
