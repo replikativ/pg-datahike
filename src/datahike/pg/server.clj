@@ -2873,6 +2873,51 @@
 
 (declare select-rows resolve-param-refs temp-table-prefix)
 
+(defn- expression-user-type
+  "`[:enum name]` / `[:domain name]` for an expression whose type is a
+   user type: a column declared with one, or a cast to one. Such a
+   column is stored as the enum's text or the domain's base type, so its
+   OID alone cannot tell them apart."
+  [db attr-of ^net.sf.jsqlparser.expression.Expression expr]
+  (cond
+    (instance? Column expr)
+    (some-> (attr-of (params/unquote-ident (.getColumnName ^Column expr)))
+            (as-> a (params/user-type-of-attr db a)))
+
+    (instance? net.sf.jsqlparser.expression.CastExpression expr)
+    (let [n (some-> ^net.sf.jsqlparser.expression.CastExpression expr
+                    .getColDataType .getDataType str
+                    (str/split #"\\.") last params/unquote-ident)]
+      (cond
+        (some #(= n (:name %)) (pgs/enum-types db)) [:enum n]
+        (params/registered-domain-spec db n) [:domain n]))))
+
+(defn- assignment-mismatch
+  "The source type's name when this assignment has no cast PostgreSQL
+   would make (transformAssignedExpr -> can_coerce_type), else nil.
+
+   A user type is checked by NAME, not by OID: DDL lowers an enum column
+   to text and a domain column to its base type, so every enum would
+   otherwise accept any text. An enum takes its own type, and nothing
+   else; a domain takes whatever its base takes. A source we cannot name
+   -- a subquery over an enum column reads as text here -- is left to the
+   base check rather than rejected."
+  [db attr-of expr source target user-type]
+  (let [src-type (expression-user-type db attr-of expr)]
+    (cond
+      (= :enum (first user-type))
+      (when-not (= (second src-type) (second user-type))
+        ;; A text-typed source is a real mismatch only when we can see
+        ;; that it IS text: a text column or an explicit cast.
+        (when (or (not= types/oid-text source)
+                  (instance? net.sf.jsqlparser.expression.CastExpression expr)
+                  (and (instance? Column expr) (nil? src-type)))
+          (or (second src-type) (types/format-type source -1))))
+
+      :else
+      (when-not (types/assignment-cast-exists? source target)
+        (or (second src-type) (types/format-type source -1))))))
+
 (defn- update-set-plan
   "An UPDATE's SET list as PostgreSQL plans it: a query over the target
    whose target list computes the new values (preprocess_targetlist),
@@ -2940,6 +2985,10 @@
                                   {:sqlstate (:sqlstate plan) :error-fields (:error-fields plan)})))
               columns (row-eval/table-columns db schema table)
               column-oids (into {} (map (juxt :attr :oid)) columns)
+              ;; A column of the TARGET by name -- enough to tell one
+              ;; user type from another on the right of SET.
+              attr-of (let [by-name (into {} (map (juxt (comp str/lower-case :name) :attr)) columns)]
+                        #(get by-name (str/lower-case %)))
               sql-name (fn [attr column]
                          (or (some #(when (= attr (:attr %)) (:name %)) columns) column))
 
@@ -2951,14 +3000,17 @@
                   (doseq [[{:keys [column value-expr default-fill]} source]
                           (map vector assignments (rest (:select-item-oids plan)))
                           :let [attr (keyword (:ns parsed) column)
-                                target (get column-oids attr)]
-                          :when (and (not default-fill) target
-                                     (not (oid/untyped-literal? (stmt/unwrap-parens value-expr)))
-                                     (not (types/assignment-cast-exists? source target)))]
+                                target (get column-oids attr)
+                                expr (stmt/unwrap-parens value-expr)
+                                user-type (params/user-type-of-attr db attr)
+                                mismatch (when-not (or default-fill
+                                                       (oid/untyped-literal? expr))
+                                           (assignment-mismatch db attr-of expr source
+                                                                target user-type))]
+                          :when mismatch]
                     (throw (ex-info (str "column \"" (sql-name attr column) "\" is of type "
-                                         (types/format-type target -1)
-                                         " but expression is of type "
-                                         (types/format-type source -1))
+                                         (or (second user-type) (types/format-type target -1))
+                                         " but expression is of type " mismatch)
                                     {:sqlstate "42804"
                                      :hint "You will need to rewrite or cast the expression."}))))
               v {:plan plan :assignments assignments}]

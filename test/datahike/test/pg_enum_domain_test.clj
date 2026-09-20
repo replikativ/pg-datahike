@@ -580,3 +580,44 @@
     ;; No registry entity should be created.
     (is (empty? (d/q '[:find ?n :where [_ :datahike.pg.enum/name ?n]]
                      (d/db *conn*))))))
+
+(deftest assignment-into-a-user-type-is-checked-by-its-name
+  ;; DDL lowers an enum column to text and a domain column to its base
+  ;; type, so an OID alone cannot tell one enum from another -- every
+  ;; enum column accepted any text, and the error came later from the
+  ;; enum's input function (22P02) or not at all. PostgreSQL rejects the
+  ;; assignment itself (transformAssignedExpr). Expectations are
+  ;; PostgreSQL 17's.
+  (with-open [c (DriverManager/getConnection (jdbc-url *port*))]
+    (exec! c "CREATE TYPE ad_mood AS ENUM ('ok','bad')")
+    (exec! c "CREATE DOMAIN ad_dint AS int")
+    (exec! c "CREATE TABLE ad (id int PRIMARY KEY, m ad_mood, m2 ad_mood, di ad_dint, t text, i int)")
+    (exec! c "INSERT INTO ad VALUES (1, 'ok', 'bad', 5, 'x', 7)")
+    (testing "what an enum column takes"
+      (exec! c "UPDATE ad SET m = 'ok'")
+      (exec! c "UPDATE ad SET m = 'ok'::ad_mood")
+      (exec! c "UPDATE ad SET m = m2")
+      (exec! c "UPDATE ad SET m = (SELECT m2 FROM ad LIMIT 1)")
+      (exec! c "UPDATE ad SET m = CASE WHEN id = 1 THEN m2 END"))
+    (testing "and what it does not"
+      (doseq [[sql expected]
+              [["UPDATE ad SET m = t" "column \"m\" is of type ad_mood but expression is of type text"]
+               ["UPDATE ad SET m = 'x'::text" "column \"m\" is of type ad_mood but expression is of type text"]
+               ["UPDATE ad SET m = 42" "column \"m\" is of type ad_mood but expression is of type integer"]]]
+        (let [e (try (exec! c sql) nil (catch java.sql.SQLException e e))]
+          (is (some? e) sql)
+          (when e
+            (is (= "42804" (.getSQLState ^java.sql.SQLException e)) sql)
+            (is (re-find (re-pattern (java.util.regex.Pattern/quote expected))
+                         (.getMessage ^java.sql.SQLException e))
+                sql)))))
+    (testing "the message names the user type on either side"
+      (let [e (try (exec! c "UPDATE ad SET i = m") nil (catch java.sql.SQLException e e))]
+        (is (re-find #"is of type integer but expression is of type ad_mood" (.getMessage ^java.sql.SQLException e))))
+      (let [e (try (exec! c "UPDATE ad SET di = 'abc'::text") nil (catch java.sql.SQLException e e))]
+        (is (re-find #"column \"di\" is of type ad_dint" (.getMessage ^java.sql.SQLException e))
+            "a domain is named, not its base type")))
+    (testing "a domain still takes whatever its base type takes"
+      (exec! c "UPDATE ad SET di = i")
+      (exec! c "UPDATE ad SET di = 1.5")
+      (is (= [[2]] (query-rows c "SELECT di FROM ad"))))))
