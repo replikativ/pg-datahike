@@ -271,6 +271,7 @@
 (def filter-avg            fns/filter-avg)
 (def filter-avg-numeric    fns/filter-avg-numeric)
 (def filter-jsonb-agg      fns/filter-jsonb-agg)
+(def filter-json-agg       fns/filter-json-agg)
 (def filter-jsonb-object-agg fns/filter-jsonb-object-agg)
 (def filter-json-object-agg  fns/filter-json-object-agg)
 (def jsonb-eq?             datahike.pg.jsonb/jsonb-eq?)

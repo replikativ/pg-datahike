@@ -95,3 +95,33 @@
                  (or (err "SELECT row_to_json(1)") ""))))
   (testing "to_json takes anyelement and accepts a scalar"
     (is (= "1" (v "SELECT to_json(1)")))))
+
+(deftest the-json-family-keeps-column-order
+  ;; composite_to_json walks the tuple descriptor in order (json.c);
+  ;; jsonb sorts its keys length-first, then bytewise (jsonb.c). The
+  ;; existing table's two columns are both 2 bytes, so the orders
+  ;; coincide and hid this: these names tell them apart. Expectations
+  ;; are PostgreSQL 17's.
+  (run "CREATE TABLE wo (id int, zz int, a int, bbb int, cc int)")
+  (run "INSERT INTO wo VALUES (1,2,3,4,5)")
+  (testing "the json family emits CREATE TABLE order"
+    (is (= "{\"id\":1,\"zz\":2,\"a\":3,\"bbb\":4,\"cc\":5}"
+           (v "SELECT row_to_json(wo) FROM wo")))
+    (is (= "{\"id\":1,\"zz\":2,\"a\":3,\"bbb\":4,\"cc\":5}"
+           (v "SELECT to_json(wo) FROM wo"))))
+  (testing "jsonb sorts, length first"
+    (is (= "{\"a\": 3, \"cc\": 5, \"id\": 1, \"zz\": 2, \"bbb\": 4}"
+           (v "SELECT to_jsonb(wo) FROM wo"))))
+  (testing "a derived relation keeps its select-list order"
+    (is (= "{\"b\":1,\"aa\":2}" (v "SELECT row_to_json(x) FROM (SELECT 1 AS b, 2 AS aa) x"))))
+  (testing "json_agg is the json family's: compact, ordered, and a line
+            feed before a composite element (json_agg_transfn)"
+    (is (= "[{\"id\":1,\"zz\":2,\"a\":3,\"bbb\":4,\"cc\":5}]"
+           (v "SELECT json_agg(w) FROM wo w")))
+    (run "INSERT INTO wo VALUES (6,7,8,9,10)")
+    ;; ORDER BY inside an aggregate is ignored for a whole-row argument
+    ;; (jsonb_agg too), so this asserts the rendering, not the order.
+    (let [s (v "SELECT json_agg(w) FROM wo w")]
+      (is (re-find #"\}, \n \{" s) s)
+      (is (re-find #"\{\"id\":\d+,\"zz\":" s) s))
+    (is (= "[1, 6]" (v "SELECT json_agg(id ORDER BY id) FROM wo")))))

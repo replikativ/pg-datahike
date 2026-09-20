@@ -519,6 +519,29 @@
                  coll)]
     (if (empty? vs) :__null__ vs)))
 
+(defn filter-json-agg
+  "SQL `json_agg(expr)` -- jsonb_agg's text-faithful sibling, so it is
+   TEXT here rather than a value: the json family keeps the order a
+   composite was built in, which a normalized value would lose.
+
+   PostgreSQL separates elements with \", \" and precedes a composite or
+   array element with a newline and a space (json_agg_transfn, json.c)."
+  [coll]
+  (let [vs (into [] (remove #(= filtered-out %)) coll)
+        json (requiring-resolve 'datahike.pg.jsonb/serialize-json)
+        structured? (fn [v] (or (sequential? v)
+                                ((requiring-resolve 'datahike.pg.records/record?) v)
+                                ((requiring-resolve 'datahike.pg.arrays/array?) v)))]
+    (if (empty? vs)
+      :__null__
+      (str "["
+           (->> vs
+                (map-indexed (fn [i v]
+                               (str (when (pos? i) (if (structured? v) ", \n " ", "))
+                                    (if (= :__null__ v) "null" (json v)))))
+                (apply str))
+           "]"))))
+
 (defn- akey-compare
   "Null-safe comparator for in-aggregate `ORDER BY` keys. A key is a
    scalar or a vector (multiple ORDER BY columns, compared
@@ -3086,9 +3109,9 @@
    "json_object_agg"  'datahike.pg.sql/filter-json-object-agg
    "array_agg"      'datahike.pg.sql/filter-array-agg
    "jsonb_agg"      'datahike.pg.sql/filter-jsonb-agg
-   ;; json_agg and jsonb_agg render identically for arrays — the
-   ;; families differ on OBJECT punctuation, not array punctuation.
-   "json_agg"       'datahike.pg.sql/filter-jsonb-agg
+   ;; json_agg is NOT jsonb_agg: an aggregated composite keeps its field
+   ;; order, and a structured element is preceded by a line feed.
+   "json_agg"       'datahike.pg.sql/filter-json-agg
    ;; Ordered-set aggregates — `WITHIN GROUP (ORDER BY x)` syntax.
    ;; Translator routes them through the pair-aggregate path (like
    ;; corr) since the percentile fraction is a constant alongside
