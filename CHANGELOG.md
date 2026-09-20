@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A constraint-name query is answered from pg_constraint
+
+`SELECT fk.conname AS name FROM pg_constraint fk WHERE …` was recognised by shape and answered `fk_<hash of the SQL>` — a name no catalog has, and the same answer for a table with no foreign key at all. The constraints are in `pg_constraint` under their real names, so the query now runs like any other: `child_pid_fkey`, or no row.
+
+First of the three catalog probes (plan item 0.7). The other two are blocked: the field-metadata probe covers a LEFT JOIN whose multi-condition ON returns wrong rows, and the primary-key probe needs `information_schema._pg_expandarray`, composite field selection (`(x).n`) and `pg_index.indkey` as an array.
+
 ### A function name resolves against what this server implements
 
 The scalar-function translator ended in a fallback: a name `clojure.core/resolve` could resolve was emitted as a Datalog clause, "so a caller reaches a Clojure fn we did not enumerate". Every public of `clojure.core` was therefore a function of this server, for anyone who can connect — `slurp('/etc/passwd')` read the file, `spit('/tmp/x','y')` wrote it, `inc(1)` answered 2, and `deref(1)` leaked a ClassCastException as XX000. A name is now resolved against what we implement and is **42883** otherwise, worded as `ParseFuncOrColumn` words it, argument types and hint included: `function nosuchfn(unknown, integer) does not exist`.

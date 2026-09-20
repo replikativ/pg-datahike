@@ -19,8 +19,7 @@
    comment hostile inputs.
 
    API:
-     (catalog-probe sql) → :get-fk-conname | :get-primary-keys
-                         | :get-field-metadata | nil"
+     (catalog-probe sql) → :get-primary-keys | :get-field-metadata | nil"
   (:require [clojure.string :as str]
             [datahike.pg.sql.classify :as cls]))
 
@@ -129,13 +128,6 @@
 ;; Probe predicates
 ;; ============================================================================
 
-(defn- fk-conname?
-  "Odoo's post-add-foreign-key lookup:
-     SELECT fk.conname AS name FROM pg_constraint fk WHERE …"
-  [{:keys [as-aliases idents]}]
-  (and (contains? as-aliases ["fk.conname" "name"])
-       (contains? idents "pg_constraint")))
-
 (defn- primary-keys?
   "pgjdbc DatabaseMetaData.getPrimaryKeys — a wide join with the
    distinctive `information_schema._pg_expandarray` helper and two
@@ -170,5 +162,4 @@
     (when (:select? shape)
       (cond
         (field-metadata? shape) :get-field-metadata
-        (primary-keys?   shape) :get-primary-keys
-        (fk-conname?     shape) :get-fk-conname))))
+        (primary-keys?   shape) :get-primary-keys))))

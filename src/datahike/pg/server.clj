@@ -5054,7 +5054,6 @@
     :try-advisory-lock      {:names ["pg_try_advisory_lock"]       :oids [PgWireServer/OID_BOOL]}
     :try-advisory-xact-lock {:names ["pg_try_advisory_xact_lock"]  :oids [PgWireServer/OID_BOOL]}
     :advisory-unlock        {:names ["pg_advisory_unlock"]         :oids [PgWireServer/OID_BOOL]}
-    :get-fk-conname         {:names ["name"]                       :oids [PgWireServer/OID_TEXT]}
     ;; datahike.* branching / versioning functions. Multi-row results
     ;; (branches, parent_commits) still advertise a single-column row;
     ;; PG's protocol doesn't need per-row metadata, only per-column.
@@ -5979,13 +5978,6 @@
 
 ;; --- Catalog probes ---------------------------------------------------------
 
-(defn- handle-get-fk-conname
-  "Odoo's post-add-foreign-key lookup. Returns a synthetic deterministic
-   name since we don't track constraint entities the same way PG does."
-  [{:keys [sql]} _parsed]
-  (let [fk-name (str "fk_" (Math/abs (.hashCode ^String sql)))]
-    (single-row-result "name" PgWireServer/OID_TEXT fk-name)))
-
 (defn- handle-get-primary-keys
   "pgjdbc DatabaseMetaData.getPrimaryKeys / updatable-ResultSet PK probe.
    Resolves the PK columns from Datahike schema — :db.unique/identity
@@ -6729,7 +6721,6 @@
       :pg-notify               (handle-pg-notify ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
       :create-index       (empty-result "CREATE INDEX")
-      :get-fk-conname     (handle-get-fk-conname ctx parsed)
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
       :get-field-metadata (handle-get-field-metadata ctx parsed)
 
