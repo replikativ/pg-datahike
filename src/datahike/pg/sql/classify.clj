@@ -539,13 +539,6 @@
       {:kind :dh-create-branch :args (extract-fn-string-args rest-args)}
       (and dh? (fn-name=? t1 "delete_branch"))
       {:kind :dh-delete-branch :args (extract-fn-string-args rest-args)}
-      (fn-name=? t1 "version")       {:kind :version}
-      (fn-name=? t1 "now")           {:kind :now}
-      (fn-name=? t1 "current_schema") {:kind :current-schema}
-      (fn-name=? t1 "current_database") {:kind :current-database}
-      ;; SQL-spec equivalents — both are bare-keyword expressions, not
-      ;; function calls. Tokeniser treats them as :ident, no parens.
-      (fn-name=? t1 "current_catalog") {:kind :current-database}
       ;; pg_dump session-prelude function — sets a GUC. We don't honor
       ;; the side-effect (the GUC has no Datahike equivalent), but we
       ;; need to silently accept the call so the dump replays.
@@ -604,7 +597,6 @@
                                              nil)))
                                        rest-args))]
                     (if (some? b) b true))}
-      (fn-name=? t1 "pg_get_keywords") {:kind :pg-keywords}
       :else {:kind :generic-sql})))
 
 (defn- next-ident-after

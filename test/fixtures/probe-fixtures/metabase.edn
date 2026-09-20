@@ -58,7 +58,8 @@
    :expected-system-kind :show,
    :note nil}
   {:sql "select current_catalog",
-   :expected-system-kind :current-database,
+   ;; A value function of the translator's, not a statement shortcut.
+   :expected-system-kind nil,
    :note nil}
   {:sql "show timezone", :expected-system-kind :show, :note nil}
   {:sql

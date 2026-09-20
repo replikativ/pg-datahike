@@ -4,6 +4,16 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The value functions are the translator's, not statement shortcuts
+
+A SELECT whose projection was a single system call was answered by a hand-written handler instead of being translated. `version()`, `now()`, `current_schema`, `current_database()` and `pg_get_keywords()` no longer take that path:
+
+- **`SELECT version(), 1` did not work**: it raised 42883, because only the whole-statement shortcut knew the name.
+- **`SELECT (now() AT TIME ZONE 'UTC')`** answered a `timestamptz` column called `now`; PostgreSQL gives a `timestamp`. The shortcut matched the call and ignored what surrounded it.
+- **`SELECT pg_get_keywords()`** answered one empty row called `string_agg`. It now raises, and the real set-returning function in FROM position — the form pgjdbc uses — is unaffected.
+
+Column names and types are unchanged for the forms that already worked (`version` text, `now` timestamptz, `current_schema` and `current_database` name). `set_config`, `setval` and the `datahike.*` functions keep their handlers: they write session, sequence or branch state rather than returning a value.
+
 ### Assigning to an enum or domain column is type-checked
 
 DDL lowers an enum column to text and a domain column to its base type, so the column's OID could not tell one enum from another: every enum column accepted any text, and the complaint came later from the enum's input function (22P02) — or not at all, for a label that happened to be valid. The assignment itself is now checked, as `transformAssignedExpr` does it, by the declared type's NAME.
