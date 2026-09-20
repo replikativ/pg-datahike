@@ -2631,12 +2631,17 @@
             operand))
         (coerce-comparison-operands ctx left right)))
 
+(declare quantified-subquery->in)
+
 (defn translate-predicate-expr
   "Translate a SQL predicate expression into a Clojure boolean form
    suitable for use inside a cond binding. Unlike translate-predicate which
    returns Datalog where clauses, this returns a single form."
   [ctx expr]
   (cond
+    (quantified-subquery->in expr)
+    (translate-predicate-expr ctx (quantified-subquery->in expr))
+
     ;; Kleene AND/OR, not Clojure's. `true AND NULL` is NULL, and NULL is
     ;; carried as the `:__null__` sentinel -- which Clojure's `and` sees
     ;; as truthy, so `(and X :__null__)` answered the sentinel where a
@@ -6340,21 +6345,52 @@
 ;; WHERE clause translation: SQL predicates → Datalog :where clauses
 ;; ============================================================================
 
+(declare unknown-literal-value)
+
+(defn- quantified-subquery->in
+  "`x = ANY (subquery)` IS `x IN (subquery)`, and `x <> ALL (subquery)`
+   is `x NOT IN (subquery)` -- the same sublink, spelled with a
+   quantifier (transformAExprIn, parse_expr.c). Returns the rewritten
+   InExpression, or nil when `expr` is not that shape."
+  [expr]
+  (when (or (instance? EqualsTo expr) (instance? NotEqualsTo expr))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression be expr
+          r (.getRightExpression be)]
+      (when (instance? net.sf.jsqlparser.expression.AnyComparisonExpression r)
+        (let [^net.sf.jsqlparser.expression.AnyComparisonExpression a r
+              t (str/upper-case (str (.getAnyType a)))
+              eq? (instance? EqualsTo expr)]
+          (when (or (and eq? (#{"ANY" "SOME"} t)) (and (not eq?) (= "ALL" t)))
+            (doto (InExpression.)
+              (.setLeftExpression (.getLeftExpression be))
+              (.setRightExpression (.getSelect a))
+              (.setNot (not eq?)))))))))
+
 (defn- literal-array-elements
   "If expr is an ArrayConstructor or '{…}' StringValue, return a vector of
    translated elements; else nil. Used to expand `col op ANY/ALL(<literal>)`
    into datalog branches without a runtime array allocation."
-  [ctx arr-expr]
+  [ctx arr-expr typed]
   (cond
     (instance? ArrayConstructor arr-expr)
     (mapv #(translate-expr ctx %)
           (.getExpressions ^ArrayConstructor arr-expr))
     (instance? StringValue arr-expr)
+    ;; `'{1,2}'` is an untyped array literal: PostgreSQL reads it with
+    ;; the ELEMENT type's input function, the element type coming from
+    ;; the other operand (parse_coerce.c). Splitting the text on commas
+    ;; and keeping strings compared an int column against "1" -- `= ANY`
+    ;; still matched through string coercion, but `> ANY` matched
+    ;; nothing and a numeric element never matched at all.
     (let [s (.getNotExcapedValue ^StringValue arr-expr)]
       (if (or (= s "{}") (str/blank? s))
         []
-        (let [inner (subs s 1 (dec (count s)))]
-          (mapv str/trim (str/split inner #",")))))
+        (mapv (fn [e]
+                (cond
+                  (nil? e) nil
+                  (string? e) (or (first (unknown-literal-value ctx typed e)) e)
+                  :else e))
+              (:elements (or (pg-arr/from-pg-text s :text) {:elements []})))))
     :else nil))
 
 (defn- translate-quantified-cmp
@@ -6362,7 +6398,7 @@
    literal-array and runtime-array cases. Returns a vector of clauses.
    `op` is the Clojure comparison symbol, `kind` is \"any\" or \"all\"."
   [ctx op left arr-expr kind]
-  (let [elements (literal-array-elements ctx arr-expr)
+  (let [elements (literal-array-elements ctx arr-expr left)
         col (translate-expr ctx left)]
     (if elements
       (cond
@@ -7156,6 +7192,10 @@
    Returns a vector of clause forms."
   [ctx expr]
   (cond
+    ;; `= ANY (subquery)` is IN; `<> ALL (subquery)` is NOT IN.
+    (quantified-subquery->in expr)
+    (translate-predicate ctx (quantified-subquery->in expr))
+
     (instance? AndExpression expr)
     (let [^AndExpression e expr]
       (into (translate-predicate ctx (.getLeftExpression e))
@@ -7224,16 +7264,13 @@
               kind (str/lower-case (.getName fn-expr))
               params (.getParameters fn-expr)
               arr-expr (when params (first params))
-              array-elements (cond
-                               (instance? ArrayConstructor arr-expr)
-                               (mapv #(translate-expr ctx %) (.getExpressions ^ArrayConstructor arr-expr))
-                               (instance? StringValue arr-expr)
-                               (let [s (.getNotExcapedValue ^StringValue arr-expr)]
-                                 (if (or (= s "{}") (str/blank? s))
-                                   []
-                                   (let [inner (subs s 1 (dec (count s)))]
-                                     (mapv str/trim (str/split inner #",")))))
-                               :else nil)]
+              ;; One element reader for every ANY/ALL path: `'{1,2}'` is
+              ;; an untyped array literal whose elements PostgreSQL reads
+              ;; with the other operand's input function. This copy split
+              ;; the text on commas and kept strings, so `= ANY('{1,2}')`
+              ;; compared an integer column against "1" and matched
+              ;; nothing at all.
+              array-elements (literal-array-elements ctx arr-expr left)]
           (cond
             ;; Literal ANY — or-join expansion (existing fast path).
             (and (= kind "any") array-elements)
@@ -7382,15 +7419,10 @@
         (let [^Function fn-expr right
               params (.getParameters fn-expr)
               arr-expr (when params (first params))]
-          (let [array-elements
-                (cond
-                  (instance? ArrayConstructor arr-expr)
-                  (mapv #(translate-expr ctx %) (.getExpressions ^ArrayConstructor arr-expr))
-                  (instance? StringValue arr-expr)
-                  (let [s (.getNotExcapedValue ^StringValue arr-expr)]
-                    (if (or (= s "{}") (str/blank? s)) []
-                        (mapv str/trim (str/split (subs s 1 (dec (count s))) #","))))
-                  :else nil)]
+          ;; The same element reader the other ANY/ALL paths use: this
+          ;; copy kept `'{1,2}'`'s elements as strings, so `<> ALL` over
+          ;; an integer column excluded nothing.
+          (let [array-elements (literal-array-elements ctx arr-expr left)]
             (if array-elements
               (let [col (translate-expr ctx left)
                     elements array-elements

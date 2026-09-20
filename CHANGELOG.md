@@ -4,6 +4,15 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### ANY / ALL read their elements with the other side's type
+
+`'{1,2}'` on the right of `= ANY` is an untyped array literal: PostgreSQL reads its elements with the input function of the type the comparison resolves to (`parse_coerce.c`). Three separate copies of the reader split the text on commas and kept the pieces as STRINGS, so an integer column was compared against `"1"`:
+
+- `id = ANY('{1,2}')` matched nothing (it only ever matched through string coercion), `id > ANY('{1,2}')` matched nothing, `id <> ALL('{1,2}')` excluded nothing, and a numeric element never matched at all.
+- The quoted form now answers like `ARRAY[1,2]` and `'{1,2}'::int[]`, in WHERE and in value position, and the literal is parsed as an array (quoting, `NULL` elements, nested braces) rather than by splitting on commas.
+
+**A subquery on the right is now accepted**: `x = ANY (SELECT …)` is `x IN (SELECT …)` and `x <> ALL (SELECT …)` is `x NOT IN (SELECT …)` — the same sublink spelled with a quantifier (`transformAExprIn`). Both raised before; they are rewritten once, ahead of both predicate translators, so the existing IN path handles them.
+
 ### JOIN … USING and NATURAL JOIN are joins
 
 Both were **cross products**: the columns they name were never turned into a join condition, so `a JOIN b USING (id)` returned every pair of rows (4 where PostgreSQL returns 2), and the merged name was reported ambiguous rather than answered. PostgreSQL synthesises the equality before planning and merges each pair into one output column (`parse_clause.c`).

@@ -330,3 +330,37 @@
       ;; parse error. Row content depends on how much of pg_namespace
       ;; we materialise; what matters is that the SQL is accepted.
       (is (or (.next rs) true)))))
+
+;; ---------------------------------------------------------------------------
+;; ANY / ALL
+;; ---------------------------------------------------------------------------
+
+(deftest any-all-read-their-elements-with-the-other-side-s-type
+  ;; `'{1,2}'` is an untyped array literal: PostgreSQL reads its elements
+  ;; with the input function of the type the comparison resolves to
+  ;; (parse_coerce.c). Three separate copies split the text on commas and
+  ;; kept STRINGS, so an integer column was compared against "1":
+  ;; `= ANY` matched nothing, `> ANY` matched nothing, `<> ALL` excluded
+  ;; nothing, and a numeric element never matched. Expectations are
+  ;; PostgreSQL 17's.
+  (.execute *handler* "CREATE TABLE aa (id int, s text, n numeric)")
+  (.execute *handler* "INSERT INTO aa VALUES (1,'a',1.5),(2,'b',2.5),(3,NULL,NULL)")
+  (testing "an untyped array literal, every operator"
+    (is (= [["1"] ["2"]] (rows "SELECT id FROM aa WHERE id = ANY('{1,2}') ORDER BY id")))
+    (is (= [["3"]] (rows "SELECT id FROM aa WHERE id <> ALL('{1,2}') ORDER BY id")))
+    (is (= [["2"] ["3"]] (rows "SELECT id FROM aa WHERE id > ANY('{1,2}') ORDER BY id")))
+    (is (= [["1"] ["2"] ["3"]] (rows "SELECT id FROM aa WHERE id < ALL('{5,6}') ORDER BY id")))
+    (is (= [["1"]] (rows "SELECT id FROM aa WHERE n = ANY('{1.5}')"))
+        "a numeric element is read as numeric, not as text"))
+  (testing "the typed spellings keep answering the same"
+    (is (= [["1"] ["2"]] (rows "SELECT id FROM aa WHERE id = ANY(ARRAY[1,2]) ORDER BY id")))
+    (is (= [["1"] ["2"]] (rows "SELECT id FROM aa WHERE id = ANY('{1,2}'::int[]) ORDER BY id")))
+    (is (= [["1"] ["2"]] (rows "SELECT id FROM aa WHERE s = ANY('{a,b}') ORDER BY id"))))
+  (testing "in value position, and over an empty array"
+    (is (= [["t"] ["f"] ["f"]] (rows "SELECT id = ANY('{1}') FROM aa ORDER BY id")))
+    (is (= [["f" "t"]] (rows "SELECT 1 = ANY('{}'::int[]), 1 <> ALL('{}'::int[])"))))
+  (testing "a subquery on the right is IN / NOT IN"
+    (is (= [["1"] ["2"]] (rows "SELECT id FROM aa WHERE id = ANY(SELECT 1 UNION SELECT 2) ORDER BY id")))
+    (is (= [["2"]] (rows "SELECT id FROM aa WHERE id = SOME(SELECT 2)")))
+    (is (= [["2"] ["3"]] (rows "SELECT id FROM aa WHERE id <> ALL(SELECT 1) ORDER BY id")))
+    (is (= [["t"] ["f"] ["f"]] (rows "SELECT id = ANY(SELECT 1) FROM aa ORDER BY id")))))
