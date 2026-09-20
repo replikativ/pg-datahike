@@ -1947,12 +1947,15 @@
    Returns nil for an UNcorrelated derived table, which belongs on the
    existing materialise-once path."
   [^net.sf.jsqlparser.statement.select.LateralSubSelect ls db schema
-   outer-aliases var-counter]
+   outer-aliases var-counter outer-level]
   (let [inner (.getSelect ls)
         values? (instance? Values inner)
         corr-refs (seq (if values?
                          (lateral-values-corr-refs inner outer-aliases schema)
-                         (correlated-subquery-refs inner outer-aliases)))]
+                         ;; `outer-level` is what lets an UNQUALIFIED name
+                         ;; inside the LATERAL be the outer item's column,
+                         ;; as `FROM t, LATERAL (SELECT b)` means.
+                         (correlated-subquery-refs inner outer-aliases outer-level)))]
     (when (and corr-refs (or (instance? PlainSelect inner) values?))
       (let [talias (when-let [a (.getAlias ls)]
                      (unquote-ident (str/trim (.getName ^Alias a))))
@@ -2812,8 +2815,9 @@
    when uncorrelated. Delegating to the scope-aware AST walker is essential:
    an inner `FROM other AS t` shadows an outer `t` and must never be replaced
    by the outer row binding."
-  [inner outer-aliases]
-  (expr/correlated-subquery-refs inner outer-aliases))
+  ([inner outer-aliases] (expr/correlated-subquery-refs inner outer-aliases))
+  ([inner outer-aliases outer-level]
+   (expr/correlated-subquery-refs inner outer-aliases outer-level)))
 
 (defn unwrap-parens
   "Peel redundant Parenthesis / single-element ParenthesedExpressionList
@@ -3400,7 +3404,37 @@
         ;; reduce walks the joins.
         outer-alias-set (into #{} (comp (keep identity) (map str/lower-case))
                               [name alias])
+        ;; The same relation as a namespace level, so an unqualified
+        ;; name inside a LATERAL can be attributed to it.
+        outer-level (delay
+                      (when-let [vis (or alias name)]
+                        (let [cols (when (and name schema)
+                                     (not-empty (into #{} (map :name)
+                                                      (pgs/column-info schema name db))))]
+                          {:items [{:alias vis :relation name
+                                    :columns (or cols #{})
+                                    ;; A relation whose columns we cannot
+                                    ;; read owns nothing we can claim.
+                                    :columns-unknown? (nil? cols)}]})))
         _ (validate-lateral-join-shapes! select)
+        ;; Two relations visible under one name is 42712, raised when the
+        ;; namespace is built -- before any column lookup, which is why
+        ;; PostgreSQL reports the relation and not an ambiguous column
+        ;; (checkNameSpaceConflicts, parse_relation.c).
+        _ (let [visible (keep (fn [item]
+                                (when item
+                                  ;; unquote-ident folds an unquoted name and
+                                  ;; preserves a quoted one, which is what
+                                  ;; makes `t2 AS "T"` a different relation
+                                  ;; from `t` -- do not fold again.
+                                  (if-let [a (.getAlias ^FromItem item)]
+                                    (unquote-ident (.getName ^Alias a))
+                                    (when (instance? Table item)
+                                      (unquote-ident (.getName ^Table item))))))
+                              (cons from-item (map #(.getRightItem ^Join %) (or joins []))))]
+            (when-let [dup (first (for [[n c] (frequencies visible) :when (> c 1)] n))]
+              (throw (ex-info (str "table name \"" dup "\" specified more than once")
+                              {:error :duplicate-alias :sqlstate "42712" :table dup}))))
         ;; The relations this statement's WITH list introduces, including
         ;; a recursive one referring to itself.
         with-names (into #{}
@@ -3498,9 +3532,9 @@
                ;; ordinary derived table and materialised once with the
                ;; outer column unbound.
                (and db (instance? net.sf.jsqlparser.statement.select.LateralSubSelect rt)
-                    (lateral-subselect->spec rt db schema outer-alias-set lsrf-var-counter))
+                    (lateral-subselect->spec rt db schema outer-alias-set lsrf-var-counter @outer-level))
                (let [spec (lateral-subselect->spec rt db schema outer-alias-set
-                                                   lsrf-var-counter)]
+                                                   lsrf-var-counter @outer-level)]
                  ;; An OUTER lateral has to preserve the outer row with
                  ;; NULLs when the inner is empty, and an empty collection
                  ;; binding DROPS it -- that is the inner-join semantics
@@ -3687,7 +3721,21 @@
                              ;; the engine run the inner once per outer
                              ;; row.
                              (mapv (fn [[a c]]
-                                     (ctx/col-var! ctx (keyword a c)))
+                                     ;; Resolve the outer reference the way
+                                     ;; any other column reference resolves
+                                     ;; -- through the alias map, the
+                                     ;; case-folding index, renames and
+                                     ;; INHERITS. `(keyword a c)` treated the
+                                     ;; ALIAS as a namespace, so `FROM t x,
+                                     ;; LATERAL (SELECT x.c)` raised 42P01
+                                     ;; for a relation that is in scope.
+                                     (let [col (Column. (Table. ^String a) ^String c)]
+                                       (ctx/col-var!
+                                        ctx (ctx/resolve-column col (:table-aliases ctx)
+                                                                (:default-table ctx)
+                                                                (:col-overrides ctx)
+                                                                (:derived-aliases ctx)
+                                                                (:ci-index ctx)))))
                                    corr-refs)
                              (mapv (fn [e]
                                      (let [v (srf-const-eval e)]

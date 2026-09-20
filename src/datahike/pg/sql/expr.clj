@@ -2452,61 +2452,115 @@
           (contains? (:schema db) (keyword tname cname))))
     :else true))
 
+(defn ctx-level
+  "The query level `ctx` is translating: one item per relation in scope,
+   with the columns it exposes -- what an unqualified name in a NESTED
+   SELECT is resolved against (params/level-owners). A derived or function relation, or one whose columns we
+   cannot read, is marked :columns-unknown? so a name it might own is
+   never taken for an outer reference."
+  [ctx]
+  (let [derived (or (:derived-aliases ctx) #{})
+        ;; One item per FROM OCCURRENCE: `table-aliases` registers both
+        ;; `{alias -> relation}` and `{relation -> relation}` for a single
+        ;; item, so counting its entries calls an aliased relation
+        ;; ambiguous with itself.
+        occurrences (:relation-aliases (meta (:table-aliases ctx)))
+        aliases (cond-> (or (:table-aliases ctx) {})
+                  (and (:default-table ctx)
+                       (not (contains? (or (:table-aliases ctx) {}) (:default-table ctx))))
+                  (assoc (:default-table ctx) (:default-table ctx)))]
+    {:items (vec (for [[alias relation] (if (seq occurrences)
+                                          (map (fn [a] [a (get aliases a a)]) occurrences)
+                                          aliases)]
+                   (let [cols (when (:schema ctx)
+                                (try (not-empty
+                                      (into #{} (map :name)
+                                            (pgs/column-info (:schema ctx) relation (:db ctx))))
+                                     (catch Throwable _ nil)))]
+                     {:alias alias
+                      :relation relation
+                      :columns (or cols #{})
+                      :columns-unknown? (or (contains? derived alias) (nil? cols))})))}))
+
 (defn correlated-subquery-refs
-  "Return qualified outer-column references in `inner`, respecting every
-   SELECT's FROM/JOIN alias scope, including derived and set-op branches."
-  [inner outer-aliases]
-  (letfn [(refs [node visible-outers]
-            (cond
-              (instance? ParenthesedSelect node)
-              (refs (.getSelect ^ParenthesedSelect node) visible-outers)
+  "Return the outer-column references in `inner`, respecting every
+   SELECT's FROM/JOIN alias scope, including derived and set-op
+   branches. `outer-level` (expr/ctx-level's shape) lets an
+   UNQUALIFIED name be attributed to the enclosing query when no
+   relation of the inner SELECT has it; without it only qualified
+   references are found."
+  ([inner outer-aliases] (correlated-subquery-refs inner outer-aliases nil))
+  ([inner outer-aliases outer-level]
+   (letfn [(refs [node visible-outers]
+             (cond
+               (instance? ParenthesedSelect node)
+               (refs (.getSelect ^ParenthesedSelect node) visible-outers)
 
-              (instance? SetOperationList node)
-              (into #{} (mapcat #(refs % visible-outers))
-                    (.getSelects ^SetOperationList node))
+               (instance? SetOperationList node)
+               (into #{} (mapcat #(refs % visible-outers))
+                     (.getSelects ^SetOperationList node))
 
-              (instance? PlainSelect node)
-              (let [^PlainSelect ps node
-                    joins (or (.getJoins ps) [])
-                    with-items (or (try (.getWithItemsList ps)
-                                        (catch Throwable _ nil))
-                                   [])
-                    local-items (cons (.getFromItem ps)
-                                      (map #(.getRightItem ^Join %) joins))
-                    locals (into #{} (keep local-item-alias) local-items)
-                    visible (set/difference visible-outers locals)
-                    scope-nodes (plain-select-scope-nodes ps)
-                    own-refs (into #{}
-                                   (keep (fn [^Column col]
-                                           (let [alias (some-> col .getTable .getName
-                                                               unquote-ident str/lower-case)
-                                                 cname (-> col .getColumnName
-                                                           unquote-ident str/lower-case)]
-                                             (cond
-                                               (contains? visible alias) [alias cname]
-                                               ;; An unqualified name is the row
-                                               ;; scope's column when no relation of
-                                               ;; this SELECT has it: `(SELECT v)`.
-                                               (nil? alias)
-                                               (when-let [owner (row-scope-owner cname visible)]
-                                                 (when-not (some #(local-item-has-column? % cname)
-                                                                 local-items)
-                                                   [owner cname]))))))
-                                   (mapcat params/ast-columns scope-nodes))
-                    children (concat (mapcat nested-selects-in scope-nodes)
-                                     (mapcat nested-selects-in local-items))
+               (instance? PlainSelect node)
+               (let [^PlainSelect ps node
+                     joins (or (.getJoins ps) [])
+                     with-items (or (try (.getWithItemsList ps)
+                                         (catch Throwable _ nil))
+                                    [])
+                     local-items (cons (.getFromItem ps)
+                                       (map #(.getRightItem ^Join %) joins))
+                     locals (into #{} (keep local-item-alias) local-items)
+                     visible (set/difference visible-outers locals)
+                     scope-nodes (plain-select-scope-nodes ps)
+                     own-refs (into #{}
+                                    (keep (fn [^Column col]
+                                            (let [alias (some-> col .getTable .getName
+                                                                unquote-ident str/lower-case)
+                                                  cname (-> col .getColumnName
+                                                            unquote-ident str/lower-case)]
+                                              (cond
+                                                (contains? visible alias) [alias cname]
+                                               ;; An unqualified name belongs to an
+                                               ;; ENCLOSING level when no relation of
+                                               ;; this SELECT has it -- a row scope's
+                                               ;; column (`(SELECT v)`), or the outer
+                                               ;; query's (`(SELECT count(*) FROM y
+                                               ;; WHERE b IS NULL)`, where b is the
+                                               ;; outer relation's).
+                                                (nil? alias)
+                                                (when-not (some #(local-item-has-column? % cname)
+                                                                local-items)
+                                                  (when-let [owner
+                                                             (or (row-scope-owner cname visible)
+                                                                 ;; Only the level this SELECT is
+                                                                 ;; nested in: a deeper one is
+                                                                 ;; attributed when IT is
+                                                                 ;; translated. An item whose
+                                                                 ;; columns we cannot read claims
+                                                                 ;; nothing, and two items of one
+                                                                 ;; level claiming it is 42702.
+                                                                 (let [owners (remove :columns-unknown?
+                                                                                      (params/level-owners
+                                                                                       outer-level cname))]
+                                                                   (when (next (distinct (map :relation owners)))
+                                                                     (params/ambiguous-column! cname))
+                                                                   (:alias (first owners))))]
+                                                    (when (contains? visible owner)
+                                                      [owner cname])))))))
+                                    (mapcat params/ast-columns scope-nodes))
+                     children (concat (mapcat nested-selects-in scope-nodes)
+                                      (mapcat nested-selects-in local-items))
                     ;; WITH definitions are attached to the SELECT but are
                     ;; outside the ordinary projection/FROM scope nodes.
                     ;; They can themselves correlate to an outer query (the
                     ;; asyncpg domain-type probe does so from a recursive CTE).
-                    with-refs
-                    (mapcat (fn [^WithItem wi]
-                              (when-let [body (try (.getParenthesedStatement wi)
-                                                   (catch Throwable _ nil))]
-                                (refs body visible-outers)))
-                            with-items)]
-                (into own-refs (concat with-refs
-                                       (mapcat #(refs % visible) children))))
+                     with-refs
+                     (mapcat (fn [^WithItem wi]
+                               (when-let [body (try (.getParenthesedStatement wi)
+                                                    (catch Throwable _ nil))]
+                                 (refs body visible-outers)))
+                             with-items)]
+                 (into own-refs (concat with-refs
+                                        (mapcat #(refs % visible) children))))
 
               ;; Expression roots (notably CASE) are not SELECT scopes, but
               ;; can both refer directly to an outer column and contain scalar
@@ -2514,24 +2568,24 @@
               ;; CASE references are collected here without leaking through an
               ;; inner alias scope; each immediate SELECT child is then handled
               ;; by `refs` under its own FROM shadowing rules.
-              :else
-              (let [own-refs (into #{}
-                                   (keep (fn [^Column col]
-                                           (let [alias (some-> col .getTable .getName
-                                                               unquote-ident str/lower-case)]
-                                             (when (contains? visible-outers alias)
-                                               [alias (-> col .getColumnName
-                                                          unquote-ident str/lower-case)]))))
-                                   (params/ast-columns node))]
-                (into own-refs (mapcat #(refs % visible-outers))
+               :else
+               (let [own-refs (into #{}
+                                    (keep (fn [^Column col]
+                                            (let [alias (some-> col .getTable .getName
+                                                                unquote-ident str/lower-case)]
+                                              (when (contains? visible-outers alias)
+                                                [alias (-> col .getColumnName
+                                                           unquote-ident str/lower-case)]))))
+                                    (params/ast-columns node))]
+                 (into own-refs (mapcat #(refs % visible-outers))
                       ;; Values is itself a Select in JSqlParser. Its columns
                       ;; are handled above; recursing into the node returned by
                       ;; nested-selects-in would revisit the identical object
                       ;; forever. Other expression roots only retain proper
                       ;; child SELECTs here.
-                      (remove #(identical? node %) (nested-selects-in node))))))]
-    (when (seq outer-aliases)
-      (not-empty (refs inner (set outer-aliases))))))
+                       (remove #(identical? node %) (nested-selects-in node))))))]
+     (when (seq outer-aliases)
+       (not-empty (refs inner (set outer-aliases)))))))
 
 (defn- nested-subquery-body?
   "True when a SELECT body contains another SELECT below its own scope."
@@ -2827,7 +2881,7 @@
           inner (when (instance? ParenthesedSelect right)
                   (.getSelect ^ParenthesedSelect right))
           corr-refs (when inner
-                      (correlated-subquery-refs inner (outer-alias-set ctx)))
+                      (correlated-subquery-refs inner (outer-alias-set ctx) (ctx-level ctx)))
           _ (when inner
               (analyze-in-subquery! ctx left-asts inner corr-refs))
           subquery-values-var (when (and inner (not row-in?) (not (seq corr-refs)))
@@ -4747,7 +4801,7 @@
     [(name owner) col-name]))
 
 (defn- row-subquery-correlation-refs [ctx inner]
-  (let [qualified (correlated-subquery-refs inner (outer-alias-set ctx))
+  (let [qualified (correlated-subquery-refs inner (outer-alias-set ctx) (ctx-level ctx))
         ;; An inner SELECT without FROM resolves its unqualified columns in
         ;; the outer scope. PostgreSQL's own ROWCOMPARE regression uses
         ;; `(SELECT f1, f2)` in precisely this shape.
@@ -7715,7 +7769,7 @@
           inner (when (instance? ParenthesedSelect right)
                   (.getSelect ^ParenthesedSelect right))
           corr-refs (when inner
-                      (correlated-subquery-refs inner (outer-alias-set ctx)))
+                      (correlated-subquery-refs inner (outer-alias-set ctx) (ctx-level ctx)))
           _ (when inner
               (analyze-in-subquery! ctx left-asts inner corr-refs))
           subquery-values-var (when (and inner (not row-in?) (not (seq corr-refs)))
@@ -7855,7 +7909,7 @@
                   (instance? PlainSelect sub-select) sub-select
                   :else nil)
           corr-refs (when inner
-                      (correlated-subquery-refs inner (outer-alias-set ctx)))
+                      (correlated-subquery-refs inner (outer-alias-set ctx) (ctx-level ctx)))
           _ (when (seq corr-refs)
               (analyze-exists-subquery! ctx inner corr-refs))
           _ (when (and (seq corr-refs) (nested-subquery-body? inner))

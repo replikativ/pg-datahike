@@ -480,6 +480,17 @@
    the inner level has no such column."
   nil)
 
+(defn level-owners
+  "The items of `level` -- a query level as `expr/ctx-level` builds it,
+   `{:items [{:alias :relation :columns :columns-unknown?}]}` -- that
+   expose `col-name`. PostgreSQL resolves an unqualified name against the
+   relations of a level (colNameToVar), which needs each one's columns:
+   an alias name alone cannot say who owns what."
+  [level col-name]
+  (filterv (fn [{:keys [columns columns-unknown?]}]
+             (or columns-unknown? (contains? columns col-name)))
+           (:items level)))
+
 (defn binding-column-owners
   "Return the aliases in `bindings` that expose `col-name`, restricted to
    `aliases` (default: *from-source-aliases*, when set).
