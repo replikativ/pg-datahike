@@ -13,7 +13,7 @@
    `translate-delete` produce tx-data + (for UPDATE/DELETE) an
    eids-walk query. INSERT RETURNING and UPDATE RETURNING land in
    `extract-returning`; UPDATE expressions evaluated per row at handler
-   time go through `eval-update-expr`. CHECK constraints are evaluated
+   time go through the SELECT translator. CHECK constraints are evaluated
    by datahike.pg.sql.row-eval.
 
    The bottom half implements CTEs: `translate-cte-branch`
@@ -198,7 +198,6 @@
          extract-value
          strict-scalar-value
          coerce-insert-value
-         eval-update-expr
          extract-returning
          materialize-table-function
          materialize-derived-select!
@@ -207,7 +206,6 @@
          match-aggregate-index
          select-item-alias
          eval-values-literal
-         extract-from-values
          apply-sql-cast
          parse-bytea-hex
          join-type)
@@ -974,7 +972,6 @@
     (if predicate (walk predicate) [])))
 (declare apply-sql-cast)
 (declare eval-corr-scalar)
-(declare ^:dynamic *eval-update-db*)
 
 (defn- srf-const-eval
   "Evaluate a table-function argument expression to a constant value at
@@ -2213,8 +2210,7 @@
               ;; query. They are an OUTER level, so an inner column shadows
               ;; a same-named outer one, as PostgreSQL requires.
               params/*outer-scope-aliases* aliases
-              params/*lateral-outer-aliases* aliases
-              *eval-update-db* query-db]
+              params/*lateral-outer-aliases* aliases]
       (case (:kind spec)
         :case
         (let [hit (some (fn [{:keys [when-sql then]}]
@@ -3405,6 +3401,13 @@
         outer-alias-set (into #{} (comp (keep identity) (map str/lower-case))
                               [name alias])
         _ (validate-lateral-join-shapes! select)
+        ;; The relations this statement's WITH list introduces, including
+        ;; a recursive one referring to itself.
+        with-names (into #{}
+                         (keep (fn [^net.sf.jsqlparser.statement.select.WithItem wi]
+                                 (some-> (.getAlias wi) str str/trim
+                                         params/unquote-ident str/lower-case)))
+                         (or (.getWithItemsList select) []))
         [db schema join-aliases derived-joins lsrf-specs]
         (reduce
          (fn [[db schema aliases derived lsrfs] ^Join j]
@@ -3413,7 +3416,27 @@
                         unwrap-derived-parentheses
                         expand-view
                         name-anonymous-derived)
-                 _ (when-not (identical? raw-rt rt) (.setRightItem j rt))]
+                 _ (when-not (identical? raw-rt rt) (.setRightItem j rt))
+                 ;; A joined relation is checked like the FROM item
+                 ;; above: absent, it used to surface as "missing
+                 ;; FROM-clause entry" for the first column that named
+                 ;; it, rather than PostgreSQL's 42P01 for the relation.
+                 ;; A name this statement's own WITH list declares counts
+                 ;; as known: a recursive CTE's body joins the CTE
+                 ;; itself, and its rows exist only while the rule runs.
+                 _ (when (instance? Table rt)
+                     (let [rn (unquote-ident (.getName ^Table rt))]
+                       (when-not (or (relation-known? schema rn)
+                                     (contains? with-names (str/lower-case rn))
+                                     ;; A catalog relation exists in
+                                     ;; PostgreSQL whether or not this
+                                     ;; layer materialises rows for it.
+                                     (str/starts-with? (str/lower-case rn) "pg_")
+                                     (str/starts-with? (str/lower-case rn) "information_schema"))
+                         (throw (ex-info (str "relation \"" rn "\" does not exist")
+                                         {:error :undefined-table
+                                          :sqlstate "42P01"
+                                          :table rn})))))]
              (cond
                ;; A correlated SRF is ALWAYS in a join/comma position —
                ;; it has to have an outer row to correlate WITH — so this
@@ -6419,7 +6442,7 @@
     (long v)
     v))
 
-(defn- sql-value
+(defn sql-value
   "A result cell as an SQL value: the NULL sentinel as nil."
   [v]
   (when-not (or (nil? v) (= :__null__ v)) (widen-integral v)))
@@ -7089,23 +7112,25 @@
           (java.util.Date/from (.toInstant ^java.time.ZonedDateTime val))
           :else val)))))
 
-(declare eval-update-expr eval-update-cond)
-
-(def ^:dynamic *eval-update-db*
-  "Bound by build-update-tx-for-bindings to the live db when evaluating
-   per-row UPDATE SET expressions. Read by the Function (`concat`,
-   etc.) and ParenthesedSelect (scalar subquery) branches of
-   `eval-update-expr` — which need a db handle to dispatch to
-   translate-select for inner subqueries. nil when an UPDATE has no
-   subquery / function-call assignments, which is the common case."
-  nil)
-
-(def ^:dynamic *eval-update-parse-fn*
-  "Captured parse hook used by scalar subqueries evaluated inside tx fns."
-  nil)
-
-(defonce ^:private ^ThreadLocal dml-scalar-cache
+(def ^:private dml-scalar-cache
+  "One InitPlan per uncorrelated scalar subquery of a DML statement,
+   keyed by the statement's time: PostgreSQL runs such a subquery once,
+   however many rows the statement writes."
   (ThreadLocal.))
+
+(defn- reject-grouping!
+  "Reject aggregate and window calls in `expr`, an expression computing
+   one row's value -- RETURNING, an UPDATE's SET list, ON CONFLICT's
+   (parse_agg.c's EXPR_KIND_RETURNING / EXPR_KIND_UPDATE_SOURCE).
+   Nested SELECTs are their own level and may group."
+  [expr context]
+  (when (seq (params/ast-window-names expr))
+    (throw (ex-info (str "window functions are not allowed in " context)
+                    {:sqlstate "42P20"})))
+  (when (some fns/aggregate-function? (params/ast-function-names expr))
+    (throw (errors/pg-error
+            :grouping-error
+            {:message (str "aggregate functions are not allowed in " context)}))))
 
 (defn- dml-scalar-correlated?
   [inner]
@@ -7169,581 +7194,6 @@
                 (evaluate)))]
       (when-not (= :__null__ v) v))))
 
-(defn- num-operand
-  "PG-style unknown-operand resolution for arithmetic: a text-format
-   wire parameter decodes as a String; in numeric context PG casts it
-   to the numeric type. Numeric-looking strings parse (long or double
-   by shape); everything else passes through unchanged so non-numeric
-   operands still fail the arithmetic's number? guards."
-  [x]
-  (if (and (string? x)
-           (re-matches #"\s*[+-]?\d+(\.\d+)?([eE][+-]?\d+)?\s*" x))
-    (try (coerce/coerce-numeric x (if (re-find #"[.eE]" x) :double :long))
-         (catch Exception _ x))
-    x))
-
-(defn- sql-numeric? [x]
-  (or (number? x) (types/numeric-special? x)))
-
-(defn- temporal-value?
-  "A stored date/timestamp. Dates come back as java.util.Date from the
-   :db.type/instant attribute; the java.time types appear via casts."
-  [v]
-  (or (instance? java.util.Date v)
-      (instance? java.time.LocalDate v)
-      (instance? java.time.LocalDateTime v)
-      (instance? java.time.Instant v)))
-
-(defn- shift-days
-  "`date + n` / `date - n`: shift by n DAYS, preserving the value's type."
-  [v ^long n]
-  (cond
-    (instance? java.time.LocalDate v)     (.plusDays ^java.time.LocalDate v n)
-    (instance? java.time.LocalDateTime v) (.plusDays ^java.time.LocalDateTime v n)
-    (instance? java.time.Instant v)       (.plus ^java.time.Instant v n java.time.temporal.ChronoUnit/DAYS)
-    (instance? java.util.Date v)
-    (java.util.Date/from (.plus (.toInstant ^java.util.Date v) n java.time.temporal.ChronoUnit/DAYS))
-    :else nil))
-
-(defn eval-update-cond
-  "Evaluate a boolean expression in UPDATE SET position -- the tests of a
-   CASE. Three-valued: returns true / false / :__null__, so the caller can
-   apply PostgreSQL's rule that a branch is taken only on TRUE.
-
-   A small evaluator rather than a reuse of the WHERE translator: this runs
-   per ENTITY against an already-materialised entity-map, not as a datalog
-   clause over the whole relation."
-  [expr entity-map ns-str schema]
-  (let [ev (fn [e] (eval-update-expr e entity-map ns-str schema))
-        ;; SELECT-list predicates and UPDATE expressions are evaluated here,
-        ;; outside expr/translate-comparison's Datalog path. Preserve the
-        ;; same PostgreSQL rule in both lowering paths: an unknown string
-        ;; literal takes the known column operand's declared type. Runtime
-        ;; class is insufficient for money because numeric shares its
-        ;; BigDecimal carrier.
-        comparison-values
-        (fn [left right]
-          (let [coerce-one
-                (fn [typed unknown v]
-                  (if (and (instance? Column typed)
-                           (instance? StringValue unknown)
-                           (let [attr (keyword ns-str
-                                               (unquote-ident
-                                                (.getColumnName ^Column typed)))]
-                             (= "money"
-                                (or (get-in schema [attr :pg/type])
-                                    (params/pg-type-of-attr nil attr)))))
-                    (sql-cast/parse-money v)
-                    v))]
-            [(coerce-one right left (ev left))
-             (coerce-one left right (ev right))]))]
-    (cond
-      (instance? AndExpression expr)
-      (fns/sql-and3 (eval-update-cond (.getLeftExpression ^AndExpression expr) entity-map ns-str schema)
-                    (eval-update-cond (.getRightExpression ^AndExpression expr) entity-map ns-str schema))
-      (instance? OrExpression expr)
-      (fns/sql-or3 (eval-update-cond (.getLeftExpression ^OrExpression expr) entity-map ns-str schema)
-                   (eval-update-cond (.getRightExpression ^OrExpression expr) entity-map ns-str schema))
-      (instance? net.sf.jsqlparser.expression.NotExpression expr)
-      (fns/sql-not3 (eval-update-cond (.getExpression ^net.sf.jsqlparser.expression.NotExpression expr)
-                                      entity-map ns-str schema))
-      (instance? Parenthesis expr)
-      (eval-update-cond (.getExpression ^Parenthesis expr) entity-map ns-str schema)
-      (instance? IsNullExpression expr)
-      (let [v (ev (.getLeftExpression ^IsNullExpression expr))]
-        (if (.isNot ^IsNullExpression expr) (some? v) (nil? v)))
-      (instance? EqualsTo expr)
-      (apply fns/sql-eq3? (comparison-values (.getLeftExpression ^EqualsTo expr)
-                                             (.getRightExpression ^EqualsTo expr)))
-      (instance? NotEqualsTo expr)
-      (apply fns/sql-ne3? (comparison-values (.getLeftExpression ^NotEqualsTo expr)
-                                             (.getRightExpression ^NotEqualsTo expr)))
-      (instance? GreaterThan expr)
-      (apply fns/sql-gt3? (comparison-values (.getLeftExpression ^GreaterThan expr)
-                                             (.getRightExpression ^GreaterThan expr)))
-      (instance? GreaterThanEquals expr)
-      (apply fns/sql-ge3? (comparison-values (.getLeftExpression ^GreaterThanEquals expr)
-                                             (.getRightExpression ^GreaterThanEquals expr)))
-      (instance? MinorThan expr)
-      (apply fns/sql-lt3? (comparison-values (.getLeftExpression ^MinorThan expr)
-                                             (.getRightExpression ^MinorThan expr)))
-      (instance? MinorThanEquals expr)
-      (apply fns/sql-le3? (comparison-values (.getLeftExpression ^MinorThanEquals expr)
-                                             (.getRightExpression ^MinorThanEquals expr)))
-      (instance? BooleanValue expr) (.getValue ^BooleanValue expr)
-
-      ;; The predicate surface eval-update-expr does not itself decide.
-      ;; These all have three-valued implementations already.
-      (instance? Between expr)
-      (let [^Between b expr
-            v (ev (.getLeftExpression b))]
-        (if (.isNot b)
-          (fns/sql-not-between? v (ev (.getBetweenExpressionStart b)) (ev (.getBetweenExpressionEnd b)))
-          (fns/sql-between? v (ev (.getBetweenExpressionStart b)) (ev (.getBetweenExpressionEnd b)))))
-
-      (instance? LikeExpression expr)
-      (let [^LikeExpression l expr
-            v (ev (.getLeftExpression l))
-            pat (ev (.getRightExpression l))
-            r (fns/sql-like3? v (expr/like-pattern->regex (str pat) (.isCaseInsensitive l)))]
-        (if (.isNot l) (fns/sql-not3 r) r))
-
-      (instance? InExpression expr)
-      (let [^InExpression i expr
-            v (ev (.getLeftExpression i))
-            right (.getRightExpression i)
-            vals (when (instance? ParenthesedExpressionList right)
-                   (mapv ev ^ParenthesedExpressionList right))
-            r (if vals (fns/sql-in3? (set vals) v) :__null__)]
-        (if (.isNot i) (fns/sql-not3 r) r))
-
-      (instance? JsonOperator expr)
-      (let [^JsonOperator jo expr
-            l (ev (.getLeftExpression jo))
-            r (ev (.getRightExpression jo))]
-        (case (.getStringExpression jo)
-          "@>" (jb/jsonb-contains? l r)
-          "<@" (jb/jsonb-contained? l r)
-          "?"  (jb/jsonb-exists? l r)
-          "?|" (jb/jsonb-exists-any? l r)
-          "?&" (jb/jsonb-exists-all? l r)
-          :__null__))
-
-      ;; A bare column or a value expression used as a boolean.
-      (or (instance? Column expr) (instance? JdbcParameter expr))
-      (let [v (ev expr)] (cond (nil? v) :__null__ (= :__null__ v) :__null__ :else (boolean v)))
-
-      ;; Anything else is REFUSED. The old `:else` evaluated the node with
-      ;; eval-update-expr and took its truthiness -- and eval-update-expr
-      ;; STRINGIFIED whatever it did not know, so a non-empty string made
-      ;; EVERY unrecognised predicate unconditionally TRUE. `UPDATE t SET x
-      ;; = CASE WHEN s LIKE 'zzz%' THEN 'a' ELSE 'b' END` took the THEN
-      ;; branch on every row.
-      :else
-      (throw (ex-info "UPDATE SET condition not supported"
-                      {:error :feature-not-supported
-                       :feature (str "UPDATE SET condition of type "
-                                     (.getName ^Class (type expr)))
-                       :expr (str expr)})))))
-
-(defn eval-update-expr
-  "Evaluate an UPDATE SET expression for a specific entity.
-   For simple literals, returns the literal value.
-   For expressions (col + 1, col * 2), evaluates against the entity's current values.
-
-   JdbcParameter placeholders return a ParamRef — the tx-build step runs
-   substitute-params once bound values are available from Bind."
-  [value-expr entity-map ns-str schema]
-  (cond
-    (instance? JdbcParameter value-expr)
-    ;; Execute-time re-evaluation (*bound-params* bound): resolve to the
-    ;; concrete value so arithmetic like `SET bal = bal + $1` computes —
-    ;; a ParamRef operand made `+` throw ClassCastException (hit by
-    ;; pgbench -M prepared). Parse time keeps the ParamRef sentinel for
-    ;; the tx-build substitution pass.
-    (let [idx (.getIndex ^JdbcParameter value-expr)]
-      (if-let [bound params/*bound-params*]
-        (nth bound (dec (long idx)))
-        (->ParamRef idx)))
-
-    (instance? LongValue value-expr)
-    (.getValue ^LongValue value-expr)
-
-    (instance? DoubleValue value-expr)
-    (types/decimal-literal value-expr (.getValue ^DoubleValue value-expr))
-
-    (instance? StringValue value-expr)
-    (expr/string-value-text ^StringValue value-expr)
-
-    (instance? BooleanValue value-expr)
-    (.getValue ^BooleanValue value-expr)
-
-    (instance? NullValue value-expr)
-    nil
-
-    ;; Column reference — look up current value (or EXCLUDED.col for upsert,
-    ;; or the VALUES alias for UPDATE ... FROM (VALUES ...))
-    (instance? Column value-expr)
-    (let [^Column col-expr value-expr
-          col-name (unquote-ident (.getColumnName col-expr))
-          tbl (.getTable col-expr)
-          tbl-name (when tbl (unquote-ident (.getName ^Table tbl)))
-          binding-owners (when (and (nil? tbl-name) (seq params/*from-source-aliases*))
-                           (params/binding-column-owners params/*from-bindings* col-name))
-          target-column? (contains? schema (keyword ns-str col-name))]
-      (cond
-        ;; Bound by the current UPDATE ... FROM row (or the materialised
-        ;; target row used by correlated UPDATE expressions).
-        (and tbl-name params/*from-bindings* (contains? params/*from-bindings* tbl-name))
-        (get-in params/*from-bindings* [tbl-name col-name])
-
-        (and (nil? tbl-name) (> (count binding-owners) 1))
-        (params/ambiguous-column! col-name)
-
-        (and (nil? tbl-name) (= 1 (count binding-owners)) target-column?)
-        (params/ambiguous-column! col-name)
-
-        (and (nil? tbl-name) (= 1 (count binding-owners)))
-        (get-in params/*from-bindings* [(first binding-owners) col-name])
-
-        (and tbl-name (= "EXCLUDED" (.toUpperCase ^String tbl-name)))
-        (get entity-map (keyword "excluded" col-name))
-
-        :else
-        (let [attr (keyword ns-str col-name)
-              v (get entity-map attr)
-              v (if (= :db.type/bigdec (get-in schema [attr :db/valueType]))
-                  (types/numeric-storage->value v)
-                  v)
-              ;; `a[1]` parses as a COLUMN with an array constructor
-              ;; attached, not as an ArrayExpression -- so the plain column
-              ;; lookup returned the WHOLE array and the subscript was
-              ;; silently dropped.
-              subs (some-> (.getArrayConstructor col-expr) .getExpressions)]
-          (if-let [idx (when (= 1 (count subs))
-                         (let [i (eval-update-expr (first subs) entity-map ns-str schema)]
-                           (when (integer? i) (long i))))]
-            (let [arr (cond (pg-arr/array? v) v
-                            (string? v) (try (pg-arr/from-pg-text v :unknown)
-                                             (catch Throwable _ nil)))]
-              (when arr (nth (pg-arr/flat-elements arr) (dec idx) nil)))
-            v))))
-
-    ;; Arithmetic context: a wire parameter of unknown type decodes as a
-    ;; String; PG resolves `int + $1` by casting the unknown operand to
-    ;; the numeric type. Mirror that for numeric-looking strings only —
-    ;; anything else keeps its type and fails the arithmetic like PG's
-    ;; 22P02 would.
-    (instance? Addition value-expr)
-    (let [^Addition e value-expr
-          l0 (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r0 (eval-update-expr (.getRightExpression e) entity-map ns-str schema)
-          l (num-operand l0)
-          r (num-operand r0)]
-      (cond
-        ;; `date + n` shifts by n DAYS. A date column is stored as a
-        ;; java.util.Date, which num-operand turns into nothing, so
-        ;; `UPDATE t SET d = d + 1` silently WIPED the column instead of
-        ;; advancing it.
-        (and (temporal-value? l0) (number? r)) (shift-days l0 (long r))
-        (and (number? l) (temporal-value? r0)) (shift-days r0 (long l))
-        (and (sql-numeric? l) (sql-numeric? r)) (fns/sql-+ l r)))
-
-    ;; Negative literal operand: `SET x = x + -123` parses the RHS as a
-    ;; SignedExpression; without this branch it fell to `(str value-expr)`
-    ;; and the arithmetic threw String→Number (hit by pgbench's tpcb
-    ;; script, whose :delta is uniform over [-5000, 5000]).
-    (instance? SignedExpression value-expr)
-    (let [^SignedExpression se value-expr
-          inner (eval-update-expr (.getExpression se) entity-map ns-str schema)]
-      (when (number? inner)
-        (if (= \- (.getSign se)) (- inner) inner)))
-
-    ;; Subtraction: numeric subtract or jsonb key deletion (col - 'key' or col - idx)
-    (instance? Subtraction value-expr)
-    (let [^Subtraction e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (cond
-        (and (nil? l)) nil
-        ;; `date - n` shifts back n DAYS, the mirror of the Addition branch.
-        ;; Checked BEFORE the jsonb-deletion case, which would otherwise
-        ;; try to parse a Date as JSON.
-        (and (temporal-value? l) (number? (num-operand r)))
-        (shift-days l (- (long (num-operand r))))
-        ;; jsonb key/index deletion: left is jsonb (string containing JSON, map, or vector)
-        (and (some? l) (some? r)
-             (or (map? (jb/parse-jsonb l)) (sequential? (jb/parse-jsonb l))))
-        (let [result (if (integer? r)
-                       (jb/jsonb-delete-idx l (long r))
-                       (jb/jsonb-delete-key l (str r)))]
-          (jb/serialize-jsonb result))
-        ;; Numeric subtraction (num-operand: unknown-type wire params
-        ;; arrive as strings — cast in numeric context like PG)
-        (and (sql-numeric? (num-operand l)) (sql-numeric? (num-operand r)))
-        (fns/sql-- (num-operand l) (num-operand r))
-        :else nil))
-
-    (instance? Multiplication value-expr)
-    (let [^Multiplication e value-expr
-          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
-          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
-      (when (and (sql-numeric? l) (sql-numeric? r)) (fns/sql-* l r)))
-
-    (instance? Division value-expr)
-    (let [^Division e value-expr
-          l (num-operand (eval-update-expr (.getLeftExpression e) entity-map ns-str schema))
-          r (num-operand (eval-update-expr (.getRightExpression e) entity-map ns-str schema))]
-      ;; fns/sql-div, not `/`, and NO zero guard. Skipping a zero divisor
-      ;; produced nil, which this function's caller reads as `SET col =
-      ;; NULL` -- so `UPDATE t SET c = x/0` reported success and RETRACTED
-      ;; the column, where PostgreSQL raises 22012 and leaves the row
-      ;; alone. sql-div also brings integer division, so `SET i = 7/2`
-      ;; stores 3 rather than the Ratio 7/2.
-      (when (and (sql-numeric? l) (sql-numeric? r)) (fns/sql-div l r)))
-
-    ;; String/jsonb concatenation: col || '...'::jsonb merges jsonb; string concat otherwise
-    (instance? Concat value-expr)
-    (let [^Concat e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and (some? l) (some? r))
-        (let [lp (jb/parse-jsonb l)
-              rp (jb/parse-jsonb r)]
-          (if (or (map? lp) (sequential? lp) (map? rp) (sequential? rp))
-            ;; jsonb concat/merge
-            (jb/serialize-jsonb (jb/jsonb-concat l r))
-            ;; plain string concat
-            (str l r)))))
-
-    ;; jsonb field access: col->'key' or col->>'key' in UPDATE SET expressions
-    (instance? JsonExpression value-expr)
-    (let [{:keys [base chain]} (expr/flatten-json-chain ^JsonExpression value-expr)
-          base-val (eval-update-expr base entity-map ns-str schema)]
-      (reduce
-       (fn [current [key-expr op-str]]
-         (let [key-val (eval-update-expr key-expr entity-map ns-str schema)
-               r ((jb/op op-str) current key-val)]
-           ;; `->` is serialised here and NOT in the SELECT emitter. That
-           ;; divergence predates the shared registry; it is preserved
-           ;; deliberately so this refactor stays behaviour-preserving,
-           ;; and is resolved when the operator semantics are fixed.
-           ;;
-           ;; A missing key is SQL NULL, which must leave as nil: the
-           ;; sentinel reached the column and `SET s = j->>'k'` wrote the
-           ;; literal text ":__null__" for every row without that key.
-           (cond
-             (= :__null__ r) nil
-             (= op-str "->>") r
-             :else (jb/serialize-jsonb r))))
-       base-val
-       chain))
-
-    (instance? Parenthesis value-expr)
-    (eval-update-expr (.getExpression ^Parenthesis value-expr)
-                      entity-map ns-str schema)
-
-    ;; AT TIME ZONE — evaluate inner expression. Java Date is UTC-based so
-    ;; timezone is effectively a no-op for our purposes (PG's default is UTC).
-    (instance? net.sf.jsqlparser.expression.TimezoneExpression value-expr)
-    (eval-update-expr (.getLeftExpression ^net.sf.jsqlparser.expression.TimezoneExpression value-expr)
-                      entity-map ns-str schema)
-
-    ;; Bare CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME (no parens)
-    ;; — TimeKeyExpression, same value as the function forms below
-    ;; (issue #14's UPDATE-path twin).
-    (instance? TimeKeyExpression value-expr)
-    (java.util.Date.)
-
-    ;; Function call.
-    (instance? net.sf.jsqlparser.expression.Function value-expr)
-    (let [^net.sf.jsqlparser.expression.Function f value-expr
-          fname (str/lower-case (.getName f))
-          ;; The SQL keyword call forms -- `substring(s FROM 1 FOR 2)`,
-          ;; `position('a' IN s)` -- put their operands in a
-          ;; NamedExpressionList and leave .getParameters empty, so they
-          ;; arrived with NO arguments and fell through to the stringifying
-          ;; fallback below.
-          args (or (some-> (.getParameters f) .getExpressions)
-                   (some-> (.getNamedParameters f) .getExpressions))
-          args (if (and (= fname "position") (nil? (.getParameters f)) (= 2 (count args)))
-                 ;; gram.y swaps these before analysis -- see the same
-                 ;; adjustment in translate-function-call.
-                 [(second args) (first args)]
-                 args)]
-      (case fname
-        ("now" "current_timestamp" "localtimestamp") (java.util.Date.)
-        ("current_date") (java.util.Date.)
-        ;; concat(...) — PG's NULL-safe string concatenation. Required
-        ;; by Odoo's _parent_store_create UPDATE that builds parent_path
-        ;; from a correlated scalar subquery + node.id + literal '/'.
-        "concat"
-        (apply str (map #(let [v (eval-update-expr % entity-map ns-str schema)]
-                           (if (some? v) (str v) ""))
-                        args))
-        ;; coalesce / nullif are not in the shared table -- the SELECT path
-        ;; special-cases them in the translator, which this evaluator cannot
-        ;; reuse -- so they need spelling out here.
-        ("substring" "substr")
-        (let [[a b c] (mapv #(eval-update-expr % entity-map ns-str schema) args)
-              r (if (some? c) (fns/sql-substring a b c) (fns/sql-substring a b))]
-          (if (= :__null__ r) nil r))
-        "coalesce"
-        (first (remove nil? (map #(eval-update-expr % entity-map ns-str schema) args)))
-        "nullif"
-        (let [[a b] (mapv #(eval-update-expr % entity-map ns-str schema) args)]
-          (when-not (true? (fns/sql-eq3? a b)) a))
-        ;; Anything else in the shared function table. Without this the
-        ;; fallback STRINGIFIED the call, so `UPDATE t SET i = coalesce(i,0)`
-        ;; handed the numeric coercion the text "coalesce(i, 0)" and raised
-        ;; "invalid input syntax for numeric".
-        (if-let [impl (get fns/sql-fn->clj-fn fname)]
-          (let [vs (mapv #(eval-update-expr % entity-map ns-str schema) args)
-                spec (get fns/sql-function-specs fname)
-                wrapped (if (or (contains? fns/non-strict-fns fname)
-                                (= false (:strict? spec)))
-                          impl
-                          (fns/null-safe impl))
-                r (apply wrapped vs)]
-            (if (= :__null__ r) nil r))
-          ;; Refuse rather than stringify: this fallback wrote the SQL
-          ;; source text of the call into the column.
-          (throw (ex-info "UPDATE SET function not supported"
-                          {:error :feature-not-supported
-                           :feature (str "UPDATE SET function " fname)
-                           :expr (str value-expr)})))))
-
-    ;; Scalar subquery: (SELECT col FROM tbl WHERE ...). Used inside
-    ;; concat()/etc. arguments for correlated reads. Requires a live db
-    ;; (bound by the server-side caller as *eval-update-db*); without
-    ;; one we have no db to query, so fall through with nil.
-    ;;
-    ;; Outer-row correlation rides on `*from-bindings*`: the caller
-    ;; binds {outer-alias → {col-string → entity-value}} so the inner
-    ;; SELECT's WHERE references like `node.parent_id` resolve via
-    ;; expr.clj's existing from-bindings Column branch.
-    (instance? ParenthesedSelect value-expr)
-    (strict-scalar-value (.getSelect ^ParenthesedSelect value-expr)
-                         schema *eval-update-db*
-                         (or *eval-update-parse-fn* params/*parse-sql*))
-
-    ;; Cast expression: evaluate inner and cast
-    (instance? CastExpression value-expr)
-    (apply-sql-cast (eval-update-expr (.getLeftExpression ^CastExpression value-expr)
-                                      entity-map ns-str schema)
-                    ^CastExpression value-expr)
-
-    ;; Parenthesized single expression — unwrap
-    (instance? ParenthesedExpressionList value-expr)
-    (let [^ParenthesedExpressionList pel value-expr]
-      (if (= (count pel) 1)
-        (eval-update-expr (first pel) entity-map ns-str schema)
-        (str value-expr)))
-
-    ;; CASE WHEN … THEN … ELSE … END. Without this the fallback stringified
-    ;; the whole expression, so `UPDATE t SET i = CASE …` wrote the SQL text
-    ;; into the column (or, for a numeric column, raised on the coercion).
-    ;; A branch is taken only when its test is TRUE -- UNKNOWN is not.
-    (instance? CaseExpression value-expr)
-    (let [^CaseExpression ce value-expr
-          switch (.getSwitchExpression ce)
-          switch-v (when switch (eval-update-expr switch entity-map ns-str schema))
-          ev (fn [e] (eval-update-expr e entity-map ns-str schema))
-          taken (reduce (fn [_ ^WhenClause wc]
-                          (let [when-e (.getWhenExpression wc)
-                                hit? (if switch
-                                       (true? (fns/sql-eq3? switch-v (ev when-e)))
-                                       (true? (eval-update-cond when-e entity-map ns-str schema)))]
-                            (when hit? (reduced [(ev (.getThenExpression wc))]))))
-                        nil (.getWhenClauses ce))]
-      (if taken
-        (first taken)
-        (when-let [else (.getElseExpression ce)] (ev else))))
-
-    ;; Arithmetic and bitwise operators that already have an implementation
-    ;; in the shared function table. Without these the fallback stringified
-    ;; the expression, and `UPDATE t SET n = 7 % 3` was a SILENT NO-OP --
-    ;; the text failed the numeric coercion and the column kept its old
-    ;; value, with no error.
-    (instance? Modulo value-expr)
-    (let [^Modulo e value-expr]
-      (fns/sql-mod (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-                   (eval-update-expr (.getRightExpression e) entity-map ns-str schema)))
-
-    (or (instance? BitwiseAnd value-expr) (instance? BitwiseOr value-expr)
-        (instance? BitwiseXor value-expr))
-    (let [^net.sf.jsqlparser.expression.BinaryExpression e value-expr
-          l (eval-update-expr (.getLeftExpression e) entity-map ns-str schema)
-          r (eval-update-expr (.getRightExpression e) entity-map ns-str schema)]
-      (when (and (some? l) (some? r))
-        (cond
-          (instance? BitwiseAnd value-expr) (bit-and (long l) (long r))
-          (instance? BitwiseOr value-expr)  (bit-or (long l) (long r))
-          :else                             (bit-xor (long l) (long r)))))
-
-    ;; EXTRACT(field FROM v) / TRIM(… FROM s) are their own AST nodes, not
-    ;; Functions, so they never reached the function table.
-    (instance? ExtractExpression value-expr)
-    (let [^ExtractExpression e value-expr
-          v (fns/sql-extract (str (.getName e))
-                             (eval-update-expr (.getExpression e) entity-map ns-str schema))]
-      (if (= :__null__ v) nil v))
-
-    (instance? TrimFunction value-expr)
-    (let [^TrimFunction e value-expr
-          spec (str/lower-case (str (.getTrimSpecification e)))
-          from-e (.getFromExpression e)
-          str-e (if from-e from-e (.getExpression e))
-          chars-e (when from-e (.getExpression e))
-          v (eval-update-expr str-e entity-map ns-str schema)
-          c (when chars-e (eval-update-expr chars-e entity-map ns-str schema))
-          f (case spec "leading" fns/sql-ltrim "trailing" fns/sql-rtrim fns/sql-btrim)
-          r (if c (f v c) (f v))]
-      (if (= :__null__ r) nil r))
-
-    ;; ARRAY[…] constructor, and `arr[i]` subscripting.
-    (instance? ArrayConstructor value-expr)
-    ;; Canonical PG text, not the PgArray record: an array COLUMN is stored
-    ;; as "{1,2}" text, so handing the record straight to the coercion wrote
-    ;; the Clojure vector's toString ("[7, 8]") into the column.
-    (pg-arr/to-pg-text
-     (pg-arr/array :unknown
-                   (mapv #(eval-update-expr % entity-map ns-str schema)
-                         (.getExpressions ^ArrayConstructor value-expr))))
-
-    (instance? ArrayExpression value-expr)
-    (let [^ArrayExpression e value-expr
-          base (eval-update-expr (.getObjExpression e) entity-map ns-str schema)
-          idx  (eval-update-expr (.getIndexExpression e) entity-map ns-str schema)]
-      ;; An array COLUMN arrives as canonical PG text; an ARRAY[…] literal
-      ;; as a PgArray record. Accept either.
-      (let [arr (cond (pg-arr/array? base) base
-                      (string? base) (try (pg-arr/from-pg-text base :unknown)
-                                          (catch Throwable _ nil)))]
-        (when (and arr (integer? idx))
-          (nth (pg-arr/flat-elements arr) (dec (long idx)) nil))))
-
-    ;; A PREDICATE in value position -- `SET b = (n > 5)`,
-    ;; `SET s = (n IN (10,20))::text`. eval-update-cond already knows the
-    ;; whole predicate surface three-valued; the fallback stringified them,
-    ;; so the column received the SQL source text "n IN (10, 20)".
-    (or (instance? EqualsTo value-expr) (instance? NotEqualsTo value-expr)
-        (instance? GreaterThan value-expr) (instance? GreaterThanEquals value-expr)
-        (instance? MinorThan value-expr) (instance? MinorThanEquals value-expr)
-        (instance? Between value-expr) (instance? LikeExpression value-expr)
-        (instance? InExpression value-expr) (instance? IsNullExpression value-expr)
-        (instance? NotExpression value-expr) (instance? JsonOperator value-expr)
-        (instance? AndExpression value-expr) (instance? OrExpression value-expr))
-    (let [v (eval-update-cond value-expr entity-map ns-str schema)]
-      (if (= :__null__ v) nil v))
-
-    ;; Anything else is REFUSED, not stringified. `:else (str value-expr)`
-    ;; wrote the SQL source text of the expression into the column --
-    ;; `UPDATE t SET a = ARRAY[7,8]` stored the string "ARRAY[7, 8]" in an
-    ;; int[] column, no error raised. Silent data corruption is worse than
-    ;; an honest refusal, which is the stance doc/design-alignment.md
-    ;; already takes for OUTER LATERAL.
-    :else
-    (throw (ex-info "UPDATE SET expression not supported"
-                    {:error :feature-not-supported
-                     :feature (str "UPDATE SET expression of type "
-                                   (.getName ^Class (type value-expr)))
-                     :expr (str value-expr)}))))
-
-(defn- reject-grouping!
-  "Reject aggregate and window calls in `expr`, an expression computing
-   one row's value -- RETURNING or an UPDATE's SET list (parse_agg.c's
-   EXPR_KIND_RETURNING / EXPR_KIND_UPDATE_SOURCE). Nested SELECTs are
-   their own level and may group."
-  [expr context]
-  (when (seq (params/ast-window-names expr))
-    (throw (ex-info (str "window functions are not allowed in " context)
-                    {:sqlstate "42P20"})))
-  (when (some fns/aggregate-function? (params/ast-function-names expr))
-    (throw (errors/pg-error
-            :grouping-error
-            {:message (str "aggregate functions are not allowed in " context)}))))
-
 (defn extract-returning
   "Preserve a RETURNING target list as typed descriptors.
 
@@ -7761,8 +7211,11 @@
                         :feature-not-supported
                         {:message "set-returning functions are not allowed in RETURNING"})))
               (reject-grouping! item-expr "RETURNING")
-              ;; A sequence advance is deferred to the SELECT executor's
-              ;; marker pass, which a row projection does not run.
+              ;; A sequence advance commits outside the statement, and
+              ;; RETURNING is projected over a SPECULATIVE db so that an
+              ;; error in it still aborts the write. Advancing from there
+              ;; invalidates that db (40001). It needs the reservation
+              ;; INSERT's sequence defaults make before the write.
               (when (contains? (params/ast-function-names item-expr) "nextval")
                 (throw (errors/pg-error
                         :feature-not-supported
@@ -8023,6 +7476,9 @@
                 (throw (ex-info "multi-column ON CONFLICT update from a row expression is not supported"
                                 {:error :feature-not-supported :sqlstate "0A000"})))
               (map (fn [^Column col value-expr]
+                     ;; ON CONFLICT's SET list computes one row's values,
+                     ;; like an UPDATE's, and PostgreSQL names it that way.
+                     (reject-grouping! value-expr "UPDATE")
                      (when-let [^Table qualifier (.getTable col)]
                        (throw (ex-info
                                (str "column \"" (unquote-ident (.getName qualifier))
@@ -8091,63 +7547,6 @@
                                      :column c}))
                     :else c)))
               col-names)])))
-
-(defn- with-conflict-expression-context
-  "Evaluate `f` with PostgreSQL's ON CONFLICT row namespaces installed.
-
-   The ordinary update evaluator receives keyword-keyed target and EXCLUDED
-   values directly. A scalar subquery is parsed by the SELECT translator,
-   however, and needs the same rows represented as FROM bindings. EXCLUDED
-   stays out of `*from-source-aliases*`: it is visible only when qualified,
-   while an unqualified column belongs to the target row."
-  [f txdb schema table-name target-alias old-map attrs]
-  (let [target-name (or target-alias table-name)
-        attr->logical (into {}
-                            (keep (fn [{:keys [name attr]}]
-                                    (when (and attr (not= :db/id attr))
-                                      [(ctx/resolve-inherited-attr
-                                        attr schema txdb) name])))
-                            (pgs/column-info schema table-name txdb))
-        logical-row (fn [row]
-                      (reduce (fn [out [attr logical]]
-                                (let [storage-attr
-                                      (or (when (contains? row attr) attr)
-                                          (some #(when (and (keyword? %)
-                                                            (= logical (name %))) %)
-                                                (keys row)))]
-                                  (if storage-attr
-                                    (assoc out logical (get row storage-attr))
-                                    out)))
-                              {} attr->logical))
-        target-row (merge (logical-row old-map)
-                          (into {} (map (fn [[attr value]] [(name attr) value]))
-                                old-map))
-        excluded-row (merge (logical-row attrs)
-                            (into {} (map (fn [[attr value]] [(name attr) value]))
-                                  attrs))
-        bindings {target-name target-row
-                  "excluded" excluded-row}
-        row-oids (fn [row]
-                   (into {}
-                         (keep (fn [[col _]]
-                                 (when-let [oid (params/infer-param-oid-for-column
-                                                 schema table-name col txdb)]
-                                   [col oid])))
-                         row))
-        binding-oids {target-name (row-oids target-row)
-                      "excluded" (row-oids excluded-row)}
-        aliases #{target-name "excluded"}]
-    (binding [params/*from-bindings* bindings
-              params/*from-binding-oids* binding-oids
-              ;; Neither row is an UPDATE ... FROM source.  In particular,
-              ;; counting the materialised target row as one makes a legal
-              ;; `SET v = v + excluded.v` look ambiguous between the target
-              ;; schema and its own binding.  Qualified target references
-              ;; still resolve through *from-bindings*, while unqualified
-              ;; ones resolve through the target schema as PostgreSQL does.
-              params/*from-source-aliases* #{}
-              params/*lateral-outer-aliases* aliases]
-      (f))))
 
 (defn- conflict-set-params
   "Build the explicit db.fn argument used to carry parameters occurring in
@@ -8277,22 +7676,22 @@
                                       [(keyword "excluded" (name attr)) value]))
                             attrs))
         combined (merge old-map target-logical excluded-map)
-        eval-in-context
-        (fn [f]
-          (with-conflict-expression-context
-            #(binding [params/*bound-params* (or set-params params/*bound-params*)
-                       *eval-update-db* txdb
-                       *eval-update-parse-fn* parse-fn]
-               (f combined))
-            txdb schema table-name target-alias old-map attrs))]
+        ;; The conflicting row and `excluded` are two relations in the
+        ;; translator's scope (ExecOnConflictUpdate binds the existing
+        ;; tuple and the proposed one), so the whole SET list is ONE
+        ;; projection over them -- not an expression at a time through a
+        ;; second evaluator.
+        row-scope (fn [asts]
+                    (binding [params/*bound-params* (or set-params params/*bound-params*)]
+                      ((requiring-resolve 'datahike.pg.sql.row-eval/row-values)
+                       asts combined ns schema txdb
+                       {:alias target-alias :excluded? true})))]
     (when (or (nil? update-where)
-              (true? (eval-in-context
-                      #((requiring-resolve 'datahike.pg.sql.row-eval/check-result)
-                        update-where % ns schema txdb
-                        {:alias target-alias :excluded? true}))))
+              (true? (let [v (first (:values (row-scope [update-where])))]
+                       (when (some? v) (boolean v)))))
       (reduce
        (fn [{:keys [row-after] :as result}
-            {:keys [attr value-expr]}]
+            [{:keys [attr]} new-val]]
          ;; PostgreSQL evaluates every SET RHS against the pre-update target
          ;; row, not against assignments earlier in the same SET list.
          (let [attr (or (when (contains? old-map attr) attr)
@@ -8301,18 +7700,6 @@
                               (keys old-map))
                         attr)
                old-val (get old-map attr)
-               excluded-column?
-               (and (instance? Column value-expr)
-                    (when-let [t (.getTable ^Column value-expr)]
-                      (= "EXCLUDED" (.toUpperCase (.getName ^Table t)))))
-               new-val
-               (if excluded-column?
-                 (let [logical-name (unquote-ident
-                                     (.getColumnName ^Column value-expr))
-                       source-column (some #(when (= logical-name (:name %)) %)
-                                           logical-columns)]
-                   (value-for attrs source-column))
-                 (eval-in-context #(eval-update-expr value-expr % ns schema)))
                coerced (when (some? new-val)
                          (coerce-insert-value new-val attr schema))]
            (cond-> (if (nil? new-val)
@@ -8324,7 +7711,8 @@
              (some? new-val)
              (update :ops conj [:db/add (:db/id result) attr coerced]))))
        {:db/id (:db/id old-map) :ops [] :row-after old-map}
-       update-assignments))))
+       (map vector update-assignments
+            (:values (row-scope (mapv :value-expr update-assignments))))))))
 
 (defn- materialize-conflict-defaults
   [txdb attrs constraint-plan schema]
@@ -9311,63 +8699,44 @@
         (if (= (.getSign se) \-) (- inner) inner)))
     :else :unhandled))
 
-(defn extract-from-values
-  "If an UPDATE's FROM clause is `(VALUES (...), (...)) AS alias(col1, col2, ...)`,
-   extract it. Returns {:alias str :cols [str] :rows [[literal ...] ...]} or nil."
-  [^Update update]
-  (when-let [from-item (.getFromItem update)]
-    (when (instance? ParenthesedFromItem from-item)
-      (let [^ParenthesedFromItem pfi from-item
-            inner (.getFromItem pfi)]
-        (when (instance? Values inner)
-          (let [^Values vs inner
-                alias-obj (.getAlias pfi)
-                alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
-                alias-cols (when alias-obj
-                             (some->> (.getAliasColumns ^Alias alias-obj)
-                                      (mapv (fn [^net.sf.jsqlparser.expression.Alias$AliasColumn c]
-                                              (unquote-ident (.-name c))))))
-                raw-exprs (.getExpressions vs)
-                ;; JSqlParser quirk: multi-row VALUES produces a list of
-                ;; ParenthesedExpressionList; single-row VALUES flattens to
-                ;; the column expressions directly (one row).
-                rows (if (and (seq raw-exprs)
-                              (instance? ParenthesedExpressionList (first raw-exprs)))
-                       (mapv (fn [^ParenthesedExpressionList row]
-                               (mapv eval-values-literal
-                                     (iterator-seq (.iterator row))))
-                             raw-exprs)
-                       [(mapv eval-values-literal raw-exprs)])]
-            (when (and alias-name (seq alias-cols)
-                       (every? (fn [r] (not-any? #(= :unhandled %) r)) rows))
-              {:alias alias-name :cols alias-cols :rows rows})))))))
+(defn- row-subquery-columns
+  "`SET (a, b) = (SELECT x, y …)`: one scalar subquery per target
+   column, each selecting that column of the row.
 
-(defn- extract-update-from-table
-  "Extract the single ordinary table form supported by UPDATE ... FROM.
-   More complex FROM trees remain explicit feature gaps rather than being
-   silently ignored."
-  [^Update update schema]
-  (when-let [from-item (.getFromItem update)]
-    (when (seq (.getJoins update))
-      (throw (ex-info "UPDATE FROM with multiple relations is not supported"
-                      {:error :feature-not-supported :sqlstate "0A000"})))
-    (if (instance? Table from-item)
-      (let [{raw-name :name alias :alias} (ctx/extract-table-info from-item)
-            _ (when-not (relation-known? schema raw-name)
-                (throw (ex-info (str "relation \"" raw-name "\" does not exist")
-                                {:error :undefined-table
-                                 :sqlstate "42P01"
-                                 :table raw-name})))
-            table-name (first (canonical-relation schema raw-name []))]
-        {:table table-name :alias alias})
-      (throw (ex-info "UPDATE FROM source is not supported"
-                      {:error :feature-not-supported :sqlstate "0A000"})))))
+   PostgreSQL evaluates the subquery ONCE per row (a MULTIEXPR sublink);
+   this evaluates it once per column, which differs only for a volatile
+   subquery. What it preserves is what the values are: no row gives every
+   column NULL, and more than one row is 21000, because each scalar
+   subquery answers that way by itself.
+
+   nil when `exprs` is not a single row subquery of matching width, which
+   leaves the caller's own arity check to reject it."
+  [cols exprs]
+  (when (= 1 (count exprs))
+    (let [sel (when (instance? ParenthesedSelect (first exprs))
+                (.getSelect ^ParenthesedSelect (first exprs)))
+          ps (when (instance? PlainSelect sel) sel)
+          items (some-> ps .getSelectItems vec)]
+      (when (= (count cols) (count items))
+        (mapv (fn [item]
+                (doto (ParenthesedSelect.)
+                  (.setSelect (doto (PlainSelect.)
+                                (.setSelectItems [item])
+                                (.setFromItem (.getFromItem ^PlainSelect ps))
+                                (.setJoins (.getJoins ^PlainSelect ps))
+                                (.setWhere (.getWhere ^PlainSelect ps))
+                                (.setGroupByElement (.getGroupBy ^PlainSelect ps))
+                                (.setHaving (.getHaving ^PlainSelect ps))
+                                (.setOrderByElements (.getOrderByElements ^PlainSelect ps))
+                                (.setLimit (.getLimit ^PlainSelect ps))
+                                (.setOffset (.getOffset ^PlainSelect ps))))))
+              items)))))
 
 (defn translate-update
   "Translate an UPDATE statement to Datahike retract+assert pairs.
-   Handles UPDATE with WITH RECURSIVE CTE — for these, the result is
-   {:type :update-with-recursive ...} containing the rule, columns,
-   and target table info for the server to execute."
+   A WITH clause, recursive or not, rides along in :with-sql: the SET
+   list is translated at Execute as a query over the target, and the CTE
+   is materialised there like any other relation."
   [^Update update schema db]
   (let [table (.getTable update)
         raw-table (unquote-ident (.getName ^Table table))
@@ -9456,6 +8825,13 @@
                              :sqlstate "42601"
                              :column dup})))
         withs (.getWithItemsList update)
+        ;; The WITH clause rides along into the SET query, which is
+        ;; parsed as ordinary SQL: the CTE is then materialised by the
+        ;; SELECT translator, for the FROM relation and for a subquery
+        ;; in SET alike.
+        with-sql (when (seq withs)
+                   ;; A WithItem renders its own RECURSIVE keyword.
+                   (str "WITH " (str/join ", " (map str withs)) " "))
         ;; The FROM relation as written, joins included: the SET list is
         ;; translated at Execute as a query over the target joined to it
         ;; (server/update-set-plan). The shapes below are what the
@@ -9465,103 +8841,46 @@
                    ;; its toString leaves the comma out.
                    (str fi (apply str (map (fn [^Join j]
                                              (str (if (.isSimple j) ", " " ") j))
-                                           (or (.getJoins update) [])))))
-        [from-values from-table from-unsupported]
-        (try [(extract-from-values update)
-              (when-not (extract-from-values update)
-                (extract-update-from-table update schema))
-              nil]
-             (catch clojure.lang.ExceptionInfo e
-               (if (= "0A000" (:sqlstate (ex-data e)))
-                 ;; A shape only the joined query can serve. Kept as the
-                 ;; error the fallback raises if it ever runs.
-                 [nil nil (ex-message e)]
-                 (throw e))))
-        recursive? (and withs (seq withs)
-                        (some #(.isRecursive ^net.sf.jsqlparser.statement.select.WithItem %) withs))
-        ;; The recursive CTE executor owns its FROM relation, which is a
-        ;; virtual relation absent from the base schema at this point.
-        from-table (when-not recursive? from-table)]
-    (if recursive?
-      ;; WITH RECURSIVE UPDATE: translate the CTE(s) to Datalog rule(s) and
-      ;; let the server execute the iterative update.
-      (let [recursive-cte (first (filter #(.isRecursive ^net.sf.jsqlparser.statement.select.WithItem %)
-                                         withs))
-            cte-info (translate-recursive-cte recursive-cte schema db)]
-        {:type :update-with-recursive
-         :table table-name
-         :ns ns
-         :cte cte-info
-         ;; Parse the SET clause: which target columns get which CTE columns
-         :set-mappings
-         (mapv (fn [^UpdateSet us]
-                 (let [target-col (unquote-ident (.getColumnName ^Column (first (.getColumns us))))
-                       value-expr (first (.getValues us))
-                       ;; Expected form: cte_alias.cte_col → cte column name
-                       cte-col (when (instance? Column value-expr)
-                                 (unquote-ident (.getColumnName ^Column value-expr)))]
-                   {:target-col (canonical-target-column target-col)
-                    :cte-col cte-col}))
-               update-sets)
-         ;; Parse the WHERE join condition to find the join column
-         ;; Expected form: row.id = cte_alias.cte_col
-         :join-info
-         (when where-expr
-           (let [parse-eq (fn [^net.sf.jsqlparser.expression.operators.relational.EqualsTo eq]
-                            (let [l (.getLeftExpression eq)
-                                  r (.getRightExpression eq)
-                                  l-col (when (instance? Column l) (unquote-ident (.getColumnName ^Column l)))
-                                  r-col (when (instance? Column r) (unquote-ident (.getColumnName ^Column r)))
-                                  l-tbl (when (instance? Column l)
-                                          (when-let [t (.getTable ^Column l)]
-                                            (unquote-ident (.getName ^Table t))))
-                                  r-tbl (when (instance? Column r)
-                                          (when-let [t (.getTable ^Column r)]
-                                            (unquote-ident (.getName ^Table t))))]
-                              ;; Identify which side is the target table
-                              {:l-tbl l-tbl :l-col l-col :r-tbl r-tbl :r-col r-col}))]
-             (when (instance? net.sf.jsqlparser.expression.operators.relational.EqualsTo where-expr)
-               (parse-eq where-expr))))})
-      ;; Regular UPDATE
-      (cond-> {:type :update
-               :table table-name
-               :alias alias-name
-               :ns ns
+                                           (or (.getJoins update) [])))))]
+    (cond-> {:type :update
+             :table table-name
+             :alias alias-name
+             :ns ns
                ;; The FROM relation as written. The SET list is
                ;; translated again at Execute as a query over the target
                ;; joined to it (server/update-set-plan), which is how
                ;; PostgreSQL plans UPDATE ... FROM.
-               :from-sql from-sql
-               :from-unsupported from-unsupported
+             :with-sql with-sql
+             :from-sql from-sql
                ;; The parameter types this statement was translated with:
                ;; the SET list is translated again at Execute
                ;; (server/update-set-plan) and must see the same ones.
-               :declared-param-oids params/*declared-param-oids*
-               :where-expr where-expr
-               :assignments
-               (vec
-                (mapcat
-                 (fn [^UpdateSet us]
-                   (let [cols (vec (.getColumns us))
-                         exprs (vec (.getValues us))]
-                     (when-not (= (count cols) (count exprs))
-                       ;; A multi-column assignment sourced by ROW(...) or a
-                       ;; sub-SELECT needs one evaluation yielding a record.
-                       ;; Refuse it until that lowering exists; applying only
-                       ;; the first pair is silent partial data corruption.
-                       (throw (ex-info
-                               "multi-column UPDATE from a row expression is not supported"
-                               {:error :feature-not-supported :sqlstate "0A000"})))
-                     (map (fn [^Column col value-expr]
-                            {:column (canonical-target-column
-                                      (unquote-ident (.getColumnName col)))
-                             :value-expr value-expr})
-                          cols exprs)))
-                 update-sets))}
-        from-values (assoc :from-values from-values)
-        from-table (assoc :from-table from-table)
-        (.getReturningClause update)
-        (assoc :returning (extract-returning (.getReturningClause update)))))))
+             :declared-param-oids params/*declared-param-oids*
+             :where-expr where-expr
+             :assignments
+             (vec
+              (mapcat
+               (fn [^UpdateSet us]
+                 (let [cols (vec (.getColumns us))
+                       exprs (or (row-subquery-columns (vec (.getColumns us))
+                                                       (vec (.getValues us)))
+                                 (vec (.getValues us)))]
+                   (when-not (= (count cols) (count exprs))
+                       ;; A multi-column assignment from anything else --
+                       ;; ROW(...), a set-operation subquery -- still needs
+                       ;; one evaluation yielding a record. Applying only
+                       ;; the first pair is silent partial corruption.
+                     (throw (ex-info
+                             "multi-column UPDATE from a row expression is not supported"
+                             {:error :feature-not-supported :sqlstate "0A000"})))
+                   (map (fn [^Column col value-expr]
+                          {:column (canonical-target-column
+                                    (unquote-ident (.getColumnName col)))
+                           :value-expr value-expr})
+                        cols exprs)))
+               update-sets))}
+      (.getReturningClause update)
+      (assoc :returning (extract-returning (.getReturningClause update))))))
 
 ;; ============================================================================
 ;; WITH RECURSIVE: translate to Datalog rules
@@ -10148,9 +9467,7 @@
    `:deferred` spec; the server re-runs the rule at Execute via
    materialize-recursive-rows! once the params are bound.
 
-   Reuses `translate-recursive-cte` for the rule construction; rule
-   eval here is the SELECT counterpart of `build-update-with-recursive-tx`
-   in the server."
+   Reuses `translate-recursive-cte` for the rule construction."
   [^net.sf.jsqlparser.statement.select.WithItem wi target-name db schema]
   (let [{:keys [rule rule-name col-names rule-vars in-params in-args anchor]}
         (translate-recursive-cte wi schema db)

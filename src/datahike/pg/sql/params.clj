@@ -209,6 +209,13 @@
    which case scalar subqueries are evaluated without memoization."
   nil)
 
+(def ^:dynamic *row-execute*
+  "`(fn [plan db] rows)` running a translated one-row SELECT the way the
+   server runs any other: with the passes that follow the query, which is
+   what resolves a deferred sequence call. Bound for the statement's
+   execution; without it a row projection runs the query alone."
+  nil)
+
 (def ^:dynamic *session-dependent?*
   "An atom set while translating a statement that reads a value of the
    SESSION -- `current_schema`, `current_database()`. Such a translation
@@ -405,7 +412,7 @@
 (def ^:dynamic *from-bindings*
   "When bound (by build-update-tx handling UPDATE ... FROM),
    a map {alias-name → {col-name → literal}} used by the Column branches
-   of translate-expr and eval-update-expr to substitute row-level values
+   of translate-expr to substitute row-level values
    for references like `src.col` to the current FROM row."
   nil)
 

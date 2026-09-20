@@ -2871,161 +2871,7 @@
         [:db/retract eid attr old-val])
       [:db/add eid attr val])))
 
-;; Forward-declare so build-update-tx-for-bindings (below) can read the
-;; prepared-statement param vector; the binding site is in executePrepared
-;; further down, after the handler closure setup.
-(defn- build-update-tx-for-bindings
-  "Build tx-data for a single UPDATE row, optionally with from-bindings for
-   UPDATE ... FROM (VALUES ...) substitution. Returns {:eids [...] :tx-data [...]}.
-
-   When `parsed` carries `:enriched-db` (CTEs materialised at parse-sql
-   time), the row-matching query and translate-predicate ctx use that
-   db/schema so virtual `:<cte>/<col>` attrs resolve. Resulting eids
-   are still real entity-ids in the live db."
-  [db schema parsed from-bindings]
-  (let [{:keys [table alias ns assignments where-expr enriched-db]} parsed
-        query-db (or enriched-db db)
-        ;; The row-matching query (WHERE translation, anchor, :in plumbing)
-        ;; is a pure function of (parsed, schema) when there are no
-        ;; per-row FROM(VALUES) bindings and no enriched-db — cache it per
-        ;; statement so repeated executions skip make-ctx + translate.
-        shape-key (when (and (nil? from-bindings) (nil? enriched-db))
-                    [(pg-cache/identity-key parsed)
-                     (pg-cache/identity-key schema)])
-        cached (when shape-key
-                 (.get ^java.util.Map update-row-match-cache shape-key))
-        {:keys [q in-params in-args-raw]}
-        (or cached
-            (let [query-schema (or (:schema enriched-db) schema)
-                  default-key (or alias table)
-                  table-aliases (cond-> {table table}
-                                  alias (assoc alias table))
-                  ctx (#'sql/make-ctx query-schema table-aliases default-key
-                                      {:db query-db
-                                       :parse-sql sql/parse-sql
-                                       :hints (pgs/schema-hints query-db)})
-                  _ (when where-expr
-                      ;; Top-level UPDATE WHERE = conjunctive context: the value-bound
-                      ;; data-pattern fast path makes the row-matching query indexed
-                      ;; ([?e :attr v] instead of a get-else scan) — and self-anchoring:
-                      ;; the datahike planner rejects a WHERE of only get-else clauses
-                      ;; with an unbound entity var.
-                      ;; Params stay as ?pN vars (values via :in): inlining the
-                      ;; bound literal made the row-matching clauses NOVEL per
-                      ;; value, so datalog's parse/plan caches missed and the full
-                      ;; planner re-ran per Execute (~18% of tpcb CPU). With ?pN
-                      ;; the conjunctive fast path emits `[?e :attr ?pN]` — one
-                      ;; plan per statement shape, values supplied at d/q time.
-                      (binding [params/*from-bindings* from-bindings
-                                params/*from-source-aliases* (when from-bindings
-                                                               (set (keys from-bindings)))
-                                expr/*conjunctive-where* true]
-                        (let [preds (#'sql/translate-predicate ctx where-expr)]
-                          (swap! (:where-clauses ctx) into preds))))
-                  evar (#'sql/entity-var! ctx default-key)
-                  _ (when (empty? @(:where-clauses ctx))
-                      (let [cols (pgs/column-info schema table)]
-                        (when-let [first-col (second cols)]
-                          (#'sql/col-var! ctx (:attr first-col)))))
-                  _ (ensure-evar-anchor! ctx evar table)
-                  where-clauses @(:where-clauses ctx)
-                  ;; Prepared-statement UPDATE: translate-predicate lifts every
-                  ;; JdbcParameter to a logic variable (e.g. `?p2`) and records a
-                  ;; ParamRef in :in-args. Without plumbing :in/:in-args through
-                  ;; to d/q, the row-matching query has an unbound var and
-                  ;; returns zero rows (manifesting as "UPDATE 0" for a row that
-                  ;; clearly exists). Substitute the ParamRefs against
-                  ;; *cached-bound* here so the d/q call has concrete literals.
-                  in-params @(:in-params ctx)
-                  in-args-raw @(:in-args ctx)
-                  v {:q (cond-> {:find [evar] :where (vec where-clauses)}
-                          (seq in-params) (assoc :in (into ['$] in-params)))
-                     :in-params in-params
-                     :in-args-raw in-args-raw}]
-              (when shape-key
-                (.put ^java.util.Map update-row-match-cache shape-key v))
-              v))
-        in-args (if-let [bound *cached-bound*]
-                  (sql/substitute-params in-args-raw
-                                         (fn [idx] (nth bound idx)))
-                  in-args-raw)
-        eids (mapv first
-                   (if (seq in-args)
-                     (run-param-query q #(apply d/q q query-db in-args))
-                     (run-param-query q #(d/q q query-db))))
-        ;; For prepared UPDATE, resolve ParamRef values BEFORE
-        ;; coerce-insert-value — otherwise the coercion fires on a
-        ;; placeholder record (no-op passthrough), then the bound
-        ;; literal lands in tx-data untyped, and Datahike rejects e.g.
-        ;; "2014-12-23 -08" against a :db.type/instant column.
-        resolve-param (if-let [bound *cached-bound*]
-                        (fn [v]
-                          (if (sql/param-ref? v)
-                            (nth bound (:idx v))
-                            v))
-                        identity)
-        ;; Build {outer-alias-or-table → {col-string → value}} for each
-        ;; eid so SET assignments containing scalar subqueries with
-        ;; correlated outer-row references (Odoo's _parent_store_create
-        ;; UPDATE: `concat((SELECT … WHERE id = node.parent_id), node.id,
-        ;; '/')`) can resolve those references. The binding rides on
-        ;; *from-bindings*, which expr.clj's Column branch already
-        ;; consults for UPDATE…FROM(VALUES) bindings; we extend the
-        ;; same map with the outer row keyed by alias-or-table.
-        outer-key (or alias table)
-        column-constraints (read-column-constraints db table)
-        tx-data (vec (keep identity
-                           (mapcat
-                            (fn [eid]
-                              (let [entity-map (into {} (map (fn [^datahike.datom.Datom d]
-                                                               [(.-a d) (.-v d)])
-                                                             (d/datoms db :eavt eid)))
-                                    outer-binding (when outer-key
-                                                    {outer-key
-                                                     (into {}
-                                                           (map (fn [[k v]] [(name k) v]))
-                                                           entity-map)})
-                                    eff-from-bindings (merge from-bindings outer-binding)]
-                                (for [{:keys [column value-expr]} assignments
-                                      :let [attr (keyword ns column)
-                                            ;; *bound-params* (0-based; *cached-bound*
-                                            ;; is 1-indexed with slot 0 unused) lets
-                                            ;; JdbcParameter operands resolve inline —
-                                            ;; `SET bal = bal + $1` used to throw
-                                            ;; ClassCastException on the ParamRef
-                                            ;; (pgbench -M prepared).
-                                            default? (and (instance? Column value-expr)
-                                                          (nil? (.getTable ^Column value-expr))
-                                                          (= "default"
-                                                             (str/lower-case
-                                                              (.getColumnName ^Column value-expr))))
-                                            raw-val (if default?
-                                                      (when-let [[kind value arg]
-                                                                 (:default (get column-constraints column))]
-                                                        (do
-                                                          (when (= :nextval kind)
-                                                            (throw (ex-info
-                                                                    "UPDATE SET DEFAULT for sequence-backed columns is not supported"
-                                                                    {:error :feature-not-supported
-                                                                     :sqlstate "0A000"})))
-                                                          (row-constraints/eval-default kind value)))
-                                                      (binding [params/*from-bindings* eff-from-bindings
-                                                                params/*from-source-aliases*
-                                                                (when from-bindings
-                                                                  (set (keys from-bindings)))
-                                                                params/*bound-params*
-                                                                (or params/*bound-params*
-                                                                    (when-let [cb *cached-bound*]
-                                                                      (vec (rest cb))))
-                                                                stmt/*eval-update-db* db
-                                                                stmt/*eval-update-parse-fn* sql/parse-sql]
-                                                        (sql/eval-update-expr value-expr entity-map ns schema)))
-                                            resolved (resolve-param raw-val)]]
-                                  (assignment-op eid entity-map attr resolved schema db))))
-                            eids)))]
-    {:eids eids :tx-data tx-data}))
-
-(declare select-rows resolve-param-refs temp-table-prefix build-update-tx*)
+(declare select-rows resolve-param-refs temp-table-prefix)
 
 (defn- update-set-plan
   "An UPDATE's SET list as PostgreSQL plans it: a query over the target
@@ -3068,9 +2914,22 @@
                           (when (str/starts-with? table temp-table-prefix)
                             (second (re-matches #"[^_]*_(.*)"
                                                 (subs table (count temp-table-prefix))))))
-              text (str "SELECT " (quoted (or visible table)) ".db_id"
+              ;; A CTE of the target's own name shadows it in the FROM
+              ;; list; PostgreSQL resolves an UPDATE's target to the
+              ;; table regardless, so name it in a way a CTE cannot be
+              ;; named -- schema-qualified.
+              shadowed? (and (:with-sql parsed)
+                             (re-find (re-pattern (str "(?i)\\bWITH\\s+(RECURSIVE\\s+)?"
+                                                       (java.util.regex.Pattern/quote table)
+                                                       "\\b"))
+                                      (:with-sql parsed)))
+              from-name (if shadowed?
+                          (str "\"public\"." (quoted table))
+                          (quoted table))
+              text (str (:with-sql parsed)
+                        "SELECT " (quoted (or visible table)) ".db_id"
                         (apply str (map #(str ", (" (:sql %) ")") assignments))
-                        " FROM " (quoted table) (when visible (str " AS " (quoted visible)))
+                        " FROM " from-name (when visible (str " AS " (quoted visible)))
                         (when from-sql (str ", " from-sql))
                         (when where-expr (str " WHERE " where-expr)))
               plan (binding [params/*bound-params* nil
@@ -3161,78 +3020,11 @@
    that need speculative tempid remapping should pass an `eid->tempid` map
    and remap the tx-data afterward.
 
-   UPDATE ... FROM joins the source into the SET query (step 2's path).
-   Only a CTE-backed UPDATE still runs the target matcher once per source
-   row with that row's columns bound as constants."
+   Every UPDATE -- plain, with FROM, with a WITH clause -- is one query
+   over the target, so this is `build-update-tx-from-plan` under the name
+   the callers use."
   [ctx db schema parsed]
-  (if (and (:from-sql parsed) (not (:enriched-db parsed)))
-    ;; The source relation is joined into the SET query itself.
-    (build-update-tx-from-plan ctx db schema parsed)
-    (build-update-tx* ctx db schema parsed)))
-
-(defn- build-update-tx*
-  "The per-source-row path, for an UPDATE whose FROM relation the SET
-   query cannot carry (a CTE)."
-  [ctx db schema parsed]
-  (when-let [msg (:from-unsupported parsed)]
-    (throw (ex-info msg {:error :feature-not-supported :sqlstate "0A000"})))
-  (if-let [{:keys [alias cols rows]} (:from-values parsed)]
-    (reduce
-     (fn [acc row]
-       (let [binding-map {alias (zipmap cols row)}
-             {:keys [eids tx-data]} (build-update-tx-for-bindings
-                                     db schema parsed binding-map)]
-         (-> acc
-             (update :eids into eids)
-             (update :tx-data into tx-data))))
-     {:eids [] :tx-data []}
-     rows)
-    (if-let [{source-table :table source-alias :alias} (:from-table parsed)]
-      (let [column-info (->> (pgs/column-info schema source-table db)
-                             (remove #(= "db-row-exists" (:name %)))
-                             vec)
-            marker (pgs/row-marker-attr source-table)
-            source-eids (if (contains? schema marker)
-                          ;; Row markers are deliberately not :db/indexed;
-                          ;; AVET therefore has no entries for them. AEVT is
-                          ;; still an attribute-prefix scan and remains cheap.
-                          (into [] (keep (fn [^datahike.datom.Datom datom]
-                                           (when (true? (.-v datom)) (.-e datom))))
-                                (d/datoms db :aevt marker))
-                          (->> column-info
-                               (mapcat (fn [{:keys [attr]}]
-                                         (when (and attr (not= :db/id attr))
-                                           (map (fn [^datahike.datom.Datom datom] (.-e datom))
-                                                (d/datoms db :aevt attr)))))
-                               distinct
-                               sort
-                               vec))]
-        (with-cte-namespaces parsed
-          (dissoc
-           (reduce
-            (fn [{:keys [seen] :as acc} eid]
-              (let [entity-map (into {} (map (fn [^datahike.datom.Datom datom]
-                                               [(.-a datom) (.-v datom)]))
-                                     (d/datoms db :eavt eid))
-                    row (into {}
-                              (map (fn [{:keys [name attr]}]
-                                     [name (if (= :db/id attr) eid (get entity-map attr))]))
-                              column-info)
-                    result (build-update-tx-for-bindings
-                            db schema parsed {source-alias row})
-                    fresh-eids (remove seen (:eids result))
-                    fresh-set (set fresh-eids)
-                    fresh-tx (filterv #(contains? fresh-set (second %)) (:tx-data result))]
-                (-> acc
-                    (update :seen into fresh-eids)
-                    (update :eids into fresh-eids)
-                    (update :tx-data into fresh-tx))))
-            {:seen #{} :eids [] :tx-data []}
-            source-eids)
-           :seen)))
-      (if (:enriched-db parsed)
-        (with-cte-namespaces parsed (build-update-tx-for-bindings db schema parsed nil))
-        (build-update-tx-from-plan ctx db schema parsed)))))
+  (build-update-tx-from-plan ctx db schema parsed))
 
 (defn- check-update-identity-collisions!
   "Pre-flight check: before running tx-data from build-update-tx, scan
@@ -3376,67 +3168,6 @@
         (empty-result (str "UPDATE " (count eids)))))
     (catch Exception e
       (classified-error "UPDATE error: " e))))
-
-(defn- build-update-with-recursive-tx
-  "Run the recursive CTE rule, then for each result row look up the target entity
-   and produce :db/add tx-data for the SET mappings.
-   Returns {:eids [...] :tx-data [...]}."
-  [db parsed]
-  (let [{:keys [table ns cte set-mappings join-info]} parsed
-        {:keys [rule rule-name col-names rule-vars in-params in-args]} cte
-        ;; Identify CTE-side and table-side of the join.
-        ;; join-info has {:l-tbl :l-col :r-tbl :r-col} with column refs.
-        cte-name (str rule-name)
-        {:keys [l-tbl l-col r-tbl r-col]} join-info
-        col-name-set (set col-names)
-        ;; CTE side: matches the CTE alias/name OR has a col-name that's a CTE column
-        cte-join-col (cond
-                       (= cte-name l-tbl) l-col
-                       (= cte-name r-tbl) r-col
-                       (= table l-tbl) r-col
-                       (= table r-tbl) l-col
-                       (contains? col-name-set l-col) l-col
-                       :else r-col)
-        target-join-col (if (= cte-join-col l-col) r-col l-col)
-        cte-join-idx (.indexOf ^java.util.List col-names cte-join-col)
-        ;; Run the rule
-        find-clause (apply vector :find rule-vars)
-        rule-call (apply list rule-name rule-vars)
-        in-clause (into '[$ %] in-params)
-        q {:find rule-vars
-           :in in-clause
-           :where [rule-call]}
-        rows (apply d/q q db rule in-args)
-        ;; Build a lookup map: cte_join_value → {target_col → value}
-        join-attr (keyword ns target-join-col)
-        rows-by-join (into {}
-                           (for [row rows]
-                             [(nth row cte-join-idx)
-                              (into {} (for [{:keys [target-col cte-col]} set-mappings
-                                             :let [idx (.indexOf ^java.util.List col-names cte-col)]
-                                             :when (>= idx 0)]
-                                         [(keyword ns target-col) (nth row idx)]))]))
-        ;; Find target entities by their join attribute
-        eid+val (vec (d/q '[:find ?e ?v
-                            :in $ ?attr [?v ...]
-                            :where [?e ?attr ?v]]
-                          db join-attr (vec (keys rows-by-join))))
-        tx-data (vec (mapcat (fn [[eid join-val]]
-                               (let [updates (get rows-by-join join-val)]
-                                 (for [[attr v] updates
-                                       :when (some? v)]
-                                   [:db/add eid attr v])))
-                             eid+val))]
-    {:eids (mapv first eid+val) :tx-data tx-data}))
-
-(defn- execute-update-with-recursive [conn parsed]
-  (try
-    (let [db (d/db conn)
-          {:keys [eids tx-data]} (build-update-with-recursive-tx db parsed)]
-      (when (seq tx-data) (transact-recorded! conn tx-data))
-      (empty-result (str "UPDATE " (count eids))))
-    (catch Exception e
-      (classified-error "UPDATE (WITH RECURSIVE) error: " e))))
 
 ;; ============================================================================
 ;; DDL execution
@@ -5828,7 +5559,7 @@
    transaction (see open-implicit-tx! / *implicit-tx-allowed*) so the
    whole group is atomic. COPY is excluded — it runs its own sub-protocol
    and commits separately."
-  #{:insert :update :update-with-recursive :delete :truncate
+  #{:insert :update :delete :truncate
     :ddl-create :ddl-create-view :ddl-create-sequence :ddl-alter-sequence
     :ddl-create-enum :ddl-alter-enum :ddl-rename-enum :ddl-drop-enum
     :ddl-create-composite :ddl-create-domain :ddl-drop-domain
@@ -8248,30 +7979,6 @@
         (execute-insert
          conn parsed resolver
          :tx-wrap (:tx-wrap ctx))))))
-
-(defn- exec-update-with-recursive
-  [ctx parsed]
-  (let [{:keys [conn tx-state]} ctx]
-    (if (:in-tx? @tx-state)
-      (try
-        (let [spec-db (:speculative-db @tx-state)
-              eid->tempid (:eid->tempid @tx-state)
-              {:keys [eids tx-data]} (build-update-with-recursive-tx spec-db parsed)
-              spec-report (when (seq tx-data) (dc/with spec-db tx-data))
-              _ (when spec-report
-                  (unique-constraints/validate-report! spec-report))
-              commit-tx-data (mapv (fn [[op eid attr val]]
-                                     [op (get eid->tempid eid eid) attr val])
-                                   tx-data)]
-          (swap! tx-state (fn [ts]
-                            (cond-> ts
-                              true (update :tx-buffer into (guard-catalog-tx commit-tx-data))
-                              spec-report (assoc :speculative-db (:db-after spec-report)))))
-          (empty-result (str "UPDATE " (count eids))))
-        (catch Exception e
-          (swap! tx-state assoc :aborted? true)
-          (classified-error "UPDATE (WITH RECURSIVE) error: " e)))
-      (execute-update-with-recursive conn parsed))))
 
 (defn- exec-update
   [ctx parsed]
@@ -12176,9 +11883,15 @@
                                      (contains? write-parse-types (:type parsed)))
                             (open-implicit-tx! ctx))
                           (binding [params/*runtime-db* db
+                                    ;; Row projections (RETURNING, CHECK,
+                                    ;; ON CONFLICT) run their plans the
+                                    ;; way a SELECT runs, so a deferred
+                                    ;; sequence call resolves.
+                                    params/*row-execute*
+                                    (fn [plan plan-db]
+                                      (:results (select-rows (assoc ctx :db plan-db) plan)))
                                     *statement-catalog-basis*
-                                    (when (contains? #{:insert :update :update-with-recursive
-                                                       :delete :truncate} (:type parsed))
+                                    (when (contains? #{:insert :update :delete :truncate} (:type parsed))
                                       (if-let [certificate
                                                (when (:catalog-dependency-shape parsed)
                                                  (schema-cached
@@ -12196,7 +11909,6 @@
                               :system                (exec-system ctx parsed)
                               :select                (exec-select ctx parsed)
                               :insert                (exec-insert ctx parsed)
-                              :update-with-recursive (exec-update-with-recursive ctx parsed)
                             ;; Templated simple-protocol UPDATE/DELETE ride
                             ;; the prepared-statement machinery: the exec
                             ;; paths re-translate WHERE and evaluate SET
