@@ -670,11 +670,19 @@
                           ;; LHS is from another table (the "left" side
                           ;; of the join from this join's perspective)
                             [l-var r-attr]))]
-                    (reset! ref-info {:value-join? true
-                                      :left-key-var left-key-var
-                                      :right-key-attr right-key-attr
-                                      :right-alias right-alias
-                                      :left-evar (ctx/entity-var! ctx (:default-table ctx))}))
+                    ;; ACCUMULATE. `reset!` here kept only the LAST
+                    ;; equality of a multi-condition ON, so
+                    ;; `ON (b.x = a.x AND b.y = a.y)` joined on `y`
+                    ;; alone and answered rows that match neither pair.
+                    (swap! ref-info
+                           (fn [info]
+                             (-> (or info {})
+                                 (assoc :value-join? true
+                                        :right-alias right-alias
+                                        :left-evar (ctx/entity-var! ctx (:default-table ctx)))
+                                 (update :value-keys (fnil conj [])
+                                         {:left-key-var left-key-var
+                                          :right-key-attr right-key-attr})))))
                 ;; For inner joins: unify on a shared logic var when both
                 ;; sides are plain columns — indexable data patterns the
                 ;; engine hash-joins in O(n), see ctx/unify-inner-equijoin!.
@@ -3017,6 +3025,13 @@
   (and (symbol? x)
        (or (contains? throwing-projection-ops x)
            (str/starts-with? (name x) "?nextval-marker-"))))
+
+(defn- clause-vars
+  "The logic variables a Datalog clause mentions, at any depth."
+  [clause]
+  (into #{}
+        (filter (fn [x] (and (symbol? x) (str/starts-with? (name x) "?"))))
+        (tree-seq coll? seq clause)))
 
 (defn- throwing-projection?
   [form clauses]
@@ -5548,25 +5563,29 @@
               (if (:value-join? ref-info)
                 ;; VALUE-EQUALITY LEFT JOIN: ON t1.a = t2.x
                 ;; (RIGHT JOINs are rewritten to LEFT at AST level)
-                (let [{:keys [left-key-var right-key-attr right-alias left-evar
+                (let [{:keys [value-keys right-alias left-evar
                               matched-only-preds]} ref-info
+                      ;; EVERY equality of the ON clause, not just one.
+                      left-key-vars (mapv :left-key-var value-keys)
+                      right-key-attrs (mapv :right-key-attr value-keys)
                       right-evar (ctx/entity-var! ctx right-alias)
-                      ;; Convert left join key to get-else so NULL-key entities are included.
-                      ;; They'll go to the unmatched branch via not-join.
-                      _ (let [clauses @(:where-clauses ctx)
-                              key-pattern (first (filter (fn [c]
-                                                           (and (vector? c) (= 3 (count c))
-                                                                (= left-key-var (nth c 2))
-                                                                (keyword? (second c))))
-                                                         clauses))]
-                          (when key-pattern
-                            (let [[evar attr _] key-pattern]
-                              (reset! (:where-clauses ctx)
-                                      (mapv (fn [c]
-                                              (if (= c key-pattern)
-                                                [(list 'get-else '$ evar attr :__null__) left-key-var]
-                                                c))
-                                            @(:where-clauses ctx))))))
+                      ;; Convert each left join key to get-else so NULL-key entities are
+                      ;; included. They'll go to the unmatched branch via not-join.
+                      _ (doseq [left-key-var left-key-vars]
+                          (let [clauses @(:where-clauses ctx)
+                                key-pattern (first (filter (fn [c]
+                                                             (and (vector? c) (= 3 (count c))
+                                                                  (= left-key-var (nth c 2))
+                                                                  (keyword? (second c))))
+                                                           clauses))]
+                            (when key-pattern
+                              (let [[evar attr _] key-pattern]
+                                (reset! (:where-clauses ctx)
+                                        (mapv (fn [c]
+                                                (if (= c key-pattern)
+                                                  [(list 'get-else '$ evar attr :__null__) left-key-var]
+                                                  c))
+                                              @(:where-clauses ctx)))))))
                       all-clauses @(:where-clauses ctx)
                       ;; Right-side clauses: data patterns on the right entity var
                       right-clause? (fn [clause]
@@ -5585,48 +5604,73 @@
                                                 (= right-marker (second c))))
                                          left-clauses))
                       ;; Separate right-side clauses into key and non-key
-                      right-key-clause (first (filter #(= right-key-attr (second %)) right-clauses))
-                      right-non-key (vec (remove #(or (= right-key-attr (second %))
+                      key-attr? (set right-key-attrs)
+                      right-key-clauses (vec (filter #(key-attr? (second %)) right-clauses))
+                      right-non-key (vec (remove #(or (key-attr? (second %))
                                                       (= right-marker (second %)))
                                                  right-clauses))
                       ;; Right-side value variables (from non-key patterns)
                       right-val-vars (vec (distinct
                                            (keep (fn [[_ _ v]] v) right-non-key)))
-                      ;; Also include the right-side key var if it was requested in SELECT
-                      right-key-var (when right-key-clause (nth right-key-clause 2))
+                      ;; The right-side key vars a SELECT asked for, by attr
+                      key-var-by-attr (into {} (map (fn [[_ a v]] [a v])) right-key-clauses)
+                      left-key? (set left-key-vars)
                       all-right-vars (vec (distinct
-                                           (concat (when (and right-key-var
-                                                              (not= right-key-var left-key-var))
-                                                     [right-key-var])
+                                           (concat (remove left-key? (vals key-var-by-attr))
                                                    right-val-vars)))
-                      ;; Shared vars for or-join: left-key + all right-side vars + right entity var
-                      shared-vars (vec (distinct (concat [left-key-var right-evar] all-right-vars)))
-                      ;; Branch 1: matched — right entity with matching key
+                      ;; Branch 1: matched — a right entity matching EVERY
+                      ;; equality of the ON clause. One data pattern per
+                      ;; equality, all on the same right entity var.
                       ;; Use get-else for non-key right columns (they may be NULL)
-                      matched-key [right-evar right-key-attr left-key-var]
+                      matched-keys (mapv (fn [{:keys [left-key-var right-key-attr]}]
+                                           [right-evar right-key-attr left-key-var])
+                                         value-keys)
                       matched-non-key (mapv (fn [[_e a v]]
                                               [(list 'get-else '$ right-evar a :__null__) v])
                                             right-non-key)
-                      ;; If right key var was in SELECT and differs from left key, bind it
-                      matched-key-bind (when (and right-key-var (not= right-key-var left-key-var))
-                                         [[(list 'identity left-key-var) right-key-var]])
+                      ;; If a right key var was in SELECT and differs from its
+                      ;; left key, bind it
+                      matched-key-binds (vec (keep (fn [{:keys [left-key-var right-key-attr]}]
+                                                     (let [rv (key-var-by-attr right-key-attr)]
+                                                       (when (and rv (not= rv left-key-var))
+                                                         [(list 'identity left-key-var) rv])))
+                                                   value-keys))
                       ;; Right-side filter predicates from the ON clause
                       ;; (e.g. `… AND d.objsubid = 0`) — applied inside
                       ;; the matched branch only. Without this they'd
                       ;; act as global filters and convert the LEFT JOIN
                       ;; into an INNER JOIN.
-                      matched-parts (into [matched-key]
+                      matched-parts (into (vec matched-keys)
                                           (concat matched-non-key
-                                                  matched-key-bind
+                                                  matched-key-binds
                                                   matched-only-preds))
                       matched (apply list 'and matched-parts)
-                      ;; Branch 2: unmatched — no right entity with this key
+                      ;; A condition may read a LEFT column that is not a
+                      ;; join key (`ON b.x = a.x AND b.y > a.y`). Such a
+                      ;; var has to cross into the or-join, or it is a
+                      ;; fresh unbound var inside the branch and the whole
+                      ;; join answers nothing.
+                      bound-outside (into #{} (mapcat clause-vars) left-clauses)
+                      matched-vars (into #{} (mapcat clause-vars) matched-parts)
+                      outer-left-vars (vec (distinct
+                                            (concat left-key-vars
+                                                    (filter #(and (bound-outside %)
+                                                                  (not (left-key? %)))
+                                                            matched-vars))))
+                      ;; Shared vars for or-join: every left var a condition
+                      ;; reads + all right-side vars + right entity var
+                      shared-vars (vec (distinct (concat outer-left-vars
+                                                         [right-evar]
+                                                         all-right-vars)))
+                      ;; Branch 2: unmatched — no right entity satisfies the
+                      ;; WHOLE condition. Negating the key pattern alone
+                      ;; dropped a left row whose key matched while another
+                      ;; condition did not, instead of null-extending it.
                       null-bindings (into [[(list 'ground :__null__) right-evar]]
                                           (mapv (fn [v] [(list 'ground :__null__) v])
                                                 all-right-vars))
                       unmatched (apply list 'and
-                                       (into [(list 'not-join [left-key-var]
-                                                    [right-evar right-key-attr left-key-var])]
+                                       (into [(list* 'not-join outer-left-vars matched-parts)]
                                              null-bindings))
                       oj-clause (list* 'or-join shared-vars matched unmatched nil)]
                   ;; Add right entity var to :with for dedup prevention
@@ -5653,7 +5697,7 @@
                 ;; the LEFT alias's entity-var (e.g. ?t_eid) is still
                 ;; intact here. We pull it from ref-info's
                 ;; :left-table-evar field.
-                (let [{:keys [ref-var ref-attr left-table-evar]} ref-info
+                (let [{:keys [ref-var ref-attr left-table-evar matched-only-preds]} ref-info
                       owner-evar (ctx/entity-var! ctx alias)
                       all-clauses @(:where-clauses ctx)
                       ;; The original ref pattern from the ON clause:
@@ -5701,9 +5745,26 @@
                       ;; binding in both branches: matched via the ref
                       ;; data pattern; unmatched via ground :__null__.
                       include-owner? (and owner-evar (not (some #(= owner-evar %) right-vars)))
+                      ;; A second ON condition (`… AND c.name = 'Acme'`)
+                      ;; was read by nobody here: the branch took the ref
+                      ;; pattern and stopped, so the whole join answered
+                      ;; NOTHING. It belongs in the matched branch, like
+                      ;; the value-join path, and any LEFT var it reads
+                      ;; has to cross into the or-join with it.
+                      pred-vars (into #{} (mapcat clause-vars) matched-only-preds)
+                      outer-left-vars (vec (distinct
+                                            (concat
+                                             (when left-evar [left-evar])
+                                             (filter (fn [v]
+                                                       (and (not= v ref-var)
+                                                            (not= v owner-evar)
+                                                            (not (some #{v} right-vars))
+                                                            (some #(contains? (clause-vars %) v)
+                                                                  left-clauses)))
+                                                     pred-vars))))
                       shared-vars (vec (distinct
                                         (concat
-                                         (when left-evar [left-evar])
+                                         outer-left-vars
                                          [ref-var]
                                          (when include-owner? [owner-evar])
                                          right-vars)))
@@ -5728,8 +5789,9 @@
                                          left-evar
                                          [[(list 'identity left-evar) ref-var]]
                                          :else [])
-                      matched (apply list 'and
-                                     (concat matched-ref-bind right-clauses))
+                      matched-parts (vec (concat matched-ref-bind right-clauses
+                                                 matched-only-preds))
+                      matched (apply list 'and matched-parts)
                       ;; Unmatched branch: assert no right row points at
                       ;; this LEFT, and ground all right-side + owner vars
                       ;; to :__null__. Without the LEFT entity-var we
@@ -5741,10 +5803,26 @@
                                             true           (conj ref-var)))
                       not-match-guard
                       (if left-evar
-                        ;; "no posting points at this transaction"
-                        (let [inner-eid (gensym "?lj-inner-")]
-                          [(list 'not-join [left-evar]
-                                 [inner-eid ref-attr left-evar])])
+                        ;; "no posting points at this transaction" -- and,
+                        ;; when the ON clause says more, none that also
+                        ;; satisfies the rest of it. Negating the ref
+                        ;; pattern alone would drop a LEFT row whose ref
+                        ;; matched but whose predicate did not, instead of
+                        ;; null-extending it. Only the right-side patterns
+                        ;; a predicate READS come along: the others are
+                        ;; display columns, and a row missing one of those
+                        ;; is still a match.
+                        (if (seq matched-only-preds)
+                          [(list* 'not-join outer-left-vars
+                                  (concat matched-ref-bind
+                                          (filter (fn [c]
+                                                    (some #(contains? pred-vars %)
+                                                          (clause-vars c)))
+                                                  right-clauses)
+                                          matched-only-preds))]
+                          (let [inner-eid (gensym "?lj-inner-")]
+                            [(list 'not-join [left-evar]
+                                   [inner-eid ref-attr left-evar])]))
                         ;; legacy: ref-var = :__null__
                         [[(list '= ref-var :__null__)]])
                       unmatched (apply list 'and
