@@ -4,6 +4,11 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A statement is checked against the catalog it was lowered against
+
+- **`ERROR: catalog changed while statement was being executed` no longer fires without a reason.** The check a write makes before it commits compared the whole global catalog, so two things aborted unrelated statements: the OID allocator's counter, which every `CREATE` anywhere bumps, and other sessions' temp tables, which are global rows here and are dropped when a connection closes. Neither is visible to a statement in PostgreSQL, and both are now out of the comparison. A churn reproduction went from 303 errors and no successes to none; concurrent DDL on unrelated *permanent* tables still aborts.
+- **A session value no longer leaks between sessions.** `current_schema` and `current_database()` are read through the session that translated the statement, and translated plans are shared server-wide, so one session could answer another's `search_path` — or one database's name to a session connected to another. Statements that read a session value are no longer cached across sessions.
+
 ### UPDATE computes its SET list in a query over the target
 
 Plain UPDATE (no FROM) is planned as PostgreSQL plans it: a query over the target whose target list computes the new values, `SELECT db_id, (e1), … FROM target WHERE …`, run by the SELECT executor. The hand-written per-row evaluator remains only for UPDATE … FROM and CTE-backed UPDATE until they move too.

@@ -23,11 +23,23 @@
   "Structural accounting limits, not an exact JVM heap guarantee."
   {:max-datoms 100000 :max-nodes 1000000 :max-bytes 33554432 :max-depth 64})
 
+(def temp-object-prefix
+  "The namespace prefix of a session-private (temporary) catalog object.
+   PostgreSQL keeps another backend's temp schema invisible; here temp
+   objects are ordinary global catalog rows, so the basis has to hide
+   them itself -- otherwise one session's temp DDL, including the
+   cleanup at disconnect, invalidates every other session's statement."
+  "__dh_pg_temp_")
+
 (def tracking-selector
   {:attributes #{:db/ident}
    :namespaces #{"pg" "datahike.pg" "__inherit__" "__seq__"}
    :namespace-prefixes #{"datahike.pg."}
-   :exclude-attributes #{:__seq__/value}})
+   ;; A sequence's value is not a definition, and the OID allocator is a
+   ;; single counter every CREATE bumps: it says an object was allocated
+   ;; somewhere, never what this statement reads. Keeping it made an
+   ;; unrelated session's CREATE/DROP pair abort a live write.
+   :exclude-attributes #{:__seq__/value :datahike.pg.catalog/next-oid}})
 
 (def tracking-options {:track-dependencies {::catalog tracking-selector}})
 
@@ -64,18 +76,46 @@
 
 (defn catalog-attribute?
   "Stored catalog namespaces, including future attributes in those namespaces.
-   Sequence values are intentionally not catalog definitions. Ident datoms
+   Sequence values are intentionally not catalog definitions, and neither
+   is the OID allocator's counter (see tracking-selector). Ident datoms
    bind logical schema names to entity IDs, including schema entity ordering."
   [attr]
   (when (keyword? attr)
     (let [n (namespace attr)]
       (and (not= :__seq__/value attr)
+           (not= :datahike.pg.catalog/next-oid attr)
            (or (= :db/ident attr)
                (= "pg" n)
                (= "datahike.pg" n)
                (and n (str/starts-with? n "datahike.pg."))
                (= "__inherit__" n)
                (= "__seq__" n))))))
+
+(defn temp-object-name?
+  "Does this value name a session-private catalog object? A temp table's
+   storage name is `__dh_pg_temp_<session>_<name>`, carried either as a
+   string or as the namespace of an attribute keyword."
+  [v]
+  (boolean
+   (cond
+     (keyword? v) (let [n (namespace v)]
+                    (or (and n (str/starts-with? n temp-object-prefix))
+                        (str/starts-with? (name v) temp-object-prefix)))
+     (string? v) (str/starts-with? v temp-object-prefix)
+     :else false)))
+
+(defn- remove-temp-objects
+  "The schema map without session-private objects, including the
+   eid -> ident entries datahike keeps alongside the attribute keys."
+  [schema]
+  (persistent!
+   (reduce-kv (fn [out k v]
+                (if (or (temp-object-name? k)
+                        (temp-object-name? v)
+                        (and (map? v) (temp-object-name? (:db/ident v))))
+                  out
+                  (assoc! out k v)))
+              (transient {}) schema)))
 
 (defn- limits! [options]
   (when (or (not (map? options))
@@ -188,19 +228,32 @@
      (let [limits (limits! options)
            state (volatile! {:datoms 0 :nodes 0 :bytes 0})
            scanned (volatile! 0)
-           schema (dbi/-schema db)
+           schema (remove-temp-objects (dbi/-schema db))
            config (dbi/-config db)
            read? (= :read (:schema-flexibility config))
            attrs (sort (filter catalog-attribute? (conj (set (keys schema)) :db/ident)))
            rows (if read?
                   (dbi/datoms db :aevt [])
                   (mapcat #(dbi/datoms db :aevt [%]) attrs))
+           rows (vec rows)
+           ;; A temp object's rows are spread over several entities (the
+           ;; object, its columns), and only some of them carry the name.
+           ;; Drop every entity that any temp-named value belongs to.
+           temp-entities (persistent!
+                          (reduce (fn [out datom]
+                                    (let [attr (dbi/-ident-for db (:a datom))]
+                                      (if (or (temp-object-name? attr)
+                                              (temp-object-name? (:v datom)))
+                                        (conj! out (:e datom))
+                                        out)))
+                                  (transient #{}) rows))
            frozen-schema (freeze-value schema state limits 0)
            catalog
            (reduce (fn [out datom]
                      (vswap! scanned inc)
                      (let [attr (dbi/-ident-for db (:a datom))]
-                       (if (catalog-attribute? attr)
+                       (if (and (catalog-attribute? attr)
+                                (not (contains? temp-entities (:e datom))))
                          (do
                            (charge! state limits :datoms 1)
                            (conj out [(freeze-value attr state limits 0)

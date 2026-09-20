@@ -209,6 +209,19 @@
    which case scalar subqueries are evaluated without memoization."
   nil)
 
+(def ^:dynamic *session-dependent?*
+  "An atom set while translating a statement that reads a value of the
+   SESSION -- `current_schema`, `current_database()`. Such a translation
+   closes over the session it was translated for, because a Datalog
+   function runs outside the connection's dynamic scope, so the result
+   must not be shared through the server-wide parse cache."
+  nil)
+
+(defn session-dependent!
+  "Mark the statement being translated as reading a session value."
+  []
+  (some-> *session-dependent?* (reset! true)))
+
 (def ^:dynamic *session-state*
   "The current pgwire connection's session-state atom while SQL is being
    translated. Session-valued expressions capture the atom (rather than a
