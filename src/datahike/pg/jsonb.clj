@@ -116,6 +116,17 @@
                        :sqlstate "22P02"
                        :detail (.getMessage e)})))))
 
+(deftype JsonObject [pairs]
+  ;; NOT a defrecord: a record is `map?`, so the writer's map branch
+  ;; would sort it like any other object -- the very thing this type
+  ;; exists to prevent, and the same trap PgArray / PgRecord carry.
+  Object
+  (toString [_] (str "#JsonObject" (vec pairs))))
+
+(defn- ->JsonObject [pairs] (JsonObject. pairs))
+
+(defn- json-object-pairs [^JsonObject o] (.-pairs o))
+
 (defn- normalize-tree
   "Bring a freshly-parsed tree into the value model:
 
@@ -140,12 +151,14 @@
     ;; (`{":dims": [3], ":elements": …}`). These must be tested BEFORE
     ;; the map branch.
     (pg-arr/array? v) (mapv normalize-tree (:elements v))
+    ;; A composite keeps its FIELD ORDER through the json family:
+    ;; composite_to_json walks the tuple descriptor in order (json.c),
+    ;; where jsonb sorts. A map loses that order -- and past 8 entries
+    ;; reorders it outright -- so the pairs are carried as they are.
     (records/record? v)
-    (let [fs (:fields v)]
-      (persistent!
-       (reduce (fn [m [i f]]
-                 (assoc! m (or (:name f) (str "f" (inc i))) (normalize-tree (:value f))))
-               (transient {}) (map-indexed vector fs))))
+    (->JsonObject (mapv (fn [i f]
+                          [(or (:name f) (str "f" (inc i))) (normalize-tree (:value f))])
+                        (range) (:fields v)))
     ;; A temporal value is ISO-8601, not java.util.Date's .toString
     ;; ("Sun Aug 16 19:00:16 PDT 2026").
     ;; PostgreSQL's JsonEncodeDateTime renders the value AS STORED — a
@@ -248,17 +261,36 @@
   "Object punctuation for the writer.
 
    PostgreSQL renders the two families differently, and the difference
-   is only in objects: `jsonb` emits `\": \"` after a key and `\", \"`
+   is only in objects and in KEY ORDER: `jsonb` emits `\": \"` after a
+   key and `\", \"` between pairs and sorts its keys, while a `json`
+   value that PostgreSQL BUILT keeps the order it was built in
    between pairs, while a `json` value that PostgreSQL BUILT (rather
    than echoed verbatim) is compact — `{\"a\":1}`. Arrays are `[1, 2]`
    in both."
-  {:pair ": " :sep ", "})
+  {:pair ": " :sep ", " :sort-keys? true})
 
 (defn- emit!
   [^StringBuilder sb v]
   (cond
     (nil? v)     (.append sb "null")
     (= json-null v) (.append sb "null")
+    (instance? JsonObject v)
+    (let [pairs (json-object-pairs v)
+          ;; jsonb sorts and takes the last of duplicate keys; json keeps
+          ;; both the order and the duplicates (`{"a":1,"a":2}`).
+          pairs (if (:sort-keys? *json-style*)
+                  (sort-by first pg-key-cmp
+                           (vals (reduce (fn [m [k x]] (assoc m k [k x])) {} pairs)))
+                  pairs)]
+      (.append sb \{)
+      (reduce (fn [first? [k x]]
+                (when-not first? (.append sb (:sep *json-style*)))
+                (append-json-string! sb (str k))
+                (.append sb (:pair *json-style*))
+                (emit! sb x)
+                false)
+              true pairs)
+      (.append sb \}))
     (map? v)     (do (.append sb \{)
                      (reduce (fn [first? k]
                                (when-not first? (.append sb (:sep *json-style*)))
@@ -336,7 +368,7 @@
                       (catch Exception _ v))
                  (normalize-tree v))
           sb (StringBuilder.)]
-      (binding [*json-style* {:pair ":" :sep ","}]
+      (binding [*json-style* {:pair ":" :sep "," :sort-keys? false}]
         (emit! sb data))
       (.toString sb))))
 
@@ -1056,7 +1088,7 @@
    way because the two names shared one implementation."
   ([v] (to-json v false))
   ([v already-json?]
-   (binding [*json-style* {:pair ":" :sep ","}]
+   (binding [*json-style* {:pair ":" :sep "," :sort-keys? false}]
      (to-jsonb v already-json?))))
 
 ;; ============================================================================

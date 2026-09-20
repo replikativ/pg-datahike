@@ -129,6 +129,44 @@
       ;; construct a category mismatch.
       (is (= ["a" "z"] (col c 2 "SELECT id, coalesce(s,'z') FROM tr ORDER BY id")))
       (is (= [nil "2"] (col c 2 "SELECT id, case when id=1 then null else 2 end FROM tr ORDER BY id"))))
+    (testing "all-unknown resolves to text, as parse_coerce.c does"
+      ;; "If all the inputs were UNKNOWN type -- ie, unknown-type
+      ;; literals -- then resolve as type TEXT." A construct with no
+      ;; typed input is therefore text for resolution too, which is
+      ;; what makes an assignment into a non-string column 42804.
+      (doseq [sql ["SELECT pg_typeof(CASE WHEN true THEN NULL END)"
+                   "SELECT pg_typeof(CASE WHEN true THEN NULL ELSE NULL END)"
+                   "SELECT pg_typeof(CASE WHEN true THEN (NULL) END)"
+                   "SELECT pg_typeof(coalesce(NULL,NULL))"
+                   "SELECT pg_typeof(nullif('a','b'))"
+                   "SELECT pg_typeof(greatest(NULL,NULL))"
+                   "SELECT pg_typeof(least(NULL,NULL))"]]
+        (is (= ["text"] (col c 1 sql)) sql))
+      (is (= ["integer"] (col c 1 "SELECT pg_typeof(coalesce(NULL,1))"))
+          "one typed input still decides")
+      (is (= ["integer"] (col c 1 "SELECT pg_typeof(CASE WHEN true THEN 1 ELSE NULL END)")))
+      (is (thrown-with-msg?
+           org.postgresql.util.PSQLException
+           #"operator does not exist: integer = text"
+           (col c 1 "SELECT 1 = (CASE WHEN true THEN NULL END)"))
+          "and text is a real type for operator resolution")
+      (testing "so an assignment into a non-string column is 42804"
+        (exec! c "CREATE TABLE tr_assign (i int, t text, v varchar(3))")
+        (exec! c "INSERT INTO tr_assign VALUES (1, 'x', 'ab')")
+        (doseq [sql ["UPDATE tr_assign SET i = CASE WHEN true THEN NULL END"
+                     "UPDATE tr_assign SET i = CASE WHEN true THEN '5' END"
+                     "UPDATE tr_assign SET i = coalesce(NULL,NULL)"
+                     "UPDATE tr_assign SET i = nullif('a','b')"]]
+          (is (thrown-with-msg?
+               org.postgresql.util.PSQLException
+               #"is of type integer but expression is of type text"
+               (exec! c sql))
+              sql))
+        (testing "a string column takes it, and so does a typed branch"
+          (exec! c "UPDATE tr_assign SET t = CASE WHEN true THEN NULL END")
+          (exec! c "UPDATE tr_assign SET v = CASE WHEN true THEN 'yy' END")
+          (exec! c "UPDATE tr_assign SET i = CASE WHEN true THEN 1 ELSE NULL END")
+          (is (= ["1"] (col c 1 "SELECT i FROM tr_assign"))))))
     (testing "a genuine category mismatch is an error"
       (is (thrown-with-msg?
            org.postgresql.util.PSQLException

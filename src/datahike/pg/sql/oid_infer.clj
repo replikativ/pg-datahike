@@ -615,6 +615,22 @@
     (or (get types/element-oid->array-oid common)
         (first array-oids))))
 
+(defn- all-unknown-text
+  "TEXT when every one of `exprs` is PostgreSQL's UNKNOWN -- an untyped
+   literal or an undeclared parameter -- else nil (parse_coerce.c
+   select_common_type: \"If all the inputs were UNKNOWN type … resolve as
+   type TEXT\").
+
+   Gated on the expressions rather than on their OIDs, because a nil OID
+   also means an expression we simply could not type: answering text for
+   THAT would destroy the nil every fallback downstream relies on."
+  [exprs]
+  (let [unwrap (fn unwrap [e] (if (instance? Parenthesis e)
+                                (recur (.getExpression ^Parenthesis e))
+                                e))]
+    (when (every? #(untyped-literal? (unwrap %)) exprs)
+      types/oid-text)))
+
 (defn- function-oid
   "Resolve a scalar or aggregate function reference. `:arg-type`
    sentinel in the registry means 'propagate the first argument's type'.
@@ -694,8 +710,9 @@
       ;; COALESCE / NULLIF / GREATEST / LEAST resolve a COMMON type over
       ;; every argument, the same way CASE and UNION do.
       (= rule :common-type)
-      (types/select-common-type (mapv #(resolution-oid % env) args)
-                                (str/upper-case fname) false)
+      (or (types/select-common-type (mapv #(resolution-oid % env) args)
+                                    (str/upper-case fname) false)
+          (all-unknown-text args))
       ;; PostgreSQL declares BOTH a float8 and a numeric overload of
       ;; sqrt / exp / ln / log / log10 / power, and function resolution
       ;; prefers the candidate with an exact-type argument -- so ANY
@@ -806,7 +823,8 @@
     ;; The COMMON type of every branch, not the first branch that happens
     ;; to have one: `CASE WHEN … THEN 1.50::numeric ELSE 1.5::float8 END`
     ;; is float8 in PostgreSQL, and prints 1.5 rather than 1.50.
-    (types/select-common-type (mapv #(resolution-oid % env) branches) "CASE" false)))
+    (or (types/select-common-type (mapv #(resolution-oid % env) branches) "CASE" false)
+        (all-unknown-text branches))))
 
 (defn- boolean-literal-column?
   "JSqlParser versions older than 5.x sometimes parse bare `TRUE`/`FALSE`

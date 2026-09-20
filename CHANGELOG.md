@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Type resolution: all-unknown is text, and the json family keeps column order
+
+- **A construct whose inputs are all untyped literals resolves to TEXT**, as `select_common_type` does: `CASE WHEN … THEN NULL END`, `COALESCE(NULL,NULL)`, `NULLIF('a','b')`, `GREATEST`/`LEAST(NULL,NULL)`. Text is then a real type for what follows, so `SET int_col = CASE WHEN … THEN NULL END` raises 42804 instead of storing NULL, and `1 = (CASE WHEN true THEN NULL END)` raises 42883. One typed input still decides, and an expression we merely fail to type is unaffected.
+- **`row_to_json` / `to_json` emit the table's column order**; they sorted keys like `jsonb`, which only agrees with PostgreSQL when the names happen to sort the same. `to_jsonb` keeps its sorted output, which was already right.
+- **`json_agg` is no longer `jsonb_agg`.** It kept the jsonb family's key sorting and object punctuation, and dropped the line feed PostgreSQL writes before each composite element.
+
 ### A statement is checked against the catalog it was lowered against
 
 - **`ERROR: catalog changed while statement was being executed` no longer fires without a reason.** The check a write makes before it commits compared the whole global catalog, so two things aborted unrelated statements: the OID allocator's counter, which every `CREATE` anywhere bumps, and other sessions' temp tables, which are global rows here and are dropped when a connection closes. Neither is visible to a statement in PostgreSQL, and both are now out of the comparison. A churn reproduction went from 303 errors and no successes to none; concurrent DDL on unrelated *permanent* tables still aborts.
