@@ -42,7 +42,7 @@
    that table."
   [db schema table]
   (sql/cached-result
-   [::columns table schema]
+   [::columns table schema (sql/catalog-basis-of db)]
    (fn []
      (let [declared-oid (fn [attr]
                           (some #(when (= attr (:attr %)) (:oid %))
@@ -132,11 +132,14 @@
   [asts scs schema db]
   (let [quoted (into #{} (comp (filter #(nil? (:table %))) (mapcat :columns) (map :name)) scs)
         texts (mapv #(expression-text % quoted) asts)
+        ;; The catalog basis is part of the key for the same reason
+        ;; parse-sql's own key has it: this memo would otherwise answer
+        ;; from before a catalog change that left the schema map equal.
         k (into [::plan texts
                  (mapv (fn [{:keys [alias table columns]}]
                          [alias table (mapv (juxt :name :oid) columns)])
                        scs)
-                 schema]
+                 schema (sql/catalog-basis-of db)]
                 (sql/translation-context))
         c (sql/cached-result
            k
@@ -171,7 +174,10 @@
                  (not= :select (:type p))
                  {:type :error :sqlstate "0A000"
                   :message (str "row expression planned as " (name (:type p)) " is not supported")}
-                 :else {:plan p :run (stmt/const-select-fn p)}))))]
+                 ;; A plan that reads a session value is this session's
+                 ;; (sql/cached-result does not keep it).
+                 :else (cond-> {:plan p :run (stmt/const-select-fn p)}
+                         (:session-dependent? p) (assoc :session-dependent? true))))))]
     (when (= :error (:type c)) (plan-error! c))
     c))
 

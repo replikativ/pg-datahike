@@ -27,7 +27,9 @@
                          :keep-history? true})
        (mapv (fn [attr] {:db/ident attr :db/valueType :db.type/string
                          :db/cardinality :db.cardinality/one})
-             (concat metadata-attrs [:user/value :__seq__/value])))))
+             (concat metadata-attrs [:user/value :__seq__/value
+                                     :datahike.pg.catalog/next-oid
+                                     :__dh_pg_temp_9a85fd9ca4d44b7d_bang/id])))))
 
 (deftest namespace-selection-is-extensible-but-not-a-prefix-accident
   (doseq [attr (conj metadata-attrs :db/ident :datahike.pg.catalog/version)]
@@ -329,3 +331,30 @@
     (is (= 'catalog/value frozen))
     (is (nil? (meta frozen)))
     (is (some? (meta value)) "The caller's symbol was not modified")))
+
+(deftest another-sessions-temp-objects-and-the-oid-counter-are-invisible
+  ;; The basis is the guard a write checks before it commits. It has to
+  ;; hold what the statement was lowered against, and nothing else:
+  ;; PostgreSQL keeps one backend's temp schema invisible to another,
+  ;; and its OID counter is not a definition. Both used to abort
+  ;; unrelated writes -- a CREATE TEMP TABLE (or the DROP a disconnect
+  ;; issues) in any session, and every CREATE anywhere.
+  (let [source (fixture-db)
+        captured (basis/capture source)]
+    (testing "the OID allocator's counter"
+      (is (not (basis/catalog-attribute? :datahike.pg.catalog/next-oid)))
+      (is (basis/matches?
+           captured
+           (tx source [[:db/add -1 :datahike.pg.catalog/next-oid "17588"]]))))
+    (testing "another session's temp table, created and dropped"
+      (let [created (tx source [{:datahike.pg/hidden "t"
+                                 :datahike.pg.object/revision
+                                 "__dh_pg_temp_9a85fd9ca4d44b7d_bang"}
+                                [:db/add -1 :__dh_pg_temp_9a85fd9ca4d44b7d_bang/id "1"]])]
+        (is (basis/matches? captured created))
+        (is (basis/matches? (basis/capture created) source))))
+    (testing "a permanent object is still observed"
+      (is (not (basis/matches?
+                captured
+                (tx source [{:datahike.pg/hidden "t"
+                             :datahike.pg.object/revision "public_thing"}])))))))

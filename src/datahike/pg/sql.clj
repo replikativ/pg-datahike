@@ -473,11 +473,14 @@
 (defn translation-context
   "What a translation depends on besides its SQL, schema and catalog: the
    declared parameter types, the session's temp tables, whether the SQL is
-   nested in a statement (see params/*nested-parse?*) and search_path."
+   nested in a statement (see params/*nested-parse?*), search_path and the
+   database. The cache is server-wide and its keys compare by value, so two
+   databases built by the same DDL have equal schemas and an equal catalog
+   basis; without the name they would share a plan."
   []
   [params/*declared-param-oids* params/*temp-table-map* params/*nested-parse?*
    (when params/*session-state*
-     (select-keys @params/*session-state* [:search-path]))])
+     (select-keys @params/*session-state* [:search-path :db-name]))])
 
 (defn- translation-cache-key [sql schema db]
   ;; Keep exact values, not their hashes: native catalog transactions do not
@@ -562,17 +565,25 @@
    isolated map; nil disables caching entirely."
   global-parse-cache)
 
+(defn catalog-basis-of
+  "The exact catalog/schema comparison value of `db`, as the parse cache's
+   own key takes it: what a cached translation is valid for."
+  [db]
+  (catalog-basis/capture db))
+
 (defn cached-result
   "The value of (f), kept in the parse-sql result cache under `k`, with
    the same LRU bound and the same clearing on DDL. `k` must hold
-   everything the value depends on. A result of :type :error is not
-   kept."
+   everything the value depends on. A result of :type :error, or one
+   that reads a session value, is not kept."
   [k f]
   (let [cache *parse-cache*]
     (if-some [hit (cache-get cache k)]
       hit
       (let [v (f)]
-        (if (= :error (:type v)) v (cache-put! cache k v))))))
+        (if (or (= :error (:type v)) (:session-dependent? v))
+          v
+          (cache-put! cache k v))))))
 
 (defn invalidate-parse-cache!
   "Clear the server-wide parse-sql result cache. Called from every DDL
@@ -640,7 +651,10 @@
 
 (defn- cacheable-parse?
   "True if this parse result can safely live in the cross-call cache.
-   Excludes session-dependent system queries, transient errors,
+   Excludes statements that read a session value (their translation
+   closes over the session it was translated for -- see
+   params/*session-dependent?*), session-dependent system queries,
+   transient errors,
    results enriched against db rows, and parsed maps that carry
    mutable per-call state.
 
@@ -654,6 +668,7 @@
   (and parsed
        (not (#{:system :error} (:type parsed)))
        (not (:enriched-db parsed))
+       (not (:session-dependent? parsed))
        (not (contains? parsed :row-refs))))
 
 ;; ============================================================================
@@ -2728,7 +2743,14 @@
        ;; a shape whose `#` is even harder to see.
          (or (unsupported-operator-error sql)
              (templated-parse sql schema db)
-             (let [parsed (parse-sql* sql schema db)]
+             (let [session? (atom false)
+                   parsed (binding [params/*session-dependent?* session?]
+                            (parse-sql* sql schema db))
+                   ;; A translation that reads a session value belongs to
+                   ;; the session it was translated for.
+                   parsed (cond-> parsed
+                            (and @session? (map? parsed))
+                            (assoc :session-dependent? true))]
                (when (and cache (cacheable-parse? parsed))
                  (cache-put! cache cache-key parsed))
                parsed)))))))

@@ -805,7 +805,8 @@
       ;; expression — the sole-select path is classified by
       ;; datahike.pg.sql.classify, but column-position use lands here.
       (= fname "current_database")
-      (let [fn-param (symbol (str "?cur-db" (swap! (:var-counter ctx) inc)))
+      (let [_ (params/session-dependent!)
+            fn-param (symbol (str "?cur-db" (swap! (:var-counter ctx) inc)))
             state params/*session-state*
             impl-fn (fn [] (or (some-> state deref :db-name) "datahike"))]
         (swap! (:in-params ctx) conj fn-param)
@@ -814,7 +815,8 @@
         result-var)
 
       (= fname "current_schema")
-      (let [fn-param (symbol (str "?cur-sch" (swap! (:var-counter ctx) inc)))
+      (let [_ (params/session-dependent!)
+            fn-param (symbol (str "?cur-sch" (swap! (:var-counter ctx) inc)))
             state params/*session-state*
             impl-fn (fn []
                       (let [path (or (some-> state deref :search-path)
@@ -5124,9 +5126,14 @@
 
 (defn- session-value-expr!
   "Lower a bare SQL session value to a zero-argument Datalog input fn.
-   Capture the session atom now so prepared statements observe later changes."
+   Capture the session atom now so prepared statements observe later
+   changes: a Datalog function runs outside the connection's dynamic
+   scope (another thread), so it cannot read the executing session. The
+   plan therefore belongs to this session alone -- see
+   params/session-dependent!, which keeps it out of the shared cache."
   [ctx prefix value-fn]
-  (let [result-var (ctx/fresh-var! ctx)
+  (let [_ (params/session-dependent!)
+        result-var (ctx/fresh-var! ctx)
         fn-param (symbol (str "?" prefix (swap! (:var-counter ctx) inc)))
         state params/*session-state*
         impl-fn (fn [] (or (value-fn state) :__null__))]
