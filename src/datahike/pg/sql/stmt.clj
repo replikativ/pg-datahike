@@ -801,12 +801,10 @@
     ;; functions, which JSqlParser also surfaces as calls and which PG
     ;; special-cases to the same names. Schema qualification is dropped.
     (instance? Function expr)
-    [(let [n (str/lower-case (.getName ^Function expr))]
-       (if-let [i (str/last-index-of n ".")] (subs n (inc i)) n))
-     2]
+    [(expr/resolution-name (.getName ^Function expr)) 2]
 
     (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
-    [(str/lower-case (.getName ^net.sf.jsqlparser.expression.AnalyticExpression expr)) 2]
+    [(expr/resolution-name (.getName ^net.sf.jsqlparser.expression.AnalyticExpression expr)) 2]
 
     ;; A cast takes the operand's name when that name is a good one, and
     ;; otherwise the target type's — so the type name is only a fallback.
@@ -909,7 +907,7 @@
 
 (defn- match-aggregate-index*
   [^Function f find-elems find-aliases]
-  (let [fname (str/lower-case (.getName f))
+  (let [fname (expr/resolution-name (.getName f))
         agg-sym (get fns/sql-aggregate->datalog fname)
         ;; Base name without the ns qualifier: for matching against
         ;; (count ?x) emitted by COUNT(*) special case.
@@ -1115,17 +1113,16 @@
     "statement_timestamp" "clock_timestamp"})
 
 (defn- srf-base-name
-  "The bare, lower-cased name of a function call, with any schema
-   qualifier removed: `pg_catalog.generate_series` -> `generate_series`.
+  "The lower-cased name a FROM-clause function call resolves under, by
+   the rule every other call uses (`expr/resolution-name`):
+   `pg_catalog.generate_series` is `generate_series`, and any other
+   qualifier stays part of the name and resolves to nothing.
 
-   PostgreSQL resolves the qualified and unqualified forms to the same
-   function through search_path, and we serve one schema, so the last
-   dot-separated segment is the name."
+   Dropping the LAST dot-separated segment instead made up a function:
+   `nosuchschema.unnest(…)` returned rows where PostgreSQL raises."
   [^String n]
   (when n
-    (let [n (str/lower-case n)
-          i (.lastIndexOf n ".")]
-      (if (neg? i) n (subs n (inc i))))))
+    (expr/resolution-name (str/lower-case n))))
 
 (defn- table-function-has-column-reference?
   "Whether a table function argument contains a column reference.
@@ -3912,7 +3909,7 @@
                         (let [expr (.getExpression item)]
                           (when (or (and (instance? Function expr)
                                          (fns/aggregate-function?
-                                          (str/lower-case (.getName ^Function expr))))
+                                          (expr/resolution-name (.getName ^Function expr))))
                                     (instance? net.sf.jsqlparser.expression.AnalyticExpression expr))
                             (str/lower-case
                              (unquote-ident (.getName ^Alias a))))))))
@@ -4131,12 +4128,19 @@
         ;; names, at the precision `pick-precision-variant` picks.
         emit-analytic-agg!
         (fn [^net.sf.jsqlparser.expression.AnalyticExpression ae alias0]
-          (let [fname (str/lower-case (.getName ae))
+          (let [fname (expr/resolution-name (.getName ae))
                 agg-sym (get fns/sql-aggregate->datalog fname)
                 inner-expr (.getExpression ae)
                 filter-expr (.getFilterExpression ae)
                 within-group? (= "WITHIN_GROUP" (str (.getType ae)))
                 idx (count @find-elements)]
+            ;; Only an aggregate takes FILTER. Without this the name fell
+            ;; through to the default aggregate below, so an unknown one
+            ;; ANSWERED -- `nosuchfn(a) FILTER (WHERE true)` as a COUNT.
+            (when (and filter-expr (not within-group?))
+              (expr/validate-decorated-call!
+               ctx fname (second (expr/call-node-name+args ae)) "FILTER"
+               (some? agg-sym)))
             (reject-ordered-set-boundary! fname agg-sym inner-expr within-group?)
             (reject-vector-distinct-aggregate! (.isDistinct ae) inner-expr)
             (reset! has-aggregates? true)
@@ -4170,10 +4174,15 @@
                                  :else (or agg-sym 'datahike.pg.sql/filter-sum))]
                 (swap! find-elements conj (list filter-agg case-var))
                 (swap! find-aliases conj (or alias0 fname)))
-              ;; No filter — treat as regular aggregate
+              ;; No filter — treat as regular aggregate. A name that is
+              ;; not one defaulted to COUNT here, which answers a number
+              ;; for a function that does not exist.
               (let [v (if inner-expr (expr/translate-expr ctx inner-expr)
                           (ctx/entity-var! ctx default-table))]
-                (swap! find-elements conj (list (or agg-sym 'count) v))
+                (when-not agg-sym
+                  (expr/undefined-function!
+                   ctx fname (second (expr/call-node-name+args ae))))
+                (swap! find-elements conj (list agg-sym v))
                 (swap! find-aliases conj (or alias0 fname))))
             idx))
 
@@ -4188,7 +4197,7 @@
         (fn [^Function f-node alias0]
           (let [idx (count @find-elements)]
             (let [^Function f f-node
-                  fname (str/lower-case (.getName f))
+                  fname (expr/resolution-name (.getName f))
                   agg-sym (get fns/sql-aggregate->datalog fname)
                   params (.getParameters f)
                   is-distinct? (.isDistinct f)]
@@ -4514,7 +4523,7 @@
                 ;; WINDOW: has partition/orderBy/window, or is a ranking function.
                 (instance? net.sf.jsqlparser.expression.AnalyticExpression expr)
                 (let [^net.sf.jsqlparser.expression.AnalyticExpression ae expr
-                      fname (str/lower-case (.getName ae))
+                      fname (expr/resolution-name (.getName ae))
                       agg-sym (get fns/sql-aggregate->datalog fname)
                       inner-expr (.getExpression ae)
                       filter-expr (.getFilterExpression ae)
@@ -4587,7 +4596,10 @@
                     ;; Window function: collect spec for server-side post-processing.
                     ;; All base columns must be in :find so the post-processor can
                     ;; partition, sort, and compute values from the result tuples.
-                    (let [;; `OVER w` names a window defined once in the
+                    (let [_ (expr/validate-decorated-call!
+                             ctx fname (second (expr/call-node-name+args ae)) "OVER"
+                             (or (some? agg-sym) (expr/window-function-name? fname)))
+                          ;; `OVER w` names a window defined once in the
                           ;; statement's WINDOW clause. The name was never
                           ;; resolved, so such a window had no PARTITION BY, no
                           ;; ORDER BY and no frame at all -- every row of the
@@ -4830,7 +4842,7 @@
 
                 ;; Aggregate: COUNT(*), SUM(col), etc.
                 (and (instance? Function expr)
-                     (fns/aggregate-function? (str/lower-case (.getName ^Function expr))))
+                     (fns/aggregate-function? (expr/resolution-name (.getName ^Function expr))))
                 (emit-agg! ^Function expr alias-str)
 
                 ;; PostgreSQL evaluates a top-level set-returning function in
@@ -5197,7 +5209,7 @@
         ;; HAVING-only position and can be added if needed.
         translate-agg
         (fn [^Function f]
-          (let [fname (str/lower-case (.getName f))
+          (let [fname (expr/resolution-name (.getName f))
                 params (.getParameters f)
                 is-count-star? (or (nil? params)
                                    (zero? (count params))
@@ -6850,7 +6862,7 @@
                           schema db params/*parse-sql*)
      (instance? net.sf.jsqlparser.expression.Function e)
      (let [^net.sf.jsqlparser.expression.Function f e
-           fname (str/lower-case (.getName f))]
+           fname (expr/resolution-name (.getName f))]
        (cond
          ;; nextval('seq_name') in INSERT VALUES → marker resolved
          ;; per-execute by resolve-nextval-markers.
@@ -6905,7 +6917,7 @@
      (and (instance? TimezoneExpression e)
           (let [left (.getLeftExpression ^TimezoneExpression e)]
             (and (instance? net.sf.jsqlparser.expression.Function left)
-                 (= "now" (str/lower-case (.getName ^net.sf.jsqlparser.expression.Function left))))))
+                 (= "now" (expr/resolution-name (.getName ^net.sf.jsqlparser.expression.Function left))))))
      {:fn :now}
 
     ;; ArrayConstructor literal: ARRAY[1,2,3] / ARRAY[ARRAY[1,2],…].

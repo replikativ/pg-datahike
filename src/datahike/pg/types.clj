@@ -805,6 +805,13 @@
    evaluated anew for every row that calls them."
   (into #{} (keep #(when (= "v" (:volatile %)) (:proname %))) pg-catalog/procs))
 
+(defn proc-name?
+  "Whether pg_proc has a function of this name, at any signature. The
+   question PostgreSQL asks to tell 42883 (\"no such function\") from
+   42809 (\"there is one, but not of the kind this clause needs\")."
+  [fname]
+  (contains? pg-catalog/procs-by-name fname))
+
 (def ^:private assignment-casts
   "castsource -> #{casttarget} for the pg_cast entries usable in an
    assignment: castcontext 'i' or 'a'."
