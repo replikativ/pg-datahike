@@ -181,15 +181,13 @@
                    "WHERE c='foo'"))))
     (is (= [["10" "31" "bugle"] ["10" "30" nil]]
            (rows c "SELECT * FROM update_values ORDER BY b DESC")))
-    (let [before (rows c "SELECT * FROM update_values ORDER BY b")
-          e (try
-              (exec! c (str "UPDATE update_values SET (b,a)="
-                            "(SELECT a,b FROM update_values LIMIT 1)"))
-              nil
-              (catch java.sql.SQLException e e))]
-      (is (some? e))
-      (is (= "0A000" (.getSQLState ^java.sql.SQLException e)))
-      (is (= before (rows c "SELECT * FROM update_values ORDER BY b"))))
+    ;; A row subquery assigns both columns, PostgreSQL's own
+    ;; update.sql shape. ORDER BY makes which row it reads definite.
+    (is (= 2 (update-count
+              c (str "UPDATE update_values SET (b,a)="
+                     "(SELECT a,b FROM update_values ORDER BY b LIMIT 1)"))))
+    (is (= [["30" "10" nil] ["30" "10" "bugle"]]
+           (rows c "SELECT * FROM update_values ORDER BY c NULLS FIRST")))
     (let [e (try
               (exec! c "UPDATE update_values t SET t.b=t.b+10 WHERE t.a=10")
               nil
@@ -309,3 +307,27 @@
         (is (= [["1" "51"]] (rows c "SELECT id, x FROM uf WHERE id = 1")))))
     (testing "an unknown source relation is 42P01"
       (is (= "42P01" (sqlstate c "UPDATE uf t SET x = 1 FROM nosuch s WHERE s.id = t.id"))))))
+
+(deftest multi-column-set-from-a-subquery
+  ;; `SET (a,b) = (SELECT x, y …)`. PostgreSQL evaluates the subquery
+  ;; once per row; this evaluates it once per column, which differs only
+  ;; for a volatile subquery. The values are PostgreSQL's: no row gives
+  ;; every column NULL, and more than one row is an error.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE mt (id int PRIMARY KEY, a int, b int)")
+    (exec! c "CREATE TABLE ms (id int, x int, y int)")
+    (exec! c "INSERT INTO mt VALUES (1,1,1),(2,2,2)")
+    (exec! c "INSERT INTO ms VALUES (1,10,20)")
+    (testing "a correlated row subquery assigns both columns"
+      (exec! c "UPDATE mt SET (a,b) = (SELECT x, y FROM ms WHERE ms.id = mt.id) WHERE id = 1")
+      (is (= [["1" "10" "20"]] (rows c "SELECT id, a, b FROM mt WHERE id = 1"))))
+    (testing "no row gives every column NULL"
+      (exec! c "UPDATE mt SET (a,b) = (SELECT x, y FROM ms WHERE ms.id = 99) WHERE id = 2")
+      (is (= [["2" nil nil]] (rows c "SELECT id, a, b FROM mt WHERE id = 2"))))
+    (testing "the per-column assignment cast still applies"
+      (is (= "42804" (sqlstate c "UPDATE mt SET (a,b) = (SELECT 1.6, '9'::text) WHERE id = 2")))
+      (exec! c "UPDATE mt SET (a,b) = (SELECT 1.6, 2) WHERE id = 2")
+      (is (= [["2" "2" "2"]] (rows c "SELECT id, a, b FROM mt WHERE id = 2"))))
+    (testing "a literal row list is unchanged"
+      (exec! c "UPDATE mt SET (a,b) = (7, 8) WHERE id = 1")
+      (is (= [["1" "7" "8"]] (rows c "SELECT id, a, b FROM mt WHERE id = 1"))))))

@@ -351,13 +351,23 @@
             "ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n"))
   (is (= [["15"]] (rows "SELECT n FROM t WHERE id = 1"))))
 
-(deftest do-update-unqualified-columns-belong-to-the-target-row
+(deftest do-update-unqualified-columns-are-ambiguous
+  ;; The conflicting row and `excluded` share one level, and `excluded`
+  ;; has every column of the target, so an unqualified name on the right
+  ;; of SET -- or in the WHERE -- is 42702 in PostgreSQL. This used to
+  ;; resolve to the target and answer.
   (seed!)
-  (testing "VALUES and INSERT SELECT both accept PostgreSQL's usual form"
+  (doseq [sql ["INSERT INTO t (id, n) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n"
+               "INSERT INTO t (id, n) SELECT 1, 7 ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n"
+               "INSERT INTO t (id, n) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = 1 WHERE n > 0"]]
+    (is (= "42702" (.-sqlstate ^PgWireServer$QueryResult (run sql))) sql))
+  (is (= [["10"]] (rows "SELECT n FROM t WHERE id = 1")) "and nothing was written")
+  (testing "qualified on both sides is the PostgreSQL form"
     (run (str "INSERT INTO t (id, n) VALUES (1, 5) "
-              "ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n"))
+              "ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n"))
+    (is (= [["15"]] (rows "SELECT n FROM t WHERE id = 1")))
     (run (str "INSERT INTO t (id, n) SELECT 1, 7 "
-              "ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n"))
+              "ON CONFLICT (id) DO UPDATE SET n = t.n + EXCLUDED.n WHERE EXCLUDED.n > 0"))
     (is (= [["22"]] (rows "SELECT n FROM t WHERE id = 1")))))
 
 (deftest do-update-rejects-duplicate-target-columns

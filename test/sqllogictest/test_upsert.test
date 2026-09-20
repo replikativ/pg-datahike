@@ -43,7 +43,7 @@ SELECT k, v, label FROM kv
 
 # DO UPDATE with expression using existing value
 statement ok
-INSERT INTO kv VALUES (3, 5.0, 'three_new') ON CONFLICT (k) DO UPDATE SET v = v + EXCLUDED.v
+INSERT INTO kv VALUES (3, 5.0, 'three_new') ON CONFLICT (k) DO UPDATE SET v = kv.v + EXCLUDED.v
 
 query IRT rowsort
 SELECT k, v, label FROM kv

@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### One evaluator for DML
+
+`eval-update-expr` and `eval-update-cond` are deleted, with the machinery that served them — about 1,200 lines. Every UPDATE (plain, with FROM, with a WITH clause) and every ON CONFLICT DO UPDATE now computes its values through the SELECT translator, so an expression means the same thing in a SET list as in a SELECT list.
+
+Two fixes fell out of it:
+- **A joined relation that does not exist** is `relation "x" does not exist` (42P01), PostgreSQL's message, rather than "missing FROM-clause entry" for whichever column first named it. Only the first FROM item was checked.
+- **A schema-qualified name never resolves to a CTE**, as in PostgreSQL, where a CTE lives in no schema. This is what lets `WITH t AS (…) UPDATE t SET …` reach the table while the subqueries see the CTE.
+
+### Multi-column SET from a subquery
+
+`SET (a, b) = (SELECT x, y …)` was refused with 0A000. It now assigns both columns: a correlated row subquery reads the row being updated, no row gives every column NULL, more than one row is an error, and each column takes its own assignment cast. PostgreSQL evaluates the subquery once per row and this evaluates it once per column, which differs only for a volatile subquery; a set-operation subquery is still refused.
+
+### ON CONFLICT DO UPDATE and CTE-backed UPDATE use the SELECT translator
+
+- **ON CONFLICT DO UPDATE SET** is one projection over the conflicting row and `excluded`, as PostgreSQL's ExecOnConflictUpdate binds both tuples, instead of an expression at a time through the second evaluator. An unqualified column on the right of SET, or in the WHERE, is **42702** — PostgreSQL's answer, since `excluded` has every column of the target; it used to resolve to the target and answer. Aggregates are 42803 and window functions 42P20.
+- **An UPDATE with a WITH clause** carries it into the query that computes the SET values, so the CTE is a relation like any other. `WITH d AS (…) UPDATE t SET n = d.n FROM d WHERE d.id = t.id` matched nothing and reported `UPDATE 0`; a CTE read by a subquery in SET raised "relation does not exist". WITH RECURSIVE UPDATE goes through the same path as every other UPDATE now.
+
 ### UPDATE ... FROM is one joined query
 
 The source relation is joined into the query that computes the SET values, as PostgreSQL plans it, instead of running the target matcher once per source row.

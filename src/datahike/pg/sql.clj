@@ -399,19 +399,16 @@
 
 ;; Expression + predicate translation moved to datahike.pg.sql.expr.
 ;; Re-export translate-predicate — server.clj reaches it via
-;; `#'sql/translate-predicate` from its build-update-tx path.
+;; `#'sql/translate-predicate` when it matches DELETE's rows.
 (def translate-predicate expr/translate-predicate)
 
 ;; Statement-level translation (SELECT / INSERT / UPDATE / DELETE / CTE)
 ;; moved to datahike.pg.sql.stmt. Re-export:
-;;   - eval-update-expr — public reach-in from server.clj for UPDATE
-;;     row-level evaluation.
 ;;   - coerce-insert-value — server.clj reaches via
 ;;     `#'sql/coerce-insert-value` at INSERT row build time.
 ;;   - translate-select / translate-insert / translate-update /
 ;;     translate-delete / select-item-alias — referenced by parse-sql
 ;;     dispatch below. Local private aliases avoid qualifying each site.
-(def eval-update-expr     stmt/eval-update-expr)
 (def coerce-insert-value stmt/coerce-insert-value)
 (def ^:private translate-select    stmt/translate-select)
 (def ^:private translate-insert    stmt/translate-insert)
@@ -896,8 +893,10 @@
      `materialize-set-op!`.
    - Recursive WITH items in SELECT/INSERT/DELETE go through
      `materialize-recursive-cte!` (run the Datalog rule, persist rows).
-     Recursive items in UPDATE are skipped here so translate-update's
-     existing `:update-with-recursive` path keeps owning that case.
+     Recursive items in UPDATE are skipped here: the SET list is
+     translated at Execute as a query carrying the same WITH clause,
+     which materialises the CTE there. Running the fixed point here too
+     would compute it twice, and would reject shapes that path serves.
    - Data-modifying CTE bodies (`WITH x AS (INSERT … RETURNING …)`) are
      skipped — JSqlParser's `WithItem.getSelect()` casts to
      ParenthesedSelect and crashes on them, and the feature is not

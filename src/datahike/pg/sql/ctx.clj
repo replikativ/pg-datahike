@@ -338,7 +338,12 @@
   (let [name (params/unquote-ident (.getName table))
         alias (.getAlias table)
         alias-name (when alias (params/unquote-ident (.getName ^Alias alias)))]
-    {:name  (get *relation-namespaces* name name)
+    {;; A schema-qualified name never names a CTE (PostgreSQL's CTEs
+     ;; live in no schema), which is how an UPDATE reaches its target
+     ;; table while a CTE of the same name serves the subqueries.
+     :name  (if (.getSchemaName table)
+              name
+              (get *relation-namespaces* name name))
      :alias (or alias-name name)}))
 
 (defn make-ctx

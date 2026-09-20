@@ -415,6 +415,29 @@
             (is (= state (.getSQLState ^SQLException e)))
             (is (re-find (re-pattern message) (.getMessage ^SQLException e)))))))))
 
+(deftest cte-backed-update-sees-the-cte
+  ;; The WITH clause rides into the query that computes the SET values,
+  ;; so the CTE is one relation among the rest. Before, an UPDATE whose
+  ;; FROM named a CTE matched nothing and reported UPDATE 0, and a
+  ;; subquery in SET raised "relation does not exist".
+  (with-open [c (jdbc)]
+    (.executeUpdate (.createStatement c) "CREATE TABLE ct (id int PRIMARY KEY, n int)")
+    (.executeUpdate (.createStatement c) "INSERT INTO ct VALUES (1,10),(2,20),(3,30)")
+    (testing "a CTE as the FROM relation"
+      (is (= 3 (.executeUpdate (.createStatement c)
+                               (str "WITH d AS (SELECT id, n * 2 AS n2 FROM ct) "
+                                    "UPDATE ct t SET n = d.n2 FROM d WHERE d.id = t.id"))))
+      (is (= [["1" "20"] ["2" "40"] ["3" "60"]] (rows c "SELECT id, n FROM ct ORDER BY id"))))
+    (testing "a CTE read by a subquery in SET"
+      (is (= 3 (.executeUpdate (.createStatement c)
+                               (str "WITH d AS (SELECT max(n) AS m FROM ct) "
+                                    "UPDATE ct SET n = (SELECT m FROM d)"))))
+      (is (= [["1" "60"] ["2" "60"] ["3" "60"]] (rows c "SELECT id, n FROM ct ORDER BY id"))))
+    (testing "and RETURNING still projects the updated row"
+      (is (= [["1"] ["2"] ["3"]]
+             (rows c (str "WITH d AS (SELECT id FROM ct) "
+                          "UPDATE ct t SET n = 1 FROM d WHERE d.id = t.id RETURNING t.id")))))))
+
 (deftest with-recursive-update-from-cte
   ;; Lock-in for the UPDATE WITH RECURSIVE path with a 2-column CTE — the
   ;; shape that previously triggered datahike's delta-driven-expand fast
