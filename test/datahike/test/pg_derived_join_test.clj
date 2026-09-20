@@ -100,3 +100,35 @@
       (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult r)))
       (is (re-find #"non-equality outer join"
                    (.-error ^PgWireServer$QueryResult r))))))
+
+(deftest using-and-natural-joins-are-joins
+  ;; `USING (c)` and NATURAL are conditions PostgreSQL synthesises before
+  ;; planning, and the pair of columns becomes ONE output column
+  ;; (parse_clause.c). Neither happened here: the join was a CROSS
+  ;; PRODUCT, and the merged name was reported ambiguous. Expectations
+  ;; are PostgreSQL 17's.
+  (run "CREATE TABLE ug_a (id int, x int, k int)")
+  (run "CREATE TABLE ug_b (id int, y int, k int)")
+  (run "INSERT INTO ug_a VALUES (1,10,7),(2,20,8),(3,30,9)")
+  (run "INSERT INTO ug_b VALUES (1,100,7),(2,200,99)")
+  (testing "the merged columns are the join condition"
+    (is (= "2" (v "SELECT count(*) FROM ug_a JOIN ug_b USING (id)")))
+    (is (= "1" (v "SELECT count(*) FROM ug_a JOIN ug_b USING (id, k)")))
+    (is (= "1" (v "SELECT count(*) FROM ug_a NATURAL JOIN ug_b"))))
+  (testing "the merged column is one column, the left side's"
+    (is (= [["1" "10" "100"] ["2" "20" "200"]]
+           (rows "SELECT id, x, y FROM ug_a JOIN ug_b USING (id) ORDER BY id")))
+    (is (= [["1" "7" "10" "100"]]
+           (rows "SELECT id, k, x, y FROM ug_a NATURAL JOIN ug_b"))))
+  (testing "SELECT * emits it once, first, then each relation's rest"
+    (is (= [["1" "10" "7" "100" "7"] ["2" "20" "8" "200" "99"]]
+           (rows "SELECT * FROM ug_a JOIN ug_b USING (id) ORDER BY id")))
+    (is (= [["1" "7" "10" "100"]] (rows "SELECT * FROM ug_a NATURAL JOIN ug_b")))
+    (is (= [["1" "10" "7" "100" "7"] ["2" "20" "8" "200" "99"]]
+           (rows "SELECT * FROM ug_a a1 JOIN ug_b b1 USING (id) ORDER BY id"))))
+  (testing "a qualified reference still names its own side"
+    (is (= [["1" "1"] ["2" "2"]]
+           (rows "SELECT ug_a.id, ug_b.id FROM ug_a JOIN ug_b USING (id) ORDER BY 1"))))
+  (testing "an ON join is unchanged: both columns, both emitted"
+    (is (= [["1" "10" "7" "1" "100" "7"] ["2" "20" "8" "2" "200" "99"]]
+           (rows "SELECT * FROM ug_a JOIN ug_b ON ug_a.id = ug_b.id ORDER BY ug_a.id")))))

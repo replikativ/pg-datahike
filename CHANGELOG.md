@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### JOIN … USING and NATURAL JOIN are joins
+
+Both were **cross products**: the columns they name were never turned into a join condition, so `a JOIN b USING (id)` returned every pair of rows (4 where PostgreSQL returns 2), and the merged name was reported ambiguous rather than answered. PostgreSQL synthesises the equality before planning and merges each pair into one output column (`parse_clause.c`).
+
+- `USING (…)` and NATURAL now produce the equality, against the relations to the left of the join.
+- The merged column is one column: an unqualified reference resolves to it, and `SELECT *` emits it once and first, followed by each relation's remaining columns — PostgreSQL's order. A qualified reference still names its own side.
+- An OUTER join's merged column is `COALESCE` of the two sides, which this does not build yet, so it stays ambiguous rather than answering the left side's NULL.
+
 ### Names resolve level by level
 
 PostgreSQL searches the innermost query level first and stops at the first level that has the name; ambiguity is only possible *within* a level (`colNameToVar`). Only QUALIFIED outer references were collected here, and the rest was patched per case:

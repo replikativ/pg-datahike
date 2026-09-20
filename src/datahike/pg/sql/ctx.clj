@@ -126,8 +126,13 @@
          ;; speculative tables) simply do not become candidates, so this
          ;; can only ever turn a failure into a resolution.
         relation-aliases (:relation-aliases (meta table-aliases))
+        ;; A column an INNER join MERGED is one column, not two
+        ;; (transformJoinUsingAlias): the equality makes the two sides
+        ;; the same value, so the left one answers.
+        merged? (contains? (:merged-columns (meta table-aliases)) col-name0)
         owner (or override-owner
                   (when (and (nil? table-alias) ci (not= "db_id" col-name0)
+                             (not merged?)
                              (or (> (count relation-aliases) 1)
                                  (> (count (set (vals table-aliases))) 1)))
                  ;; Group by the resolved ATTRIBUTE, not by alias.
