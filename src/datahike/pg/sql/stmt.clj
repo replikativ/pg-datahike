@@ -128,11 +128,17 @@
   (when (some (fn [^SelectItem item]
                 (instance? AllColumns (.getExpression item)))
               select-items)
-    (let [expand-relation
+    (let [merged-of (or (:merged-columns-by-alias (meta table-aliases)) {})
+          expand-relation
           (fn [alias real]
-            (for [column (pgs/column-info schema real db)
-                  :when (not= "db_id" (:name column))]
-              (expanded-select-item alias (:name column))))
+            ;; A merged column is emitted ONCE, with the left side's
+            ;; expansion: `SELECT * FROM a JOIN b USING (id)` gives id,
+            ;; a's remaining columns, then b's.
+            (let [merged (set (get merged-of alias))]
+              (for [column (pgs/column-info schema real db)
+                    :when (and (not= "db_id" (:name column))
+                               (not (contains? merged (:name column))))]
+                (expanded-select-item alias (:name column)))))
           expanded
           (mapcat
            (fn [^SelectItem original]
@@ -252,6 +258,44 @@
            :detail (str "The combining JOIN type must be INNER or LEFT "
                         "for a LATERAL reference.")}))))))
 
+(defn- relation-column-names
+  "The column names `relation` exposes, lower-cased, or nil when they
+   cannot be read."
+  [schema db relation]
+  (when (and relation schema)
+    (not-empty (into #{} (comp (map :name) (remove #(= "db_id" %)))
+                     (pgs/column-info schema relation db)))))
+
+(defn join-merged-columns
+  "The columns `join` MERGES with the relations on its left: the names
+   `USING (…)` lists, or every name both sides share for a NATURAL join
+   (transformJoinUsingAlias / transformJoinOnClause, parse_clause.c).
+   `left` is {alias relation}.
+
+   PostgreSQL turns each into an equality between the two sides AND
+   merges the pair into one output column. Neither happened here, so a
+   USING or NATURAL join was a cross product -- `a JOIN b USING (id)`
+   answered every pair of rows."
+  [^Join join left right-relation schema db]
+  (let [right-cols (relation-column-names schema db right-relation)
+        named (mapv #(params/unquote-ident (str %)) (or (.getUsingColumns join) []))
+        natural? (and (.isNatural join) (empty? named))
+        wanted (if natural?
+                 (when right-cols
+                   (vec (for [[_ rel] left
+                              c (or (relation-column-names schema db rel) #{})
+                              :when (contains? right-cols c)]
+                          c)))
+                 named)]
+    (vec (distinct
+          (keep (fn [c]
+                  (when-let [owner (some (fn [[alias rel]]
+                                           (when (contains? (or (relation-column-names schema db rel) #{}) c)
+                                             alias))
+                                         left)]
+                    {:column c :left-alias owner}))
+                wanted)))))
+
 (defn translate-join
   "Add join clauses for a SQL JOIN to the context.
    For INNER joins with ref-based ON (a.ref_col = b.db_id), unifies the ref
@@ -316,8 +360,17 @@
                              (= 1 (.size ^ParenthesedExpressionList e)))
                         (flatten-and (.get ^ParenthesedExpressionList e 0))
                         :else [e]))
-        on-exprs (some-> (.getOnExpressions join) seq
-                         (->> (mapcat flatten-and)))
+        ;; `USING (c)` and NATURAL are equalities PostgreSQL synthesises
+        ;; before planning; without them the join is a cross product.
+        merged (join-merged-columns join (:table-aliases ctx) name
+                                    (:schema ctx) (:db ctx))
+        using-on (mapv (fn [{:keys [column left-alias]}]
+                         (EqualsTo. (Column. (Table. ^String left-alias) ^String column)
+                                    (Column. (Table. ^String right-alias) ^String column)))
+                       merged)
+        on-exprs (concat (some-> (.getOnExpressions join) seq
+                                 (->> (mapcat flatten-and)))
+                         using-on)
         ;; Track ref-attr info for outer join post-processing
         ref-info (atom nil)]
     ;; For LEFT/RIGHT/FULL joins, pre-register the right-alias entity var in
@@ -3677,8 +3730,52 @@
         ;; The alias map necessarily collapses a self-join's two values to
         ;; the same storage namespace; occurrence metadata lets ctx still
         ;; raise PostgreSQL's 42702 for `FROM t x, t y ... b`.
+        ;; What each USING / NATURAL join merges: one output column, not
+        ;; two. Recorded per right-hand alias so `SELECT *` emits it once
+        ;; and an unqualified reference is not ambiguous.
+        ;; Walked in FROM order: a join merges against the relations to
+        ;; its LEFT only, which is also what decides the owner of each
+        ;; merged column.
+        merged-joins
+        (:merged
+         (reduce (fn [{:keys [left] :as acc} ^Join j]
+                   (let [rt (.getRightItem j)]
+                     (if-not (instance? Table rt)
+                       acc
+                       (let [{jn :name ja :alias} (ctx/extract-table-info ^Table rt)
+                             ralias (or ja jn)
+                             cols (join-merged-columns j left jn schema db)]
+                         (cond-> (update acc :left assoc ralias jn)
+                           (seq cols)
+                           (update :merged conj
+                                   {:right ralias
+                                    :columns (mapv :column cols)
+                                    :owners (mapv (juxt :left-alias :column) cols)
+                                    :outer? (not= :inner (join-type j))}))))))
+                 {:left (cond-> {}
+                          default-table (assoc default-table
+                                               (get table-aliases default-table default-table)))
+                  :merged []}
+                 (or joins [])))
         table-aliases (with-meta table-aliases
-                        {:relation-aliases (mapv first star-relations)})
+                        {:relation-aliases (mapv first star-relations)
+                         ;; Both sides drop it from their own expansion;
+                         ;; it is emitted once, first, from its owner.
+                         :merged-columns-by-alias
+                         (reduce (fn [m {:keys [right columns owners]}]
+                                   (reduce (fn [m [a c]] (update m a (fnil conj #{}) c))
+                                           (update m right (fnil into #{}) columns)
+                                           owners))
+                                 {} merged-joins)
+                         :merged-order (vec (mapcat :owners merged-joins))
+                         ;; An INNER join's merged column is the left
+                         ;; side's: the equality makes the two the same
+                         ;; value. An OUTER join's is COALESCE of both,
+                         ;; which this does not build, so it stays
+                         ;; ambiguous rather than answering a NULL.
+                         :merged-columns (into #{}
+                                               (comp (remove :outer?) (mapcat :columns))
+                                               merged-joins)})
 
         ;; Create context
         hints (pgs/schema-hints db)
@@ -4385,17 +4482,32 @@
                 ;; table. `SELECT * FROM t JOIN c` used to return t's
                 ;; columns alone — a silently narrower row, which is
                 ;; worse than an error because the client cannot tell.
-                (doseq [[ali real] star-relations]
-                  (doseq [col (pgs/column-info schema real db)
-                          :when (not= "db_id" (:name col))]
+                (doseq [[ali col-name]
+                        ;; A merged column (USING / NATURAL) is emitted
+                        ;; ONCE and FIRST, from the side that owns it,
+                        ;; then every relation's remaining columns in
+                        ;; FROM order -- PostgreSQL's expansion order.
+                        (concat (:merged-order (meta table-aliases))
+                                (for [[ali real] star-relations
+                                      col (pgs/column-info schema real db)
+                                      :when (and (not= "db_id" (:name col))
+                                                 (not (contains?
+                                                       (set (get (:merged-columns-by-alias
+                                                                  (meta table-aliases)) ali))
+                                                       (:name col))))]
+                                  [ali (:name col)]))
+                        :let [real (get table-aliases ali ali)
+                              col (or (first (filter #(= col-name (:name %))
+                                                     (pgs/column-info schema real db)))
+                                      {:name col-name :attr (keyword real col-name)})]]
                     ;; Route through the [:aliased …] form so the column
                     ;; binds against the alias's entity var, matching the
                     ;; `t.*` expansion.
-                    (let [v (expr/column-value! ctx (if (= real ali)
-                                                      (:attr col)
-                                                      [:aliased ali (:attr col)]))]
-                      (swap! find-elements conj v)
-                      (swap! find-aliases conj (or alias-str (:name col))))))
+                  (let [v (expr/column-value! ctx (if (= real ali)
+                                                    (:attr col)
+                                                    [:aliased ali (:attr col)]))]
+                    (swap! find-elements conj v)
+                    (swap! find-aliases conj (or alias-str (:name col)))))
 
                 ;; AnalyticExpression: FILTER aggregate or window function.
                 ;; FILTER: has filterExpression, no partition/orderBy/window.
