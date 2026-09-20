@@ -4,6 +4,18 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### An outer join applies every condition of its ON clause
+
+The lowering kept one. Each condition `reset!` a single `ref-info` map, so `LEFT JOIN b ON (b.x = a.x AND b.y = a.y)` joined on `y` alone — and **answered rows that satisfy neither pair**, with no error. Two more holes sat in the same construction:
+
+- `ON (b.x = a.x AND b.y = 1)` **dropped** the unmatched left row instead of null-extending it: the unmatched branch negated the key pattern alone, so a left row whose key matched but whose predicate did not fell out of both branches.
+- `ON (b.x = a.x AND b.y > a.y)` **answered nothing at all**: `a.y` was not in the or-join's head, so inside the branch it was a fresh unbound variable. Any ON condition reading a left column that is not a join key did this.
+- A ref-based outer join read `ref-var`/`ref-attr` and nothing else, so a second condition was discarded silently.
+
+Now every condition becomes part of the matched branch, the or-join's head carries each left variable a condition reads, and the unmatched branch negates the whole condition rather than the key. RIGHT and FULL are rewritten into this path and follow. One condition, and INNER JOIN with the same ON, are unchanged.
+
+This is the join under pgjdbc's column-metadata query (`LEFT JOIN pg_attrdef d ON (d.adrelid = a.attrelid AND d.adnum = a.attnum)`), which multiplied one row per column into twenty — and which the field-metadata catalog probe has been hiding.
+
 ### A constraint-name query is answered from pg_constraint
 
 `SELECT fk.conname AS name FROM pg_constraint fk WHERE …` was recognised by shape and answered `fk_<hash of the SQL>` — a name no catalog has, and the same answer for a table with no foreign key at all. The constraints are in `pg_constraint` under their real names, so the query now runs like any other: `child_pid_fkey`, or no row.
