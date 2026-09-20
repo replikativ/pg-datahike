@@ -7782,20 +7782,25 @@
           returning-clause)))
 
 (defn- reject-hidden-target-name!
-  "A DML target alias completely hides the target's original relation name."
-  [statement raw-table alias-name]
-  (when (and alias-name (not= alias-name raw-table))
-    (when (some (fn [^Column col]
-                  (when-let [table (.getTable col)]
-                    (= raw-table (unquote-ident (.getName ^Table table)))))
-                (params/ast-columns statement))
-      (throw (ex-info (str "invalid reference to FROM-clause entry for table \""
-                           raw-table "\"")
-                      {:error :undefined-table
-                       :sqlstate "42P01"
-                       :table raw-table
-                       :hint (str "Perhaps you meant to reference the table alias \""
-                                  alias-name "\".")})))))
+  "A DML target alias completely hides the target's original relation
+   name -- unless a FROM item brings that name back, which is legal
+   because the alias is what the target is called then (`UPDATE t q SET
+   … FROM t WHERE t.id = q.id`)."
+  ([statement raw-table alias-name] (reject-hidden-target-name! statement raw-table alias-name nil))
+  ([statement raw-table alias-name from-names]
+   (when (and alias-name (not= alias-name raw-table)
+              (not (contains? (set from-names) raw-table)))
+     (when (some (fn [^Column col]
+                   (when-let [table (.getTable col)]
+                     (= raw-table (unquote-ident (.getName ^Table table)))))
+                 (params/ast-columns statement))
+       (throw (ex-info (str "invalid reference to FROM-clause entry for table \""
+                            raw-table "\"")
+                       {:error :undefined-table
+                        :sqlstate "42P01"
+                        :table raw-table
+                        :hint (str "Perhaps you meant to reference the table alias \""
+                                   alias-name "\".")}))))))
 
 ;; Array/type metadata lives on ident entities, independently of schema-map
 ;; identity. Exact catalog inputs distinguish native metadata transactions as
@@ -9388,7 +9393,24 @@
               :else col-name)))
         alias-obj (.getAlias ^Table table)
         alias-name (when alias-obj (unquote-ident (.getName ^Alias alias-obj)))
-        _ (reject-hidden-target-name! update raw-table alias-name)
+        ;; The name each FROM relation is visible under: its alias, else
+        ;; its own name (only a Table has one to clash with).
+        from-items (cons (.getFromItem update)
+                         (map #(.getRightItem ^Join %) (or (.getJoins update) [])))
+        from-names (keep (fn [item]
+                           (when item
+                             (if-let [a (.getAlias ^FromItem item)]
+                               (unquote-ident (.getName ^Alias a))
+                               (when (instance? Table item)
+                                 (unquote-ident (.getName ^Table item))))))
+                         from-items)
+        ;; PostgreSQL's target is in the range table with the rest, so a
+        ;; FROM relation visible under the same name is 42712
+        ;; (setTargetTable / checkNameSpaceConflicts).
+        _ (when-let [dup (some (set from-names) [(or alias-name raw-table)])]
+            (throw (ex-info (str "table name \"" dup "\" specified more than once")
+                            {:error :duplicate-alias :sqlstate "42712" :table dup})))
+        _ (reject-hidden-target-name! update raw-table alias-name from-names)
         ns table-name
         where-expr (.getWhere update)
         update-sets (.getUpdateSets update)
@@ -9434,13 +9456,32 @@
                              :sqlstate "42601"
                              :column dup})))
         withs (.getWithItemsList update)
-        from-values (extract-from-values update)
+        ;; The FROM relation as written, joins included: the SET list is
+        ;; translated at Execute as a query over the target joined to it
+        ;; (server/update-set-plan). The shapes below are what the
+        ;; per-source-row fallback can still do by itself.
+        from-sql (when-let [fi (.getFromItem update)]
+                   ;; A comma-separated relation is a "simple" join, and
+                   ;; its toString leaves the comma out.
+                   (str fi (apply str (map (fn [^Join j]
+                                             (str (if (.isSimple j) ", " " ") j))
+                                           (or (.getJoins update) [])))))
+        [from-values from-table from-unsupported]
+        (try [(extract-from-values update)
+              (when-not (extract-from-values update)
+                (extract-update-from-table update schema))
+              nil]
+             (catch clojure.lang.ExceptionInfo e
+               (if (= "0A000" (:sqlstate (ex-data e)))
+                 ;; A shape only the joined query can serve. Kept as the
+                 ;; error the fallback raises if it ever runs.
+                 [nil nil (ex-message e)]
+                 (throw e))))
         recursive? (and withs (seq withs)
                         (some #(.isRecursive ^net.sf.jsqlparser.statement.select.WithItem %) withs))
         ;; The recursive CTE executor owns its FROM relation, which is a
         ;; virtual relation absent from the base schema at this point.
-        from-table (when (and (not recursive?) (not from-values))
-                     (extract-update-from-table update schema))]
+        from-table (when-not recursive? from-table)]
     (if recursive?
       ;; WITH RECURSIVE UPDATE: translate the CTE(s) to Datalog rule(s) and
       ;; let the server execute the iterative update.
@@ -9486,6 +9527,12 @@
                :table table-name
                :alias alias-name
                :ns ns
+               ;; The FROM relation as written. The SET list is
+               ;; translated again at Execute as a query over the target
+               ;; joined to it (server/update-set-plan), which is how
+               ;; PostgreSQL plans UPDATE ... FROM.
+               :from-sql from-sql
+               :from-unsupported from-unsupported
                ;; The parameter types this statement was translated with:
                ;; the SET list is translated again at Execute
                ;; (server/update-set-plan) and must see the same ones.
