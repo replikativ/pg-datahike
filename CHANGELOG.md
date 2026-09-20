@@ -4,6 +4,15 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Assigning to an enum or domain column is type-checked
+
+DDL lowers an enum column to text and a domain column to its base type, so the column's OID could not tell one enum from another: every enum column accepted any text, and the complaint came later from the enum's input function (22P02) — or not at all, for a label that happened to be valid. The assignment itself is now checked, as `transformAssignedExpr` does it, by the declared type's NAME.
+
+- `SET enumcol = 'x'::text`, `= text_col`, `= 42` raise **42804**; `= 'ok'`, `= 'ok'::the_enum`, `= another_column_of_that_enum` are accepted.
+- The message names the user type on either side: `column "m" is of type mood but expression is of type text`, and `column "i" is of type integer but expression is of type mood`.
+- A domain is named rather than its base type (`column "di" is of type dint …`), and still takes whatever its base type takes.
+- A source this layer cannot name — a subquery over an enum column reads as text here — is left to the base check rather than rejected, which is what PostgreSQL accepts too.
+
 ### One evaluator for DML
 
 `eval-update-expr` and `eval-update-cond` are deleted, with the machinery that served them — about 1,200 lines. Every UPDATE (plain, with FROM, with a WITH clause) and every ON CONFLICT DO UPDATE now computes its values through the SELECT translator, so an expression means the same thing in a SET list as in a SELECT list.

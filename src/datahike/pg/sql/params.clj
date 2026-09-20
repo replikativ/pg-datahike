@@ -954,6 +954,24 @@
                        [?e :pg/type ?pt]]}
              d attr))))
 
+(defn user-type-of-attr
+  "`[:enum name]` or `[:domain name]` when this column was declared with
+   a user type, else nil. DDL lowers such a column to the enum's text or
+   the domain's base type, so `:pg/type` no longer names it; the ident
+   entity keeps the declared name."
+  [db attr]
+  (when-let [d (or db *parse-db*)]
+    (let [row (first (d/q '{:find [?e ?en ?dn]
+                            :in [$ ?ident]
+                            :where [[?e :db/ident ?ident]
+                                    [(get-else $ ?e :datahike.pg/enum-of :__null__) ?en]
+                                    [(get-else $ ?e :datahike.pg/domain-of :__null__) ?dn]]}
+                          d attr))
+          [_ en dn] row
+          named? #(and % (not= :__null__ %))]
+      (cond (named? en) [:enum en]
+            (named? dn) [:domain dn]))))
+
 (defn pg-typmod-of-attr
   "The `:pg/typmod` attached to a schema ident entity, by the same route
    `pg-type-of-attr` uses and for the same reason: it lives on the ident
