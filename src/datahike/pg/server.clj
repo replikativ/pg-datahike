@@ -3025,7 +3025,7 @@
                             eids)))]
     {:eids eids :tx-data tx-data}))
 
-(declare select-rows resolve-param-refs temp-table-prefix)
+(declare select-rows resolve-param-refs temp-table-prefix build-update-tx*)
 
 (defn- update-set-plan
   "An UPDATE's SET list as PostgreSQL plans it: a query over the target
@@ -3036,13 +3036,19 @@
    column's default -- `nextval(...)` per row -- or carries a
    :default-fill for a constant one.
 
+   UPDATE ... FROM joins the source relation into that same query, as
+   PostgreSQL does: the SET list is evaluated for EVERY joined pair, and
+   a target row matched by several of them is updated once (which pair
+   wins is unspecified). Identical pairs collapse here, which is only
+   visible to a volatile SET expression.
+
    The values are computed where PostgreSQL computes them: over the
    pre-statement rows the WHERE keeps, with one statement time, and with
    uncorrelated subqueries run once."
   [parsed schema db]
   (let [k [::set-plan (pg-cache/identity-key parsed) (pg-cache/identity-key schema)]]
     (or (.get ^java.util.Map update-row-match-cache k)
-        (let [{:keys [table alias assignments where-expr]} parsed
+        (let [{:keys [table alias assignments where-expr from-sql]} parsed
               quoted #(str \" (str/replace % "\"" "\"\"") \")
               column-constraints (read-column-constraints db table)
               assignments
@@ -3065,6 +3071,7 @@
               text (str "SELECT " (quoted (or visible table)) ".db_id"
                         (apply str (map #(str ", (" (:sql %) ")") assignments))
                         " FROM " (quoted table) (when visible (str " AS " (quoted visible)))
+                        (when from-sql (str ", " from-sql))
                         (when where-expr (str " WHERE " where-expr)))
               plan (binding [params/*bound-params* nil
                              params/*declared-param-oids* (:declared-param-oids parsed)]
@@ -3096,11 +3103,19 @@
                                     {:sqlstate "42804"
                                      :hint "You will need to rewrite or cast the expression."}))))
               v {:plan plan :assignments assignments}]
-          (.put ^java.util.Map update-row-match-cache k v)
+          ;; A plan enriched against db ROWS (a derived, VALUES or
+          ;; function source is materialised into a snapshot) is valid
+          ;; only for that db, exactly as the parse cache's own
+          ;; cacheable-parse? says. Keeping it would re-run a later
+          ;; execution -- in another session, or after a write -- against
+          ;; the snapshot this one was translated on.
+          (when-not (:enriched-db plan)
+            (.put ^java.util.Map update-row-match-cache k v))
           v))))
 
 (defn- build-update-tx-from-plan
-  "UPDATE without FROM: the SET values come from update-set-plan's query,
+  "The SET values come from update-set-plan's query -- over the target,
+   joined to the source relation when the statement has a FROM --
    run by the SELECT executor (select-rows) against `db`, then take the
    assignment cast into the column. {:eids :tx-data}."
   [ctx db schema parsed]
@@ -3115,6 +3130,15 @@
                                                               (some-> bound rest vec))]
                             (select-rows (assoc ctx :db db) plan))
         rows (mapv #(if (sequential? %) (vec %) [%]) results)
+        ;; UPDATE ... FROM: a target row several source rows match is
+        ;; updated once. PostgreSQL leaves the winning pair unspecified.
+        rows (if (:from-sql parsed)
+               (second (reduce (fn [[seen out] row]
+                                 (if (contains? seen (first row))
+                                   [seen out]
+                                   [(conj seen (first row)) (conj out row)]))
+                               [#{} []] rows))
+               rows)
         tx-data (into []
                       (mapcat
                        (fn [[eid & values]]
@@ -3137,11 +3161,21 @@
    that need speculative tempid remapping should pass an `eid->tempid` map
    and remap the tx-data afterward.
 
-   For UPDATE ... FROM, runs the target matcher once per source row with
-   that row's columns bound as constants. PostgreSQL updates a target row
-   at most once even when several source rows match; retain the first match
-   in the source's stable entity order."
+   UPDATE ... FROM joins the source into the SET query (step 2's path).
+   Only a CTE-backed UPDATE still runs the target matcher once per source
+   row with that row's columns bound as constants."
   [ctx db schema parsed]
+  (if (and (:from-sql parsed) (not (:enriched-db parsed)))
+    ;; The source relation is joined into the SET query itself.
+    (build-update-tx-from-plan ctx db schema parsed)
+    (build-update-tx* ctx db schema parsed)))
+
+(defn- build-update-tx*
+  "The per-source-row path, for an UPDATE whose FROM relation the SET
+   query cannot carry (a CTE)."
+  [ctx db schema parsed]
+  (when-let [msg (:from-unsupported parsed)]
+    (throw (ex-info msg {:error :feature-not-supported :sqlstate "0A000"})))
   (if-let [{:keys [alias cols rows]} (:from-values parsed)]
     (reduce
      (fn [acc row]

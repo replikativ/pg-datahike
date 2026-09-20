@@ -4,6 +4,17 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### UPDATE ... FROM is one joined query
+
+The source relation is joined into the query that computes the SET values, as PostgreSQL plans it, instead of running the target matcher once per source row.
+
+- The SET list is evaluated for **every** joined pair, so `SET x = 100 / s.v` raises 22012 from a pair that loses, and a target row several pairs match is updated once.
+- Sources that were refused with 0A000 now work: several relations, an explicit JOIN, a subquery, and a source that is the target itself. `FROM (VALUES …)` no longer requires literal cells.
+- A FROM relation visible under the target's own name raises **42712**, as PostgreSQL does; the target's name is free once the target is aliased (`UPDATE t q SET … FROM t WHERE t.id = q.id`).
+- A derived, VALUES or function source is materialised per execution rather than kept in the statement's plan, so a second execution reads the current rows.
+
+RETURNING that references a source column still raises 42P01, and an unqualified column both relations have resolves to the target where PostgreSQL raises 42702. The per-source-row evaluator now runs only for a CTE-backed UPDATE.
+
 ### Type resolution: all-unknown is text, and the json family keeps column order
 
 - **A construct whose inputs are all untyped literals resolves to TEXT**, as `select_common_type` does: `CASE WHEN … THEN NULL END`, `COALESCE(NULL,NULL)`, `NULLIF('a','b')`, `GREATEST`/`LEAST(NULL,NULL)`. Text is then a real type for what follows, so `SET int_col = CASE WHEN … THEN NULL END` raises 42804 instead of storing NULL, and `1 = (CASE WHEN true THEN NULL END)` raises 42883. One typed input still decides, and an expression we merely fail to type is unaffected.

@@ -260,3 +260,52 @@
     (exec! c "UPDATE tt SET x = tt.x + 10 WHERE tt.id = 1")
     (exec! c "UPDATE tt t SET x = t.x + 100 WHERE t.id = 2")
     (is (= [["1" "11"] ["2" "102"]] (rows c "SELECT id, x FROM tt ORDER BY id")))))
+
+(deftest update-from-is-one-joined-query
+  ;; PostgreSQL plans UPDATE ... FROM as an ordinary join whose target
+  ;; list computes the SET values, so the list is evaluated for EVERY
+  ;; joined pair and a target row several pairs match is updated once.
+  ;; Expectations are PostgreSQL 17's.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE uf (id int PRIMARY KEY, x int)")
+    (exec! c "CREATE TABLE ua (id int, v int, tag text)")
+    (exec! c "CREATE TABLE ub (id int, w int)")
+    (exec! c "INSERT INTO uf VALUES (1,10),(2,20),(3,30)")
+    (exec! c "INSERT INTO ua VALUES (1,5,'a'),(1,7,'b'),(2,6,'c')")
+    (exec! c "INSERT INTO ub VALUES (1,100),(2,200)")
+    (testing "a target matched by several source rows is updated once"
+      (is (= 2 (update-count c "UPDATE uf t SET x = t.x + a.v FROM ua a WHERE a.id = t.id")))
+      (is (= [["1" "15"] ["2" "26"] ["3" "30"]] (rows c "SELECT id, x FROM uf ORDER BY id"))))
+    (testing "SET is evaluated for every pair, including the discarded ones"
+      (exec! c "INSERT INTO ua VALUES (2,0,'d')")
+      (is (= "22012" (sqlstate c "UPDATE uf t SET x = 100 / a.v FROM ua a WHERE a.id = t.id")))
+      (exec! c "DELETE FROM ua WHERE tag = 'd'"))
+    (testing "several relations, a join, a subquery and VALUES all serve as the source"
+      (exec! c "UPDATE uf t SET x = a.v + b.w FROM ua a, ub b WHERE a.id = t.id AND b.id = t.id AND a.tag = 'a'")
+      (is (= [["1" "105"] ["2" "26"]] (rows c "SELECT id, x FROM uf WHERE id < 3 ORDER BY id")))
+      (exec! c "UPDATE uf t SET x = a.v FROM ua a JOIN ub b ON b.id = a.id WHERE a.id = t.id AND a.tag = 'a'")
+      (is (= [["1" "5"]] (rows c "SELECT id, x FROM uf WHERE id = 1")))
+      (exec! c "UPDATE uf t SET x = j.v FROM (SELECT id, v * 2 AS v FROM ua WHERE tag = 'a') j WHERE j.id = t.id")
+      (is (= [["1" "10"]] (rows c "SELECT id, x FROM uf WHERE id = 1")))
+      (exec! c "UPDATE uf t SET x = s.a FROM (VALUES (3, 99)) AS s(i, a) WHERE s.i = t.id")
+      (is (= [["3" "99"]] (rows c "SELECT id, x FROM uf WHERE id = 3"))))
+    (testing "the target itself may be the source"
+      (exec! c "UPDATE uf t SET x = 7 FROM (SELECT id FROM uf WHERE id = 2) z WHERE z.id = t.id")
+      (is (= [["2" "7"]] (rows c "SELECT id, x FROM uf WHERE id = 2"))))
+    (testing "a derived source is re-read on every execution"
+      ;; It is materialised into a snapshot at translate time, so a
+      ;; cached plan would answer from the db it was translated on.
+      (exec! c "UPDATE uf t SET x = j.v FROM (SELECT id, v FROM ua WHERE tag = 'a') j WHERE j.id = t.id")
+      (is (= [["1" "5"]] (rows c "SELECT id, x FROM uf WHERE id = 1")))
+      (exec! c "UPDATE ua SET v = v * 10 WHERE tag = 'a'")
+      (exec! c "UPDATE uf t SET x = j.v FROM (SELECT id, v FROM ua WHERE tag = 'a') j WHERE j.id = t.id")
+      (is (= [["1" "50"]] (rows c "SELECT id, x FROM uf WHERE id = 1"))))
+    (testing "a source visible under the target's own name is 42712"
+      ;; PostgreSQL puts the target in the range table with the rest.
+      (is (= "42712" (sqlstate c "UPDATE uf SET x = 1 FROM uf")))
+      (is (= "42712" (sqlstate c "UPDATE uf a SET x = 1 FROM ua a WHERE a.id = 1")))
+      (testing "but the target's name is free once the target is aliased"
+        (exec! c "UPDATE uf q SET x = uf.x + 1 FROM uf WHERE uf.id = q.id AND q.id = 1")
+        (is (= [["1" "51"]] (rows c "SELECT id, x FROM uf WHERE id = 1")))))
+    (testing "an unknown source relation is 42P01"
+      (is (= "42P01" (sqlstate c "UPDATE uf t SET x = 1 FROM nosuch s WHERE s.id = t.id"))))))
