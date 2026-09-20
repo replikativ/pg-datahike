@@ -907,6 +907,21 @@
       ;; connection. We're single-tenant so they all return the
       ;; static handler name. The bare-identifier forms (no parens)
       ;; are handled in `translate-expr`.
+      ;; The server's own version string, the same one the startup
+      ;; parameters report. A plain function, so `version()` works
+      ;; wherever an expression does -- `SELECT version(), 1` was 42883
+      ;; because only a whole-statement shortcut knew the name.
+      (= fname "version")
+      (let [fn-param (symbol (str "?version" (swap! (:var-counter ctx) inc)))
+            v (str "PostgreSQL " datahike.pg.PgWireServer/SERVER_VERSION
+                   " (Datahike PgWire compatibility layer)")
+            impl-fn (fn [] v)]
+        (fns/check-arity! fname (count args))
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+        result-var)
+
       (contains? #{"current_user" "session_user" "user" "system_user"} fname)
       (let [fn-param (symbol (str "?cur-user" (swap! (:var-counter ctx) inc)))
             impl-fn (fn [] "datahike")]

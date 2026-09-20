@@ -5038,13 +5038,8 @@
    handle-* emits at Execute."
   [parsed]
   (case (:system-type parsed)
-    :current-database       {:names ["current_database"]           :oids [types/oid-name]}
-    :current-schema         {:names ["current_schema"]             :oids [types/oid-name]}
-    :version                {:names ["version"]                    :oids [PgWireServer/OID_TEXT]}
-    :now                    {:names ["now"]                        :oids [types/oid-timestamptz]}
     :pg-backend-pid         {:names ["pg_backend_pid"]             :oids [PgWireServer/OID_INT4]}
     :txid-current           {:names ["txid_current"]               :oids [PgWireServer/OID_INT8]}
-    :pg-keywords            {:names ["string_agg"]                 :oids [PgWireServer/OID_TEXT]}
     :nextval                {:names ["nextval"]                    :oids [PgWireServer/OID_INT8]}
     :currval                {:names ["currval"]                    :oids [PgWireServer/OID_INT8]}
     :lastval                {:names ["lastval"]                    :oids [PgWireServer/OID_INT8]}
@@ -6765,11 +6760,6 @@
 
       ;; Simple info queries
       :show              (handle-show (:var parsed) schema session-state tx-state)
-      :version           (handle-version)
-      :pg-keywords       (handle-pg-keywords ctx parsed)
-      :current-schema    (handle-current-schema session-state)
-      :current-database  (handle-current-database (:db-name @session-state))
-      :now               (handle-now ctx parsed)
 
       ;; Sequence functions (classify supplies :seq-name / :new-value)
       :nextval           (handle-nextval ctx parsed)

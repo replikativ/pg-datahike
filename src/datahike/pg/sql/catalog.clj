@@ -2048,8 +2048,7 @@
     ;; isolation that SHOW transaction_isolation must report back.
     :set-session-isolation :set-transaction-isolation
     :set-session-access :set-transaction-access
-    :version :now :current-schema :current-database
-    :pg-keywords :nextval :currval :lastval :setval
+    :nextval :currval :lastval :setval
     :try-advisory-xact-lock :try-advisory-lock
     :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
     :pg-backend-pid :txid-current :pg-sleep :pg-notify

@@ -142,19 +142,17 @@
            (:name (c/classify "SAVEPOINT \"3e8d481a-3964-11f1\""))))))
 
 (deftest classify-select-hijack
-  (is (= :version          (kind "SELECT version()")))
-  (is (= :now              (kind "SELECT now()")))
-  (is (= :now              (kind "SELECT (now() AT TIME ZONE 'UTC')")))
-  ;; A trailing cast changes result type + column name, so the
-  ;; single-value hijack must NOT fire — the translator handles it
-  ;; (issue #13: `SELECT now()::date` rendered as timestamp).
-  (is (= :generic-sql      (kind "SELECT now()::date")))
-  (is (= :generic-sql      (kind "SELECT version()::text")))
-  (is (= :generic-sql      (kind "SELECT current_catalog = current_database()")))
-  (is (= :generic-sql      (kind "SELECT now() = current_timestamp")))
-  (is (= :generic-sql      (kind "SELECT current_schema IS NULL")))
-  (is (= :current-schema   (kind "SELECT current_schema()")))
-  (is (= :current-database (kind "SELECT current_database()")))
+  ;; The value functions are the translator's, so no statement shape is
+  ;; hijacked for them any more: `SELECT version(), 1` used to be 42883,
+  ;; and `SELECT (now() AT TIME ZONE 'UTC')` answered a timestamptz
+  ;; called "now" where PostgreSQL gives a timestamp.
+  (doseq [sql ["SELECT version()" "SELECT now()" "SELECT (now() AT TIME ZONE 'UTC')"
+               "SELECT now()::date" "SELECT version()::text"
+               "SELECT current_catalog = current_database()"
+               "SELECT now() = current_timestamp" "SELECT current_schema IS NULL"
+               "SELECT current_schema()" "SELECT current_database()"
+               "SELECT pg_get_keywords()"]]
+    (is (= :generic-sql (kind sql)) sql))
   (is (= :pg-backend-pid   (kind "SELECT pg_backend_pid()")))
   (is (= :txid-current     (kind "SELECT txid_current()")))
   (is (= :nextval          (kind "SELECT nextval('foo')")))
@@ -202,8 +200,9 @@
   ;; dispatch in classify-select accepts both bare and quoted forms.
   (is (= :advisory-lock (kind "SELECT \"pg_advisory_lock\"(42)")))
   (is (= :pg-sleep      (kind "SELECT \"pg_sleep\"(0)")))
-  (is (= :now           (kind "SELECT \"now\"()")))
-  (is (= :current-database (kind "SELECT \"current_database\"()"))))
+  ;; A quoted value function is the translator's too.
+  (is (= :generic-sql   (kind "SELECT \"now\"()")))
+  (is (= :generic-sql   (kind "SELECT \"current_database\"()"))))
 
 (deftest classify-cursors
   (is (= :declare-cursor (kind "DECLARE c1 CURSOR FOR SELECT 1")))
