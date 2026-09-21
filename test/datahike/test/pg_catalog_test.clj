@@ -568,8 +568,10 @@
     (let [r (ex "SELECT tablename, indexname FROM pg_indexes ORDER BY indexname")]
       (is (nil? (:err r)))
       (is (= ["tablename" "indexname"] (:cols r)))
+      ;; `:person/name` is :db.unique/identity -- a PRIMARY KEY -- and
+      ;; PostgreSQL names that index after the TABLE, not the column.
       (is (some (fn [[tbl idx]] (and (= "person" tbl)
-                                     (= "person_name_key" idx)))
+                                     (= "person_pkey" idx)))
                 (:rows r))))))
 
 (deftest test-pg-indexes-projection
@@ -577,7 +579,7 @@
     (let [r (ex "SELECT indexname FROM pg_indexes")]
       (is (nil? (:err r)))
       (is (= ["indexname"] (:cols r)))
-      (is (some #(str/ends-with? (first %) "_key") (:rows r))))))
+      (is (some #(str/ends-with? (first %) "_pkey") (:rows r))))))
 
 (deftest test-pg-indexes-where-filter
   (testing "WHERE tablename = 'person' returns only that table's indexes"

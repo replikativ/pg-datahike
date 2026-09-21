@@ -4,6 +4,18 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The last shape probe is gone, and shape.clj with it
+
+`DatabaseMetaData.getPrimaryKeys` was answered by a **probe**: a handler that recognised pgjdbc's SQL by its shape, regexed `ct.relname = '…'` out of it, read the Datahike schema, and returned a column (`IS_NOT_NULL`) the driver never asked for. Whatever the query said — a different table, a join, a WHERE — the probe answered the same way. Three things were missing before the catalog could answer it itself, and all three are here:
+
+- **`information_schema._pg_expandarray(anyarray)`** — one row per element, as the record `(x, n)`: the element and its 1-based subscript. Two OUT parameters, so PostgreSQL expands it to two *columns* in FROM and yields the *composite* in a SELECT list; `(…).n` selects a field out of it through the same ProjectSet node. Only the schema-qualified spelling resolves, as in PostgreSQL. An `int2vector` argument — `pg_index.indkey`, which is what pgjdbc passes — is read as the vector it is.
+- **`pg_index.indnatts` / `indnkeyatts`** — the column counts newer pgjdbc and Metabase bound their primary-key walk with.
+- **A `pg_class` row for an implicit index.** `JOIN pg_class ci ON (ci.oid = i.indexrelid)` matched nothing, because only `CREATE INDEX` indexes had one. A primary key's and a unique column's index are relations in PostgreSQL too.
+
+The three catalogs that describe an implicit index — `pg_index`, `pg_indexes`, `pg_class` — each built the list separately and disagreed: `pg_indexes` called a primary key's index `t_id_key` where `pg_index` called it `t_id_pkey`, and PostgreSQL calls it **`t_pkey`**, naming it after the table. They now come from one descriptor list, and `pg_constraint` names a primary key the same way. Two tests that had copied the old spelling are corrected.
+
+With the probe deleted, `shape.clj` has no callers and is deleted: **no SQL statement is answered by recognising its shape any more.**
+
 ### The last server shortcuts are translated: advisory locks, pg_sleep, pg_notify
 
 Eight functions were answerable only as a **whole statement** — the classifier matched the sole projection and a handler answered it — so the same call written anywhere else was 42883 on a server where the bare form works:

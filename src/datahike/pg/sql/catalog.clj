@@ -28,7 +28,6 @@
             [datahike.pg.jsonb :as jb]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
-            [datahike.pg.sql.shape :as shape]
             [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types])
   (:import [net.sf.jsqlparser.schema Table]
@@ -371,6 +370,14 @@
       :pg/type "int2vector"}
      {:db/ident :pg_index/indisprimary :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_index/indisunique :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     ;; The number of KEY columns, as opposed to the INCLUDE-only ones
+     ;; that follow them in indkey. No index here has INCLUDE columns,
+     ;; so both counts are indkey's length. pgjdbc reads it (PG 11+) to
+     ;; bound its primary-key walk.
+     {:db/ident :pg_index/indnatts :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+      :pg/type "int2"}
+     {:db/ident :pg_index/indnkeyatts :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+      :pg/type "int2"}
      {:db/ident :pg_index/indisvalid :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      ;; indpred / indexprs are bytea in real PG but tested only for IS
      ;; NULL — a string column with "" (treated as non-null) works.
@@ -834,6 +841,53 @@
                     [?index :datahike.pg.index/relation ?relation]
                     [?relation :datahike.pg.object/oid ?relation-oid]]}
           db))))
+
+(defn- native-index-descriptors
+  "The indexes PostgreSQL would have created implicitly -- one per UNIQUE
+   or PRIMARY KEY column, plus the plain indexed ones -- as
+   `{:table :column :attnum :oid :relation-oid :name :primary? :unique?
+     :indexdef}`.
+
+   ONE source for the three catalogs that describe them. pg_index,
+   pg_indexes and pg_class each built the list again and they disagreed:
+   pg_indexes called a primary key's index `t_id_key` where pg_index
+   called it `t_id_pkey`, and pg_class had no row for an implicit index
+   at all -- so `JOIN pg_class ci ON (ci.oid = i.indexrelid)`, the join
+   pgjdbc's getPrimaryKeys makes, matched nothing."
+  [db user-schema hints]
+  (let [tables (pgs/derive-virtual-tables user-schema hints)
+        oid-of (fn [tname] (long (or (pgs/table-oid db tname)
+                                     (Math/abs (.hashCode ^String tname)))))]
+    (vec
+     (for [[tname {:keys [columns]}] (sort-by key tables)
+           [idx col] (map-indexed vector columns)
+           :when (or (:unique col)
+                     (and (:indexed? col) (not (:internal-index? col))))
+           :let [primary? (= :db.unique/identity (:unique col))
+                 unique? (some? (:unique col))
+                 attnum (long (or (pgs/column-attnum user-schema tname (:name col) hints)
+                                  (inc idx)))
+                 tbl-oid (oid-of tname)
+                 ;; PostgreSQL names a primary key's index after the
+                 ;; TABLE (`uq_pkey`); only a unique or plain index carries
+                 ;; the column (`uq_e_key`, `uq_n_idx`). ChooseIndexName /
+                 ;; ChooseConstraintName in indexcmds.c.
+                 idx-name (cond primary? (str tname "_pkey")
+                                unique?  (str tname "_" (:name col) "_key")
+                                :else    (str tname "_" (:name col) "_idx"))]]
+       {:table tname
+        :column (:name col)
+        :attnum attnum
+        :relation-oid tbl-oid
+        ;; Deterministic from (table, column): it only has to be unique
+        ;; within the catalog, not to match PostgreSQL's counter.
+        :oid (bit-or 0x40000000
+                     (bit-xor tbl-oid (Math/abs (.hashCode ^String (:name col)))))
+        :name idx-name
+        :primary? primary?
+        :unique? unique?
+        :indexdef (str "CREATE " (when unique? "UNIQUE ") "INDEX " idx-name
+                       " ON public." tname " USING btree (" (:name col) ")")}))))
 
 (defn- attribute-storage [oid]
   (cond
@@ -1339,7 +1393,20 @@
                  :pg_class/relkind "i"
                  :pg_class/reltype 0
                  (pgs/row-marker-attr "pg_class") true})
-              (catalog-objects/objects-by-kind cte-db :index))))))
+              (catalog-objects/objects-by-kind cte-db :index))
+        ;; The IMPLICIT indexes -- a PRIMARY KEY's and a UNIQUE column's --
+        ;; are relations in PostgreSQL too, and pgjdbc's getPrimaryKeys
+        ;; joins pg_class a second time to read the index's name out of
+        ;; them. Same descriptors pg_index and pg_indexes use, so the oid
+        ;; it joins on and the name it reports cannot drift apart.
+        (mapv (fn [{:keys [oid name]}]
+                {:pg_class/oid oid
+                 :pg_class/relname name
+                 :pg_class/relnamespace 2200
+                 :pg_class/relkind "i"
+                 :pg_class/reltype 0
+                 (pgs/row-marker-attr "pg_class") true})
+              (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db)))))))
     "pg_tables"
     (mapv (fn [t]
             {:pg_tables/schemaname "public"
@@ -1527,23 +1594,14 @@
              (pgs/row-marker-attr "information_schema_sequences") true})
           (sequence-entities cte-db))
     "pg_indexes"
-    (let [tables (pgs/derive-virtual-tables user-schema (pgs/schema-hints cte-db))
-          native
-          (for [[tname {:keys [columns]}] (sort-by key tables)
-                col columns
-                :when (or (:unique col)
-                          (and (:indexed? col) (not (:internal-index? col))))
-                :let [unique? (some? (:unique col))
-                      idxname (str tname "_" (:name col) (if unique? "_key" "_idx"))]]
+    (let [native
+          (for [{:keys [table name indexdef]}
+                (native-index-descriptors cte-db user-schema (pgs/schema-hints cte-db))]
             {:pg_indexes/schemaname "public"
-             :pg_indexes/tablename tname
-             :pg_indexes/indexname idxname
+             :pg_indexes/tablename table
+             :pg_indexes/indexname name
              :pg_indexes/tablespace "pg_default"
-             :pg_indexes/indexdef (str "CREATE "
-                                       (when unique? "UNIQUE ")
-                                       "INDEX " idxname
-                                       " ON public." tname
-                                       " (" (:name col) ")")
+             :pg_indexes/indexdef indexdef
              (pgs/row-marker-attr "pg_indexes") true})
           explicit
           (for [{:keys [table name indexdef]} (explicit-index-descriptors cte-db)]
@@ -1561,42 +1619,20 @@
     ;; position(s); for single-col PK/UNIQUE that's just [attnum].
     "pg_index"
     (let [hints (pgs/schema-hints cte-db)
-          tables (pgs/derive-virtual-tables user-schema hints)
           native
-          (for [[tname {:keys [columns]}] (sort-by key tables)
-                [idx col] (map-indexed vector columns)
-                :when (:unique col)
-                :let [tbl-oid (or (pgs/table-oid cte-db tname)
-                                  (Math/abs (.hashCode ^String tname)))
-                   ;; Synthesize an index oid deterministic from
-                   ;; (tbl-oid, attname). Doesn't need to match PG's
-                   ;; counter — just unique within pg_index.
-                      idx-oid (bit-or 0x40000000 (bit-xor tbl-oid
-                                                          (Math/abs (.hashCode
-                                                                     ^String (:name col)))))
-                      primary? (= :db.unique/identity (:unique col))
-                      attnum (long (or (pgs/column-attnum
-                                        user-schema tname (:name col) hints)
-                                       (inc idx)))
-                      idx-name (str tname "_" (:name col)
-                                    (if primary? "_pkey" "_key"))
-                   ;; pg_get_indexdef format: "CREATE [UNIQUE] INDEX
-                   ;; <name> ON <schema>.<table> USING btree (<col>)".
-                   ;; Always UNIQUE here since we only synthesize rows
-                   ;; for unique columns; btree is PG's default access
-                   ;; method.
-                      idxdef (str "CREATE UNIQUE INDEX " idx-name
-                                  " ON public." tname
-                                  " USING btree (" (:name col) ")")]]
-            {:pg_index/indrelid (long tbl-oid)
-             :pg_index/indexrelid (long idx-oid)
+          (for [{:keys [relation-oid oid attnum primary? unique? indexdef]}
+                (native-index-descriptors cte-db user-schema hints)]
+            {:pg_index/indrelid relation-oid
+             :pg_index/indexrelid oid
              :pg_index/indkey (str attnum)
+             :pg_index/indnatts 1
+             :pg_index/indnkeyatts 1
              :pg_index/indisprimary primary?
-             :pg_index/indisunique true
+             :pg_index/indisunique unique?
              :pg_index/indisvalid true
              :pg_index/indpred ""
              :pg_index/indexprs ""
-             :pg_index/indexdef idxdef
+             :pg_index/indexdef indexdef
              (pgs/row-marker-attr "pg_index") true})
           explicit
           (for [{:keys [oid relation-oid keys unique? valid? indexdef]}
@@ -1604,6 +1640,8 @@
             {:pg_index/indrelid relation-oid
              :pg_index/indexrelid oid
              :pg_index/indkey (str/join " " (map :attnum keys))
+             :pg_index/indnatts (long (count keys))
+             :pg_index/indnkeyatts (long (count keys))
              :pg_index/indisprimary false
              :pg_index/indisunique unique?
              :pg_index/indisvalid valid?
@@ -1773,8 +1811,12 @@
                                  (Math/abs (.hashCode ^String tname)))
                     primary? (= :db.unique/identity (:unique col))
                     contype  (if primary? "p" "u")
-                    cname    (str tname "_" (:name col)
-                                  (if primary? "_pkey" "_key"))
+                    ;; Same naming as the index that backs it: a primary
+                    ;; key is `<table>_pkey`, a unique constraint
+                    ;; `<table>_<column>_key`.
+                    cname    (if primary?
+                               (str tname "_pkey")
+                               (str tname "_" (:name col) "_key"))
                     condef   (str (if primary? "PRIMARY KEY (" "UNIQUE (")
                                   (:name col) ")")
                     attnum   (attnum-for tname (:name col))]]
@@ -2088,16 +2130,12 @@
    callers that have one (parse-sql) can avoid classifying twice per
    statement.
 
-   Two-stage routing: kinds from the classifier's whitelist go
-   straight through; everything else is a candidate SELECT body that
-   shape/catalog-probe inspects structurally (see shape.clj for the
-   probe catalogue)."
+   Only the classifier's whitelist routes now. Everything else is
+   ordinary SQL: the last structural PROBE -- pgjdbc's getPrimaryKeys --
+   is gone, because the catalog answers that query itself."
   [^String sql cls-info]
   (let [kind (:kind cls-info)]
-    (cond
-      (contains? classify-system-kinds kind) kind
-      (= :generic-sql kind) (shape/catalog-probe sql)
-      :else nil)))
+    (when (contains? classify-system-kinds kind) kind)))
 
 (defn system-query?
   "Check if a SQL string is a system/catalog query and return the
