@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The session functions work in an expression
+
+`pg_backend_pid()` and `txid_current()` were answerable only as a **whole statement** — `classify` matched the sole projection and a handler answered it — so `SELECT pg_backend_pid(), 1` and `WHERE pid = pg_backend_pid()` raised 42883 on a server where `SELECT pg_backend_pid()` works. The same shape the value functions had before they were translated.
+
+Both now translate like any other call and read the session-state atom, which is what a Datalog function running off the connection's thread can still reach: the session carries its backend pid, and a thunk for the transaction id so a prepared statement re-executed later reports the transaction it *runs* in rather than the one it was planned in. The plan is session-dependent, so it never serves another session.
+
+`pg_sleep`, `pg_notify` and the advisory locks stay whole-statement handlers: they need the connection itself at execution, not a value read from it. (Plan item 0.6.)
+
 ### A window column keeps its place in a derived table
 
 `SELECT * FROM (SELECT a, row_number() OVER (…) AS rn, b FROM t) x` answered the columns **a, b, rn** — the window value last, shifting every column after it. The window executor appends its values to each row, and the derived-table path read them back in that order; each spec carries the position it had in the SELECT list, and the top-level path has always restored them by it.
