@@ -5608,8 +5608,26 @@
                                       (and (vector? clause) (= 3 (count clause))
                                            (= right-evar (first clause))
                                            (keyword? (second clause))))
+                      ;; ... and the get-else form a nullable column read
+                      ;; takes: `[(get-else $ ?fu_eid :fu/v :__null__) ?v]`.
+                      ;; Only data patterns were recognised, so a column
+                      ;; read by a WHERE over the nullable side stayed
+                      ;; OUTSIDE the or-join, reading the right entity var
+                      ;; that the unmatched branch grounds to `:__null__` --
+                      ;; `Bad format for entity-id in pattern`, as XX000,
+                      ;; for `LEFT JOIN fu ON (ft.id = fu.id) WHERE fu.v IS
+                      ;; NOT NULL`. The READ belongs inside the join; the
+                      ;; predicate stays outside, where it filters the
+                      ;; null-extended rows as PostgreSQL does.
+                      right-get-else? (fn [clause]
+                                        (and (vector? clause) (= 2 (count clause))
+                                             (seq? (first clause))
+                                             (= 'get-else (first (first clause)))
+                                             (= right-evar (nth (vec (first clause)) 2 nil))))
+                      right-side? (fn [c] (or (right-clause? c) (right-get-else? c)))
                       right-clauses (vec (filter right-clause? all-clauses))
-                      left-clauses (vec (remove right-clause? all-clauses))
+                      right-reads (vec (filter right-get-else? all-clauses))
+                      left-clauses (vec (remove right-side? all-clauses))
                       ;; Also remove any right-side marker/get-else from left clauses
                       right-table (get (:table-aliases ctx) right-alias right-alias)
                       right-marker (pgs/row-marker-attr right-table)
@@ -5625,9 +5643,11 @@
                       right-non-key (vec (remove #(or (key-attr? (second %))
                                                       (= right-marker (second %)))
                                                  right-clauses))
-                      ;; Right-side value variables (from non-key patterns)
+                      ;; Right-side value variables (from non-key patterns
+                      ;; and from the column reads that moved inside)
                       right-val-vars (vec (distinct
-                                           (keep (fn [[_ _ v]] v) right-non-key)))
+                                           (concat (keep (fn [[_ _ v]] v) right-non-key)
+                                                   (keep second right-reads))))
                       ;; The right-side key vars a SELECT asked for, by attr
                       key-var-by-attr (into {} (map (fn [[_ a v]] [a v])) right-key-clauses)
                       left-key? (set left-key-vars)
@@ -5641,9 +5661,11 @@
                       matched-keys (mapv (fn [{:keys [left-key-var right-key-attr]}]
                                            [right-evar right-key-attr left-key-var])
                                          value-keys)
-                      matched-non-key (mapv (fn [[_e a v]]
-                                              [(list 'get-else '$ right-evar a :__null__) v])
-                                            right-non-key)
+                      matched-non-key (into (mapv (fn [[_e a v]]
+                                                    [(list 'get-else '$ right-evar a :__null__) v])
+                                                  right-non-key)
+                                            ;; already in get-else form
+                                            right-reads)
                       ;; If a right key var was in SELECT and differs from its
                       ;; left key, bind it
                       matched-key-binds (vec (keep (fn [{:keys [left-key-var right-key-attr]}]
