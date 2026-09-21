@@ -73,11 +73,12 @@
   {;; --- catalog / object resolution -----------------------------------
    :undefined-column
    {:sqlstate "42703"
-    :format (fn [{:keys [column table]}]
-              (when column
-                (if table
-                  (str "column \"" column "\" of relation \"" table "\" does not exist")
-                  (str "column \"" column "\" does not exist"))))}
+    :format (fn [{:keys [column table message]}]
+              (or message
+                  (when column
+                    (if table
+                      (str "column \"" column "\" of relation \"" table "\" does not exist")
+                      (str "column \"" column "\" does not exist")))))}
 
    :ambiguous-column
    {:sqlstate "42702"

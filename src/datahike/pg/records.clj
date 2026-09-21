@@ -27,6 +27,36 @@
    (->PgRecord type-oid
                (mapv (fn [v] {:oid (oid-fn v) :value v}) values))))
 
+(defn named-record
+  "A PgRecord whose fields carry NAMES, for the composite values SQL can
+   select a field out of: `(information_schema._pg_expandarray(a)).n`.
+   An anonymous ROW has no names -- PostgreSQL calls those fields f1, f2,
+   … and `field-value` falls back to that."
+  [names+oids+values]
+  (->PgRecord 2249
+              (mapv (fn [[n oid v]] {:name n :oid oid :value v})
+                    names+oids+values)))
+
+(defn field-value
+  "The value of the field `fname` of a record: by name when the record
+   has names, else by PostgreSQL's positional `fN` spelling. Returns
+   ::absent when the record has no such field, which the caller reports
+   as 42703."
+  [^PgRecord r ^String fname]
+  (let [fields (:fields r)
+        lower (str/lower-case fname)
+        by-name (first (keep-indexed (fn [i f]
+                                       (when (and (:name f)
+                                                  (= lower (str/lower-case (:name f))))
+                                         i))
+                                     fields))
+        idx (or by-name
+                (when-let [[_ n] (re-matches #"(?i)f(\d+)" lower)]
+                  (dec (Long/parseLong n))))]
+    (if (and idx (< -1 idx (count fields)))
+      (:value (nth fields idx))
+      ::absent)))
+
 (defn with-layout
   "Retag an anonymous record with a named composite type and its declared
    field OIDs. Composite casts need this metadata after expression lowering:

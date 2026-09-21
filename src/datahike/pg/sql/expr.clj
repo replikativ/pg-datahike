@@ -6517,6 +6517,41 @@
                 (uncorrelated-scalar-var! ctx inner)))
             :__null__))))
 
+    ;; `(expr).field` -- a field of a composite value. PostgreSQL names
+    ;; an anonymous ROW's fields f1, f2, …; a record that carries names
+    ;; (what a record-returning function builds) is selected by those.
+    ;; Nothing translated this at all, so every composite field selection
+    ;; was `RowGetExpression is not supported`.
+    (instance? net.sf.jsqlparser.expression.RowGetExpression expr)
+    (let [^net.sf.jsqlparser.expression.RowGetExpression e expr
+          fname (.getColumnName e)
+          inner (translate-expr ctx (.getExpression e))
+          pick (fn [v]
+                 (cond
+                   (or (nil? v) (= :__null__ v)) :__null__
+                   (pg-rec/record? v)
+                   (let [fv (pg-rec/field-value v fname)]
+                     (if (= ::pg-rec/absent fv)
+                       (throw (errors/pg-error
+                               :undefined-column
+                               {:message (str "could not identify column \"" fname
+                                              "\" in record data type")}))
+                       (if (nil? fv) :__null__ fv)))
+                   :else
+                   (throw (errors/pg-error
+                           :undefined-column
+                           {:message (str "could not identify column \"" fname
+                                          "\" in record data type")}))))]
+      (if (or (symbol? inner) (seq? inner))
+        (let [fn-param (symbol (str "?rowget" (swap! (:var-counter ctx) inc)))
+              result-var (ctx/propagate-nullability! ctx (ctx/fresh-var! ctx) inner)]
+          (swap! (:in-params ctx) conj fn-param)
+          (swap! (:in-args ctx) conj pick)
+          (swap! (:where-clauses ctx) conj
+                 [(list fn-param (ctx/materialize-arg! ctx inner)) result-var])
+          result-var)
+        (pick inner)))
+
     :else
     (throw (ex-info "unsupported SQL expression"
                     {:error :feature-not-supported
