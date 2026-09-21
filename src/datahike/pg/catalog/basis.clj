@@ -324,6 +324,104 @@
            (tracking/valid? (::token (meta basis)) db ::catalog tracking-selector))
       (= basis (capture db (:limits (meta basis))))))
 
+(defn- basis-relations
+  "The relation names a capture knows about: an attribute entity is named
+   by its `:db/ident`'s namespace, a catalog object by its
+   `:datahike.pg.object/name`."
+  [basis]
+  (persistent!
+   (reduce (fn [out [attr _eid value _added]]
+             (cond
+               (and (= :db/ident attr) (keyword? value) (namespace value))
+               (conj! out (namespace value))
+
+               (and (= :datahike.pg.object/name attr) (string? value))
+               (conj! out value)
+
+               :else out))
+           (transient #{})
+           (:catalog basis))))
+
+(defn- basis-entities [basis]
+  (persistent! (reduce (fn [out [_ eid _ _]] (conj! out eid)) (transient #{})
+                       (:catalog basis))))
+
+(defn- frozen-map
+  "The map inside a frozen schema value, which `freeze-value` tags as
+   `[:map {…}]`."
+  [v]
+  (when (and (vector? v) (= :map (first v)) (map? (second v)))
+    (second v)))
+
+(defn- schema-entry-relation
+  "The relation a frozen-schema entry belongs to. The map is keyed both by
+   attribute IDENT and by the numeric attribute id whose value is that
+   ident, so a new attribute shows up under both."
+  [k v]
+  (cond
+    (and (keyword? k) (namespace k)) (namespace k)
+    (and (number? k) (keyword? v) (namespace v)) (namespace v)
+    :else nil))
+
+(defn only-new-relations?
+  "Whether `current` differs from `expected` ONLY by relations that did not
+   exist when `expected` was captured.
+
+   The guard this serves protects a statement lowered against `expected`
+   from being written against a catalog that changed under it. Exact
+   equality answers that conservatively but too bluntly: another session
+   running `CREATE TABLE other` invalidated every open transaction, even
+   though nothing those transactions could have read had changed. So the
+   difference is examined instead, and admitted only in the one shape
+   that cannot affect an already-lowered statement:
+
+     - nothing the expected capture held may be MISSING or CHANGED, in
+       the frozen schema or in the catalog rows; and
+     - every added row must belong to an entity the expected capture did
+       not have, naming relations it did not know.
+
+   `ALTER TABLE … ADD COLUMN` therefore does NOT qualify -- it adds an
+   attribute in an EXISTING relation's namespace, which a lowered
+   statement may have to see (a default, a constraint) -- and neither
+   does a DROP, a RENAME or a type change, which modify or remove what
+   the capture held."
+  [expected current]
+  (boolean
+   (and (= (:attribute-refs? expected) (:attribute-refs? current))
+        (= (:schema-flexibility expected) (:schema-flexibility current))
+        (when-let [e-schema (frozen-map (:schema expected))]
+          (when-let [c-schema (frozen-map (:schema current))]
+            (let [e-rows (set (:catalog expected))
+                  added (remove e-rows (:catalog current))
+                  added-rels (basis-relations (assoc current :catalog added))
+                  e-rels (basis-relations expected)
+                  e-eids (basis-entities expected)]
+              (and
+               ;; every attribute the statement was lowered against is
+               ;; still there, unchanged
+               (every? (fn [[k v]] (= v (get c-schema k ::missing))) e-schema)
+               ;; no captured catalog row lost or rewritten
+               (= (count e-rows) (count (filter e-rows (:catalog current))))
+               ;; the additions are entirely new entities
+               (every? (fn [[_ eid _ _]] (not (contains? e-eids eid))) added)
+               ;; naming only relations the capture did not know
+               (not-any? e-rels added-rels)
+               ;; and every new schema entry belongs to one of them
+               (every? (fn [[k v]]
+                         (or (contains? e-schema k)
+                             (contains? added-rels (schema-entry-relation k v))))
+                       c-schema))))))))
+
+(defn compatible?
+  "`matches?`, widened by `only-new-relations?`: a catalog that merely
+   GAINED relations cannot have changed what an already-lowered statement
+   reads, so it is not a reason to abort that statement's write."
+  [basis db]
+  (when-not (::basis (meta basis))
+    (throw (ex-info "Expected a captured catalog basis" {:error :catalog-basis-value})))
+  (or (matches? basis db)
+      (only-new-relations? basis (capture db (:limits (meta basis))))))
+
 (defn without-replayed-enum-markers
   "Normalize an expected replay basis for exact [entity label] marker adds
    intentionally omitted from the preceding transaction buffer. Never apply
