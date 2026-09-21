@@ -53,6 +53,7 @@
             [datahike.pg.constraints.unique :as unique-constraints]
             [datahike.pg.window :as window]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.records :as pg-rec]
             [datahike.pg.schema :as pgs]
             [datahike.pg.keywords :as pg-kw]
             [datahike.pg.sql.cast :as sql-cast]
@@ -2756,21 +2757,43 @@
         ;; long → would report text/int8). asyncpg's typeinfo decodes typtype as
         ;; "char" → bytes b'c'; if we send it as text it sees the str 'c' and
         ;; `kind == b'c'` fails, so it never builds the composite codec.
+        ;; Per-column record sample. A composite value -- `ROW(a,b)`, a
+        ;; whole-row reference, `_pg_expandarray`'s (x,n) -- is
+        ;; materialised the way an array column is: canonical PG text
+        ;; plus the layout the text cannot carry (field names and OIDs),
+        ;; so it RENDERS right and a field can still be read out of it.
+        ;; Without this the PgRecord was Java-`str`'d to
+        ;; "…PgRecord@hash" -- the outer half of pgjdbc's primary-key
+        ;; query, `(result.keys).x`, reads a record out of a derived
+        ;; table.
+         col-record (mapv (fn [i] (first (filter pg-rec/record? (sample-rows i))))
+                          (range (count sub-aliases)))
          col-pg-type (mapv (fn [i]
-                             (if-let [ae (nth col-array-elem i)]
-                               (str "_" (name ae))
-                               (get types/oid-preserving-pg-name (nth sub-oids i nil))))
+                             (cond
+                               (nth col-array-elem i) (str "_" (name (nth col-array-elem i)))
+                               (nth col-record i)     "record"
+                               :else (get types/oid-preserving-pg-name (nth sub-oids i nil))))
                            (range (count sub-aliases)))
         ;; Per-column inferred type + coercion fn, computed once.
-         col-types (mapv (fn [i] (if (nth col-array-elem i) :db.type/string (col-vtype i)))
+         col-types (mapv (fn [i] (if (or (nth col-array-elem i) (nth col-record i))
+                                   :db.type/string
+                                   (col-vtype i)))
                          (range (count sub-aliases)))
          col-coercions (mapv (fn [i]
-                               (if (nth col-array-elem i)
+                               (cond
+                                 (nth col-array-elem i)
                                  (fn [v] (cond
                                            (pg-arr/array? v) (pg-arr/to-pg-text v)
                                            (string? v)       v
                                            :else             (str v)))
-                                 (col-coerce (nth col-types i))))
+
+                                 (nth col-record i)
+                                 (fn [v] (cond
+                                           (pg-rec/record? v) (pg-rec/to-pg-text v)
+                                           (string? v)        v
+                                           :else              (str v)))
+
+                                 :else (col-coerce (nth col-types i))))
                              (range (count sub-aliases)))
          schema-tx (conj
                     (vec (for [[i a] (map-indexed vector sub-aliases)]
@@ -2781,7 +2804,12 @@
                             ;; "_T" or OID-preserving scalar char/oid).
                              (nth col-pg-type i)   (assoc :pg/type (nth col-pg-type i))
                             ;; :pg/array-elem drives canonical-text array decode.
-                             (nth col-array-elem i) (assoc :pg/array-elem (nth col-array-elem i)))))
+                             (nth col-array-elem i) (assoc :pg/array-elem (nth col-array-elem i))
+                            ;; :pg/record-fields carries what record text
+                            ;; drops: `name:oid` per field.
+                             (nth col-record i)
+                             (assoc :pg/record-fields
+                                    (pg-rec/layout->text (pg-rec/layout (nth col-record i)))))))
                     {:db/ident       row-marker
                      :db/valueType   :db.type/boolean
                      :db/cardinality :db.cardinality/one})
@@ -2801,7 +2829,20 @@
                           (assoc cols row-marker true))))
          spec-db2 (if (seq data-tx) (with-fn spec-db data-tx) spec-db)]
      {:db      spec-db2
-      :schema  (:schema spec-db2)
+      ;; `:pg/record-fields` is transacted onto the attribute entity, and
+      ;; `(:schema db)` does not surface custom attrs (the same blind spot
+      ;; `:pg/type` and `:pg/not-null` go through `schema-hints` for). The
+      ;; translator reads the layout straight off this map to rebuild a
+      ;; record out of its text, so fold it in here rather than making
+      ;; every reader run a Datalog query for it.
+      :schema  (reduce (fn [sch i]
+                         (if-let [r (nth col-record i)]
+                           (assoc-in sch [(keyword target-name (nth sub-aliases i))
+                                          :pg/record-fields]
+                                     (pg-rec/layout->text (pg-rec/layout r)))
+                           sch))
+                       (:schema spec-db2)
+                       (range (count sub-aliases)))
       :name    target-name
       :alias   (or alias target-name)
       :aliases sub-aliases})))

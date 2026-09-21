@@ -4,6 +4,21 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A record survives a materialised relation
+
+A derived table, a CTE and a set operation are **materialised**: their rows are run and stored in a speculative db, whose columns hold Datahike scalars. A composite value went in as a Java object and came back out as `datahike.pg.records.PgRecord@6f2b958e` — rendered, compared and read as that string — and `(s.r).f1` raised 42703, *could not identify column "f1" in record data type*:
+
+```sql
+SELECT r FROM (SELECT row(7,8) AS r) s          -- datahike.pg.records.PgRecord@…
+SELECT (s.r).f1 FROM (SELECT row(7,8) AS r) s   -- 42703
+```
+
+It is now stored the way an array column already was: canonical PG text (`(7,8)`, quoting and NULL cells included), plus the field names and OIDs that text drops — `:pg/record-fields`, the record twin of `:pg/array-elem`. So it renders as PostgreSQL renders it, and a field read back out of it keeps its type: `(s.r).f2 + 1` is arithmetic, not a cast error, and a whole-row reference through a derived table still answers `(s.r).s` by name.
+
+This is the outer half of pgjdbc's primary-key query — `(result.keys).x` out of a derived table — one of the three things 0.7's last shape probe needs.
+
+Found while doing it, recorded and not fixed here: **a derived table's column-alias list is ignored** — `SELECT a FROM (SELECT 1 AS x) AS s(a)` is 42703 where PostgreSQL answers 1. Only the `FROM (VALUES …) AS v(a,b)` path passes those aliases through.
+
 ### An outer join whose ON clause has no equality
 
 `LEFT JOIN lb b ON true`, `ON (b.y > a.y)`, `ON (b.x <> a.x)`, `ON (b.v = 'p')`, `ON false`, `ON (b.v IS NULL)` — every ON clause that does not relate the two rows by equality was refused with 0A000, `non-equality outer join conditions are not supported`. PostgreSQL answers all of them: it considers every right row for every left row and lets the conditions filter. Most of the ON-clause space looks like that, so the refusal turned away a large part of the language.

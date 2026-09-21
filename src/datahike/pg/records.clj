@@ -115,3 +115,105 @@
           (int-array (map (comp types/oid->wire-int :oid) (:fields r))))
   (doseq [f (:fields r) :when (record? (:value f))]
     (register-layouts! reg-fn (:value f))))
+
+;; ── Canonical text back to a record ─────────────────────────────────────
+;;
+;; A record that goes through a MATERIALISED relation -- a derived table,
+;; a CTE, a set operation -- is stored as its canonical text, the way an
+;; array column is (`:pg/array-elem`), because a speculative db's columns
+;; hold Datahike scalars. Rendering it is then right by construction;
+;; reading a FIELD out of it again needs the text parsed, and the field
+;; names and OIDs the text does not carry, which the column's
+;; `:pg/record-fields` layout records.
+
+(defn from-pg-text
+  "The raw field cells of PG's canonical record text `(a,b,\"c,d\",)`, in
+   order. A quoted cell is unescaped (`\"\"` → `\"`, `\\x` → `x`); an
+   UNQUOTED empty cell is nil, which is how `record_in` reads SQL NULL;
+   a quoted empty cell is the empty string. Returns nil when `s` is not
+   record text, so a caller can fall through to its other cases."
+  [^String s]
+  (let [s (str/trim (or s ""))]
+    (when (and (str/starts-with? s "(") (str/ends-with? s ")") (>= (count s) 2))
+      (let [body (subs s 1 (dec (count s)))
+            n (count body)
+            ;; `quoted?` is the cell's, `in?` the position's: `\"\"` is one
+            ;; escaped quote INSIDE a quoted cell and an empty quoted cell
+            ;; when it is the whole cell, and only the state tells them
+            ;; apart. An empty cell that was never quoted is NULL.
+            cell-value (fn [^StringBuilder sb quoted?]
+                         (when (or quoted? (pos? (.length sb))) (str sb)))]
+        (if (zero? n)
+          []
+          (loop [i 0, sb (StringBuilder.), quoted? false, in? false, out []]
+            (if (= i n)
+              (conj out (cell-value sb quoted?))
+              (let [c (.charAt body i)]
+                (cond
+                  in?
+                  (cond
+                    (and (= c \") (< (inc i) n) (= \" (.charAt body (inc i))))
+                    (recur (+ i 2) (.append sb \") quoted? true out)
+
+                    (= c \")
+                    (recur (inc i) sb quoted? false out)
+
+                    (and (= c \\) (< (inc i) n))
+                    (recur (+ i 2) (.append sb (.charAt body (inc i))) quoted? true out)
+
+                    :else
+                    (recur (inc i) (.append sb c) quoted? true out))
+
+                  (= c \")
+                  (recur (inc i) sb true true out)
+
+                  (= c \,)
+                  (recur (inc i) (StringBuilder.) false false
+                         (conj out (cell-value sb quoted?)))
+
+                  (and (= c \\) (< (inc i) n))
+                  (recur (+ i 2) (.append sb (.charAt body (inc i))) quoted? false out)
+
+                  :else
+                  (recur (inc i) (.append sb c) quoted? false out))))))))))
+
+(defn layout
+  "A record's [name oid] pairs -- what canonical text loses."
+  [^PgRecord r]
+  (mapv (fn [f] [(:name f) (:oid f)]) (:fields r)))
+
+(defn layout->text
+  "A layout as one string, for a schema entity: `name:oid` per field,
+   comma separated, the name left empty for an anonymous ROW's field."
+  [lay]
+  (str/join "," (map (fn [[n oid]] (str (or n "") ":" (or oid 25))) lay)))
+
+(defn text->layout
+  "Inverse of `layout->text`."
+  [^String s]
+  (when (seq s)
+    (mapv (fn [part]
+            (let [i (str/last-index-of part ":")
+                  nm (subs part 0 i)
+                  oid (subs part (inc i))]
+              [(when (seq nm) nm) (parse-long oid)]))
+          (str/split s #","))))
+
+(defn text->record
+  "Rebuild a PgRecord from canonical text. Each field is read with its
+   OID's input function when `lay` names one and the type has one;
+   otherwise the cell stays text -- a value that renders identically and
+   only loses the field's declared type. nil when `s` is not record text."
+  [^String s lay parse-fn]
+  (when-let [cells (from-pg-text s)]
+    (->PgRecord 2249
+                (vec (map-indexed
+                      (fn [i cell]
+                        (let [[nm oid] (nth lay i [nil types/oid-text])
+                              oid (or oid types/oid-text)
+                              v (when (some? cell)
+                                  (or (try (parse-fn oid cell) (catch Exception _ nil))
+                                      cell))]
+                          (cond-> {:oid oid :value v}
+                            nm (assoc :name nm))))
+                      cells)))))
