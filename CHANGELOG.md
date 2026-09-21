@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### INSERT then UPDATE in one transaction survives a concurrent commit
+
+A transaction that inserts a row and then updates it — the shape every ORM writes — aborted with 40001 the moment **any** other session committed, in any table, on any row. When another commit lands while a transaction is open, the buffered statements are replayed onto the new base; that replay refused outright whenever the buffer held an insert, because replaying gives the inserted rows fresh speculative entity ids and the map the later statements resolve through still named the old ones. It is rebuilt from the replay report instead.
+
+Measured on the reproduction: four sessions × 25 such transactions, each on its **own** table, aborted 52 of 100 times before and 0 of 100 after, with every row inserted and updated. A read-modify-write (`UPDATE … SET v = v + 1`) under the same concurrency loses nothing: the replay re-evaluates against the fresh base, which is what the rebase is for. A genuine overlap — another session retracting the row this one updates — still aborts with 40001.
+
 ### ANY and ALL have one implementation
 
 `x <op> ANY(arr)` / `ALL(arr)` had **four** runtimes: the WHERE path built a two-valued predicate out of `clojure.core`'s operators, the value path carried two copies that recognised only `=` and `<>`, and the equality WHERE branch had a fourth of its own over `pg-arr/member?`. Each had its own idea of how to read an int2vector — which is why one array fix had to be made in three places — and they disagreed with PostgreSQL:
