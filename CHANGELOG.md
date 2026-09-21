@@ -4,6 +4,17 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A field of a composite value
+
+`(expr).field` was not translated at all — every spelling raised `expression of type RowGetExpression is not supported`, including the whole-row form `(t).col` and the `(f(x)).n` a record-returning function is read with:
+
+```
+SELECT (row(1,2)).f1      →  1        SELECT (rc).a FROM rc   →  5
+SELECT (row(1,2)).f3      →  42703 could not identify column "f3" in record data type
+```
+
+An anonymous ROW's fields are named `f1`, `f2`, … as PostgreSQL names them; a record that carries field names is selected by those, which is what `information_schema._pg_expandarray(…)` will need. A record still does not survive being projected through a derived table (it renders as its Java object), so `(result.KEYS).x` — the outer half of pgjdbc's primary-key query — is not reachable yet; that is recorded on plan item 0.7.
+
 ### A parameter inside a derived table or a CTE
 
 ```
