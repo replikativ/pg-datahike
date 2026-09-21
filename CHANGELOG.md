@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The differential fuzzer joins
+
+A new `join` surface generates a join type (`JOIN`, `LEFT`, `RIGHT`, `FULL`), an ON clause of one to three conjuncts around an equality — another equality, a comparison between the relations, a test over one side only — and a projection that may read the nullable side, then runs each sample over **both** wire protocols and compares the rows with a real PostgreSQL 17. `bb fuzz join [n] [seed]`.
+
+Its join classes were one single-condition equi-join over `JOIN`/`LEFT JOIN`, which is why a LEFT JOIN that answered rows matching neither side of a two-condition ON lived here for as long as it did. On its first run the new surface found that FULL JOIN loses every right-only row, and that a condition over the nullable side leaks a datalog error as XX000 — both recorded in the plan. INNER joins are clean.
+
+It is not in the `bb fuzz all` gate yet: it reports 47 known disagreements, and listing them as expected divergences would be a manifest larger than the manifest. It joins the gate when those are fixed (plan item 0.11).
+
 ### An outer join applies every condition of its ON clause
 
 The lowering kept one. Each condition `reset!` a single `ref-info` map, so `LEFT JOIN b ON (b.x = a.x AND b.y = a.y)` joined on `y` alone — and **answered rows that satisfy neither pair**, with no error. Two more holes sat in the same construction:
