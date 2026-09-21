@@ -497,8 +497,15 @@
    key identifies a distinct sample (the SQL, plus parameters when bound)."
   [surface ^java.util.Random r]
   (case surface
+    ;; Over BOTH protocols. The simple-query path rewrites numeric
+    ;; literals into $N before parsing (template/parameterize-numbers) so
+    ;; that one plan serves a whole statement family; the extended path
+    ;; never re-templates. Running each sample both ways is the
+    ;; templated-vs-untemplated identity check (plan item 0.8) and costs
+    ;; one extra round trip per sample.
     :select   (let [[cls sql] (gen-select r)]
-                {:class cls :key sql :run #(q % sql)})
+                {:class cls :key sql
+                 :run (fn [c] (mapv unordered [(q c sql) (prep-q c sql [])]))})
     :prepared (let [[cls sql params] (gen-prepared r)]
                 {:class cls :key (str sql " " (pr-str params))
                  :run #(prep-q % sql params)})
