@@ -4,6 +4,19 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A LIKE pattern that is not a literal, and ESCAPE
+
+In value position the pattern was compiled to a regex at **translate** time, whatever it was. A column, a parameter or NULL arrives there as a logic variable or the null sentinel, and `(str …)` of those compiles to a regex that matches their printed form and nothing else:
+
+```
+SELECT s LIKE p FROM t     false for every row, whatever p held
+SELECT 'a' LIKE NULL       false, where PostgreSQL answers NULL
+```
+
+The WHERE path has always deferred a non-literal pattern to a per-row matcher — pgjdbc rewrites every pattern literal into a parameter under the extended protocol, so it had to. Value position now does the same, three-valued: NULL on either side is NULL, not false.
+
+**`ESCAPE` escaped the wrong character.** JSqlParser hands the clause over as a `StringValue` whose `toString` keeps the quotes, so taking its first character gave `'` — every `ESCAPE x` escaped the quote rather than `x`. `'a%c' LIKE 'a$%c' ESCAPE '$'` answered false, and the same predicate in WHERE answered no rows. Both paths read it through one helper now.
+
 ### A LEFT JOIN onto a ref target keeps every left row
 
 `SELECT p.name, c.name FROM person p LEFT JOIN company c ON p.company = c.db_id` answered **no rows at all** when `person/company` is a `:db.type/ref` — an INNER join over the same columns was right, so the relation was there.
