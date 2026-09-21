@@ -80,6 +80,16 @@
                       (str "column \"" column "\" of relation \"" table "\" does not exist")
                       (str "column \"" column "\" does not exist")))))}
 
+   ;; `FROM (SELECT …) AS s(a,b)` naming more columns than the relation
+   ;; has. PostgreSQL's addRangeTableEntryForSubquery.
+   :invalid-column-reference
+   {:sqlstate "42P10"
+    :format (fn [{:keys [table available specified message]}]
+              (or message
+                  (when table
+                    (str "table \"" table "\" has " available
+                         " columns available but " specified " columns specified"))))}
+
    :ambiguous-column
    {:sqlstate "42702"
     :format (fn [{:keys [column]}]
