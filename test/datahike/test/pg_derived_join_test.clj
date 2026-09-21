@@ -89,17 +89,21 @@
          (rows (str "SELECT * FROM ((SELECT 1 AS x)), "
                     "((SELECT * FROM ((SELECT 2 AS y))))")))))
 
-(deftest unsupported-derived-and-outer-join-shapes-fail-before-datalog
+(deftest unsupported-derived-shapes-fail-before-datalog
   (testing "duplicate projected names do not leak a Datahike schema update"
     (let [r (run "SELECT count(*) FROM (SELECT 1 AS x, 2 AS x) s")]
       (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult r)))
-      (is (re-find #"duplicate columns" (.-error ^PgWireServer$QueryResult r)))))
-  (testing "a predicate-only outer join does not construct nil rule variables"
-    (seed!)
-    (let [r (run "SELECT t.id, c.v FROM t LEFT JOIN c ON true")]
-      (is (= "0A000" (.-sqlstate ^PgWireServer$QueryResult r)))
-      (is (re-find #"non-equality outer join"
-                   (.-error ^PgWireServer$QueryResult r))))))
+      (is (re-find #"duplicate columns" (.-error ^PgWireServer$QueryResult r))))))
+
+(deftest a-predicate-only-outer-join-is-a-nested-loop
+  ;; This was refused with 0A000 ("non-equality outer join conditions
+  ;; are not supported"). It is now lowered as a nested loop -- see
+  ;; datahike.test.pg-outer-join-on-test for the full shape coverage.
+  (seed!)
+  (is (= [["1" "10"] ["1" "20"] ["2" "10"] ["2" "20"]]
+         (rows "SELECT t.id, c.v FROM t LEFT JOIN c ON true ORDER BY 1,2")))
+  (is (= [["1" nil] ["2" nil]]
+         (rows "SELECT t.id, c.v FROM t LEFT JOIN c ON (c.v > 1000) ORDER BY 1,2"))))
 
 (deftest using-and-natural-joins-are-joins
   ;; `USING (c)` and NATURAL are conditions PostgreSQL synthesises before

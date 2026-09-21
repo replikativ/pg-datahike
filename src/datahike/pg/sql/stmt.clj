@@ -296,6 +296,13 @@
                     {:column c :left-alias owner}))
                 wanted)))))
 
+(defn- clause-vars
+  "The logic variables a Datalog clause mentions, at any depth."
+  [clause]
+  (into #{}
+        (filter (fn [x] (and (symbol? x) (str/starts-with? (name x) "?"))))
+        (tree-seq coll? seq clause)))
+
 (defn translate-join
   "Add join clauses for a SQL JOIN to the context.
    For INNER joins with ref-based ON (a.ref_col = b.db_id), unifies the ref
@@ -747,7 +754,25 @@
             (if (#{:left :right :full} jtype)
               (let [preds (expr/translate-predicate ctx expr)]
                 (swap! ref-info update :matched-only-preds (fnil into [])
-                       (vec preds)))
+                       (vec preds))
+                ;; A conjunct that reads a COLUMN, as opposed to `ON true`
+                ;; / `ON (1=1)` which fold to a constant. PostgreSQL
+                ;; refuses a FULL JOIN whose ON clause has one of these
+                ;; and no equality between the relations (see the
+                ;; refusal in sql.clj), so the distinction has to survive
+                ;; translation.
+                ;;
+                ;; A literal `false` conjunct makes the WHOLE clause
+                ;; constant -- PostgreSQL's constant folding turns
+                ;; `x AND false` into `false` before the join-condition
+                ;; check, and answers it as a cross join that matches
+                ;; nothing. (A conjunct that merely evaluates to false,
+                ;; `1=2`, is not recognised here: we refuse where
+                ;; PostgreSQL answers, which is the safe direction.)
+                (if (= "false" (str/lower-case (str/trim (str expr))))
+                  (swap! ref-info assoc :constant-false-on? true)
+                  (when (some (comp seq clause-vars) preds)
+                    (swap! ref-info assoc :variable-pred? true))))
               ;; INNER-join ON conjunct = top-level conjunct: allow the
               ;; indexable data-pattern fast paths.
               (let [preds (binding [expr/*conjunctive-where* true]
@@ -759,14 +784,23 @@
       ;; `(or-join [nil ...])`. Refuse that still-unsupported shape before
       ;; Datahike's rule parser sees it. Equijoins and the separately
       ;; materialized LATERAL ON TRUE path remain supported.
-      (when (and (#{:left :right :full} jtype)
-                 (contains? info :matched-only-preds)
-                 (not (:value-join? info))
-                 (nil? (:ref-attr info)))
-        (throw (errors/pg-error
-                :feature-not-supported
-                {:message "non-equality outer join conditions are not supported"})))
-      {:name name :alias right-alias :join-type jtype :ref-info info})))
+      ;;
+      ;; An ON clause with no equality BETWEEN the relations is a NESTED
+      ;; LOOP: every right row is considered for every left row, and the
+      ;; conditions filter. PostgreSQL joins that way whenever it has to
+      ;; -- `ON (b.y > a.y)`, `ON (b.v IS NOT NULL)`, `ON true` -- and
+      ;; most of the ON-clause space has no equality in it, so refusing
+      ;; it refused a large part of the language. The lowering is the
+      ;; equi-join's with the row-existence marker in place of the key
+      ;; pattern: it enumerates the right relation rather than seeking
+      ;; into it.
+      (let [info (if (and (#{:left :right :full} jtype)
+                          (not (:value-join? info))
+                          (nil? (:ref-attr info)))
+                   (assoc info :nested-loop? true :right-alias right-alias
+                          :left-evar (ctx/entity-var! ctx (:default-table ctx)))
+                   info)]
+        {:name name :alias right-alias :join-type jtype :ref-info info}))))
 
 (defn select-item-alias
   "The explicit `AS` label of a select item, or nil.
@@ -3065,13 +3099,6 @@
    which loses a right-only row that happens to equal a left row's
    projection, and loses duplicates outright."
   false)
-
-(defn- clause-vars
-  "The logic variables a Datalog clause mentions, at any depth."
-  [clause]
-  (into #{}
-        (filter (fn [x] (and (symbol? x) (str/starts-with? (name x) "?"))))
-        (tree-seq coll? seq clause)))
 
 (defn- clause-bound-vars
   "The logic variables a clause BINDS, as opposed to reads: a data
@@ -5616,7 +5643,87 @@
         _ (when (some #(= :left (:join-type %)) join-infos)
             (doseq [{:keys [join-type ref-info alias]} join-infos
                     :when (and (= :left join-type) ref-info)]
-              (if (:value-join? ref-info)
+              (cond
+                ;; NESTED LOOP: an ON clause with no equality between the
+                ;; relations. Every right row is considered for every
+                ;; left row and the conditions filter -- PostgreSQL's
+                ;; `ON (b.y > a.y)`, `ON (b.v IS NOT NULL)`, `ON true`.
+                ;; The shape is the equi-join's with the ROW MARKER in
+                ;; place of the key pattern: it enumerates the right
+                ;; relation instead of seeking into it.
+                (:nested-loop? ref-info)
+                (let [{:keys [right-alias matched-only-preds left-evar]} ref-info
+                      right-evar (ctx/entity-var! ctx alias)
+                      all-clauses @(:where-clauses ctx)
+                      right-table (get (:table-aliases ctx) right-alias right-alias)
+                      right-marker (pgs/row-marker-attr right-table)
+                      right-side? (fn [c]
+                                    (or (and (vector? c) (= 3 (count c))
+                                             (= right-evar (first c))
+                                             (keyword? (second c)))
+                                        (and (vector? c) (= 2 (count c))
+                                             (seq? (first c))
+                                             (= 'get-else (first (first c)))
+                                             (= right-evar (nth (vec (first c)) 2 nil)))))
+                      right-clauses (vec (filter right-side? all-clauses))
+                      left-clauses (vec (remove right-side? all-clauses))
+                      ;; Read every right column as get-else: a row
+                      ;; missing one is still a row of the relation.
+                      right-reads (mapv (fn [c]
+                                          (if (and (vector? c) (= 3 (count c))
+                                                   (not= right-marker (second c)))
+                                            [(list 'get-else '$ right-evar (second c) :__null__)
+                                             (nth c 2)]
+                                            c))
+                                        (remove #(and (vector? %) (= 3 (count %))
+                                                      (= right-marker (second %)))
+                                                right-clauses))
+                      right-vars (vec (distinct (keep second right-reads)))
+                      ;; The LEFT row's anchor, mentioned so the branch
+                      ;; is evaluated per left row -- which is what a
+                      ;; nested loop is -- and so the negation below has
+                      ;; a head variable that appears inside it.
+                      anchor-bind (when left-evar
+                                    [(list 'identity left-evar) (gensym "?nl-anchor")])
+                      matched-parts (into (cond-> [[right-evar right-marker true]]
+                                            anchor-bind (conj anchor-bind))
+                                          (concat right-reads matched-only-preds))
+                      pred-vars (into #{} (mapcat clause-vars) matched-parts)
+                      bound-outside (into #{} (mapcat clause-bound-vars) left-clauses)
+                      outer-left-vars (vec (distinct
+                                            (filter #(and (bound-outside %)
+                                                          (not= % right-evar)
+                                                          (not (some #{%} right-vars)))
+                                                    pred-vars)))
+                      shared-vars (vec (distinct (concat outer-left-vars
+                                                         (keep identity [left-evar])
+                                                         [right-evar] right-vars)))
+                      matched (apply list 'and matched-parts)
+                      ;; `ON true` and `ON (b.v IS NOT NULL)` read no
+                      ;; LEFT column, so there is no left variable to
+                      ;; negate under -- and a bare `not` cannot be
+                      ;; resolved (nothing in it is bound) while an empty
+                      ;; `not-join` head is not a clause. Negate under
+                      ;; the LEFT row's own anchor: the question "has the
+                      ;; right relation no row satisfying this?" then has
+                      ;; a binding to hang on, and answers the same for
+                      ;; every left row, which is what a condition
+                      ;; independent of the left row means.
+                      neg-head (vec (distinct (concat outer-left-vars
+                                                      (keep identity [left-evar]))))
+                      no-match (list* 'not-join neg-head matched-parts)
+                      unmatched (apply list 'and
+                                       (into [no-match]
+                                             (mapv (fn [v] [(list 'ground :__null__) v])
+                                                   (cons right-evar right-vars))))
+                      oj-clause (list* 'or-join shared-vars matched unmatched nil)]
+                  (swap! (:with-vars ctx) conj right-evar)
+                  (reset! (:where-clauses ctx)
+                          (if *unmatched-rows-only*
+                            (into left-clauses (rest unmatched))
+                            (conj left-clauses oj-clause))))
+
+                (:value-join? ref-info)
                 ;; VALUE-EQUALITY LEFT JOIN: ON t1.a = t2.x
                 ;; (RIGHT JOINs are rewritten to LEFT at AST level)
                 (let [{:keys [value-keys right-alias left-evar
@@ -5771,6 +5878,7 @@
                             (into left-clauses (rest unmatched))
                             (conj left-clauses oj-clause))))
 
+                :else
                 ;; REF-BASED LEFT JOIN: ON p.dept = d.db_id
                 ;;
                 ;; LEFT iteration semantics: surface every LEFT row,
@@ -6792,6 +6900,17 @@
       (seq text-search-candidates)
       (assoc :secondary-text-candidates text-search-candidates)
       ;; Include join metadata for outer join handling
+      ;; A nested-loop outer join whose ON clause reads a column. Legal
+      ;; for LEFT and RIGHT; a FULL JOIN with one is what PostgreSQL
+      ;; refuses as "only supported with merge-joinable or hash-joinable
+      ;; join conditions", and only the FULL assembly in sql.clj knows
+      ;; it is assembling one.
+      (some #(let [info (:ref-info %)]
+               (and (:nested-loop? info) (:variable-pred? info)
+                    (not (:constant-false-on? info))))
+            join-infos)
+      (assoc :variable-nested-loop-join? true)
+
       (some #(#{:left :right :full} (:join-type %)) join-infos)
       (assoc :join-infos join-infos
              :left-table (get table-aliases default-table default-table)

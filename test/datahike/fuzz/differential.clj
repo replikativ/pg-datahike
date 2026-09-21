@@ -371,11 +371,20 @@
   ["JOIN" "LEFT JOIN" "RIGHT JOIN" "FULL JOIN"])
 
 (def ^:private join-keys
-  "An equality BETWEEN the relations. Every generated ON clause has one:
-   an outer join without one is a nested loop this server refuses with
-   0A000, and 80% of a corpus reporting that boundary would hide what
-   this surface is for -- the answers where it does join."
+  "An equality BETWEEN the relations. Most generated ON clauses have one,
+   so the corpus is mostly about the answers a join produces rather than
+   about the nested-loop boundary -- but not all of them: see
+   `nested-loop-on` below."
   ["ft.i = fu.k" "ft.j = fu.k" "ft.id = fu.id"])
+
+(def ^:private nested-loop-on
+  "An ON clause with NO equality between the relations. PostgreSQL answers
+   it by considering every right row for every left row and filtering, and
+   so, since the nested-loop lowering, does this server -- including the
+   two shapes where nothing qualifies and every left row is null-extended,
+   which is the half a matched branch alone cannot answer."
+  ["true" "false" "fu.k > ft.i" "fu.k <> ft.i" "fu.v IS NULL"
+   "fu.k = 10" "fu.id > 1" "ft.b" "ft.id < 4"])
 
 (def ^:private join-conditions
   "The conjuncts that ride along with the key: another equality, a
@@ -394,8 +403,12 @@
    how a right-side variable reaches the outer query."
   [^java.util.Random r]
   (let [pick (fn [v] (nth v (.nextInt r (count v))))
-        conds (cons (pick join-keys)
-                    (repeatedly (.nextInt r 3) #(pick join-conditions)))
+        ;; One sample in four joins WITHOUT an equality between the
+        ;; relations -- a nested loop.
+        conds (if (zero? (.nextInt r 4))
+                (distinct (repeatedly (inc (.nextInt r 2)) #(pick nested-loop-on)))
+                (cons (pick join-keys)
+                      (repeatedly (.nextInt r 3) #(pick join-conditions))))
         on (str/join " AND " (distinct conds))
         jt (pick join-types)
         cls (case jt "JOIN" :j-inner "LEFT JOIN" :j-left "RIGHT JOIN" :j-right :j-full)]
@@ -538,13 +551,36 @@
 (def manifest-path "test/integration/fuzz/expected-divergences.edn")
 
 (defn expected-divergences
-  "{[surface key] reason} of known, explained disagreements."
+  "The known, explained disagreements, as
+   `{:exact {[surface key] reason} :patterns [{:surface :re :reason}]}`.
+
+   An entry names either one sample (`:key`) or a CLASS of them
+   (`:key-pattern`, a regex over the generated SQL). A class entry is for a
+   gap the grammar reaches through many combinations -- an aggregate over a
+   FULL JOIN is refused whatever its ON clause says -- where one entry per
+   string would be a list that grows with the grammar and says the same
+   thing every time."
   []
-  (let [f (io/file manifest-path)]
-    (if (.exists f)
-      (into {} (map (fn [{:keys [surface key reason]}] [[surface key] reason]))
-            (edn/read-string (slurp f)))
-      {})))
+  (let [f (io/file manifest-path)
+        entries (if (.exists f) (edn/read-string (slurp f)) [])]
+    {:exact (into {} (keep (fn [{:keys [surface key reason]}]
+                             (when key [[surface key] reason])))
+                  entries)
+     :patterns (into [] (keep (fn [{:keys [surface key-pattern reason]}]
+                                (when key-pattern
+                                  {:surface surface
+                                   :re (re-pattern key-pattern)
+                                   :reason reason})))
+                     entries)}))
+
+(defn- expected-hit?
+  "True when `key` on `surface` is a listed divergence, by name or by class."
+  [{:keys [exact patterns]} surface key]
+  (or (contains? exact [surface key])
+      (boolean (some (fn [entry]
+                       (and (= (:surface entry) surface)
+                            (re-find (:re entry) key)))
+                     patterns))))
 
 (defn- clip [x] (let [s (pr-str x)] (subs s 0 (min 160 (count s)))))
 
@@ -554,10 +590,15 @@
   ([result] (report result (expected-divergences)))
   ([{:keys [surface seed drawn ran diffs]} expected]
    (let [bad (frequencies (map :class diffs))
-         unexpected (remove #(contains? expected [(:surface %) (:key %)]) diffs)
+         unexpected (remove #(expected-hit? expected (:surface %) (:key %)) diffs)
          diff-keys (set (map :key diffs))
          ;; Only an entry this run actually DREW can drift.
-         drifted (for [[[s k] _] expected
+         ;; Only an EXACT entry drift-checks. A class entry covers samples
+         ;; that need not all disagree -- a WHERE that empties the result
+         ;; agrees on both sides while the gap is still there -- so "every
+         ;; drawn sample agreed" would fail the run on a seed rather than on
+         ;; a fix. A class entry is pruned by hand when its gap closes.
+         drifted (for [[[s k] _] (:exact expected)
                        :when (and (= s surface) (drawn k) (not (diff-keys k)))]
                    k)]
      (println (format "== %s (seed %s): %d distinct samples, %d disagreements (%d unexpected) =="
@@ -567,7 +608,7 @@
        (println (format "   %-12s%6d%6d" (name c) (ran c) (get bad c 0))))
      (doseq [{:keys [class key reference target]} diffs]
        (println (format "\n  [%s]%s %s" (name class)
-                        (if (contains? expected [surface key]) " (expected)" "") key))
+                        (if (expected-hit? expected surface key) " (expected)" "") key))
        (println "    PG  " (clip reference))
        (println "    we  " (clip target)))
      {:unexpected (vec unexpected) :drifted (vec drifted)})))

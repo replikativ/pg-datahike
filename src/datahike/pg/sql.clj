@@ -2068,6 +2068,23 @@
                           ;; Refuse those until the combination happens
                           ;; before aggregation. ORDER BY is left alone: its
                           ;; rows are right and only their order is not.
+                          ;; PostgreSQL plans a FULL JOIN as a merge or a
+                          ;; hash join, so its ON clause must contain an
+                          ;; equality BETWEEN the relations -- or no column
+                          ;; at all, `ON true` / `ON false`, which it plans
+                          ;; as a cross join. Anything else, including a
+                          ;; condition over one side alone (`ON (b.v IS
+                          ;; NULL)`, `ON (b.k = 10)`), is 0A000 there, so it
+                          ;; is 0A000 here: the nested-loop lowering could
+                          ;; answer it, but answering where PostgreSQL
+                          ;; refuses is its own divergence.
+                          (when (or (:variable-nested-loop-join? left-result)
+                                    (:variable-nested-loop-join? right-result))
+                            (throw (errors/pg-error
+                                    :feature-not-supported
+                                    {:message (str "FULL JOIN is only supported with "
+                                                   "merge-joinable or hash-joinable "
+                                                   "join conditions")})))
                           (when-let [feature (cond
                                                (or (:has-aggregates? left-result)
                                                    (:has-aggregates? right-result))
