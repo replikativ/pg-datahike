@@ -12,6 +12,8 @@ The ANY/ALL paths that take their array from a **column** now read that form; a 
 
 The fix had to be made in three places, because ANY has three runtime implementations — value position, the WHERE predicate, and the shared `any-all-op-fn`. Recorded as its own item: they should be one.
 
+A third golden turns out to have recorded this bug too: `pgjdbc-getPrimaryKeys-person` held `{:rows []}`, and now holds the `id` PostgreSQL answers.
+
 ### A field of a composite value
 
 `(expr).field` was not translated at all — every spelling raised `expression of type RowGetExpression is not supported`, including the whole-row form `(t).col` and the `(f(x)).n` a record-returning function is read with:
