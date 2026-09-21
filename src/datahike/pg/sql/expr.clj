@@ -2379,6 +2379,29 @@
                      args)))
     form))
 
+(defn- like-escape-char
+  "The ESCAPE character of a LIKE, defaulting to backslash.
+
+   JSqlParser hands the clause over as a StringValue whose `toString`
+   KEEPS the quotes, so taking its first character gave `'` and every
+   `ESCAPE x` escaped the quote character instead of x: `'a%c' LIKE
+   'a$%c' ESCAPE '$'` answered false, and the same in WHERE answered no
+   rows."
+  [^LikeExpression e]
+  (let [esc (.getEscape e)
+        text (cond
+               (nil? esc) nil
+               (instance? StringValue esc) (.getValue ^StringValue esc)
+               :else (let [t (str esc)]
+                       (if (and (> (count t) 1)
+                                (str/starts-with? t "'")
+                                (str/ends-with? t "'"))
+                         (subs t 1 (dec (count t)))
+                         t)))]
+    (if (str/blank? text)
+      (Character/valueOf \\)
+      (Character/valueOf (char (first text))))))
+
 (defn like-pattern->regex
   "Compile a SQL LIKE pattern to a java.util.regex.Pattern.
 
@@ -3064,12 +3087,40 @@
              (.getLeftExpression e) (.getRightExpression e) true)
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
-          pattern (translate-expr ctx (.getRightExpression e))
-          ^Character esc (or (when-let [c (.getEscape e)]
-                               (when-not (str/blank? (str c)) (Character/valueOf (char (first (str c))))))
-                             (Character/valueOf \\))
-          re-obj (like-pattern->regex pattern case-insensitive? esc)
-          base (list 'datahike.pg.sql/sql-like3? col re-obj)]
+          right-expr (.getRightExpression e)
+          pattern (translate-expr ctx right-expr)
+          ^Character esc (like-escape-char e)
+          ;; The pattern is compiled HERE only when it is one: a column,
+          ;; a parameter or NULL reaches this as a logic var or the null
+          ;; sentinel, and `(str …)` of those compiled to a regex that
+          ;; matches their printed form and nothing else. `s LIKE p` over
+          ;; a pattern column answered FALSE for every row, and
+          ;; `'a' LIKE NULL` answered false where PostgreSQL answers
+          ;; NULL. The WHERE path has always deferred these; this one is
+          ;; the same expression in value position.
+          literal? (or (instance? StringValue right-expr) (string? pattern))
+          base (if literal?
+                 (list 'datahike.pg.sql/sql-like3? col
+                       (like-pattern->regex pattern case-insensitive? esc))
+                 (let [cache (volatile! [nil nil])
+                       matcher (fn [s pat]
+                                 (if (or (nil? s) (= :__null__ s)
+                                         (nil? pat) (= :__null__ pat))
+                                   :__null__
+                                   (let [pat-str (str pat)
+                                         [last-str last-re] @cache
+                                         re (if (= last-str pat-str)
+                                              last-re
+                                              (let [r (like-pattern->regex
+                                                       pat-str case-insensitive? esc)]
+                                                (vreset! cache [pat-str r])
+                                                r))]
+                                     (boolean (re-find re (str s))))))
+                       fn-param (symbol (str "?like-val" (swap! (:var-counter ctx) inc)))]
+                   (swap! (:in-params ctx) conj fn-param)
+                   (swap! (:in-args ctx) conj matcher)
+                   (list fn-param col
+                         (if (seq? pattern) (ctx/materialize-arg! ctx pattern) pattern))))]
       (if not-like? (list 'datahike.pg.sql/sql-not3 base) base))
 
     ;; col [NOT] BETWEEN lo AND hi inside CASE WHEN.
@@ -7785,10 +7836,7 @@
           right-expr (.getRightExpression e)
           pattern (translate-expr ctx right-expr)
           ;; ESCAPE character (default: backslash per PostgreSQL).
-          ^Character escape-char (let [esc (.getEscape e)]
-                                   (if (and esc (not (str/blank? (str esc))))
-                                     (Character/valueOf (char (first (str esc))))
-                                     (Character/valueOf \\)))
+          ^Character escape-char (like-escape-char e)
           ;; Compile the SQL LIKE pattern → Java regex source. Same
           ;; rules whether the pattern is known at parse time or not:
           ;;   %  → .*       _  → .       <esc>X → literal X
