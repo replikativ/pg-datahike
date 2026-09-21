@@ -174,6 +174,12 @@
    "current-schemas"
    "SELECT current_schemas(false)"})
 
+(def ^:private may-be-empty
+  "Probes whose empty answer is the RIGHT answer, against this fixture.
+   Everything else answering nothing is a bug, not a baseline -- see
+   `a-golden-does-not-record-an-empty-answer`."
+  #{})
+
 (deftest catalog-goldens
   (let [h (fresh-handler)]
     (doseq [[probe-name sql] probes]
@@ -190,3 +196,31 @@
                                      "expected rows: " (pr-str (:rows expected)) "\n"
                                      "actual rows:   " (pr-str (:rows actual)) "\n"
                                      "diff:          " (pr-str diff)))))))))
+
+(deftest a-golden-does-not-record-an-empty-answer
+  ;; A golden records what the implementation DID, so a wrong answer
+  ;; nobody had checked against PostgreSQL became the expectation and
+  ;; then defended itself. Three were found in one day --
+  ;; `pgjdbc-getColumns-person`, `is-columns-person` and
+  ;; `pgjdbc-getPrimaryKeys-person` -- and every one held `:rows []`: a
+  ;; query that a catalog probe, or a type the array reader could not
+  ;; parse, had been answering with nothing.
+  ;;
+  ;; Every probe here reads a fixture that HAS tables, columns and a
+  ;; primary key, so no answer is nearly always a bug. A probe whose
+  ;; empty answer is genuinely right goes in `may-be-empty`, with the
+  ;; reason.
+  (let [h (fresh-handler)]
+    (doseq [[probe-name sql] probes
+            :when (not (contains? may-be-empty probe-name))]
+      (testing probe-name
+        (let [{:keys [rows error]} (result->plain
+                                    (.execute
+                                     ^datahike.pg.PgWireServer$QueryHandler h sql))]
+          (is (nil? error) (str probe-name ": " error))
+          (is (seq rows)
+              (str probe-name " answered no rows. A catalog probe over a"
+                   " fixture that has tables and a primary key almost never"
+                   " should: check it against PostgreSQL before recording"
+                   " the answer, and add it to `may-be-empty` only if the"
+                   " empty result is genuinely right.\n  " sql)))))))

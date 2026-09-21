@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A golden may not record an empty answer
+
+A golden file records what the implementation *did*, so a wrong answer nobody had checked against PostgreSQL became the expectation and then defended itself. Three turned up in one day — `pgjdbc-getColumns-person`, `is-columns-person` and `pgjdbc-getPrimaryKeys-person` — and every one held `:rows []`: a query that a catalog probe, or a type the array reader could not parse, had been answering with nothing.
+
+The goldens test now fails on a probe that answers no rows, since every probe reads a fixture that has tables, columns and a primary key. A probe whose empty answer is genuinely right goes in `may-be-empty`, with the reason.
+
 ### An int2vector reads as the vector it is
 
 `a.attnum = ANY(i.indkey)` matched nothing. An int2vector — `pg_index.indkey`, `pg_proc.proargtypes` — is written **space-separated** (`1`, `1 2`) rather than in braces, so the array reader saw a scalar. That is how pgjdbc and Metabase ask which columns an index covers, and both got nothing back.
