@@ -1157,13 +1157,21 @@
   [^String t]
   (some-> t (str/replace #"\s*\([^)]*\)" "") (ddl/pg-type-hint false)))
 
+(def ^:private expandarray-name
+  "`information_schema._pg_expandarray`, qualified. Only that spelling
+   resolves: the function lives in information_schema, which is not on
+   the default search_path, so PostgreSQL answers 42883 for a bare
+   `_pg_expandarray(…)` and `resolution-name` keeps the qualifier for
+   exactly that reason."
+  "information_schema._pg_expandarray")
+
 (def ^:private known-srf-names
   "Function names `materialize-table-function` knows how to turn into a
    relation. Used only to tell an UNKNOWN function in FROM apart from a
    known one whose arguments we could not evaluate (a correlated LATERAL
    argument): the first is 42883, the second is not."
   #{"unnest" "generate_series" "pg_get_keywords"
-    "pg_input_error_info"
+    "pg_input_error_info" expandarray-name
     "jsonb_array_elements" "json_array_elements"
     "jsonb_array_elements_text" "json_array_elements_text"
     "jsonb_each" "json_each" "jsonb_each_text" "json_each_text"
@@ -1224,12 +1232,32 @@
   "Whether expr is a set-returning function supported by ProjectSet.
 
    Keep this deliberately narrower than `known-srf-names`: several entries in
-   that set are scalar compatibility shims when used outside FROM.  These two
-   functions have unambiguous PostgreSQL set semantics in a SELECT list."
+   that set are scalar compatibility shims when used outside FROM.  These
+   functions have unambiguous PostgreSQL set semantics in a SELECT list --
+   `_pg_expandarray` included: pgjdbc calls it exactly there, as
+   `(information_schema._pg_expandarray(i.indkey)).n`."
   [expr]
   (and (instance? Function expr)
-       (contains? #{"generate_series" "unnest"}
+       (contains? #{"generate_series" "unnest" expandarray-name}
                   (srf-base-name (.getName ^Function expr)))))
+
+(defn- srf-row-get
+  "[function field] when `expr` is `(srf(…)).field` -- a field selection
+   over a set-returning call -- else nil. The ROW is parenthesed, so the
+   call sits one level in (a one-element expression LIST, not a
+   Parenthesis)."
+  [expr]
+  (when (instance? net.sf.jsqlparser.expression.RowGetExpression expr)
+    (let [^net.sf.jsqlparser.expression.RowGetExpression e expr
+          inner (loop [x (.getExpression e)]
+                  (cond
+                    (instance? Function x) x
+                    (instance? net.sf.jsqlparser.expression.Parenthesis x)
+                    (recur (.getExpression ^net.sf.jsqlparser.expression.Parenthesis x))
+                    (and (instance? java.util.List x) (= 1 (count x))) (recur (first x))
+                    :else nil))]
+      (when (and inner (target-list-srf? inner))
+        [inner (.getColumnName e)]))))
 
 (defn contains-target-list-srf?
   "Whether an expression contains a ProjectSet-capable SRF in this query
@@ -1238,7 +1266,7 @@
    that SELECT's placement context."
   [expr]
   (boolean
-   (some #(contains? #{"generate_series" "unnest"} (srf-base-name %))
+   (some #(contains? #{"generate_series" "unnest" expandarray-name} (srf-base-name %))
          (params/ast-function-names expr))))
 
 (defn- reject-prohibited-target-srf!
@@ -1369,6 +1397,33 @@
                     :else              nil)]
          (when vals
            (with-ordinality ["unnest"] (mapv vector vals) [(vtype-of (first vals))] [nil])))
+
+       ;; `information_schema._pg_expandarray(anyarray)` — one row per
+       ;; element, each a RECORD (x, n): the element and its 1-based
+       ;; subscript. It is how pgjdbc walks `pg_index.indkey` in
+       ;; getPrimaryKeys, and nothing implemented it, so that query was
+       ;; answered by a shape probe instead of by the catalog.
+       (= fname expandarray-name)
+       ;; Two OUT parameters, so in FROM it is a relation of two columns
+       ;; -- `FROM information_schema._pg_expandarray(ARRAY[5,6])` is
+       ;; `5|1`, `6|2`. In the SELECT list the same call yields the
+       ;; composite `(5,1)`; see `project-set-values`.
+       (let [pa (when (seq params) (eval-fn (first params)))
+             vals (cond
+                    (pg-arr/array? pa) (vec (pg-arr/flat-elements pa))
+                    (sequential? pa)   (vec pa)
+                    ;; The argument pgjdbc passes is `pg_index.indkey`, an
+                    ;; INT2VECTOR -- space-separated, not in braces -- so the
+                    ;; ordinary array reader sees a scalar. Same coercion the
+                    ;; `a.attnum = ANY(i.indkey)` path uses.
+                    (string? pa) (some-> (expr/int2vector->array pa)
+                                         pg-arr/flat-elements vec)
+                    :else nil)]
+         (when vals
+           (with-ordinality ["x" "n"]
+             (vec (map-indexed (fn [i v] [v (long (inc i))]) vals))
+             [(vtype-of (first vals)) :db.type/long]
+             [nil "int4"])))
 
        (= fname "generate_series")
        (let [args (mapv eval-fn params)]
@@ -1537,7 +1592,17 @@
                 (if (.containsKey by-expr e)
                   (.get by-expr e)
                   ::corr)))]
-      (mapv first (:rows materialized))
+      ;; A function with OUT parameters returns a COMPOSITE, and in the
+      ;; SELECT list PostgreSQL yields that composite rather than its
+      ;; first column: `SELECT information_schema._pg_expandarray(a)` is
+      ;; `(x,n)` per element, and `(…).n` selects a field out of it.
+      (let [{:keys [aliases rows]} materialized]
+        (if (> (count aliases) 1)
+          (mapv (fn [row]
+                  (pg-rec/named-record
+                   (map (fn [a v] [a (types/infer-oid-from-value v) v]) aliases row)))
+                rows)
+          (mapv first rows)))
       [])))
 
 (defn apply-project-set
@@ -1559,10 +1624,18 @@
                                  level-specs)
                     n (reduce max 0 (map count values))]
                 (for [i (range n)]
-                  (reduce (fn [out [{:keys [out-pos]} vs]]
-                            (assoc out out-pos (if (< i (count vs))
-                                                 (nth vs i)
-                                                 :__null__)))
+                  (reduce (fn [out [{:keys [out-pos field]} vs]]
+                            (let [v (if (< i (count vs)) (nth vs i) :__null__)
+                                  v (if (and field (pg-rec/record? v))
+                                      (let [fv (pg-rec/field-value v field)]
+                                        (if (= ::pg-rec/absent fv)
+                                          (throw (errors/pg-error
+                                                  :undefined-column
+                                                  {:message (str "could not identify column \""
+                                                                 field "\" in record data type")}))
+                                          (if (nil? fv) :__null__ fv)))
+                                      v)]
+                              (assoc out out-pos v)))
                           row
                           (map vector level-specs values)))))
             rows)))]
@@ -4171,39 +4244,47 @@
         window-specs (atom [])    ;; [{:op kw :partition-by [idx] :order-by [[idx dir]] :frame {...}}]
         project-set-specs (atom [])
         lower-project-srf!
-        (fn lower-project-srf! [^Function f alias-str visible?]
-          (let [children (atom [])
-                arg-vars
-                (mapv (fn [arg]
-                        (if (target-list-srf? arg)
-                          (let [{:keys [out-var] :as child}
-                                (lower-project-srf! ^Function arg nil false)]
-                            (swap! children conj child)
-                            out-var)
-                          (let [v (expr/translate-expr ctx arg)]
-                            (cond
-                              (symbol? v) v
-                              (seq? v) (ctx/materialize-arg! ctx v)
-                              :else (ctx/materialize-arg!
-                                     ctx (list 'identity
-                                               (if (nil? v) :__null__ v)))))))
-                      (vec (or (.getParameters f) [])))
-                level (if (seq @children)
-                        (inc (reduce max (map :level @children)))
-                        0)
-                out-var (ctx/fresh-var! ctx)
-                out-pos (when visible? (count @find-elements))
-                spec {:function f :arg-vars arg-vars :level level
-                      :out-var out-var :out-pos out-pos}]
-            (ctx/add-clause! ctx [(list 'identity :__null__) out-var])
-            (doseq [child @children]
-              (swap! project-set-specs conj child))
-            (swap! project-set-specs conj spec)
-            (when visible?
-              (swap! find-elements conj out-var)
-              (swap! find-aliases conj
-                     (or alias-str (srf-base-name (.getName f)))))
-            spec))
+        (fn lower-project-srf!
+          ([^Function f alias-str visible?]
+           (lower-project-srf! f alias-str visible? nil))
+          ([^Function f alias-str visible? field]
+           (let [children (atom [])
+                 arg-vars
+                 (mapv (fn [arg]
+                         (if (target-list-srf? arg)
+                           (let [{:keys [out-var] :as child}
+                                 (lower-project-srf! ^Function arg nil false)]
+                             (swap! children conj child)
+                             out-var)
+                           (let [v (expr/translate-expr ctx arg)]
+                             (cond
+                               (symbol? v) v
+                               (seq? v) (ctx/materialize-arg! ctx v)
+                               :else (ctx/materialize-arg!
+                                      ctx (list 'identity
+                                                (if (nil? v) :__null__ v)))))))
+                       (vec (or (.getParameters f) [])))
+                 level (if (seq @children)
+                         (inc (reduce max (map :level @children)))
+                         0)
+                 out-var (ctx/fresh-var! ctx)
+                 out-pos (when visible? (count @find-elements))
+                 spec (cond-> {:function f :arg-vars arg-vars :level level
+                               :out-var out-var :out-pos out-pos}
+                        field (assoc :field field))]
+             (ctx/add-clause! ctx [(list 'identity :__null__) out-var])
+             (doseq [child @children]
+               (swap! project-set-specs conj child))
+             (swap! project-set-specs conj spec)
+             (when visible?
+               (swap! find-elements conj out-var)
+               (swap! find-aliases conj
+                      (or alias-str
+                          ;; `(srf(…)).n` is named after the FIELD, as
+                          ;; PostgreSQL names it.
+                          field
+                          (srf-base-name (.getName f)))))
+             spec)))
 
         ;; Lightweight oid-env — built before aggregate dispatch so the
         ;; SUM/AVG branches can pick the numeric-precision runtime
@@ -5007,6 +5088,16 @@
                 ;; each base row after its base ORDER BY and before LIMIT.
                 (target-list-srf? expr)
                 (lower-project-srf! ^Function expr alias-str true)
+
+                ;; `(srf(…)).field` — a field of the composite an SRF
+                ;; with OUT parameters yields. PostgreSQL expands the
+                ;; set through the same ProjectSet node and selects the
+                ;; field from each row; this is the half of pgjdbc's
+                ;; primary-key query that reads
+                ;; `(information_schema._pg_expandarray(i.indkey)).n`.
+                (srf-row-get expr)
+                (let [[^Function f field] (srf-row-get expr)]
+                  (lower-project-srf! f alias-str true field))
 
                 ;; Regular column or expression
                 :else

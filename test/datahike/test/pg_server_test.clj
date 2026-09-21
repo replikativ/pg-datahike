@@ -686,9 +686,9 @@
 (deftest test-pg-get-indexdef
   (testing "pg_index.indexdef pre-baked from schema (UNIQUE / PRIMARY KEY)"
     (let [r (rows (.execute *handler* "SELECT indexdef FROM pg_index ORDER BY indexdef"))]
-      (is (some #(re-find #"CREATE UNIQUE INDEX person_name_pkey" %) (map first r))
+      (is (some #(re-find #"CREATE UNIQUE INDEX person_pkey" %) (map first r))
           "PK index def synthesized from :db.unique/identity")
-      (is (some #(re-find #"CREATE UNIQUE INDEX department_name_pkey" %) (map first r))
+      (is (some #(re-find #"CREATE UNIQUE INDEX department_pkey" %) (map first r))
           "Department PK index def synthesized")))
 
   (testing "pg_get_indexdef(oid) reads the pre-baked column"
@@ -700,12 +700,16 @@
           "every row should be a CREATE UNIQUE INDEX statement"))))
 
 (deftest test-pg-constraint-and-getconstraintdef
+  ;; PostgreSQL names a primary key after the TABLE -- `person_pkey` --
+  ;; whatever its column is called; only a UNIQUE constraint carries the
+  ;; column (`person_email_key`). These expectations had copied our own
+  ;; `<table>_<column>_pkey` spelling.
   (testing "pg_constraint synthesizes one row per PK / UNIQUE column"
     (let [r (rows (.execute *handler* "SELECT conname, contype, condef FROM pg_constraint ORDER BY conname"))
           named (into {} (map (fn [[n t d]] [n [t d]]) r))]
-      (is (contains? named "person_name_pkey"))
-      (is (= ["p" "PRIMARY KEY (name)"] (named "person_name_pkey")))
-      (is (contains? named "department_name_pkey"))))
+      (is (contains? named "person_pkey"))
+      (is (= ["p" "PRIMARY KEY (name)"] (named "person_pkey")))
+      (is (contains? named "department_pkey"))))
 
   (testing "pg_get_constraintdef(oid) joins pg_constraint and reads condef"
     (let [r (rows (.execute *handler* "SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c WHERE c.contype = 'p' ORDER BY c.conname"))]

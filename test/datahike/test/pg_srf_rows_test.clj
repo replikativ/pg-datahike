@@ -330,3 +330,46 @@
   (testing "a narrow integer keeps its declared width"
     (is (= [["1"]]
            (rows "SELECT * FROM jsonb_to_recordset('[{\"a\":1}]'::jsonb) AS r(a smallint)")))))
+
+(deftest pg-expandarray-is-a-set-of-subscripted-elements
+  ;; `information_schema._pg_expandarray(anyarray)` returns one row per
+  ;; element as the record `(x, n)` -- the element and its 1-based
+  ;; subscript. Nothing implemented it, so pgjdbc's getPrimaryKeys, which
+  ;; walks `pg_index.indkey` with it, was answered by a shape PROBE that
+  ;; regexed the table name out of the SQL and read the schema instead.
+  ;;
+  ;; The function has two OUT parameters, so PostgreSQL expands it to two
+  ;; COLUMNS in FROM and yields the composite in a SELECT list. Only the
+  ;; schema-qualified spelling resolves: information_schema is not on the
+  ;; default search_path.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (testing "in the SELECT list it yields the composite"
+    (is (= [["(a,1)"] ["(b,2)"]]
+           (rows "SELECT information_schema._pg_expandarray(ARRAY['a','b'])"))))
+  (testing "a field of it"
+    (is (= [["1"] ["2"] ["3"]]
+           (rows "SELECT (information_schema._pg_expandarray(ARRAY[7,8,9])).n")))
+    (is (= [["7"] ["8"] ["9"]]
+           (rows "SELECT (information_schema._pg_expandarray(ARRAY[7,8,9])).x")))
+    (is (= [["a" "1"] ["b" "2"]]
+           (rows (str "SELECT (information_schema._pg_expandarray(ARRAY['a','b'])).x AS e, "
+                      "(information_schema._pg_expandarray(ARRAY['a','b'])).n AS i")))))
+  (testing "in FROM it is a relation of two columns"
+    (is (= [["5" "1"] ["6" "2"]]
+           (rows "SELECT * FROM information_schema._pg_expandarray(ARRAY[5,6])")))
+    (is (= [["5" "1"] ["6" "2"]]
+           (rows "SELECT x, n FROM information_schema._pg_expandarray(ARRAY[5,6])"))))
+  (testing "an int2vector argument -- what pgjdbc passes"
+    ;; `pg_index.indkey` is written space-separated, not in braces, so the
+    ;; ordinary array reader saw a scalar and the call produced no rows.
+    (run "CREATE TABLE expk (id int PRIMARY KEY, s text)")
+    (is (= [["1"]] (rows "SELECT (information_schema._pg_expandarray(i.indkey)).n
+                            FROM pg_catalog.pg_index i
+                            JOIN pg_catalog.pg_class c ON (c.oid = i.indrelid)
+                           WHERE c.relname = 'expk' AND i.indisprimary"))))
+  (testing "a field the record does not have is 42703"
+    (is (= "42703" (state "SELECT (information_schema._pg_expandarray(ARRAY[1,2])).zz"))))
+  (testing "the unqualified spelling does not resolve, as in PostgreSQL"
+    (is (= "42883" (state "SELECT (_pg_expandarray(ARRAY[1,2])).n")))))
+

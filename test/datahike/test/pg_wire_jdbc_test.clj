@@ -967,3 +967,27 @@
                  (str "got " (.getSQLState e) ": " (.getMessage e)))))
       (.rollback a))))
 
+(deftest test-get-primary-keys-comes-from-the-catalog
+  ;; `DatabaseMetaData.getPrimaryKeys` was answered by a shape PROBE: a
+  ;; handler that regexed `ct.relname = '…'` out of pgjdbc's SQL, read
+  ;; the Datahike schema, and returned a made-up `IS_NOT_NULL` column
+  ;; pgjdbc never asked for. The wide catalog join the driver actually
+  ;; sends is now answered by the catalog tables themselves --
+  ;; `information_schema._pg_expandarray`, `pg_index.indnkeyatts` and a
+  ;; `pg_class` row for the implicit primary-key index -- so the probe
+  ;; and shape.clj with it are gone.
+  (with-conn [c {}]
+    (with-open [st (.createStatement c)]
+      (.execute st "CREATE TABLE pkjdbc (id int PRIMARY KEY, s text)"))
+    (let [md (.getMetaData c)]
+      (with-open [rs (.getPrimaryKeys md nil "public" "pkjdbc")]
+        (let [rows (loop [acc []]
+                     (if (.next rs)
+                       (recur (conj acc [(.getString rs "TABLE_SCHEM")
+                                         (.getString rs "TABLE_NAME")
+                                         (.getString rs "COLUMN_NAME")
+                                         (.getShort rs "KEY_SEQ")
+                                         (.getString rs "PK_NAME")]))
+                       acc))]
+          (is (= [["public" "pkjdbc" "id" 1 "pkjdbc_pkey"]] rows)))))))
+

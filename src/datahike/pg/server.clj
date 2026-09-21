@@ -4959,13 +4959,6 @@
     :dh-create-branch       {:names ["create_branch"]               :oids [PgWireServer/OID_TEXT]}
     :dh-delete-branch       {:names ["delete_branch"]               :oids [PgWireServer/OID_TEXT]}
     :show                   (show-metadata parsed)
-    :get-primary-keys       {:names ["TABLE_CAT" "TABLE_SCHEM" "TABLE_NAME"
-                                     "COLUMN_NAME" "KEY_SEQ" "PK_NAME"
-                                     "IS_NOT_NULL"]
-                             :oids  [PgWireServer/OID_TEXT PgWireServer/OID_TEXT
-                                     PgWireServer/OID_TEXT PgWireServer/OID_TEXT
-                                     PgWireServer/OID_INT2 PgWireServer/OID_TEXT
-                                     PgWireServer/OID_BOOL]}
     nil))
 
 (defn- describe-from-metadata
@@ -5817,48 +5810,6 @@
 
 ;; --- Catalog probes ---------------------------------------------------------
 
-(defn- handle-get-primary-keys
-  "pgjdbc DatabaseMetaData.getPrimaryKeys / updatable-ResultSet PK probe.
-   Resolves the PK columns from Datahike schema — :db.unique/identity
-   attrs for single-col PK, :db/tupleAttrs for composite — without
-   executing pgjdbc's wide catalog JOIN."
-  [{:keys [conn sql]} _parsed]
-  (let [schema-now (:schema (d/db conn))
-        tname (second (re-find #"ct\.relname\s*=\s*'([^']+)'" sql))
-        tuple-attr-kw (when tname (keyword tname "pg$pk_tuple"))
-        tuple-props (when tuple-attr-kw (get schema-now tuple-attr-kw))
-        cols
-        (cond
-          (and tuple-props (seq (:db/tupleAttrs tuple-props)))
-          (map-indexed (fn [i a] [(name a) (inc i)])
-                       (:db/tupleAttrs tuple-props))
-          tname
-          (let [single (some (fn [[a p]]
-                               (when (and (keyword? a)
-                                          (= tname (namespace a))
-                                          (= :db.unique/identity (:db/unique p))
-                                          (not= a tuple-attr-kw))
-                                 a))
-                             schema-now)]
-            (when single [[(name single) 1]])))
-        rows (into []
-                   (for [[col-name key-seq] (or cols [])]
-                     (into-array String
-                                 [nil "public" tname col-name
-                                  (str key-seq)
-                                  (str tname "_pkey")
-                                  "t"])))]
-    (PgWireServer$QueryResult.
-     (into-array String ["TABLE_CAT" "TABLE_SCHEM" "TABLE_NAME"
-                         "COLUMN_NAME" "KEY_SEQ" "PK_NAME"
-                         "IS_NOT_NULL"])
-     (int-array [PgWireServer/OID_TEXT PgWireServer/OID_TEXT
-                 PgWireServer/OID_TEXT PgWireServer/OID_TEXT
-                 PgWireServer/OID_INT2 PgWireServer/OID_TEXT
-                 PgWireServer/OID_BOOL])
-     (into-array (Class/forName "[Ljava.lang.String;") rows)
-     (str "SELECT " (count rows)))))
-
 ;; --- Sequence handlers ------------------------------------------------------
 
 (def ^:private nextval-max-retries
@@ -6499,7 +6450,6 @@
       :txid-current            (handle-txid-current ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
       :create-index       (empty-result "CREATE INDEX")
-      :get-primary-keys   (handle-get-primary-keys ctx parsed)
 
       ;; Transaction isolation level. SET SESSION CHARACTERISTICS sets the
       ;; session default; SET [LOCAL] TRANSACTION sets the current tx's

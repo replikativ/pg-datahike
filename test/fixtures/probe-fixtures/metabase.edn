@@ -42,8 +42,10 @@
    :note "missed catalog probe — could be fast-pathed"}
   {:sql
    "SELECT result.TABLE_CAT AS \"TABLE_CAT\", result.TABLE_SCHEM AS \"TABLE_SCHEM\", result.TABLE_NAME AS \"TABLE_NAME\", result.COLUMN_NAME AS \"COLUMN_NAME\", result.KEY_SEQ AS \"KEY_SEQ\", result.PK_NAME AS \"PK_NAME\"FROM (SELECT current_database() AS TABLE_CAT, n.nspname AS TABLE_SCHEM, ct.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ, ci.relname AS PK_NAME, information_schema._pg_expandarray(i.indkey) AS KEYS, a.attnum AS A_ATTNUM, i.indnkeyatts as KEY_COUNT FROM pg_catalog.pg_class ct JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid) JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid) JOIN pg_catalog.pg_index i ON ( a.attrelid = i.indrelid) JOIN pg_catalog.pg_class ci ON (ci.oid = i.indexrelid) WHERE true AND n.nspname = $1 AND ct.relname = $2 AND i.indisprimary ) result where result.A_ATTNUM = (result.KEYS).x AND result.KEY_SEQ <= KEY_COUNT ORDER BY result.table_name, result.pk_name, result.key_seq",
-   :expected-system-kind :get-primary-keys,
-   :note nil}
+   :expected-system-kind nil,
+   :note "answered by the catalog through the ordinary SQL path since the
+          getPrimaryKeys probe was deleted -- _pg_expandarray, indnkeyatts
+          and a pg_class row for the implicit index are all there now"}
   {:sql
    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
    :expected-system-kind :set-session-isolation,
