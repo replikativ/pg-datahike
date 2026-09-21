@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A window column keeps its place in a derived table
+
+`SELECT * FROM (SELECT a, row_number() OVER (…) AS rn, b FROM t) x` answered the columns **a, b, rn** — the window value last, shifting every column after it. The window executor appends its values to each row, and the derived-table path read them back in that order; each spec carries the position it had in the SELECT list, and the top-level path has always restored them by it.
+
+Metabase's column introspection is exactly this shape (`row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum` in the middle of sixteen columns), so every column after it was one place out.
+
+`window-projection-indices` moves to `datahike.pg.window`, where both paths read it.
+
 ### A LIKE pattern that is not a literal, and ESCAPE
 
 In value position the pattern was compiled to a regex at **translate** time, whatever it was. A column, a parameter or NULL arrives there as a logic variable or the null sentinel, and `(str …)` of those compiles to a regex that matches their printed form and nothing else:
