@@ -11003,6 +11003,17 @@
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
+        ;; The session values a translated expression needs at RUN time.
+        ;; `pg_backend_pid()` and `txid_current()` were answerable only as
+        ;; a whole statement, so `SELECT pg_backend_pid(), 1` and
+        ;; `WHERE pid = pg_backend_pid()` were 42883; a translated call
+        ;; reads them from the session-state atom instead, which is the
+        ;; one thing a Datalog function running off this thread can still
+        ;; reach.
+        _ (swap! session-state assoc
+                 :session-id session-id
+                 :backend-pid (Math/abs (bit-and 0x7fffffff (.hashCode ^String session-id)))
+                 :current-tx-id (fn [] (try (:max-tx (d/db conn)) (catch Throwable _ 0))))
         ;; Transaction state: {:in-tx? bool :aborted? bool :tx-buffer [] :speculative-db db :eid->tempid {}
         ;;                      :session-id str :owned-locks #{[table id]...}}
         tx-state (atom {:in-tx? false :aborted? false

@@ -96,3 +96,30 @@
       (testing "the same holds inside a row projection (RETURNING)"
         (is (= "alpha" (scalar a "INSERT INTO t VALUES (2) RETURNING current_database()")))
         (is (= "beta" (scalar b "INSERT INTO t VALUES (2) RETURNING current_database()")))))))
+
+(deftest the-session-functions-work-in-an-expression
+  ;; Each was answerable only as a WHOLE statement -- classify matched
+  ;; the sole projection and a handler answered it -- so
+  ;; `SELECT pg_backend_pid(), 1` and `WHERE pid = pg_backend_pid()`
+  ;; raised 42883 on a server where `SELECT pg_backend_pid()` works.
+  ;;
+  ;; They read the session-state atom, which is what a Datalog function
+  ;; running off the connection's thread can still reach; the plan is
+  ;; marked session-dependent so it never serves another session.
+  (with-open [a (connect-to "alpha")
+              b (connect-to "alpha")]
+    (testing "pg_backend_pid is the same value however it is asked for"
+      (let [alone (scalar a "SELECT pg_backend_pid()")
+            in-expr (scalar a "SELECT pg_backend_pid(), 1")
+            again (scalar a "SELECT pg_backend_pid()")]
+        (is (= alone in-expr again))
+        (is (pos? (Long/parseLong alone)))))
+    (testing "and it is the EXECUTING session's, not the translating one's"
+      (is (not= (scalar a "SELECT pg_backend_pid(), 1")
+                (scalar b "SELECT pg_backend_pid(), 1"))))
+    (testing "in a predicate"
+      (is (= "1" (scalar a "SELECT 1 WHERE pg_backend_pid() > 0"))))
+    (testing "txid_current reads the transaction it runs in"
+      (is (= "t" (scalar a "SELECT txid_current() > 0")))
+      (is (= (scalar a "SELECT txid_current()")
+             (scalar a "SELECT txid_current(), 2"))))))
