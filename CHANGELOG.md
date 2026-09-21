@@ -19,6 +19,8 @@ All eight are ordinary translated functions now, and the shortcuts are deleted �
 
 Fixing the quoted form that psycopg2 emits (`SELECT "pg_notify"(…)` — it quotes every identifier it composes) meant fixing function-name folding generally: a quoted name kept its quotes and resolved to nothing, so `SELECT "upper"('a')` was 42883 too. Quoting only prevents case folding, so a quoted name now loses its quotes and keeps its case — and `SELECT "UPPER"('a')` is 42883, as in PostgreSQL, because `pg_proc` holds `upper`.
 
+One asyncpg conformance test comes off the expected-failure list with this: `test_prepare_06_interrupted_close` prepares `SELECT pg_sleep(10)` over the **extended** protocol, which a whole-statement shortcut cannot serve at all.
+
 The semantics are unchanged and checked through the new path: exclusion across sessions, re-entrancy (two locks need two unlocks), the distinct two-key namespace, release at COMMIT for `pg_advisory_xact_lock` and on connection close, and 25P01 for a transaction-level lock outside a transaction. A `void` function renders as the empty string, as in PostgreSQL.
 
 ### INSERT then UPDATE in one transaction survives a concurrent commit

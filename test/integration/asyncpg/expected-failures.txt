@@ -97,7 +97,6 @@ tests/test_introspection.py::TestIntrospection::test_introspection_retries_after
 # Decimal cases are advertised through the text fallback, so asyncpg selects
 # its text encoder and rejects Python int/float values before Bind.
 tests/test_prepare.py::TestPrepare::test_prepare_03
-tests/test_prepare.py::TestPrepare::test_prepare_06_interrupted_close
 tests/test_prepare.py::TestPrepare::test_prepare_09_raise_error
 tests/test_prepare.py::TestPrepare::test_prepare_14_explain
 tests/test_prepare.py::TestPrepare::test_prepare_19_concurrent_calls
