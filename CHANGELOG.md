@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The fuzzer checks both protocols on every SELECT
+
+The simple-query path rewrites numeric literals into `$N` before parsing, so that one plan serves a whole statement family; the extended path never re-templates. Those are two different translations of the same statement, and nothing compared them. The select surface now runs each sample over both and compares the pair against PostgreSQL — the templated-vs-untemplated identity check (plan item 0.8).
+
+Result over the 854-sample corpus: **no divergence**. The one disagreement is the known `to_char` refusal, already in the manifest.
+
 ### A derived table's column-alias list renames its columns
 
 `FROM (SELECT …) AS s(a,b)` renames the relation's columns, left to right — `SELECT a FROM (SELECT 1 AS x) AS s(a)` reads the renamed column, and `x` is gone. Only the `FROM (VALUES …) AS v(a,b)` path passed those aliases to the materialiser, so every other derived table answered 42703 for the name the query itself declared.
