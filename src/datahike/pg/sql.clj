@@ -667,6 +667,10 @@
        (not (#{:system :error} (:type parsed)))
        (not (:enriched-db parsed))
        (not (:session-dependent? parsed))
+       ;; Materialised from a parameterised body: the relation in this
+       ;; plan is EMPTY, because the body ran before Bind. Caching it
+       ;; would hand the empty relation to every later execution.
+       (not (:materialisation-params? parsed))
        (not (contains? parsed :row-refs))))
 
 ;; ============================================================================
@@ -2783,13 +2787,22 @@
          (or (unsupported-operator-error sql)
              (templated-parse sql schema db)
              (let [session? (atom false)
-                   parsed (binding [params/*session-dependent?* session?]
+                   mat-params? (atom false)
+                   parsed (binding [params/*session-dependent?* session?
+                                    params/*materialisation-params?* mat-params?]
                             (parse-sql* sql schema db))
                    ;; A translation that reads a session value belongs to
                    ;; the session it was translated for.
                    parsed (cond-> parsed
                             (and @session? (map? parsed))
-                            (assoc :session-dependent? true))]
+                            (assoc :session-dependent? true)
+                            ;; A derived table or CTE whose body reads a
+                            ;; `$n` was materialised EMPTY here, before
+                            ;; Bind. The server re-parses at Execute with
+                            ;; the values in scope; such a plan must not
+                            ;; be cached, since it holds no rows.
+                            (and @mat-params? (map? parsed))
+                            (assoc :materialisation-params? true))]
                (when (and cache (cacheable-parse? parsed))
                  (cache-put! cache cache-key parsed))
                parsed)))))))

@@ -11644,6 +11644,15 @@
                                        ;; not from head at Bind time.
                                          cached (if (or (and (:runtime-subqueries? cached)
                                                              (:enriched-db cached))
+                                                        ;; A derived table or CTE whose body
+                                                        ;; reads a `$n` was materialised
+                                                        ;; EMPTY at Parse -- the body ran
+                                                        ;; before Bind. Re-parse with the
+                                                        ;; values in scope so it runs with
+                                                        ;; them: otherwise the relation is
+                                                        ;; empty and the statement answers
+                                                        ;; no rows, for any binding.
+                                                        (:materialisation-params? cached)
                                                         (and (= :insert (:type cached))
                                                              (:insert-source cached)
                                                              (or (:enriched-db cached)
