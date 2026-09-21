@@ -4,6 +4,25 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### DateStyle chooses the output format
+
+`SET DateStyle` was accepted and then ignored: every date and timestamp rendered ISO whatever the session asked for. It is a display style plus a field order, and both halves move independently, so:
+
+```sql
+SET DateStyle = 'Postgres, MDY';  SELECT '2000-04-01'::date   -- 04-01-2000
+SET DateStyle = 'Postgres, DMY';  SELECT '2000-04-01'::date   -- 01-04-2000
+SET DateStyle = 'SQL, MDY';       SELECT '2000-04-01'::date   -- 04/01/2000
+SET DateStyle = 'German';         SELECT '2000-04-01'::date   -- 01.04.2000
+SET DateStyle = 'Postgres, MDY';  SELECT '2016-09-01 12:00'::timestamp
+                                     -- Thu Sep 01 12:00:00 2016
+```
+
+`SHOW DateStyle` reports the session's own setting, and `SET datestyle = 'DMY'` changes only the order (`ISO, DMY`).
+
+It is also read from the **startup packet**, which is how libpq passes `PGDATESTYLE` — and how PostgreSQL's own regression suite asks for `Postgres, MDY`. It never sends a `SET`, so honouring only the SET would have left that whole suite rendering in the wrong style.
+
+Both wire protocols render through the session's setting; the extended one has its own row-rendering path, which the first version of this missed.
+
 ### Shared advisory locks, the locks we hold, and a database's oid
 
 Measured against PostgreSQL's own `advisory_lock` regression file, three things were missing, and the file sat at 39% of PostgreSQL's output:
