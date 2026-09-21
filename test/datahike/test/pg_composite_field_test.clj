@@ -49,6 +49,12 @@
     :no-error
     (catch SQLException e (.getSQLState e))))
 
+(defn- error [^Connection c sql]
+  (try
+    (with-open [st (.createStatement c)] (.execute st sql))
+    ""
+    (catch SQLException e (.getMessage e))))
+
 (deftest a-field-of-a-composite-value
   (with-open [c (jdbc)]
     (exec! c "CREATE TABLE rc (id int, a int, b text)")
@@ -94,10 +100,13 @@
                              WHERE c.relname = 'ix2' ORDER BY a.attnum")))
       (is (= "1 2" (scalar c "SELECT i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
                                WHERE c.relname = 'ix2' AND 2 = ANY(i.indkey)"))))
-    (testing "an untyped literal is still not an array"
-      ;; PostgreSQL: malformed array literal. What must NOT happen is
+    (testing "an untyped literal that is not an array is 22P02"
+      ;; `array_in` failing, which is what PostgreSQL raises here. We used
+      ;; to answer NULL -- silently -- and what must never happen is
       ;; reading `'12'` as a one-element vector and answering true.
-      (is (not= "t" (scalar c "SELECT 12 = ANY('12')"))))
+      (is (= "22P02" (state c "SELECT 12 = ANY('12')")))
+      (is (re-find #"malformed array literal: \"12\""
+                   (error c "SELECT 12 = ANY('12')"))))
     (testing "ordinary arrays are unchanged"
       (is (= "t" (scalar c "SELECT 5 = ANY('{5,6}')")))
       (is (= "t" (scalar c "SELECT 7 = ANY(ARRAY[7,8])")))
