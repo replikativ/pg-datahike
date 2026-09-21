@@ -365,6 +365,51 @@
                              (pick ["i > 0" "j IS NOT NULL" "b" "i IS NULL"])
                              (pick ["" "PARTITION BY b" "ORDER BY id"]))])))
 
+(def ^:private join-types
+  ;; RIGHT and FULL are rewritten into LEFT before translation, so they
+  ;; exercise the same lowering by a different road.
+  ["JOIN" "LEFT JOIN" "RIGHT JOIN" "FULL JOIN"])
+
+(def ^:private join-keys
+  "An equality BETWEEN the relations. Every generated ON clause has one:
+   an outer join without one is a nested loop this server refuses with
+   0A000, and 80% of a corpus reporting that boundary would hide what
+   this surface is for -- the answers where it does join."
+  ["ft.i = fu.k" "ft.j = fu.k" "ft.id = fu.id"])
+
+(def ^:private join-conditions
+  "The conjuncts that ride along with the key: another equality, a
+   comparison between the relations, a test over one side only. The mix is
+   the point -- a lowering that keeps one condition, or that cannot see a
+   left column that is not a key, answers wrong rows for every
+   combination but the first."
+  ["ft.i = fu.k" "ft.j = fu.k" "ft.id = fu.id"
+   "fu.k > ft.i" "fu.k <> ft.i" "fu.k < ft.j" "fu.k >= ft.id"
+   "fu.k = 10" "fu.k IS NOT NULL" "fu.v IS NULL" "fu.id > 1"
+   "ft.i = 10" "ft.b" "ft.i IS NOT NULL" "ft.id < 4"])
+
+(defn gen-join
+  "One [class sql] join sample: a join type, an ON clause of one to three
+   conjuncts, and a projection that may read the nullable side -- which is
+   how a right-side variable reaches the outer query."
+  [^java.util.Random r]
+  (let [pick (fn [v] (nth v (.nextInt r (count v))))
+        conds (cons (pick join-keys)
+                    (repeatedly (.nextInt r 3) #(pick join-conditions)))
+        on (str/join " AND " (distinct conds))
+        jt (pick join-types)
+        cls (case jt "JOIN" :j-inner "LEFT JOIN" :j-left "RIGHT JOIN" :j-right :j-full)]
+    (case (.nextInt r 4)
+      0 [cls (format "SELECT ft.id, fu.v FROM ft %s fu ON (%s)" jt on)]
+      ;; A projection over the nullable side: the shape that made an
+      ;; unmatched branch fire alongside the matched one.
+      1 [cls (format "SELECT ft.id, coalesce(fu.v, '-'), fu.k FROM ft %s fu ON (%s)" jt on)]
+      ;; WHERE over the join -- PostgreSQL reduces an outer join to an
+      ;; inner one when the WHERE rejects the null-extended row.
+      2 [cls (format "SELECT ft.id, fu.v FROM ft %s fu ON (%s) WHERE %s" jt on
+                     (pick ["fu.v IS NULL" "fu.v IS NOT NULL" "ft.id > 1" "fu.k = 10"]))]
+      3 [cls (format "SELECT count(*), count(fu.v) FROM ft %s fu ON (%s)" jt on)])))
+
 (defn gen-prepared
   "A parameterised [class sql params]; the point is the extended protocol,
    so the shapes stay simple and the parameter positions vary."
@@ -428,6 +473,12 @@
 ;; Runners
 ;; ---------------------------------------------------------------------------
 
+(defn- unordered
+  "A result with its rows as a set: two engines may answer the same rows
+   in a different order, and this surface is about WHICH rows."
+  [[status payload :as result]]
+  (if (= :rows status) [:rows (vec (sort-by pr-str payload))] result))
+
 (defn- sample
   "Draw the next sample for `surface`: {:class :key :run (fn [conn])}. The
    key identifies a distinct sample (the SQL, plus parameters when bound)."
@@ -438,6 +489,15 @@
     :prepared (let [[cls sql params] (gen-prepared r)]
                 {:class cls :key (str sql " " (pr-str params))
                  :run #(prep-q % sql params)})
+    ;; A join runs over BOTH protocols: the simple one psql speaks and the
+    ;; extended one every driver speaks. They are separate code paths here,
+    ;; and a statement that answers over one has failed outright over the
+    ;; other. Rows are compared as a SET -- ordering has its own item, and
+    ;; a generated ORDER BY over a null-extended row would report it once
+    ;; per sample.
+    :join     (let [[cls sql] (gen-join r)]
+                {:class cls :key sql
+                 :run (fn [c] (mapv unordered [(q c sql) (prep-q c sql [])]))})
     ;; A mutation is only comparable from the same start state: re-seed,
     ;; run, then compare the outcome (row count or SQLSTATE) and the table.
     :dml      (let [[cls sql] (gen-dml r)]
@@ -517,11 +577,20 @@
    manifest entry the run drew that now agrees."
   [& [surface n seed]]
   (let [surfaces (if (or (nil? surface) (= "all" surface))
+                   ;; :join is NOT in the gate yet. It reports 47 known
+                   ;; disagreements over its 132-sample default corpus --
+                   ;; FULL JOIN loses every right-only row, and a condition
+                   ;; over the nullable side leaks a datalog error -- each
+                   ;; an item in doc/consolidation-plan.md. Listing them as
+                   ;; expected divergences would be a manifest larger than
+                   ;; the manifest, so the surface runs on demand
+                   ;; (`bb fuzz join`) until those are fixed, and joins the
+                   ;; gate when it is clean.
                    [:select :prepared :dml]
                    [(keyword surface)])
         n (if n (Long/parseLong n) nil)
         seed (if seed (Long/parseLong seed) 20260918)
-        default-n {:select 1500 :prepared 600 :dml 300}
+        default-n {:select 1500 :prepared 600 :join 600 :dml 300}
         outcomes (doall (for [s surfaces]
                           (report (run-surface s (or n (default-n s)) seed))))
         unexpected (mapcat :unexpected outcomes)

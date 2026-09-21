@@ -32,7 +32,7 @@
                 :task (apply shell "clojure -M:dev -m datahike.test.cross-engine"
                              *command-line-args*)}
 
-  fuzz {:doc "Differential fuzzer vs a real PostgreSQL 17.7. Usage: bb fuzz [select|prepared|dml|all] [n] [seed]. Requires REFERENCE_URL + TARGET_URL env (defaults: local oracle :15998, dev server :15432)."
+  fuzz {:doc "Differential fuzzer vs a real PostgreSQL 17.7. Usage: bb fuzz [select|prepared|join|dml|all] [n] [seed]. Requires REFERENCE_URL + TARGET_URL env (defaults: local oracle :15998, dev server :15432)."
         :task (apply shell "clojure -M:dev -m datahike.fuzz.differential" *command-line-args*)}
 
   gen-catalog {:doc "Regenerate src/datahike/pg/pg_catalog.edn from a PostgreSQL source checkout's catalog .dat files. Usage: bb gen-catalog [path] (default .internal/postgres-REL_17_7)."
