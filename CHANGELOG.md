@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A new table no longer aborts another session's transaction
+
+A statement is lowered against a catalog snapshot, and the write it produces is guarded: if the catalog changed underneath, the write raises 40001 rather than landing against a catalog it was not planned for. The comparison was **equality of the whole catalog**, so any DDL anywhere invalidated every open transaction — another session running `CREATE TABLE other` made a transaction that had touched neither that table nor anything near it fail at COMMIT with *catalog changed while statement was being executed*. PostgreSQL does not.
+
+The difference is examined now, and admitted in exactly one shape: the catalog merely **gained relations**. Nothing the capture held may be missing or changed — in the frozen schema or in the catalog rows — and every added row must belong to an entity the capture did not have, naming relations it did not know.
+
+`ALTER TABLE … ADD COLUMN` therefore does **not** qualify, even on an unrelated table: it changes an existing relation, and a lowered statement may have to see that change (a default, a constraint). A DROP, a RENAME and a type change do not qualify either. The remaining conservatism — an unrelated `ALTER` still aborting where PostgreSQL would not — needs per-statement dependency scoping, which the admission certificate already models for literal INSERT and targeted DELETE.
+
 ### The last shape probe is gone, and shape.clj with it
 
 `DatabaseMetaData.getPrimaryKeys` was answered by a **probe**: a handler that recognised pgjdbc's SQL by its shape, regexed `ct.relname = '…'` out of it, read the Datahike schema, and returned a column (`IS_NOT_NULL`) the driver never asked for. Whatever the query said — a different table, a join, a WHERE — the probe answered the same way. Three things were missing before the catalog could answer it itself, and all three are here:

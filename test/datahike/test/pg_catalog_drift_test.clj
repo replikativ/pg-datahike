@@ -273,3 +273,43 @@
       (is (= "40001" (state result)))
       (is (= (inc before) (sequence-value)) "COPY does not reevaluate its reserved default")
       (is (= [] (rows (execute "SELECT a,b FROM drift_rows")))))))
+
+(deftest a-new-relation-does-not-abort-an-open-transaction
+  ;; The guard compares the catalog a statement was lowered against with
+  ;; the one its write lands on, and compared them for EQUALITY: another
+  ;; session's `CREATE TABLE other` -- a table this transaction cannot
+  ;; have read -- aborted it with 40001 at COMMIT. PostgreSQL does not.
+  ;;
+  ;; The difference is examined instead, and admitted only when the
+  ;; catalog merely GAINED relations: nothing the capture held may be
+  ;; missing or changed, and every added row must belong to an entity it
+  ;; did not have.
+  (create-table!)
+  (is (nil? (state (execute "BEGIN"))))
+  (is (nil? (state (execute "INSERT INTO drift_rows(a,b) VALUES(1,2)"))))
+  ;; another session's unrelated DDL, mid-transaction
+  (is (nil? (state (execute "CREATE TABLE unrelated_rows(x int)"))))
+  (pg/invalidate-schema-cache!)
+  (is (nil? (state (execute "UPDATE drift_rows SET b = 3 WHERE a = 1"))))
+  (is (nil? (state (execute "COMMIT"))))
+  (is (= [["1" "3"]] (rows (execute "SELECT a,b FROM drift_rows")))))
+
+(deftest only-new-relations-admits-additions-and-nothing-else
+  ;; The rule itself, at the value level: a capture is compatible with a
+  ;; later one only when the later one ADDED relations. A column added to
+  ;; a relation the capture knew is a change it may have to see -- a
+  ;; default, a constraint -- so it is not admitted.
+  (let [before (basis/capture (d/db *conn*))]
+    (d/transact *conn* [{:db/ident :brand_new/id :db/valueType :db.type/long
+                         :db/cardinality :db.cardinality/one}])
+    (let [after-new (d/db *conn*)]
+      (testing "a relation the capture did not know"
+        (is (true? (basis/compatible? before after-new)))
+        (is (false? (basis/matches? before after-new))
+            "and it is genuinely not equal"))
+      (testing "a column added to a relation it did know"
+        (let [mid (basis/capture after-new)]
+          (d/transact *conn* [{:db/ident :brand_new/extra :db/valueType :db.type/long
+                               :db/cardinality :db.cardinality/one}])
+          (is (false? (basis/compatible? mid (d/db *conn*)))))))))
+

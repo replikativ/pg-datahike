@@ -208,7 +208,7 @@
 
 (defn- assert-catalog-current! [expected db]
   (when (and expected
-             (not (or (catalog-basis/matches? expected db)
+             (not (or (catalog-basis/compatible? expected db)
                       (catalog-admission/valid?
                        (::catalog-admission/certificate (meta expected)) db))))
     (let [certificate (::catalog-admission/certificate (meta expected))]
