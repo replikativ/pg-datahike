@@ -884,6 +884,40 @@
                [(apply list fn-param args) result-var])
         result-var)
 
+      ;; The session functions, in an expression. Each was answerable
+      ;; only as a whole statement (classify + a handler), so
+      ;; `SELECT pg_backend_pid(), 1` and `WHERE pid = pg_backend_pid()`
+      ;; raised 42883 on a server where `SELECT pg_backend_pid()` works.
+      ;; Both read what the session-state atom carries: a Datalog
+      ;; function runs off this connection's thread, and the atom is the
+      ;; one thing it can still reach.
+      (= fname "pg_backend_pid")
+      (let [_ (params/session-dependent!)
+            fn-param (symbol (str "?pid" (swap! (:var-counter ctx) inc)))
+            state params/*session-state*
+            impl-fn (fn [] (or (some-> state deref :backend-pid) 0))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+        result-var)
+
+      ;; The transaction id is read when the row is produced, not when
+      ;; the statement is translated: the session carries a thunk, so a
+      ;; prepared statement re-executed later reports the transaction it
+      ;; runs in rather than the one it was planned in.
+      (= fname "txid_current")
+      (let [_ (params/session-dependent!)
+            fn-param (symbol (str "?txid" (swap! (:var-counter ctx) inc)))
+            state params/*session-state*
+            impl-fn (fn []
+                      (if-let [f (some-> state deref :current-tx-id)]
+                        (or (f) 0)
+                        0))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param) result-var])
+        result-var)
+
       ;; current_database() / current_schema() used inline as a value
       ;; expression — the sole-select path is classified by
       ;; datahike.pg.sql.classify, but column-position use lands here.
