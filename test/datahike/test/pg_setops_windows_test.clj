@@ -205,3 +205,37 @@
       (is (= ["5" "1"]
              (col c 1 (str "(SELECT id FROM ft ORDER BY id DESC LIMIT 1) "
                            "UNION ALL (SELECT id FROM ft ORDER BY id LIMIT 1)")))))))
+
+(deftest a-window-column-keeps-its-place-in-a-derived-table
+  ;; The window executor APPENDS its values to each row, and the derived
+  ;; table read them back in that order -- so `SELECT *` over a subquery
+  ;; whose middle column is a window function answered the columns in
+  ;; the wrong ORDER, silently. Each spec carries its target-list
+  ;; position and the top-level path has always restored them by it.
+  ;;
+  ;; Metabase's column introspection is exactly this shape, and its
+  ;; `row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS
+  ;; attnum` came back last, shifting every column after it.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE wp (id int, a text, b text)")
+    (exec! c "INSERT INTO wp VALUES (1,'a1','b1'),(2,'a2','b2')")
+    (let [row (fn [sql]
+                (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+                  (.next rs)
+                  (let [n (.getColumnCount (.getMetaData rs))]
+                    (mapv #(.getString rs (int %)) (range 1 (inc n))))))]
+      (testing "the window column is where the SELECT list put it"
+        (is (= ["a1" "1" "b1"]
+               (row "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY id) AS rn, b FROM wp) x")))
+        (is (= ["1" "a1" "b1"]
+               (row "SELECT * FROM (SELECT row_number() OVER (ORDER BY id) AS rn, a, b FROM wp) x")))
+        (is (= ["a1" "b1" "1"]
+               (row "SELECT * FROM (SELECT a, b, row_number() OVER (ORDER BY id) AS rn FROM wp) x"))))
+      (testing "two of them, around an ordinary column"
+        (is (= ["a1" "2" "1" "1"]
+               (row (str "SELECT * FROM (SELECT a, count(*) OVER () AS c, id, "
+                         "row_number() OVER (ORDER BY id) AS rn FROM wp) x")))))
+      (testing "naming the columns was always right, and still is"
+        (is (= ["a1" "1" "b1"]
+               (row (str "SELECT x.a, x.rn, x.b FROM (SELECT a, row_number() OVER (ORDER BY id) AS rn, "
+                         "b FROM wp) x"))))))))

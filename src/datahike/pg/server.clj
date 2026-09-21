@@ -687,8 +687,6 @@
               -1)))
         find-aliases)))))
 
-(declare window-projection-indices)
-
 (defn- select-output-shape
   "The visible output [aliases oids] of one SELECT plan, as Execute streams
    it. `oids` holds nil where the column is statically unknown -- Describe
@@ -732,7 +730,7 @@
                                 :avg PgWireServer/OID_NUMERIC
                                 nil)))
                 all-oids (into oids (map win-oid) wspecs)
-                vis (window-projection-indices aliases wspecs)]
+                vis (window/window-projection-indices aliases wspecs)]
             [(mapv #(nth all-aliases %) vis) (mapv #(nth all-oids %) vis)])
           [aliases oids])
         [aliases oids]
@@ -6863,37 +6861,6 @@
    (DDL mints a new schema map → recompile)."
   (pg-cache/bounded-cache 512))
 
-(defn- window-projection-indices
-  "Indices that restore window outputs to their SQL target-list positions.
-
-   The Datalog query carries ordinary outputs and hidden __win_* inputs;
-   the window executor appends computed values. PostgreSQL exposes neither
-   implementation detail and preserves the original SELECT-list order."
-  [base-aliases window-specs]
-  (let [base-indices (vec (keep-indexed
-                           (fn [i a]
-                             (when-not (and (string? a)
-                                            (.startsWith ^String a "__win_"))
-                               i))
-                           base-aliases))
-        window-start (count base-aliases)
-        window-by-pos (into {}
-                            (map-indexed
-                             (fn [i spec]
-                               [(or (:out-pos spec)
-                                    (+ (count base-indices) i))
-                                (+ window-start i)]))
-                            window-specs)
-        n (+ (count base-indices) (count window-specs))]
-    (loop [pos 0
-           base (seq base-indices)
-           out []]
-      (if (= pos n)
-        out
-        (if-let [window-idx (get window-by-pos pos)]
-          (recur (inc pos) base (conj out window-idx))
-          (recur (inc pos) (next base) (conj out (first base))))))))
-
 (defn- compile-fast-select
   "Compile a parsed plain SELECT into a direct executor: datalog query +
    ParamRef argument template + precomputed result shape. Returns nil when
@@ -7647,7 +7614,7 @@
                                         (or (:alias spec) (name (:op spec))))
                                       window-specs)
                     new-aliases (into (vec find-aliases) win-aliases)
-                    visible-indices (window-projection-indices find-aliases window-specs)
+                    visible-indices (window/window-projection-indices find-aliases window-specs)
                     final-results (mapv (fn [row]
                                           (mapv #(nth row % nil) visible-indices))
                                         windowed)

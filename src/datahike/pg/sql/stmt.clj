@@ -2515,11 +2515,13 @@
                        (mapv (fn [r] (if (sequential? r) (vec r) [r])) sub-results)
                        win-specs)
                  aliases (into (vec sub-aliases) (map :alias) win-specs)
-                 keep-idx (vec (keep-indexed
-                                (fn [i a] (when-not (and (string? a)
-                                                         (.startsWith ^String a "__win_"))
-                                            i))
-                                aliases))]
+                 ;; The window executor APPENDS its values, and reading
+                 ;; them back in that order put the window column last:
+                 ;; `SELECT * FROM (SELECT a, row_number() OVER (…) rn, b
+                 ;; FROM t) x` answered a, b, rn. Each spec knows its
+                 ;; target-list position, and the top-level path has
+                 ;; always restored them by it; so does this one now.
+                 keep-idx (window/window-projection-indices sub-aliases win-specs)]
              [(mapv (fn [r] (mapv #(nth r % nil) keep-idx)) rows)
               (mapv #(nth aliases %) keep-idx)
               (when sub-oids

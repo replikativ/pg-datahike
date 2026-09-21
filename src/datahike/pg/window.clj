@@ -453,6 +453,37 @@
                       :__null__))))))
     (persistent! result)))
 
+(defn window-projection-indices
+  "Indices that restore window outputs to their SQL target-list positions.
+
+   The Datalog query carries ordinary outputs and hidden __win_* inputs;
+   the window executor appends computed values. PostgreSQL exposes neither
+   implementation detail and preserves the original SELECT-list order."
+  [base-aliases window-specs]
+  (let [base-indices (vec (keep-indexed
+                           (fn [i a]
+                             (when-not (and (string? a)
+                                            (.startsWith ^String a "__win_"))
+                               i))
+                           base-aliases))
+        window-start (count base-aliases)
+        window-by-pos (into {}
+                            (map-indexed
+                             (fn [i spec]
+                               [(or (:out-pos spec)
+                                    (+ (count base-indices) i))
+                                (+ window-start i)]))
+                            window-specs)
+        n (+ (count base-indices) (count window-specs))]
+    (loop [pos 0
+           base (seq base-indices)
+           out []]
+      (if (= pos n)
+        out
+        (if-let [window-idx (get window-by-pos pos)]
+          (recur (inc pos) base (conj out window-idx))
+          (recur (inc pos) (next base) (conj out (first base))))))))
+
 ;; ============================================================================
 ;; Main entry point
 ;; ============================================================================
