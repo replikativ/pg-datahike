@@ -653,6 +653,10 @@
                         visible-rows)]
       (-> base
           (assoc :column-order aliases)
+          ;; PostgreSQL tags CTAS with the SELECT's row count ("SELECT 3"),
+          ;; not "CREATE TABLE"; when IF NOT EXISTS skips the work it says
+          ;; "CREATE TABLE AS". Both need to know this was a CTAS.
+          (assoc :ctas? true :ctas-rows (count data-tx))
           (assoc :column-type-oids
                  (into {} (map vector aliases oids)))
           (update :tx-data into (concat (mapv :schema col-specs) data-tx))))))
@@ -2217,6 +2221,7 @@
                                 :view-name (unquote-ident obj-name)
                                 :if-exists? (.isIfExists d)}
                         {:type :ddl-drop :table obj-name
+                         :if-exists? (.isIfExists d)
                          :cascade? (boolean (some #(= "cascade" (str/lower-case (str %)))
                                                   (.getParameters d)))}))
 
