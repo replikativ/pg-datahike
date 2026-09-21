@@ -136,3 +136,31 @@
   (testing "an ON join is unchanged: both columns, both emitted"
     (is (= [["1" "10" "7" "1" "100" "7"] ["2" "20" "8" "2" "200" "99"]]
            (rows "SELECT * FROM ug_a JOIN ug_b ON ug_a.id = ug_b.id ORDER BY ug_a.id")))))
+
+(deftest a-column-alias-list-renames-a-derived-tables-columns
+  ;; `FROM (SELECT …) AS s(a,b)` RENAMES the relation's columns, left to
+  ;; right: `SELECT a FROM (SELECT 1 AS x) AS s(a)` reads the renamed
+  ;; column, and `x` is gone. Only the `FROM (VALUES …) AS v(a,b)` path
+  ;; passed those aliases to the materialiser, so every other derived
+  ;; table answered 42703 for its own declared name.
+  ;;
+  ;; Naming more columns than the relation has is 42P10; naming fewer
+  ;; leaves the rest under their own names. Expectations are a
+  ;; PostgreSQL 17 oracle's.
+  (testing "the alias list renames"
+    (is (= "1" (v "SELECT a FROM (SELECT 1 AS x) AS s(a)")))
+    (is (= "1" (v "SELECT s.a FROM (SELECT 1 AS x) AS s(a)")))
+    (is (= [["1" "2"]] (rows "SELECT a, b FROM (SELECT 1 AS x, 2 AS y) AS s(a,b)"))))
+  (testing "fewer aliases than columns leaves the rest alone"
+    (is (= [["1" "2"]] (rows "SELECT a, y FROM (SELECT 1 AS x, 2 AS y) AS s(a)"))))
+  (testing "more aliases than columns is 42P10"
+    (let [r (run "SELECT * FROM (SELECT 1 AS x) AS s(a,b)")]
+      (is (= "42P10" (.-sqlstate ^PgWireServer$QueryResult r)))
+      (is (re-find #"has 1 columns available but 2 columns specified"
+                   (.-error ^PgWireServer$QueryResult r)))))
+  (testing "a derived table over a real relation, and VALUES as before"
+    (seed!)
+    (is (= [["1" "10"] ["2" "20"]]
+           (rows "SELECT k, w FROM (SELECT tid, v FROM c) AS s(k,w) ORDER BY 1")))
+    (is (= [["1" "2"]] (rows "SELECT * FROM (VALUES (1,2)) AS v(a,b)")))))
+

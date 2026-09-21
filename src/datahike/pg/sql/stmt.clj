@@ -2253,7 +2253,7 @@
       ;; Inner may also be a SetOperationList (UNION/INTERSECT/EXCEPT) —
       ;; handle that by translating each branch, executing, and combining.
       (or inner-ps (instance? net.sf.jsqlparser.statement.select.SetOperationList inner))
-      (materialize-set-op! inner sub-name db schema sub-alias)
+      (materialize-set-op! inner sub-name db schema sub-alias alias-cols)
 
       ;; FROM (VALUES (...), (...)) AS v(a,b). materialize-set-op! already
       ;; knows how to evaluate and type literal VALUES rows; this shape was
@@ -2594,6 +2594,22 @@
         ;; array_agg(atttypid)); use it to type array columns instead of the
         ;; runtime value class. Visible columns stay nil (value-sampled).
          sub-oids    (if corr-resolved (nth corr-resolved 2) sub-oids)
+        ;; `AS s(a,b)` RENAMES the relation's columns, left to right --
+        ;; `SELECT a FROM (SELECT 1 AS x) AS s(a)` is the inner name
+        ;; replaced, not an additional one. Naming more columns than the
+        ;; relation has is 42P10; naming fewer leaves the rest alone.
+        ;; Only the `FROM (VALUES …) AS v(a,b)` path did this, so every
+        ;; other derived table answered 42703 for its own alias.
+         _ (when (> (count explicit-aliases) (count sub-aliases))
+             (throw (errors/pg-error
+                     :invalid-column-reference
+                     {:table (or alias target-name)
+                      :available (count sub-aliases)
+                      :specified (count explicit-aliases)})))
+         sub-aliases (if (seq explicit-aliases)
+                       (into (vec (take (count explicit-aliases) explicit-aliases))
+                             (drop (count explicit-aliases) sub-aliases))
+                       sub-aliases)
          duplicate-aliases (->> sub-aliases frequencies
                                 (keep (fn [[column n]] (when (> n 1) column)))
                                 seq)

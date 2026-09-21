@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A derived table's column-alias list renames its columns
+
+`FROM (SELECT …) AS s(a,b)` renames the relation's columns, left to right — `SELECT a FROM (SELECT 1 AS x) AS s(a)` reads the renamed column, and `x` is gone. Only the `FROM (VALUES …) AS v(a,b)` path passed those aliases to the materialiser, so every other derived table answered 42703 for the name the query itself declared.
+
+Naming **more** columns than the relation has is now 42P10 (`table "s" has 1 columns available but 2 columns specified`), as in PostgreSQL; naming fewer leaves the rest under their own names.
+
 ### A record survives a materialised relation
 
 A derived table, a CTE and a set operation are **materialised**: their rows are run and stored in a speculative db, whose columns hold Datahike scalars. A composite value went in as a Java object and came back out as `datahike.pg.records.PgRecord@6f2b958e` — rendered, compared and read as that string — and `(s.r).f1` raised 42703, *could not identify column "f1" in record data type*:
