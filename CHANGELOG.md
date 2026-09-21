@@ -4,6 +4,19 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A parameter inside a derived table or a CTE
+
+```
+SELECT * FROM (SELECT id FROM t WHERE id = ?) x          0 rows, for every binding
+WITH x AS (SELECT id FROM t WHERE id = ?) SELECT * FROM x      same
+```
+
+A relation the translator has to **materialise** — a derived table, a CTE, a set operation — is produced by running its body and storing the rows in a speculative db. That happens while the statement is *parsed*, which under the extended protocol is before Bind: the body saw placeholders rather than values, matched nothing, and the relation came out empty. No error, just no rows.
+
+Literals were fine, which is why it survived: it takes a bound parameter *and* a materialised relation together, and most tests use one or the other. Metabase's column introspection uses both, and got nothing back.
+
+Such a statement is now marked while parsing and re-parsed at Execute with `params/*bound-params*` in scope, where the translator resolves the placeholders inline — the mechanism runtime subqueries already use. The parse-time plan is not cached, since the relation in it is empty.
+
 ### NOT NULL reaches the catalog
 
 `name TEXT NOT NULL` came back as `pg_attribute.attnotnull` **false** and `information_schema.columns.is_nullable` **YES**: the catalog derived not-nullness from the primary key alone. Those two columns are what a client reads to decide whether a column may be omitted from an INSERT, and what Hibernate and SQLAlchemy reflect a schema through.

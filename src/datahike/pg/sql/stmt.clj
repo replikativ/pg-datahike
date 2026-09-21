@@ -2433,11 +2433,19 @@
          run-branch (fn [{:keys [query in-args sql-limit sql-offset hidden-count
                                  project-set project-order-by project-limit project-offset]
                           :as p}]
-                      (if-let [literal-rows (:literal-rows p)]
-                        literal-rows
-                        (let [q (cond-> query
-                                  (:limit p)  (assoc :limit (:limit p))
-                                  (:offset p) (assoc :offset (:offset p)))
+                      ;; A body that reads a `$n` is run HERE, at parse
+                      ;; time, which is before Bind: the placeholders were
+                      ;; still sentinels and the relation came out empty,
+                      ;; for every binding. Mark the statement so the
+                      ;; server re-parses it at Execute, where
+                      ;; `params/*bound-params*` supplies the values.
+                      (let [_ (when (some params/param-ref? in-args)
+                                (params/materialisation-params!))]
+                        (if-let [literal-rows (:literal-rows p)]
+                          literal-rows
+                          (let [q (cond-> query
+                                    (:limit p)  (assoc :limit (:limit p))
+                                    (:offset p) (assoc :offset (:offset p)))
                            ;; If translate-select materialized derived
                            ;; tables (FROM (…) AS sub) or catalog refs
                            ;; under it, the resulting query references
@@ -2445,27 +2453,27 @@
                            ;; in :enriched-db. Run against that, falling
                            ;; back to the outer db when the branch was
                            ;; a plain table reference.
-                              exec-db (or (:enriched-db p) db)
-                              raw (if (seq in-args)
-                                    (apply q-fn q exec-db in-args)
-                                    (q-fn q exec-db))
-                              _ (when (seq project-order-by)
-                                  (throw (errors/pg-error
-                                          :feature-not-supported
-                                          {:feature "derived SELECT ordered by a set-returning function"})))
-                              raw (if (seq project-set)
-                                    (apply-project-set raw project-set)
-                                    raw)
-                              raw (cond->> raw
-                                    sql-offset (drop sql-offset)
-                                    sql-limit  (take sql-limit)
-                                    project-offset (drop project-offset)
-                                    project-limit (take project-limit))
-                              hc (or hidden-count 0)
-                              visible (- (count (:find query)) hc)
-                              raw (if (pos? hc)
-                                    (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
-                                    raw)
+                                exec-db (or (:enriched-db p) db)
+                                raw (if (seq in-args)
+                                      (apply q-fn q exec-db in-args)
+                                      (q-fn q exec-db))
+                                _ (when (seq project-order-by)
+                                    (throw (errors/pg-error
+                                            :feature-not-supported
+                                            {:feature "derived SELECT ordered by a set-returning function"})))
+                                raw (if (seq project-set)
+                                      (apply-project-set raw project-set)
+                                      raw)
+                                raw (cond->> raw
+                                      sql-offset (drop sql-offset)
+                                      sql-limit  (take sql-limit)
+                                      project-offset (drop project-offset)
+                                      project-limit (take project-limit))
+                                hc (or hidden-count 0)
+                                visible (- (count (:find query)) hc)
+                                raw (if (pos? hc)
+                                      (mapv #(if (sequential? %) (vec (take visible %)) %) raw)
+                                      raw)
                               ;; A derived SELECT has the same logical
                               ;; projection as a top-level SELECT. In
                               ;; particular, expressions over aggregates are
@@ -2473,11 +2481,11 @@
                               ;; slots and reconstructed afterward. Persisting
                               ;; the physical rows leaked `__compound_*` as a
                               ;; virtual column and omitted the declared alias.
-                              [rows _]
-                              (apply-compound-projections raw (:find-aliases p)
-                                                          query in-args
-                                                          (:compound-exprs p))]
-                          rows)))
+                                [rows _]
+                                (apply-compound-projections raw (:find-aliases p)
+                                                            query in-args
+                                                            (:compound-exprs p))]
+                            rows))))
          branch-rows (mapv run-branch (:branches branch-parsed))
          ;; Apply the same logical projection to the first branch's aliases.
          ;; Set-operation branches must agree in width; SQL takes the exposed

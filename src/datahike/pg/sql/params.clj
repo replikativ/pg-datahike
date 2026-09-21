@@ -229,6 +229,23 @@
   []
   (some-> *session-dependent?* (reset! true)))
 
+(def ^:dynamic *materialisation-params?*
+  "Atom set while translating a statement that MATERIALISES a relation --
+   a derived table or a CTE -- whose body reads a `$n`. Those rows are
+   produced by running the body at parse time, before Bind, so the body
+   would see unbound placeholders and the relation would come out EMPTY:
+   `SELECT * FROM (SELECT id FROM t WHERE id = ?) x` answered no rows at
+   all, for any binding. The server re-parses such a statement at Execute
+   with `*bound-params*` in scope, where the translator resolves the
+   placeholders inline and the body runs with real values."
+  nil)
+
+(defn materialisation-params!
+  "Mark the statement being translated as materialising a relation from a
+   parameterised body."
+  []
+  (some-> *materialisation-params?* (reset! true)))
+
 (def ^:dynamic *session-state*
   "The current pgwire connection's session-state atom while SQL is being
    translated. Session-valued expressions capture the atom (rather than a
