@@ -4,6 +4,16 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A LEFT JOIN onto a ref target keeps every left row
+
+`SELECT p.name, c.name FROM person p LEFT JOIN company c ON p.company = c.db_id` answered **no rows at all** when `person/company` is a `:db.type/ref` — an INNER join over the same columns was right, so the relation was there.
+
+The lowering was written for the other direction, the ref's owner on the joined side (`FROM transaction LEFT JOIN posting ON posting.transaction = t.db_id`), and took the joined alias for the ref's owner either way. In this direction that emitted `[?c_eid :person/company ?c_eid]` — entity and value the same variable — and left the right side's own patterns outside the join, where they filtered.
+
+The ON clause now records which side owns the ref, and this direction has its own lowering: one pattern, `[?p_eid :person/company ?c_eid]`, says the whole join; the right side is read through the joined entity variable; and the left row's own ref column stays bound outside, so a row whose ref exists but fails a further ON condition is null-extended rather than dropped.
+
+Reachable only from a Datahike-native schema, which is why no SQL-created fixture and no fuzzer corpus covered it.
+
 ### FULL JOIN answers both sides, every time
 
 Three defects, one query:

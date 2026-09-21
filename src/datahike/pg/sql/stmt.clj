@@ -579,6 +579,17 @@
                     (reset! ref-info {:ref-var ref-var
                                       :ref-attr ref-attr
                                       :right-alias target-alias
+                                      ;; Which side OWNS the ref attribute.
+                                      ;; This lowering was written for the
+                                      ;; owner on the JOINED side (`FROM
+                                      ;; transaction LEFT JOIN posting ON
+                                      ;; posting.transaction = t.db_id`) and
+                                      ;; assumed it either way, so the other
+                                      ;; direction emitted a pattern whose
+                                      ;; entity and value were one variable
+                                      ;; and the join answered nothing.
+                                      :owner-on-left? (= target-alias right-alias)
+                                      :owner-evar (ctx/entity-var! ctx (alias-of ref-resolved))
                                       :left-table-evar original-left-evar
                                       :left-evar (ctx/entity-var! ctx (:default-table ctx))})
                     (swap! (:left-join-evars ctx) conj ref-var)))
@@ -612,6 +623,12 @@
                       (reset! ref-info {:ref-var ref-var
                                         :ref-attr (if (vector? ref-side) (nth ref-side 2) ref-side)
                                         :right-alias db-id-alias
+                                        ;; See :owner-on-left? above: the
+                                        ;; db_id side is the JOINED table
+                                        ;; when the ref's owner is the one
+                                        ;; we are joining FROM.
+                                        :owner-on-left? (= db-id-alias right-alias)
+                                        :owner-evar (ctx/entity-var! ctx (alias-of ref-side))
                                         ;; Original LEFT entity-var
                                         ;; (the one OUR alias points to,
                                         ;; e.g. ?t_eid for "t"). Used by
@@ -5764,40 +5781,121 @@
                 ;; the LEFT alias's entity-var (e.g. ?t_eid) is still
                 ;; intact here. We pull it from ref-info's
                 ;; :left-table-evar field.
-                (let [{:keys [ref-var ref-attr left-table-evar matched-only-preds]} ref-info
-                      owner-evar (ctx/entity-var! ctx alias)
-                      all-clauses @(:where-clauses ctx)
+                (if (:owner-on-left? ref-info)
+                  ;; THE OTHER DIRECTION: the ref's owner is the table we
+                  ;; are joining FROM, and its value IS the joined
+                  ;; entity -- `FROM person p LEFT JOIN company c ON
+                  ;; p.company = c.db_id`. One pattern says the whole
+                  ;; join, `[?p_eid :person/company ?c_eid]`; matched
+                  ;; reads the right side through ?c_eid, unmatched says
+                  ;; this left row has no such company and nulls it.
+                  ;;
+                  ;; The branch below assumed the owner was always the
+                  ;; JOINED side, so it took the joined alias for the
+                  ;; owner and emitted `[?c_eid :person/company ?c_eid]`
+                  ;; -- entity and value one variable -- and the join
+                  ;; answered NOTHING, for every row.
+                  (let [{:keys [ref-var ref-attr owner-evar matched-only-preds]} ref-info
+                        right-evar (ctx/entity-var! ctx alias)
+                        all-clauses @(:where-clauses ctx)
+                        ref-binding? (fn [c]
+                                       (and (vector? c) (= 3 (count c))
+                                            (= ref-attr (second c))
+                                            (= ref-var (nth c 2))))
+                        right-side? (fn [c]
+                                      (or (and (vector? c) (= 3 (count c))
+                                               (= right-evar (first c))
+                                               (keyword? (second c)))
+                                          (and (vector? c) (= 2 (count c))
+                                               (seq? (first c))
+                                               (= 'get-else (first (first c)))
+                                               (= right-evar (nth (vec (first c)) 2 nil)))))
+                        right-clauses (vec (filter right-side? all-clauses))
+                        left-clauses (vec (remove (fn [c] (or (ref-binding? c) (right-side? c)))
+                                                  all-clauses))
+                        right-marker (pgs/row-marker-attr
+                                      (get (:table-aliases ctx) alias alias))
+                        right-clauses (vec (remove #(and (vector? %) (= 3 (count %))
+                                                         (= right-marker (second %)))
+                                                   right-clauses))
+                        ;; A right-side column may be missing on the
+                        ;; matched entity; read it as get-else so the row
+                        ;; still matches, with NULL for that column.
+                        right-reads (mapv (fn [c]
+                                            (if (and (vector? c) (= 3 (count c)))
+                                              [(list 'get-else '$ right-evar (second c) :__null__)
+                                               (nth c 2)]
+                                              c))
+                                          right-clauses)
+                        right-vars (vec (distinct (keep second right-reads)))
+                        ;; `p.company` itself is a LEFT column: its value
+                        ;; is the person's, matched or not, so it stays
+                        ;; bound outside the join. Binding it inside and
+                        ;; grounding it to NULL in the unmatched branch
+                        ;; made a left row whose ref exists but fails
+                        ;; another condition fit NEITHER branch -- it
+                        ;; disappeared instead of being null-extended.
+                        matched-parts (into [[owner-evar ref-attr right-evar]]
+                                            (concat right-reads matched-only-preds))
+                        pred-vars (into #{} (mapcat clause-vars) matched-only-preds)
+                        bound-outside (into #{} (mapcat clause-bound-vars) left-clauses)
+                        outer-left-vars (vec (distinct
+                                              (cons owner-evar
+                                                    (filter #(and (bound-outside %)
+                                                                  (not= % owner-evar)
+                                                                  (not= % right-evar)
+                                                                  (not= % ref-var)
+                                                                  (not (some #{%} right-vars)))
+                                                            pred-vars))))
+                        shared-vars (vec (distinct (concat outer-left-vars
+                                                           [right-evar]
+                                                           right-vars)))
+                        matched (apply list 'and matched-parts)
+                        unmatched (apply list 'and
+                                         (into [(list* 'not-join outer-left-vars matched-parts)]
+                                               (mapv (fn [v] [(list 'ground :__null__) v])
+                                                     (cons right-evar right-vars))))
+                        oj-clause (list* 'or-join shared-vars matched unmatched nil)]
+                    (swap! (:with-vars ctx) conj right-evar)
+                    (reset! (:where-clauses ctx)
+                            (if *unmatched-rows-only*
+                              (into left-clauses (rest unmatched))
+                              (conj left-clauses oj-clause))))
+
+                  (let [{:keys [ref-var ref-attr left-table-evar matched-only-preds]} ref-info
+                        owner-evar (ctx/entity-var! ctx alias)
+                        all-clauses @(:where-clauses ctx)
                       ;; The original ref pattern from the ON clause:
                       ;; `[?p_eid :posting/transaction ?ref-var]`. We
                       ;; strip it from the outer where (so it doesn't
                       ;; force iteration over postings) and re-emit
                       ;; into the matched branch.
-                      ref-binding? (fn [clause]
-                                     (and (vector? clause) (= 3 (count clause))
-                                          (= ref-attr (second clause))
-                                          (= ref-var (nth clause 2))))
+                        ref-binding? (fn [clause]
+                                       (and (vector? clause) (= 3 (count clause))
+                                            (= ref-attr (second clause))
+                                            (= ref-var (nth clause 2))))
                       ;; Right-side data patterns on ref-var (used to
                       ;; project right-side columns via the ref's
                       ;; deref'd identity).
-                      right-clause? (fn [clause]
-                                      (and (vector? clause) (= 3 (count clause))
-                                           (= ref-var (first clause))
-                                           (keyword? (second clause))))
-                      right-clauses (vec (filter right-clause? all-clauses))
+                        right-clause? (fn [clause]
+                                        (and (vector? clause) (= 3 (count clause))
+                                             (= ref-var (first clause))
+                                             (keyword? (second clause))))
+                        right-clauses (vec (filter right-clause? all-clauses))
                       ;; Outer (LEFT-driving) clauses: drop the ref-binding
                       ;; (moves into matched) and any right-clauses (those
                       ;; only make sense when matched).
-                      left-clauses (vec (remove (fn [c]
-                                                  (or (ref-binding? c)
-                                                      (right-clause? c)))
-                                                all-clauses))
+                        left-clauses (vec (remove (fn [c]
+                                                    (or (ref-binding? c)
+                                                        (right-clause? c)))
+                                                  all-clauses))
                       ;; Vars introduced by right-side patterns; needed in
                       ;; shared-vars and as :__null__ bindings in unmatched.
-                      right-vars (vec (distinct
-                                       (keep (fn [clause]
-                                               (when (and (vector? clause) (= 3 (count clause)))
-                                                 (nth clause 2)))
-                                             right-clauses)))
+                        right-vars (vec (distinct
+                                         (keep (fn [clause]
+                                                 (when (and (vector? clause) (= 3 (count clause)))
+                                                   (nth clause 2)))
+                                               right-clauses)))
                       ;; If the LEFT alias was swapped in translate-join
                       ;; (legacy / non-LEFT path that leaked here), we
                       ;; might not have left-table-evar. Fall back to
@@ -5805,36 +5903,36 @@
                       ;; LEFT-without-empty-rows but loses null-side
                       ;; semantics. The translate-join change above
                       ;; keeps left-table-evar populated for LEFT.
-                      left-evar (or left-table-evar
-                                    (when (and ref-var (not= ref-var owner-evar))
-                                      ref-var))
+                        left-evar (or left-table-evar
+                                      (when (and ref-var (not= ref-var owner-evar))
+                                        ref-var))
                       ;; ?owner-evar (the right-side entity-var) needs
                       ;; binding in both branches: matched via the ref
                       ;; data pattern; unmatched via ground :__null__.
-                      include-owner? (and owner-evar (not (some #(= owner-evar %) right-vars)))
+                        include-owner? (and owner-evar (not (some #(= owner-evar %) right-vars)))
                       ;; A second ON condition (`… AND c.name = 'Acme'`)
                       ;; was read by nobody here: the branch took the ref
                       ;; pattern and stopped, so the whole join answered
                       ;; NOTHING. It belongs in the matched branch, like
                       ;; the value-join path, and any LEFT var it reads
                       ;; has to cross into the or-join with it.
-                      pred-vars (into #{} (mapcat clause-vars) matched-only-preds)
-                      outer-left-vars (vec (distinct
-                                            (concat
-                                             (when left-evar [left-evar])
-                                             (filter (fn [v]
-                                                       (and (not= v ref-var)
-                                                            (not= v owner-evar)
-                                                            (not (some #{v} right-vars))
-                                                            (some #(contains? (clause-bound-vars %) v)
-                                                                  left-clauses)))
-                                                     pred-vars))))
-                      shared-vars (vec (distinct
-                                        (concat
-                                         outer-left-vars
-                                         [ref-var]
-                                         (when include-owner? [owner-evar])
-                                         right-vars)))
+                        pred-vars (into #{} (mapcat clause-vars) matched-only-preds)
+                        outer-left-vars (vec (distinct
+                                              (concat
+                                               (when left-evar [left-evar])
+                                               (filter (fn [v]
+                                                         (and (not= v ref-var)
+                                                              (not= v owner-evar)
+                                                              (not (some #{v} right-vars))
+                                                              (some #(contains? (clause-bound-vars %) v)
+                                                                    left-clauses)))
+                                                       pred-vars))))
+                        shared-vars (vec (distinct
+                                          (concat
+                                           outer-left-vars
+                                           [ref-var]
+                                           (when include-owner? [owner-evar])
+                                           right-vars)))
                       ;; Matched branch:
                       ;;   - the ref data pattern `[?p_eid ref-attr ?t_eid]`
                       ;;     binds owner-evar (?p_eid) and unifies its
@@ -5847,29 +5945,29 @@
                       ;;     must be bound); `[(identity left-evar)
                       ;;     ref-var]` is a function-binding (binds
                       ;;     ref-var to left-evar's value).
-                      matched-ref-bind (cond
-                                         (and include-owner? left-evar)
-                                         [[owner-evar ref-attr left-evar]
-                                          [(list 'identity left-evar) ref-var]]
-                                         include-owner?
-                                         [[owner-evar ref-attr ref-var]]
-                                         left-evar
-                                         [[(list 'identity left-evar) ref-var]]
-                                         :else [])
-                      matched-parts (vec (concat matched-ref-bind right-clauses
-                                                 matched-only-preds))
-                      matched (apply list 'and matched-parts)
+                        matched-ref-bind (cond
+                                           (and include-owner? left-evar)
+                                           [[owner-evar ref-attr left-evar]
+                                            [(list 'identity left-evar) ref-var]]
+                                           include-owner?
+                                           [[owner-evar ref-attr ref-var]]
+                                           left-evar
+                                           [[(list 'identity left-evar) ref-var]]
+                                           :else [])
+                        matched-parts (vec (concat matched-ref-bind right-clauses
+                                                   matched-only-preds))
+                        matched (apply list 'and matched-parts)
                       ;; Unmatched branch: assert no right row points at
                       ;; this LEFT, and ground all right-side + owner vars
                       ;; to :__null__. Without the LEFT entity-var we
                       ;; can't express "no right matches THIS row", so
                       ;; degrade to ref-var = :__null__ (legacy behavior).
-                      null-bindings (mapv (fn [v] [(list 'ground :__null__) v])
-                                          (cond-> (vec right-vars)
-                                            include-owner? (conj owner-evar)
-                                            true           (conj ref-var)))
-                      not-match-guard
-                      (if left-evar
+                        null-bindings (mapv (fn [v] [(list 'ground :__null__) v])
+                                            (cond-> (vec right-vars)
+                                              include-owner? (conj owner-evar)
+                                              true           (conj ref-var)))
+                        not-match-guard
+                        (if left-evar
                         ;; "no posting points at this transaction" -- and,
                         ;; when the ON clause says more, none that also
                         ;; satisfies the rest of it. Negating the ref
@@ -5879,26 +5977,26 @@
                         ;; a predicate READS come along: the others are
                         ;; display columns, and a row missing one of those
                         ;; is still a match.
-                        (if (seq matched-only-preds)
-                          [(list* 'not-join outer-left-vars
-                                  (concat matched-ref-bind
-                                          (filter (fn [c]
-                                                    (some #(contains? pred-vars %)
-                                                          (clause-vars c)))
-                                                  right-clauses)
-                                          matched-only-preds))]
-                          (let [inner-eid (gensym "?lj-inner-")]
-                            [(list 'not-join [left-evar]
-                                   [inner-eid ref-attr left-evar])]))
+                          (if (seq matched-only-preds)
+                            [(list* 'not-join outer-left-vars
+                                    (concat matched-ref-bind
+                                            (filter (fn [c]
+                                                      (some #(contains? pred-vars %)
+                                                            (clause-vars c)))
+                                                    right-clauses)
+                                            matched-only-preds))]
+                            (let [inner-eid (gensym "?lj-inner-")]
+                              [(list 'not-join [left-evar]
+                                     [inner-eid ref-attr left-evar])]))
                         ;; legacy: ref-var = :__null__
-                        [[(list '= ref-var :__null__)]])
-                      unmatched (apply list 'and
-                                       (concat not-match-guard null-bindings))
-                      oj-clause (list* 'or-join shared-vars matched unmatched nil)]
-                  (reset! (:where-clauses ctx)
-                          (if *unmatched-rows-only*
-                            (into left-clauses (rest unmatched))
-                            (conj left-clauses oj-clause)))))))
+                          [[(list '= ref-var :__null__)]])
+                        unmatched (apply list 'and
+                                         (concat not-match-guard null-bindings))
+                        oj-clause (list* 'or-join shared-vars matched unmatched nil)]
+                    (reset! (:where-clauses ctx)
+                            (if *unmatched-rows-only*
+                              (into left-clauses (rest unmatched))
+                              (conj left-clauses oj-clause))))))))
 
         nullable-order-vars (atom #{})
 

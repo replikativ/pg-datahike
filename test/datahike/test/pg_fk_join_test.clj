@@ -5,7 +5,7 @@
    `a.fk` surfaces as the entity-id and `b.pk` is the user's business
    key. Covers both the auto-detected case (RHS is :db.unique/identity)
    and the hint-driven case (:datahike.pg/references override)."
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
             [datahike.pg.schema :as pgs]
             [datahike.pg.server :as pg])
@@ -114,3 +114,36 @@
            (pairs c "SELECT p.name, c.name FROM person p JOIN company c
                      ON p.company = c.id
                      WHERE c.name = 'Globex' ORDER BY p.name")))))
+
+(deftest a-left-join-onto-a-ref-target-keeps-every-left-row
+  ;; `person.company` is a :db.type/ref; the join reaches the target by
+  ;; its entity id. The lowering was written for the other direction --
+  ;; the ref OWNER on the joined side, as in `FROM transaction LEFT JOIN
+  ;; posting ON posting.transaction = t.db_id` -- and took the joined
+  ;; alias to be the ref's owner either way, emitting a pattern whose
+  ;; entity and value are the same variable. The join then answered
+  ;; NOTHING AT ALL, for every row.
+  (with-open [c (jdbc)]
+    (is (= [["Alice"   "Acme"]
+            ["Bob"     "Acme"]
+            ["Charlie" "Globex"]]
+           (pairs c "SELECT p.name, c.name FROM person p LEFT JOIN company c
+                       ON p.company = c.db_id
+                     ORDER BY p.name")))
+    (testing "a person without a company is kept, with NULLs"
+      (d/transact *conn* [{:person/id 4 :person/name "Dana"}])
+      (is (= [["Alice"   "Acme"]
+              ["Bob"     "Acme"]
+              ["Charlie" "Globex"]
+              ["Dana"    nil]]
+             (pairs c "SELECT p.name, c.name FROM person p LEFT JOIN company c
+                         ON p.company = c.db_id
+                       ORDER BY p.name"))))
+    (testing "every ON condition applies here too"
+      (is (= [["Alice"   "Acme"]
+              ["Bob"     "Acme"]
+              ["Charlie" nil]
+              ["Dana"    nil]]
+             (pairs c "SELECT p.name, c.name FROM person p LEFT JOIN company c
+                         ON p.company = c.db_id AND c.name = 'Acme'
+                       ORDER BY p.name"))))))
