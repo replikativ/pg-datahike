@@ -911,3 +911,59 @@
         ;; and no further result follows the empty fragment
         (is (false? (.getMoreResults st)))
         (is (= -1 (.getUpdateCount st)))))))
+
+(deftest test-insert-then-update-survives-a-concurrent-commit
+  ;; A transaction that INSERTs and then UPDATEs is the shape every ORM
+  ;; writes, and it aborted with 40001 the moment ANY other session
+  ;; committed -- in any table, on any row. The rebase refused outright
+  ;; whenever the buffer held an insert ("concurrent update after inserts
+  ;; in this transaction"), because replaying it gives the inserted rows
+  ;; FRESH speculative eids and the eid->tempid map the later statements
+  ;; resolve through would have named eids that no longer exist. It is
+  ;; rebuilt from the replay report instead.
+  ;;
+  ;; Measured before the fix: 4 sessions x 25 such transactions, each on
+  ;; its OWN table, aborted 52 of 100 times.
+  (with-conn [a {:preferQueryMode "simple"}]
+    (with-open [seed (.createStatement a)]
+      (.execute seed "CREATE TABLE iu (id INTEGER, s TEXT)")
+      (.execute seed "CREATE TABLE iu_other (id INTEGER)"))
+    (.setAutoCommit a false)
+    (with-open [sta (.createStatement a)]
+      (.executeUpdate sta "INSERT INTO iu (id, s) VALUES (1, 'a')")
+      ;; Another session commits, to an unrelated table, while A is open.
+      (with-conn [b {:preferQueryMode "simple"}]
+        (.setAutoCommit b true)
+        (with-open [stb (.createStatement b)]
+          (.executeUpdate stb "INSERT INTO iu_other (id) VALUES (9)")))
+      ;; The UPDATE lands on the row A inserted -- through the rebase.
+      (.executeUpdate sta "UPDATE iu SET s = 'b' WHERE id = 1")
+      (.commit a)
+      (with-open [rs (.executeQuery sta "SELECT id, s FROM iu ORDER BY id")]
+        (is (.next rs))
+        (is (= 1 (.getInt rs 1)))
+        (is (= "b" (.getString rs 2)) "the update must have reached the inserted row")
+        (is (not (.next rs)) "exactly one row")))))
+
+(deftest test-insert-then-update-still-aborts-on-a-real-overlap
+  ;; The rebase may carry an insert, but not over a write that would be
+  ;; lost: session B retracts the row A is updating.
+  (with-conn [a {:preferQueryMode "simple"}]
+    (with-open [seed (.createStatement a)]
+      (.execute seed "CREATE TABLE iu2 (id INTEGER, s TEXT)")
+      (.executeUpdate seed "INSERT INTO iu2 (id, s) VALUES (5, 'seed')"))
+    (.setAutoCommit a false)
+    (with-open [sta (.createStatement a)]
+      (.executeUpdate sta "INSERT INTO iu2 (id, s) VALUES (6, 'new')")
+      (.executeUpdate sta "UPDATE iu2 SET s = 'mine' WHERE id = 5")
+      (with-conn [b {:preferQueryMode "simple"}]
+        (.setAutoCommit b true)
+        (with-open [stb (.createStatement b)]
+          (.execute stb "TRUNCATE iu2")))
+      (try (.commit a)
+           (is false "expected serialization_failure on COMMIT")
+           (catch SQLException e
+             (is (= "40001" (.getSQLState e))
+                 (str "got " (.getSQLState e) ": " (.getMessage e)))))
+      (.rollback a))))
+

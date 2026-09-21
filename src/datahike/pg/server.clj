@@ -5447,10 +5447,6 @@
             (if (empty? buf)
               (swap! tx-state assoc :speculative-db base :begin-max-tx cur)
               (do
-                (when (seq (:eid->tempid ts))
-                  (throw (ex-info "could not serialize access due to concurrent update"
-                                  {:error :serialization-failure
-                                   :detail "concurrent update after inserts in this transaction"})))
                 (let [our-eas (tx-buffer-eas buf base)
                       their (ring-write-eas-graced (db-ring-key base) begin cur)
                       conflict? (cond
@@ -5467,7 +5463,21 @@
                     (unique-constraints/validate-report! rep)
                     (swap! tx-state assoc
                            :speculative-db (:db-after rep)
-                           :begin-max-tx cur)))))))))))
+                           :begin-max-tx cur
+                           ;; The replay assigns FRESH speculative eids to
+                           ;; this transaction's inserted rows, so the
+                           ;; eid→tempid map the later statements resolve
+                           ;; through has to be rebuilt from the report --
+                           ;; its old keys name eids that no longer exist.
+                           ;; Rebasing used to refuse outright whenever the
+                           ;; transaction held an insert, which made
+                           ;; INSERT-then-UPDATE in one transaction abort
+                           ;; with 40001 as soon as ANY other session
+                           ;; committed, in any table.
+                           :eid->tempid
+                           (into {} (keep (fn [[tid eid]]
+                                            (when (string? tid) [eid tid])))
+                                 (:tempids rep)))))))))))))
 
 (defn- unsafe-enum-marker-op?
   [op]
