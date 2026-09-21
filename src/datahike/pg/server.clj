@@ -5069,12 +5069,6 @@
                                      PgWireServer/OID_TEXT PgWireServer/OID_TEXT
                                      PgWireServer/OID_INT2 PgWireServer/OID_TEXT
                                      PgWireServer/OID_BOOL]}
-    :get-field-metadata     {:names ["oid" "attnum" "attname" "relname"
-                                     "nspname" "notnull" "isautoincrement"]
-                             :oids  [PgWireServer/OID_OID PgWireServer/OID_INT2
-                                     PgWireServer/OID_TEXT PgWireServer/OID_TEXT
-                                     PgWireServer/OID_TEXT PgWireServer/OID_BOOL
-                                     PgWireServer/OID_BOOL]}
     nil))
 
 (defn- describe-from-metadata
@@ -6018,59 +6012,6 @@
      (into-array (Class/forName "[Ljava.lang.String;") rows)
      (str "SELECT " (count rows)))))
 
-(defn- handle-get-field-metadata
-  "pgjdbc PgResultSetMetaData.fetchFieldMetaData. Extracts (tableOid,
-   attnum) pairs from pgjdbc's inline UNION ALL and resolves each via
-   our materialized catalog (reverse pg_class.oid → relname, then
-   pg_attribute for attname / attnotnull). pgjdbc only cares about the
-   per-field row; nullable / autoincrement booleans answer with
-   'not null = attnotnull' and 'autoinc = false'."
-  [{:keys [conn sql]} _parsed]
-  (let [first-pair (re-find #"SELECT\s+(\d+)\s+AS\s+oid\s*,\s*(\d+)\s+AS\s+attnum" sql)
-        rest-pairs (re-seq #"UNION\s+ALL\s+SELECT\s+(\d+)\s*,\s*(\d+)\b" sql)
-        pairs (into (if first-pair [[(Long/parseLong (nth first-pair 1))
-                                     (Long/parseLong (nth first-pair 2))]]
-                        [])
-                    (map (fn [[_ o a]]
-                           [(Long/parseLong o) (Long/parseLong a)]))
-                    rest-pairs)
-        db (d/db conn)
-        schema (dbi/-schema db)
-        tbl-by-oid (into {}
-                         (keep (fn [table]
-                                 (when-let [oid (pgs/table-oid db table)]
-                                   [oid table])))
-                         (pgs/table-names schema))
-        virtual (pgs/derive-virtual-tables schema (pgs/schema-hints db))
-        rows (into []
-                   (for [[toid anum] pairs
-                         :let [tname (get tbl-by-oid toid)
-                               cols (get-in virtual [tname :columns])
-                               col (some (fn [[idx candidate]]
-                                           (when (= anum
-                                                    (long (or (:attnum candidate)
-                                                              (inc idx))))
-                                             candidate))
-                                         (map-indexed vector cols))]
-                         :when col]
-                     (into-array String
-                                 [(str toid)
-                                  (str anum)
-                                  (:name col)
-                                  tname
-                                  "public"
-                                  (if (= :db.unique/identity (:unique col)) "t" "f")
-                                  "f"])))]
-    (PgWireServer$QueryResult.
-     (into-array String ["oid" "attnum" "attname" "relname"
-                         "nspname" "notnull" "isautoincrement"])
-     (int-array [PgWireServer/OID_OID PgWireServer/OID_INT2
-                 PgWireServer/OID_TEXT PgWireServer/OID_TEXT
-                 PgWireServer/OID_TEXT PgWireServer/OID_BOOL
-                 PgWireServer/OID_BOOL])
-     (into-array (Class/forName "[Ljava.lang.String;") rows)
-     (str "SELECT " (count rows)))))
-
 ;; --- Sequence handlers ------------------------------------------------------
 
 (def ^:private nextval-max-retries
@@ -6720,7 +6661,6 @@
       ;; Catalog probes (shape-matched in system-query?*)
       :create-index       (empty-result "CREATE INDEX")
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
-      :get-field-metadata (handle-get-field-metadata ctx parsed)
 
       ;; Transaction isolation level. SET SESSION CHARACTERISTICS sets the
       ;; session default; SET [LOCAL] TRANSACTION sets the current tx's
@@ -11509,7 +11449,7 @@
           ;; Any system query whose parse attached :metadata (via
           ;; system-result-metadata) — covers :current-database, :now,
           ;; :version, :nextval, advisory locks,
-          ;; :get-primary-keys, :get-field-metadata, :show, etc. No-row
+          ;; :get-primary-keys, :show, etc. No-row
           ;; system commands (SET, BEGIN, DECLARE CURSOR, …) have no
           ;; :metadata — they fall through to nil, i.e. NoData, which
           ;; is protocol-legal for a row-less command.

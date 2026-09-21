@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The column-metadata probe is gone; the catalog answers it
+
+pgjdbc's `ResultSetMetaData` query — the five-way join over `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type` and a LEFT JOIN onto `pg_attrdef` — was recognised by shape and answered by a handler that regexed the `(oid, attnum)` pairs out of the inline `UNION ALL` and resolved them against the Datahike schema. It ran as SQL for the first time today and answers **exactly** what PostgreSQL answers, including `attidentity != '' OR pg_get_expr(d.adbin, d.adrelid) LIKE '%nextval(%'` finding a serial column's default and yielding NULL, not false, where the column has none.
+
+What was keeping it a probe was the LEFT JOIN with a two-column ON, which multiplied one row per column into twenty — fixed in the outer-join work. Second of the three probes (plan item 0.7).
+
+pgjdbc's suite, which drives this query through `ResultSetMetaData`, is unchanged at 275 passed / 0 failed.
+
 ### The session functions work in an expression
 
 `pg_backend_pid()` and `txid_current()` were answerable only as a **whole statement** — `classify` matched the sole projection and a handler answered it — so `SELECT pg_backend_pid(), 1` and `WHERE pid = pg_backend_pid()` raised 42883 on a server where `SELECT pg_backend_pid()` works. The same shape the value functions had before they were translated.

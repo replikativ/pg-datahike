@@ -19,7 +19,7 @@
    comment hostile inputs.
 
    API:
-     (catalog-probe sql) → :get-primary-keys | :get-field-metadata | nil"
+     (catalog-probe sql) → :get-primary-keys | nil"
   (:require [clojure.string :as str]
             [datahike.pg.sql.classify :as cls]))
 
@@ -137,17 +137,6 @@
        (contains? qrefs "result.pk_name")
        (contains? qrefs "information_schema._pg_expandarray")))
 
-(defn- field-metadata?
-  "pgjdbc PgResultSetMetaData.fetchFieldMetaData — a 5-way JOIN whose
-   projection list starts with `c.oid, a.attnum, a.attname` against
-   `pg_catalog.pg_class c` and `pg_catalog.pg_attribute a`."
-  [{:keys [qrefs]}]
-  (and (contains? qrefs "c.oid")
-       (contains? qrefs "a.attnum")
-       (contains? qrefs "a.attname")
-       (contains? qrefs "pg_catalog.pg_class")
-       (contains? qrefs "pg_catalog.pg_attribute")))
-
 (defn catalog-probe
   "If sql is a SELECT that matches a known catalog-probe shape,
    return the :kind keyword the dispatch in server.clj expects; else
@@ -161,5 +150,4 @@
   (let [shape (summarize (cls/tokenize sql))]
     (when (:select? shape)
       (cond
-        (field-metadata? shape) :get-field-metadata
-        (primary-keys?   shape) :get-primary-keys))))
+        (primary-keys? shape) :get-primary-keys))))
