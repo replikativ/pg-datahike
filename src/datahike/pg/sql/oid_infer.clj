@@ -218,6 +218,9 @@
    ;; pg_typeof returns regtype, not text — this is the OID the
    ;; reporter of #19 saw and mistook for the bit type's own.
    "pg_typeof"     types/oid-regtype
+   ;; void: PostgreSQL renders it as the empty string, not NULL.
+   "pg_sleep"      types/oid-void
+   "pg_notify"     types/oid-void
    "enum_first"    :arg-type
    "enum_last"     :arg-type
    "enum_range"    types/oid-text-array

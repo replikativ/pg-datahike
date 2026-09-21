@@ -51,6 +51,7 @@
             [datahike.pg.errors :as errors]
             [datahike.pg.records :as pg-rec]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.locks :as locks]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.cast :as sql-cast]
             [datahike.pg.sql.coerce :as coerce]
@@ -275,7 +276,19 @@
   [^String name]
   (let [;; JSqlParser renders a qualified ANALYTIC name with a space
         ;; (`pg_catalog row_number`), not with the dot it parsed.
-        raw-name (str/replace (str/lower-case name) \space \.)
+        spaced (str/replace name \space \.)
+        ;; A QUOTED name keeps its case and loses its quotes; an unquoted
+        ;; one folds down, which is all quoting does in PostgreSQL's
+        ;; lexer. The quotes used to stay part of the name, so
+        ;; `SELECT "upper"('a')` and psycopg2's `SELECT "pg_notify"(…)`
+        ;; -- it quotes every identifier it composes -- resolved to
+        ;; nothing and answered 42883.
+        fold (fn [^String seg]
+               (if (and (> (count seg) 1)
+                        (str/starts-with? seg "\"") (str/ends-with? seg "\""))
+                 (str/replace (subs seg 1 (dec (count seg))) "\"\"" "\"")
+                 (str/lower-case seg)))
+        raw-name (str/join "." (map fold (str/split spaced #"\.")))
         strip (fn [^String prefix] (subs raw-name (count prefix)))]
     (cond
       (str/starts-with? raw-name "pg_catalog.")
@@ -766,12 +779,39 @@
     (and (string? v) (str/blank? v)) (pg-arr/array :int8 [])
     :else (coerce-pg-array v)))
 
+(def ^:private advisory-fn-kinds
+  "The advisory-lock functions a translated expression can answer, and
+   what each does. They were whole-statement handlers only, so
+   `SELECT pg_try_advisory_lock(1), 2` -- or the same call inside a CASE,
+   which is how a migration tool guards a step -- was 42883."
+  {"pg_advisory_lock"           {:op :lock       :xact? false}
+   "pg_advisory_xact_lock"      {:op :lock       :xact? true}
+   "pg_try_advisory_lock"       {:op :try-lock   :xact? false}
+   "pg_try_advisory_xact_lock"  {:op :try-lock   :xact? true}
+   "pg_advisory_unlock"         {:op :unlock     :xact? false}
+   "pg_advisory_unlock_all"     {:op :unlock-all :xact? false}})
+
+(defn- advisory-key
+  "The registry key for an advisory call's arguments: one bigint, or the
+   PAIR for the two-key namespace, which PostgreSQL keeps distinct from
+   the single-key one."
+  [vals]
+  (let [vals (mapv (fn [v] (if (number? v) (long v) v)) (remove #(= :__null__ %) vals))]
+    (case (count vals)
+      1 (first vals)
+      2 (vec vals)
+      nil)))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
   [ctx ^Function f]
-  (let [raw-name (str/lower-case (.getName f))
-        fname (resolution-name raw-name)
+  (let [;; NOT lower-cased here: `resolution-name` folds an UNQUOTED name
+        ;; and strips the quotes from a quoted one, which is the only
+        ;; thing quoting does. Folding first made `"UPPER"('a')` resolve
+        ;; to `upper`, where PostgreSQL says the function does not exist.
+        raw-name (resolution-name (.getName f))
+        fname raw-name
         ;; The SQL keyword call forms -- `substring(s FROM 1 FOR 2)`,
         ;; `position('a' IN s)`, `trim(BOTH ' ' FROM s)` -- put their
         ;; operands in a NamedExpressionList and leave .getParameters
@@ -910,6 +950,83 @@
       ;; Both read what the session-state atom carries: a Datalog
       ;; function runs off this connection's thread, and the atom is the
       ;; one thing it can still reach.
+      ;; `pg_sleep` and `pg_notify` answer without reading the session at
+      ;; all, so unlike the ones below they stay cacheable. Both were
+      ;; whole-statement handlers, which made `SELECT pg_sleep(0), 2`
+      ;; 42883 on a server where `SELECT pg_sleep(0)` works.
+      ;;
+      ;; A `void` function renders as the EMPTY STRING in PostgreSQL, not
+      ;; as NULL -- `SELECT pg_sleep(0), 2` prints `|2`.
+      (= fname "pg_sleep")
+      (let [fn-param (symbol (str "?sleep" (swap! (:var-counter ctx) inc)))
+            ;; Capped, as the statement handler capped it: `pg_sleep(99999)`
+            ;; is a denial of service, not a query.
+            impl-fn (fn [secs]
+                      (let [ms (long (min 60000 (Math/round (* 1000.0 (double (if (number? secs) secs 0))))))]
+                        (when (pos? ms) (Thread/sleep ms))
+                        ""))
+            arg (if (seq arg-exprs)
+                  (translate-expr ctx (first arg-exprs))
+                  0)
+            arg (if (seq? arg) (ctx/materialize-arg! ctx arg) arg)]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(list fn-param arg) result-var])
+        result-var)
+
+      ;; There is no LISTEN delivery here, so notifying is observably the
+      ;; same as delivering to zero subscribers -- the statement handler
+      ;; already treated it that way.
+      (= fname "pg_notify")
+      (let [fn-param (symbol (str "?notify" (swap! (:var-counter ctx) inc)))
+            args (mapv (fn [a]
+                         (let [v (translate-expr ctx a)]
+                           (if (seq? v) (ctx/materialize-arg! ctx v) v)))
+                       arg-exprs)
+            impl-fn (fn [& _] "")]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
+      ;; The advisory locks, in an expression. They need the SESSION --
+      ;; the registry is keyed by it -- so they read it from the
+      ;; session-state atom, the one thing a Datalog function running off
+      ;; this connection's thread can reach, and the plan is marked
+      ;; session-dependent so it is not shared.
+      (contains? advisory-fn-kinds fname)
+      (let [_ (params/session-dependent!)
+            {:keys [xact? op]} (get advisory-fn-kinds fname)
+            fn-param (symbol (str "?adv" (swap! (:var-counter ctx) inc)))
+            state params/*session-state*
+            args (mapv (fn [a]
+                         (let [v (translate-expr ctx a)]
+                           (if (seq? v) (ctx/materialize-arg! ctx v) v)))
+                       arg-exprs)
+            impl-fn
+            (fn [& vals]
+              (let [sid (some-> state deref :session-id)
+                    key (advisory-key vals)]
+                (cond
+                  (nil? sid) :__null__
+                  ;; `pg_advisory_xact_lock` outside a transaction is
+                  ;; 25P01 in PostgreSQL, and the statement handler
+                  ;; raised it; keep that.
+                  (and xact? (not (some-> state deref :tx-state deref :in-tx?)))
+                  (throw (errors/pg-error
+                          :no-active-transaction
+                          {:message (str fname " requires a transaction")}))
+                  :else
+                  (case op
+                    :lock       (do (locks/advisory-lock! key sid xact?) "")
+                    :try-lock   (boolean (locks/advisory-lock-try! key sid xact?))
+                    :unlock     (boolean (locks/advisory-unlock! key sid))
+                    :unlock-all (do (locks/release-advisory-locks! sid) "")))))]
+        (swap! (:in-params ctx) conj fn-param)
+        (swap! (:in-args ctx) conj impl-fn)
+        (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
+        result-var)
+
       (= fname "pg_backend_pid")
       (let [_ (params/session-dependent!)
             fn-param (symbol (str "?pid" (swap! (:var-counter ctx) inc)))

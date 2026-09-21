@@ -159,47 +159,31 @@
   (is (= :currval          (kind "SELECT currval('foo')")))
   (is (= :setval           (kind "SELECT setval('foo', 10)"))))
 
-(deftest classify-advisory-lock-args
-  (is (= {:kind :advisory-lock       :args [42]}
-         (c/classify "SELECT pg_advisory_lock(42)")))
-  (is (= {:kind :try-advisory-lock   :args [42]}
-         (c/classify "SELECT pg_try_advisory_lock(42)")))
-  (is (= {:kind :advisory-xact-lock  :args [1 2]}
-         (c/classify "SELECT pg_advisory_xact_lock(1, 2)")))
-  (is (= {:kind :try-advisory-xact-lock :args [-99]}
-         (c/classify "SELECT pg_try_advisory_xact_lock(-99)")))
-  (is (= {:kind :advisory-unlock     :args [42]}
-         (c/classify "SELECT pg_advisory_unlock(42)")))
-  (is (= {:kind :advisory-unlock-all}
-         (c/classify "SELECT pg_advisory_unlock_all()"))))
-
-(deftest classify-pg-sleep-duration
-  (is (= [0] (:args (c/classify "SELECT pg_sleep(0)"))))
-  (is (= [3] (:args (c/classify "SELECT pg_sleep(3)"))))
-  ;; fractional not numerically captured (we only take longs); pg_sleep's
-  ;; integer path is what migrations use. Fractional still classifies as
-  ;; :pg-sleep so the handler runs.
-  (is (= :pg-sleep (kind "SELECT pg_sleep(0.5)"))))
-
-(deftest classify-pg-notify
-  ;; Odoo's bus issues `SELECT pg_notify(channel, payload)` from a
-  ;; post-commit hook on every model write. We classify it as a void
-  ;; no-op so it doesn't fall through to the JSqlParser path (which
-  ;; would route it to datalog and fail on the unknown function).
-  ;;
-  ;; psycopg2's SQL.identifier() always double-quotes the function
-  ;; name, so the load-bearing form is the quoted variant; the bare
-  ;; form is included for parity.
-  (is (= :pg-notify (kind "SELECT pg_notify('imbus', '{}')")))
-  (is (= :pg-notify (kind "SELECT \"pg_notify\"('imbus', '{}')"))))
+(deftest advisory-locks-sleep-and-notify-are-translated-not-classified
+  ;; They were whole-statement shortcuts, which answered 42883 for the
+  ;; same call written inside an expression -- `SELECT pg_sleep(0), 2`,
+  ;; or the `CASE WHEN pg_try_advisory_lock(…)` a migration tool guards
+  ;; a step with. They are ordinary translated functions now, so the
+  ;; classifier hands the whole family to the SQL path.
+  (doseq [sql ["SELECT pg_advisory_lock(42)"
+               "SELECT pg_try_advisory_lock(42)"
+               "SELECT pg_advisory_xact_lock(1, 2)"
+               "SELECT pg_try_advisory_xact_lock(-99)"
+               "SELECT pg_advisory_unlock(42)"
+               "SELECT pg_advisory_unlock_all()"
+               "SELECT pg_sleep(0)"
+               "SELECT pg_sleep(0.5)"
+               "SELECT pg_notify('imbus', '{}')"
+               "SELECT \"pg_notify\"('imbus', '{}')"
+               "SELECT \"pg_advisory_lock\"(42)"
+               "SELECT \"pg_sleep\"(0)"]]
+    (is (= :generic-sql (kind sql)) sql)))
 
 (deftest classify-quoted-system-fns
   ;; Regression: psycopg2 quotes EVERY system function it composes via
   ;; SQL.identifier (Odoo's bus uses pg_notify; future modules could
   ;; quote pg_advisory_lock etc.). Make sure the function-name
   ;; dispatch in classify-select accepts both bare and quoted forms.
-  (is (= :advisory-lock (kind "SELECT \"pg_advisory_lock\"(42)")))
-  (is (= :pg-sleep      (kind "SELECT \"pg_sleep\"(0)")))
   ;; A quoted value function is the translator's too.
   (is (= :generic-sql   (kind "SELECT \"now\"()")))
   (is (= :generic-sql   (kind "SELECT \"current_database\"()"))))

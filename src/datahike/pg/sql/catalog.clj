@@ -2054,9 +2054,7 @@
     :set-session-isolation :set-transaction-isolation
     :set-session-access :set-transaction-access
     :nextval :currval :lastval :setval
-    :try-advisory-xact-lock :try-advisory-lock
-    :advisory-xact-lock :advisory-unlock-all :advisory-unlock :advisory-lock
-    :pg-backend-pid :txid-current :pg-sleep :pg-notify
+    :pg-backend-pid :txid-current
     :comment-on :lock-table :create-index
     :maintenance-noop :schema-noop
     :create-database :drop-database

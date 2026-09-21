@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### The last server shortcuts are translated: advisory locks, pg_sleep, pg_notify
+
+Eight functions were answerable only as a **whole statement** — the classifier matched the sole projection and a handler answered it — so the same call written anywhere else was 42883 on a server where the bare form works:
+
+```sql
+SELECT pg_sleep(0), 2                                       -- was 42883
+SELECT CASE WHEN pg_try_advisory_lock(1) THEN 'got' END     -- was 42883
+```
+
+That second one is how a migration tool (Flyway, Alembic, Ecto, Rails) guards a step, so the shortcut turned the guard into an error.
+
+All eight are ordinary translated functions now, and the shortcuts are deleted — the classifier hands the whole family to the SQL path. `pg_sleep` and `pg_notify` need no session and stay cacheable; the advisory locks read the session id the registry is keyed by from the session-state atom, which is what a Datalog function running off the connection's thread can reach, and their plans are marked session-dependent so they are never shared. The lock registry moved to `datahike.pg.locks`, which the SQL layer can require.
+
+Fixing the quoted form that psycopg2 emits (`SELECT "pg_notify"(…)` — it quotes every identifier it composes) meant fixing function-name folding generally: a quoted name kept its quotes and resolved to nothing, so `SELECT "upper"('a')` was 42883 too. Quoting only prevents case folding, so a quoted name now loses its quotes and keeps its case — and `SELECT "UPPER"('a')` is 42883, as in PostgreSQL, because `pg_proc` holds `upper`.
+
+The semantics are unchanged and checked through the new path: exclusion across sessions, re-entrancy (two locks need two unlocks), the distinct two-key namespace, release at COMMIT for `pg_advisory_xact_lock` and on connection close, and 25P01 for a transaction-level lock outside a transaction. A `void` function renders as the empty string, as in PostgreSQL.
+
 ### INSERT then UPDATE in one transaction survives a concurrent commit
 
 A transaction that inserts a row and then updates it — the shape every ORM writes — aborted with 40001 the moment **any** other session committed, in any table, on any row. When another commit lands while a transaction is open, the buffered statements are replayed onto the new base; that replay refused outright whenever the buffer held an insert, because replaying gives the inserted rows fresh speculative entity ids and the map the later statements resolve through still named the old ones. It is rebuilt from the replay report instead.

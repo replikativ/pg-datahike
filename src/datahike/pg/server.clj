@@ -53,7 +53,8 @@
             [datahike.pg.types :as types]
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.window :as window]
-            [datahike.pg.jsonb :as jb])
+            [datahike.pg.jsonb :as jb]
+            [datahike.pg.locks :as locks])
   (:import [datahike.pg PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler
             PgWireServer$QueryHandlerFactory PgWireServer$PgProtocolException
             PgWireServer$PasswordAuthenticator PgParamCodec]
@@ -144,6 +145,12 @@
 
 (defonce ^:private lock-registry (atom {}))
 
+(def reset-advisory-locks!
+  "Clear the advisory-lock registry (a test-fixture helper). Re-exported:
+   the registry itself lives in `datahike.pg.locks`, which the SQL layer
+   requires to answer a TRANSLATED `pg_advisory_lock(…)`."
+  locks/reset-advisory-locks!)
+
 (defn reset-lock-registry!
   "Clear the server-wide row-lock registry. Intended for test fixtures —
    in production, locks are released on COMMIT/ROLLBACK/DISCARD ALL and
@@ -166,116 +173,9 @@
              (into {} (remove (fn [[_ sid]] (= sid session-id)) reg))))))
 
 ;; ============================================================================
-;; Advisory locks (pg_advisory_lock / pg_try_advisory_lock / …).
-;;
-;; PG semantics we implement:
-;;   - Session-level: held until pg_advisory_unlock / pg_advisory_unlock_all /
-;;     connection close. Re-entrant for the same session — a second
-;;     pg_advisory_lock by the same owner increments a refcount and requires
-;;     an equal number of unlocks to release.
-;;   - Transaction-level (pg_advisory_xact_lock): auto-released at COMMIT or
-;;     ROLLBACK. Not reference-counted in PG (a second call in the same tx
-;;     is a no-op); we match that.
-;;   - Try variants are non-blocking: return false instead of waiting.
-;;   - Blocking variants spin-wait (exponential backoff up to 100ms). Our
-;;     entire pgwire server is a single JVM, so conflicts resolve in-process.
-;;
-;; Crucial: migration tools (Flyway, Alembic, Ecto.Migrator, Rails) take a
-;; well-known key at startup and only proceed if pg_try_advisory_lock
-;; returns true. Returning anything other than a real boolean (or a dummy
-;; "looks truthy" string — our prior behavior) silently breaks
-;; mutual-exclusion across concurrent migrate runs.
-(defonce ^:private advisory-locks
-  ;; {lock-key {:session-id str :count long :xact? bool}}
-  (atom {}))
-
-(defn reset-advisory-locks!
-  "Clear the advisory-lock registry. Test-fixture helper; not for handler
-   code. In production, locks release on unlock, COMMIT/ROLLBACK (xact-
-   level), DISCARD ALL, or connection close."
-  []
-  (reset! advisory-locks {}))
-
-(defn- advisory-lock-try!
-  "Acquire a single advisory lock, non-blocking. Returns true on success,
-   false if another session holds it. Same-session re-lock increments the
-   refcount (session-level only); xact-level re-lock is a no-op."
-  [lock-key session-id xact?]
-  (let [result (atom :unknown)]
-    (swap! advisory-locks
-           (fn [m]
-             (let [existing (get m lock-key)]
-               (cond
-                 (nil? existing)
-                 (do (reset! result :acquired)
-                     (assoc m lock-key {:session-id session-id
-                                        :count 1
-                                        :xact? xact?}))
-                 (not= (:session-id existing) session-id)
-                 (do (reset! result :blocked) m)
-                 xact?
-                 (do (reset! result :acquired) m)
-                 :else
-                 (do (reset! result :acquired)
-                     (update-in m [lock-key :count] inc))))))
-    (= @result :acquired)))
-
-(defn- advisory-lock!
-  "Blocking acquire. Spin-wait with exponential backoff up to 100ms."
-  [lock-key session-id xact?]
-  (loop [attempt 0]
-    (if (advisory-lock-try! lock-key session-id xact?)
-      true
-      (do (Thread/sleep ^long (min 100 (bit-shift-left 1 (min 7 attempt))))
-          (recur (inc attempt))))))
-
-(defn- advisory-unlock!
-  "Decrement refcount on `lock-key` (session-level); remove when it
-   reaches zero. Returns true if WE held it and released one, false
-   otherwise. xact-level locks cannot be unlocked by hand in PG — they
-   release at tx end — but we accept it as a no-op-false for symmetry."
-  [lock-key session-id]
-  (let [[before after]
-        (swap-vals! advisory-locks
-                    (fn [m]
-                      (let [e (get m lock-key)]
-                        (cond
-                          (or (nil? e)
-                              (not= (:session-id e) session-id)
-                              (:xact? e))
-                          m
-                          (<= (:count e) 1)
-                          (dissoc m lock-key)
-                          :else
-                          (update-in m [lock-key :count] dec)))))]
-    (not= before after)))
-
-(defn- release-advisory-locks!
-  "Release advisory locks owned by `session-id`. If xact-only? is true,
-   only release the tx-level ones (called from COMMIT/ROLLBACK); otherwise
-   release all (called from session close and DISCARD ALL)."
-  ([session-id] (release-advisory-locks! session-id false))
-  ([session-id xact-only?]
-   ;; Hot path (end-tx! on every implicit-tx commit): skip the global
-   ;; rebuild + write when this session holds no matching advisory lock.
-   (let [match? (fn [v] (and (= (:session-id v) session-id)
-                             (or (not xact-only?) (:xact? v))))]
-     (when (some match? (vals @advisory-locks))
-       (swap! advisory-locks
-              (fn [m] (into {} (remove (fn [[_k v]] (match? v))) m)))))))
-
-(defn- parse-advisory-key
-  "Extract the advisory-lock key from a parsed pg_advisory_lock* map.
-   parse-sql merges the classifier's :args (a vector of longs) into
-   the parsed map; single-arg form returns the long directly, two-arg
-   form returns [hi lo] so the two-key namespace is distinct in the
-   lock registry."
-  [parsed]
-  (let [args (:args parsed)]
-    (case (count args)
-      1 (first args)
-      2 (vec args)
-      nil)))
+;; Advisory locks live in datahike.pg.locks: a translated
+;; `pg_advisory_lock(…)` in an expression reaches them from the SQL
+;; layer, which cannot require this namespace.
 
 (defn- acquire-lock!
   "Record `[table id]` as locked by `session-id`. If already locked by a
@@ -5049,14 +4949,6 @@
     :lastval                {:names ["lastval"]                    :oids [PgWireServer/OID_INT8]}
     :setval                 {:names ["setval"]                     :oids [PgWireServer/OID_INT8]}
     :set-config             {:names ["set_config"]                 :oids [PgWireServer/OID_TEXT]}
-    :advisory-lock          {:names ["pg_advisory_lock"]           :oids [OID_VOID]}
-    :advisory-xact-lock     {:names ["pg_advisory_xact_lock"]      :oids [OID_VOID]}
-    :advisory-unlock-all    {:names ["pg_advisory_unlock_all"]     :oids [OID_VOID]}
-    :pg-sleep               {:names ["pg_sleep"]                   :oids [OID_VOID]}
-    :pg-notify              {:names ["pg_notify"]                  :oids [OID_VOID]}
-    :try-advisory-lock      {:names ["pg_try_advisory_lock"]       :oids [PgWireServer/OID_BOOL]}
-    :try-advisory-xact-lock {:names ["pg_try_advisory_xact_lock"]  :oids [PgWireServer/OID_BOOL]}
-    :advisory-unlock        {:names ["pg_advisory_unlock"]         :oids [PgWireServer/OID_BOOL]}
     ;; datahike.* branching / versioning functions. Multi-row results
     ;; (branches, parent_commits) still advertise a single-column row;
     ;; PG's protocol doesn't need per-row metadata, only per-column.
@@ -5586,7 +5478,7 @@
   ;; state. This includes commit failures and implicit rollback at Sync.
   (reset! cursors {})
   (release-session-locks! session-id)
-  (release-advisory-locks! session-id true)
+  (locks/release-advisory-locks! session-id true)
   (swap! tx-state
          (fn [state]
            (-> state
@@ -5760,7 +5652,7 @@
   (invalidate-rolled-back-ddl! tx-state)
   (restore-temp-tables! tx-state temp-tables)
   (release-session-locks! session-id)
-  (release-advisory-locks! session-id)
+  (locks/release-advisory-locks! session-id)
   (reset! tx-state {:in-tx? false :aborted? false
                     :session-id session-id
                     :owned-locks #{}})
@@ -5798,48 +5690,6 @@
 
 ;; --- Advisory-lock handlers -------------------------------------------------
 
-(defn- handle-advisory-lock
-  [{:keys [session-id]} parsed]
-  (advisory-lock! (parse-advisory-key parsed) session-id false)
-  (void-result "pg_advisory_lock"))
-
-(defn- handle-try-advisory-lock
-  [{:keys [session-id]} parsed]
-  (let [got? (advisory-lock-try! (parse-advisory-key parsed) session-id false)]
-    (single-row-result "pg_try_advisory_lock"
-                       PgWireServer/OID_BOOL
-                       (if got? "t" "f"))))
-
-(defn- handle-advisory-xact-lock
-  [{:keys [session-id tx-state]} parsed]
-  (if-not (:in-tx? @tx-state)
-    (error-result "pg_advisory_xact_lock requires a transaction" "25P01")
-    (do (advisory-lock! (parse-advisory-key parsed) session-id true)
-        (void-result "pg_advisory_xact_lock"))))
-
-(defn- handle-try-advisory-xact-lock
-  [{:keys [session-id tx-state]} parsed]
-  (if-not (:in-tx? @tx-state)
-    (error-result "pg_try_advisory_xact_lock requires a transaction" "25P01")
-    (let [got? (advisory-lock-try! (parse-advisory-key parsed) session-id true)]
-      (single-row-result "pg_try_advisory_xact_lock"
-                         PgWireServer/OID_BOOL
-                         (if got? "t" "f")))))
-
-(defn- handle-advisory-unlock
-  [{:keys [session-id]} parsed]
-  (let [ok? (advisory-unlock! (parse-advisory-key parsed) session-id)]
-    (single-row-result "pg_advisory_unlock"
-                       PgWireServer/OID_BOOL
-                       (if ok? "t" "f"))))
-
-(defn- handle-advisory-unlock-all
-  [{:keys [session-id]} _parsed]
-  (release-advisory-locks! session-id)
-  (void-result "pg_advisory_unlock_all"))
-
-;; --- Session introspection --------------------------------------------------
-
 (defn- handle-pg-backend-pid
   [{:keys [session-id]} _parsed]
   (single-row-result "pg_backend_pid"
@@ -5854,24 +5704,6 @@
     (single-row-result "txid_current"
                        PgWireServer/OID_INT8
                        (str (or tx-id 0)))))
-
-(defn- handle-pg-sleep
-  "Honor the requested sleep, capped at 60s to prevent DoS via
-   `pg_sleep(99999)`. classify emits :args as numbers (long or double)."
-  [_ctx parsed]
-  (let [secs (double (or (first (:args parsed)) 0))
-        ms (long (min 60000 (Math/round (* 1000.0 secs))))]
-    (when (pos? ms) (Thread/sleep ms))
-    (void-result "pg_sleep")))
-
-(defn- handle-pg-notify
-  "No-op: pg-datahike has no LISTEN/NOTIFY delivery, so a NOTIFY with no
-   subscribers is observably the same as a delivered NOTIFY ignored.
-   Keeps Odoo's bus post-commit hook (addons/bus/models/bus.py) from
-   tripping the registry build during --init=mail (and transitively
-   --init=account)."
-  [_ctx _parsed]
-  (void-result "pg_notify"))
 
 (defn- handle-now [_ctx _parsed]
   (single-row-result "now"
@@ -6661,18 +6493,10 @@
                   (.withSqlstate "XX000"))))))
 
       ;; Advisory locks (see defonce ^:private advisory-locks above).
-      :advisory-lock           (handle-advisory-lock ctx parsed)
-      :try-advisory-lock       (handle-try-advisory-lock ctx parsed)
-      :advisory-xact-lock      (handle-advisory-xact-lock ctx parsed)
-      :try-advisory-xact-lock  (handle-try-advisory-xact-lock ctx parsed)
-      :advisory-unlock         (handle-advisory-unlock ctx parsed)
-      :advisory-unlock-all     (handle-advisory-unlock-all ctx parsed)
 
       ;; Session introspection
       :pg-backend-pid          (handle-pg-backend-pid ctx parsed)
       :txid-current            (handle-txid-current ctx parsed)
-      :pg-sleep                (handle-pg-sleep ctx parsed)
-      :pg-notify               (handle-pg-notify ctx parsed)
       ;; Catalog probes (shape-matched in system-query?*)
       :create-index       (empty-result "CREATE INDEX")
       :get-primary-keys   (handle-get-primary-keys ctx parsed)
@@ -10974,6 +10798,11 @@
         tx-state (atom {:in-tx? false :aborted? false
                         :session-id session-id
                         :owned-locks #{}})
+        ;; A translated `pg_advisory_xact_lock(…)` has to know whether a
+        ;; transaction is open, and it reads the session through this atom
+        ;; -- so the atom carries the transaction state itself, by
+        ;; reference, rather than a copy that would go stale.
+        _ (swap! session-state assoc :tx-state tx-state)
         ;; SQL-level prepared statements (PREPARE name AS ... ; EXECUTE
         ;; name(args)). Session-scoped: dropped on close / DISCARD ALL.
         ;; Keyed by lowercased name → {:sql "..." :types [...]}.
@@ -11026,7 +10855,7 @@
         ;; state.
         (invalidate-rolled-back-ddl! tx-state)
         (release-session-locks! session-id)
-        (release-advisory-locks! session-id)
+        (locks/release-advisory-locks! session-id)
         ;; Drop CREATE TEMP tables — they live only for the session.
         ;; Best-effort: a table already dropped by hand, or one whose
         ;; create rolled back, simply has nothing to retract.
