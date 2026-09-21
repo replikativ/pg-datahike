@@ -68,3 +68,37 @@
     (testing "in a predicate and an expression"
       (is (= "1" (scalar c "SELECT 1 WHERE (row(1,2)).f1 = 1")))
       (is (= "3" (scalar c "SELECT (row(1,2)).f1 + (row(1,2)).f2"))))))
+
+(deftest an-int2vector-is-an-array
+  ;; `pg_index.indkey` is an int2vector: PostgreSQL writes it
+  ;; SPACE-separated (`1`, `1 2`), not in braces, so the array reader
+  ;; saw a scalar and `a.attnum = ANY(i.indkey)` matched nothing. That
+  ;; is how pgjdbc and Metabase ask which columns an index covers.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE ix (id int PRIMARY KEY, v text)")
+    (exec! c "CREATE TABLE ix2 (a int, b int, v text)")
+    (exec! c "CREATE INDEX ix2_ab ON ix2 (a, b)")
+    (testing "the rendering is PostgreSQL's"
+      (is (= "1" (scalar c "SELECT i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+                             WHERE c.relname = 'ix' AND i.indisprimary")))
+      (is (= "1 2" (scalar c "SELECT i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+                               WHERE c.relname = 'ix2'"))))
+    (testing "and it reads as the vector it is"
+      (is (= "id" (scalar c "SELECT a.attname FROM pg_index i
+                               JOIN pg_class c ON c.oid = i.indrelid
+                               JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+                              WHERE c.relname = 'ix' AND i.indisprimary")))
+      (is (= "a" (scalar c "SELECT a.attname FROM pg_index i
+                              JOIN pg_class c ON c.oid = i.indrelid
+                              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+                             WHERE c.relname = 'ix2' ORDER BY a.attnum")))
+      (is (= "1 2" (scalar c "SELECT i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+                               WHERE c.relname = 'ix2' AND 2 = ANY(i.indkey)"))))
+    (testing "an untyped literal is still not an array"
+      ;; PostgreSQL: malformed array literal. What must NOT happen is
+      ;; reading `'12'` as a one-element vector and answering true.
+      (is (not= "t" (scalar c "SELECT 12 = ANY('12')"))))
+    (testing "ordinary arrays are unchanged"
+      (is (= "t" (scalar c "SELECT 5 = ANY('{5,6}')")))
+      (is (= "t" (scalar c "SELECT 7 = ANY(ARRAY[7,8])")))
+      (is (= "f" (scalar c "SELECT 9 = ANY('{5,6}')"))))))

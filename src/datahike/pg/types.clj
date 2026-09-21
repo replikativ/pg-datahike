@@ -378,6 +378,11 @@
 ;; Datahike value type → PostgreSQL OID (for wire protocol)
 ;; ============================================================================
 
+(def ^:const oid-int2vector
+  "int2vector (22): the space-separated integer vector `pg_index.indkey`
+   and `pg_proc.proargtypes` are written as."
+  22)
+
 (def pg-name->oid
   "Map a PostgreSQL type name (the string stored on :pg/type when
    the column's original SQL type doesn't match the Datahike
@@ -418,6 +423,10 @@
     "vector"      oid-vector
     "pg_lsn"      oid-pg-lsn
     "oid"         oid-oid
+    ;; The catalogs' own vector type: `pg_index.indkey`,
+    ;; `pg_proc.proargtypes`. Declaring it is what lets a value written
+    ;; SPACE-separated be read as the vector it is.
+    "int2vector"  oid-int2vector
     "regclass"    oid-regclass
     "regtype"     oid-regtype
     "regnamespace" oid-regnamespace

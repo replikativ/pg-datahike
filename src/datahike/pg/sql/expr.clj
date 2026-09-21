@@ -747,6 +747,25 @@
 
 (declare translate-deferred-form)
 
+(defn int2vector->array
+  "An int2vector -- `pg_index.indkey`, `pg_proc.proargtypes` -- as a
+   PgArray. PostgreSQL writes this type as SPACE-separated numbers
+   rather than in braces, so the ordinary array reader sees a scalar and
+   `a.attnum = ANY(i.indkey)` matched nothing: that is how pgjdbc and
+   Metabase ask which columns an index covers. Only callers that know
+   the value IS an int2vector use this -- `ANY('12')` over an untyped
+   literal stays the malformed-array error PostgreSQL gives."
+  [v]
+  (cond
+    (pg-arr/array? v) v
+    ;; the ordinary braces form still wins when the value has one
+    (and (string? v) (str/starts-with? (str/triml v) "{")) (coerce-pg-array v)
+    (and (string? v) (re-matches #"\s*-?\d+(?:\s+-?\d+)*\s*" v))
+    (pg-arr/array :int8 (mapv #(Long/parseLong %)
+                              (str/split (str/trim v) #"\s+")))
+    (and (string? v) (str/blank? v)) (pg-arr/array :int8 [])
+    :else (coerce-pg-array v)))
+
 (defn translate-function-call
   "Translate a non-aggregate SQL function to a Datalog function binding.
    Adds the binding clause to where-clauses and returns the result variable."
@@ -2479,19 +2498,20 @@
    their own copy forty lines apart, and only the `<>` one had been made
    three-valued -- so `3 = ANY(ARRAY[1,NULL])` answered FALSE where
    PostgreSQL says NULL."
-  [kind cmp]
-  (fn [c a]
-    (let [arr (coerce-pg-array a)]
-      (if (or (fns/sql-null? c) (nil? arr))
-        :__null__
-        (let [cmps (map (fn [el]
-                          (if (or (nil? el) (= :__null__ el))
-                            :__null__
-                            (cmp c el)))
-                        (pg-arr/flat-elements arr))]
-          (if (= kind "all")
-            (reduce fns/sql-and3 true cmps)
-            (reduce fns/sql-or3 false cmps)))))))
+  ([kind cmp] (any-all-op-fn kind cmp coerce-pg-array))
+  ([kind cmp read-arr]
+   (fn [c a]
+     (let [arr (read-arr a)]
+       (if (or (fns/sql-null? c) (nil? arr))
+         :__null__
+         (let [cmps (map (fn [el]
+                           (if (or (nil? el) (= :__null__ el))
+                             :__null__
+                             (cmp c el)))
+                         (pg-arr/flat-elements arr))]
+           (if (= kind "all")
+             (reduce fns/sql-and3 true cmps)
+             (reduce fns/sql-or3 false cmps))))))))
 
 (defn empty-aggregate-row
   "SQL requires an aggregate over an EMPTY relation to still produce ONE
@@ -2944,7 +2964,13 @@
               col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
               arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
               fn-param (symbol (str "?pg-" kind (swap! (:var-counter ctx) inc)))
-              op-fn (any-all-op-fn kind fns/sql-eq?)
+              ;; A COLUMN may hand over an int2vector (`pg_index.indkey`),
+              ;; which PostgreSQL writes SPACE-separated; a literal may
+              ;; not -- `12 = ANY('12')` is a malformed array there.
+              op-fn (any-all-op-fn kind fns/sql-eq?
+                                   (if (instance? Column arr-expr)
+                                     int2vector->array
+                                     coerce-pg-array))
               result-var (ctx/fresh-var! ctx)]
           (swap! (:in-params ctx) conj fn-param)
           (swap! (:in-args ctx) conj op-fn)
@@ -6642,13 +6668,27 @@
             arr' (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
             fn-param (symbol (str "?pg-q" kind (swap! (:var-counter ctx) inc)))
             cmp-fn (requiring-resolve (symbol "clojure.core" (name op)))
+            ;; An int2vector operand -- `pg_index.indkey` -- is written
+            ;; SPACE-separated, so the braces reader sees a scalar and the
+            ;; comparison matched nothing. Read it as the vector it is,
+            ;; and only when the operand's declared type says so:
+            ;; `12 = ANY('12')` over an untyped literal stays the
+            ;; malformed-array error PostgreSQL gives.
+            int2vec? (or (= types/oid-int2vector
+                            (try (source-oid ctx arr-expr) (catch Throwable _ nil)))
+                         ;; A COLUMN operand may hand over an int2vector;
+                         ;; a literal may not -- `12 = ANY('12')` is the
+                         ;; malformed-array error in PostgreSQL, and
+                         ;; reading it as a vector would answer `t`.
+                         (instance? Column arr-expr))
+            read-arr (if int2vec? int2vector->array coerce-pg-array)
             op-fn (case kind
                     "any" (fn [c a]
-                            (if-let [arr (coerce-pg-array a)]
+                            (if-let [arr (read-arr a)]
                               (boolean (pg-arr/any-match? arr #(cmp-fn c %)))
                               false))
                     "all" (fn [c a]
-                            (if-let [arr (coerce-pg-array a)]
+                            (if-let [arr (read-arr a)]
                               (pg-arr/all-match? arr #(cmp-fn c %))
                               true)))
             result-var (ctx/fresh-var! ctx)]
@@ -7517,12 +7557,19 @@
                   col (if (seq? col) (ctx/materialize-arg! ctx col) col)
                   arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
                   fn-param (symbol (str "?pg-" kind "-pred" (swap! (:var-counter ctx) inc)))
+                  ;; A COLUMN may hand over an int2vector
+                  ;; (`pg_index.indkey`), which PostgreSQL writes
+                  ;; SPACE-separated rather than in braces; a literal may
+                  ;; not -- `12 = ANY('12')` is a malformed array there.
+                  read-arr (if (instance? Column arr-expr)
+                             int2vector->array
+                             coerce-pg-array)
                   op-fn (case kind
                           "any" (fn [c a]
-                                  (if-let [arr (coerce-pg-array a)]
+                                  (if-let [arr (read-arr a)]
                                     (boolean (pg-arr/member? arr c)) false))
                           "all" (fn [c a]
-                                  (if-let [arr (coerce-pg-array a)]
+                                  (if-let [arr (read-arr a)]
                                     (pg-arr/all-match? arr #(= % c)) true)))
                   result-var (ctx/fresh-var! ctx)]
               (swap! (:in-params ctx) conj fn-param)
