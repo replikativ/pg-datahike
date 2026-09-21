@@ -1,6 +1,6 @@
 {:error nil,
  :rows
  [["db_id" "bigint" "NO" "1"]
-  ["id" "integer" "YES" "2"]
-  ["name" "text" "YES" "3"]
+  ["id" "integer" "NO" "2"]
+  ["name" "text" "NO" "3"]
   ["age" "integer" "YES" "4"]]}
