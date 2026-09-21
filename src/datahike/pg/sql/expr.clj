@@ -2501,17 +2501,115 @@
   ([kind cmp] (any-all-op-fn kind cmp coerce-pg-array))
   ([kind cmp read-arr]
    (fn [c a]
-     (let [arr (read-arr a)]
-       (if (or (fns/sql-null? c) (nil? arr))
-         :__null__
+     (let [arr (read-arr a)
+           els (when arr (pg-arr/flat-elements arr))]
+       (cond
+         ;; An EMPTY array settles the answer whatever the scalar is,
+         ;; NULL included: there is no element to be unknown about.
+         ;; `NULL > ANY(ARRAY[]::int[])` is FALSE and `NULL > ALL(…)` is
+         ;; TRUE in PostgreSQL, where we answered NULL for both.
+         (and arr (empty? els)) (= kind "all")
+         (or (fns/sql-null? c) (nil? arr)) :__null__
+         :else
          (let [cmps (map (fn [el]
                            (if (or (nil? el) (= :__null__ el))
                              :__null__
                              (cmp c el)))
-                         (pg-arr/flat-elements arr))]
+                         els)]
            (if (= kind "all")
              (reduce fns/sql-and3 true cmps)
              (reduce fns/sql-or3 false cmps))))))))
+
+(def ^:private quantified-cmp-fns
+  "The per-element comparison each `<op> ANY/ALL(…)` runs. Two-valued on
+   purpose: an element that IS NULL is turned into UNKNOWN by
+   `any-all-op-fn`'s Kleene fold, so the comparison itself never sees
+   one. `clojure.core`'s operators were used here instead, and they
+   throw on the `:__null__` sentinel -- `WHERE v > ANY(arr)` over an
+   array holding a NULL was a ClassCastException (XX000)."
+  {'=    fns/sql-eq?
+   'not= fns/sql-ne?
+   '<    fns/sql-lt?
+   '<=   fns/sql-le?
+   '>    fns/sql-gt?
+   '>=   fns/sql-ge?})
+
+(def ^:private quantified-literal-ops
+  "The per-element predicate a LITERAL `<op> ANY/ALL(…)` expands to, as a
+   symbol a datalog clause can name. They are the SQL comparisons, not
+   `clojure.core`'s: `=` is type-sensitive for numbers, so `v = ANY(…)`
+   over a numeric column missed `1.5` against `1.5M`."
+  {'=    'datahike.pg.sql/sql-eq?
+   'not= 'datahike.pg.sql/sql-ne?
+   '<    'datahike.pg.sql/sql-lt?
+   '<=   'datahike.pg.sql/sql-le?
+   '>    'datahike.pg.sql/sql-gt?
+   '>=   'datahike.pg.sql/sql-ge?})
+
+(defn quantified-rhs
+  "`[kind arr-expr]` when `r` is `ANY(x)` or `ALL(x)`, else nil."
+  [r]
+  (when (instance? Function r)
+    (let [^Function f r
+          kind (str/lower-case (.getName f))]
+      (when (#{"any" "all"} kind)
+        [kind (some-> (.getParameters f) (.get 0))]))))
+
+(defn- quantified-array-reader
+  "How to read the ARRAY operand of a quantified comparison. An
+   int2vector -- `pg_index.indkey`, `pg_proc.proargtypes` -- is written
+   SPACE-separated, so the braces reader sees a scalar and the
+   comparison matches nothing; that is how pgjdbc and Metabase ask which
+   columns an index covers. A COLUMN may hand one over, and so may an
+   expression whose declared type says so. An untyped LITERAL may not:
+   `12 = ANY('12')` stays the malformed-array error PostgreSQL gives."
+  [ctx arr-expr]
+  (if (or (instance? Column arr-expr)
+          (= types/oid-int2vector
+             (try (source-oid ctx arr-expr) (catch Throwable _ nil))))
+    int2vector->array
+    coerce-pg-array))
+
+(defn quantified-result-var
+  "`left <op> ANY/ALL(arr)` as ONE variable, bound by the Kleene runtime.
+
+   THE implementation: the WHERE path and the value path (a projection, a
+   CASE test) both call this, for every comparison operator. They used to
+   have three runtimes between them -- two copies of the `=`/`<>` value
+   form and a two-valued WHERE form built on `clojure.core` -- which
+   disagreed with PostgreSQL and with each other: `v > ANY(arr)` in value
+   position was 42883 (only `=` and `<>` were recognised), the same
+   comparison in WHERE threw on a NULL element, and `<> ANY(i.indkey)`
+   did not read an int2vector although `= ANY(i.indkey)` did."
+  [ctx op left arr-expr kind]
+  (let [cmp (or (get quantified-cmp-fns op)
+                (throw (ex-info "unsupported quantified comparison"
+                                {:error :feature-not-supported :op op})))
+        col-val (translate-expr ctx left)
+        arr-val (translate-expr ctx arr-expr)
+        col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
+        arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
+        fn-param (symbol (str "?pg-q" kind (swap! (:var-counter ctx) inc)))
+        base-read (quantified-array-reader ctx arr-expr)
+        ;; A non-NULL operand that is not array-shaped is `array_in`
+        ;; failing, which PostgreSQL raises as 22P02 -- `12 = ANY('12')`
+        ;; is an error there. We answered NULL, silently.
+        read-arr (fn [a]
+                   (when-not (fns/sql-null? a)
+                     (or (base-read a)
+                         (throw (errors/pg-error
+                                 :invalid-text-representation
+                                 {:message (str "malformed array literal: "
+                                                (pr-str (str a)))
+                                  :detail (str "Array value must start with \"{\" "
+                                               "or dimension information.")})))))
+        op-fn (any-all-op-fn kind cmp read-arr)
+        result-var (ctx/fresh-var! ctx)]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj op-fn)
+    (swap! (:where-clauses ctx) conj
+           [(list fn-param col-val arr-val) result-var])
+    result-var))
 
 (defn empty-aggregate-row
   "SQL requires an aggregate over an EMPTY relation to still produce ONE
@@ -2842,6 +2940,24 @@
           r (translate-expr ctx (.getRightExpression e))]
       (list 'datahike.pg.tsearch/ts-match3 l r))
 
+    ;; `x <op> ANY/ALL(arr)` in VALUE position, for EVERY comparison
+    ;; operator. Only `=` and `<>` were recognised here, so `SELECT v >
+    ;; ANY(arr)` reached the function table and answered 42883, "function
+    ;; any(integer[]) does not exist".
+    (and (or (instance? GreaterThan expr)
+             (instance? GreaterThanEquals expr)
+             (instance? MinorThan expr)
+             (instance? MinorThanEquals expr))
+         (quantified-rhs (.getRightExpression
+                          ^net.sf.jsqlparser.expression.BinaryExpression expr)))
+    (let [^net.sf.jsqlparser.expression.BinaryExpression e expr
+          op (cond (instance? GreaterThan e) '>
+                   (instance? GreaterThanEquals e) '>=
+                   (instance? MinorThan e) '<
+                   :else '<=)
+          [kind arr-expr] (quantified-rhs (.getRightExpression e))]
+      (quantified-result-var ctx op (.getLeftExpression e) arr-expr kind))
+
     (and (or (instance? EqualsTo expr)
              (instance? NotEqualsTo expr)
              (instance? GreaterThan expr)
@@ -2950,33 +3066,10 @@
                         (#{"any" "all"}
                          (str/lower-case (.getName ^Function right))))]
       (if any-arr?
-        ;; col = ANY(arr) / col = ALL(arr). The array may be an
-        ;; ArrayConstructor literal (handled efficiently by the
-        ;; translate-predicate WHERE path via or-join) or a runtime
-        ;; expression. Here we go through the runtime dispatch since
-        ;; predicate-expr is consumed in projection / CASE contexts
-        ;; where we need a single boolean-valued form.
-        (let [^Function fn-expr right
-              kind (str/lower-case (.getName fn-expr))
-              arr-expr (some-> (.getParameters fn-expr) (.get 0))
-              col-val (translate-expr ctx (.getLeftExpression e))
-              arr-val (translate-expr ctx arr-expr)
-              col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
-              arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
-              fn-param (symbol (str "?pg-" kind (swap! (:var-counter ctx) inc)))
-              ;; A COLUMN may hand over an int2vector (`pg_index.indkey`),
-              ;; which PostgreSQL writes SPACE-separated; a literal may
-              ;; not -- `12 = ANY('12')` is a malformed array there.
-              op-fn (any-all-op-fn kind fns/sql-eq?
-                                   (if (instance? Column arr-expr)
-                                     int2vector->array
-                                     coerce-pg-array))
-              result-var (ctx/fresh-var! ctx)]
-          (swap! (:in-params ctx) conj fn-param)
-          (swap! (:in-args ctx) conj op-fn)
-          (swap! (:where-clauses ctx) conj
-                 [(list fn-param col-val arr-val) result-var])
-          result-var)
+        ;; `col = ANY(arr)` / `= ALL(arr)` in VALUE position -- a
+        ;; projection, a CASE test -- through the one quantified runtime.
+        (let [[kind arr-expr] (quantified-rhs right)]
+          (quantified-result-var ctx '= (.getLeftExpression e) arr-expr kind))
         ;; jsonb `=` in VALUE position (a projection, a CASE test) has
         ;; the same scale-insensitivity as in WHERE, and the same
         ;; reason not to be `=` on the canonical text.
@@ -3002,21 +3095,8 @@
           any-arr? (and (instance? Function r)
                         (#{"any" "all"} (str/lower-case (.getName ^Function r))))]
       (if any-arr?
-        (let [^Function fn-expr r
-              kind (str/lower-case (.getName fn-expr))
-              arr-expr (some-> (.getParameters fn-expr) (.get 0))
-              col-val (translate-expr ctx l)
-              arr-val (translate-expr ctx arr-expr)
-              col-val (if (seq? col-val) (ctx/materialize-arg! ctx col-val) col-val)
-              arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
-              fn-param (symbol (str "?pg-ne-" kind (swap! (:var-counter ctx) inc)))
-              op-fn (any-all-op-fn kind fns/sql-ne?)
-              result-var (ctx/fresh-var! ctx)]
-          (swap! (:in-params ctx) conj fn-param)
-          (swap! (:in-args ctx) conj op-fn)
-          (swap! (:where-clauses ctx) conj
-                 [(list fn-param col-val arr-val) result-var])
-          result-var)
+        (let [[kind arr-expr] (quantified-rhs r)]
+          (quantified-result-var ctx 'not= l arr-expr kind))
         (apply list
                (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
                  'datahike.pg.sql/jsonb-ne?
@@ -6672,8 +6752,17 @@
    `op` is the Clojure comparison symbol, `kind` is \"any\" or \"all\"."
   [ctx op left arr-expr kind]
   (let [elements (literal-array-elements ctx arr-expr left)
+        ;; The literal expansion is an optimisation, and only a sound one
+        ;; while no element is NULL. `x > ALL(ARRAY[1,NULL])` expanded to
+        ;; `(> ?x nil)` and threw; three-valued ALL is the runtime's job.
+        ;; ANY may still drop the NULLs: in WHERE, UNKNOWN is rejected.
+        elements (when (or (nil? elements)
+                           (= kind "any")
+                           (not-any? nil? elements))
+                   elements)
+        pred (get quantified-literal-ops op)
         col (translate-expr ctx left)]
-    (if elements
+    (if (and elements pred)
       (cond
         ;; <op> ANY(<literal>) — or-join over per-element comparisons.
         (= kind "any")
@@ -6681,7 +6770,7 @@
           (if (empty? non-null)
             [[(list 'not= col col)]]
             (let [shared-vars (vec (sort-by str (ctx/collect-vars col)))
-                  branches (for [v non-null] [(list op col v)])
+                  branches (for [v non-null] [(list pred col v)])
                   clause (if (seq shared-vars)
                            (concat ['or-join shared-vars] branches)
                            (concat ['or] branches))]
@@ -6690,43 +6779,13 @@
         :else
         (if (empty? elements)
           []
-          (mapv (fn [v] [(list op col v)]) elements)))
-      ;; Runtime array — dispatch via an in-param predicate function
-      ;; that closes over the comparison op.
-      (let [arr-val (translate-expr ctx arr-expr)
-            col' (if (seq? col) (ctx/materialize-arg! ctx col) col)
-            arr' (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
-            fn-param (symbol (str "?pg-q" kind (swap! (:var-counter ctx) inc)))
-            cmp-fn (requiring-resolve (symbol "clojure.core" (name op)))
-            ;; An int2vector operand -- `pg_index.indkey` -- is written
-            ;; SPACE-separated, so the braces reader sees a scalar and the
-            ;; comparison matched nothing. Read it as the vector it is,
-            ;; and only when the operand's declared type says so:
-            ;; `12 = ANY('12')` over an untyped literal stays the
-            ;; malformed-array error PostgreSQL gives.
-            int2vec? (or (= types/oid-int2vector
-                            (try (source-oid ctx arr-expr) (catch Throwable _ nil)))
-                         ;; A COLUMN operand may hand over an int2vector;
-                         ;; a literal may not -- `12 = ANY('12')` is the
-                         ;; malformed-array error in PostgreSQL, and
-                         ;; reading it as a vector would answer `t`.
-                         (instance? Column arr-expr))
-            read-arr (if int2vec? int2vector->array coerce-pg-array)
-            op-fn (case kind
-                    "any" (fn [c a]
-                            (if-let [arr (read-arr a)]
-                              (boolean (pg-arr/any-match? arr #(cmp-fn c %)))
-                              false))
-                    "all" (fn [c a]
-                            (if-let [arr (read-arr a)]
-                              (pg-arr/all-match? arr #(cmp-fn c %))
-                              true)))
-            result-var (ctx/fresh-var! ctx)]
-        (swap! (:in-params ctx) conj fn-param)
-        (swap! (:in-args ctx) conj op-fn)
-        (swap! (:where-clauses ctx) conj
-               [(list fn-param col' arr') result-var])
-        [[(list 'identity result-var)]]))))
+          (mapv (fn [v] [(list pred col v)]) elements)))
+      ;; Runtime array — the one quantified runtime, and `true?` rather
+      ;; than `identity`: WHERE keeps only TRUE, and the `:__null__`
+      ;; sentinel an UNKNOWN comparison yields is TRUTHY in a datalog
+      ;; predicate position.
+      (let [result-var (quantified-result-var ctx op left arr-expr kind)]
+        [[(list 'true? result-var)]]))))
 
 (defn- column-vtype
   "Return the Datahike `:db/valueType` of the schema attribute that
@@ -7544,69 +7603,13 @@
       ;;    (no allocation, best-planner hints)
       ;;  - Runtime expr (fn result, column) → bind the array at runtime
       ;;    and call pg-arr/member? (for ANY) or pg-arr/all-match? (ALL)
-      (if (and (instance? Function right)
-               (#{"any" "all"}
-                (str/lower-case (.getName ^Function right))))
-        (let [^Function fn-expr right
-              kind (str/lower-case (.getName fn-expr))
-              params (.getParameters fn-expr)
-              arr-expr (when params (first params))
-              ;; One element reader for every ANY/ALL path: `'{1,2}'` is
-              ;; an untyped array literal whose elements PostgreSQL reads
-              ;; with the other operand's input function. This copy split
-              ;; the text on commas and kept strings, so `= ANY('{1,2}')`
-              ;; compared an integer column against "1" and matched
-              ;; nothing at all.
-              array-elements (literal-array-elements ctx arr-expr left)]
-          (cond
-            ;; Literal ANY — or-join expansion (existing fast path).
-            (and (= kind "any") array-elements)
-            (let [col (translate-expr ctx left)
-                  non-null-vals (filterv some? array-elements)
-                  shared-vars (vec (sort-by str (ctx/collect-vars col)))]
-              (if (empty? non-null-vals)
-                [[(list 'not= col col)]]
-                (let [in-clause (if (seq shared-vars)
-                                  (concat ['or-join shared-vars]
-                                          (for [v non-null-vals] [(list 'datahike.pg.sql/sql-eq? col v)]))
-                                  (concat ['or]
-                                          (for [v non-null-vals] [(list 'datahike.pg.sql/sql-eq? col v)])))]
-                  [in-clause])))
-
-            ;; Literal ALL — AND of per-element equalities.
-            (and (= kind "all") array-elements)
-            (if (empty? array-elements)
-              []  ;; x = ALL(<empty>) is TRUE per PG
-              (let [col (translate-expr ctx left)]
-                (mapv (fn [v] [(list 'datahike.pg.sql/sql-eq? col v)]) array-elements)))
-
-            ;; Runtime array — bind and dispatch through pg-arr.
-            :else
-            (let [col (translate-expr ctx left)
-                  arr-val (translate-expr ctx arr-expr)
-                  col (if (seq? col) (ctx/materialize-arg! ctx col) col)
-                  arr-val (if (seq? arr-val) (ctx/materialize-arg! ctx arr-val) arr-val)
-                  fn-param (symbol (str "?pg-" kind "-pred" (swap! (:var-counter ctx) inc)))
-                  ;; A COLUMN may hand over an int2vector
-                  ;; (`pg_index.indkey`), which PostgreSQL writes
-                  ;; SPACE-separated rather than in braces; a literal may
-                  ;; not -- `12 = ANY('12')` is a malformed array there.
-                  read-arr (if (instance? Column arr-expr)
-                             int2vector->array
-                             coerce-pg-array)
-                  op-fn (case kind
-                          "any" (fn [c a]
-                                  (if-let [arr (read-arr a)]
-                                    (boolean (pg-arr/member? arr c)) false))
-                          "all" (fn [c a]
-                                  (if-let [arr (read-arr a)]
-                                    (pg-arr/all-match? arr #(= % c)) true)))
-                  result-var (ctx/fresh-var! ctx)]
-              (swap! (:in-params ctx) conj fn-param)
-              (swap! (:in-args ctx) conj op-fn)
-              (swap! (:where-clauses ctx) conj
-                     [(list fn-param col arr-val) result-var])
-              [[(list 'identity result-var)]])))
+      ;; `col = ANY/ALL(…)` -- the same lowering every other comparison
+      ;; operator goes through. This branch had its OWN literal expansion
+      ;; and its OWN runtime (pg-arr/member?, all-match? over `=`), which
+      ;; is how the int2vector fix had to be made three times and how the
+      ;; `=` form came to disagree with the `>` form about NULL elements.
+      (if-let [[kind arr-expr] (quantified-rhs right)]
+        (translate-quantified-cmp ctx '= left arr-expr kind)
         ;; Special case: column = value can be a ground filter. Skip
         ;; the fast-path when the Column carries an ArrayConstructor
         ;; (e.g. `xs[2]`) — that needs translate-expr's subscript

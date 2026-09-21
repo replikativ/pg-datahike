@@ -183,7 +183,7 @@
         num  #(pick (into cols-num ["1" "0" "-1" "2.5" "10"]))
         any  #(pick cols-any)
         txt  #(pick ["s" "'aa'" "'%a%'" "''"])]
-    (case (.nextInt r 58)
+    (case (.nextInt r 60)
       0  [:cmp-proj  (format "SELECT id, %s %s %s AS c FROM ft ORDER BY id" (num) (pick cmp) (num))]
       1  [:cmp-where (format "SELECT id FROM ft WHERE %s %s %s ORDER BY id" (num) (pick cmp) (num))]
       2  [:arith     (format "SELECT id, %s %s %s AS c FROM ft ORDER BY id" (num) (pick arith) (num))]
@@ -265,6 +265,25 @@
                              (pick ["2 = ANY(arr)" "2 <> ALL(arr)" "arr @> ARRAY[1]"
                                     "arr && ARRAY[1,9]" "arr = ARRAY[1,2,3]"
                                     "array_length(arr,1) > 1" "arr IS NULL"]))]
+      ;; `<op> ANY/ALL` for EVERY comparison operator, in BOTH positions,
+      ;; over a column array and over literals that hold a NULL. The
+      ;; corpus had only `= ANY(arr)` and `<> ALL(arr)` in WHERE, which is
+      ;; how three separate runtimes for this one construct stayed
+      ;; undetected: the value position answered 42883 for `>`, the WHERE
+      ;; position threw on a NULL element, and each had its own idea of
+      ;; how to read an int2vector.
+      58 [:anyall    (format "SELECT id, %s AS c FROM ft ORDER BY id"
+                             (str (pick ["i" "j" "n" "sm"]) " "
+                                  (pick ["=" "<>" "<" "<=" ">" ">="]) " "
+                                  (pick ["ANY" "ALL"])
+                                  (pick ["(arr)" "(ARRAY[1,2])" "(ARRAY[1,NULL])"
+                                         "(ARRAY[]::int[])" "(NULL)"])))]
+      59 [:anyallw   (format "SELECT id FROM ft WHERE %s ORDER BY id"
+                             (str (pick ["i" "j" "n" "sm"]) " "
+                                  (pick ["=" "<>" "<" "<=" ">" ">="]) " "
+                                  (pick ["ANY" "ALL"])
+                                  (pick ["(arr)" "(ARRAY[1,2])" "(ARRAY[1,NULL])"
+                                         "(ARRAY[]::int[])"])))]
       30 [:jsonb     (format "SELECT id, %s AS c FROM ft ORDER BY id"
                              (pick ["js" "js->'a'" "js->>'a'" "jsonb_typeof(js)"
                                     "js ? 'a'" "jsonb_array_length(js)"

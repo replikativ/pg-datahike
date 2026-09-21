@@ -4,6 +4,23 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### ANY and ALL have one implementation
+
+`x <op> ANY(arr)` / `ALL(arr)` had **four** runtimes: the WHERE path built a two-valued predicate out of `clojure.core`'s operators, the value path carried two copies that recognised only `=` and `<>`, and the equality WHERE branch had a fourth of its own over `pg-arr/member?`. Each had its own idea of how to read an int2vector — which is why one array fix had to be made in three places — and they disagreed with PostgreSQL:
+
+| | was | now |
+|---|---|---|
+| `SELECT v > ANY(arr)` | 42883, *function any(integer[]) does not exist* | the comparison |
+| `WHERE v > ANY(arr)` with a NULL element | XX000 ClassCastException | three-valued |
+| `WHERE v > ALL(ARRAY[1,NULL])` | XX000 NullPointerException | three-valued |
+| `v <> ANY(i.indkey)` | matched nothing (int2vector unread) | reads the vector |
+| `NULL > ANY(ARRAY[]::int[])` | NULL | `f` — an empty array settles it |
+| `12 = ANY('12')` | NULL, silently | 22P02 *malformed array literal: "12"*, as PostgreSQL raises |
+
+One Kleene runtime now serves every comparison operator in both positions, with one array reader and one literal expansion; the literal fast path is used only where it is sound (no NULL element) and expands to the **SQL** comparisons rather than `clojure.core`'s, so `v = ANY(…)` over a numeric column no longer misses `1.5` against `1.5M`.
+
+The fuzzer drew only `2 = ANY(arr)` and `2 <> ALL(arr)`, both in WHERE, which is how three runtimes for one construct stayed hidden. Its grammar now draws every operator, in both positions, over a column array, an empty array, a NULL array and literals holding a NULL — and that grammar found the empty-array rule above on the first run.
+
 ### The fuzzer checks both protocols on every SELECT
 
 The simple-query path rewrites numeric literals into `$N` before parsing, so that one plan serves a whole statement family; the extended path never re-templates. Those are two different translations of the same statement, and nothing compared them. The select surface now runs each sample over both and compares the pair against PostgreSQL — the templated-vs-untemplated identity check (plan item 0.8).

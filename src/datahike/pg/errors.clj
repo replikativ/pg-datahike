@@ -165,8 +165,12 @@
    ;; --- input / data ---------------------------------------------------
    :invalid-text-representation
    {:sqlstate "22P02"
-    :format (fn [{:keys [type value detail enum?]}]
+    :format (fn [{:keys [type value detail enum? message]}]
               (cond
+                ;; A caller-supplied message wins: `array_in`'s "malformed
+                ;; array literal" carries its own wording AND a DETAIL, and
+                ;; without this the DETAIL was shown as the message too.
+                message message
                 (and enum? type (some? value))
                 (str "invalid input value for enum " type ": " (pr-str value))
                 (and type value)
