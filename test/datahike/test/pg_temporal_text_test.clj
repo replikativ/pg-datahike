@@ -117,3 +117,49 @@
     (seed! c)
     (is (= "2020-01-01 10:00:00" (one c "SELECT ts FROM ev")))
     (is (= "2020-01-01" (one c "SELECT d FROM ev")))))
+
+(deftest datestyle-chooses-the-output-format
+  ;; `DateStyle` is a session setting, and it was accepted and then
+  ;; ignored: every date and timestamp rendered ISO whatever the session
+  ;; asked for. PostgreSQL's own regression suite runs under
+  ;; `Postgres, MDY` -- pg_regress passes it in the STARTUP packet, never
+  ;; as a SET -- so every date in that whole suite was in the wrong
+  ;; style, and the files that are mostly dates diverged on nearly every
+  ;; line.
+  ;;
+  ;; The setting is a display style plus a field order, and the halves
+  ;; move independently: `SET datestyle = 'DMY'` changes only the order.
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "ISO is the default"
+      (is (= "2000-04-01" (one c "SELECT '2000-04-01'::date")))
+      (is (= "2016-09-01 12:00:00" (one c "SELECT '2016-09-01 12:00:00'::timestamp")))
+      (is (= "ISO, MDY" (one c "SHOW DateStyle"))))
+    (testing "Postgres style, and the field order it reads"
+      (exec! c "SET DateStyle = 'Postgres, MDY'")
+      (is (= "04-01-2000" (one c "SELECT '2000-04-01'::date")))
+      (is (= "Thu Sep 01 12:00:00 2016" (one c "SELECT '2016-09-01 12:00:00'::timestamp"))
+          "the Postgres style names the weekday and the month")
+      (is (= "Postgres, MDY" (one c "SHOW DateStyle")))
+      (exec! c "SET DateStyle = 'Postgres, DMY'")
+      (is (= "01-04-2000" (one c "SELECT '2000-04-01'::date"))))
+    (testing "SQL and German"
+      (exec! c "SET DateStyle = 'SQL, MDY'")
+      (is (= "04/01/2000" (one c "SELECT '2000-04-01'::date")))
+      (exec! c "SET DateStyle = 'German'")
+      (is (= "01.04.2000" (one c "SELECT '2000-04-01'::date"))))
+    (testing "the halves move independently"
+      (exec! c "SET DateStyle = 'ISO, MDY'")
+      (exec! c "SET datestyle = 'DMY'")
+      (is (= "ISO, DMY" (one c "SHOW DateStyle")) "only the order changed"))
+    (testing "RESET returns to the default"
+      (exec! c "RESET DateStyle")
+      (is (= "ISO, MDY" (one c "SHOW DateStyle")))
+      (is (= "2000-04-01" (one c "SELECT '2000-04-01'::date"))))
+    (testing "a column renders in the session's style too, not only a literal"
+      (seed! c)
+      (exec! c "SET DateStyle = 'Postgres, MDY'")
+      (is (= "01-01-2020" (one c "SELECT d FROM ev WHERE id = 1")))
+      (is (= "Wed Jan 01 10:00:00 2020" (one c "SELECT ts FROM ev WHERE id = 1")))
+      (exec! c "RESET DateStyle"))))
+

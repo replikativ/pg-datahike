@@ -1591,6 +1591,14 @@
                       (str/join ", " path)
                       (get show-settings "search_path")))
 
+      ;; `SHOW DateStyle` reports the session's own setting, not the
+      ;; startup default -- a client that SETs it and reads it back
+      ;; (psql's \set, pg_dump's prelude) was told ISO whatever it asked
+      ;; for.
+      (contains? #{"datestyle" "date_style"} setting-name)
+      (show-setting "DateStyle"
+                    (types/date-style-text (or (:date-style @session-state) [:iso :mdy])))
+
       (contains? show-settings setting-name)
       (show-setting setting-name (get show-settings setting-name))
 
@@ -5657,7 +5665,7 @@
 (def ^:private session-guc-keys
   "Session-state keys that behave as resettable GUCs. RESET ALL clears
    these but preserves connection-identity keys (e.g. :db-name)."
-  [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search
+  [:as-of :since :history :branch :commit-id :search-path :hnsw-ef-search :date-style
    :valid-at :valid-from :valid-to :statement-timeout :isolation :read-only?])
 
 (defn- handle-reset
@@ -5676,6 +5684,9 @@
 
       (= "search_path" setting)
       (swap! session-state dissoc :search-path)
+
+      (contains? #{"datestyle" "date_style"} setting)
+      (swap! session-state dissoc :date-style)
 
       (= "hnsw.ef_search" setting)
       (swap! session-state dissoc :hnsw-ef-search)))
@@ -6274,6 +6285,16 @@
         (let [setting (some-> (:var parsed) str/lower-case)]
           (when (= "search_path" setting)
             (set-search-path! session-state (:values parsed)))
+          ;; `SET DateStyle` chooses the date/timestamp OUTPUT format,
+          ;; and was accepted and then ignored -- every value rendered
+          ;; ISO whatever the session asked for. PostgreSQL's own
+          ;; regression suite runs under `Postgres, MDY`.
+          (when (contains? #{"datestyle" "date_style"} setting)
+            (let [raw (or (:value parsed)
+                          (str/join "," (:values parsed)))]
+              (swap! session-state assoc :date-style
+                     (types/parse-date-style
+                      raw (or (:date-style @session-state) [:iso :mdy])))))
           (when (= "hnsw.ef_search" setting)
             (let [value (try
                           (parse-long (or (:value parsed) ""))
@@ -10696,7 +10717,7 @@
      SET datahike.history = 'true'
      RESET datahike.as_of"
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
-                                              initial-statement-timeout
+                                              initial-statement-timeout initial-date-style
                                               release-conn-on-close?
                                               dispatch-stats
                                               on-create-database on-delete-database
@@ -10728,7 +10749,9 @@
                               ;; explicit SET.
                               initial-branch (assoc :branch initial-branch)
                               (some? initial-statement-timeout)
-                              (assoc :statement-timeout initial-statement-timeout)))
+                              (assoc :statement-timeout initial-statement-timeout)
+                              initial-date-style
+                              (assoc :date-style initial-date-style)))
         ;; session-id is unique per handler so the global lock-registry can
         ;; distinguish this connection's locks from others'.
         session-id (str (java.util.UUID/randomUUID))
@@ -11037,6 +11060,9 @@
                                                       (java.util.IdentityHashMap.))
                     catalog/*registered-databases* registered-databases
                     params/*session-state* session-state
+                    ;; The date/timestamp OUTPUT format is this session's
+                    ;; setting, and the renderer runs on this thread.
+                    types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                     ;; Parameter types declared by the Parse message affect
                     ;; expression resolution and lowering, not merely the
                     ;; later ParameterDescription. For example, PostgreSQL
@@ -11278,6 +11304,11 @@
                                                       (java.util.IdentityHashMap.))
                     params/*statement-time* (java.util.Date.)
                     params/*scalar-subquery-cache* (atom {})
+                    ;; The extended protocol renders its rows here, so the
+                    ;; session's date style has to be in scope on this
+                    ;; path too -- a driver that binds parameters was
+                    ;; getting ISO whatever the session had set.
+                    types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                     *max-result-rows* max-result-rows]
             (or
              ;; Tier-1 compiled lane: plain autocommit SELECT with no
@@ -11310,6 +11341,7 @@
                   params/*statement-time* (java.util.Date.)
                   params/*scalar-subquery-cache* (atom {})
                   params/*session-state* session-state
+                  types/*date-style* (or (:date-style @session-state) [:iso :mdy])
                   params/*cancel* (current-cancel)
                   *max-result-rows* max-result-rows
                   datahike.query/*disable-planner* false]
@@ -11866,11 +11898,24 @@
               initial-timeout
               (parse-startup-statement-timeout
                (.get ^java.util.Map startup-params "options"))
+              ;; libpq turns PGDATESTYLE into a startup parameter, which
+              ;; is how pg_regress asks for `Postgres, MDY` -- it never
+              ;; sends a SET. Ignoring it meant every date in that whole
+              ;; suite was rendered in the wrong style.
+              initial-date-style
+              (some-> (or (.get ^java.util.Map startup-params "DateStyle")
+                          (.get ^java.util.Map startup-params "datestyle")
+                          (some-> ^String (.get ^java.util.Map startup-params "options")
+                                  (->> (re-find #"(?i)-c\s*datestyle=([^\s]+)"))
+                                  second))
+                      (types/parse-date-style [:iso :mdy]))
               handler-opts (cond-> (assoc opts
                                           :db-name requested
                                           :registered-databases names)
                              (some? initial-timeout)
-                             (assoc :initial-statement-timeout initial-timeout))]
+                             (assoc :initial-statement-timeout initial-timeout)
+                             (some? initial-date-style)
+                             (assoc :initial-date-style initial-date-style))]
           (if-let [conn (get registry requested)]
             (if branch
               (let [branch-conn (connect-branch conn branch)]

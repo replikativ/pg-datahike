@@ -1485,6 +1485,91 @@
 (defn- timestamp-text [^java.time.LocalDateTime ldt]
   (str (.toLocalDate ldt) " " (time-text (.toLocalTime ldt))))
 
+;; ── DateStyle ──────────────────────────────────────────────────────────
+;;
+;; PostgreSQL's date/timestamp OUTPUT format is a session setting, and
+;; `SET DateStyle` was accepted and then ignored: every value rendered
+;; ISO. Its own regression suite runs under `DateStyle=Postgres, MDY`
+;; (pg_regress sets PGDATESTYLE), which is why `horology`, `timestamp`
+;; and `timestamptz` disagreed on nearly every line.
+;;
+;; The setting is a display style plus a field ORDER for ambiguous input:
+;; `Postgres, MDY` prints `04-01-2000`, `Postgres, DMY` prints
+;; `01-04-2000`, `SQL` uses slashes, `German` dots, and ISO is the
+;; unambiguous default. `*date-style*` carries the pair; the renderer is
+;; the only reader.
+
+(def ^:dynamic *date-style*
+  "[style order], where style is :iso | :postgres | :sql | :german and
+   order is :mdy | :dmy | :ymd. PostgreSQL's own default is [:iso :mdy]."
+  [:iso :mdy])
+
+(defn parse-date-style
+  "Read a `DateStyle` value -- `ISO, MDY`, `Postgres`, `german, dmy`,
+   in any order and case -- into `[style order]`, keeping whichever half
+   the value does not mention. PostgreSQL treats the two halves
+   independently, and `SET datestyle = 'DMY'` changes only the order."
+  ([v] (parse-date-style v *date-style*))
+  ([v [style order]]
+   (reduce (fn [[st ord] tok]
+             (case (str/lower-case (str/trim tok))
+               ("iso")        [:iso ord]
+               ("postgres")   [:postgres ord]
+               ("sql")        [:sql ord]
+               ("german")     [:german ord]
+               ("mdy" "us" "nonaeuro" "noneuro") [st :mdy]
+               ("dmy" "european" "euro") [st :dmy]
+               ("ymd")        [st :ymd]
+               [st ord]))
+           [style order]
+           (str/split (str (or v "")) #","))))
+
+(defn date-style-text
+  "`[style order]` rendered the way `SHOW DateStyle` renders it."
+  [[style order]]
+  (str (case style :iso "ISO" :postgres "Postgres" :sql "SQL" :german "German")
+       ", "
+       (case order :mdy "MDY" :dmy "DMY" :ymd "YMD")))
+
+(def ^:private month-abbrevs
+  ["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"])
+
+(def ^:private day-abbrevs
+  ;; java.time's DayOfWeek is Monday=1; PostgreSQL prints the same names.
+  ["Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"])
+
+(defn- date-parts [^java.time.LocalDate d]
+  [(format "%02d" (.getMonthValue d))
+   (format "%02d" (.getDayOfMonth d))
+   (format "%04d" (.getYear d))])
+
+(defn date->pg-text
+  "A date, in the session's DateStyle. `EncodeDateOnly` in datetime.c."
+  ([d] (date->pg-text d *date-style*))
+  ([^java.time.LocalDate d [style order]]
+   (let [[m dd y] (date-parts d)]
+     (case style
+       :iso      (str y "-" m "-" dd)
+       :postgres (if (= order :dmy) (str dd "-" m "-" y) (str m "-" dd "-" y))
+       :sql      (if (= order :dmy) (str dd "/" m "/" y) (str m "/" dd "/" y))
+       :german   (str dd "." m "." y)))))
+
+(defn timestamp->pg-text
+  "A timestamp, in the session's DateStyle. `EncodeDateTime` in
+   datetime.c: the Postgres style prints the weekday and month by name --
+   `Thu Sep 01 12:00:00 2016` -- and the others keep the date and time
+   in the style's own order, separated by a space."
+  ([ldt] (timestamp->pg-text ldt *date-style*))
+  ([^java.time.LocalDateTime ldt [style order :as ds]]
+   (let [d (.toLocalDate ldt)
+         t (time-text (.toLocalTime ldt))]
+     (case style
+       :postgres (str (nth day-abbrevs (dec (.getValue (.getDayOfWeek d)))) " "
+                      (nth month-abbrevs (dec (.getMonthValue d))) " "
+                      (format "%02d" (.getDayOfMonth d)) " "
+                      t " " (format "%04d" (.getYear d)))
+       (str (date->pg-text d ds) " " t)))))
+
 (defn money-text
   "cash_out in the C locale: `-$1,234,567.89`."
   [v]
@@ -1511,15 +1596,15 @@
   ([v] (temporal->pg-text v nil))
   ([v src-oid]
    (cond
-     (instance? java.time.LocalDate v)     (str v)
+     (instance? java.time.LocalDate v)     (date->pg-text v)
      (instance? java.time.LocalTime v)     (time-text v)
      (instance? java.time.OffsetTime v)
      (let [^java.time.OffsetTime t v]
        (str (time-text (.toLocalTime t)) (offset-text (.getOffset t))))
-     (instance? java.time.LocalDateTime v) (timestamp-text v)
+     (instance? java.time.LocalDateTime v) (timestamp->pg-text v)
      (instance? java.time.OffsetDateTime v)
      (let [^java.time.OffsetDateTime t v]
-       (str (timestamp-text (.toLocalDateTime (.withOffsetSameInstant t java.time.ZoneOffset/UTC)))
+       (str (timestamp->pg-text (.toLocalDateTime (.withOffsetSameInstant t java.time.ZoneOffset/UTC)))
             "+00"))
 
      (inst? v)
@@ -1528,9 +1613,9 @@
                                      (.toInstant ^java.util.Date v))
            ldt (java.time.LocalDateTime/ofInstant inst java.time.ZoneOffset/UTC)]
        (cond
-         (= src-oid oid-date)        (str (.toLocalDate ldt))
-         (= src-oid oid-timestamptz) (str (timestamp-text ldt) "+00")
-         :else                       (timestamp-text ldt)))
+         (= src-oid oid-date)        (date->pg-text (.toLocalDate ldt))
+         (= src-oid oid-timestamptz) (str (timestamp->pg-text ldt) "+00")
+         :else                       (timestamp->pg-text ldt)))
 
      :else nil)))
 
