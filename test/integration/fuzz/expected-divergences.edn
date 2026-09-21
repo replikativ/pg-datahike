@@ -1,43 +1,38 @@
 ;; Known, explained disagreements between PostgreSQL 17.7 and pg-datahike
 ;; found by datahike.fuzz.differential. One entry per sample:
-;;   {:surface :select|:prepared|:dml, :key <the SQL as generated>, :reason "..."}
+;;   {:surface :select|:prepared|:join|:dml, :key <the SQL as generated>, :reason "..."}
+;; or, for a gap the grammar reaches through many combinations that all mean
+;; the same thing:
+;;   {:surface :join, :key-pattern "<regex over the SQL>", :reason "..."}
 ;;
-;; A disagreement NOT listed here fails the run (regression). A listed entry
-;; that the run draws and that now AGREES also fails (baseline drift): prune
-;; it and record the newly supported behaviour. Keep reasons specific --
-;; "unsupported" is not a reason; say what is missing.
+;; A disagreement NOT listed here fails the run (regression). A listed :key
+;; entry that the run draws and that now AGREES also fails (baseline drift):
+;; prune it and record the newly supported behaviour. A :key-pattern entry is
+;; NOT drift-checked -- some samples of a class agree by accident (a WHERE
+;; that empties the result) -- so prune it by hand when its gap closes. Keep
+;; reasons specific -- "unsupported" is not a reason; say what is missing.
 [{:surface :select
   :key "SELECT id, to_char(d, 'YYYY-MM-DD') AS c FROM ft ORDER BY id"
   :reason "to_char over date/timestamp is refused with 0A000: PostgreSQL's
            formatting.c template language (YYYY, MM, Day, FM, TH, ...) is not
            implemented. Numeric to_char works."}
  {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+  :key-pattern "^SELECT count\\(.*FROM ft FULL JOIN"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000, whatever the ON
+           clause says: the join is two queries whose rows are concatenated, so
+           an aggregate pushed into the halves is computed per half and answered
+           twice (count(*) said 5 and 4 where PostgreSQL says 7). Refused until
+           the combination happens before aggregation -- one query with two
+           branches. A CLASS entry: the ON-clause grammar reaches this one
+           refusal through dozens of combinations that all mean the same thing."}
  {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id AND ft.id < 4)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.i = fu.k AND ft.i IS NOT NULL AND ft.id < 4)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id AND ft.b)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND ft.b AND fu.k <> ft.i)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND fu.id > 1)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND fu.k > ft.i)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND fu.k <> ft.i)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id AND ft.i = 10)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
- {:surface :join
-  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.i = fu.k)"
-  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}]
+  :key-pattern "FULL JOIN fu ON \\((?![^)]*(ft\\.\\w+ = fu\\.|fu\\.\\w+ = ft\\.))[^)]*\\) WHERE "
+  :reason "a FULL JOIN whose ON clause has no equality BETWEEN the relations is
+           0A000 here, as it is in PostgreSQL -- except when a WHERE clause
+           rejects the null-extended rows of one side. PostgreSQL's
+           reduce_outer_joins then weakens the join to LEFT/RIGHT/INNER, which
+           needs no merge- or hash-joinable condition, and answers; we still
+           refuse. Join-strength reduction from a strict WHERE qual is not
+           implemented. The pattern matches only the ON clauses WITHOUT such an
+           equality, so a wrong answer to a FULL JOIN that does have one is
+           still a regression."}]

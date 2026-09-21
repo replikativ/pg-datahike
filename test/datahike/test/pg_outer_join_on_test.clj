@@ -230,3 +230,68 @@
                                    LEFT JOIN pg_catalog.pg_attrdef d
                                      ON (d.adrelid = a.attrelid AND d.adnum = a.attnum)
                                   WHERE a.attrelid = 'cols'::regclass"))))))))
+
+(deftest an-on-clause-with-no-equality-is-a-nested-loop
+  ;; An ON clause that relates the two rows by anything other than
+  ;; equality -- `>`, `<>`, `IS NULL`, a condition on one side alone,
+  ;; `true` -- was refused with 0A000. PostgreSQL answers it by
+  ;; considering every right row for every left row and filtering, and
+  ;; most of the ON-clause space looks like this, so the refusal turned
+  ;; away a large part of the language.
+  ;;
+  ;; The lowering is the equi-join's with the row-existence marker in
+  ;; place of the key pattern: it ENUMERATES the right relation instead
+  ;; of seeking into it. Left rows no right row satisfies are
+  ;; null-extended as ever.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (seed! c)
+    (testing "ON true is the cross product, with every left row kept"
+      (is (= [["1" "1" "p"] ["1" "1" "q"] ["1" "1" "r"]
+              ["1" "2" "p"] ["1" "2" "q"] ["1" "2" "r"]
+              ["2" "1" "p"] ["2" "1" "q"] ["2" "1" "r"]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        LEFT JOIN lb b ON true
+                      ORDER BY 1,2,3"))))
+    (testing "an inequality between the two rows"
+      (is (= [["1" "1" "q"] ["1" "1" "r"] ["1" "2" "q"]
+              ["2" "1" "q"] ["2" "1" "r"]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        LEFT JOIN lb b ON (b.y > a.y)
+                      ORDER BY 1,2,3"))))
+    (testing "a non-equality between the two rows"
+      (is (= [["1" "1" "r"] ["1" "2" "r"] ["2" "1" "p"] ["2" "1" "q"]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        LEFT JOIN lb b ON (b.x <> a.x)
+                      ORDER BY 1,2,3"))))
+    (testing "a condition on the right row alone"
+      (is (= [["1" "1" "p"] ["1" "2" "p"] ["2" "1" "p"]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        LEFT JOIN lb b ON (b.v = 'p')
+                      ORDER BY 1,2,3"))))
+    (testing "a condition NO right row satisfies null-extends every left row"
+      ;; The branch that answers this is a negation whose body mentions
+      ;; the left row only through the join variable -- a cross product
+      ;; by construction. Datahike's planner excluded every row for such
+      ;; a body (replikativ/datahike#1092), which is what made these two
+      ;; answer nothing at all.
+      (is (= [["1" "1" nil] ["1" "2" nil] ["2" "1" nil]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        LEFT JOIN lb b ON false
+                      ORDER BY 1,2,3")))
+      (is (= [["1" "1" nil] ["1" "2" nil] ["2" "1" nil]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        LEFT JOIN lb b ON (b.v IS NULL)
+                      ORDER BY 1,2,3"))))
+    (testing "INNER JOIN with the same condition keeps only the matches"
+      (is (= [["1" "1" "q"] ["1" "1" "r"] ["1" "2" "q"]
+              ["2" "1" "q"] ["2" "1" "r"]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        JOIN lb b ON (b.y > a.y)
+                      ORDER BY 1,2,3"))))
+    (testing "RIGHT JOIN keeps every right row"
+      (is (= [["1" "2" "p"] [nil nil "q"] [nil nil "r"]]
+             (rows c "SELECT a.x, a.y, b.v FROM la a
+                        RIGHT JOIN lb b ON (a.y > b.y)
+                      ORDER BY 3,1,2"))))))

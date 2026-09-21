@@ -4,6 +4,14 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### An outer join whose ON clause has no equality
+
+`LEFT JOIN lb b ON true`, `ON (b.y > a.y)`, `ON (b.x <> a.x)`, `ON (b.v = 'p')`, `ON false`, `ON (b.v IS NULL)` — every ON clause that does not relate the two rows by equality was refused with 0A000, `non-equality outer join conditions are not supported`. PostgreSQL answers all of them: it considers every right row for every left row and lets the conditions filter. Most of the ON-clause space looks like that, so the refusal turned away a large part of the language.
+
+The lowering is the equi-join's with the **row-existence marker** in place of the key pattern: the matched branch enumerates the right relation rather than seeking into it, and the unmatched branch null-extends the left rows no right row satisfies, as before. INNER JOIN with the same condition was always supported and is unchanged; RIGHT and FULL reach this path through the rewrite to LEFT.
+
+The two shapes where *no* right row qualifies (`ON false`, `ON (b.v IS NULL)`) answered nothing at all until [replikativ/datahike#1092](https://github.com/replikativ/datahike/pull/1092): the unmatched branch is a negation whose body mentions the left row only through the join variable — a cross product by construction — and the query planner decided such a body's satisfiability *after* projecting to the join variables, where the empty relation that makes it unsolvable has already been dropped. It read as satisfiable and excluded every row. **This release therefore requires the Datahike version carrying that fix.**
+
 ### A golden may not record an empty answer
 
 A golden file records what the implementation *did*, so a wrong answer nobody had checked against PostgreSQL became the expectation and then defended itself. Three turned up in one day — `pgjdbc-getColumns-person`, `is-columns-person` and `pgjdbc-getPrimaryKeys-person` — and every one held `:rows []`: a query that a catalog probe, or a type the array reader could not parse, had been answering with nothing.
