@@ -62,6 +62,24 @@
           (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
           acc)))))
 
+(defn- prepared-rows
+  "`rows`, over the extended protocol -- the one every driver uses."
+  [^Connection c sql]
+  (with-open [st (.prepareStatement c sql) rs (.executeQuery st)]
+    (let [n (.getColumnCount (.getMetaData rs))]
+      (loop [acc []]
+        (if (.next rs)
+          (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
+          acc)))))
+
+(defn- state
+  "The SQLSTATE of a statement that must fail."
+  [^Connection c sql]
+  (try
+    (with-open [st (.createStatement c)] (.execute st sql))
+    :no-error
+    (catch java.sql.SQLException e (.getSQLState e))))
+
 (defn- seed! [^Connection c]
   (exec! c "CREATE TABLE la (x int, y int)")
   (exec! c "CREATE TABLE lb (x int, y int, v text)")
@@ -151,6 +169,45 @@
       (is (= [["1" "one"] ["2" nil]]
              (rows c "SELECT na.id, nb.w FROM na RIGHT JOIN nb ON (na.id = nb.id AND na.v IS NOT NULL)
                       ORDER BY 1"))))))
+
+(deftest a-full-join-answers-both-sides-every-time
+  ;; Three defects, one query:
+  ;;
+  ;;   * the FULL -> LEFT rewrite mutated the AST in place, and the AST
+  ;;     cache hands out the same object per SQL string, so the FIRST
+  ;;     execution answered a FULL JOIN and every later one a plain LEFT
+  ;;     JOIN -- the right-only rows disappeared once the statement had
+  ;;     been run before;
+  ;;   * the halves were combined by removing from the second every row
+  ;;     equal to one in the first, which loses a right-only row that
+  ;;     happens to equal a left row's projection;
+  ;;   * `describeResult` did not know the shape, so over the extended
+  ;;     protocol the client met DataRows with no RowDescription
+  ;;     ("Received resultset tuples, but no field structure for them")
+  ;;     and every later statement on that connection failed too.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE fa (id int, k int)")
+    (exec! c "CREATE TABLE fb (id int, w text)")
+    (exec! c "INSERT INTO fa VALUES (1,10),(2,20)")
+    (exec! c "INSERT INTO fb VALUES (10,'ten'),(30,'thirty')")
+    ;; sorted: a NULL left id orders first
+    (let [expected [[nil "thirty"] ["1" "ten"] ["2" nil]]]
+      (testing "both sides, and the same answer every time"
+        (dotimes [_ 3]
+          (is (= expected
+                 (sort (rows c "SELECT fa.id, fb.w FROM fa FULL JOIN fb ON (fa.k = fb.id)"))))))
+      (testing "over a prepared statement, which is how every driver asks"
+        (is (= expected
+               (sort (prepared-rows c "SELECT fa.id, fb.w FROM fa FULL JOIN fb ON (fa.k = fb.id)")))))
+      (testing "and the connection still works afterwards"
+        (is (= [["1"]] (rows c "SELECT 1")))))
+    (testing "what cannot be answered is refused, not answered twice"
+      ;; `count(*)` used to return one row per half -- 5 and 4 where
+      ;; PostgreSQL says 7.
+      (doseq [sql ["SELECT count(*) FROM fa FULL JOIN fb ON (fa.k = fb.id)"
+                   "SELECT DISTINCT fa.id FROM fa FULL JOIN fb ON (fa.k = fb.id)"
+                   "SELECT fa.id FROM fa FULL JOIN fb ON (fa.k = fb.id) LIMIT 2"]]
+        (is (= "0A000" (state c sql)) sql)))))
 
 (deftest three-conditions-and-a-catalog-shape
   (with-open [c (jdbc)]

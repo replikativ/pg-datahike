@@ -10243,11 +10243,13 @@
                                raw)
                           raw)))
         left-results (vec (exec-select left-query))
-        right-results (vec (exec-select right-query))
-        ;; Right-only rows: appear in right-results but not left-results
-        ;; (matched rows appear in both with same values)
-        left-set (set left-results)
-        right-only (remove left-set right-results)
+        ;; The swapped half answers the rows with no match and nothing
+        ;; else (stmt/*unmatched-rows-only*), so the two halves are
+        ;; disjoint by construction. Pairing them by REMOVING from the
+        ;; second every row equal to one in the first lost a right-only
+        ;; row that happened to equal a left row's projection -- and lost
+        ;; duplicates outright.
+        right-only (vec (exec-select right-query))
         combined (concat left-results right-only)]
     (format-query-result combined (or find-aliases (:find-aliases left-query)))))
 
@@ -11499,6 +11501,28 @@
                         (map int (set-operation-output-oids (:sub-results parsed) db)))]
               (PgWireServer$QueryResult.
                (into-array String aliases)
+               oids
+               (into-array (Class/forName "[Ljava.lang.String;")
+                           (make-array String 0 0))
+               "SELECT 0")))
+
+          ;; FULL JOIN — same contract as a set operation: the
+          ;; executor runs two halves and combines them, and without a
+          ;; Describe response here the client meets its DataRows with
+          ;; no RowDescription ("Received resultset tuples, but no field
+          ;; structure for them") and the connection is out of step for
+          ;; every statement after it. Both halves project the same
+          ;; columns, so the left one describes the result.
+          (= :full-join (:type parsed))
+          (when-let [sub (:left-query parsed)]
+            (let [db (if (:in-tx? @tx-state)
+                       (or (:speculative-db @tx-state) (d/db conn))
+                       (d/db conn))
+                  db (or (:enriched-db sub) db)
+                  [aliases oids] (select-output-shape sub db (effective-item-oids sub))
+                  oids (int-array (map #(types/oid->wire-int (or % PgWireServer/OID_TEXT)) oids))]
+              (PgWireServer$QueryResult.
+               (into-array String (or (:find-aliases parsed) aliases))
                oids
                (into-array (Class/forName "[Ljava.lang.String;")
                            (make-array String 0 0))

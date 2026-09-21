@@ -4,6 +4,18 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### FULL JOIN answers both sides, every time
+
+Three defects, one query:
+
+- **The rewrite mutated a cached AST.** A FULL JOIN is lowered by rewriting it into a LEFT JOIN in place (`setFull false`), and the AST cache hands out the same parsed object for the same SQL — so the FIRST execution answered a FULL JOIN and every later one a plain LEFT JOIN, silently dropping the right-only rows. Which answer you got depended on whether anything had run the statement before. Such a statement now gets its own AST.
+- **The halves were combined by subtraction.** The second half ran as a full LEFT JOIN over the swapped tables, and rows equal to one from the first half were removed — which loses a right-only row that happens to equal a left row's projection, and loses duplicates outright. The second half now contributes exactly the rows with no match, so the halves are disjoint by construction.
+- **The extended protocol got no RowDescription.** `describeResult` knew `:select` and `:set-operation` but not `:full-join`, so a client that Describes before Execute met DataRows with no description — `Received resultset tuples, but no field structure for them` — and **every later statement on that connection failed too**. It now describes from the left half, as set operations do.
+
+An **aggregate, `DISTINCT`, `LIMIT` or `OFFSET` over a FULL JOIN is now refused with 0A000** rather than answered per half: `count(*)` returned two rows, `5` and `4`, where PostgreSQL returns `7`. Lifting that needs the combination to happen before aggregation — one query with two branches rather than two queries.
+
+With these, the fuzzer's join surface goes from 47 disagreements to 10 — all of them that refusal, registered as expected — so **`:join` is now part of `bb fuzz all`**: INNER, LEFT, RIGHT and FULL, over both wire protocols, gate every change from here.
+
 ### A condition over an outer join's nullable side
 
 `SELECT na.id, nb.w FROM na LEFT JOIN nb ON (na.id = nb.id) WHERE nb.w IS NOT NULL` raised **`Bad format for entity-id in pattern`** as XX000, and the same condition inside the ON raised `Cannot resolve any more clauses`. The column read was emitted as a `get-else` on the right *entity* variable, outside the or-join — the variable the unmatched branch grounds to `:__null__`.

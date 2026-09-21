@@ -10,4 +10,34 @@
   :key "SELECT id, to_char(d, 'YYYY-MM-DD') AS c FROM ft ORDER BY id"
   :reason "to_char over date/timestamp is refused with 0A000: PostgreSQL's
            formatting.c template language (YYYY, MM, Day, FM, TH, ...) is not
-           implemented. Numeric to_char works."}]
+           implemented. Numeric to_char works."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id AND ft.id < 4)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.i = fu.k AND ft.i IS NOT NULL AND ft.id < 4)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id AND ft.b)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND ft.b AND fu.k <> ft.i)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND fu.id > 1)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND fu.k > ft.i)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.j = fu.k AND fu.k <> ft.i)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.id = fu.id AND ft.i = 10)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}
+ {:surface :join
+  :key "SELECT count(*), count(fu.v) FROM ft FULL JOIN fu ON (ft.i = fu.k)"
+  :reason "an aggregate over a FULL JOIN is refused with 0A000: the join is two\n           queries whose rows are concatenated, so an aggregate pushed into\n           the halves is computed per half and answered twice (count(*) said\n           5 and 4 where PostgreSQL says 7). Refused until the combination\n           happens before aggregation -- one query with two branches."}]

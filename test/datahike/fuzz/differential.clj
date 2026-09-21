@@ -577,20 +577,11 @@
    manifest entry the run drew that now agrees."
   [& [surface n seed]]
   (let [surfaces (if (or (nil? surface) (= "all" surface))
-                   ;; :join is NOT in the gate yet. It reports 47 known
-                   ;; disagreements over its 132-sample default corpus --
-                   ;; FULL JOIN loses every right-only row, and a condition
-                   ;; over the nullable side leaks a datalog error -- each
-                   ;; an item in doc/consolidation-plan.md. Listing them as
-                   ;; expected divergences would be a manifest larger than
-                   ;; the manifest, so the surface runs on demand
-                   ;; (`bb fuzz join`) until those are fixed, and joins the
-                   ;; gate when it is clean.
-                   [:select :prepared :dml]
+                   [:select :prepared :join :dml]
                    [(keyword surface)])
         n (if n (Long/parseLong n) nil)
         seed (if seed (Long/parseLong seed) 20260918)
-        default-n {:select 1500 :prepared 600 :join 600 :dml 300}
+        default-n {:select 1500 :prepared 600 :join 150 :dml 300}
         outcomes (doall (for [s surfaces]
                           (report (run-surface s (or n (default-n s)) seed))))
         unexpected (mapcat :unexpected outcomes)

@@ -1307,7 +1307,19 @@
                                  parser-sql)
                     (stmt/validate-lateral-join-shapes!
                      (CCJSqlParserUtil/parse parser-sql)))
-                stmt (ast-parse parser-sql)
+                ;; A FULL JOIN is rewritten IN PLACE into a LEFT JOIN
+                ;; (`.setFull false`) before translation, and the AST cache
+                ;; hands out the same mutable object for the same SQL. The
+                ;; first execution therefore answered a FULL JOIN and every
+                ;; later one a plain LEFT JOIN, silently dropping the
+                ;; right-only rows -- which also made the behaviour depend
+                ;; on cache state, and so on whether anything had run the
+                ;; statement before. Such a statement gets its own AST.
+                full-join-sql? (boolean (re-find #"(?is)\bfull\s+(?:outer\s+)?join\b"
+                                                 parser-sql))
+                stmt (if full-join-sql?
+                       (CCJSqlParserUtil/parse parser-sql)
+                       (ast-parse parser-sql))
             ;; Catalog materialisation: find every catalog table ref
             ;; anywhere in the AST (top-level, derived tables, UNION
             ;; branches, WHERE subqueries, CTE bodies) and inject a
@@ -2034,8 +2046,35 @@
                                       (.setRightItem j from2)
                                       (.setLeft j true)
                                       (.setFull j false))))
-                              right-result (assoc (translate-select ^PlainSelect stmt2 cte-schema cte-db)
+                              ;; The swapped half contributes ONLY the rows
+                              ;; with no match: the matched ones are already
+                              ;; in the first half, and pairing the halves by
+                              ;; removing equal projections afterwards loses a
+                              ;; right-only row that happens to look like a
+                              ;; left one -- and loses duplicates outright.
+                              right-result (assoc (binding [stmt/*unmatched-rows-only* true]
+                                                    (translate-select ^PlainSelect stmt2 cte-schema cte-db))
                                                   :type :select)]
+                          ;; A FULL JOIN is two queries whose rows are
+                          ;; concatenated, so anything that has to see ALL
+                          ;; the rows at once cannot be pushed into the
+                          ;; halves: an aggregate was computed per half and
+                          ;; answered TWICE (`count(*)` said 5 and 4 where
+                          ;; PostgreSQL says 7), and LIMIT cut each half.
+                          ;; Refuse those until the combination happens
+                          ;; before aggregation. ORDER BY is left alone: its
+                          ;; rows are right and only their order is not.
+                          (when-let [feature (cond
+                                               (or (:has-aggregates? left-result)
+                                                   (:has-aggregates? right-result))
+                                               "an aggregate over a FULL JOIN"
+                                               (or (:has-distinct? left-result)
+                                                   (:has-distinct? right-result))
+                                               "DISTINCT over a FULL JOIN"
+                                               (or (:limit left-result) (:offset left-result))
+                                               "LIMIT or OFFSET over a FULL JOIN")]
+                            (throw (errors/pg-error :feature-not-supported
+                                                    {:feature feature})))
                           {:type :full-join
                            :left-query left-result
                            :right-query right-result
