@@ -5471,7 +5471,7 @@
   ;; state. This includes commit failures and implicit rollback at Sync.
   (reset! cursors {})
   (release-session-locks! session-id)
-  (locks/release-advisory-locks! session-id true)
+  (locks/release-advisory-locks! session-id :xact)
   (swap! tx-state
          (fn [state]
            (-> state

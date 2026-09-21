@@ -784,12 +784,20 @@
    what each does. They were whole-statement handlers only, so
    `SELECT pg_try_advisory_lock(1), 2` -- or the same call inside a CASE,
    which is how a migration tool guards a step -- was 42883."
-  {"pg_advisory_lock"           {:op :lock       :xact? false}
-   "pg_advisory_xact_lock"      {:op :lock       :xact? true}
-   "pg_try_advisory_lock"       {:op :try-lock   :xact? false}
-   "pg_try_advisory_xact_lock"  {:op :try-lock   :xact? true}
-   "pg_advisory_unlock"         {:op :unlock     :xact? false}
-   "pg_advisory_unlock_all"     {:op :unlock-all :xact? false}})
+  {"pg_advisory_lock"                  {:op :lock       :xact? false :mode :exclusive}
+   "pg_advisory_xact_lock"             {:op :lock       :xact? true  :mode :exclusive}
+   "pg_try_advisory_lock"              {:op :try-lock   :xact? false :mode :exclusive}
+   "pg_try_advisory_xact_lock"         {:op :try-lock   :xact? true  :mode :exclusive}
+   "pg_advisory_unlock"                {:op :unlock     :xact? false :mode :exclusive}
+   "pg_advisory_unlock_all"            {:op :unlock-all :xact? false :mode :exclusive}
+   ;; The SHARED half of the family: two shared holders coexist, an
+   ;; exclusive holder excludes everyone. PostgreSQL's own advisory_lock
+   ;; regression file takes both modes on the same key in one statement.
+   "pg_advisory_lock_shared"           {:op :lock       :xact? false :mode :shared}
+   "pg_advisory_xact_lock_shared"      {:op :lock       :xact? true  :mode :shared}
+   "pg_try_advisory_lock_shared"       {:op :try-lock   :xact? false :mode :shared}
+   "pg_try_advisory_xact_lock_shared"  {:op :try-lock   :xact? true  :mode :shared}
+   "pg_advisory_unlock_shared"         {:op :unlock     :xact? false :mode :shared}})
 
 (defn- advisory-key
   "The registry key for an advisory call's arguments: one bigint, or the
@@ -996,7 +1004,7 @@
       ;; session-dependent so it is not shared.
       (contains? advisory-fn-kinds fname)
       (let [_ (params/session-dependent!)
-            {:keys [xact? op]} (get advisory-fn-kinds fname)
+            {:keys [xact? op mode]} (get advisory-fn-kinds fname)
             fn-param (symbol (str "?adv" (swap! (:var-counter ctx) inc)))
             state params/*session-state*
             args (mapv (fn [a]
@@ -1018,10 +1026,14 @@
                           {:message (str fname " requires a transaction")}))
                   :else
                   (case op
-                    :lock       (do (locks/advisory-lock! key sid xact?) "")
-                    :try-lock   (boolean (locks/advisory-lock-try! key sid xact?))
-                    :unlock     (boolean (locks/advisory-unlock! key sid))
-                    :unlock-all (do (locks/release-advisory-locks! sid) "")))))]
+                    :lock       (do (locks/advisory-lock! key sid xact? mode) "")
+                    :try-lock   (boolean (locks/advisory-lock-try! key sid xact? mode))
+                    :unlock     (boolean (locks/advisory-unlock! key sid mode))
+                    ;; `pg_advisory_unlock_all()` releases the SESSION-level
+                    ;; locks; a transaction-level one is held until the
+                    ;; transaction ends, which is what PostgreSQL's own
+                    ;; advisory_lock test asserts.
+                    :unlock-all (do (locks/release-advisory-locks! sid :session) "")))))]
         (swap! (:in-params ctx) conj fn-param)
         (swap! (:in-args ctx) conj impl-fn)
         (swap! (:where-clauses ctx) conj [(apply list fn-param args) result-var])
