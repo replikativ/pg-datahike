@@ -6551,10 +6551,40 @@
     (instance? net.sf.jsqlparser.expression.RowGetExpression expr)
     (let [^net.sf.jsqlparser.expression.RowGetExpression e expr
           fname (.getColumnName e)
-          inner (translate-expr ctx (.getExpression e))
+          inner-expr (.getExpression e)
+          ;; A record that came through a MATERIALISED relation is stored
+          ;; as canonical text (a speculative db's columns hold Datahike
+          ;; scalars), with `:pg/record-fields` carrying the field names
+          ;; and OIDs the text drops. Resolve that layout HERE, while the
+          ;; schema is at hand, and close over it: at runtime the value is
+          ;; a bare string and nothing else could say what its fields are.
+          ;; `(s.r).f` parses with the ROW in parentheses, so the column
+          ;; is one level in.
+          inner-col (loop [x inner-expr]
+                      (cond
+                        (instance? Column x) x
+                        (instance? Parenthesis x) (recur (.getExpression ^Parenthesis x))
+                        ;; `(s.r)` parses as a one-element parenthesed
+                        ;; expression LIST, not a Parenthesis.
+                        (and (instance? java.util.List x) (= 1 (count x)))
+                        (recur (first x))
+                        :else nil))
+          lay (when inner-col
+                (when-let [resolved (try (ctx/resolve-column
+                                          ^Column inner-col
+                                          (:table-aliases ctx) (:default-table ctx)
+                                          (:col-overrides ctx) (:derived-aliases ctx)
+                                          (:ci-index ctx))
+                                         (catch Throwable _ nil))]
+                  (some-> (ctx/attr-of ctx resolved)
+                          (as-> a (get-in (:schema ctx) [a :pg/record-fields]))
+                          pg-rec/text->layout)))
+          inner (translate-expr ctx inner-expr)
           pick (fn [v]
                  (cond
                    (or (nil? v) (= :__null__ v)) :__null__
+                   (and (string? v) (pg-rec/from-pg-text v))
+                   (recur (pg-rec/text->record v (or lay []) input/parse))
                    (pg-rec/record? v)
                    (let [fv (pg-rec/field-value v fname)]
                      (if (= ::pg-rec/absent fv)

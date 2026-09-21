@@ -102,3 +102,44 @@
       (is (= "t" (scalar c "SELECT 5 = ANY('{5,6}')")))
       (is (= "t" (scalar c "SELECT 7 = ANY(ARRAY[7,8])")))
       (is (= "f" (scalar c "SELECT 9 = ANY('{5,6}')"))))))
+
+(deftest a-record-survives-a-materialised-relation
+  ;; A derived table, a CTE and a set operation are MATERIALISED: their
+  ;; rows are stored in a speculative db, whose columns hold Datahike
+  ;; scalars. A record went in as a Java object and came out as
+  ;; "datahike.pg.records.PgRecord@6f2b958e" -- rendered, compared and
+  ;; read as that string -- and `(s.r).f1` raised 42703.
+  ;;
+  ;; It is stored the way an array column is: canonical PG text, plus the
+  ;; field names and OIDs the text drops (`:pg/record-fields`, the record
+  ;; twin of `:pg/array-elem`), so it renders as PostgreSQL renders it
+  ;; and a field read out of it keeps its type -- `(s.r).f2 + 1` is
+  ;; arithmetic, not a cast error.
+  ;;
+  ;; This is the outer half of pgjdbc's primary-key query, which reads
+  ;; `(result.keys).x` out of a derived table.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's.
+  (with-open [c (jdbc)]
+    (testing "the record renders as PostgreSQL renders it"
+      (is (= "(7,8)" (scalar c "SELECT r FROM (SELECT row(7,8) AS r) s")))
+      (is (= "(\"x,y\",2)" (scalar c "SELECT r FROM (SELECT row('x,y',2) AS r) s")))
+      ;; A NULL field is an EMPTY cell, which is how record_out writes it.
+      (is (= "(\"x,y\",)" (scalar c "SELECT r FROM (SELECT row('x,y',NULL::int) AS r) s"))))
+    (testing "a field read back out of it"
+      (is (= "7" (scalar c "SELECT (s.r).f1 FROM (SELECT row(7,8) AS r) s")))
+      (is (= "8" (scalar c "SELECT (s.r).f2 FROM (SELECT row(7,8) AS r) s")))
+      (is (= "x,y" (scalar c "SELECT (s.r).f1 FROM (SELECT row('x,y',2) AS r) s")))
+      (is (= "t" (scalar c "SELECT (s.r).f2 IS NULL FROM (SELECT row('a',NULL::int) AS r) s"))))
+    (testing "the field keeps its type"
+      (is (= "9" (scalar c "SELECT (s.r).f2 + 1 FROM (SELECT row(7,8) AS r) s")))
+      (is (= "(7,8)" (scalar c "SELECT r FROM (SELECT row(7,8) AS r) s WHERE (s.r).f2 = 8"))))
+    (testing "a CTE, materialised the same way"
+      (is (= "4" (scalar c "WITH x AS (SELECT row(4,5) AS r) SELECT (x.r).f1 FROM x")))
+      (is (= "(4,5)" (scalar c "WITH x AS (SELECT row(4,5) AS r) SELECT r FROM x"))))
+    (testing "a whole-row reference through a derived table"
+      (exec! c "CREATE TABLE wr (id int, s text)")
+      (exec! c "INSERT INTO wr VALUES (3,'c')")
+      (is (= "(3,c)" (scalar c "SELECT r FROM (SELECT wr AS r FROM wr) s")))
+      (is (= "c" (scalar c "SELECT (s.r).s FROM (SELECT wr AS r FROM wr) s"))))))
+

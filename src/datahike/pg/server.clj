@@ -3682,6 +3682,11 @@
               ;; the correct array OID (`pg/type "_T"` resolves it).
               [:pg/array-elem kw1]
               [:pg/array-ndim long1]
+              ;; Composite column metadata, the record twin of
+              ;; :pg/array-elem: `name:oid` per field (records/layout->text),
+              ;; so a record stored as canonical text in a materialised
+              ;; relation can be read back with its field names and types.
+              [:pg/record-fields str1]
               [:pg/default-kind kw1]
               [:pg/default-value str1]
               [:pg/default-arg str1]
