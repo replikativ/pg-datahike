@@ -362,11 +362,13 @@
     "pg_index"
     [{:db/ident :pg_index/indrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
      {:db/ident :pg_index/indexrelid :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
-     ;; PG stores indkey as an int2vector — a sequence of column
-     ;; positions. We hold a JSON-ish string "[1]" or "[1,2]"; pgjdbc
-     ;; calls information_schema._pg_expandarray on it, which we have
-     ;; stubbed to pass through via SQL translation.
-     {:db/ident :pg_index/indkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+     ;; indkey is an int2vector: the indexed column positions, written
+     ;; SPACE-separated as PostgreSQL writes them (`1`, `1 2`). Declaring
+     ;; the type is what lets `a.attnum = ANY(i.indkey)` read it as the
+     ;; vector it is -- pgjdbc and Metabase ask that way, and without the
+     ;; declaration the array reader saw a scalar and matched nothing.
+     {:db/ident :pg_index/indkey :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+      :pg/type "int2vector"}
      {:db/ident :pg_index/indisprimary :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_index/indisunique :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
      {:db/ident :pg_index/indisvalid :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
