@@ -63,6 +63,16 @@
 (defn- exec! [^Connection c sql]
   (with-open [st (.createStatement c)] (.execute st sql)))
 
+(defn- row [^Connection c sql]
+  (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+    (.next rs)
+    (let [n (.getColumnCount (.getMetaData rs))]
+      (mapv #(.getString rs (int %)) (range 1 (inc n))))))
+
+(defn- state [^Connection c sql]
+  (try (exec! c sql) :no-error
+       (catch java.sql.SQLException e (.getSQLState e))))
+
 (deftest current-schema-is-the-executing-sessions
   ;; Not the sole projection, so it is translated and cached.
   (let [sql "SELECT current_schema, id FROM t"]
@@ -123,3 +133,47 @@
       (is (= "t" (scalar a "SELECT txid_current() > 0")))
       (is (= (scalar a "SELECT txid_current()")
              (scalar a "SELECT txid_current(), 2"))))))
+
+(deftest advisory-locks-sleep-and-notify-work-in-an-expression
+  ;; The last three server shortcuts. `pg_sleep`, `pg_notify` and the six
+  ;; advisory-lock functions were answerable only as a WHOLE statement,
+  ;; so `SELECT pg_sleep(0), 2` -- and the `CASE WHEN
+  ;; pg_try_advisory_lock(…)` a migration tool guards a step with --
+  ;; raised 42883 on a server where the bare call works.
+  ;;
+  ;; The advisory ones read the session-state atom for the session id the
+  ;; registry is keyed by; `pg_sleep` and `pg_notify` need no session at
+  ;; all and stay cacheable.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's; `void` renders as the
+  ;; EMPTY STRING there, not as NULL.
+  (with-open [a (connect-to "alpha")
+              b (connect-to "alpha")]
+    (testing "void functions in a projection"
+      (is (= "" (scalar a "SELECT pg_sleep(0)")))
+      (is (= "" (scalar a "SELECT pg_sleep(0), 2")))
+      (is (= "" (scalar a "SELECT pg_notify('c','p'), 3")))
+      (is (= "2" (nth (row a "SELECT pg_sleep(0), 2") 1))))
+    (testing "a lock is exclusive across sessions, and re-entrant within one"
+      (is (= "t" (scalar a "SELECT pg_try_advisory_lock(900)")))
+      (is (= "f" (scalar b "SELECT pg_try_advisory_lock(900)")))
+      (is (= "t" (scalar a "SELECT pg_try_advisory_lock(900)")) "re-entrant")
+      (is (= "t" (scalar a "SELECT pg_advisory_unlock(900)")))
+      (is (= "f" (scalar b "SELECT pg_try_advisory_lock(900)"))
+          "one unlock does not release a doubly-held lock")
+      (is (= "t" (scalar a "SELECT pg_advisory_unlock(900)")))
+      (is (= "t" (scalar b "SELECT pg_try_advisory_lock(900)")))
+      (is (= "" (scalar b "SELECT pg_advisory_unlock_all()"))))
+    (testing "inside an expression, which is how a migration tool asks"
+      (is (= "got" (scalar a "SELECT CASE WHEN pg_try_advisory_lock(901) THEN 'got' ELSE 'busy' END")))
+      (is (= "busy" (scalar b "SELECT CASE WHEN pg_try_advisory_lock(901) THEN 'got' ELSE 'busy' END")))
+      (is (= "t" (scalar a "SELECT pg_advisory_unlock(901)"))))
+    (testing "the two-key namespace is distinct from the one-key one"
+      (is (= "t" (scalar a "SELECT pg_try_advisory_lock(1, 2)")))
+      (is (= "t" (scalar b "SELECT pg_try_advisory_lock(1)"))
+          "a single key 1 is a different lock from the pair (1,2)")
+      (is (= "t" (scalar a "SELECT pg_advisory_unlock(1, 2)")))
+      (is (= "t" (scalar b "SELECT pg_advisory_unlock(1)"))))
+    (testing "a transaction-level lock outside a transaction is 25P01"
+      (is (= "25P01" (state a "SELECT pg_advisory_xact_lock(902)"))))))
+

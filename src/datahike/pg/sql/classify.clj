@@ -551,27 +551,11 @@
       {:kind :set-config :args (extract-fn-string-args rest-args)}
       (fn-name=? t1 "pg_backend_pid") {:kind :pg-backend-pid}
       (fn-name=? t1 "txid_current")  {:kind :txid-current}
-      (fn-name=? t1 "pg_sleep")
-      {:kind :pg-sleep :args (extract-fn-numeric-args rest-args)}
-      ;; pg_notify(channel, payload) — Odoo's bus uses this from a
-      ;; post-commit hook (addons/bus/models/bus.py) on every model
-      ;; write. We accept it as a void no-op: there is no LISTEN
-      ;; delivery in pg-datahike, so the sender path is observably
-      ;; equivalent to delivering to zero subscribers.
-      (fn-name=? t1 "pg_notify")
-      {:kind :pg-notify}
-      (fn-name=? t1 "pg_advisory_lock")
-      {:kind :advisory-lock :args (extract-fn-numeric-args rest-args)}
-      (fn-name=? t1 "pg_try_advisory_lock")
-      {:kind :try-advisory-lock :args (extract-fn-numeric-args rest-args)}
-      (fn-name=? t1 "pg_advisory_xact_lock")
-      {:kind :advisory-xact-lock :args (extract-fn-numeric-args rest-args)}
-      (fn-name=? t1 "pg_try_advisory_xact_lock")
-      {:kind :try-advisory-xact-lock :args (extract-fn-numeric-args rest-args)}
-      (fn-name=? t1 "pg_advisory_unlock")
-      {:kind :advisory-unlock :args (extract-fn-numeric-args rest-args)}
-      (fn-name=? t1 "pg_advisory_unlock_all")
-      {:kind :advisory-unlock-all}
+      ;; `pg_sleep`, `pg_notify` and the advisory locks used to be
+      ;; whole-statement shortcuts here. They are TRANSLATED now -- see
+      ;; datahike.pg.sql.expr -- so they work in an expression too
+      ;; (`SELECT pg_sleep(0), 2`, `CASE WHEN pg_try_advisory_lock(1) …`),
+      ;; which the shortcut answered with 42883.
       (fn-name=? t1 "nextval")
       {:kind :nextval :seq-name (first (extract-fn-string-args rest-args))}
       (fn-name=? t1 "currval")

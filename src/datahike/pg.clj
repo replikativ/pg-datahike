@@ -94,6 +94,7 @@
 
    The table is then queryable via SQL: `SELECT * FROM app_metrics`."
   (:require [datahike.pg.schema :as schema]
+            [datahike.pg.locks :as locks]
             [datahike.pg.server :as server]
             [datahike.pg.sql :as sql]))
 
@@ -191,4 +192,4 @@
 
 (def reset-advisory-locks!
   "Clear the advisory-lock registry. Test-fixture helper."
-  server/reset-advisory-locks!)
+  locks/reset-advisory-locks!)
