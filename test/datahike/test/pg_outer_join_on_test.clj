@@ -118,6 +118,40 @@
       ;; second ON condition. Its own item in doc/consolidation-plan.md.
       )))
 
+(deftest a-condition-over-the-nullable-side
+  ;; A column of the nullable side read by a WHERE, or by a condition the
+  ;; join defers, was read OUTSIDE the or-join -- a `get-else` on the
+  ;; right ENTITY variable, which the unmatched branch grounds to
+  ;; `:__null__`. The client got datalog's "Bad format for entity-id in
+  ;; pattern" (or "Cannot resolve any more clauses") as XX000.
+  ;;
+  ;; The READ belongs inside the join; the predicate stays outside, where
+  ;; it filters the null-extended rows -- which is how PostgreSQL reduces
+  ;; an outer join to an inner one.
+  (with-open [c (jdbc)]
+    (exec! c "CREATE TABLE na (id int, v int)")
+    (exec! c "CREATE TABLE nb (id int, w text)")
+    (exec! c "INSERT INTO na VALUES (1,10),(2,20),(3,30)")
+    (exec! c "INSERT INTO nb VALUES (1,'one'),(2,NULL)")
+    (testing "a WHERE over the nullable side"
+      (is (= [["1" "one"]]
+             (rows c "SELECT na.id, nb.w FROM na LEFT JOIN nb ON (na.id = nb.id)
+                       WHERE nb.w IS NOT NULL ORDER BY 1")))
+      (is (= [["2" nil] ["3" nil]]
+             (rows c "SELECT na.id, nb.w FROM na LEFT JOIN nb ON (na.id = nb.id)
+                       WHERE nb.w IS NULL ORDER BY 1"))))
+    (testing "a condition over the nullable side inside the ON"
+      (is (= [["1" nil] ["2" nil] ["3" nil]]
+             (rows c "SELECT na.id, nb.w FROM na LEFT JOIN nb ON (na.id = nb.id AND nb.w IS NULL)
+                      ORDER BY 1")))
+      (is (= [["1" "one"] ["2" nil] ["3" nil]]
+             (rows c "SELECT na.id, nb.w FROM na LEFT JOIN nb ON (na.id = nb.id AND nb.w IS NOT NULL)
+                      ORDER BY 1"))))
+    (testing "and on the other side of a RIGHT join"
+      (is (= [["1" "one"] ["2" nil]]
+             (rows c "SELECT na.id, nb.w FROM na RIGHT JOIN nb ON (na.id = nb.id AND na.v IS NOT NULL)
+                      ORDER BY 1"))))))
+
 (deftest three-conditions-and-a-catalog-shape
   (with-open [c (jdbc)]
     (seed! c)

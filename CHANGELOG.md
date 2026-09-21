@@ -4,6 +4,12 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### A condition over an outer join's nullable side
+
+`SELECT na.id, nb.w FROM na LEFT JOIN nb ON (na.id = nb.id) WHERE nb.w IS NOT NULL` raised **`Bad format for entity-id in pattern`** as XX000, and the same condition inside the ON raised `Cannot resolve any more clauses`. The column read was emitted as a `get-else` on the right *entity* variable, outside the or-join — the variable the unmatched branch grounds to `:__null__`.
+
+The read now happens inside the join, where the matched branch binds it and the unmatched branch nulls it; the predicate stays outside, filtering the null-extended rows, which is how PostgreSQL reduces an outer join to an inner one. The join surface of the differential fuzzer drops from 47 disagreements to 27 — every one that remains is a FULL JOIN, which has its own items.
+
 ### The differential fuzzer joins
 
 A new `join` surface generates a join type (`JOIN`, `LEFT`, `RIGHT`, `FULL`), an ON clause of one to three conjuncts around an equality — another equality, a comparison between the relations, a test over one side only — and a projection that may read the nullable side, then runs each sample over **both** wire protocols and compares the rows with a real PostgreSQL 17. `bb fuzz join [n] [seed]`.
