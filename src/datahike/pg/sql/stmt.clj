@@ -3026,6 +3026,19 @@
        (or (contains? throwing-projection-ops x)
            (str/starts-with? (name x) "?nextval-marker-"))))
 
+(def ^:dynamic *unmatched-rows-only*
+  "True while translating the SWAPPED half of a FULL JOIN, which
+   contributes exactly the rows the other half cannot have: the ones
+   with no match. The outer-join lowering then emits its unmatched
+   branch alone, instead of an or-join whose matched branch repeats
+   every row the first half already answered.
+
+   A FULL JOIN used to be two LEFT JOINs whose results were combined by
+   removing, from the second, every row that appeared in the first --
+   which loses a right-only row that happens to equal a left row's
+   projection, and loses duplicates outright."
+  false)
+
 (defn- clause-vars
   "The logic variables a Datalog clause mentions, at any depth."
   [clause]
@@ -5726,7 +5739,10 @@
                       oj-clause (list* 'or-join shared-vars matched unmatched nil)]
                   ;; Add right entity var to :with for dedup prevention
                   (swap! (:with-vars ctx) conj right-evar)
-                  (reset! (:where-clauses ctx) (conj left-clauses oj-clause)))
+                  (reset! (:where-clauses ctx)
+                          (if *unmatched-rows-only*
+                            (into left-clauses (rest unmatched))
+                            (conj left-clauses oj-clause))))
 
                 ;; REF-BASED LEFT JOIN: ON p.dept = d.db_id
                 ;;
@@ -5880,7 +5896,9 @@
                                        (concat not-match-guard null-bindings))
                       oj-clause (list* 'or-join shared-vars matched unmatched nil)]
                   (reset! (:where-clauses ctx)
-                          (conj left-clauses oj-clause))))))
+                          (if *unmatched-rows-only*
+                            (into left-clauses (rest unmatched))
+                            (conj left-clauses oj-clause)))))))
 
         nullable-order-vars (atom #{})
 
