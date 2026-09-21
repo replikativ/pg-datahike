@@ -72,19 +72,24 @@
              JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid)
             WHERE true"))))
 
-(deftest probe-field-metadata
-  (is (= :get-field-metadata
-         (shape/catalog-probe
-          "SELECT c.oid, a.attnum, a.attname, c.relname, n.nspname,
-                  a.attnotnull OR (t.typtype = 'd' AND t.typnotnull),
-                  a.attidentity != '' OR pg_catalog.pg_get_expr(def.adbin, def.adrelid) LIKE '%nextval(%'
-             FROM pg_catalog.pg_class c
-             JOIN pg_catalog.pg_namespace n ON (c.relnamespace = n.oid)
-             JOIN pg_catalog.pg_attribute a ON (c.oid = a.attrelid)
-             JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid)
-             LEFT JOIN pg_catalog.pg_attrdef def
-                    ON (a.attrelid = def.adrelid AND a.attnum = def.adnum)
-            WHERE (c.oid, a.attnum) IN ((16384, 1), (16384, 2))"))))
+(deftest a-column-metadata-query-is-not-a-probe
+  ;; It was: a handler regexed the (oid, attnum) pairs out of pgjdbc's
+  ;; inline UNION ALL and answered from the Datahike schema. The catalog
+  ;; tables carry all of it -- pg_attrdef and pg_get_expr included, so
+  ;; `… LIKE '%nextval(%'` finds a serial column's default -- and the
+  ;; query answers exactly as PostgreSQL does through the ordinary SQL
+  ;; path, once its LEFT JOIN works. That join is what the probe hid.
+  (is (nil? (shape/catalog-probe
+             "SELECT c.oid, a.attnum, a.attname, c.relname, n.nspname,
+                     a.attnotnull OR (t.typtype = 'd' AND t.typnotnull),
+                     a.attidentity != '' OR pg_catalog.pg_get_expr(def.adbin, def.adrelid) LIKE '%nextval(%'
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON (c.relnamespace = n.oid)
+                JOIN pg_catalog.pg_attribute a ON (c.oid = a.attrelid)
+                JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid)
+                LEFT JOIN pg_catalog.pg_attrdef def
+                       ON (a.attrelid = def.adrelid AND a.attnum = def.adnum)
+               WHERE (c.oid, a.attnum) IN ((16384, 1), (16384, 2))"))))
 
 (deftest probe-catalogs-have-no-shape-shortcut
   ;; Every catalog a client reads is a real relation now, so no probe
@@ -153,9 +158,16 @@
 ;; ============================================================================
 
 (deftest probe-ordering
-  (testing "field-metadata SELECT references pg_class — field-metadata wins"
-    (is (= :get-field-metadata
+  (testing "the primary-key probe still matches its own shape"
+    (is (= :get-primary-keys
            (shape/catalog-probe
-            "SELECT c.oid, a.attnum, a.attname
-               FROM pg_catalog.pg_class c
-               JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid")))))
+            "SELECT NULL AS TABLE_CAT,
+                    (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ,
+                    result.key_seq AS KS, result.pk_name AS PKN
+               FROM pg_catalog.pg_class ct
+              WHERE true"))))
+  (testing "a plain pg_class/pg_attribute join is nobody's probe"
+    (is (nil? (shape/catalog-probe
+               "SELECT c.oid, a.attnum, a.attname
+                  FROM pg_catalog.pg_class c
+                  JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid")))))

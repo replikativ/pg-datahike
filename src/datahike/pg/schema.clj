@@ -587,6 +587,15 @@
                          :where [[?e :db/ident ?ident]
                                  [?e :pg/type ?pt]]}
                        db)
+        ;; `NOT NULL`, recorded the same way and just as invisible in
+        ;; `(:schema db)`. The catalog knew only the primary key's
+        ;; not-nullness, so `name TEXT NOT NULL` came back with
+        ;; pg_attribute.attnotnull false and is_nullable YES -- what a
+        ;; client reads to decide whether a column may be omitted.
+        not-nulls (q-fn '{:find [?ident]
+                          :where [[?e :db/ident ?ident]
+                                  [?e :pg/not-null true]]}
+                        db)
         ;; Column ORDER, by schema-entity id — which is CREATE TABLE
         ;; order. Collected here rather than per-call because everything
         ;; attnum-shaped needs it and they were disagreeing:
@@ -610,10 +619,13 @@
                                  (update acc (namespace ident) (fnil conj []) (name ident))
                                  acc))
                              {} ordered-idents)]
-    (assoc (reduce (fn [acc [ident pt]]
-                     (update acc ident assoc :pg-type pt))
-                   ident-hints
-                   pg-types)
+    (assoc (reduce (fn [acc [ident]]
+                     (update acc ident assoc :not-null? true))
+                   (reduce (fn [acc [ident pt]]
+                             (update acc ident assoc :pg-type pt))
+                           ident-hints
+                           pg-types)
+                   not-nulls)
            ::column-order column-order
            ::catalog-db db)))
 
@@ -893,6 +905,11 @@
                                         :valuetype   vtype
                                         :cardinality (:db/cardinality props)
                                         :unique      (:db/unique props)
+                                        ;; `NOT NULL` as DDL recorded it,
+                                        ;; carried on the hint map because
+                                        ;; `(:schema db)` surfaces only the
+                                        ;; :db/* keys.
+                                        :not-null?   (boolean (:not-null? h))
                                         :ref?        (= vtype :db.type/ref)
                                         :references  (:references h)
                                         :internal-index? (:internal-index? h)

@@ -1065,7 +1065,7 @@
                      base)))
            :pg_attribute/attnum (long (or (:attnum col) (inc idx)))
            :pg_attribute/attrelid (long tbl-oid)
-           :pg_attribute/attnotnull pk?
+           :pg_attribute/attnotnull (boolean (or pk? (:not-null? col)))
            :pg_attribute/atthasdef (contains? default-idents (:attr col))
            :pg_attribute/attidentity identity-code
            :pg_attribute/attstorage (attribute-storage (:oid col))
@@ -1454,7 +1454,10 @@
                :information_schema_columns/column_name            (:name col)
                :information_schema_columns/ordinal_position       pos
                :information_schema_columns/column_default         nil
-               :information_schema_columns/is_nullable            (if identity? "NO" "YES")
+               :information_schema_columns/is_nullable            (if (or identity?
+                                                                          (:not-null? col)
+                                                                          (= :db.unique/identity (:unique col)))
+                                                                    "NO" "YES")
                ;; From the column's DECLARED OID, not its storage
                ;; valueType — the same correction pg_attribute.atttypid
                ;; needed. :db.type/instant carries date, time and
