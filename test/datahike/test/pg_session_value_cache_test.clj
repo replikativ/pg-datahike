@@ -63,6 +63,14 @@
 (defn- exec! [^Connection c sql]
   (with-open [st (.createStatement c)] (.execute st sql)))
 
+(defn- rows [^Connection c sql]
+  (with-open [st (.createStatement c) rs (.executeQuery st sql)]
+    (let [n (.getColumnCount (.getMetaData rs))]
+      (loop [acc []]
+        (if (.next rs)
+          (recur (conj acc (mapv #(.getString rs (int %)) (range 1 (inc n)))))
+          acc)))))
+
 (defn- row [^Connection c sql]
   (with-open [st (.createStatement c) rs (.executeQuery st sql)]
     (.next rs)
@@ -176,4 +184,61 @@
       (is (= "t" (scalar b "SELECT pg_advisory_unlock(1)"))))
     (testing "a transaction-level lock outside a transaction is 25P01"
       (is (= "25P01" (state a "SELECT pg_advisory_xact_lock(902)"))))))
+
+(deftest shared-advisory-locks-and-what-pg-locks-reports
+  ;; PostgreSQL's advisory locks come in two modes, and its own
+  ;; regression file takes both on the same key in one statement, asks
+  ;; `pg_locks` what is held, and expects the SESSION-level locks to
+  ;; survive a ROLLBACK that drops the transaction-level ones. Only the
+  ;; exclusive half existed here, `pg_locks` was always empty, and
+  ;; `pg_advisory_unlock_all()` released transaction locks too.
+  ;;
+  ;; Expectations are a PostgreSQL 17 oracle's; the file is
+  ;; src/test/regress/sql/advisory_lock.sql.
+  (with-open [a (connect-to "alpha")
+              b (connect-to "alpha")]
+    (testing "two shared holders coexist; an exclusive one excludes"
+      (is (= "t" (scalar a "SELECT pg_try_advisory_lock_shared(501)")))
+      (is (= "t" (scalar b "SELECT pg_try_advisory_lock_shared(501)")))
+      (is (= "f" (scalar b "SELECT pg_try_advisory_lock(501)")))
+      (is (= "t" (scalar a "SELECT pg_advisory_unlock_shared(501)")))
+      (is (= "t" (scalar b "SELECT pg_advisory_unlock_shared(501)")))
+      (is (= "t" (scalar b "SELECT pg_try_advisory_lock(501)")))
+      (is (= "f" (scalar a "SELECT pg_try_advisory_lock_shared(501)")))
+      (is (= "t" (scalar b "SELECT pg_advisory_unlock(501)"))))
+    (testing "pg_locks reports them as PostgreSQL does"
+      (is (= "" (scalar a "SELECT pg_advisory_lock(1)")))
+      (is (= "" (scalar a "SELECT pg_advisory_lock_shared(2)")))
+      (is (= "" (scalar a "SELECT pg_advisory_lock(1, 1)")))
+      (is (= [["advisory" "0" "1" "1" "ExclusiveLock" "t"]
+              ["advisory" "0" "2" "1" "ShareLock" "t"]
+              ["advisory" "1" "1" "2" "ExclusiveLock" "t"]]
+             (rows a "SELECT locktype, classid, objid, objsubid, mode, granted
+                        FROM pg_locks WHERE locktype = 'advisory'
+                       ORDER BY classid, objid, objsubid"))
+          "a one-argument key is (0, key, 1); a two-argument key is (a, b, 2)"))
+    (testing "unlock_all releases the session locks, not the transaction ones"
+      (is (= "" (scalar a "SELECT pg_advisory_unlock_all()")))
+      (is (= [] (rows a "SELECT 1 FROM pg_locks WHERE locktype = 'advisory'"))))))
+
+(deftest a-database-has-an-oid
+  ;; `SELECT oid AS datoid FROM pg_database WHERE datname = current_database()`
+  ;; opens PostgreSQL's own regression files, which then interpolate
+  ;; `:datoid` into every later query. With no oid column the variable
+  ;; stays unset and psql sends the literal `:datoid` to the server for
+  ;; the rest of the file -- one missing column, every later statement.
+  (with-open [c (connect-to "alpha")]
+    (let [oid (scalar c "SELECT oid FROM pg_database WHERE datname = current_database()")]
+      (is (some? oid))
+      (is (pos? (Long/parseLong oid)))
+      (is (= oid (scalar c "SELECT oid FROM pg_database WHERE datname = current_database()"))
+          "and it is stable"))
+    (testing "the templates keep PostgreSQL's own oids"
+      (is (= [["1" "template1"] ["4" "template0"]]
+             (rows c "SELECT oid, datname FROM pg_database
+                       WHERE datname IN ('template0','template1') ORDER BY oid"))))
+    (testing "the columns a client reads alongside it"
+      (is (= [["6" "t" "-1"]]
+             (rows c "SELECT encoding, datallowconn, datconnlimit FROM pg_database
+                       WHERE datname = current_database()"))))))
 

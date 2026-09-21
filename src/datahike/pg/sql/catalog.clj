@@ -26,6 +26,7 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.catalog.objects :as catalog-objects]
             [datahike.pg.jsonb :as jb]
+            [datahike.pg.locks :as locks]
             [datahike.pg.schema :as pgs]
             [datahike.pg.sql.classify :as cls]
             [datahike.pg.sql.params :as params]
@@ -210,6 +211,24 @@
    handler without a registry still discover the expected row set."
   nil)
 
+(defn- database-oid
+  "The oid a database name is reported under. PostgreSQL's own for the
+   templates; derived from the name for a real one, so a client that
+   stores it (`SELECT oid … \\gset`) and compares it later still agrees
+   with what the catalog says."
+  [name]
+  (case name
+    "template1" 1
+    "template0" 4
+    (+ 16384 (bit-and 0x7fffff (Math/abs (.hashCode ^String (str name)))))))
+
+(defn- current-database-oid
+  "The oid of the database this session is connected to."
+  [_db]
+  (database-oid (or (some-> params/*session-state* deref :db-name)
+                    (first *registered-databases*)
+                    "datahike")))
+
 (defn catalog-schema-for
   "Resolve a catalog table's Datahike schema. Checks extensions first
    (allowing userland overrides in theory, though we don't rely on
@@ -332,6 +351,26 @@
     "pg_database"
     [{:db/ident :pg_database/datname :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
      {:db/ident :pg_database/datdba :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+     ;; A database HAS an oid, and a client reads it: PostgreSQL's own
+     ;; regression suite opens with `SELECT oid AS datoid FROM pg_database
+     ;; WHERE datname = current_database() \\gset` and then interpolates
+     ;; `:datoid` into every later query, so an absent oid does not cost
+     ;; one row -- it leaves the variable unset and psql sends the literal
+     ;; `:datoid` to the server for the rest of the file.
+     {:db/ident :pg_database/oid :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+      :pg/type "oid"}
+     {:db/ident :pg_database/encoding :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+      :pg/type "int4"}
+     {:db/ident :pg_database/datcollate :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+      :pg/type "name"}
+     {:db/ident :pg_database/datctype :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+      :pg/type "name"}
+     {:db/ident :pg_database/datistemplate :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_database/datallowconn :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+     {:db/ident :pg_database/datconnlimit :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+      :pg/type "int4"}
+     {:db/ident :pg_database/dattablespace :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+      :pg/type "oid"}
      {:db/ident (pgs/row-marker-attr "pg_database") :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
     "pg_settings"
     [{:db/ident :pg_settings/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :pg/type "name"}
@@ -1207,14 +1246,25 @@
     ;; `*registered-databases*`, each name in it becomes a row alongside
     ;; the templates. Unbound → legacy "datahike" placeholder so bare-
     ;; handler tests still see the expected shape.
-    (let [real (or (seq *registered-databases*) ["datahike"])]
-      (into [{:pg_database/datname "template0" :pg_database/datdba 10
-              (pgs/row-marker-attr "pg_database") true}
-             {:pg_database/datname "template1" :pg_database/datdba 10
-              (pgs/row-marker-attr "pg_database") true}]
-            (map (fn [name]
-                   {:pg_database/datname name :pg_database/datdba 10
-                    (pgs/row-marker-attr "pg_database") true}))
+    (let [real (or (seq *registered-databases*) ["datahike"])
+          ;; PostgreSQL's own oids for the templates; a real database gets
+          ;; one derived from its name, stable across restarts because a
+          ;; client stores it (`\\gset`) and compares it later.
+          row (fn [name oid template? allow-conn?]
+                {:pg_database/datname name
+                 :pg_database/datdba 10
+                 :pg_database/oid (long oid)
+                 :pg_database/encoding 6                   ; UTF8
+                 :pg_database/datcollate "en_US.UTF-8"
+                 :pg_database/datctype "en_US.UTF-8"
+                 :pg_database/datistemplate template?
+                 :pg_database/datallowconn allow-conn?
+                 :pg_database/datconnlimit -1
+                 :pg_database/dattablespace 1663           ; pg_default
+                 (pgs/row-marker-attr "pg_database") true})]
+      (into [(row "template1" (database-oid "template1") true true)
+             (row "template0" (database-oid "template0") true false)]
+            (map (fn [name] (row name (database-oid name) false true)))
             real))
     "pg_settings"
     [{:pg_settings/name "max_index_keys"
@@ -1750,7 +1800,28 @@
            [962 "ucs_basic" "b" 6 nil] [963 "unicode" "i" -1 nil]])
     "pg_trigger" []
     "pg_rewrite" []
-    "pg_locks" []
+    ;; The advisory locks this server actually holds. PostgreSQL reports
+    ;; a one-argument key as (classid 0, objid, objsubid 1) and a
+    ;; two-argument key as (classid, objid, objsubid 2); the mode is
+    ;; ExclusiveLock or ShareLock. Row locks are not reported: they are
+    ;; a registry of our own, not PostgreSQL's lock manager.
+    "pg_locks"
+    (let [db-oid (current-database-oid cte-db)]
+      (vec
+       (for [[lock-key mode] (locks/held-advisory-locks)
+             :let [[classid objid objsubid]
+                   (if (vector? lock-key)
+                     [(long (first lock-key)) (long (second lock-key)) 2]
+                     [0 (long lock-key) 1])]]
+         {:pg_locks/locktype "advisory"
+          :pg_locks/database db-oid
+          :pg_locks/classid classid
+          :pg_locks/objid objid
+          :pg_locks/objsubid objsubid
+          :pg_locks/mode (if (= :shared mode) "ShareLock" "ExclusiveLock")
+          :pg_locks/granted true
+          :pg_locks/fastpath false
+          (pgs/row-marker-attr "pg_locks") true})))
     "pg_stat_activity" []
     "pg_statistic_ext"
     []

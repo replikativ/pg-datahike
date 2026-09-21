@@ -4,6 +4,18 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Shared advisory locks, the locks we hold, and a database's oid
+
+Measured against PostgreSQL's own `advisory_lock` regression file, three things were missing, and the file sat at 39% of PostgreSQL's output:
+
+- **The shared half of the advisory-lock family** — `pg_advisory_lock_shared` and its four relatives. Two shared holders coexist; an exclusive holder excludes every other session. A session can hold the same object at session *and* transaction level at once, which PostgreSQL keeps as separate holds, so the registry keys a holder by session, level and mode.
+- **`pg_locks` never reported anything.** The advisory locks this server holds are now rows there, in PostgreSQL's representation: a one-argument key is `(classid 0, objid, objsubid 1)`, a two-argument key is `(classid, objid, objsubid 2)`, and the mode is `ExclusiveLock` or `ShareLock`.
+- **`pg_advisory_unlock_all()` released transaction-level locks too.** It releases the session-level ones; a transaction-level lock is held until the transaction ends.
+
+Also `pg_database.oid`, with the columns a client reads beside it (`encoding`, `datcollate`, `datctype`, `datistemplate`, `datallowconn`, `datconnlimit`, `dattablespace`). PostgreSQL's regression files open with `SELECT oid AS datoid FROM pg_database WHERE datname = current_database() \gset` and then interpolate `:datoid` into every later query — so an absent oid does not cost one row, it leaves the variable unset and psql sends the literal `:datoid` to the server for the rest of the file.
+
+`advisory_lock` now reproduces 268 of PostgreSQL's 276 lines, and every remaining difference is a `WARNING` we have no way to send (the wire layer has no `NoticeResponse`).
+
 ### A new table no longer aborts another session's transaction
 
 A statement is lowered against a catalog snapshot, and the write it produces is guarded: if the catalog changed underneath, the write raises 40001 rather than landing against a catalog it was not planned for. The comparison was **equality of the whole catalog**, so any DDL anywhere invalidated every open transaction — another session running `CREATE TABLE other` made a transaction that had touched neither that table nor anything near it fail at COMMIT with *catalog changed while statement was being executed*. PostgreSQL does not.
