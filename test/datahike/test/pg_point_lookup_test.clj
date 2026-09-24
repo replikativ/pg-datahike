@@ -60,7 +60,7 @@
         (testing "the AVET value is a scalar input, not a derived query value"
           (is (= [[:seek-key :db.type/long]]
                  (mapv #(get % ::params/coercion) transformed)))
-          (is (not-any? #{'datahike.pg.sql/seek-key}
+          (is (not-any? #(and (symbol? %) (= "seek-key" (name %)))
                         (tree-seq coll? seq query))
               (pr-str query)))
         (testing "at-most-one cardinality needs neither sorting nor bag keys"

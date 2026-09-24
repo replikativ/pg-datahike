@@ -96,7 +96,7 @@
   (:require [datahike.pg.schema :as schema]
             [datahike.pg.locks :as locks]
             [datahike.pg.server :as server]
-            [datahike.pg.sql :as sql]))
+            [datahike.pg.sql.catalog :as catalog]))
 
 ;; ---------------------------------------------------------------------------
 ;; Server lifecycle
@@ -172,13 +172,13 @@
 ;; ---------------------------------------------------------------------------
 
 (def register-catalog-table!
-  "Register a virtual catalog table. See datahike.pg.sql's
-   implementation for entry shape."
-  sql/register-catalog-table!)
+  "Register a virtual catalog table. See
+   `datahike.pg.sql.catalog/register-catalog-table!` for the entry shape."
+  catalog/register-catalog-table!)
 
 (def unregister-catalog-table!
   "Remove a previously-registered catalog table."
-  sql/unregister-catalog-table!)
+  catalog/unregister-catalog-table!)
 
 ;; ---------------------------------------------------------------------------
 ;; Test-fixture helpers (exposed so app tests can reset server-wide state)

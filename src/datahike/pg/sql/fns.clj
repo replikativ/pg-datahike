@@ -23,14 +23,14 @@
 
    - Lookup tables:
        * `sql-aggregate->datalog` — SQL agg name → fully-qualified
-         symbol. Emitted symbol resolves via
-         `datahike.pg.sql/filter-*` which re-exports from this ns.
+         symbol, `datahike.pg.query-fns/filter-*`, which aliases the
+         function defined here.
        * `sql-fn->clj-fn` — SQL fn name → actual IFn value. Used by
          `translate-function-call` at emit time to wrap in `null-safe`.
 
    Runtime symbols re-exported from `datahike.pg.sql` so the
    translator's emitted forms keep the old qualified path
-   (`'datahike.pg.sql/filter-count`, `'datahike.pg.sql/sql-+`, …)
+   (`'datahike.pg.query-fns/filter-count`, `'datahike.pg.query-fns/sql-+`, …)
    for backward compat with already-prepared statements cached on
    clients."
   (:require [clojure.string :as str]
@@ -55,8 +55,7 @@
 ;; ---------------------------------------------------------------------------
 ;; FILTER-aware aggregate functions
 ;; Non-matching rows produce the :__null__ sentinel; these filter it out.
-;; Keep the fn defs BEFORE the sql-aggregate->datalog map so the
-;; `'datahike.pg.sql/filter-*` symbols in the map resolve once re-exported.
+;; The sql-aggregate->datalog map names them as `datahike.pg.query-fns/filter-*`.
 
 (defn filter-sum
   "SUM that ignores :__null__ sentinel values. Returns :__null__ if all filtered.
@@ -3066,10 +3065,8 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Lookup tables used by translate-*.
-;; Aggregate symbols resolve via `datahike.pg.sql/filter-*` — those names
-;; are `def`-aliased from this ns in sql.clj to preserve the historical
-;; emitted path (matters for clients that cache prepared-statement
-;; parse results across deploys).
+;; Aggregate symbols name `datahike.pg.query-fns/filter-*`, aliases of the
+;; functions above: that namespace is the allow-list a query may call.
 
 (def sql-aggregate->datalog
   "Map SQL aggregate function names (lowercased) to Datalog aggregate
@@ -3084,41 +3081,41 @@
    `filter-count` / `filter-count-distinct` which skip NULLs per SQL
    spec (PG: 'count(expression) returns the number of non-null input
    rows')."
-  {"count"          'datahike.pg.sql/filter-count
-   "bool_and"       'datahike.pg.sql/filter-bool-and
-   "every"          'datahike.pg.sql/filter-bool-and
-   "sum"            'datahike.pg.sql/filter-sum
-   "avg"            'datahike.pg.sql/filter-avg
-   "min"            'datahike.pg.sql/filter-min
-   "max"            'datahike.pg.sql/filter-max
-   "count_distinct" 'datahike.pg.sql/filter-count-distinct
-   "stddev"         'datahike.pg.sql/filter-stddev-samp
-   "stddev_samp"    'datahike.pg.sql/filter-stddev-samp
+  {"count"          'datahike.pg.query-fns/filter-count
+   "bool_and"       'datahike.pg.query-fns/filter-bool-and
+   "every"          'datahike.pg.query-fns/filter-bool-and
+   "sum"            'datahike.pg.query-fns/filter-sum
+   "avg"            'datahike.pg.query-fns/filter-avg
+   "min"            'datahike.pg.query-fns/filter-min
+   "max"            'datahike.pg.query-fns/filter-max
+   "count_distinct" 'datahike.pg.query-fns/filter-count-distinct
+   "stddev"         'datahike.pg.query-fns/filter-stddev-samp
+   "stddev_samp"    'datahike.pg.query-fns/filter-stddev-samp
    ;; NOT Datalog's raw `stddev`/`variance`: those cast every element to
    ;; Number, so a group containing a NULL -- which arrives as the
    ;; `:__null__` sentinel -- died with "class clojure.lang.Keyword cannot
    ;; be cast to class java.lang.Number".
-   "stddev_pop"     'datahike.pg.sql/filter-stddev-pop
-   "variance"       'datahike.pg.sql/filter-variance-samp
-   "var_samp"       'datahike.pg.sql/filter-variance-samp
-   "var_pop"        'datahike.pg.sql/filter-variance-pop
+   "stddev_pop"     'datahike.pg.query-fns/filter-stddev-pop
+   "variance"       'datahike.pg.query-fns/filter-variance-samp
+   "var_samp"       'datahike.pg.query-fns/filter-variance-samp
+   "var_pop"        'datahike.pg.query-fns/filter-variance-pop
    "median"         'median
-   "corr"           'datahike.pg.sql/filter-corr
-   "string_agg"     'datahike.pg.sql/filter-string-agg
-   "jsonb_object_agg" 'datahike.pg.sql/filter-jsonb-object-agg
-   "json_object_agg"  'datahike.pg.sql/filter-json-object-agg
-   "array_agg"      'datahike.pg.sql/filter-array-agg
-   "jsonb_agg"      'datahike.pg.sql/filter-jsonb-agg
+   "corr"           'datahike.pg.query-fns/filter-corr
+   "string_agg"     'datahike.pg.query-fns/filter-string-agg
+   "jsonb_object_agg" 'datahike.pg.query-fns/filter-jsonb-object-agg
+   "json_object_agg"  'datahike.pg.query-fns/filter-json-object-agg
+   "array_agg"      'datahike.pg.query-fns/filter-array-agg
+   "jsonb_agg"      'datahike.pg.query-fns/filter-jsonb-agg
    ;; json_agg is NOT jsonb_agg: an aggregated composite keeps its field
    ;; order, and a structured element is preceded by a line feed.
-   "json_agg"       'datahike.pg.sql/filter-json-agg
+   "json_agg"       'datahike.pg.query-fns/filter-json-agg
    ;; Ordered-set aggregates — `WITHIN GROUP (ORDER BY x)` syntax.
    ;; Translator routes them through the pair-aggregate path (like
    ;; corr) since the percentile fraction is a constant alongside
    ;; the per-row value, and Datalog aggregates take a single coll.
-   "percentile_cont" 'datahike.pg.sql/filter-percentile-cont
-   "percentile_disc" 'datahike.pg.sql/filter-percentile-disc
-   "mode"            'datahike.pg.sql/filter-mode})
+   "percentile_cont" 'datahike.pg.query-fns/filter-percentile-cont
+   "percentile_disc" 'datahike.pg.query-fns/filter-percentile-disc
+   "mode"            'datahike.pg.query-fns/filter-mode})
 
 (defn aggregate-function? [^String fname]
   (contains? sql-aggregate->datalog (str/lower-case fname)))

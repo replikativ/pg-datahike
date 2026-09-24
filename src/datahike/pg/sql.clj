@@ -34,7 +34,6 @@
             [datahike.pg.sql.ddl :as ddl]
             [datahike.pg.sql.expr :as expr]
             [datahike.pg.jsonb]
-            [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.oid-infer :as oid]
             [datahike.pg.sql.params :as params]
             [datahike.pg.sql.stmt :as stmt]
@@ -64,21 +63,6 @@
            [net.sf.jsqlparser.statement.create.index CreateIndex]))
 
 (set! *warn-on-reflection* true)
-
-;; ============================================================================
-;; Re-exports for external callers (handler, tests)
-;; ============================================================================
-;; Record + placeholder fns moved to datahike.pg.sql.params. Re-export the
-;; non-dynamic names so `sql/...` references keep resolving; callers that
-;; need the dynamic vars (*bound-params*, *parse-db*) must use `params/...`
-;; directly — `binding` doesn't follow Var aliases across namespaces.
-
-(def ParamRef datahike.pg.sql.params.ParamRef)
-(def ->ParamRef params/->ParamRef)
-(def param-ref? params/param-ref?)
-(def substitute-params params/substitute-params)
-(def nextval-marker? params/nextval-marker?)
-(def resolve-nextvals! params/resolve-nextvals!)
 
 (declare ^:dynamic *parse-cache* ^:dynamic *ast-cache*)
 (def ^:private unquote-ident params/unquote-ident)
@@ -263,153 +247,8 @@
                            view-definition-attr (str owned-select)
                            view-columns-attr (pr-str columns)}))}))))
 
-;; Aggregate + scalar fns moved to datahike.pg.sql.fns. Re-export at the old
-;; `datahike.pg.sql/...` names so the qualified symbols emitted by the
-;; translator (and cached in client prepared statements) keep resolving.
-(def filter-sum            fns/filter-sum)
-(def filter-sum-numeric    fns/filter-sum-numeric)
-(def filter-avg            fns/filter-avg)
-(def filter-avg-numeric    fns/filter-avg-numeric)
-(def filter-jsonb-agg      fns/filter-jsonb-agg)
-(def filter-json-agg       fns/filter-json-agg)
-(def filter-jsonb-object-agg fns/filter-jsonb-object-agg)
-(def filter-json-object-agg  fns/filter-json-object-agg)
-(def jsonb-eq?             datahike.pg.jsonb/jsonb-eq?)
-(def jsonb-ne?             datahike.pg.jsonb/jsonb-ne?)
-(def sql-null?             fns/sql-null?)
-(def sql-not-null?         fns/sql-not-null?)
-(def filter-min            fns/filter-min)
-(def filter-max            fns/filter-max)
-(def filter-enum-min       fns/filter-enum-min)
-(def filter-enum-max       fns/filter-enum-max)
-(def filter-count          fns/filter-count)
-(def filter-bool-and       fns/filter-bool-and)
-(def filter-count-distinct fns/filter-count-distinct)
-(def filter-variance-samp  fns/filter-variance-samp)
-(def filter-stddev-samp    fns/filter-stddev-samp)
-(def filter-variance-pop   fns/filter-variance-pop)
-(def filter-stddev-pop     fns/filter-stddev-pop)
-(def filter-variance-samp-numeric fns/filter-variance-samp-numeric)
-(def filter-variance-pop-numeric  fns/filter-variance-pop-numeric)
-(def filter-stddev-samp-numeric   fns/filter-stddev-samp-numeric)
-(def filter-stddev-pop-numeric    fns/filter-stddev-pop-numeric)
-(def filter-corr           fns/filter-corr)
-(def filter-array-agg      fns/filter-array-agg)
-(def filter-string-agg     fns/filter-string-agg)
-(def filter-string-agg-ordered      fns/filter-string-agg-ordered)
-(def filter-string-agg-ordered-desc fns/filter-string-agg-ordered-desc)
-(def filter-array-agg-ordered      fns/filter-array-agg-ordered)
-(def filter-array-agg-ordered-desc fns/filter-array-agg-ordered-desc)
-(def filter-percentile-cont fns/filter-percentile-cont)
-(def filter-percentile-disc fns/filter-percentile-disc)
-(def filter-mode            fns/filter-mode)
-(def seek-key fns/seek-key)
-(def resolve-param-ref params/resolve-param-ref)
-(def filter-sum-float4 fns/filter-sum-float4)
-(def sql-f4+ fns/sql-f4+)
-(def sql-f4- fns/sql-f4-)
-(def sql-f4* fns/sql-f4*)
-(def sql-f4div fns/sql-f4div)
-(def sql-int+ fns/sql-int+)
-(def sql-int- fns/sql-int-)
-(def sql-int* fns/sql-int*)
-(def sql-int-div fns/sql-int-div)
-(def sql-int-neg fns/sql-int-neg)
-(def sql-int-abs fns/sql-int-abs)
-(def order-cmp fns/order-cmp)
-(def sql-lt? fns/sql-lt?)
-(def sql-gt? fns/sql-gt?)
-(def sql-le? fns/sql-le?)
-(def sql-ge? fns/sql-ge?)
-(def sql-power-op fns/sql-power-op)
-(def sql-eq? fns/sql-eq?)
-(def sql-ne? fns/sql-ne?)
-(def sql-may? fns/sql-may?)
-(def sql-eq3? fns/sql-eq3?)
-(def sql-ne3? fns/sql-ne3?)
-(def sql-lt3? fns/sql-lt3?)
-(def sql-gt3? fns/sql-gt3?)
-(def sql-le3? fns/sql-le3?)
-(def sql-ge3? fns/sql-ge3?)
-(def sql-and3 fns/sql-and3)
-(def sql-or3 fns/sql-or3)
-(def sql-not3 fns/sql-not3)
-(def sql-like3? fns/sql-like3?)
-(def sql-distinct? fns/sql-distinct?)
-(def sql-between? fns/sql-between?)
-(def sql-substring fns/sql-substring)
-(def sql-extract fns/sql-extract)
-(def sql-at-time-zone fns/sql-at-time-zone)
-(def sql-btrim fns/sql-btrim)
-(def sql-ltrim fns/sql-ltrim)
-(def sql-rtrim fns/sql-rtrim)
-(def sql-not-between? fns/sql-not-between?)
-(def sql-not-distinct? fns/sql-not-distinct?)
-(def sql-in3? fns/sql-in3?)
-(def sql-between3? fns/sql-between3?)
-(def sql-in? fns/sql-in?)
-(def sql-+   fns/sql-+)
-(def sql--   fns/sql--)
-(def sql-date+ fns/sql-date+)
-(def sql-date- fns/sql-date-)
-(def sql-timestamp- fns/sql-timestamp-)
-(def sql-time- fns/sql-time-)
-(def sql-unsupported-temporal-arithmetic fns/sql-unsupported-temporal-arithmetic)
-(def sql-*   fns/sql-*)
-(def sql-div fns/sql-div)
-(def sql-money+ fns/sql-money+)
-(def sql-money- fns/sql-money-)
-(def sql-money* fns/sql-money*)
-(def sql-money-div fns/sql-money-div)
-(def sql-money-div-money fns/sql-money-div-money)
-(def sql-mod fns/sql-mod)
-
-;; Bitwise operators. Re-exported here because the translator emits
-;; fully-qualified `datahike.pg.sql/...` symbols that Datahike's
-;; resolve-fn looks up at execute time.
-(def sql-bit-and         fns/sql-bit-and)
-(def sql-bit-or          fns/sql-bit-or)
-(def sql-bit-xor         fns/sql-bit-xor)
-(def sql-bit-not         fns/sql-bit-not)
-(def sql-bit-shift-left  fns/sql-bit-shift-left)
-(def sql-bit-shift-right fns/sql-bit-shift-right)
-(def sql-power           fns/sql-power)
-(def null-safe fns/null-safe)
-
-;; Context primitives moved to datahike.pg.sql.ctx. Re-export at old names
-;; so `#'sql/...` reach-ins from server.clj keep resolving.
-(def make-ctx              ctx/make-ctx)
-(def fresh-var!            ctx/fresh-var!)
-(def entity-var!           ctx/entity-var!)
-(def add-clause!           ctx/add-clause!)
-(def col-var!              ctx/col-var!)
-(def materialize-arg!      ctx/materialize-arg!)
-(def null-guard-clauses    ctx/null-guard-clauses)
-(def make-columns-optional! ctx/make-columns-optional!)
-(def collect-vars          ctx/collect-vars)
-(def resolve-column        ctx/resolve-column)
-(def resolve-inherited-attr ctx/resolve-inherited-attr)
-
-;; Catalog extension seam + system-query detection moved to
-;; datahike.pg.sql.catalog. Re-export names that are reached in from
-;; datahike.pg (public facade) or server.clj (system-query fast path).
-(def register-catalog-table!     catalog/register-catalog-table!)
-(def unregister-catalog-table!   catalog/unregister-catalog-table!)
-(def system-query?               catalog/system-query?)
-
-;; Expression + predicate translation moved to datahike.pg.sql.expr.
-;; Re-export translate-predicate — server.clj reaches it via
-;; `#'sql/translate-predicate` when it matches DELETE's rows.
-(def translate-predicate expr/translate-predicate)
-
-;; Statement-level translation (SELECT / INSERT / UPDATE / DELETE / CTE)
-;; moved to datahike.pg.sql.stmt. Re-export:
-;;   - coerce-insert-value — server.clj reaches via
-;;     `#'sql/coerce-insert-value` at INSERT row build time.
-;;   - translate-select / translate-insert / translate-update /
-;;     translate-delete / select-item-alias — referenced by parse-sql
-;;     dispatch below. Local private aliases avoid qualifying each site.
-(def coerce-insert-value stmt/coerce-insert-value)
+;; Statement-level translation lives in datahike.pg.sql.stmt; parse-sql
+;; dispatches to it through these private aliases.
 (def ^:private translate-select    stmt/translate-select)
 (def ^:private translate-insert    stmt/translate-insert)
 (def ^:private translate-update    stmt/translate-update)

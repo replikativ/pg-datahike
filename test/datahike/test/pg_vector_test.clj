@@ -7,6 +7,7 @@
             [datahike.db.interface :as dbi]
             [datahike.pg.server :as pg]
             [datahike.pg.sql :as sql]
+            [datahike.pg.sql.params :as params]
             [datahike.pg.types :as types]
             [datahike.pg.vector :as vector])
   (:import [datahike.pg PgParamCodec PgWireServer$PgProtocolException
@@ -166,7 +167,7 @@
     (is (= "[1,2,3]"
            (vector/to-pg-text
             (:query-vector (:secondary-candidate eligible)))))
-    (is (sql/param-ref?
+    (is (params/param-ref?
          (:query-vector (:secondary-candidate prepared))))
     (is (= 12 (get-in offset [:secondary-candidate :candidate-limit])))
     (is (nil? (:secondary-candidate unbounded)))

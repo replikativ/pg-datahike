@@ -23,7 +23,6 @@
             [datahike.writer :as writer]
             [datahike.tx-preds :as tx-preds]
             [datahike.versioning :as versioning]
-            [datahike.query.resolve :as dqr]
             [datahike.pg.arrays :as pg-arr]
             [datahike.pg.cache :as pg-cache]
             [datahike.pg.catalog.admission :as catalog-admission]
@@ -34,10 +33,12 @@
             [datahike.pg.records :as pg-rec]
             [datahike.pg.errors :as errors]
             [datahike.pg.schema :as pgs]
+            [datahike.pg.resolve :as pg-resolve]
             [datahike.pg.secondary :as pg-secondary]
             [datahike.pg.sql :as sql]
             [datahike.pg.sql.row-eval :as row-eval]
             [datahike.pg.sql.expr :as expr]
+            [datahike.pg.sql.fns :as fns]
             [datahike.pg.sql.catalog :as catalog]
             [datahike.pg.bits :as pg-bits]
             [datahike.pg.sql.classify :as cls]
@@ -1902,7 +1903,7 @@
           :let [attr (keyword ns col)]
           :when (some #(and (map? %)
                             (contains? % attr)
-                            (not (and (sql/nextval-marker? (get % attr))
+                            (not (and (params/nextval-marker? (get % attr))
                                       (:generated-default? (get % attr)))))
                       (tree-seq coll? seq tx-data))]
     (throw (errors/pg-error
@@ -2278,7 +2279,7 @@
                                     (row-constraints/prepare-candidate
                                      entry constraint-plan
                                      (fn [value attr]
-                                       (#'sql/coerce-insert-value
+                                       (#'stmt/coerce-insert-value
                                         value attr (dbi/-schema txdb) txdb)))]
                                 (conj acc attrs))))
                           []
@@ -2363,7 +2364,7 @@
                             (resolve-value (get attrs attr))
                             (materialize-column-default default resolve-value))
                  coerced (when (some? resolved)
-                           (#'sql/coerce-insert-value resolved attr schema db))]
+                           (#'stmt/coerce-insert-value resolved attr schema db))]
              (cond-> attrs
                (or present? default) (assoc attr coerced))))
          candidate
@@ -2386,7 +2387,7 @@
               (if (contains? attrs attr)
                 (let [resolved (resolve-value (get attrs attr))
                       coerced (when (some? resolved)
-                                (#'sql/coerce-insert-value
+                                (#'stmt/coerce-insert-value
                                  resolved attr schema db))]
                   (assoc attrs attr coerced))
                 attrs))
@@ -2700,23 +2701,23 @@
                   default-key (or alias table)
                   table-aliases (cond-> {table table}
                                   alias (assoc alias table))
-                  ctx (#'sql/make-ctx query-schema table-aliases default-key
-                                      {:db query-db
-                                       :parse-sql sql/parse-sql
-                                       :hints (pgs/schema-hints query-db)})
+                  ctx (#'sql-ctx/make-ctx query-schema table-aliases default-key
+                                          {:db query-db
+                                           :parse-sql sql/parse-sql
+                                           :hints (pgs/schema-hints query-db)})
                   _ (when where-expr
                       ;; Top-level DELETE WHERE = conjunctive context: enables the
                       ;; data-pattern fast paths. Params stay as ?pN vars (values
                       ;; via :in) so the row-matching plan is one-per-shape — see
                       ;; build-update-tx-for-bindings.
                       (binding [expr/*conjunctive-where* true]
-                        (let [preds (#'sql/translate-predicate ctx where-expr)]
+                        (let [preds (#'expr/translate-predicate ctx where-expr)]
                           (swap! (:where-clauses ctx) into preds))))
-                  evar (#'sql/entity-var! ctx default-key)
+                  evar (#'sql-ctx/entity-var! ctx default-key)
                   _ (when (empty? @(:where-clauses ctx))
                       (let [cols (pgs/column-info schema table)]
                         (when-let [first-col (second cols)]
-                          (#'sql/col-var! ctx (:attr first-col)))))
+                          (#'sql-ctx/col-var! ctx (:attr first-col)))))
                   _ (ensure-evar-anchor! ctx evar table)
                   ;; ?pN param plumbing (mirrors build-update-tx-for-bindings):
                   ;; the WHERE keeps params as vars, so supply the bound values as
@@ -2729,8 +2730,8 @@
                 (.put ^java.util.Map update-row-match-cache shape-key v))
               v))
         in-args (if-let [bound *cached-bound*]
-                  (sql/substitute-params in-args-raw
-                                         (fn [idx] (nth bound idx)))
+                  (params/substitute-params in-args-raw
+                                            (fn [idx] (nth bound idx)))
                   in-args-raw)
         eids (mapv first
                    (if (seq in-args)
@@ -2771,7 +2772,7 @@
    :db/retract). `db` lets coerce-insert-value read :pg/type, which the
    schema map does not carry -- without it jsonb went in uncanonicalized."
   [eid entity-map attr v schema db]
-  (let [val (when (some? v) (#'sql/coerce-insert-value v attr schema db))
+  (let [val (when (some? v) (#'stmt/coerce-insert-value v attr schema db))
         old-val (get entity-map attr)]
     (if (nil? val)
       (when (and (some? old-val) (integer? eid))
@@ -4698,7 +4699,7 @@
   (cond-> (update source-plan :source params/substitute-select-plan fetch)
     (get-in source-plan [:conflict-plan :set-params])
     (update-in [:conflict-plan :set-params]
-               #(sql/substitute-params % fetch))))
+               #(params/substitute-params % fetch))))
 
 (defn- resolve-param-refs
   "Given a parsed result from sql/parse-sql and a 1-indexed `bound`
@@ -4716,17 +4717,17 @@
   (let [fetch (fn [idx] (nth bound idx))]
     (cond-> parsed
       (contains? parsed :in-args)
-      (update :in-args sql/substitute-params fetch)
+      (update :in-args params/substitute-params fetch)
       (contains? parsed :tx-data)
-      (update :tx-data sql/substitute-params fetch)
+      (update :tx-data params/substitute-params fetch)
       (contains? parsed :insert-candidates)
-      (update :insert-candidates sql/substitute-params fetch)
+      (update :insert-candidates params/substitute-params fetch)
       (contains? parsed :insert-source)
       (update :insert-source substitute-insert-source-params fetch)
       (contains? parsed :secondary-candidate)
-      (update :secondary-candidate sql/substitute-params fetch)
+      (update :secondary-candidate params/substitute-params fetch)
       (contains? parsed :secondary-order-candidate)
-      (update :secondary-order-candidate sql/substitute-params fetch)
+      (update :secondary-order-candidate params/substitute-params fetch)
       ;; A compound aggregate over a constant — `sum(x) / 2` — carries the
       ;; constant in the spec rather than in a column, and a rewritten
       ;; literal arrives here as a ParamRef like any other.
@@ -4736,7 +4737,7 @@
                 (mapv (fn [sub]
                         (cond-> sub
                           (contains? sub :in-args)
-                          (update :in-args sql/substitute-params fetch)))
+                          (update :in-args params/substitute-params fetch)))
                       subs)))
       ;; Parameterised recursive CTEs: each spec's :in-args carries the
       ;; ParamRef sentinels for the `$n` in its anchor/recursive body.
@@ -4750,11 +4751,11 @@
                           ;; Iterative spec: params live in the anchor/recursive
                           ;; branches' :in-args.
                           (-> spec
-                              (update-in [:anchor :in-args] #(when % (sql/substitute-params % fetch)))
-                              (update-in [:recursive :in-args] #(when % (sql/substitute-params % fetch))))
+                              (update-in [:anchor :in-args] #(when % (params/substitute-params % fetch)))
+                              (update-in [:recursive :in-args] #(when % (params/substitute-params % fetch))))
                           (cond-> spec
                             (contains? spec :in-args)
-                            (update :in-args sql/substitute-params fetch))))
+                            (update :in-args params/substitute-params fetch))))
                       specs))))))
 
 (defn- coerce-insert-tx-data
@@ -4791,7 +4792,7 @@
                    (not (keyword? attr)) (assoc m attr v)
                    (nil? v)          (assoc m attr nil)
                    ;; Preserve false and explicit NULL through row validation.
-                   :else (let [c (#'sql/coerce-insert-value v attr schema db)]
+                   :else (let [c (#'stmt/coerce-insert-value v attr schema db)]
                            (assoc m attr c))))
                {} entry)
               entry))
@@ -4826,7 +4827,7 @@
    generation and are committed atomically with its creation."
   [parsed conn tx-state]
   (let [resolver #(nextval-for-tx! conn tx-state %)
-        resolve  #(sql/resolve-nextvals! % resolver)]
+        resolve  #(params/resolve-nextvals! % resolver)]
     (cond-> parsed
       (contains? parsed :in-args)     (update :in-args resolve)
       (contains? parsed :tx-data)     (update :tx-data resolve)
@@ -4862,7 +4863,7 @@
 
    (COMMENT ON, LOCK TABLE, CREATE VIEW, CREATE INDEX and arbitrary
    SET vars are already silently accepted unconditionally — see
-   sql/system-query?.)"
+   catalog/system-query?.)"
   {:strict     #{}
    :permissive #{:grant :revoke :policy :rls :create-extension}
    :pg-dump    #{:grant :revoke :policy :rls :create-extension
@@ -6540,15 +6541,15 @@
                     (and a-null? b-null?) 0
                     a-null? (if nulls-first? -1 1)
                     b-null? (if nulls-first? 1 -1)
-                    ;; sql/order-cmp, not `compare`: Clojure's compares
+                    ;; fns/order-cmp, not `compare`: Clojure's compares
                     ;; NaN EQUAL to everything, so a NaN in the sort key
                     ;; left the result silently unsorted -- and a
                     ;; non-transitive comparator can make TimSort raise
                     ;; outright. PostgreSQL sorts NaN above every
                     ;; non-NaN.
                     :else (if (= dir :desc)
-                            (sql/order-cmp vb va)
-                            (sql/order-cmp va vb)))]
+                            (fns/order-cmp vb va)
+                            (fns/order-cmp va vb)))]
             (if (zero? c)
               (recur (rest specs))
               c))
@@ -6656,8 +6657,8 @@
         {:schema (dbi/-schema db)
          :exec
          (fn [db bound]
-           (let [args (mapv (fn [a] (if (sql/param-ref? a)
-                                      (sql/resolve-param-ref a #(nth bound %))
+           (let [args (mapv (fn [a] (if (params/param-ref? a)
+                                      (params/resolve-param-ref a #(nth bound %))
                                       a))
                             in-args)
                  q-input (cond-> query
@@ -7056,7 +7057,7 @@
        :find-aliases find-aliases}
       (let [call-seen (java.util.IdentityHashMap.)
             resolve-result-value
-            #(sql/resolve-nextvals!
+            #(params/resolve-nextvals!
               % (fn [sequence-name]
                   (nextval-for-tx! (:conn ctx) tx-state sequence-name))
               nil call-seen)
@@ -7612,7 +7613,7 @@
               call-seen (java.util.IdentityHashMap.)
               nextval-resolver (fn [sequence-name]
                                  (nextval-for-tx! conn tx-state sequence-name))
-              resolver #(sql/resolve-nextvals! % nextval-resolver nil call-seen)
+              resolver #(params/resolve-nextvals! % nextval-resolver nil call-seen)
               source-db (or (:enriched-db parsed)
                             (get-in parsed [:insert-source :source :enriched-db])
                             spec-db)
@@ -7716,7 +7717,7 @@
             call-seen (java.util.IdentityHashMap.)
             nextval-resolver (fn [sequence-name]
                                (nextval-for-tx! conn tx-state sequence-name))
-            resolver #(sql/resolve-nextvals! % nextval-resolver nil call-seen)
+            resolver #(params/resolve-nextvals! % nextval-resolver nil call-seen)
             source-db (or (:enriched-db parsed)
                           (get-in parsed [:insert-source :source :enriched-db])
                           db)
@@ -10265,7 +10266,7 @@
                              :actual-columns (count row)})))
                 resolve-value
                 (fn [value]
-                  (sql/resolve-nextvals!
+                  (params/resolve-nextvals!
                    value
                    (fn [sequence-name]
                      (if (:in-tx? @tx-state)
@@ -10288,7 +10289,7 @@
                          (let [resolved (materialize-column-default
                                          default resolve-value)
                                coerced (when (some? resolved)
-                                         (#'sql/coerce-insert-value
+                                         (#'stmt/coerce-insert-value
                                           resolved attr schema db-now))]
                            (assoc candidate attr coerced))
                          (throw (ex-info
@@ -10624,98 +10625,63 @@
    predicate in its writer and is rejected until writer-side guard deployment
    exists."
   [conn admissions]
-  (let [db (d/db conn)
-        config (dbi/-config db)
-        store-id (get-in config [:store :id])
-        writer-backend (get-in config [:writer :backend])
-        _store-id (when-not store-id
-                    (throw (ex-info "UNIQUE enforcement needs a durable Datahike store id"
+  ;; Its transaction and validation query run under pg-datahike's resolver
+  ;; whoever admits: a handler, start-server or add-database!.
+  (pg-resolve/with-symbol-resolver
+    (let [db (d/db conn)
+          config (dbi/-config db)
+          store-id (get-in config [:store :id])
+          writer-backend (get-in config [:writer :backend])
+          _store-id (when-not store-id
+                      (throw (ex-info "UNIQUE enforcement needs a durable Datahike store id"
+                                      {:error :object-not-in-prerequisite-state
+                                       :sqlstate "55000"})))
+          _writer-backend (when-not (= :self writer-backend)
+                            (throw (ex-info
+                                    "UNIQUE enforcement cannot install its guard in a remote writer"
                                     {:error :object-not-in-prerequisite-state
-                                     :sqlstate "55000"})))
-        _writer-backend (when-not (= :self writer-backend)
-                          (throw (ex-info
-                                  "UNIQUE enforcement cannot install its guard in a remote writer"
-                                  {:error :object-not-in-prerequisite-state
-                                   :sqlstate "55000"
-                                   :writer-backend writer-backend})))
+                                     :sqlstate "55000"
+                                     :writer-backend writer-backend})))
         ;; Check the guard even on a cache hit. The cache only avoids repeated
         ;; scans; it is not evidence that a process-local hook remains present.
-        guard-state (tx-preds/ensure-tx-pred!
-                     store-id unique-constraints/predicate-id
-                     unique-constraints/validate-report!)
-        key (unique-admission-key conn)
-        candidate {:writer (:writer db) :result (promise)}
-        selected (get (swap! admissions
-                             #(if (and (= :present guard-state)
-                                       (contains? % key)
-                                       (identical? (:writer db) (:writer (get % key))))
-                                % (assoc % key candidate)))
-                      key)]
-    (if (identical? candidate selected)
-      (try
+          guard-state (tx-preds/ensure-tx-pred!
+                       store-id unique-constraints/predicate-id
+                       unique-constraints/validate-report!)
+          key (unique-admission-key conn)
+          candidate {:writer (:writer db) :result (promise)}
+          selected (get (swap! admissions
+                               #(if (and (= :present guard-state)
+                                         (contains? % key)
+                                         (identical? (:writer db) (:writer (get % key))))
+                                  % (assoc % key candidate)))
+                        key)]
+      (if (identical? candidate selected)
+        (try
         ;; Both functions execute against the writer's candidate, not a
         ;; snapshot captured by this caller. Nested migration functions finish
         ;; before the full validation runs. Head-conflict replay executes the
         ;; validation again; registry installation itself stays outside replay.
         ;; Even an already-migrated branch receives an admission transaction.
-        (transact-recorded!
-         conn [[:db.fn/call prepare-pg-schema-tx]
-               [:db.fn/call (fn [db]
-                              (unique-constraints/validate-db! db)
-                              [])]]
-         catalog-basis/tracking-options)
-        (deliver (:result candidate) {:ok true})
-        true
-        (catch Throwable e
-          (deliver (:result candidate) {:error e})
-          (swap! admissions #(if (identical? candidate (get % key))
-                               (dissoc % key)
-                               %))
-          (throw e)))
-      (let [{:keys [error]} @(:result selected)]
-        (when error (throw error))
-        true))))
+          (transact-recorded!
+           conn [[:db.fn/call prepare-pg-schema-tx]
+                 [:db.fn/call (fn [db]
+                                (unique-constraints/validate-db! db)
+                                [])]]
+           catalog-basis/tracking-options)
+          (deliver (:result candidate) {:ok true})
+          true
+          (catch Throwable e
+            (deliver (:result candidate) {:error e})
+            (swap! admissions #(if (identical? candidate (get % key))
+                                 (dissoc % key)
+                                 %))
+            (throw e)))
+        (let [{:keys [error]} @(:result selected)]
+          (when error (throw error))
+          true)))))
 
-(defn make-query-handler
-  "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
-
-   conn: a Datahike connection
-   opts: optional map with
-     :on-query         (fn [sql])  invoked on every SQL string
-     :compat           :strict (default) | :permissive — named bundle
-                       of features to silently accept, see compat-presets.
-     :silently-accept  a set of reject-kinds to swallow on top of the
-                       preset. Valid kinds: :grant :revoke :policy :rls
-                       :create-extension. These return a synthetic
-                       success tag (e.g. \"GRANT\") instead of SQLSTATE
-                       0A000.
-     :db-name          string — the database name this handler represents.
-                       Returned by `current_database()`; defaults to
-                       \"datahike\" when omitted.
-     :registered-databases
-                       seq of strings — all database names registered at
-                       the server. Surfaced in the virtual `pg_database`
-                       catalog so \\l and DatabaseMetaData enumerate the
-                       server's tenancy. Typically supplied by
-                       `start-server` with the keys of its registry;
-                       omit for single-DB / bare-handler use.
-     :dispatch-stats   optional atom; when supplied, the handler bumps
-                       :fast-path-count or :full-parse-count on each
-                       parse-sql invocation depending on whether
-                       catalog/system-query? matched. Used by tests
-                       and observability tooling to detect when an
-                       upgrade silently demotes a probe to the slow
-                       path.
-     :max-result-rows positive integer — maximum rows returned by one SELECT
-                       before SQLSTATE 54000 (default 100000). Set false to
-                       disable the guard. Safe query shapes push cap+1 into
-                       Datahike; every shape is checked before wire encoding.
-
-   Supports temporal session variables:
-     SET datahike.as_of = '2024-01-15T00:00:00Z'
-     SET datahike.since = '2024-01-01T00:00:00Z'
-     SET datahike.history = 'true'
-     RESET datahike.as_of"
+(defn- make-query-handler*
+  "The handler `make-query-handler` scopes; see there."
   ^PgWireServer$QueryHandler [conn & [{:keys [on-query db-name registered-databases initial-branch
                                               initial-statement-timeout initial-date-style
                                               release-conn-on-close?
@@ -10759,9 +10725,8 @@
         ;; `pg_backend_pid()` and `txid_current()` were answerable only as
         ;; a whole statement, so `SELECT pg_backend_pid(), 1` and
         ;; `WHERE pid = pg_backend_pid()` were 42883; a translated call
-        ;; reads them from the session-state atom instead, which is the
-        ;; one thing a Datalog function running off this thread can still
-        ;; reach.
+        ;; reads them from the session-state atom instead, which it closes
+        ;; over, so it needs no binding of this statement to be in place.
         _ (swap! session-state assoc
                  :session-id session-id
                  :backend-pid (Math/abs (bit-and 0x7fffffff (.hashCode ^String session-id)))
@@ -11790,6 +11755,78 @@
 ;; Server lifecycle
 ;; ============================================================================
 
+(defn- scoped-handler
+  "`handler`, every call made with Datahike resolving query symbols through
+   `datahike.pg.resolve/symbol-resolver`."
+  ^PgWireServer$QueryHandler [^PgWireServer$QueryHandler h]
+  (reify PgWireServer$QueryHandler
+    (execute [_ sql] (pg-resolve/with-symbol-resolver (.execute h sql)))
+    (executeInGroup [_ sql] (pg-resolve/with-symbol-resolver (.executeInGroup h sql)))
+    (parse [_ sql oids] (pg-resolve/with-symbol-resolver (.parse h sql oids)))
+    (describeParams [_ parsed] (pg-resolve/with-symbol-resolver (.describeParams h parsed)))
+    (describeResult [_ parsed] (pg-resolve/with-symbol-resolver (.describeResult h parsed)))
+    (executePrepared [_ parsed params] (pg-resolve/with-symbol-resolver (.executePrepared h parsed params)))
+    (planCacheToken [_] (pg-resolve/with-symbol-resolver (.planCacheToken h)))
+    (markTransactionFailed [_] (pg-resolve/with-symbol-resolver (.markTransactionFailed h)))
+    (close [_] (pg-resolve/with-symbol-resolver (.close h)))
+    (copyChunk [_ chunk] (pg-resolve/with-symbol-resolver (.copyChunk h chunk)))
+    (copyComplete [_] (pg-resolve/with-symbol-resolver (.copyComplete h)))
+    (copyAbort [_ reason] (pg-resolve/with-symbol-resolver (.copyAbort h reason)))
+    (beginBatchScope [_] (pg-resolve/with-symbol-resolver (.beginBatchScope h)))
+    (flushBatch [_ tx-data] (pg-resolve/with-symbol-resolver (.flushBatch h tx-data)))
+    (discardBatch [_] (pg-resolve/with-symbol-resolver (.discardBatch h)))
+    (commitImplicit [_] (pg-resolve/with-symbol-resolver (.commitImplicit h)))
+    (rollbackImplicit [_] (pg-resolve/with-symbol-resolver (.rollbackImplicit h)))))
+
+(defn make-query-handler
+  "Create a PgWireServer.QueryHandler that dispatches SQL to Datahike.
+
+   conn: a Datahike connection
+   opts: optional map with
+     :on-query         (fn [sql])  invoked on every SQL string
+     :compat           :strict (default) | :permissive — named bundle
+                       of features to silently accept, see compat-presets.
+     :silently-accept  a set of reject-kinds to swallow on top of the
+                       preset. Valid kinds: :grant :revoke :policy :rls
+                       :create-extension. These return a synthetic
+                       success tag (e.g. \"GRANT\") instead of SQLSTATE
+                       0A000.
+     :db-name          string — the database name this handler represents.
+                       Returned by `current_database()`; defaults to
+                       \"datahike\" when omitted.
+     :registered-databases
+                       seq of strings — all database names registered at
+                       the server. Surfaced in the virtual `pg_database`
+                       catalog so \\l and DatabaseMetaData enumerate the
+                       server's tenancy. Typically supplied by
+                       `start-server` with the keys of its registry;
+                       omit for single-DB / bare-handler use.
+     :dispatch-stats   optional atom; when supplied, the handler bumps
+                       :fast-path-count or :full-parse-count on each
+                       parse-sql invocation depending on whether
+                       catalog/system-query? matched. Used by tests
+                       and observability tooling to detect when an
+                       upgrade silently demotes a probe to the slow
+                       path.
+     :max-result-rows positive integer — maximum rows returned by one SELECT
+                       before SQLSTATE 54000 (default 100000). Set false to
+                       disable the guard. Safe query shapes push cap+1 into
+                       Datahike; every shape is checked before wire encoding.
+
+   Supports temporal session variables:
+     SET datahike.as_of = '2024-01-15T00:00:00Z'
+     SET datahike.since = '2024-01-01T00:00:00Z'
+     SET datahike.history = 'true'
+     RESET datahike.as_of"
+  ^PgWireServer$QueryHandler [conn & [opts]]
+  ;; Every symbol a statement's queries name resolves through pg-datahike's
+  ;; own table (datahike.pg.resolve), bound here for each call rather than
+  ;; installed for the process: an application embedding this keeps its own
+  ;; resolver.
+  (scoped-handler
+   (pg-resolve/with-symbol-resolver
+     (make-query-handler* conn opts))))
+
 (defn- reject-unknown-db-handler
   "QueryHandler that rejects every query with SQLSTATE 3D000. Returned
    when the StartupMessage's `database` param doesn't match any entry
@@ -12034,44 +12071,6 @@
                       {:type :datahike.pg/invalid-tls-config})))
     [auth ssl (or public? require-tls?)]))
 
-(def ^:private symbol-emitting-namespaces
-  "The namespaces whose functions the SQL translator names in the
-   Datalog clauses it emits, by qualified symbol -- the aggregates and
-   the two index/text-search helpers, and nothing else. Every other
-   namespace of ours is reached from our own code by
-   `requiring-resolve`, never named in a clause, so registering it
-   would only widen what a query in this process can call."
-  '[datahike.pg.sql
-    datahike.pg.secondary
-    datahike.pg.tsearch])
-
-(defonce ^:private safe-symbol-resolver-installed
-  (atom false))
-
-(defn- install-safe-symbol-resolver!
-  "Resolve the symbols in a query the way Datahike's own server does.
-
-   A Datalog clause names its function by SYMBOL, and Datahike's default
-   resolver is the permissive one: any `clojure.core` public, then any
-   qualified symbol through `requiring-resolve`, then a leading-dot
-   symbol as a reflective method call. That default is for a process
-   that writes its own queries. This one runs queries it TRANSLATED from
-   SQL a client sent, so it installs the curated resolver
-   (`datahike.query.resolve/safe-fns`: pure, process-free) plus the
-   namespaces this translator emits symbols from -- the second lock on
-   the door the function lookup already closes.
-
-   Process-wide rather than per request: a query runs wherever Datahike
-   runs it, not only on the connection thread. That is a side effect on
-   the host process, and it is not undone by `stop-server`: an
-   application that also issues its OWN Datalog queries naming its own
-   functions registers them with `datahike.query.resolve/register-fn!`
-   or `register-ns!`, as it would against Datahike's own server."
-  []
-  (when (compare-and-set! safe-symbol-resolver-installed false true)
-    (run! dqr/register-ns! symbol-emitting-namespaces)
-    (alter-var-root #'dqr/*symbol-resolver* (constantly dqr/safe-symbol-resolver))))
-
 (defn start-server
   "Start a PostgreSQL wire protocol server for one or more Datahike
    connections.
@@ -12155,7 +12154,6 @@
                                database-template]
                         :or {port 5432 host "127.0.0.1" default "datahike"}
                         :as opts}]]
-  (install-safe-symbol-resolver!)
   (let [registry (normalize-registry conn-or-registry default)
         registry-atom (atom registry)
         ;; Build hooks from template if not explicitly supplied. The
