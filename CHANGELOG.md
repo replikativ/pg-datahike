@@ -4,6 +4,20 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### Query functions resolve per statement, and the process keeps its own resolver
+
+A started server used to install Datahike's `safe-symbol-resolver` for the whole process and register `datahike.pg.sql`, `datahike.pg.secondary` and `datahike.pg.tsearch` with Datahike's function registry. Both were wrong:
+
+- **The embedding application lost its own queries.** The install replaced `datahike.query.resolve/*symbol-resolver*` for good, so after one `start-server` the host's Datalog could no longer call its own functions, most of `clojure.core` or a method by reflection. Datahike's own test suite failed as soon as a pg test started a server in the same JVM.
+- **Datahike's clients could call pg-datahike's internals.** That registry is what Datahike's server lets its clients call. Registering whole namespaces registered every public function in them: a read-only client of Datahike's HTTP or Kabel server in the same process could clear the translation and catalog caches, register or remove a catalog table every pg client then sees, and write entries into the translation cache.
+- **A handler made without `start-server` had no lock at all.** `make-query-handler` and `make-query-handler-factory` are public, and a server built on them resolved with whatever the process had.
+
+Now `make-query-handler` binds `datahike.pg.resolve/symbol-resolver` around every call into the handler, and nothing is installed or registered. The resolver knows the functions the translator emits, which now live in `datahike.pg.query-fns`, a namespace holding nothing else, plus the two secondary-index and two text-search clauses. After those it falls back to Datahike's `safe-symbol-resolver`, so functions an application registered still resolve. A binding reaches everything a statement does: a connection's calls run on its thread, results are realized before a call returns, and the local writer carries the binding to the writer thread where CHECK and foreign keys are enforced.
+
+The projection interpreter, the one-row CHECK/RETURNING fast path and window aggregates resolve through the same table. They used to read the process's resolver or call `requiring-resolve`. A constant projection head nothing resolves is now an error instead of a silent NULL, and `median(x) OVER ()` works: its unqualified symbol could not be `requiring-resolve`d.
+
+`datahike.pg.sql` no longer re-exports the translator's functions or the `params`, `ctx`, `catalog`, `expr` and `stmt` helpers it used to. Use those namespaces directly. `datahike.pg/register-catalog-table!` and `unregister-catalog-table!` are unchanged.
+
 ### DateStyle chooses the output format
 
 `SET DateStyle` was accepted and then ignored: every date and timestamp rendered ISO whatever the session asked for. It is a display style plus a field order, and both halves move independently, so:
@@ -283,7 +297,7 @@ The decorated call forms resolved no better:
 
 **One qualifier rule, for every path**: a qualifier is dropped only when it names the schema the function is in — `pg_catalog` for the builtins, `public` for the pgvector ones — so `public.upper('a')` is 42883 here as it is in PostgreSQL. The aggregate and window paths read the name for themselves and did not follow it: `pg_catalog.count(*)` reported that `count` does not exist on a server where `count(*)` answers, and `pg_catalog.max(a)` fell through to a per-row max — a silently wrong column.
 
-Two further locks, behind that one: the projection interpreter resolves a literal symbol the way the engine itself would rather than through `clojure.core/resolve`, and a started server installs `datahike.query.resolve/safe-symbol-resolver` for the process, with the namespaces this translator emits symbols from registered. A query reaching the engine can name a function, and Datahike's default resolver — right for a process that writes its own queries — reaches every `clojure.core` public and any class method by reflection. That install is process-wide and outlives `stop-server`; an application issuing its own Datalog queries in the same process registers its functions with `register-fn!` / `register-ns!`, as it would against Datahike's own server.
+Behind that one, the symbols the translator does emit resolve through pg-datahike's own table, never the runtime: see "Query functions resolve per statement" above.
 
 One name goes the other way: `name('x')` used to answer `x`, by accident, through `clojure.core/name`. It is a real PostgreSQL function — one of the type-name cast functions (`text(…)`, `int4(…)`, `bool(…)`), none of which this server implements — so it is now 42883 with the rest of that family.
 

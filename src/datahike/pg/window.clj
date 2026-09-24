@@ -43,7 +43,9 @@
       :default-val val      — LAG/LEAD default
       :ntile-n int}"
   (:require [datahike.pg.errors :as errors]
-            [datahike.pg.sql.fns :as fns]))
+            [datahike.pg.resolve :as pg-resolve]
+            [datahike.pg.sql.fns :as fns]
+            [datahike.query :as dq]))
 
 (set! *warn-on-reflection* true)
 
@@ -189,15 +191,16 @@
 ;; Aggregates over a frame
 ;; ============================================================================
 
-(def ^:private resolve-agg
-  "The aggregate the translator named, resolved once per symbol. The
-   symbols are the same ones the plain (non-window) aggregate path emits
-   into the Datalog :find clause."
-  (memoize (fn [sym]
-             (or (requiring-resolve sym)
-                 (throw (errors/pg-error
-                         :feature-not-supported
-                         {:feature (str "window aggregate " sym)}))))))
+(defn- resolve-agg
+  "The aggregate the translator named: the symbols are the same ones the
+   plain (non-window) aggregate path emits into the Datalog :find clause,
+   ours by qualified name or one of Datahike's built-in aggregates."
+  [sym]
+  (or (pg-resolve/emitted-fn sym)
+      (get dq/built-in-aggregates sym)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:feature (str "window aggregate " sym)}))))
 
 (defn- frame-args
   "The aggregate's input over [start end): one value per row, or a [value
@@ -231,7 +234,7 @@
   (let [n (count partition)
         v-at (fn [i] (let [[_ row] (nth partition i)] (nth row col-idx nil)))
         f (when agg-sym (resolve-agg agg-sym))
-        numeric-avg? (= 'datahike.pg.sql/filter-avg-numeric agg-sym)
+        numeric-avg? (= 'datahike.pg.query-fns/filter-avg-numeric agg-sym)
         out (object-array n)]
     (case op
       (:sum :min :max)

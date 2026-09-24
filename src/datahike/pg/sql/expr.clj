@@ -63,7 +63,7 @@
             [datahike.pg.types :as types]
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector]
-            [datahike.query.resolve :as dqr])
+            [datahike.pg.resolve :as pg-resolve])
   (:import [net.sf.jsqlparser.schema Column Table]
            [net.sf.jsqlparser.expression
             Alias ArrayExpression Function LongValue DoubleValue StringValue NullValue
@@ -1781,8 +1781,8 @@
       (let [[s start len] args]
         (swap! (:where-clauses ctx) conj
                [(if len
-                  (list 'datahike.pg.sql/sql-substring s start len)
-                  (list 'datahike.pg.sql/sql-substring s start))
+                  (list 'datahike.pg.query-fns/sql-substring s start len)
+                  (list 'datahike.pg.query-fns/sql-substring s start))
                 result-var])
         result-var)
 
@@ -2266,19 +2266,18 @@
    literal symbol rather than a bound fn-param.
 
    The heads this translator emits are datalog aggregates and pure
-   helpers -- `count`, `min`, one of ours under its namespace. Resolving
-   them through the runtime (`clojure.core/resolve`) made every public
-   of `clojure.core` reachable the moment any user-derived symbol got
-   this far, which is the same hole the function lookup had.
-
-   One rule for every head: whatever the ENGINE would resolve it to. In
-   a server process that is Datahike's curated query set (`safe-fns`:
-   pure, process-free) plus the namespaces `start-server` registers;
-   embedded, with no server started, it is Datahike's permissive
-   default, exactly as before."
+   helpers -- `count`, `min`, one of `datahike.pg.query-fns`. They
+   resolve as the engine resolves them while pg-datahike runs a query
+   (`datahike.pg.resolve/symbol-resolver`), whatever resolver the
+   process has: resolving through the runtime would make every public
+   of `clojure.core` reachable the moment a user-derived symbol got
+   this far. A constant head nothing resolves is our bug, not NULL."
   [op]
   (when (symbol? op)
-    (dqr/*symbol-resolver* op)))
+    (or (pg-resolve/symbol-resolver op)
+        (when-not (str/starts-with? (name op) "?")
+          (throw (ex-info (str "No function for projection head " op)
+                          {:type :datahike.pg/unresolved-function :symbol op}))))))
 
 (defn interpret-form
   "Interpret a Clojure-like form against a variable bindings map.
@@ -2458,7 +2457,7 @@
                                test (translate-deferred-form
                                      ctx
                                      #(if switch-val
-                                        (list 'datahike.pg.sql/sql-eq? switch-val
+                                        (list 'datahike.pg.query-fns/sql-eq? switch-val
                                               (translate-expr ctx when-val))
                                         (translate-predicate-expr ctx when-val)))
                                then (translate-deferred-form
@@ -2668,12 +2667,12 @@
    symbol a datalog clause can name. They are the SQL comparisons, not
    `clojure.core`'s: `=` is type-sensitive for numbers, so `v = ANY(…)`
    over a numeric column missed `1.5` against `1.5M`."
-  {'=    'datahike.pg.sql/sql-eq?
-   'not= 'datahike.pg.sql/sql-ne?
-   '<    'datahike.pg.sql/sql-lt?
-   '<=   'datahike.pg.sql/sql-le?
-   '>    'datahike.pg.sql/sql-gt?
-   '>=   'datahike.pg.sql/sql-ge?})
+  {'=    'datahike.pg.query-fns/sql-eq?
+   'not= 'datahike.pg.query-fns/sql-ne?
+   '<    'datahike.pg.query-fns/sql-lt?
+   '<=   'datahike.pg.query-fns/sql-le?
+   '>    'datahike.pg.query-fns/sql-gt?
+   '>=   'datahike.pg.query-fns/sql-ge?})
 
 (defn quantified-rhs
   "`[kind arr-expr]` when `r` is `ANY(x)` or `ALL(x)`, else nil."
@@ -3050,13 +3049,13 @@
     ;; answered the sentinel where it should be NULL.
     (instance? AndExpression expr)
     (let [^AndExpression e expr]
-      (list 'datahike.pg.sql/sql-and3
+      (list 'datahike.pg.query-fns/sql-and3
             (translate-predicate-expr ctx (.getLeftExpression e))
             (translate-predicate-expr ctx (.getRightExpression e))))
 
     (instance? OrExpression expr)
     (let [^OrExpression e expr]
-      (list 'datahike.pg.sql/sql-or3
+      (list 'datahike.pg.query-fns/sql-or3
             (translate-predicate-expr ctx (.getLeftExpression e))
             (translate-predicate-expr ctx (.getRightExpression e))))
 
@@ -3164,28 +3163,28 @@
           l (.getLeftExpression e)
           r (.getRightExpression e)
           _ (check-comparison-types! ctx '> l r)]
-      (apply list 'datahike.pg.sql/sql-gt3? (translate-value-comparison-operands ctx l r)))
+      (apply list 'datahike.pg.query-fns/sql-gt3? (translate-value-comparison-operands ctx l r)))
 
     (instance? GreaterThanEquals expr)
     (let [^GreaterThanEquals e expr
           l (.getLeftExpression e)
           r (.getRightExpression e)
           _ (check-comparison-types! ctx '>= l r)]
-      (apply list 'datahike.pg.sql/sql-ge3? (translate-value-comparison-operands ctx l r)))
+      (apply list 'datahike.pg.query-fns/sql-ge3? (translate-value-comparison-operands ctx l r)))
 
     (instance? MinorThan expr)
     (let [^MinorThan e expr
           l (.getLeftExpression e)
           r (.getRightExpression e)
           _ (check-comparison-types! ctx '< l r)]
-      (apply list 'datahike.pg.sql/sql-lt3? (translate-value-comparison-operands ctx l r)))
+      (apply list 'datahike.pg.query-fns/sql-lt3? (translate-value-comparison-operands ctx l r)))
 
     (instance? MinorThanEquals expr)
     (let [^MinorThanEquals e expr
           l (.getLeftExpression e)
           r (.getRightExpression e)
           _ (check-comparison-types! ctx '<= l r)]
-      (apply list 'datahike.pg.sql/sql-le3? (translate-value-comparison-operands ctx l r)))
+      (apply list 'datahike.pg.query-fns/sql-le3? (translate-value-comparison-operands ctx l r)))
 
     (instance? EqualsTo expr)
     (let [^EqualsTo e expr
@@ -3205,8 +3204,8 @@
         (let [l (.getLeftExpression e)]
           (apply list
                  (if (or (jsonb-column? ctx l) (jsonb-column? ctx right))
-                   'datahike.pg.sql/jsonb-eq?
-                   'datahike.pg.sql/sql-eq3?)
+                   'datahike.pg.query-fns/jsonb-eq?
+                   'datahike.pg.query-fns/sql-eq3?)
                  (translate-value-comparison-operands ctx l right)))))
 
     (instance? NotEqualsTo expr)
@@ -3228,8 +3227,8 @@
           (quantified-result-var ctx 'not= l arr-expr kind))
         (apply list
                (if (or (jsonb-column? ctx l) (jsonb-column? ctx r))
-                 'datahike.pg.sql/jsonb-ne?
-                 'datahike.pg.sql/sql-ne3?)
+                 'datahike.pg.query-fns/jsonb-ne?
+                 'datahike.pg.query-fns/sql-ne3?)
                (translate-value-comparison-operands ctx l r))))
 
     (instance? IsNullExpression expr)
@@ -3241,8 +3240,8 @@
     (let [^IsNullExpression e expr
           v (translate-expr ctx (.getLeftExpression e))]
       (if (.isNot e)
-        (list 'datahike.pg.sql/sql-not-null? v)
-        (list 'datahike.pg.sql/sql-null? v)))
+        (list 'datahike.pg.query-fns/sql-not-null? v)
+        (list 'datahike.pg.query-fns/sql-null? v)))
 
     (instance? NotExpression expr)
     (let [^NotExpression e expr
@@ -3255,7 +3254,7 @@
       ;; bind ?v -- it just filters. `sql-not3` is an ordinary function
       ;; call and so has neither problem, but nested seq args still have
       ;; to be materialised.
-      (list 'datahike.pg.sql/sql-not3
+      (list 'datahike.pg.query-fns/sql-not3
             (if (seq? inner) (ctx/materialize-arg! ctx inner) inner)))
 
     ;; col [NOT] IN (literal-list-or-subquery) used inside CASE WHEN /
@@ -3334,7 +3333,7 @@
                      (cond-> (set non-null-vals)
                        static-null? (conj :__null__)))
           base (when-not row-in?
-                 (list 'datahike.pg.sql/sql-in3? set-form col))]
+                 (list 'datahike.pg.query-fns/sql-in3? set-form col))]
       (if (seq corr-refs)
         (if row-in?
           (correlated-row-in-var! ctx left-values left-oids inner corr-refs not-in?)
@@ -3342,7 +3341,7 @@
         (if row-in?
           (row-in-result-var! ctx subquery-rows-var left-values not-in?)
           (if not-in?
-            (list 'datahike.pg.sql/sql-not3 (ctx/materialize-arg! ctx base))
+            (list 'datahike.pg.query-fns/sql-not3 (ctx/materialize-arg! ctx base))
             base))))
 
     ;; col [NOT] LIKE 'pat' inside CASE WHEN. Reuse the LIKE→regex
@@ -3369,7 +3368,7 @@
           ;; the same expression in value position.
           literal? (or (instance? StringValue right-expr) (string? pattern))
           base (if literal?
-                 (list 'datahike.pg.sql/sql-like3? col
+                 (list 'datahike.pg.query-fns/sql-like3? col
                        (like-pattern->regex pattern case-insensitive? esc))
                  (let [cache (volatile! [nil nil])
                        matcher (fn [s pat]
@@ -3390,7 +3389,7 @@
                    (swap! (:in-args ctx) conj matcher)
                    (list fn-param col
                          (if (seq? pattern) (ctx/materialize-arg! ctx pattern) pattern))))]
-      (if not-like? (list 'datahike.pg.sql/sql-not3 base) base))
+      (if not-like? (list 'datahike.pg.query-fns/sql-not3 base) base))
 
     ;; col [NOT] BETWEEN lo AND hi inside CASE WHEN.
     (instance? Between expr)
@@ -3405,8 +3404,8 @@
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)
           lo  (translate-expr ctx lo-ast)
           hi  (translate-expr ctx hi-ast)
-          base (list 'datahike.pg.sql/sql-between3? col lo hi)]
-      (if not-between? (list 'datahike.pg.sql/sql-not3 base) base))
+          base (list 'datahike.pg.query-fns/sql-between3? col lo hi)]
+      (if not-between? (list 'datahike.pg.query-fns/sql-not3 base) base))
 
     ;; col IS [NOT] {TRUE|FALSE|UNKNOWN} inside CASE WHEN.
     (instance? IsBooleanExpression expr)
@@ -3427,8 +3426,8 @@
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)]
       (if (.isNot e)
-        (list 'datahike.pg.sql/sql-not-null? col)
-        (list 'datahike.pg.sql/sql-null? col)))
+        (list 'datahike.pg.query-fns/sql-not-null? col)
+        (list 'datahike.pg.query-fns/sql-null? col)))
 
     ;; a IS [NOT] DISTINCT FROM b -- the NULL-aware `<>`, also 2-valued.
     (instance? IsDistinctExpression expr)
@@ -3438,7 +3437,7 @@
           l (if (seq? l) (ctx/materialize-arg! ctx l) l)
           r (translate-expr ctx (.getRightExpression e))
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)
-          base (list 'datahike.pg.sql/sql-distinct? l r)]
+          base (list 'datahike.pg.query-fns/sql-distinct? l r)]
       (if (.isNot e) (list 'not base) base))
 
     ;; col ~ 'pat' / col !~ 'pat' inside CASE WHEN. Same pre-compile
@@ -3458,8 +3457,8 @@
           pattern (translate-expr ctx (.getRightExpression e))
           re-str (let [s (str pattern)] (if ci? (str "(?i)" s) s))
           re-obj (re-pattern re-str)
-          base (list 'datahike.pg.sql/sql-like3? col re-obj)]
-      (if negate? (list 'datahike.pg.sql/sql-not3 base) base))
+          base (list 'datahike.pg.query-fns/sql-like3? col re-obj)]
+      (if negate? (list 'datahike.pg.query-fns/sql-not3 base) base))
 
     ;; A bare value/column expression used as a boolean: must be a
     ;; non-predicate type (literal, Column, Function, etc.). Routing
@@ -4067,11 +4066,11 @@
    defined in this ns. Datahike's query engine resolves these symbols at
    run time to the `null-safe` wrapped fns, so `1 + NULL = NULL` rather
    than throwing."
-  '{+ datahike.pg.sql/sql-+
-    - datahike.pg.sql/sql--
-    * datahike.pg.sql/sql-*
-    / datahike.pg.sql/sql-div
-    rem datahike.pg.sql/sql-mod})
+  '{+ datahike.pg.query-fns/sql-+
+    - datahike.pg.query-fns/sql--
+    * datahike.pg.query-fns/sql-*
+    / datahike.pg.query-fns/sql-div
+    rem datahike.pg.query-fns/sql-mod})
 
 (defn- int-arith-width
   "The declared integer width this arithmetic node must be checked at,
@@ -4139,10 +4138,10 @@
         l (if (instance? StringValue left) r0 l0)
         r (if (instance? StringValue right) l0 r0)]
     (when (and (= l types/oid-float4) (= r types/oid-float4))
-      (get '{+ datahike.pg.sql/sql-f4+
-             - datahike.pg.sql/sql-f4-
-             * datahike.pg.sql/sql-f4*
-             / datahike.pg.sql/sql-f4div}
+      (get '{+ datahike.pg.query-fns/sql-f4+
+             - datahike.pg.query-fns/sql-f4-
+             * datahike.pg.query-fns/sql-f4*
+             / datahike.pg.query-fns/sql-f4div}
            op-sym))))
 
 (defn- int-arith-op
@@ -4150,10 +4149,10 @@
    one."
   [ctx expr op-sym]
   (when-let [w (int-arith-width ctx expr)]
-    (when-let [sym (get '{+ datahike.pg.sql/sql-int+
-                          - datahike.pg.sql/sql-int-
-                          * datahike.pg.sql/sql-int*
-                          / datahike.pg.sql/sql-int-div}
+    (when-let [sym (get '{+ datahike.pg.query-fns/sql-int+
+                          - datahike.pg.query-fns/sql-int-
+                          * datahike.pg.query-fns/sql-int*
+                          / datahike.pg.query-fns/sql-int-div}
                         op-sym)]
       [sym w])))
 
@@ -4190,24 +4189,24 @@
                                 types/oid-timestamptz types/oid-interval} %)]
     (cond
       (and (= op-sym '-) (date? loid) (date? roid))
-      'datahike.pg.sql/sql-date-
+      'datahike.pg.query-fns/sql-date-
         ;; An unknown right operand is normally a plan-cache parameter for
         ;; an integer literal. Preserve that established date +/- path.
       (and (contains? #{'+ '-} op-sym) (date? loid)
            (or (nil? roid) (integer? roid)))
-      (if (= op-sym '+) 'datahike.pg.sql/sql-date+ 'datahike.pg.sql/sql-date-)
+      (if (= op-sym '+) 'datahike.pg.query-fns/sql-date+ 'datahike.pg.query-fns/sql-date-)
         ;; `integer + date` commutes. `integer - date` is not an operator
         ;; in PostgreSQL, so only `+` picks the right-hand date up.
       (and (= op-sym '+) (date? roid) (or (nil? loid) (integer? loid)))
-      'datahike.pg.sql/sql-date+
+      'datahike.pg.query-fns/sql-date+
       (and (= op-sym '-) (timestamp? loid) (timestamp? roid))
-      'datahike.pg.sql/sql-timestamp-
+      'datahike.pg.query-fns/sql-timestamp-
       (and (= op-sym '-) (= types/oid-time loid) (= types/oid-time roid))
-      'datahike.pg.sql/sql-time-
+      'datahike.pg.query-fns/sql-time-
         ;; Any other typed temporal combination must not reach numeric +/-,
         ;; whose Number casts leak a JVM implementation error.
       (or (temporal? loid) (temporal? roid))
-      'datahike.pg.sql/sql-unsupported-temporal-arithmetic
+      'datahike.pg.query-fns/sql-unsupported-temporal-arithmetic
       :else nil)))
 
 (defn- agg-marker?
@@ -4244,13 +4243,13 @@
         factor? #(contains? #{types/oid-int2 types/oid-int4 types/oid-int8
                               types/oid-float4 types/oid-float8} %)]
     (cond
-      (and (= op-sym '+) (money? l) (money? r)) 'datahike.pg.sql/sql-money+
-      (and (= op-sym '-) (money? l) (money? r)) 'datahike.pg.sql/sql-money-
+      (and (= op-sym '+) (money? l) (money? r)) 'datahike.pg.query-fns/sql-money+
+      (and (= op-sym '-) (money? l) (money? r)) 'datahike.pg.query-fns/sql-money-
       (and (= op-sym '*)
            (or (and (money? l) (factor? r))
-               (and (factor? l) (money? r)))) 'datahike.pg.sql/sql-money*
-      (and (= op-sym '/) (money? l) (money? r)) 'datahike.pg.sql/sql-money-div-money
-      (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.sql/sql-money-div
+               (and (factor? l) (money? r)))) 'datahike.pg.query-fns/sql-money*
+      (and (= op-sym '/) (money? l) (money? r)) 'datahike.pg.query-fns/sql-money-div-money
+      (and (= op-sym '/) (money? l) (factor? r)) 'datahike.pg.query-fns/sql-money-div
       :else nil)))
 
 (defn- check-scalar-subquery-arithmetic-types!
@@ -4345,7 +4344,7 @@
                     (list emit-op (second int-op) lv rv)
                     (list emit-op lv rv))]
         (if not-prefix?
-          (list 'datahike.pg.sql/sql-bit-not (ctx/materialize-arg! ctx arith))
+          (list 'datahike.pg.query-fns/sql-bit-not (ctx/materialize-arg! ctx arith))
           arith)))))
 
 (defn translate-binary-fn
@@ -4511,7 +4510,7 @@
                                        (.getRightExpression expr))]
     (if (instance? XorExpression normalized)
       (translate-binary-fn ctx normalized
-                           'datahike.pg.sql/sql-bit-xor fns/sql-bit-xor)
+                           'datahike.pg.query-fns/sql-bit-xor fns/sql-bit-xor)
       (translate-expr ctx normalized))))
 
 (defn flatten-json-chain
@@ -6146,23 +6145,23 @@
              ;; Intervals are still text-backed. Until they have a
              ;; structural value, never send that carrier through numeric
              ;; multiplication and leak String->Number to a client.
-             (list 'datahike.pg.sql/sql-unsupported-temporal-arithmetic inner)
+             (list 'datahike.pg.query-fns/sql-unsupported-temporal-arithmetic inner)
              (let [w (when-not (number? inner)
                        (int-width-of ctx (.getExpression se)))]
                (cond
                  (number? inner) (- inner)
-                 w (list 'datahike.pg.sql/sql-int-neg w inner)
+                 w (list 'datahike.pg.query-fns/sql-int-neg w inner)
                  ;; Route through numeric-special-aware multiplication so
                  ;; -Infinity swaps sign and -NaN remains NaN. Bare Clojure
                  ;; multiplication casts the carrier record to Number.
-                 :else (list 'datahike.pg.sql/sql-* -1 inner))))
+                 :else (list 'datahike.pg.query-fns/sql-* -1 inner))))
         ;; `~` — bitwise NOT, over integers and bit strings alike.
         ;; Previously fell through to the identity branch below, so
         ;; `SELECT ~1` answered 1 instead of -2: a silent wrong answer,
         ;; not an unsupported-feature error.
         \~ (if (or (number? inner) (pg-bits/pg-bit? inner))
              (fns/sql-bit-not inner)
-             (list 'datahike.pg.sql/sql-bit-not inner))
+             (list 'datahike.pg.query-fns/sql-bit-not inner))
         inner))
 
     ;; Arithmetic — materialize sub-expression operands to ensure Datahike
@@ -6226,15 +6225,15 @@
     ;; normalized below because the parser gives XOR lower precedence than
     ;; these operators while PostgreSQL puts them all at one level.
     (instance? BitwiseAnd expr)
-    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-and fns/sql-bit-and)
+    (translate-binary-fn ctx expr 'datahike.pg.query-fns/sql-bit-and fns/sql-bit-and)
     (instance? BitwiseOr expr)
-    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-or fns/sql-bit-or)
+    (translate-binary-fn ctx expr 'datahike.pg.query-fns/sql-bit-or fns/sql-bit-or)
     (instance? BitwiseLeftShift expr)
-    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-left fns/sql-bit-shift-left)
+    (translate-binary-fn ctx expr 'datahike.pg.query-fns/sql-bit-shift-left fns/sql-bit-shift-left)
     (instance? BitwiseRightShift expr)
-    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-bit-shift-right fns/sql-bit-shift-right)
+    (translate-binary-fn ctx expr 'datahike.pg.query-fns/sql-bit-shift-right fns/sql-bit-shift-right)
     (instance? BitwiseXor expr)
-    (translate-binary-fn ctx expr 'datahike.pg.sql/sql-power-op fns/sql-power-op)
+    (translate-binary-fn ctx expr 'datahike.pg.query-fns/sql-power-op fns/sql-power-op)
     (instance? XorExpression expr)
     (translate-hash-xor ctx expr)
 
@@ -6584,7 +6583,7 @@
                   zone-var (let [z (translate-expr ctx zone-expr)]
                              (if (seq? z) (ctx/materialize-arg! ctx z) z))
                   value-var (if (seq? value-var) (ctx/materialize-arg! ctx value-var) value-var)]
-              [(list 'datahike.pg.sql/sql-at-time-zone value-var zone-var kind)
+              [(list 'datahike.pg.query-fns/sql-at-time-zone value-var zone-var kind)
                (case kind :timestamp types/oid-timestamptz
                      :timestamptz types/oid-timestamp
                      :timetz types/oid-timetz)]))
@@ -6610,7 +6609,7 @@
     (let [^ExtractExpression e expr
           v (translate-expr ctx (.getExpression e))
           v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
-      (list 'datahike.pg.sql/sql-extract (str (.getName e)) v))
+      (list 'datahike.pg.query-fns/sql-extract (str (.getName e)) v))
 
     ;; TRIM([LEADING|TRAILING|BOTH] [chars] FROM s) is also its own node.
     ;; With a FROM, `.getExpression` is the CHARACTER SET and
@@ -6628,9 +6627,9 @@
               (let [cv (translate-expr ctx chars-e)]
                 (if (seq? cv) (ctx/materialize-arg! ctx cv) cv)))
           f (case spec
-              "leading"  'datahike.pg.sql/sql-ltrim
-              "trailing" 'datahike.pg.sql/sql-rtrim
-              'datahike.pg.sql/sql-btrim)]
+              "leading"  'datahike.pg.query-fns/sql-ltrim
+              "trailing" 'datahike.pg.query-fns/sql-rtrim
+              'datahike.pg.query-fns/sql-btrim)]
       (if c (list f v c) (list f v)))
 
     ;; Boolean-producing operators as SELECT-list projections.
@@ -7393,23 +7392,23 @@
                vector-cmp-param
                [(list vector-cmp-param l r)]
                (and jsonb-cmp? (= op '=))
-               [(list 'datahike.pg.sql/jsonb-eq? l r)]
+               [(list 'datahike.pg.query-fns/jsonb-eq? l r)]
                jsonb-cmp?
-               [(list 'datahike.pg.sql/jsonb-ne? l r)]
+               [(list 'datahike.pg.query-fns/jsonb-ne? l r)]
                :else
                ;; `=` / `<>` compare numbers by VALUE across types; see
                ;; fns/sql-eq?. The ordering operators are already
                ;; cross-type in Clojure and pass through unchanged.
                [(list (case op
-                        = 'datahike.pg.sql/sql-eq?
-                        not= 'datahike.pg.sql/sql-ne?
+                        = 'datahike.pg.query-fns/sql-eq?
+                        not= 'datahike.pg.query-fns/sql-ne?
                         ;; NaN sorts above everything in PostgreSQL, so
                         ;; the ordering operators need it too -- IEEE-754
                         ;; makes all four false for any NaN operand.
-                        < 'datahike.pg.sql/sql-lt?
-                        > 'datahike.pg.sql/sql-gt?
-                        <= 'datahike.pg.sql/sql-le?
-                        >= 'datahike.pg.sql/sql-ge?
+                        < 'datahike.pg.query-fns/sql-lt?
+                        > 'datahike.pg.query-fns/sql-gt?
+                        <= 'datahike.pg.query-fns/sql-le?
+                        >= 'datahike.pg.query-fns/sql-ge?
                         op)
                       l r)]))))))
 
@@ -7541,12 +7540,12 @@
 
 (def ^:private op->may-kw
   "Binary comparison predicates that `sql-may?` can express."
-  {'datahike.pg.sql/sql-eq? :eq
-   'datahike.pg.sql/sql-ne? :ne
-   'datahike.pg.sql/sql-lt? :lt
-   'datahike.pg.sql/sql-gt? :gt
-   'datahike.pg.sql/sql-le? :le
-   'datahike.pg.sql/sql-ge? :ge})
+  {'datahike.pg.query-fns/sql-eq? :eq
+   'datahike.pg.query-fns/sql-ne? :ne
+   'datahike.pg.query-fns/sql-lt? :lt
+   'datahike.pg.query-fns/sql-gt? :gt
+   'datahike.pg.query-fns/sql-le? :le
+   'datahike.pg.query-fns/sql-ge? :ge})
 
 (defn- may-clause
   "M(φ) -- \"φ is TRUE or UNKNOWN\" -- as a single clause, or nil when the
@@ -7565,7 +7564,7 @@
         (when (and (vector? c) (= 1 (count c)) (seq? (first c)))
           (let [[op l r] (first c)]
             (when (and (= 3 (count (first c))) (op->may-kw op))
-              [(list 'datahike.pg.sql/sql-may? (op->may-kw op) l r)])))))))
+              [(list 'datahike.pg.query-fns/sql-may? (op->may-kw op) l r)])))))))
 
 (defn- conjunct-spine
   "Flatten an AND spine (through parentheses) into its conjuncts."
@@ -7774,8 +7773,8 @@
               (let [v (ctx/col-var! ctx resolved)
                     guards (ctx/null-guard-clauses ctx [v])
                     equality-fn (if (jsonb-column? ctx left)
-                                  'datahike.pg.sql/jsonb-eq?
-                                  'datahike.pg.sql/sql-eq?)]
+                                  'datahike.pg.query-fns/jsonb-eq?
+                                  'datahike.pg.query-fns/sql-eq?)]
                 (conj guards [(list equality-fn v pv)]))))
           (if (and (instance? Column left)
                    (not= types/oid-vector (source-oid ctx left))
@@ -7819,14 +7818,14 @@
                 ;; because jsonb attributes are never `:db/index`ed.
                 (jsonb-column? ctx left)
                 (let [v (ctx/col-var! ctx resolved)]
-                  [[(list 'datahike.pg.sql/jsonb-eq? v val)]])
+                  [[(list 'datahike.pg.query-fns/jsonb-eq? v val)]])
 
                 (and *conjunctive-where* (ctx/bind-col-value! ctx resolved val))
                 []
               ;; Regular column = value (including aliased columns)
                 :else
                 (let [v (ctx/col-var! ctx resolved)]
-                  [[(list 'datahike.pg.sql/sql-eq? v val)]])))
+                  [[(list 'datahike.pg.query-fns/sql-eq? v val)]])))
             (translate-comparison ctx '= (.getLeftExpression e) (.getRightExpression e))))))
 
     (instance? NotEqualsTo expr)
@@ -7920,8 +7919,8 @@
       ;; Kleene AND. Guarding all three operands non-NULL first would drop
       ;; the rows where `1 NOT BETWEEN 3 AND NULL` is TRUE.
       [[(list (if not-between?
-                'datahike.pg.sql/sql-not-between?
-                'datahike.pg.sql/sql-between?)
+                'datahike.pg.query-fns/sql-not-between?
+                'datahike.pg.query-fns/sql-between?)
               col lo hi)]])
 
     (instance? IsNullExpression expr)
@@ -7994,8 +7993,8 @@
         (let [v (translate-expr ctx inner)
               v (if (seq? v) (ctx/materialize-arg! ctx v) v)]
           (if not-null?
-            [[(list 'datahike.pg.sql/sql-not-null? v)]]
-            [[(list 'datahike.pg.sql/sql-null? v)]]))))
+            [[(list 'datahike.pg.query-fns/sql-not-null? v)]]
+            [[(list 'datahike.pg.query-fns/sql-null? v)]]))))
 
     ;; col IS TRUE / col IS FALSE / col IS NOT TRUE / col IS NOT FALSE
     (instance? IsBooleanExpression expr)
@@ -8017,8 +8016,8 @@
           col (translate-expr ctx (.getLeftExpression e))
           col (if (seq? col) (ctx/materialize-arg! ctx col) col)]
       (if (.isNot e)
-        [[(list 'datahike.pg.sql/sql-not-null? col)]]
-        [[(list 'datahike.pg.sql/sql-null? col)]]))
+        [[(list 'datahike.pg.query-fns/sql-not-null? col)]]
+        [[(list 'datahike.pg.query-fns/sql-null? col)]]))
 
     ;; a IS [NOT] DISTINCT FROM b — the NULL-aware `<>`.
     (instance? IsDistinctExpression expr)
@@ -8029,8 +8028,8 @@
           r (translate-expr ctx (.getRightExpression e))
           r (if (seq? r) (ctx/materialize-arg! ctx r) r)]
       [[(list (if (.isNot e)
-                'datahike.pg.sql/sql-not-distinct?
-                'datahike.pg.sql/sql-distinct?)
+                'datahike.pg.query-fns/sql-not-distinct?
+                'datahike.pg.query-fns/sql-distinct?)
               l r)]])
 
     ;; col ~ 'pattern' / col !~ 'pattern' / col ~* 'pattern' / col !~* 'pattern'
@@ -8293,10 +8292,10 @@
                            (correlated-in-var! ctx col inner corr-refs not-in?)
 
                            :else
-                           (let [base (list 'datahike.pg.sql/sql-in3?
+                           (let [base (list 'datahike.pg.query-fns/sql-in3?
                                             subquery-values-var col)
                                  form (if not-in?
-                                        (list 'datahike.pg.sql/sql-not3
+                                        (list 'datahike.pg.query-fns/sql-not3
                                               (ctx/materialize-arg! ctx base))
                                         base)]
                              (ctx/materialize-arg! ctx form)))]
@@ -8319,7 +8318,7 @@
         ;; col matches NOT IN iff every (not= col p_i) holds.
           (and not-in? has-param?)
           (into guards
-                (mapv (fn [v] [(list 'datahike.pg.sql/sql-ne? col v)]) non-null-vals))
+                (mapv (fn [v] [(list 'datahike.pg.query-fns/sql-ne? col v)]) non-null-vals))
 
         ;; NOT IN literal list — set-based predicate wrapped in `not`.
         ;; Using `(or-join ...)` with many branches explodes Datahike's
@@ -8343,7 +8342,7 @@
           (let [shared-vars (vec (distinct (concat (ctx/collect-vars col)
                                                    (filter symbol? non-null-vals))))
                 branches (mapv (fn [v]
-                                 (list 'and [(list 'datahike.pg.sql/sql-eq? col v)]))
+                                 (list 'and [(list 'datahike.pg.query-fns/sql-eq? col v)]))
                                non-null-vals)]
             (conj guards (apply list 'or-join shared-vars branches)))
 
@@ -8351,7 +8350,7 @@
         ;; `(contains? #{...} :__null__)` returns false, so positive IN is already null-safe.
           :else
           (let [val-set (set non-null-vals)]
-            [[(list 'datahike.pg.sql/sql-in? val-set col)]]))))
+            [[(list 'datahike.pg.query-fns/sql-in? val-set col)]]))))
 
     ;; EXISTS / NOT EXISTS subquery
     (instance? ExistsExpression expr)
@@ -8487,13 +8486,13 @@
                                          (or
                                           ;; Bare list form: (= ?a ?b)
                                           (and (seq? c)
-                                               (contains? #{'= 'datahike.pg.sql/sql-eq?}
+                                               (contains? #{'= 'datahike.pg.query-fns/sql-eq?}
                                                           (first c))
                                                (= 3 (count c)))
                                           ;; Wrapped form: [(= ?a ?b)]
                                           (and (vector? c) (= 1 (count c))
                                                (seq? (first c))
-                                               (contains? #{'= 'datahike.pg.sql/sql-eq?}
+                                               (contains? #{'= 'datahike.pg.query-fns/sql-eq?}
                                                           (first (first c)))
                                                (= 3 (count (first c))))))
                                        new-clauses)

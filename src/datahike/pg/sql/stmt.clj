@@ -68,7 +68,8 @@
             [datahike.pg.tsearch :as tsearch]
             [datahike.pg.vector :as pg-vector]
             [datahike.pg.bits :as pg-bits]
-            [datahike.pg.arrays :as pg-arr])
+            [datahike.pg.arrays :as pg-arr]
+            [datahike.pg.resolve :as pg-resolve])
   (:import [datahike.datom Datom]
            [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.schema Column Table]
@@ -732,7 +733,7 @@
                             r-var (expr/translate-expr ctx right)
                             eq-fn (if (or (expr/jsonb-column? ctx left)
                                           (expr/jsonb-column? ctx right))
-                                    'datahike.pg.sql/jsonb-eq?
+                                    'datahike.pg.query-fns/jsonb-eq?
                                     '=)]
                         (ctx/add-clause! ctx [(list eq-fn l-var r-var)])
                         (when (symbol? l-var)
@@ -947,7 +948,7 @@
 (defn match-aggregate-index
   "Try to find the index of an aggregate function in the find-elements.
    For COUNT(*) → look for (count ?x), for SUM(col) → (sum ?x) or
-   (datahike.pg.sql/filter-sum ?x). Returns the 0-based index or nil.
+   (datahike.pg.query-fns/filter-sum ?x). Returns the 0-based index or nil.
 
    Matches both the raw Datalog aggregate symbol and our ns-qualified
    null-filtering variant (filter-sum/avg/min/max/count[-distinct]) so
@@ -3205,12 +3206,12 @@
    Datalog planner may reorder function clauses ahead of SQL WHERE
    predicates, so SELECT projections containing these are deferred until
    after filtering when the query shape permits it."
-  '#{datahike.pg.sql/sql-div
-     datahike.pg.sql/sql-int-div
-     datahike.pg.sql/sql-f4div
-     datahike.pg.sql/sql-mod
-     datahike.pg.sql/sql-money-div
-     datahike.pg.sql/sql-money-div-money})
+  '#{datahike.pg.query-fns/sql-div
+     datahike.pg.query-fns/sql-int-div
+     datahike.pg.query-fns/sql-f4div
+     datahike.pg.query-fns/sql-mod
+     datahike.pg.query-fns/sql-money-div
+     datahike.pg.query-fns/sql-money-div-money})
 
 (defn- deferred-projection-op? [x]
   (and (symbol? x)
@@ -4340,21 +4341,21 @@
             (cond
               (= result-oid types/oid-numeric)
               (case agg-name
-                "sum" 'datahike.pg.sql/filter-sum-numeric
-                "avg" 'datahike.pg.sql/filter-avg-numeric
+                "sum" 'datahike.pg.query-fns/filter-sum-numeric
+                "avg" 'datahike.pg.query-fns/filter-avg-numeric
                 ;; The variance family is NUMERIC over int2/int4/int8/
                 ;; numeric, and its numeric runtime is not merely more
                 ;; precise -- the float one OVERFLOWED on int8 input.
-                ("stddev" "stddev_samp") 'datahike.pg.sql/filter-stddev-samp-numeric
-                "stddev_pop"             'datahike.pg.sql/filter-stddev-pop-numeric
-                ("variance" "var_samp")  'datahike.pg.sql/filter-variance-samp-numeric
-                "var_pop"                'datahike.pg.sql/filter-variance-pop-numeric
+                ("stddev" "stddev_samp") 'datahike.pg.query-fns/filter-stddev-samp-numeric
+                "stddev_pop"             'datahike.pg.query-fns/filter-stddev-pop-numeric
+                ("variance" "var_samp")  'datahike.pg.query-fns/filter-variance-samp-numeric
+                "var_pop"                'datahike.pg.query-fns/filter-variance-pop-numeric
                 nil)
               ;; sum(float4) accumulates at float4 precision (float4pl),
               ;; so it needs its own runtime too.
               (= result-oid types/oid-float4)
               (case agg-name
-                "sum" 'datahike.pg.sql/filter-sum-float4
+                "sum" 'datahike.pg.query-fns/filter-sum-float4
                 nil)
               :else nil)))
 
@@ -4405,9 +4406,9 @@
                     ;; `string_agg`, `stddev` and every other aggregate
                     ;; silently computed a SUM instead.
                     filter-agg (cond
-                                 is-count? 'datahike.pg.sql/filter-count
+                                 is-count? 'datahike.pg.query-fns/filter-count
                                  filter-precision-variant filter-precision-variant
-                                 :else (or agg-sym 'datahike.pg.sql/filter-sum))]
+                                 :else (or agg-sym 'datahike.pg.query-fns/filter-sum))]
                 (swap! find-elements conj (list filter-agg case-var))
                 (swap! find-aliases conj (or alias0 fname)))
               ;; No filter — treat as regular aggregate. A name that is
@@ -4474,10 +4475,10 @@
                         ;; aggregates already use — it was a per-row fn that
                         ;; stringified one value and dropped the delimiter, so
                         ;; it returned one row per input row.
-                  (if (and (contains? #{'datahike.pg.sql/filter-corr
-                                        'datahike.pg.sql/filter-jsonb-object-agg
-                                        'datahike.pg.sql/filter-json-object-agg
-                                        'datahike.pg.sql/filter-string-agg}
+                  (if (and (contains? #{'datahike.pg.query-fns/filter-corr
+                                        'datahike.pg.query-fns/filter-jsonb-object-agg
+                                        'datahike.pg.query-fns/filter-json-object-agg
+                                        'datahike.pg.query-fns/filter-string-agg}
                                       agg-sym)
                            params (= 2 (count params)))
                     (let [;; CORR has only a float8 overload. PostgreSQL's
@@ -4488,7 +4489,7 @@
                           ;; to end in a String->Number ClassCastException.
                           translate-arg
                           (fn [arg]
-                            (if (and (= agg-sym 'datahike.pg.sql/filter-corr)
+                            (if (and (= agg-sym 'datahike.pg.query-fns/filter-corr)
                                      (instance? StringValue arg))
                               (coerce/coerce-numeric (.getValue ^StringValue arg) :double)
                               (expr/translate-expr ctx arg)))
@@ -4502,7 +4503,7 @@
                                 ;; it needs the same treatment array_agg gets.
                                 ;; The triple carries the delimiter along with
                                 ;; the sort key and the value.
-                          order-els (when (= agg-sym 'datahike.pg.sql/filter-string-agg)
+                          order-els (when (= agg-sym 'datahike.pg.query-fns/filter-string-agg)
                                       (seq (.getOrderByElements f)))]
                       ;; Preserve duplicate input rows when a relation drives
                       ;; the aggregate. A table-free aggregate has exactly one
@@ -4527,8 +4528,8 @@
                           (ctx/add-clause! ctx [(list 'vector sort-key v1 v2) pair-var])
                           (swap! find-elements conj
                                  (list (if all-desc?
-                                         'datahike.pg.sql/filter-string-agg-ordered-desc
-                                         'datahike.pg.sql/filter-string-agg-ordered)
+                                         'datahike.pg.query-fns/filter-string-agg-ordered-desc
+                                         'datahike.pg.query-fns/filter-string-agg-ordered)
                                        pair-var)))
                         (do
                           (ctx/add-clause! ctx [(list 'vector v1 v2) pair-var])
@@ -4559,8 +4560,8 @@
                                   pair-var (ctx/fresh-var! ctx)]
                               (ctx/add-clause! ctx [(list 'vector rank-var v) pair-var])
                               [(if (= fname "min")
-                                 'datahike.pg.sql/filter-enum-min
-                                 'datahike.pg.sql/filter-enum-max)
+                                 'datahike.pg.query-fns/filter-enum-min
+                                 'datahike.pg.query-fns/filter-enum-max)
                                pair-var])
                             [agg-sym v])
                                 ;; Per-input-type variant for SUM/AVG. Compute
@@ -4575,9 +4576,9 @@
                                                (oid/expr-oid inner-expr agg-oid-env)))
                           agg-sym (cond
                                     (and is-count-col? is-distinct?)
-                                    'datahike.pg.sql/filter-count-distinct
+                                    'datahike.pg.query-fns/filter-count-distinct
                                     is-count-col?
-                                    'datahike.pg.sql/filter-count
+                                    'datahike.pg.query-fns/filter-count
                                     precision-variant precision-variant
                                     :else agg-sym)
                                 ;; Distinct aggregates (e.g. SUM(DISTINCT x)) deduplicate
@@ -4611,8 +4612,8 @@
                                                     (not (.isAsc o)))
                                                   order-els)
                                 ord-sym (if all-desc?
-                                          'datahike.pg.sql/filter-array-agg-ordered-desc
-                                          'datahike.pg.sql/filter-array-agg-ordered)]
+                                          'datahike.pg.query-fns/filter-array-agg-ordered-desc
+                                          'datahike.pg.query-fns/filter-array-agg-ordered)]
                             (ctx/add-clause! ctx [(list 'vector sort-key v) pair-var])
                             (swap! find-elements conj (list ord-sym pair-var)))
                           (swap! find-elements conj (list agg-sym v))))
@@ -5613,8 +5614,8 @@
                                         ;; where-clause function call and failed at execute
                                         ;; time with "Unknown function filter-sum-numeric".
                                         agg-syms (into (set (vals fns/sql-aggregate->datalog))
-                                                       '#{datahike.pg.sql/filter-sum-numeric
-                                                          datahike.pg.sql/filter-avg-numeric})
+                                                       '#{datahike.pg.query-fns/filter-sum-numeric
+                                                          datahike.pg.query-fns/filter-avg-numeric})
                                         ;; A form that is ALREADY a find element is an
                                         ;; aggregate the projection emitted, not a scalar
                                         ;; expression to bind — materialising it turns
@@ -7185,9 +7186,12 @@
                        where))
       (let [in-syms (vec (rest in))
             var-sym? #(and (symbol? %) (str/starts-with? (name %) "?"))
+            ;; A qualified head resolves as the engine would while
+            ;; pg-datahike runs the query; a bare one is a Datahike
+            ;; built-in, which only d/q evaluates.
             resolve-fn (fn [f]
-                         (when-not (var-sym? f)
-                           (some-> (when (namespace f) (requiring-resolve f)) deref)))
+                         (when (and (not (var-sym? f)) (namespace f))
+                           (pg-resolve/symbol-resolver f)))
             clauses (mapv (fn [[[f & args] out]]
                             {:f f :fixed (resolve-fn f) :args (vec args) :out out})
                           where)]
