@@ -369,3 +369,67 @@
                "SELECT 'CREATE TABLE p (a int) PARTITION BY RANGE (a)'"]]
     (is (nil? (rw/partition-by-clause (cls/tokenize-all sql))) sql)
     (is (= sql (rw/rewrite sql [rw/partition-by-rule])) sql)))
+
+;; ============================================================================
+;; order-by-using-rule
+;; ============================================================================
+
+(defn- order-using [sql] (rw/rewrite sql [rw/order-by-using-rule]))
+
+(deftest order-by-using-becomes-a-direction
+  (testing "the btree ordering operators are exactly ASC and DESC"
+    (is (= "SELECT x FROM t ORDER BY x ASC"  (order-using "SELECT x FROM t ORDER BY x USING <")))
+    (is (= "SELECT x FROM t ORDER BY x DESC" (order-using "SELECT x FROM t ORDER BY x USING >")))
+    (is (= "SELECT x FROM t ORDER BY x ASC"  (order-using "SELECT x FROM t ORDER BY x USING <=")))
+    (is (= "SELECT x FROM t ORDER BY x DESC" (order-using "SELECT x FROM t ORDER BY x USING >="))))
+  (testing "every key of a multi-column ORDER BY"
+    (is (= "SELECT x FROM t ORDER BY a DESC, b ASC"
+           (order-using "SELECT x FROM t ORDER BY a USING >, b USING <"))))
+  (testing "any other operator is left alone -- ordering by it is not a direction"
+    (is (= "SELECT x FROM t ORDER BY x USING ~<~"
+           (order-using "SELECT x FROM t ORDER BY x USING ~<~"))))
+  (testing "USING outside an ORDER BY is untouched"
+    (is (= "DELETE FROM a USING b WHERE a.i = b.i"
+           (order-using "DELETE FROM a USING b WHERE a.i = b.i")))
+    ;; the ORDER BY has ended by the time this USING appears
+    (is (= "SELECT x FROM t ORDER BY x LIMIT 1"
+           (order-using "SELECT x FROM t ORDER BY x LIMIT 1")))))
+
+;; ============================================================================
+;; select-into-table-rule
+;; ============================================================================
+
+(deftest select-into-lifts-to-create-table-as
+  (let [pre #(rw/rewrite % [rw/select-into-table-rule])]
+    (is (= "CREATE TABLE t AS SELECT x  FROM s" (pre "SELECT x INTO t FROM s")))
+    (testing "an INTO after FROM is not this clause"
+      (is (= "SELECT x FROM s ORDER BY x" (pre "SELECT x FROM s ORDER BY x"))))
+    (testing "a nested SELECT's INTO is not the statement's"
+      (is (= "SELECT (SELECT 1) AS x FROM s" (pre "SELECT (SELECT 1) AS x FROM s"))))
+    (testing "only a SELECT is rewritten"
+      (is (= "INSERT INTO t SELECT x FROM s" (pre "INSERT INTO t SELECT x FROM s"))))))
+
+;; ============================================================================
+;; adjacent-string-literal-rule
+;; ============================================================================
+
+(deftest adjacent-string-literals-fold-into-one
+  (let [pre #(rw/rewrite % [rw/adjacent-string-literal-rule])]
+    (is (= "SELECT 'ab'" (pre "SELECT 'a'\n'b'")))
+    (testing "a run of any length"
+      (is (= "SELECT 'abc'" (pre "SELECT 'a'\n'b'\n'c'"))))
+    (testing "an empty literal in the run"
+      (is (= "SELECT 'ab'" (pre "SELECT 'a'\n''\n'b'"))))
+    (testing "literals that are not adjacent are left alone"
+      (is (= "SELECT 'a', 'b'" (pre "SELECT 'a', 'b'")))
+      (is (= "SELECT 'a' || 'b'" (pre "SELECT 'a' || 'b'"))))))
+
+;; ============================================================================
+;; quote-reserved-alias-rule — words JSqlParser reserves and PostgreSQL does not
+;; ============================================================================
+
+(deftest reserved-words-usable-as-column-labels
+  (doseq [w ["constraint" "distinct" "minus" "semi" "unbounded" "unique"]]
+    (let [out (rw/rewrite (str "SELECT 1 AS " w) rw/default-rules)]
+      (is (str/includes? out (str "\"" w "\""))
+          (str w " should be quoted so it survives the parser")))))

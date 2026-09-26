@@ -4,6 +4,31 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### `SELECT … INTO`, and what `CREATE TABLE … AS` reports
+
+PostgreSQL has two spellings for the same statement, and we answered only one:
+
+```sql
+CREATE TABLE t AS SELECT …
+SELECT … INTO t                 -- also INTO TABLE t, INTO TEMP t
+```
+
+The second never parsed. It does now, and both report the row count they stored — `SELECT 3`, exactly as the SELECT that produced the rows would have. We reported `CREATE TABLE` for every CTAS, so every client saw a row count of zero; `CREATE TABLE IF NOT EXISTS … AS` on an existing table says `CREATE TABLE AS`, as PostgreSQL does when it skips the work.
+
+### `DROP TABLE` of a table that is not there is an error
+
+Without `IF EXISTS`, a name that resolves to nothing is `42P01`, the code `DROP VIEW` and `DROP SEQUENCE` already raised. Silently succeeding hid a typo'd or already-dropped name. Every name is resolved before anything is retracted, so `DROP TABLE good, missing` leaves `good` in place — PostgreSQL's behaviour, and it is why the check cannot simply be made per name as the drop proceeds.
+
+`DROP INDEX` of a missing index now says `index "x" does not exist` rather than the generic `unrecognized index "x"`.
+
+### Three more shapes the parser accepts
+
+Found by replaying PostgreSQL's own regression files statement by statement; each was the first divergence of at least one file.
+
+- **`ORDER BY x USING <`** names the ordering *operator* rather than a direction. For the btree ordering operators that is exactly a direction, so `USING <` / `<=` is `ASC` and `USING >` / `>=` is `DESC`. Any other operator is still refused: we cannot order by an arbitrary operator, and saying so is the truthful answer.
+- **Adjacent string literals separated by a newline** are one string: `'first line'` then `' - next line'` is `'first line - next line'`. A run of any length folds.
+- **`constraint`, `distinct`, `minus`, `semi`, `unbounded` and `unique` as column labels.** PostgreSQL accepts all six after `AS`; the parser reserved them.
+
 ### Query functions resolve per statement, and the process keeps its own resolver
 
 A started server used to install Datahike's `safe-symbol-resolver` for the whole process and register `datahike.pg.sql`, `datahike.pg.secondary` and `datahike.pg.tsearch` with Datahike's function registry. Both were wrong:
