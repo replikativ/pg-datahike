@@ -163,6 +163,108 @@ Four fixes: the literal-cast fold, the column OID (17, not text), a strict `byte
 - operator-implementation functions as a generated alias table;
 - remaining small functions per report.
 
+## Phase 7 — server-side routines
+
+The goal is PostgreSQL's own regression suite, passing except for mismatches
+that are minor or clearly delineated. Measured against it (see
+`doc/postgres-regress-baseline.md`), server-side routines are the largest
+remaining lever after the parser, and they *cascade*: a file that cannot
+create its helper function then fails every statement that calls it.
+
+### 7.1 SQL functions (done)
+
+`CREATE`/`DROP FUNCTION … LANGUAGE sql`, stored in a registry keyed by name,
+arity and declared argument types. A call is **inlined**, which is what
+PostgreSQL does too -- `inline_function` (optimizer/util/clauses.c) never
+reaches the SQL-function executor for the common case. Inlining is not an
+optimisation here, it is the only option: a statement is lowered to ONE
+Datalog query, so a per-row callout to a nested executor has nowhere to live.
+
+Two deliberate differences from `inline_function`:
+
+- It substitutes the argument's AST; we bind its **translated value**, so an
+  argument used twice is evaluated once. PostgreSQL has to refuse to inline
+  when a repeated parameter's argument is volatile or expensive; we do not.
+- It refuses to inline a STRICT function unless the body uses every parameter
+  and contains only strict constructs. We inline and guard the result, which
+  keeps the bodies it gives up on.
+
+Its refusal list is otherwise about PostgreSQL's IR (`rtable`, `jointree`,
+`setOperations`) rather than semantics, and does not apply to substitution
+into a SQL AST.
+
+### 7.2 Set-returning SQL functions in FROM
+
+A `RETURNS SETOF`/`TABLE` function used as a relation becomes a derived table.
+The dynamic binding 7.1 uses cannot reach it -- a subquery is translated by a
+runtime closure that runs after the binding is gone -- so the arguments are
+substituted into the body's AST instead, which is `substitute_actual_parameters`
+and brings back `inline_function`'s volatility rule with it.
+
+81 of the corpus's 343 single-SELECT `LANGUAGE sql` bodies are this shape, and
+they dominate the function-heavy files (`rangefuncs` is 30 SETOF to 18 scalar).
+
+### 7.3 plpgsql
+
+526 bodies across 77 files, and there is no small viable subset: EXCEPTION (54)
+and EXECUTE (48) alone touch a fifth of them. So: implement the language.
+
+- **`pl_gram.y` is the spec for the syntax** -- a real parser producing an AST,
+  not regexes over the body text.
+- **An evaluator whose two primitives delegate to what we have**: "evaluate an
+  expression" and "run a statement" go through the existing handler, which is
+  what SPI is for PostgreSQL. `pl_exec.c`'s 9,226 lines overstate the job --
+  most of it is memory contexts, plan caching and TupleDesc conversion.
+- **Refuse at CREATE time, not at call time.** Parse the whole grammar; if the
+  body uses a construct the evaluator does not implement, reject the definition
+  with 0A000 naming it. Coverage then grows monotonically and a gap is never a
+  wrong answer.
+- **EXCEPTION is a subtransaction**, so it lands last and on the savepoint
+  machinery.
+
+Implementation order follows the measured frequency: RAISE 193, DECLARE 188,
+FOR 95, IF 91, LOOP 63, EXCEPTION 54, EXECUTE 48, RETURN NEXT 28, PERFORM 24,
+RETURN QUERY 17, WHILE 9, CASE 8, FOREACH 7.
+
+`RETURN <expr>` and `BEGIN ATOMIC`, the two SQL-standard body forms the
+classifier currently rejects, fold in here: they share the body parser.
+
+### 7.4 Triggers
+
+222 of the corpus's 230 trigger bodies are plpgsql and **none** is
+`LANGUAGE sql` -- PostgreSQL forbids it ("SQL functions cannot return type
+trigger"), so triggers are gated on 7.3 by construction.
+
+Datahike's `listen!` is the wrong mechanism: `writer.cljc` fires listeners
+after the transaction is applied, once per transaction, discarding the return
+value. A trigger must run *before* the write, *modify* the row, *veto* it, and
+*abort* by raising. (Listeners are the right substrate for real LISTEN/NOTIFY,
+which is a separate no-op to remove.)
+
+The hook is `datahike.pg.constraints.row`, which already sequences the per-row
+phases and already says it mirrors `ExecInsert`. PostgreSQL's order is
+`ExecBRInsertTriggers` -> `ExecConstraints` -> insert -> `ExecARInsertTriggers`
+(nodeModifyTable.c 935/1118/1318), so BEFORE ROW goes *ahead* of constraint
+checking -- a BEFORE trigger may fix up a row that would otherwise fail NOT
+NULL. 230 CREATE TRIGGER statements over 32 files; 171 are FOR EACH ROW and 119
+are BEFORE, so the row-level rewrite path is the common case.
+
+### 7.5 Out of reach, and said so
+
+35 distinct `LANGUAGE C` names (17 files) and 43 `LANGUAGE internal` ones bind
+to PostgreSQL's own test shared library and internal symbols -- `int42_in`,
+`int44out`, `test_atomic_ops`, `make_tuple_indirect`. They exist to test C
+extensibility itself. A handful could be hand-implemented; most should not be,
+and the files whose *purpose* they are stay out of scope.
+
+### Performance
+
+Routines must not cost what they save. Inlining keeps a call inside the single
+Datalog query, so a scalar function over N rows stays one query -- the property
+to protect, and to check on the pgbench path before and after (see
+`doc/benchmarks.md` and the baseline in memory). A per-row callout would be an
+N+1 and is the thing 7.2 and 7.3 must avoid wherever the shape allows.
+
 ## Process per phase
 
 - Oracle-verified tests, taken from the report's "tests to add" sections.

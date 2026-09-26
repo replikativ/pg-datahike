@@ -2180,6 +2180,10 @@
     ;; no AS / IF NOT EXISTS / NO MINVALUE / signed values) and has no
     ;; AlterSequence branch downstream, so both are parsed here.
     :create-sequence :alter-sequence
+    ;; CREATE FUNCTION … LANGUAGE sql — the body is a dollar-quoted or
+    ;; single-quoted string JSqlParser will not carry, so the whole
+    ;; statement is token-classified and re-tagged in parse-sql.
+    :create-function-sql :drop-function-sql
     ;; TRUNCATE (whole statement — JSqlParser's Truncate grammar lacks
     ;; RESTART/CONTINUE IDENTITY) and multi-name DROP TABLE (JSqlParser
     ;; 5.2 parses a single name only). Both re-tagged to non-:system

@@ -607,13 +607,14 @@
 
 ;; Sequence DDL is classified in full further down (it needs
 ;; read-relation-name, which is defined after this dispatch).
-(declare classify-create-sequence classify-alter-sequence)
+(declare classify-create-sequence classify-alter-sequence classify-create-function)
 
 (defn- classify-create [toks]
   ;; toks starts after CREATE. Skip qualifiers (OR REPLACE, UNIQUE,
   ;; TEMPORARY, GLOBAL, LOCAL, UNLOGGED) that don't disambiguate kind.
   (let [skip? #{"or" "replace" "unique" "temporary" "temp"
                 "global" "local" "unlogged"}
+        or-replace? (and (kw=? (first toks) "or") (kw=? (second toks) "replace"))
         toks (loop [ts toks]
                (if (kw-in? (first ts) skip?)
                  (recur (rest ts))
@@ -672,7 +673,7 @@
       (kw=? t1 "trigger")
       {:kind :create-trigger :reject-kind :trigger :tag "CREATE TRIGGER"}
       (kw=? t1 "function")
-      {:kind :create-function :reject-kind :function :tag "CREATE FUNCTION"}
+      (classify-create-function (rest toks) or-replace?)
       (kw=? t1 "procedure")
       {:kind :create-procedure :reject-kind :procedure :tag "CREATE PROCEDURE"}
       (kw=? t1 "aggregate")
@@ -879,6 +880,178 @@
       (recur (conj opts opt) ts')
       [opts ts])))
 
+(defn- read-balanced
+  "Consume `(` through its matching `)`. Returns [inner-toks rest-toks],
+   or nil when the head is not `(` or the parens do not close."
+  [toks]
+  (when (= "(" (:text (first toks)))
+    (loop [ts (rest toks), depth 1, acc []]
+      (let [t (first ts)]
+        (cond
+          (nil? t) nil
+          (= "(" (:text t)) (recur (rest ts) (inc depth) (conj acc t))
+          (= ")" (:text t)) (if (= 1 depth)
+                              [acc (rest ts)]
+                              (recur (rest ts) (dec depth) (conj acc t)))
+          :else (recur (rest ts) depth (conj acc t)))))))
+
+(defn- split-top-level-commas
+  "Split a token seq on commas that are not inside parens or brackets."
+  [toks]
+  (loop [ts toks, depth 0, cur [], out []]
+    (if-let [t (first ts)]
+      (let [txt (:text t)]
+        (cond
+          (contains? #{"(" "["} txt) (recur (rest ts) (inc depth) (conj cur t) out)
+          (contains? #{")" "]"} txt) (recur (rest ts) (dec depth) (conj cur t) out)
+          (and (= "," txt) (zero? depth)) (recur (rest ts) depth [] (conj out cur))
+          :else (recur (rest ts) depth (conj cur t) out)))
+      (cond-> out (seq cur) (conj cur)))))
+
+(def ^:private type-lead-words
+  "Words that can only begin a TYPE, never an argument name. They are
+   what tells `x int` (named) from `double precision` (not)."
+  #{"bigint" "bit" "boolean" "box" "bytea" "char" "character" "cidr"
+    "circle" "date" "decimal" "double" "float" "float4" "float8" "inet"
+    "int" "int2" "int4" "int8" "integer" "interval" "json" "jsonb" "line"
+    "lseg" "macaddr" "money" "national" "numeric" "path" "point" "polygon"
+    "real" "smallint" "text" "time" "timestamp" "timestamptz" "timetz"
+    "tsquery" "tsvector" "uuid" "varbit" "varchar" "xml"})
+
+(defn- join-type-toks
+  "Re-spell a type's tokens: `character varying ( 10 )` back into
+   `character varying(10)`, lower-cased. Punctuation binds tight."
+  [toks]
+  (str/lower-case
+   (str/trim
+    (reduce (fn [acc t]
+              (let [txt (:text t)
+                    tight-left? (contains? #{"(" ")" "[" "]" "," "."} txt)
+                    tight-right? (or (str/ends-with? acc "(")
+                                     (str/ends-with? acc ".")
+                                     (str/ends-with? acc ",")
+                                     (str/ends-with? acc "["))]
+                (str acc (when-not (or (empty? acc) tight-left? tight-right?) " ") txt)))
+            ""
+            toks))))
+
+(defn- read-function-param
+  "One item of a CREATE FUNCTION argument list:
+   `[argmode] [argname] argtype [ {DEFAULT|=} expr ]`."
+  [toks]
+  (let [ts (if (and (kw-in? (first toks) #{"in" "out" "inout" "variadic"})
+                    ;; `in` is also a legal argument NAME, so it is a mode
+                    ;; only when a type still follows it.
+                    (next toks))
+             (rest toks)
+             toks)
+        ;; Cut the DEFAULT clause: it is not part of the type.
+        ts (take-while #(not (or (kw=? % "default") (= "=" (:text %)))) ts)
+        named? (and (ident-tok? (first ts))
+                    (next ts)
+                    (not (kw-in? (first ts) type-lead-words))
+                    (not (contains? #{"." "(" "["} (:text (second ts)))))]
+    (when (seq ts)
+      {:name (when named? (ident-text (first ts)))
+       :type (join-type-toks (if named? (rest ts) ts))})))
+
+(def ^:private function-attr-words
+  "Words that begin a CREATE FUNCTION attribute — i.e. that END the
+   RETURNS type."
+  #{"language" "transform" "window" "immutable" "stable" "volatile" "not"
+    "leakproof" "called" "returns" "strict" "external" "security"
+    "parallel" "cost" "rows" "support" "set" "as" "begin" "return" "with"})
+
+(defn- read-function-attrs
+  "The attribute list after the signature, in any order (PostgreSQL's
+   own grammar accepts them in any order). Only the three that change
+   what the function MEANS are kept."
+  [toks]
+  (loop [ts toks, acc {}]
+    (let [t (first ts)]
+      (cond
+        (or (nil? t) (= ";" (:text t))) acc
+
+        (kw=? t "language")
+        (recur (drop 2 ts)
+               (assoc acc :language (some-> (or (ident-text (second ts))
+                                                (string-value (second ts)))
+                                            str/lower-case)))
+
+        (kw=? t "as")
+        ;; `AS 'body'` / `AS $$body$$`, or, for a C function,
+        ;; `AS 'obj_file', 'link_symbol'` — the second string is kept so
+        ;; the caller can see this is not a body it can run.
+        (let [run (take-while #(or (= :string (:type %)) (= "," (:text %))) (rest ts))
+              strs (vec (keep string-value run))]
+          (recur (drop (inc (count run)) ts)
+                 (cond-> acc
+                   (first strs) (assoc :body (first strs))
+                   (second strs) (assoc :link-symbol (second strs)))))
+
+        (kw=? t "strict")
+        (recur (rest ts) (assoc acc :strict? true))
+
+        ;; RETURNS NULL ON NULL INPUT is STRICT spelled out; CALLED ON
+        ;; NULL INPUT is its opposite, and the default.
+        (and (kw=? t "returns") (kw=? (second ts) "null"))
+        (recur (drop 5 ts) (assoc acc :strict? true))
+
+        (and (kw=? t "called") (kw=? (second ts) "on"))
+        (recur (drop 4 ts) (assoc acc :strict? false))
+
+        :else (recur (rest ts) acc)))))
+
+(defn- classify-create-function
+  "CREATE [OR REPLACE] FUNCTION name(args) RETURNS t AS 'body' LANGUAGE l.
+
+   `toks` starts after the FUNCTION keyword. A function whose body this
+   server can run — `LANGUAGE sql`, one statement — is classified in
+   full; everything else keeps the silently-accepted reject it had, so
+   a pg_dump that defines a plpgsql trigger still restores."
+  [toks or-replace?]
+  (let [reject {:kind :create-function :reject-kind :function :tag "CREATE FUNCTION"}]
+    (or (when-let [[nm after-name] (read-relation-name toks)]
+          (when-let [[arg-toks after-args] (read-balanced after-name)]
+            (let [params (mapv read-function-param (split-top-level-commas arg-toks))
+                  ;; RETURNS SETOF t | RETURNS TABLE (…) | RETURNS t
+                  [ret after-ret]
+                  (if (kw=? (first after-args) "returns")
+                    (let [ts (rest after-args)]
+                      (cond
+                        (kw=? (first ts) "table")
+                        (when-let [[cols rest-ts] (read-balanced (rest ts))]
+                          [{:setof? true
+                            :columns (mapv read-function-param
+                                           (split-top-level-commas cols))}
+                           rest-ts])
+
+                        (kw=? (first ts) "setof")
+                        (let [type-toks (take-while #(not (kw-in? % function-attr-words))
+                                                    (rest ts))]
+                          [{:setof? true :type (join-type-toks type-toks)}
+                           (drop (count type-toks) (rest ts))])
+
+                        :else
+                        (let [type-toks (take-while #(not (kw-in? % function-attr-words)) ts)]
+                          [{:type (join-type-toks type-toks)}
+                           (drop (count type-toks) ts)])))
+                    [nil after-args])]
+              (when ret
+                (let [attrs (read-function-attrs after-ret)]
+                  (when (and (= "sql" (:language attrs))
+                             (:body attrs)
+                             (not (:link-symbol attrs))
+                             (every? :type params))
+                    {:kind :create-function-sql
+                     :fn-name nm
+                     :or-replace? (boolean or-replace?)
+                     :params params
+                     :returns ret
+                     :strict? (boolean (:strict? attrs))
+                     :body (:body attrs)}))))))
+        reject)))
+
 (defn- classify-create-sequence
   "CREATE [TEMP|UNLOGGED] SEQUENCE [IF NOT EXISTS] name [options…].
    `toks` starts just after the SEQUENCE keyword (classify-create has
@@ -946,6 +1119,48 @@
                :restart-identity? restart? :cascade? (boolean cascade?)})))
         {:kind :generic-sql})))
 
+(defn- classify-drop-function
+  "DROP FUNCTION [IF EXISTS] name [ ( [args] ) ] [CASCADE|RESTRICT].
+   `toks` starts after the FUNCTION keyword.
+
+   The argument list is reduced to an ARITY, which is what the registry
+   resolves on. An absent list means \"the only function of that name\",
+   as it does in PostgreSQL. A list of several names in one statement
+   keeps the old reject: it is rare and each name would need its own
+   resolution."
+  [toks]
+  (let [reject {:kind :drop-function :reject-kind :function :tag "DROP FUNCTION"}
+        ie? (and (kw=? (first toks) "if") (kw=? (second toks) "exists"))
+        ts (if ie? (drop 2 toks) toks)]
+    (or (when-let [[nm after-name] (read-relation-name ts)]
+          (let [[arity after-args]
+                (if-let [[arg-toks rest-ts] (read-balanced after-name)]
+                  [(if (empty? (remove #(= "," (:text %)) arg-toks))
+                     0
+                     (count (split-top-level-commas arg-toks)))
+                   rest-ts]
+                  [nil after-name])
+                ;; CASCADE / RESTRICT: RESTRICT is the default and means
+                ;; nothing here (no dependency tracking for functions);
+                ;; CASCADE would have to chase dependents, so it rejects.
+                cascade? (kw=? (first after-args) "cascade")
+                tail (drop-while #(or (= ";" (:text %))
+                                      (kw=? % "cascade") (kw=? % "restrict"))
+                                 after-args)]
+            (when (and (empty? tail) (not cascade?))
+              {:kind :drop-function-sql
+               :fn-name nm
+               :arity arity
+               ;; Kept for the 42883 message, which names the argument
+               ;; types PostgreSQL resolved: `function f(integer) does
+               ;; not exist`.
+               :arg-types (when arity
+                            (mapv #(:type (read-function-param %))
+                                  (split-top-level-commas
+                                   (first (read-balanced after-name)))))
+               :if-exists? ie?})))
+        reject)))
+
 (defn- classify-drop [toks]
   (let [t1 (first toks)]
     (cond
@@ -961,7 +1176,7 @@
       ;; Symmetric with classify-create — reuse the same :reject-kind
       ;; so a single :silently-accept entry covers both ends.
       (kw=? t1 "trigger")    {:kind :drop-trigger :reject-kind :trigger :tag "DROP TRIGGER"}
-      (kw=? t1 "function")   {:kind :drop-function :reject-kind :function :tag "DROP FUNCTION"}
+      (kw=? t1 "function")   (classify-drop-function (rest toks))
       (kw=? t1 "procedure")  {:kind :drop-procedure :reject-kind :procedure :tag "DROP PROCEDURE"}
       (kw=? t1 "aggregate")  {:kind :drop-aggregate :reject-kind :aggregate :tag "DROP AGGREGATE"}
       (and (kw=? t1 "materialized") (kw=? (second toks) "view"))

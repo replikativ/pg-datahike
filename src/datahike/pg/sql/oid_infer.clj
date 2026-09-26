@@ -745,66 +745,77 @@
     (some (fn [{:keys [name oid]}] (when (= name type-str) oid))
           (pgs/composite-types db))))
 
-(defn- cast-oid
-  "Map a SQL CAST target type-name to an OID. Uses `types/cast-category`
-   so the set of recognised target types stays in one place."
-  [^CastExpression c env]
-  (let [cdt      (.getColDataType c)
-        ;; .getDataType returns the BASE name ("int") and exposes the `[]`
-        ;; only via .getArrayData — so an array cast like `::int[]` must be
-        ;; detected here and wrapped to the element's array OID, else it
-        ;; reports the scalar (int4) and the binary array value mis-decodes.
-        type-str (some-> cdt .getDataType str str/lower-case
-                         types/base-type-name-of)
-        ad       (when cdt (.getArrayData cdt))
-        array?   (and ad (pos? (.size ^java.util.List ad)))
-        scalar-oid
-        (or
-         (composite-name->oid type-str (:db env))
-         (case (types/cast-category type-str)
+(defn sql-type-name->oid
+  "Map a SQL type NAME to its OID: `int` → 23, `character varying` → 1043,
+   `jsonb` → 3802, a composite type declared in this database → its row
+   type. nil when the name resolves to nothing.
+
+   Uses `types/cast-category` so the set of recognised names stays in one
+   place. This is what a CAST target, a function's declared argument and
+   its declared return type all resolve through; it is the seam the
+   single name/OID resolver of Phase 4 replaces."
+  [type-str db]
+  (let [type-str (some-> type-str str/lower-case types/base-type-name-of)]
+    (or
+     (composite-name->oid type-str db)
+     (case (types/cast-category type-str)
       ;; Datahike stores every integer as a Clojure long, but an explicit
       ;; CAST asserts a specific PG width — report the matching OID so
       ;; clients parse the column correctly (e.g. node-postgres returns
       ;; int4 as a JS number but int8 as a string). The wire bytes are
       ;; identical in text mode; encodeBinary narrows the long to the
       ;; declared width for binary clients.
-           :integer   (cond
-                        (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
-                        (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
-                        :else                                                    types/oid-int4)
+       :integer   (cond
+                    (#{"smallint" "int2" "smallserial" "serial2"} type-str) types/oid-int2
+                    (#{"bigint" "int8" "bigserial" "serial8"} type-str)      types/oid-int8
+                    :else                                                    types/oid-int4)
            ;; `real` is a DISTINCT type, not a spelling of double
            ;; precision -- `1.1::real` is 1.100000023841858 as a float8
            ;; and `pg_typeof` says real.
-           :float     (if (#{"real" "float4"} type-str) types/oid-float4 types/oid-float8)
-           :numeric   types/oid-numeric
-           :money     types/oid-money
-           :internal-char types/oid-char
-           :text      (cond
-                        (contains? #{"varchar" "character varying"} type-str) types/oid-varchar
-                        (contains? #{"char" "character" "bpchar"} type-str) types/oid-bpchar
-                        (= "name" type-str) types/oid-name
-                        :else types/oid-text)
-           :boolean   types/oid-bool
-           :date      types/oid-date
-           :time      (if (contains? #{"timetz" "time with time zone"} type-str)
-                        types/oid-timetz
-                        types/oid-time)
-           :timestamp (cond
-                        (re-find #"with time zone|timestamptz" type-str)
-                        types/oid-timestamptz
-                        :else types/oid-timestamp)
-           :interval  types/oid-interval
-           :uuid      types/oid-uuid
-           :bytes     types/oid-bytea
-           :bit       types/oid-bit
-           :varbit    types/oid-varbit
-           :vector    types/oid-vector
-           nil)
-         ;; Fallback for types cast-category doesn't width-classify (jsonb,
-         ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
-         ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
-         ;; and the binary value mis-decoded.
-         (get types/pg-name->oid type-str))]
+       :float     (if (#{"real" "float4"} type-str) types/oid-float4 types/oid-float8)
+       :numeric   types/oid-numeric
+       :money     types/oid-money
+       :internal-char types/oid-char
+       :text      (cond
+                    (contains? #{"varchar" "character varying"} type-str) types/oid-varchar
+                    (contains? #{"char" "character" "bpchar"} type-str) types/oid-bpchar
+                    (= "name" type-str) types/oid-name
+                    :else types/oid-text)
+       :boolean   types/oid-bool
+       :date      types/oid-date
+       :time      (if (contains? #{"timetz" "time with time zone"} type-str)
+                    types/oid-timetz
+                    types/oid-time)
+       :timestamp (cond
+                    (re-find #"with time zone|timestamptz" type-str)
+                    types/oid-timestamptz
+                    :else types/oid-timestamp)
+       :interval  types/oid-interval
+       :uuid      types/oid-uuid
+       :bytes     types/oid-bytea
+       :bit       types/oid-bit
+       :varbit    types/oid-varbit
+       :vector    types/oid-vector
+       nil)
+     ;; Fallback for types cast-category doesn't width-classify (jsonb,
+     ;; json, inet, name, oid, …): the canonical pg_type-name → OID map is
+     ;; comprehensive. Without this, `::jsonb` / `::jsonb[]` reported text
+     ;; and the binary value mis-decoded.
+     (get types/pg-name->oid type-str))))
+
+(defn- cast-oid
+  "Map a SQL CAST target type to an OID, wrapping to the array type when
+   the cast says `[]`."
+  [^CastExpression c env]
+  (let [cdt      (.getColDataType c)
+        ;; .getDataType returns the BASE name ("int") and exposes the `[]`
+        ;; only via .getArrayData — so an array cast like `::int[]` must be
+        ;; detected here and wrapped to the element's array OID, else it
+        ;; reports the scalar (int4) and the binary array value mis-decodes.
+        type-str (some-> cdt .getDataType str)
+        ad       (when cdt (.getArrayData cdt))
+        array?   (and ad (pos? (.size ^java.util.List ad)))
+        scalar-oid (sql-type-name->oid type-str (:db env))]
     (cond
       (nil? scalar-oid) nil
       array? (get types/element-oid->array-oid scalar-oid types/oid-text-array)

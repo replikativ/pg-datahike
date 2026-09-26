@@ -426,6 +426,25 @@
    it to re-parse inner SQL strings for IN / EXISTS subqueries."
   nil)
 
+(def ^:dynamic *sql-fn-args*
+  "The arguments of the `LANGUAGE sql` function whose body is being
+   translated, as `{\"argname\" value, 1 value, …}` — by name and by
+   1-based position, so a body may spell a parameter either way.
+
+   Bound only while a function body is inlined, so it shadows the
+   caller's own `$1` for exactly that extent. The values are ALREADY
+   TRANSLATED, which is why an argument used twice in the body is
+   evaluated once: `f(random())` with a body of `$1 - $1` is zero, as
+   PostgreSQL's inlined form is not."
+  nil)
+
+(def ^:dynamic *sql-fn-active*
+  "The `name/arity` keys of the SQL functions currently being inlined.
+   A body that reaches its own function again is recursive; PostgreSQL's
+   `inline_function` gives up on that (`context->active_fns`) and so do
+   we, with 42P19 rather than a stack overflow."
+  #{})
+
 (def ^:dynamic *from-bindings*
   "When bound (by build-update-tx handling UPDATE ... FROM),
    a map {alias-name → {col-name → literal}} used by the Column branches

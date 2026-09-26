@@ -1214,20 +1214,38 @@
    we implement but cannot shape or evaluate in this context is an explicit
    capability boundary (0A000). Neither case may fall through as an absent
    relation: that used to return only the outer rows in comma joins, or leak
-   an unbound Datalog entity var when WITH ORDINALITY exposed columns."
-  [^net.sf.jsqlparser.statement.select.TableFunction tf]
-  (let [fname (srf-base-name (.getName (.getFunction tf)))]
-    (if (contains? known-srf-names fname)
-      (throw (errors/pg-error
-              :feature-not-supported
-              {:message (str "table function " fname
-                             " cannot be evaluated in this context")}))
-      (throw (errors/pg-error
-              :undefined-function
-              {:function (str fname "()")
-               :hint (str "No function matches the given name and "
-                          "argument types. You might need to add "
-                          "explicit type casts.")})))))
+   an unbound Datalog entity var when WITH ORDINALITY exposed columns.
+
+   A set-returning `LANGUAGE sql` function this database DEFINES is the
+   third case. Saying it does not exist would be a lie -- it does, it is
+   in the registry, and `\\df` lists it. It gets the capability boundary."
+  ([tf] (reject-unmaterialized-table-function! tf nil))
+  ([^net.sf.jsqlparser.statement.select.TableFunction tf db]
+   (let [fname (srf-base-name (.getName (.getFunction tf)))]
+     (cond
+       (contains? known-srf-names fname)
+       (throw (errors/pg-error
+               :feature-not-supported
+               {:message (str "table function " fname
+                              " cannot be evaluated in this context")}))
+
+       (and db (seq (d/q '{:find [?e] :in [$ ?n]
+                           :where [[?e :datahike.pg.function/name ?n]]}
+                         db fname)))
+       (throw (errors/pg-error
+               :feature-not-supported
+               {:message (str "set-returning SQL function " fname
+                              " in a FROM clause")
+                :detail (str "The function is defined; producing its rows as a "
+                             "relation is not supported yet.")}))
+
+       :else
+       (throw (errors/pg-error
+               :undefined-function
+               {:function (str fname "()")
+                :hint (str "No function matches the given name and "
+                           "argument types. You might need to add "
+                           "explicit type casts.")}))))))
 
 (defn- target-list-srf?
   "Whether expr is a set-returning function supported by ProjectSet.
@@ -3626,7 +3644,7 @@
                      (table-fn->virtual-table
                       ^net.sf.jsqlparser.statement.select.TableFunction from-item db))]
             [vdb vschema vname valias]
-            (reject-unmaterialized-table-function! from-item))
+            (reject-unmaterialized-table-function! from-item db))
 
           ;; A sequence is a relation in PG: `SELECT * FROM myseq` reads
           ;; its position. Materialise the three-column form so the rest

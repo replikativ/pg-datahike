@@ -4,6 +4,41 @@ All notable changes to pg-datahike.
 
 ## [Unreleased]
 
+### SQL functions run
+
+`CREATE FUNCTION … LANGUAGE sql` was accepted as a silent no-op and every call to one then said the function does not exist. Definitions are stored now, and a call is **inlined** -- which is what PostgreSQL does too: `inline_function` (optimizer/util/clauses.c) substitutes the arguments into the body and never reaches the SQL-function executor for the common case.
+
+```sql
+CREATE FUNCTION iadd(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql;
+SELECT i, iadd(i, 10) FROM t;      -- one query, not one call per row
+SELECT i FROM t WHERE iadd(i, 0) > 1;
+```
+
+Inlining is not an optimisation here, it is the only option: a statement is lowered to one Datalog query, so a per-row callout to a nested executor has nowhere to live. A scalar function over a million rows therefore stays one query.
+
+Two places this deliberately differs from `inline_function`, both in our favour:
+
+- It substitutes the argument's **AST**; we bind its **translated value**. An argument used twice in the body is evaluated once, so `vdiff(random())` with a body of `$1 - $1` is zero. PostgreSQL has to refuse to inline exactly that case (a repeated parameter whose argument is volatile or expensive) and fall back to calling the function.
+- It refuses to inline a STRICT function unless the body uses every parameter *and* contains only strict constructs. We inline and guard the result, so the bodies it gives up on still work:
+
+```sql
+CREATE FUNCTION f(x int) RETURNS text AS $$ SELECT 'const' $$ LANGUAGE sql STRICT;
+SELECT f(NULL);                    -- NULL, not 'const'
+```
+
+Overloading is on the declared argument types, as in PostgreSQL. Keying the registry on name and arity alone was not merely a missing feature: `dfunc(int,int)` and `dfunc(text,text)` collided, a call inlined whichever body was stored, and `dfunc('Hi','City')` ran `$1 + $2` over two strings and surfaced a raw `ClassCastException`. PostgreSQL's own `polymorphism` regression test found it. Resolution now filters the overloads of that arity by whether they can take the given arguments, and when every argument is an untyped literal the all-`text` overload wins -- PostgreSQL's unknown-prefers-text rule.
+
+`DROP FUNCTION` works, with the `42883` PostgreSQL words for a missing one (`function iadd(integer, integer) does not exist`, naming the *resolved* types), `42723` for a duplicate signature, and `42725` when a bare name matches several overloads.
+
+A body this server cannot inline is a `0A000` naming the function, never a wrong answer. That covers a body with a FROM clause *and* arguments, a multi-statement `BEGIN ATOMIC` body, `RETURN <expr>`, and a recursive function. A body with a FROM and no arguments splices whole, as a scalar subquery.
+
+A set-returning function used as a relation (`SELECT * FROM f()`) is also `0A000` -- and it used to claim the function did not exist, which was a lie: it is in the registry and `DROP FUNCTION` finds it.
+
+### `sql-type-name->oid`
+
+`cast-oid` resolved a SQL type name to an OID inline. It is now `oid-infer/sql-type-name->oid`, which is what a CAST target, a function's declared argument and its declared return type all go through -- one seam for the single name/OID resolver of Phase 4 to replace, rather than three.
+
+
 ### `SELECT … INTO`, and what `CREATE TABLE … AS` reports
 
 PostgreSQL has two spellings for the same statement, and we answered only one:

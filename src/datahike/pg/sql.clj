@@ -1089,6 +1089,15 @@
               :drop-table-multi
               (assoc base :type :ddl-drop)
 
+              ;; CREATE FUNCTION … LANGUAGE sql. The classifier carries
+              ;; the whole signature (:fn-name :params :returns :strict?
+              ;; :body); every other language keeps its :reject-kind.
+              :create-function-sql
+              (assoc base :type :ddl-create-function)
+
+              :drop-function-sql
+              (assoc base :type :ddl-drop-function)
+
               ;; CREATE / ALTER SEQUENCE — fully token-classified; the
               ;; option list arrives on cls-info as :seq-opts. Validation
               ;; (defaults, bounds, 42601/22023) runs in ddl and raises,

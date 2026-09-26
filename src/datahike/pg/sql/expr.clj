@@ -86,7 +86,8 @@
             BitwiseAnd BitwiseOr BitwiseXor BitwiseLeftShift BitwiseRightShift]
            [net.sf.jsqlparser.statement.select
             PlainSelect SelectItem AllColumns ParenthesedSelect Join Values
-            Select SetOperationList FromItem OrderByElement WithItem]))
+            Select SetOperationList FromItem OrderByElement WithItem]
+           [net.sf.jsqlparser.parser CCJSqlParserUtil]))
 
 (defn- unwrap-parenthesed-select
   "The select inside any number of parentheses."
@@ -352,6 +353,201 @@
       (contains? oid-infer/sql-fn->return-oid fname)
       (contains? fns/sql-function-specs fname)
       (contains? fns/sql-fn->clj-fn fname)))
+
+(defn- function-candidates
+  "Every stored `LANGUAGE sql` overload of this name taking this many
+   arguments."
+  [db fname arity]
+  (when db
+    (mapv #(d/entity db (first %))
+          (d/q '{:find [?e] :in [$ ?n ?a]
+                 :where [[?e :datahike.pg.function/name ?n]
+                         [?e :datahike.pg.function/arity ?a]]}
+               db fname arity))))
+
+(defn- candidate-accepts?
+  "Whether `cand`'s declared argument types can take a call with these
+   actual argument OIDs. An OID of nil is an untyped literal --
+   PostgreSQL's `unknown`, which fits anything -- and two types in the
+   same cast category (int2/int4/int8, or the string types) are
+   interchangeable here because PostgreSQL would coerce between them.
+
+   This is a coarse stand-in for `func_select_candidate`
+   (parse_func.c). It is deliberately permissive: its job is to keep a
+   call off an overload whose body would be nonsense for it, not to
+   reproduce PostgreSQL's preference ranking."
+  [db cand actual-oids]
+  (let [declared (read-string (:datahike.pg.function/arg-types cand))]
+    (every? true?
+            (map (fn [decl-name actual-oid]
+                   (or (nil? actual-oid)
+                       (let [decl-oid (oid-infer/sql-type-name->oid decl-name db)]
+                         (or (nil? decl-oid)
+                             (= decl-oid actual-oid)
+                             (= (types/cast-category (types/oid->pg-name decl-oid))
+                                (types/cast-category (types/oid->pg-name actual-oid)))))))
+                 declared actual-oids))))
+
+(defn- all-text-params? [cand]
+  (let [declared (read-string (:datahike.pg.function/arg-types cand))]
+    (and (seq declared)
+         (every? #{"text"} declared))))
+
+(defn user-sql-function
+  "The stored `LANGUAGE sql` function a call of this name and these
+   argument types resolves to, or nil when none does.
+
+   One overload of the arity is used as-is. Several are filtered by
+   whether they can take these arguments; if that still leaves more
+   than one and every argument is an untyped literal, the all-`text`
+   overload wins, which is PostgreSQL's unknown-prefers-text rule and
+   the case `polymorphism` exercises (`dfunc('Hi','City')` is the
+   text/text overload, not int/int). Anything still ambiguous resolves
+   to nothing and the caller raises 42883."
+  [db fname arity actual-oids]
+  (let [cands (function-candidates db fname arity)]
+    (cond
+      (empty? cands) nil
+      (= 1 (count cands)) (first cands)
+      :else
+      (let [fits (filterv #(candidate-accepts? db % actual-oids) cands)]
+        (cond
+          (= 1 (count fits)) (first fits)
+          (and (> (count fits) 1) (every? nil? actual-oids))
+          (first (filter all-text-params? fits))
+          :else nil)))))
+
+(defn- sql-function-body-expr
+  "The single expression a `LANGUAGE sql` body returns, when the body is
+   one `SELECT <expr>` with nothing else -- no FROM, no WHERE, no
+   grouping, no ordering, no set operation. That is the shape
+   PostgreSQL's `inline_function` accepts, and the only one this inlines
+   so far: a body with a FROM is a subquery, which needs the caller's
+   arguments substituted into the AST rather than into this translation.
+
+   nil when the body is any other shape; the caller turns that into a
+   0A000 naming the function."
+  [^String body]
+  (try
+    (let [stmt (CCJSqlParserUtil/parse body)]
+      (when (instance? PlainSelect stmt)
+        (let [^PlainSelect ps stmt
+              items (.getSelectItems ps)]
+          (when (and (= 1 (count items))
+                     (nil? (.getFromItem ps))
+                     (nil? (.getWhere ps))
+                     (nil? (.getGroupBy ps))
+                     (nil? (.getHaving ps))
+                     (nil? (.getOrderByElements ps))
+                     (nil? (.getLimit ps))
+                     (nil? (.getDistinct ps))
+                     (nil? (.getWithItemsList ps)))
+            (.getExpression ^SelectItem (first items))))))
+    (catch Throwable _ nil)))
+
+(defn- sql-function-body-subquery
+  "The body as a scalar subquery -- `(SELECT max(i) FROM t)` -- for a
+   body that is one SELECT but not a bare expression. nil when the body
+   is not a single SELECT at all."
+  [^String body]
+  (try
+    (let [stmt (CCJSqlParserUtil/parse body)]
+      (when (or (instance? PlainSelect stmt) (instance? SetOperationList stmt))
+        (doto (ParenthesedSelect.)
+          (.setSelect ^Select stmt))))
+    (catch Throwable _ nil)))
+
+(defn- strict-null-guard
+  "A STRICT function is NULL whenever any argument is NULL, whatever its
+   body says: a strict function whose body ignores its parameter and
+   returns a constant still answers NULL for a NULL argument.
+
+   Inlining alone loses that -- the body no longer knows it was reached
+   through a strict call -- which is why PostgreSQL's `inline_function`
+   refuses to inline a strict function unless its body uses every
+   parameter AND contains only strict constructs. Guarding the result
+   instead keeps the bodies PostgreSQL gives up on (a COALESCE or a CASE
+   inside a strict function) while answering what PostgreSQL answers.
+
+   The one thing this does not reproduce is that PostgreSQL never
+   EVALUATES the body of a strict call: a body that raised on a NULL
+   argument would raise here and answer NULL there."
+  [ctx values result]
+  (let [fn-param (symbol (str "?pg-strict" (swap! (:var-counter ctx) inc)))
+        guard (fn [& args]
+                (if (some #(or (nil? %) (fns/sql-null? %)) (butlast args))
+                  :__null__
+                  (last args)))
+        result-var (ctx/fresh-var! ctx)]
+    (swap! (:in-params ctx) conj fn-param)
+    (swap! (:in-args ctx) conj guard)
+    (swap! (:where-clauses ctx) conj
+           [(apply list fn-param (concat values [result])) result-var])
+    result-var))
+
+(defn inline-sql-function
+  "Inline a call to a stored `LANGUAGE sql` function, the way
+   PostgreSQL's `inline_function` (optimizer/util/clauses.c) does:
+   translate the arguments, then translate the body with the parameters
+   bound to those translated values.
+
+   Binding TRANSLATED values, rather than substituting the argument's
+   AST as PostgreSQL does, means an argument used twice in the body is
+   evaluated once. That removes PostgreSQL's whole `usecounts` analysis
+   -- it has to refuse to inline when a repeated parameter's argument is
+   volatile or expensive, and we do not.
+
+   What we do keep from it: the recursion guard, and STRICT, which
+   requires that the body use every parameter."
+  [ctx fn-ent arg-exprs]
+  (let [fname (:datahike.pg.function/name fn-ent)
+        key (:datahike.pg.function/key fn-ent)
+        body (:datahike.pg.function/body fn-ent)
+        arg-names (read-string (:datahike.pg.function/arg-names fn-ent))]
+    (when (contains? params/*sql-fn-active* key)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "cannot inline recursive SQL function \"" fname "\"")})))
+    (when (:datahike.pg.function/setof? fn-ent)
+      (throw (errors/pg-error
+              :feature-not-supported
+              {:message (str "set-returning SQL function \"" fname
+                             "\" in an expression")})))
+    (let [body-expr (or (sql-function-body-expr body)
+                        ;; A body with a FROM is a scalar subquery. With no
+                        ;; parameters there is nothing to substitute into
+                        ;; it, so it can be spliced whole. With parameters
+                        ;; it cannot yet: the subquery is translated by a
+                        ;; runtime closure that runs outside the dynamic
+                        ;; binding, so its arguments would have to be
+                        ;; substituted into the AST instead.
+                        (when (empty? arg-names)
+                          (sql-function-body-subquery body)))]
+      (when-not body-expr
+        (throw (errors/pg-error
+                :feature-not-supported
+                {:message (str "SQL function \"" fname
+                               "\" has a body this server cannot inline")
+                 :detail (if (seq arg-names)
+                           (str "A body that reads from a table is supported "
+                                "only for a function with no arguments.")
+                           "Only a single SELECT is supported as a body.")})))
+      (let [values (mapv #(translate-expr ctx %) arg-exprs)
+            bindings (into {}
+                           (concat
+                            ;; by 1-based position, for a body spelling $n
+                            (map-indexed (fn [i v] [(inc i) v]) values)
+                            ;; and by name, when the parameter has one
+                            (keep-indexed (fn [i nm]
+                                            (when nm
+                                              [(str/lower-case nm) (nth values i)]))
+                                          arg-names)))
+            result (binding [params/*sql-fn-args* bindings
+                             params/*sql-fn-active* (conj params/*sql-fn-active* key)]
+                     (translate-expr ctx body-expr))]
+        (if (:datahike.pg.function/strict? fn-ent)
+          (strict-null-guard ctx values result)
+          result)))))
 
 (defn undefined-function!
   "Raise the 42883 PostgreSQL raises for a call it cannot resolve, with
@@ -2256,6 +2452,17 @@
       ;; -- `deref(1)` a ClassCastException, `eval(1)` datalog's own
       ;; "Unknown function", both XX000.
       ;;
+      ;; A function this database defines. Looked up LAST, so nothing
+      ;; built in can be shadowed -- PostgreSQL would resolve by argument
+      ;; types and could pick a user function over a built-in of the same
+      ;; name, which name+arity resolution cannot do safely.
+      (user-sql-function (:db ctx) fname (count arg-exprs)
+                         (call-arg-oids ctx arg-exprs))
+      (inline-sql-function ctx
+                           (user-sql-function (:db ctx) fname (count arg-exprs)
+                                              (call-arg-oids ctx arg-exprs))
+                           arg-exprs)
+
       ;; A SQL client names the functions the catalog has; every other
       ;; name is 42883, worded as ParseFuncOrColumn words it.
       :else
@@ -5849,6 +6056,17 @@
           tbl (.getTable col-expr)
           bound (column-binding ctx col-expr)]
       (cond
+        ;; Inside an inlined `LANGUAGE sql` body a bare name is the
+        ;; function's parameter. Nothing else is in scope for a body with
+        ;; no FROM, and PostgreSQL resolves the parameter first in any
+        ;; case (a name that is also a column of a FROM'd table is its
+        ;; own error, "column reference is ambiguous").
+        (and params/*sql-fn-args* (nil? ac) (nil? tbl)
+             (contains? params/*sql-fn-args*
+                        (str/lower-case (unquote-ident (.getColumnName col-expr)))))
+        (get params/*sql-fn-args*
+             (str/lower-case (unquote-ident (.getColumnName col-expr))))
+
         ;; A row-scope column (row-eval: RETURNING, CHECK, ON CONFLICT) is
         ;; bound to a placeholder, filled per row: the parameter's var.
         (and bound (nil? ac))
@@ -6112,6 +6330,13 @@
     ;; - Execute-time re-translation (*bound-params* bound): look up the
     ;;   value and return it directly as a literal. Used for UPDATE/
     ;;   DELETE where-expr that is kept as a JSqlParser AST at Parse.
+    ;; `$1` inside an inlined function body is that function's first
+    ;; argument, not the caller's first bind parameter.
+    (and (instance? JdbcParameter expr)
+         params/*sql-fn-args*
+         (contains? params/*sql-fn-args* (.getIndex ^JdbcParameter expr)))
+    (get params/*sql-fn-args* (.getIndex ^JdbcParameter expr))
+
     (instance? JdbcParameter expr)
     (param-value ctx (.getIndex ^JdbcParameter expr))
 
